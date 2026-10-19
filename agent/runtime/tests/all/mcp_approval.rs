@@ -155,6 +155,188 @@ async fn login(client: &ArtifactClient) {
 }
 
 #[tokio::test]
+async fn artifact_edit_preparation_preserves_complete_current_arguments() {
+    let (origin, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    login(&account).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let body = format!("<main>{}</main>", "窄屏排版\n".repeat(3500));
+    for input in [
+        json!({"action":"create","title":"Mobile report","format":"page","content":body}),
+        json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":body}),
+        json!({"action":"patch","artifact_id":"doc","patches":[{"id":"block","hash":"original","content":body}]}),
+    ] {
+        let prepared = provider
+            .prepare_call(
+                Uuid::new_v4(),
+                "ArtifactEdit",
+                &input,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.input(), &input);
+        assert_eq!(prepared.approval_facts().normalized_input, input);
+        assert_eq!(prepared.permission_input(), &input);
+    }
+}
+
+#[tokio::test]
+async fn both_reviewers_receive_complete_artifact_edits_in_both_stages() {
+    use tickloop_agent_model::judgment::{
+        Answer, Evaluation, EvaluationRequest, JudgmentClient, JudgmentError,
+    };
+    use tickloop_agent_protocol::{Content, ExecutionMode};
+    use tickloop_agent_test_support::{auto_classification, next_event};
+
+    struct ScreenedJudgment(super::trusted_approval_context::RecordingJudgment);
+
+    #[async_trait::async_trait]
+    impl JudgmentClient for ScreenedJudgment {
+        fn model(&self) -> &str {
+            "fixture-jev"
+        }
+
+        async fn evaluate(
+            &self,
+            request: &EvaluationRequest,
+            cancel: CancellationToken,
+        ) -> Result<Evaluation, JudgmentError> {
+            let mut evaluation = self.0.evaluate(request, cancel).await?;
+            if self.0.requests.lock().unwrap().len() == 1 {
+                let Answer::Choice {
+                    choice,
+                    probabilities,
+                    ..
+                } = evaluation.answers.get_mut("decision").unwrap()
+                else {
+                    panic!("Choice expected")
+                };
+                *choice = "block_soft".into();
+                for (option, probability) in probabilities {
+                    *probability = f64::from(option == "block_soft");
+                }
+            }
+            Ok(evaluation)
+        }
+    }
+
+    for use_jev in [false, true] {
+        for patch in [false, true] {
+            let (origin, control) = service().await;
+            *control.publication.lock().unwrap() =
+                Some(json!({"audience":"public","membership_revision":1}));
+            let directory = tempfile::tempdir().unwrap();
+            let account =
+                ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin)
+                    .unwrap();
+            login(&account).await;
+            let body = format!(
+                "<main>{}<p>FINAL-REVIEW-CONTENT</p></main>",
+                "窄屏排版\n".repeat(3500)
+            );
+            let input = if patch {
+                json!({"action":"patch","artifact_id":"doc","patches":[{"id":"block","hash":"original","content":body}]})
+            } else {
+                json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":body})
+            };
+            let agent = Agent::new_embedded(
+                config(),
+                Arc::new(ScriptedModel::new(vec![
+                    call("edit", "ArtifactEdit", input.clone()),
+                    text("done"),
+                ])),
+            );
+            agent
+                .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+                .unwrap();
+            let llm = Arc::new(ScriptedModel::new(vec![
+                text(&auto_classification(true).to_string()),
+                text(&auto_classification(false).to_string()),
+            ]));
+            let jev = Arc::new(ScreenedJudgment(
+                super::trusted_approval_context::RecordingJudgment {
+                    requests: Mutex::new(Vec::new()),
+                },
+            ));
+            if use_jev {
+                agent.set_judgment_client(jev.clone()).await;
+            } else {
+                agent.set_auto_reviewer(llm.clone()).await;
+            }
+            let chat = agent.create_chat(directory.path().into()).await.unwrap();
+            agent
+                .set_execution_mode(chat, ExecutionMode::Auto)
+                .await
+                .unwrap();
+            let mut events = agent.subscribe();
+            agent
+                .submit(
+                    chat,
+                    None,
+                    "Fix the mobile layout of this public page".into(),
+                )
+                .await
+                .unwrap();
+            loop {
+                match next_event(&mut events).await.kind {
+                    EventKind::PermissionRequested { request } => {
+                        panic!("unexpected manual review: {request:?}")
+                    }
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            let states = if use_jev {
+                jev.0
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|request| request.state.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                llm.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|request| {
+                        let Content::Text { text } = &request.messages[1].content[0] else {
+                            panic!("approval snapshot expected")
+                        };
+                        serde_json::from_str::<Value>(text).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(states.len(), 2);
+            for state in states {
+                assert_eq!(state["operation"]["input"], input);
+                assert_eq!(state["prepared_facts"]["normalized_input"], input);
+                assert_eq!(
+                    state["prepared_facts"]["artifact_publication"]["audience"],
+                    "public"
+                );
+            }
+            let calls = control
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["body"]["method"] == "tools/call")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["body"]["params"]["arguments"], input);
+            agent.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn three_large_artifact_edits_do_not_exhaust_the_following_bash_review() {
     use tickloop_agent_protocol::{Content, ExecutionMode};
     use tickloop_agent_test_support::{auto_classification, next_event};
@@ -1213,7 +1395,7 @@ async fn completed_without_permission_request(
 }
 
 #[tokio::test]
-async fn prepared_approval_shows_every_short_argument_and_bounds_private_content() {
+async fn non_edit_mcp_preparation_shows_short_arguments_and_bounds_private_content() {
     let (origin, _) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -1233,7 +1415,7 @@ async fn prepared_approval_shows_every_short_argument_and_bounds_private_content
     let prepared = provider
         .prepare_call(
             ChatId::new_v4(),
-            "ArtifactEdit",
+            "ArtifactComment",
             &input,
             CancellationToken::new(),
         )
@@ -1306,7 +1488,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
 }
 
 #[tokio::test]
-async fn agent_approval_and_operation_record_keep_bounded_review_arguments() {
+async fn non_edit_mcp_approval_and_operation_record_keep_bounded_review_arguments() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -1315,7 +1497,7 @@ async fn agent_approval_and_operation_record_keep_bounded_review_arguments() {
     let source = "private body ".repeat(400);
     let model = Arc::new(ScriptedModel::new(vec![call(
         "mutation",
-        "ArtifactEdit",
+        "ArtifactComment",
         json!({"mode":"fixed","version_id":"version-7","comment_text":"Short reply","share_token":"capability-private-value","source":source}),
     )]));
     let agent = Agent::new_embedded(config(), model);
@@ -1480,7 +1662,7 @@ async fn exact_deny_rule_matches_frozen_arguments_even_when_review_redacts_them(
 }
 
 #[tokio::test]
-async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record() {
+async fn non_edit_mcp_exact_allow_rule_survives_final_admission_with_bounded_record() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -1488,7 +1670,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
     login(&account).await;
     let input = json!({"mode":"fixed","share_token":"secret-capability","source":"private body ".repeat(400)});
     let model = Arc::new(ScriptedModel::new(vec![
-        call("mutation", "ArtifactEdit", input.clone()),
+        call("mutation", "ArtifactComment", input.clone()),
         text("Done"),
     ]));
     let agent = Agent::new_embedded(config(), model);
@@ -1503,7 +1685,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
             vec![PermissionRule {
                 id: rule_id,
                 decision: Decision::Allow,
-                tool: "ArtifactEdit".into(),
+                tool: "ArtifactComment".into(),
                 specifier: None,
                 input: Some(input),
                 loop_id: None,
@@ -1562,7 +1744,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
 }
 
 #[tokio::test]
-async fn deeply_structured_private_input_cannot_fill_the_operation_record() {
+async fn deeply_structured_non_edit_mcp_input_cannot_fill_the_operation_record() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -1583,7 +1765,7 @@ async fn deeply_structured_private_input_cannot_fill_the_operation_record() {
         provider
             .prepare_call(
                 ChatId::new_v4(),
-                "ArtifactEdit",
+                "ArtifactComment",
                 &input,
                 CancellationToken::new()
             )

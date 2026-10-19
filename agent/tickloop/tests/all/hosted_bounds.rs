@@ -147,18 +147,22 @@ async fn a_registry_file_over_one_shard_is_refused_and_never_read_whole() {
 
 /// A stand-in for the daemon's executable that records each start and never serves.
 fn recording_executable(directory: &Path) -> (PathBuf, PathBuf) {
-    recording_executable_of_version(directory, BUILD_VERSION)
+    recording_executable_with_metadata(directory, BUILD_VERSION, tickhost::host::BUILD_IDENTITY)
 }
 
-/// A `tickhost` of `version` that records each start and never serves.
-fn recording_executable_of_version(directory: &Path, version: &str) -> (PathBuf, PathBuf) {
+/// A `tickhost` with independent release and component identities that never serves.
+fn recording_executable_with_metadata(
+    directory: &Path,
+    version: &str,
+    content_identity: &str,
+) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let starts = directory.join("starts");
     let script = directory.join("never-serves");
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'tickhost {version}'; exit 0; }}\nread -r config\necho start >> '{}'\n",
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'tickhost {version}'; exit 0;;\n--content-identity) echo '{content_identity}'; exit 0;;\nrun) read -r config; echo start >> '{}';;\n*) exit 2;;\nesac\n",
             starts.display()
         ),
     )
@@ -196,7 +200,12 @@ async fn a_host_that_never_serves_is_started_three_times_then_reported_unavailab
         "the production start budget"
     );
     let directory = private_directory("hbs");
-    let (executable, starts_file) = recording_executable(directory.path());
+    // A release version change alone must not reject unchanged Tickhost content.
+    let (executable, starts_file) = recording_executable_with_metadata(
+        directory.path(),
+        "0.0.0-other",
+        tickhost::host::BUILD_IDENTITY,
+    );
     let controller = HostController::new(
         directory.path(),
         HostPaths {
@@ -345,10 +354,11 @@ async fn an_incompatible_host_is_refused_and_never_replaced() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_tickhost_of_another_version_is_refused_before_it_starts() {
+async fn a_tickhost_of_another_content_is_refused_before_it_starts() {
     let directory = private_directory("hbv");
+    let other_content = "tickhost:different-content";
     let (executable, starts_file) =
-        recording_executable_of_version(directory.path(), "0.0.0-other");
+        recording_executable_with_metadata(directory.path(), BUILD_VERSION, other_content);
     let controller = HostController::new(
         directory.path(),
         HostPaths {
@@ -370,8 +380,8 @@ async fn a_tickhost_of_another_version_is_refused_before_it_starts() {
     assert!(!refused.dispatched);
     for named in [
         executable.to_string_lossy().as_ref(),
-        "0.0.0-other",
-        &format!("tickhost {BUILD_VERSION}"),
+        other_content,
+        tickhost::host::BUILD_IDENTITY,
         "same build",
     ] {
         assert!(

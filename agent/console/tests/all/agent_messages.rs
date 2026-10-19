@@ -2961,26 +2961,86 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
 #[tokio::test]
 async fn family_directory_aggregates_active_user_shell_instead_of_only_completed_loops() {
     let fixture = DirectedFixture::new().await;
+    let initial = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+    assert!(
+        initial.delegation.is_none(),
+        "this aggregation case owns a root Chat"
+    );
+    assert!(initial.permissions.is_empty());
+    let workspace = tickloop_agent_tools::Workspace {
+        folder: initial.folder.clone(),
+        additional_directories: initial.additional_directories.clone(),
+    };
+    let input = json!({"command":"sleep 30", "cwd":initial.folder, "run_in_background":false});
+    let preparation_started = std::time::Instant::now();
+    let (cold, warm) = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let cold = tickloop_agent_tools::prepare(&workspace, "Bash", &input).unwrap();
+        let cold_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let warm = tickloop_agent_tools::prepare(&workspace, "Bash", &input).unwrap();
+        let warm_elapsed = started.elapsed();
+        assert_eq!(cold.input, warm.input);
+        (cold_elapsed, warm_elapsed)
+    })
+    .await
+    .unwrap();
+    eprintln!(
+        "family Shell validator setup: total_us={}, cold_us={}, warm_us={}",
+        preparation_started.elapsed().as_micros(),
+        cold.as_micros(),
+        warm.as_micros()
+    );
+    let mut shell_events = fixture.core.subscribe_user_shells();
     let shell = fixture
         .core
         .submit_user_shell_for_goal(fixture.root_chat, None, "sleep 30".into(), false)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while fixture
-            .core
-            .snapshot(fixture.root_chat)
-            .await
-            .unwrap()
-            .user_shells
-            .iter()
-            .all(|shell| shell.state != tickloop_agent_protocol::UserShellState::Running)
-        {
-            tokio::task::yield_now().await;
+    let mut last_shell = None;
+    let started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let record = shell_events.recv().await.unwrap();
+            if record.id != shell.command_id {
+                continue;
+            }
+            let state = record.state.clone();
+            last_shell = Some(record);
+            if state == tickloop_agent_protocol::UserShellState::Running {
+                break;
+            }
+            assert!(
+                !matches!(
+                    state,
+                    tickloop_agent_protocol::UserShellState::Failed
+                        | tickloop_agent_protocol::UserShellState::Unknown
+                        | tickloop_agent_protocol::UserShellState::Completed
+                ),
+                "Shell ended before its Running transition: {last_shell:?}"
+            );
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if started.is_err() {
+        let snapshot = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+        panic!(
+            "Shell {} did not reach Running; last state/reason: {:?}; pending permission requests: {:?}; Loop states: {:?}",
+            shell.command_id,
+            last_shell
+                .as_ref()
+                .map(|record| (&record.state, &record.reason)),
+            snapshot
+                .permissions
+                .iter()
+                .map(|request| (&request.name, &request.execution))
+                .collect::<Vec<_>>(),
+            snapshot
+                .loops
+                .iter()
+                .map(|goal| &goal.state)
+                .collect::<Vec<_>>()
+        );
+    }
     let root = fixture
         .core
         .family_agents(fixture.root_chat)
@@ -3700,6 +3760,7 @@ async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_n
 #[tokio::test]
 async fn background_completion_obeys_the_same_pending_inbox_limit() {
     use std::sync::atomic::Ordering;
+    const SNAPSHOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let mut timing = SubagentTimingModel::new(true);
     timing.routed = RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
@@ -3760,31 +3821,39 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
                     && operation.state == tickloop_agent_protocol::OperationState::Admitted
             })
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
     .await
     .unwrap();
     model.release.notify_waiters();
+    let mut last_counts = (0, 0);
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let snapshot = core.snapshot(root).await.unwrap();
-            if snapshot.family_completions.len() == 129 {
+            last_counts = (
+                snapshot.family_completions.len(),
+                snapshot.pending_inputs.len(),
+            );
+            if last_counts == (129, 128) {
                 break snapshot;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
-    .await
-    .unwrap();
-    tokio::task::yield_now().await;
-    let snapshot = core.snapshot(root).await.unwrap_or(snapshot);
+    .await;
+    let snapshot = snapshot.unwrap_or_else(|_| {
+        panic!(
+            "inbox did not reach 129 completion facts and 128 pending inputs; last observed: {} completion facts, {} pending inputs",
+            last_counts.0, last_counts.1
+        )
+    });
     std::fs::write(directory.path().join("inbox-release"), "release").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while core.snapshot(root).await.unwrap().loops[0].state
             != tickloop_agent_protocol::LoopState::Completed
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
     .await
@@ -3794,7 +3863,7 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
             let current=core.snapshot(root).await.unwrap();
             let count=current.messages.iter().flat_map(|message|&message.content).filter(|content|matches!(content,Content::Text {text} if text.starts_with("<task-notification>"))).count();
             if count==129 {break;}
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     }).await;
     core.shutdown().await;

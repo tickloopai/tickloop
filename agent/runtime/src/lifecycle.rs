@@ -64,20 +64,22 @@ pub struct InputLedgerState {
     pub prompt_in_conversation: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Revised<T> {
     record: T,
     revision: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct ActiveResponse {
     response_id: ResponseId,
     /// The first message index not yet claimed for this response.
     next_message: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+/// A Worker upgrade carries it to the successor as it is, so the successor's recorder goes on
+/// from the revisions already written.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Lifecycle {
     inputs: BTreeMap<InputId, Revised<InputEntry>>,
     responses: BTreeMap<ResponseId, Revised<ResponseEntry>>,

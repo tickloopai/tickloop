@@ -27,6 +27,8 @@ pub const ENDPOINT_NAME: &str = "worker-control.sock";
 /// How long a worker waits for the daemon: the longest lifecycle request plus transport.
 const DAEMON_ANSWER_TIMEOUT: Duration =
     Duration::from_secs(LIFECYCLE_TIMEOUT.as_secs() + CONTROL_TIMEOUT.as_secs());
+const DAEMON_TRANSFER_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const DAEMON_TRANSFER_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// What a worker receives privately at startup. The capability never reaches logs or models.
 #[derive(Clone, Deserialize, Serialize)]
@@ -207,6 +209,38 @@ impl DaemonControl {
     }
 
     pub async fn request(&self, request: WorkerRequest) -> Result<Value, HostError> {
+        let envelope = WorkerEnvelope {
+            daemon_epoch: self.grant.daemon_epoch,
+            binding: self.grant.binding,
+            capability: self.grant.capability.clone(),
+            request,
+        };
+        let frame = json!({"id": 1, "envelope": envelope});
+        let mut transfer_deadline = None;
+        loop {
+            let result = match transfer_deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, self.exchange(&frame)).await
+                    .unwrap_or_else(|_| Err(HostError::after("OutcomeUnknown", "the successor daemon did not confirm the request before the transfer deadline"))),
+                None => self.exchange(&frame).await,
+            };
+            match result {
+                Err(error) if error.code == "DaemonTransferred" && !error.dispatched => {
+                    let deadline = *transfer_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + DAEMON_TRANSFER_RETRY_BUDGET
+                    });
+                    let retry_at =
+                        (tokio::time::Instant::now() + DAEMON_TRANSFER_RETRY_PAUSE).min(deadline);
+                    tokio::time::sleep_until(retry_at).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn exchange(&self, frame: &Value) -> Result<Value, HostError> {
         let stream =
             tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(&self.grant.endpoint))
                 .await
@@ -216,19 +250,10 @@ impl DaemonControl {
                 .map_err(|error| HostError::before("DaemonUnavailable", error.to_string()))?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        let envelope = WorkerEnvelope {
-            daemon_epoch: self.grant.daemon_epoch,
-            binding: self.grant.binding,
-            capability: self.grant.capability.clone(),
-            request,
-        };
-        write_frame(
-            &mut writer,
-            &json!({"id":1,"envelope":envelope}),
-            BUSINESS_FRAME_BYTES,
-        )
-        .await
-        .map_err(|error| HostError::before(&error.code, error.message))?;
+
+        write_frame(&mut writer, frame, BUSINESS_FRAME_BYTES)
+            .await
+            .map_err(|error| HostError::before(&error.code, error.message))?;
         let response = tokio::time::timeout(
             DAEMON_ANSWER_TIMEOUT,
             read_frame(&mut reader, BUSINESS_FRAME_BYTES),
@@ -257,4 +282,109 @@ pub fn root_identity(root: &Path) -> Option<String> {
         metadata.ino(),
         canonical.display()
     ))
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use tickhost_connect::hosted::{error, ok};
+    use tokio::net::UnixListener;
+
+    fn control(endpoint: PathBuf) -> DaemonControl {
+        DaemonControl::new(WorkerControlGrant {
+            host_endpoint: endpoint.with_extension("host"),
+            endpoint,
+            daemon_epoch: Uuid::new_v4(),
+            binding: Uuid::new_v4(),
+            capability: "fixture-private-grant".into(),
+        })
+    }
+
+    fn request() -> WorkerRequest {
+        WorkerRequest::AllowShellSpawn {
+            chat: Uuid::new_v4(),
+            operation: Uuid::new_v4(),
+            approval: tickhost::shell::ShellApproval {
+                shell: "/bin/sh".into(),
+                command: "printf once".into(),
+                cwd: "/tmp".into(),
+                environment: "fixture".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn predispatch_daemon_transfer_retries_the_identical_authorized_operation() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            let mut original = None;
+            for attempt in 0..2 {
+                let (connection, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = connection.into_split();
+                let frame = read_frame(&mut BufReader::new(reader), BUSINESS_FRAME_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let reply = if attempt == 0 {
+                    original = Some(frame.clone());
+                    error(
+                        &frame["id"],
+                        &HostError::before("DaemonTransferred", "planned handoff"),
+                    )
+                } else {
+                    assert_eq!(Some(&frame), original.as_ref());
+                    ok(&frame["id"], json!({"accepted": true}))
+                };
+                write_frame(&mut writer, &reply, BUSINESS_FRAME_BYTES)
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            control(endpoint).request(request()).await.unwrap(),
+            json!({"accepted": true})
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncertain_or_unrelated_failures_never_retry_a_mutation() {
+        for failure in [
+            HostError::after("OutcomeUnknown", "answer was lost"),
+            HostError::after("DaemonTransferred", "may have dispatched"),
+            HostError::before("HostUnavailable", "ordinary failure"),
+        ] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let endpoint = directory.path().join("control.sock");
+            let listener = UnixListener::bind(&endpoint).unwrap();
+            let expected = failure.clone();
+            let server = tokio::spawn(async move {
+                let (connection, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = connection.into_split();
+                let frame = read_frame(&mut BufReader::new(reader), BUSINESS_FRAME_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                write_frame(
+                    &mut writer,
+                    &error(&frame["id"], &failure),
+                    BUSINESS_FRAME_BYTES,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            assert_eq!(
+                control(endpoint).request(request()).await.unwrap_err(),
+                expected
+            );
+            server.await.unwrap();
+        }
+    }
 }

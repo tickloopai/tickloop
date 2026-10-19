@@ -96,6 +96,10 @@ pub enum TickStreamEvent {
     Ready {
         watch: WatchId,
     },
+    Baseline {
+        watch: WatchId,
+        sequence: u64,
+    },
     Observation {
         audience: Vec<WatchId>,
         value: TickObservation,
@@ -314,6 +318,7 @@ pub struct EventPublisher {
 #[derive(Default)]
 struct EventMailbox {
     ready: BTreeSet<WatchId>,
+    baselines: BTreeMap<WatchId, u64>,
     gaps: BTreeMap<WatchId, InstanceRef>,
     states: BTreeMap<WatchId, (InstanceRef, TickConnectionState)>,
     metadata: BTreeMap<WatchId, (InstanceRef, TickMetadata)>,
@@ -333,6 +338,7 @@ impl EventPublisher {
                 metadata,
             } => self.metadata(instance, audience, metadata),
             TickStreamEvent::Ready { watch } => self.ready(watch),
+            TickStreamEvent::Baseline { watch, sequence } => self.ready_at(watch, sequence),
             TickStreamEvent::Observation { audience, value } => self.observation(&audience, value),
             TickStreamEvent::State {
                 instance,
@@ -364,7 +370,9 @@ impl EventPublisher {
                         .state
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    if let Some(watch) = mailbox.ready.pop_first() {
+                    if let Some((watch, sequence)) = mailbox.baselines.pop_first() {
+                        Some(TickStreamEvent::Baseline { watch, sequence })
+                    } else if let Some(watch) = mailbox.ready.pop_first() {
                         Some(TickStreamEvent::Ready { watch })
                     } else if let Some((watch, instance)) = mailbox.gaps.pop_first() {
                         Some(TickStreamEvent::Gap {
@@ -446,6 +454,13 @@ impl EventPublisher {
             .unwrap_or_else(PoisonError::into_inner)
             .ready
             .insert(watch);
+        self.wake.notify_one();
+    }
+
+    pub fn ready_at(&self, watch: WatchId, sequence: u64) {
+        let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        mailbox.baselines.insert(watch, sequence);
+        mailbox.ready.insert(watch);
         self.wake.notify_one();
     }
 
@@ -970,7 +985,7 @@ async fn observe_protocol(
                 sequence: baseline.seq,
             },
         );
-        publisher.ready(watch);
+        publisher.ready_at(watch, baseline.seq);
         ready_watches.insert(watch);
     }
     publisher.state_to(
@@ -1065,7 +1080,7 @@ async fn observe_protocol(
                     received: observation.received,
                     sequence: latest_sequence,
                 });
-                publisher.ready(watch);
+                publisher.ready_at(watch, latest_sequence);
                 ready_watches.insert(watch);
             }
         }

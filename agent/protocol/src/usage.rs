@@ -277,6 +277,40 @@ pub struct UsageSummary {
 }
 
 impl RequestUsageLedger {
+    /// Private planned-upgrade state, including request sizes omitted from ordinary wire views.
+    pub fn upgrade_checkpoint(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ledger": self,
+            "request_bytes": self.entries.iter().map(|entry| (entry.sequence, entry.serialized_request_bytes)).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn from_upgrade_checkpoint(value: serde_json::Value) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Checkpoint {
+            ledger: RequestUsageLedger,
+            request_bytes: Vec<(RequestSequence, Option<usize>)>,
+        }
+        let mut checkpoint: Checkpoint =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if checkpoint.request_bytes.len() != checkpoint.ledger.entries.len() {
+            return Err("usage checkpoint request counts differ".into());
+        }
+        for (entry, (sequence, bytes)) in checkpoint
+            .ledger
+            .entries
+            .iter_mut()
+            .zip(checkpoint.request_bytes)
+        {
+            if entry.sequence != sequence {
+                return Err("usage checkpoint request identities differ".into());
+            }
+            entry.serialized_request_bytes = bytes;
+        }
+        Ok(checkpoint.ledger)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use tickhost_connect::herdr::{PaneIdentityError, confirm_pane};
 use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
@@ -29,7 +30,68 @@ struct ViewEntry {
     renewed: Instant,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ViewCheckpoint {
+    views: Vec<(ViewRef, RetainedView)>,
+    closed_sessions: HashSet<Uuid>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RetainedView {
+    version: u64,
+    execution: Option<ExecutionRef>,
+    host: Option<HostLocation>,
+    active: bool,
+    age: Duration,
+}
+
 impl ViewRegistry {
+    pub async fn checkpoint(&self) -> ViewCheckpoint {
+        let entries = self.entries.lock().await;
+        ViewCheckpoint {
+            views: entries
+                .views
+                .iter()
+                .map(|(view, entry)| {
+                    (
+                        *view,
+                        RetainedView {
+                            version: entry.version,
+                            execution: entry.execution,
+                            host: entry.host.clone(),
+                            active: entry.active,
+                            age: entry.renewed.elapsed(),
+                        },
+                    )
+                })
+                .collect(),
+            closed_sessions: entries.closed_sessions.clone(),
+        }
+    }
+
+    pub async fn restore(&self, checkpoint: ViewCheckpoint) {
+        let now = Instant::now();
+        *self.entries.lock().await = ViewEntries {
+            views: checkpoint
+                .views
+                .into_iter()
+                .map(|(view, entry)| {
+                    (
+                        view,
+                        ViewEntry {
+                            version: entry.version,
+                            execution: entry.execution,
+                            host: entry.host,
+                            active: entry.active,
+                            renewed: now.checked_sub(entry.age).unwrap_or(now),
+                        },
+                    )
+                })
+                .collect(),
+            closed_sessions: checkpoint.closed_sessions,
+        };
+    }
+
     pub async fn update(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
         let mut entries = self.entries.lock().await;
         match update {

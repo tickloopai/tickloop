@@ -162,6 +162,7 @@ pub(super) fn start_tracked_model_request(
 
 #[derive(Default)]
 struct RequestProgress {
+    output_bytes: usize,
     displayed_text: String,
     output_started: bool,
     regression: Option<UsageCounter>,
@@ -299,6 +300,23 @@ impl Agent {
         display_text: bool,
         progress: &mut RequestProgress,
     ) -> Result<(), AgentError> {
+        let output_exhausted = if let Some(task) =
+            tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind)
+        {
+            let limit = task.budget().output_tokens();
+            match &delta {
+                ModelDelta::Text(text) | ModelDelta::Thinking(text) => {
+                    progress.output_bytes = progress.output_bytes.saturating_add(text.len());
+                    progress.output_bytes >= limit as usize
+                }
+                ModelDelta::Usage(usage) => usage
+                    .output_tokens
+                    .is_some_and(|tokens| tokens >= u64::from(limit)),
+                ModelDelta::OutputStarted => false,
+            }
+        } else {
+            false
+        };
         match delta {
             ModelDelta::OutputStarted => progress.output_started = true,
             ModelDelta::Usage(usage) => {
@@ -366,6 +384,9 @@ impl Agent {
                 }
             }
             ModelDelta::Text(_) | ModelDelta::Thinking(_) => progress.output_started = true,
+        }
+        if output_exhausted {
+            return Err(ModelError::ResponseRejected(ModelResponseRejection::OutputLimit).into());
         }
         Ok(())
     }
@@ -454,6 +475,21 @@ impl Agent {
         timeout: Option<Duration>,
         captured_text: Option<&mut String>,
     ) -> Result<PendingModelResponse, AgentError> {
+        let timeout = tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind)
+            .map(|task| {
+                timeout.map_or(task.budget().timeout(), |timeout| {
+                    timeout.min(task.budget().timeout())
+                })
+            })
+            .or(timeout);
+        let client = if context.kind != ModelRequestKind::PermissionCheck
+            && let Some(task) =
+                tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind)
+        {
+            client.auxiliary_client(task)?.unwrap_or(client)
+        } else {
+            client
+        };
         self.tracked_model_request_retrying(
             context,
             client,
@@ -499,6 +535,7 @@ impl Agent {
         cancel: CancellationToken,
         mut tracking: RetryTracking<'_>,
     ) -> Result<PendingModelResponse, AgentError> {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         let mut retries = 0;
         let max_attempts = if context.kind == ModelRequestKind::PermissionCheck {
             MAX_PERMISSION_CHECK_RETRIES + 1
@@ -509,12 +546,7 @@ impl Agent {
         let deadline = tracking
             .timeout
             .filter(|_| {
-                matches!(
-                    context.kind,
-                    ModelRequestKind::PermissionCheck
-                        | ModelRequestKind::AutoSetup
-                        | ModelRequestKind::ShellDescription
-                )
+                tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind).is_some()
             })
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
@@ -637,10 +669,14 @@ impl Agent {
         context: RequestContext,
         sequence: RequestSequence,
         client: Arc<dyn ModelClient>,
-        request: ModelRequest,
+        mut request: ModelRequest,
         cancel: CancellationToken,
         tracking: RequestTracking<'_>,
     ) -> Result<PendingModelResponse, AgentError> {
+        if tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind).is_some() {
+            request.reasoning_effort = client.minimum_reasoning_effort();
+            request.temperature = None;
+        }
         let request_bytes = (context.kind == ModelRequestKind::Conversation).then(|| {
             let messages = if request
                 .messages
@@ -734,6 +770,15 @@ impl Agent {
                         .await;
                 }
                 let mut model_context = tracking.model_context;
+                if let Some(task) =
+                    tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind)
+                {
+                    model_context = Some(
+                        model_context
+                            .unwrap_or_else(|| ModelRequestContext::new(1))
+                            .with_output_token_limit(task.budget().output_tokens()),
+                    );
+                }
                 if matches!(
                     context.kind,
                     ModelRequestKind::Conversation
@@ -842,6 +887,24 @@ impl Agent {
                 .await
         {
             result = Err(error);
+        }
+        if let Ok(output) = &result
+            && let Some(task) =
+                tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(context.kind)
+        {
+            let bytes: usize = output
+                .content
+                .iter()
+                .map(|content| match content {
+                    Content::Text { text } => text.len(),
+                    Content::Thinking { thinking, .. } => thinking.len(),
+                    _ => 0,
+                })
+                .sum();
+            if bytes >= task.budget().output_tokens() as usize {
+                result =
+                    Err(ModelError::ResponseRejected(ModelResponseRejection::OutputLimit).into());
+            }
         }
         let persistence_failed = matches!(
             &result,
@@ -1236,6 +1299,167 @@ mod tests {
         let agent = Agent::open_embedded(directory.path().join("state"), config, model).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         (directory, agent, chat)
+    }
+
+    #[tokio::test]
+    async fn auxiliary_requests_use_the_lowest_supported_effort_and_leave_conversation_unchanged() {
+        struct EffortModel {
+            supports_off: bool,
+            requests: Arc<std::sync::Mutex<Vec<ModelRequest>>>,
+            auxiliary: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelClient for EffortModel {
+            fn auxiliary_client(
+                &self,
+                _: tickloop_agent_model::auxiliary::AuxiliaryTask,
+            ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+                Ok(Some(Arc::new(Self {
+                    supports_off: self.supports_off,
+                    requests: self.requests.clone(),
+                    auxiliary: true,
+                })))
+            }
+
+            fn identity(&self) -> ModelIdentity {
+                let mut identity = tickloop_agent_test_support::config().identity();
+                if self.auxiliary {
+                    identity.requested_model = "auxiliary-fixture".into();
+                }
+                identity
+            }
+
+            fn supports_reasoning_effort(
+                &self,
+                effort: tickloop_agent_protocol::ReasoningEffort,
+            ) -> bool {
+                use tickloop_agent_protocol::ReasoningEffort;
+                matches!(effort, ReasoningEffort::Low | ReasoningEffort::High)
+                    || self.supports_off && effort == ReasoningEffort::Off
+            }
+
+            async fn complete(
+                &self,
+                request: ModelRequest,
+                _: mpsc::UnboundedSender<ModelDelta>,
+                _: CancellationToken,
+            ) -> Result<ModelOutput, ModelError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(ModelOutput {
+                    private_source: None,
+                    content: vec![Content::Text {
+                        text: "response".into(),
+                    }],
+                    usage: Default::default(),
+                    stop_reason: "end_turn".into(),
+                })
+            }
+        }
+
+        for supports_off in [true, false] {
+            let model = Arc::new(EffortModel {
+                supports_off,
+                requests: Default::default(),
+                auxiliary: false,
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+            let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+            let loop_id = uuid::Uuid::new_v4();
+            let run_id = uuid::Uuid::new_v4();
+            agent
+                .inner
+                .chats
+                .lock()
+                .await
+                .get_mut(&chat_id)
+                .unwrap()
+                .active_run = Some(run_id);
+            for kind in [
+                ModelRequestKind::Conversation,
+                ModelRequestKind::Title,
+                ModelRequestKind::AutoSetup,
+                ModelRequestKind::CompactionAutomatic,
+                ModelRequestKind::CompactionManual,
+                ModelRequestKind::CompactionDirected,
+                ModelRequestKind::PermissionCheck,
+                ModelRequestKind::WebFetch,
+                ModelRequestKind::ShellDescription,
+            ] {
+                let run_owned = matches!(
+                    kind,
+                    ModelRequestKind::Conversation
+                        | ModelRequestKind::CompactionAutomatic
+                        | ModelRequestKind::PermissionCheck
+                        | ModelRequestKind::WebFetch
+                );
+                let context = RequestContext {
+                    owner: RequestOwner {
+                        chat_id,
+                        loop_id: run_owned.then_some(loop_id),
+                        run_id: run_owned.then_some(run_id),
+                    },
+                    kind,
+                };
+                let mut request = empty_request();
+                request.reasoning_effort = Some(tickloop_agent_protocol::ReasoningEffort::High);
+                let response = agent
+                    .tracked_model_request(
+                        context,
+                        model.clone(),
+                        request,
+                        CancellationToken::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let routed = tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(kind)
+                    .is_some()
+                    && kind != ModelRequestKind::PermissionCheck;
+                let snapshot = agent.snapshot(chat_id).await.unwrap();
+                let entry = snapshot
+                    .request_usage
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.sequence == response.sequence)
+                    .unwrap();
+                assert_eq!(
+                    entry.model.requested_model,
+                    if routed {
+                        "auxiliary-fixture"
+                    } else {
+                        "fixture"
+                    }
+                );
+                let actual = model
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .reasoning_effort;
+                let expected = if tickloop_agent_model::auxiliary::AuxiliaryTask::for_request(kind)
+                    .is_none()
+                {
+                    tickloop_agent_protocol::ReasoningEffort::High
+                } else if supports_off {
+                    tickloop_agent_protocol::ReasoningEffort::Off
+                } else {
+                    tickloop_agent_protocol::ReasoningEffort::Low
+                };
+                assert_eq!(
+                    actual,
+                    Some(expected),
+                    "{kind:?}, supports_off={supports_off}"
+                );
+                agent
+                    .finish_model_request(chat_id, response.sequence, RequestOutcome::Accepted)
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+        }
     }
 
     fn empty_request() -> ModelRequest {

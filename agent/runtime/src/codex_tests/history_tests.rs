@@ -218,7 +218,7 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         .find(|point| point.prompt == "Second checkpoint")
         .unwrap();
     let mut api = tickloop_agent_model::cards::ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-responses")
+        .get("openai-api", "gpt-6-luna")
         .unwrap();
     api.api_key_env = "CODEX_HISTORY_TEST_MISSING_API_KEY".into();
     let api_client = LocalModelClients::new(None).client(&api).unwrap();

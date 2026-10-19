@@ -7,10 +7,7 @@ use std::{
     io,
     os::{
         fd::AsRawFd,
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        },
+        unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -26,6 +23,8 @@ pub mod frame;
 mod incoming;
 mod local;
 mod recovering;
+#[cfg(test)]
+mod startup_tests;
 
 use daemon_endpoint::{
     CONNECT_INTERVAL, LOCK_NAME, SOCKET_NAME, STARTUP_DEADLINE, check_socket_length,
@@ -35,8 +34,6 @@ pub use local::{LocalAgentClient, negotiate};
 pub use recovering::{ReconnectFactory, RecoveringAgentClient, worker_link};
 
 pub const DAEMON_COMMAND: &str = "daemon";
-/// How a daemon older than 16.1, or one that never named its build, appears in a mismatch.
-const UNNAMED_DAEMON_BUILD: &str = "unknown (an older Tickloop)";
 pub const RUN_SUBCOMMAND: &str = "run";
 /// The hidden process entry of the daemon: it does not appear in `--help`, and names its role in
 /// `ps`.
@@ -141,8 +138,9 @@ pub async fn connect_or_start_at(
         }
         remove_stale_socket(&endpoint)?;
         let lock_fd = lock.as_raw_fd();
-        let mut command = std::process::Command::new(&executable);
+        let mut command = tokio::process::Command::new(&executable);
         command
+            .kill_on_drop(false)
             .args(DAEMON_RUN_ARGUMENTS)
             .arg(&directory)
             .arg(lock_fd.to_string())
@@ -210,29 +208,30 @@ async fn connect_existing(
             socket_identity,
         }),
     };
-    match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
-        Ok(Ok(client)) => {
-            let Some(own_build) = tickloop_agent_protocol::build_identity() else {
-                return Ok(Some(client));
-            };
-            let hello = client.protocol();
-            if hello.build.as_deref() == Some(own_build) {
-                return Ok(Some(client));
+    let deadline = tokio::time::Instant::now() + STARTUP_DEADLINE;
+    let connection = loop {
+        let connection =
+            tokio::time::timeout_at(deadline, LocalAgentClient::connect(endpoint)).await;
+        if matches!(&connection, Ok(Err(error)) if error.code == AccessErrorCode::HandoffNotAccepted)
+        {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(
+                    "existing Agent daemon did not finish transferring within 5 seconds".into(),
+                );
             }
-            let description = format!(
-                "Running daemon build {}; this build {own_build}",
-                hello.build.as_deref().unwrap_or(UNNAMED_DAEMON_BUILD)
-            );
-            let running_executable = hello
-                .executable
-                .clone()
-                .or_else(|| process_executable(hello.process_id))
-                .and_then(|path| path.canonicalize().ok())
-                .filter(|path| path.is_file() && path != executable);
-            Err(mismatch(description, running_executable))
+            tokio::time::sleep_until((now + CONNECT_INTERVAL).min(deadline)).await;
+            continue;
         }
+        break connection;
+    };
+    match connection {
+        Ok(Ok(client)) => Ok(Some(client)),
         Ok(Err(error)) if error.code == AccessErrorCode::VersionMismatch => {
-            Err(mismatch(error.message, None))
+            let running_executable = running_daemon_executable(endpoint)
+                .await
+                .filter(|path| path != executable);
+            Err(mismatch(error.message, running_executable))
         }
         Ok(Err(error)) => {
             if matches!(error.code, AccessErrorCode::Unavailable)
@@ -250,6 +249,20 @@ async fn connect_existing(
         }
         Err(_) => Err("existing Agent daemon is not responding; it was left running".into()),
     }
+}
+
+/// Reads the executable of the same-user process behind a verified private daemon socket.
+pub async fn running_daemon_executable(endpoint: &Path) -> Option<PathBuf> {
+    validate_socket(endpoint).ok()?;
+    let stream = tokio::net::UnixStream::connect(endpoint).await.ok()?;
+    let credentials = stream.peer_cred().ok()?;
+    if credentials.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let process_id = u32::try_from(credentials.pid()?).ok()?;
+    process_executable(process_id)
+        .and_then(|path| path.canonicalize().ok())
+        .filter(|path| path.is_file() && path.file_name().is_some_and(|name| name == "tickloop"))
 }
 
 /// The executable a process runs, for daemons older than 16.1 that do not announce theirs.

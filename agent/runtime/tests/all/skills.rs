@@ -1044,7 +1044,11 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
 async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("slow", "Bash", json!({"command":"sleep 0.3"})),
+        call(
+            "slow",
+            "Bash",
+            json!({"command":"while [ ! -f slides-release ]; do sleep 0.01; done"}),
+        ),
         text("Started the Slides."),
         text("Next task done."),
     ]));
@@ -1071,6 +1075,7 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
         .invoke_skill(chat, Some(active.loop_id), "slides", "the Q3 review")
         .await
         .unwrap();
+    fs::write(directory.path().join("slides-release"), "release").unwrap();
     let mut merged = false;
     loop {
         let event = next_event(&mut events).await;

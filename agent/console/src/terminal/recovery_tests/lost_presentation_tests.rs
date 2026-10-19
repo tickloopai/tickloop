@@ -144,6 +144,7 @@ fn lost_presentation_pty_fixture() {
             tokio::task::LocalSet::new().block_on(&runtime, async {
                 let mut config = tickloop_agent_test_support::config();
                 config.model = LOST_MODEL.into();
+                config.name = LOST_MODEL.into();
                 let model = Arc::new(LostPresentationModel {
                     calls: AtomicUsize::new(0),
                 });
@@ -231,6 +232,7 @@ fn lost_presentation_pty_fixture() {
                     &console,
                     input,
                     StartupState {
+                        launch_arguments: Vec::new(),
                         chat: StartupChat::Resumed(Box::new(snapshot), true),
                                         user_settings: None,
                     },

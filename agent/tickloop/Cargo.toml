@@ -26,6 +26,7 @@ harness = false
 
 [dependencies]
 crossterm = "0.29"
+serde_json = "1"
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-config = { path = "../config" }
 tickloop-agent-console = { path = "../console" }
@@ -34,6 +35,7 @@ tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-updater = { path = "../updater" }
 tickloop-tick-packages = { path = "../../tick/packages" }
+tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 
@@ -49,7 +51,6 @@ portable-pty = "0.9"
 regex = "1"
 rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 shell-words = "1"
@@ -62,7 +63,6 @@ tickloop-agent-test-support = { path = "../test-support" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tickloop-tick-test-support = { path = "../../tick/test-support" }
 tickloop-tickhost = { path = "../../tickhost/host" }
-tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"

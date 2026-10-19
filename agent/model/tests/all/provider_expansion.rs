@@ -447,7 +447,7 @@ async fn xai_oauth_uses_responses_proxy_headers_and_preserves_encrypted_replay()
     let (endpoint, mut captured) =
         model_http_support::serve_responses(vec![(200, reply.clone()), (200, reply)]).await;
     let mut config = ModelCatalog::defaults()
-        .get("xai-oauth", "grok-4.6")
+        .get("xai-oauth", "grok-4.7")
         .unwrap();
     config.base_url = endpoint;
     let client = LocalModelClients::new(Some(root.path().to_path_buf()))
@@ -480,7 +480,7 @@ async fn xai_oauth_uses_responses_proxy_headers_and_preserves_encrypted_replay()
         assert!(headers.contains("x-xai-token-auth: xai-grok-cli"));
         assert!(headers.contains("x-grok-client-version: 1.0.62"));
         assert!(headers.contains("user-agent: xai-grok-workspace/1.0.62"));
-        assert!(headers.contains("x-grok-model-override: grok-4.6"));
+        assert!(headers.contains("x-grok-model-override: grok-4.7"));
         assert!(headers.contains("authorization: bearer fxm72vq84ep61aw9k"));
     }
     assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);

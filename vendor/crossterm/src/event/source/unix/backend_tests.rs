@@ -151,6 +151,18 @@ fn zero_timeout_reads_fragmented_and_buffered_events() {
 }
 
 #[test]
+fn an_idle_poll_keeps_incomplete_utf8_visible_to_process_handoff() {
+    let (mut writer, mut source) = event_source(true);
+    assert!(source.input_buffer_is_empty());
+    writer.write_all(&[0xe4]).unwrap();
+    assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
+    assert!(!source.input_buffer_is_empty());
+    writer.write_all(&[0xb8, 0xad]).unwrap();
+    assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), key(KeyCode::Char('中')));
+    assert!(source.input_buffer_is_empty());
+}
+
+#[test]
 fn short_poll_retains_pending_escape_until_later_poll() {
     let (mut writer, mut source) = event_source(true);
     writer.write_all(b"\x1b").unwrap();

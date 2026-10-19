@@ -177,6 +177,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         &console,
         input,
         crate::terminal::StartupState {
+            launch_arguments: Vec::new(),
             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
             user_settings: Some(tickloop_agent_config::UserSettings::in_root(&directory)),
         },
@@ -344,7 +345,7 @@ impl PlanFlow {
         loop {
             let frame = self.fixture.frame();
             let state = self.state();
-            if ready(&frame, &state) {
+            if state.is_object() && ready(&frame, &state) {
                 return (frame, state);
             }
             assert!(
@@ -356,8 +357,14 @@ impl PlanFlow {
     }
 
     fn wait_for_mode(&self, mode: &str) -> String {
+        let route = std::fs::read_to_string(self.directory.path().join(ROUTE_FILE)).unwrap();
+        let model = if route == RESTORED_ROUTE {
+            "DeepSeek Flash"
+        } else {
+            "fixture"
+        };
         self.wait(&format!("mode {mode}"), |frame, _| {
-            frame.contains(&format!("⏵⏵ {mode} · fixture"))
+            frame.contains(&format!("⏵⏵ {mode} · {model}"))
         })
         .0
     }
@@ -644,7 +651,7 @@ fn plan_flow_pty_a_restarted_daemon_reopens_the_pending_approval_and_continues_e
     flow.fixture.send(b"j\r");
     let (_, state) = flow.wait("the restored continuation in Ask", |frame, state| {
         frame.contains("Restored implementation started.")
-            && frame.contains("⏵⏵ Ask · fixture")
+            && frame.contains("⏵⏵ Ask · DeepSeek Flash")
             && approval_dialog(frame).is_none()
             && state["loops"] == json!(["Completed"])
     });

@@ -82,12 +82,31 @@ pub struct ModelConfig {
     pub provider_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_recorded_card"
+    )]
     pub card: Option<ModelCard>,
     /// Omitted in older recorded snapshots; like opencode for unknown models, such a
     /// model is treated as text only.
     #[serde(default = "text_only")]
     pub input_modalities: Vec<InputModality>,
+}
+
+fn deserialize_recorded_card<'de, D>(deserializer: D) -> Result<Option<ModelCard>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = Option::<Value>::deserialize(deserializer)?;
+    if let Some(Value::Object(card)) = value.as_mut() {
+        // Older recorded snapshots duplicated the service ID; definition YAML stays strict.
+        card.remove("service_model_id");
+    }
+    value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 pub(crate) fn text_only() -> Vec<InputModality> {

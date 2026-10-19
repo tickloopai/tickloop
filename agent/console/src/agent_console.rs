@@ -94,7 +94,28 @@ pub struct AgentConsole {
     retirements: HashMap<ExecutionRef, ChildRetirement>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UpgradeNavigation {
+    pub directory: PathBuf,
+    pub filter: AgentFilter,
+}
+
 impl AgentConsole {
+    pub(crate) fn prepare_upgrade_navigation(&self) -> Option<UpgradeNavigation> {
+        if self.pending.is_some() || self.unconfirmed_dispatch.is_some() {
+            return None;
+        }
+        Some(UpgradeNavigation {
+            directory: self.directory.clone(),
+            filter: self.filter.clone(),
+        })
+    }
+
+    pub(crate) fn restore_upgrade_navigation(&mut self, saved: UpgradeNavigation) {
+        self.directory = saved.directory;
+        self.filter = saved.filter;
+    }
+
     pub fn new(
         access: Arc<dyn AgentAccess>,
         epoch: Uuid,
@@ -702,7 +723,9 @@ fn created_execution(receipt: &CommandReceipt) -> Option<ExecutionRef> {
 
 /// How much attention an Agent row asks for. Overview families group and sort by their most
 /// urgent member, so work or errors below a finished root stay prominent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum AttentionGroup {
     NeedsInput,
     Errors,

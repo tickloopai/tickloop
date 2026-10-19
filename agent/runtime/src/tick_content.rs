@@ -23,6 +23,7 @@ const WATERMARK_EXTENSION: &str = ".json";
 
 /// Newest update data per subscription, least recently stored evicted first. Data larger than
 /// the whole budget is never kept; an evicted value is read again from its Tick on delivery.
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct TickContentCache {
     budget: usize,
     used: usize,
@@ -30,6 +31,7 @@ pub(super) struct TickContentCache {
     entries: BTreeMap<Uuid, CachedContent>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct CachedContent {
     stored_at: u64,
     bytes: usize,

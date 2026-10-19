@@ -6,6 +6,7 @@ pub use self::unix::supports_keyboard_enhancement;
 #[cfg(unix)]
 pub(crate) use self::unix::{
     disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, size, window_size,
+    export_raw_mode_state, import_raw_mode_state, validate_raw_mode_state,
 };
 #[cfg(windows)]
 #[cfg(feature = "events")]

@@ -1,8 +1,5 @@
-//! The daemon's controller works only with a Tickhost of its own build, which the host's frozen
-//! management hello names: one of another build that runs nothing is replaced at once, and one
-//! that runs or is starting Ticks, Shell tasks or connections, or is too old to say, stays until
-//! the user replaces it, refusing requests with what to do meanwhile. Refused, the daemon takes
-//! its Ticks for unknown, not lost.
+//! Compatible Tickhost content is reused while occupied; empty changed content is replaced
+//! through the host's guarded shutdown. Incompatible occupied hosts preserve their work.
 
 use std::{
     io::Write,
@@ -77,10 +74,10 @@ impl OtherBuildHost {
         let reply = hosted::HelloReply {
             epoch: Uuid::new_v4(),
             pid: std::process::id(),
-            version: hosted::BUILD_VERSION.into(),
+            version: "0.0.0".into(),
             major: hosted::MANAGEMENT_MAJOR,
             minor: hosted::MANAGEMENT_MINOR,
-            capabilities: Vec::new(),
+            capabilities: vec![hosted::CAPABILITY_IDLE_SHUTDOWN.into()],
             host: description,
         };
         let key = key.to_owned();
@@ -118,8 +115,18 @@ impl OtherBuildHost {
                     };
                     let _ = hosted::write_frame(&mut writer, &answer, frames).await;
                     // The connection stays open, as an authenticated one does.
+                    let epoch = reply.epoch;
                     tokio::spawn(async move {
-                        let _ = hosted::read_frame(&mut reader, frames).await;
+                        while let Ok(Some(request)) = hosted::read_frame(&mut reader, frames).await
+                        {
+                            let response = hosted::ok(&request["id"], json!({"epoch":epoch}));
+                            if hosted::write_frame(&mut writer, &response, frames)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         drop(writer);
                     });
                     continue;
@@ -131,7 +138,10 @@ impl OtherBuildHost {
                 let Ok(Some(request)) = hosted::read_frame(&mut reader, frames).await else {
                     continue;
                 };
-                assert_eq!(request["method"], "shutdown_host");
+                assert!(matches!(
+                    request["method"].as_str(),
+                    Some("shutdown_host" | "shutdown_idle_host")
+                ));
                 assert_eq!(request["params"]["epoch"], json!(reply.epoch));
                 flag.store(true, Ordering::SeqCst);
                 let _ = std::fs::remove_file(&socket);
@@ -227,6 +237,7 @@ impl Fixture {
 fn nothing() -> HostOccupancy {
     HostOccupancy {
         pending: Some(0),
+        views: Some(0),
         ..HostOccupancy::default()
     }
 }
@@ -356,6 +367,57 @@ async fn a_tickhost_of_another_build_with_this_business_protocol_is_replaced_too
     assert_eq!(fixture.serving_build().await, host::BUILD_IDENTITY);
 }
 
+#[tokio::test]
+async fn compatible_occupied_tickhost_content_is_reused_across_product_versions() {
+    let fixture = Fixture::with_other_build(
+        Business::Negotiated,
+        other_build(HostOccupancy {
+            ticks: vec!["Quote board".into()],
+            ..nothing()
+        }),
+    );
+    let before = fixture.controller.host_epoch().await.unwrap().unwrap();
+    assert_eq!(fixture.controller.other_tickhost().await.unwrap(), None);
+    fixture.controller.prepare_daemon_handoff().await.unwrap();
+    assert_eq!(fixture.controller.host_epoch().await.unwrap(), Some(before));
+    assert!(!fixture.host.was_stopped());
+}
+
+#[tokio::test]
+async fn unchanged_host_content_is_reused_even_when_the_product_version_differs() {
+    let mut description = other_build(nothing()).unwrap();
+    description.build = host::BUILD_IDENTITY.into();
+    let fixture = Fixture::with_other_build(Business::Negotiated, Some(description));
+    assert!(fixture.controller.host_epoch().await.unwrap().is_some());
+    assert_eq!(fixture.controller.other_tickhost().await.unwrap(), None);
+    assert!(!fixture.host.was_stopped());
+}
+
+#[tokio::test]
+async fn maintenance_retires_empty_changed_content_without_an_agent_request_or_replacement_spawn() {
+    let fixture = Fixture::with_other_build(Business::Refused, other_build(nothing()));
+    fixture.controller.maintain_upgrade().await.unwrap();
+    assert!(fixture.host.was_stopped());
+    assert!(!fixture.paths.socket().exists());
+    fixture.controller.maintain_upgrade().await.unwrap();
+    assert!(!fixture.paths.socket().exists());
+}
+
+#[tokio::test]
+async fn maintenance_preserves_occupied_tickhost_without_opening_business_connections() {
+    let fixture = Fixture::with_other_build(
+        Business::Refused,
+        other_build(HostOccupancy {
+            ticks: vec!["Quote board".into()],
+            ..nothing()
+        }),
+    );
+    for _ in 0..3 {
+        fixture.controller.maintain_upgrade().await.unwrap();
+    }
+    assert!(!fixture.host.was_stopped());
+}
+
 /// An open the host has not answered or a Shell grant no spawner claimed is about to run, so a
 /// host starting one is not empty; one too old to count them may be starting something.
 #[tokio::test]
@@ -383,6 +445,7 @@ async fn a_tickhost_of_another_build_starting_something_is_not_replaced_unasked(
             .and_then(|other| other.occupancy),
         Some(TickhostOccupancy {
             pending: 2,
+            views: Some(0),
             ..TickhostOccupancy::default()
         }),
         "the user is told what stopping it ends"
@@ -421,7 +484,7 @@ async fn a_tickhost_of_another_build_starting_something_is_not_replaced_unasked(
 #[tokio::test]
 async fn ticks_of_a_kept_tickhost_of_another_build_are_unknown_not_lost() {
     let fixture = Fixture::with_other_build(
-        Business::Negotiated,
+        Business::Refused,
         other_build(HostOccupancy {
             ticks: vec!["Quote board".into()],
             ..nothing()

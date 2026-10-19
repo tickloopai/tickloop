@@ -310,7 +310,9 @@ impl PtyView {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("CLI PTY {label}: {}", self.frame());
+        let frame = self.frame();
+        assert!(matches(&frame), "CLI PTY {label}: {frame}");
+        frame
     }
 
     async fn wait_for_editor(&mut self, label: &str, expected_draft: Option<&str>) {
@@ -380,6 +382,95 @@ impl Drop for PtyView {
     fn drop(&mut self) {
         let _ = self.writer.write_all(b"\x1b\x15\x04\x04");
         let _ = self.writer.flush();
+    }
+}
+
+#[tokio::test]
+async fn pty_wait_accepts_ready_output_captured_before_a_delayed_final_check() {
+    const READY: &str = "PTY-WAIT-FINAL-READY";
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let gate = directory.path().join("ready");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: TERMINAL_HEIGHT as u16,
+            cols: TERMINAL_WIDTH as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+    command.args([
+        "-c",
+        r#"printf '\033[?2026h\033[2J\033[HWAITING\r\n\033[?2026l'; while [ ! -e "$1" ]; do sleep 0.01; done; printf '\033[?2026h\033[2J\033[HPTY-WAIT-FINAL-READY\r\n\033[?2026l'; read -r finish"#,
+        "view-wait-fixture",
+    ]);
+    command.arg(&gate);
+    let child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let writer = pair.master.take_writer().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let (ready, captured_ready) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = Some(ready);
+        let mut bytes = [0; 1024];
+        while let Ok(count) = reader.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            let mut output = captured.lock().unwrap();
+            output.extend_from_slice(&bytes[..count]);
+            if screen::visible_screen_with_selection(
+                &String::from_utf8_lossy(&output),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            )
+            .contains(READY)
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
+            }
+        }
+    });
+    let mut view = PtyView {
+        child,
+        writer,
+        output,
+        master: pair.master,
+        width: TERMINAL_WIDTH,
+        height: TERMINAL_HEIGHT,
+    };
+    let result = AssertUnwindSafe(async {
+        view.wait_for("controlled PTY waiting", |frame| frame.contains("WAITING"))
+            .await;
+        let polls = std::cell::Cell::new(0);
+        let polling_timeout = Duration::from_secs(1);
+        let frame = view
+            .wait_for_within("captured ready frame", polling_timeout, |frame| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 1 {
+                    std::fs::write(&gate, []).unwrap();
+                    captured_ready.recv_timeout(UI_TIMEOUT).unwrap();
+                    // The child and PTY reader progress while the polling task cannot run.
+                    std::thread::sleep(polling_timeout);
+                }
+                frame.contains(READY)
+            })
+            .await;
+        assert!(frame.contains(READY));
+        assert_eq!(
+            polls.get(),
+            2,
+            "the final captured frame must be checked once"
+        );
+    })
+    .catch_unwind()
+    .await;
+    let _ = view.child.kill();
+    let _ = view.child.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -941,7 +1032,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             );
             assert!(borders[0] >= 6, "{height}×{width}: {frame}");
             assert!(
-                rows[rows.len() - 2].contains("deepseek-flash"),
+                rows[rows.len() - 2].contains("DeepSeek Flash"),
                 "{height}×{width}: the core status sits right above the key hints: {frame}"
             );
             assert!(
@@ -967,7 +1058,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             view.wait_for("help restores actual status and key hints", |frame| {
                 let rows = frame.lines().collect::<Vec<_>>();
                 !frame.contains("ctrl+j newline")
-                    && rows[rows.len() - 2].contains("deepseek-flash")
+                    && rows[rows.len() - 2].contains("DeepSeek Flash")
                     && rows[rows.len() - 1].contains("? help")
             })
             .await;
@@ -1091,10 +1182,38 @@ async fn run_sustained_daemon_loss(
         frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jk")
     })
     .await;
+    let ObservationValue::RuntimeVersion(version) = client
+        .observe(ObservationRequest::RuntimeVersion)
+        .await
+        .unwrap()
+        .initial
+    else {
+        panic!("the fixture daemon must report its owned Workers");
+    };
+    assert!(!version.workers.is_empty());
+    let owned_processes = std::iter::once(client.server_process_id())
+        .chain(version.workers.iter().map(|worker| worker.process_id))
+        .collect::<Vec<_>>();
     std::fs::rename(fixture.path("runtime"), fixture.path("owned-runtime")).unwrap();
     std::fs::write(fixture.path("runtime"), "fixture blocks daemon restart").unwrap();
-    client.shutdown_daemon().await.unwrap();
+    let shutdown = tokio::time::timeout(UI_TIMEOUT, client.shutdown_daemon())
+        .await
+        .expect("the owned daemon must acknowledge stop or close its connection");
+    tokio::time::timeout(UI_TIMEOUT, async {
+        while owned_processes.iter().any(|pid| !support::has_exited(*pid)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("owned daemon/Workers did not exit after runtime removal: {owned_processes:?}; shutdown result: {shutdown:?}"));
     daemon_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Err(error) = shutdown {
+        assert!(
+            error.code == tickloop_agent_protocol::AccessErrorCode::Unavailable
+                && error.message == "daemon connection closed",
+            "unexpected stop error after the owned processes exited: {error}"
+        );
+    }
     view.wait_for(
         "sustained loss retains a disconnected cached View",
         |frame| frame.contains("Disconnected") && frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jk"),
@@ -1136,26 +1255,30 @@ async fn actual_cli_sustained_daemon_loss_keeps_cached_output_draft_and_editing_
     let result = AssertUnwindSafe(run_sustained_daemon_loss(&fixture, &daemon_stopped))
         .catch_unwind()
         .await;
-    if fixture.path("owned-runtime").exists() {
-        std::fs::remove_file(fixture.path("runtime")).unwrap();
-        std::fs::rename(fixture.path("owned-runtime"), fixture.path("runtime")).unwrap();
-        if daemon_stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            for entry in std::fs::read_dir(fixture.path("runtime"))
-                .unwrap()
-                .filter_map(Result::ok)
-            {
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "sock")
+    let cleanup = AssertUnwindSafe(async {
+        if fixture.path("owned-runtime").exists() {
+            std::fs::remove_file(fixture.path("runtime")).unwrap();
+            std::fs::rename(fixture.path("owned-runtime"), fixture.path("runtime")).unwrap();
+            if daemon_stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                for entry in std::fs::read_dir(fixture.path("runtime"))
+                    .unwrap()
+                    .filter_map(Result::ok)
                 {
-                    std::fs::remove_file(entry.path()).unwrap();
+                    if entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "sock")
+                    {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
                 }
             }
         }
-    }
-    fixture.shutdown().await;
-    if let Err(panic) = result {
+        fixture.shutdown().await;
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = result.and(cleanup) {
         std::panic::resume_unwind(panic);
     }
 }
@@ -2422,7 +2545,10 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
                 |frame| {
                     frame.contains(&expected)
                         && frame.contains("[Image #2]")
-                        && frame.contains(anchor)
+                        && frame
+                            .lines()
+                            .find(|line| line.contains("image history"))
+                            .is_some_and(|line| line.trim() == anchor)
                 },
             )
             .await;

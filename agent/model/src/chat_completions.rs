@@ -100,11 +100,18 @@ pub(super) fn encode_request(
         config.adapter(),
         Adapter::KimiChatCompletions | Adapter::QwenChatCompletions
     ) {
-        body.as_object_mut()
-            .expect("request object")
-            .remove("max_tokens");
-        body["max_completion_tokens"] = json!(config.max_output_tokens);
+        let is_kimi_code = config.adapter() == Adapter::KimiChatCompletions
+            && config.model == super::kimi::CODE_MODEL_ID;
+        if !is_kimi_code {
+            body.as_object_mut()
+                .expect("request object")
+                .remove("max_tokens");
+            body["max_completion_tokens"] = json!(config.max_output_tokens);
+        }
         if config.adapter() == Adapter::KimiChatCompletions {
+            if is_kimi_code {
+                body["thinking"] = json!({"type": "enabled"});
+            }
             if let Some(effort) = reasoning_effort {
                 body["reasoning_effort"] = json!(effort.label());
             }
@@ -147,7 +154,12 @@ pub(super) fn encode_request(
         return Ok(body);
     }
     if config.adapter() == Adapter::GlmChatCompletions {
-        super::glm::shape_request(&mut body, reasoning_effort, request.structured_output)?;
+        super::glm::shape_request(
+            &mut body,
+            &config.model,
+            reasoning_effort,
+            request.structured_output,
+        )?;
         return Ok(body);
     }
     if let Some(effort) = reasoning_effort {

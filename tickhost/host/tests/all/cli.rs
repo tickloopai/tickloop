@@ -17,6 +17,20 @@ fn tickhost() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tickhost"))
 }
 
+#[test]
+fn release_identity_and_host_content_identity_are_reported_separately() {
+    let release = tickhost().arg("--build-identity").output().unwrap();
+    let content = tickhost().arg("--content-identity").output().unwrap();
+    assert!(release.status.success());
+    assert!(content.status.success());
+    let release = String::from_utf8(release.stdout).unwrap();
+    let content = String::from_utf8(content.stdout).unwrap();
+    assert_eq!(release.trim(), env!("TICKLOOP_BUILD_IDENTITY"));
+    assert_eq!(content.trim(), host::BUILD_IDENTITY);
+    assert!(content.starts_with("tickhost:"));
+    assert_ne!(release, content);
+}
+
 /// A `tickhost run` started the way the Agent daemon starts it, and its controller.
 struct Service {
     _directory: tempfile::TempDir,

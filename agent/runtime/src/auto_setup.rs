@@ -3,7 +3,6 @@ use std::{
     io::Read,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use serde::Deserialize;
@@ -272,7 +271,7 @@ impl Agent {
                 client,
                 request,
                 cancel.clone(),
-                Some(Duration::from_secs(30)),
+                None,
             )
             .await;
         cancel.cancel();

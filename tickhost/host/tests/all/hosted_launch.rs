@@ -857,6 +857,51 @@ async fn host_shutdown_ends_every_tick_and_removes_its_endpoint() {
     assert!(!fixture.paths.socket().exists());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_shutdown_rechecks_work_started_after_the_management_hello() {
+    let fixture = Fixture::start().await;
+    let management = ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+        .await
+        .unwrap();
+    let mut controller = fixture.controller().await;
+    let sleep = which("sleep");
+    let opened = fixture
+        .open_terminal(&mut controller, &[&sleep, "30"])
+        .await;
+    assert!(
+        !management
+            .shutdown_idle_host(1, CONTROL_TIMEOUT)
+            .await
+            .unwrap()
+    );
+    let listed = controller
+        .request("list", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(listed["items"][0]["instance"], opened["instance"]);
+    shutdown(&fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_shutdown_stops_an_empty_host_without_ending_work() {
+    let fixture = Fixture::start().await;
+    let management = ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+        .await
+        .unwrap();
+    assert!(
+        management
+            .shutdown_idle_host(0, CONTROL_TIMEOUT)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(5), fixture.server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!fixture.paths.socket().exists());
+}
+
 /// The frozen management hello tells a daemon which build the host is and what stopping it would
 /// end, so a daemon of another build replaces only a host that runs nothing.
 #[tokio::test(flavor = "multi_thread")]

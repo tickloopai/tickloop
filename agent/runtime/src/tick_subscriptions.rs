@@ -209,6 +209,53 @@ pub(super) struct TickDeliveries {
     content: TickContentCache,
     pending: HashMap<(ChatId, LoopId), PendingDelivery>,
     ready_changed: Arc<tokio::sync::Notify>,
+    resuming: BTreeSet<WatchId>,
+    baselines: BTreeMap<WatchId, u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DeliveryCheckpoint {
+    subscriptions: BTreeMap<Uuid, SubscriptionRuntime>,
+    #[serde(with = "crate::upgrade::map_entries")]
+    monitor_watches: BTreeMap<(ChatId, InstanceRef), MonitorWatch>,
+    content: TickContentCache,
+    #[serde(with = "crate::upgrade::map_entries")]
+    pending: HashMap<(ChatId, LoopId), PendingDelivery>,
+    baselines: BTreeMap<WatchId, u64>,
+}
+
+impl TickDeliveries {
+    pub(super) fn upgrade_checkpoint(&self) -> Value {
+        serde_json::to_value(DeliveryCheckpoint {
+            subscriptions: self.subscriptions.clone(),
+            monitor_watches: self.monitor_watches.clone(),
+            content: self.content.clone(),
+            pending: self.pending.clone(),
+            baselines: self.baselines.clone(),
+        })
+        .expect("Tick delivery checkpoint serializes")
+    }
+
+    pub(super) fn restore_upgrade(&mut self, value: Value) -> Result<(), String> {
+        let checkpoint: DeliveryCheckpoint =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        self.subscriptions = checkpoint.subscriptions;
+        self.monitor_watches = checkpoint.monitor_watches;
+        self.content = checkpoint.content;
+        self.pending = checkpoint.pending;
+        self.baselines = checkpoint.baselines;
+        self.resuming = self
+            .subscriptions
+            .values()
+            .map(|runtime| runtime.watch)
+            .chain(self.monitor_watches.values().map(|watch| watch.watch))
+            .collect();
+        Ok(())
+    }
+
+    pub(super) fn activate_upgrade(&self) {
+        self.publish_desired();
+    }
 }
 
 struct WatchBinding {
@@ -217,6 +264,7 @@ struct WatchBinding {
     authority: Option<HostToolAuthority>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct MonitorWatch {
     watch: WatchId,
     authority: Option<HostToolAuthority>,
@@ -225,6 +273,7 @@ struct MonitorWatch {
     last_sequence: Option<u64>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SubscriptionRuntime {
     chat_id: ChatId,
     loop_id: LoopId,
@@ -237,6 +286,7 @@ struct SubscriptionRuntime {
     frequency: TickSubscriptionFrequency,
     /// When it next hands its newest update to the Loop; `None` while an immediate subscription
     /// has nothing new.
+    #[serde(with = "crate::upgrade::optional_instant")]
     due_at: Option<Instant>,
     /// The newest update since the last delivery, without its data, which waits in the content
     /// cache; earlier ones are counted, not kept.
@@ -253,6 +303,7 @@ struct SubscriptionRuntime {
     /// A Terminal Tick's screen changed since this subscription last got it; its next sample
     /// settles it.
     has_pending_change: bool,
+    #[serde(with = "crate::upgrade::optional_instant")]
     pending_since: Option<Instant>,
     program_exit: Option<tickloop_agent_protocol::HostedProgramExit>,
     gap: bool,
@@ -265,12 +316,15 @@ struct SubscriptionRuntime {
     series: Vec<StateSeries>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct FirstUpdate {
+    #[serde(with = "crate::upgrade::instant")]
     received_at: Instant,
     sequence: u64,
     observed_at: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LatestUpdate {
     sequence: u64,
     observed_at: String,
@@ -281,7 +335,7 @@ struct LatestUpdate {
     is_oversized: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PendingDelivery {
     items: BTreeMap<InstanceRef, DeliveryItem>,
     /// The delivery came due while the Loop could not take it, so it flushes when the Loop's run
@@ -289,10 +343,11 @@ struct PendingDelivery {
     due: bool,
     /// When a held delivery is looked at again, in case the run ended before it was held or the
     /// delivery failed.
+    #[serde(with = "crate::upgrade::optional_instant")]
     retry_at: Option<Instant>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DeliveryItem {
     title: Option<String>,
     subscription: Uuid,
@@ -307,6 +362,7 @@ struct DeliveryItem {
     /// How many updates it merges: the newest and every one that newest replaced.
     updates: u64,
     /// When the earliest update it merges came due; the longest waiting go first.
+    #[serde(with = "crate::upgrade::instant")]
     waiting_since: Instant,
     gap: bool,
     kind: ObservationKind,
@@ -421,6 +477,11 @@ impl TickDeliveries {
 
     fn apply_event(&mut self, event: TickStreamEvent) {
         match event {
+            TickStreamEvent::Baseline { watch, sequence } => {
+                if !self.resuming.contains(&watch) {
+                    self.baselines.insert(watch, sequence);
+                }
+            }
             TickStreamEvent::Metadata {
                 instance,
                 audience,
@@ -1822,6 +1883,18 @@ impl Agent {
             deliveries
                 .monitor_watches
                 .retain(|member, _| members.contains(member));
+            let live_watches: BTreeSet<_> = deliveries
+                .subscriptions
+                .values()
+                .map(|runtime| runtime.watch)
+                .chain(deliveries.monitor_watches.values().map(|watch| watch.watch))
+                .collect();
+            deliveries
+                .baselines
+                .retain(|watch, _| live_watches.contains(watch));
+            deliveries
+                .resuming
+                .retain(|watch| live_watches.contains(watch));
             deliveries.publish_desired();
             deliveries.ready_changed.notify_waiters();
         }
@@ -1895,6 +1968,7 @@ impl Agent {
     /// cannot take it, as when it executes or waits for the user, so it flushes once the Loop's
     /// run ends instead of bypassing the user's answer.
     async fn deliver(&self, chat_id: ChatId, loop_id: LoopId) {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         let owner = (chat_id, loop_id);
         // The end of a run sets the Loop's state and flushes a held delivery under the Chats
         // lock, so the state is read and the delivery taken or held under it too: a run that ends
@@ -2265,6 +2339,7 @@ impl Agent {
                             None => std::future::pending::<()>().await,
                         }
                     } => {
+                        let _upgrade = agent.inner.upgrade_gate.read().await;
                         let now = Instant::now();
                         agent.sample_due_screens(now);
                         let ready = agent.tick_deliveries().collect_elapsed(now);
@@ -2323,6 +2398,7 @@ impl Agent {
                         None => return,
                     },
                 };
+                let _upgrade = agent.inner.upgrade_gate.read().await;
                 if let Ok(Some((watch, observation))) = sampled
                     && agent.tick_deliveries().record_sample(watch, &observation)
                 {
@@ -2333,6 +2409,70 @@ impl Agent {
     }
 
     async fn apply_stream_event(&self, event: TickStreamEvent) {
+        let _upgrade = self.inner.upgrade_gate.read().await;
+        let resume = if let TickStreamEvent::Ready { watch } = &event {
+            let mut deliveries = self.tick_deliveries();
+            if deliveries.resuming.remove(watch) {
+                deliveries.apply_event(TickStreamEvent::Ready { watch: *watch });
+                let target = deliveries
+                    .subscriptions
+                    .values()
+                    .find(|runtime| runtime.watch == *watch)
+                    .map(|runtime| {
+                        (
+                            runtime.chat_id,
+                            runtime.instance.clone(),
+                            runtime
+                                .latest
+                                .as_ref()
+                                .map(|latest| latest.sequence)
+                                .max(runtime.delivered.map(|watermark| watermark.sequence))
+                                .max(deliveries.baselines.get(watch).copied()),
+                        )
+                    })
+                    .or_else(|| {
+                        deliveries
+                            .monitor_watches
+                            .iter()
+                            .find(|(_, monitor)| monitor.watch == *watch)
+                            .map(|((chat, instance), monitor)| {
+                                (
+                                    *chat,
+                                    instance.clone(),
+                                    monitor
+                                        .last_sequence
+                                        .max(deliveries.baselines.get(watch).copied()),
+                                )
+                            })
+                    });
+                target
+                    .zip(deliveries.port.clone())
+                    .map(|(target, port)| (*watch, target, port))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let event = if let Some((watch, (chat, instance, previous), port)) = resume {
+            match port.read_current(chat, &instance).await {
+                Ok(Some(mut observation))
+                    if previous.is_some_and(|sequence| observation.sequence > sequence) =>
+                {
+                    observation.dropped = observation
+                        .sequence
+                        .saturating_sub(previous.unwrap())
+                        .saturating_sub(1);
+                    TickStreamEvent::Observation {
+                        audience: vec![watch],
+                        value: observation,
+                    }
+                }
+                _ => event,
+            }
+        } else {
+            event
+        };
         let changed = match &event {
             TickStreamEvent::Observation { audience, value } => Some((&value.instance, audience)),
             TickStreamEvent::ScreenChange {

@@ -6,6 +6,7 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_transcript::{Line, TaskBoardsEntry};
 
+use super::tool_execution::ToolInvocation;
 use super::*;
 
 const MAX_TASKS: usize = 256;
@@ -752,6 +753,7 @@ impl Agent {
         let mut events = self.subscribe();
         loop {
             {
+                let _upgrade = self.inner.upgrade_gate.read().await;
                 let mut chats = self.inner.chats.lock().await;
                 let (root_id, loop_id) = scope(&chats, receipt)?;
                 let chat = chats.get(&receipt.chat_id).ok_or("Agent is unavailable")?;

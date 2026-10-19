@@ -42,7 +42,7 @@ fn frame(parts: Value, finish: Option<&str>, usage: Value) -> String {
 
 fn config(root: &std::path::Path, endpoint: String) -> ModelConfig {
     let mut config = ModelCatalog::defaults()
-        .get("google-gemini-api", "gemini-3.8-flash")
+        .get("google-gemini-api", "gemini-4-argon")
         .unwrap();
     config.base_url = endpoint;
     save_api_key(root, "GEMINI_API_KEY", "test-google-key").unwrap();
@@ -64,7 +64,7 @@ fn google_connections_use_native_protocol_and_independent_authentication() {
             .iter()
             .filter(|config| config.provider_id == provider)
             .collect::<Vec<_>>();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert!(models.iter().all(|config| config.protocol
             == tickloop_agent_protocol::Protocol::Google
             && config.max_output_tokens == 65536));
@@ -120,7 +120,7 @@ async fn native_wire_encodes_images_thinking_schema_and_inclusive_usage() {
     );
     let (headers, body) = captured.await.unwrap();
     assert!(headers.starts_with(
-        "POST /anthropic/models/gemini-3.8-flash:streamGenerateContent?alt=sse HTTP/1.1"
+        "POST /anthropic/models/gemini-4-argon:streamGenerateContent?alt=sse HTTP/1.1"
     ));
     assert!(
         headers

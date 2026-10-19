@@ -301,6 +301,7 @@ async fn run_late_receipt_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        launch_arguments: Vec::new(),
         chat,
         user_settings: None,
     };
@@ -681,9 +682,17 @@ fn an_unconfirmed_creation_keeps_its_input_out_of_the_body_until_it_is_sent_once
     view.wait_for("the unconfirmed creation", |frame| {
         frame.contains("is unconfirmed; nothing was resent")
     });
+    let reads = counted(directory.path(), "hidden-receipt-reads");
     view.send(b"\r");
-    std::thread::sleep(Duration::from_millis(500));
-    let frame = view.frame();
+    wait_for_hidden_receipt_read(directory.path(), reads);
+    let frame = view.wait_for_rows(
+        "the checked creation keeps its input in the composer",
+        |frame| {
+            frame.contains("is unconfirmed; nothing was resent")
+                && composer_row(frame).contains(FIRST)
+        },
+    );
+    assert_eq!(counted(directory.path(), "creates"), 1);
     assert_eq!(
         conversation_body(&frame).matches(FIRST).count(),
         0,
@@ -701,6 +710,7 @@ fn an_unconfirmed_creation_keeps_its_input_out_of_the_body_until_it_is_sent_once
         1,
         "the created Agent shows its first input once: {frame}"
     );
+    assert_eq!(counted(directory.path(), "creates"), 1);
     assert_eq!(submits(directory.path()), 1);
     view.send(b"/clear\r");
     view.wait_for("the next New Agent draft", |frame| {
@@ -866,7 +876,9 @@ fn an_edited_input_held_behind_an_unknown_one_is_shown_only_once_it_is_sent() {
             .lines()
             .rfind(|line| line.trim_start().starts_with('❯'))
             .unwrap_or_default();
-        composer.contains(EDITED) && frame.matches("unknown acceptance").count() >= 2
+        composer.contains(EDITED)
+            && frame.matches("unknown acceptance").count() >= 2
+            && conversation_body(frame).contains(FIRST)
     });
     let body = conversation_body(&frame);
     assert_eq!(body.matches(FIRST).count(), 1, "{frame}");

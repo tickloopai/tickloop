@@ -211,6 +211,14 @@ pub(super) enum RecoveryFact {
         run: Uuid,
         overview: bool,
     },
+    ActivityFrameBegin {
+        chat: Uuid,
+    },
+    ActivityFrameEnd {
+        chat: Uuid,
+        painted: bool,
+    },
+    TasksQueried,
     AgentOpened {
         chat: Uuid,
     },
@@ -463,6 +471,7 @@ async fn run_completed_reply_recovery_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,
     };
@@ -1331,6 +1340,7 @@ fn routine_restore_pty_fixture() {
                         &interaction_console,
                         input,
                         StartupState {
+                            launch_arguments: Vec::new(),
                             chat: StartupChat::New,
                                                 user_settings: None,
                         },
@@ -1588,6 +1598,7 @@ async fn run_retained_completion_lifecycle_fixture() {
             &interaction_console,
             input,
             StartupState {
+                launch_arguments: Vec::new(),
                 chat: StartupChat::Resumed(Box::new(startup_snapshot), true),
                 user_settings: None,
             },
@@ -1834,7 +1845,7 @@ fn run_routine_restore_pty(route: &str) {
         _master: pair.master,
         timeout: RECOVERY_TIMEOUT,
     };
-    fixture.wait_for("deepseek-flash");
+    fixture.wait_for("DeepSeek Flash");
     fixture.send(format!("{ROUTINE_INPUT}\r").as_bytes());
     let completed = fixture.wait_for_phase(&phase_path, "completed");
     fixture.wait_for_turn_summary();
@@ -2111,6 +2122,7 @@ async fn run_merge_boundary_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,
     };

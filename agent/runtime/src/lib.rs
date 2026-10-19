@@ -82,6 +82,7 @@ mod system_prompt;
 mod tool_batch;
 mod tool_execution;
 mod tool_results;
+pub mod upgrade;
 mod web_fetch;
 use tool_batch::{BatchExit, RunStart, ToolBatch};
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
@@ -369,6 +370,13 @@ struct Inner {
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
+    upgrade_paused: AtomicBool,
+    upgrade_adopted: AtomicBool,
+    /// The latest scheduled time each armed Trigger's timer has tried, fired or passed.
+    trigger_tried_through: std::sync::Mutex<HashMap<(ChatId, LoopId), u64>>,
+    upgrade_gate: Arc<tokio::sync::RwLock<()>>,
+    upgrade_guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    upgrade_restore: Mutex<Option<upgrade::AgentUpgradeCheckpoint>>,
     auto_reviewer: Mutex<Option<Arc<dyn ModelClient>>>,
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
@@ -399,7 +407,7 @@ struct Inner {
 
 /// Runtime bookkeeping about a Chat's conversation that never leaves this process. Recovery and
 /// Branch copies rebuild it from the conversation chain.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
     /// What the Chat's own work vouches for, as its Transcript keeps it.
     provenance: tickloop_agent_transcript::ProvenanceEntry,
@@ -457,6 +465,7 @@ struct Chat {
     needs_plan_mode_exit_notice: bool,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
+    upgrade_wait: Option<Receipt>,
     parked: HashMap<RunId, ParkedRun>,
     /// The release of each Run waiting durably, parked or holding the execution slot. A released
     /// Run leaves this instance without writing anything; it goes on wherever the Chat loads next.
@@ -1461,8 +1470,29 @@ impl Agent {
         let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
-        let llm_client = configured_reviewer.unwrap_or(chat_client);
-        let llm_budget = auto_mode::review_budget_bytes(&snapshot);
+        let llm_client = if let Some(client) = configured_reviewer {
+            client
+        } else {
+            chat_client
+                .auxiliary_client(tickloop_agent_model::auxiliary::AuxiliaryTask::PermissionCheck)?
+                .unwrap_or(chat_client)
+        };
+        let auxiliary_model = (!has_isolated_reviewer)
+            .then(|| {
+                tickloop_agent_model::auxiliary::auxiliary_model_config(
+                    &snapshot.model,
+                    tickloop_agent_model::auxiliary::AuxiliaryTask::PermissionCheck,
+                )
+            })
+            .flatten();
+        let llm_budget = if let Some(model) = auxiliary_model.as_ref() {
+            auto_mode::review_budget_bytes(model, None)
+        } else {
+            auto_mode::review_budget_bytes(
+                &snapshot.model,
+                crate::context::context_window(&snapshot),
+            )
+        };
         let use_jev = preferred == tickloop_agent_protocol::AutoReviewerPreference::Jev
             || (has_judgment_adapter && !has_isolated_reviewer);
         let assess = |run: auto_approval::ReviewerRun,
@@ -1860,6 +1890,12 @@ impl Agent {
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
+                upgrade_paused: AtomicBool::new(false),
+                upgrade_adopted: AtomicBool::new(false),
+                trigger_tried_through: std::sync::Mutex::new(HashMap::new()),
+                upgrade_gate: Arc::new(tokio::sync::RwLock::new(())),
+                upgrade_guard: Mutex::new(None),
+                upgrade_restore: Mutex::new(None),
                 auto_reviewer: Mutex::new(None),
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
@@ -2035,6 +2071,7 @@ impl Agent {
             OutputStyle,
         )>,
     ) -> Result<ChatId, AgentError> {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         let folder = self.admit_folder(folder)?;
         if let Some(recorder) = &self.inner.recorder {
             recorder.register_chat(id, folder.as_deref()).await?;
@@ -2101,6 +2138,7 @@ impl Agent {
                 needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
+                upgrade_wait: None,
                 parked: HashMap::new(),
                 releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
@@ -2498,15 +2536,23 @@ impl Agent {
         // Held through every task this submission starts: `shutdown` either refuses it or waits
         // for those tasks.
         let _admission = self.inner.tasks.token();
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(AgentError::Invalid("agent host has shut down".into()));
+        if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
+        {
+            return Err(AgentError::Invalid(
+                "agent is unavailable during shutdown or planned upgrade".into(),
+            ));
         }
         if input.trim().is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
         let mut chats = self.inner.chats.lock().await;
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(AgentError::Invalid("agent host has shut down".into()));
+        if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
+        {
+            return Err(AgentError::Invalid(
+                "agent is unavailable during shutdown or planned upgrade".into(),
+            ));
         }
         // Checked again under this lock: a concurrent first submission of the same input may
         // have been accepted while this one was being prepared.
@@ -3522,24 +3568,12 @@ impl Agent {
                 );
             }
             if calls.is_empty() {
-                if self.wait_for_subagents(&receipt, &cancel, None).await?
-                    || self.wait_for_task_commands(&receipt, &cancel).await?
-                {
-                    self.merge_queued_messages(&receipt)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let chats = self.inner.chats.lock().await;
-                    request = self.continuation_request(&chats[&receipt.chat_id])?;
+                if let Some(continuation) = self.after_complete_response(&receipt, &cancel).await? {
+                    request = continuation;
                     continue;
                 }
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats.get_mut(&receipt.chat_id).unwrap();
-                if handback::remind(chat, &receipt) {
-                    self.save(&chat.snapshot);
-                    request = self.continuation_request(chat)?;
-                    continue;
-                }
-                return chat
+                let chats = self.inner.chats.lock().await;
+                return chats[&receipt.chat_id]
                     .snapshot
                     .request_usage
                     .run_conversation_usage(receipt.run_id)
@@ -3964,6 +3998,7 @@ impl Agent {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
             || self.inner.handover.is_cancelled()
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
             || chat.active.is_some()
             || chat.has_foreground_user_shell()
         {
@@ -4264,6 +4299,7 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        tool_batch::serialize_permission_prompt(&cancel).await?;
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
@@ -4287,7 +4323,11 @@ impl Agent {
                     .find(|goal| goal.id == receipt.loop_id)
                     .ok_or("permission Loop is unavailable")?
                     .set_state(LoopState::WaitingPermission);
-                self.park_run(chat, receipt, cancel.clone())
+                let run_cancel = chat
+                    .run_cancel(receipt.run_id)
+                    .cloned()
+                    .ok_or("permission Run is unavailable")?;
+                self.park_run(chat, receipt, run_cancel)
                     .map_err(|error| error.to_string())?;
             } else if let PermissionExecution::UserShell { command_id } = request.execution
                 && !chat.snapshot.user_shells.iter().any(|shell| {
@@ -5050,6 +5090,7 @@ impl Agent {
         for chat in self.inner.chats.lock().await.values() {
             self.release_runs_at_shutdown(chat);
         }
+        self.cancel_upgrade().await;
         self.inner.shutdown.cancel();
         // Inputs a lost answer leaves open stay open; waiters on them learn of the shutdown.
         self.inner.ledger_changes.send_replace(());
@@ -5232,7 +5273,7 @@ mod thinking_settings_tests {
         );
 
         snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get("anthropic-api", "claude-fable-5-messages")
+            .get("anthropic-api", "claude-fable-5")
             .unwrap();
         assert_eq!(snapshot.effective_reasoning_effort(), None);
         assert!(!snapshot.thinking_enabled);

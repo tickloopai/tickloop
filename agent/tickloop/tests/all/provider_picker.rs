@@ -295,7 +295,7 @@ fn saved_builtin_key_is_reused_and_model_browsing_does_not_save_a_selection() {
     terminal.wait_for_frame_after(mark, "built-in model uses saved key", |frame| {
         frame.contains("Choose model · Signed-in Providers")
             && frame.contains("API key saved")
-            && frame.contains("DeepSeek-V4.1-Flash")
+            && frame.contains("DeepSeek Flash (deepseek-flash)")
     });
     terminal.assert_dialog("slash-model", "Choose model · Signed-in Providers");
     terminal.close_model_picker();

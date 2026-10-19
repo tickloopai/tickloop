@@ -189,6 +189,8 @@ mod tick_subscriptions;
 mod tickhost_shells;
 #[path = "all/tickhost_versions.rs"]
 mod tickhost_versions;
+#[path = "all/tool_batches.rs"]
+mod tool_batches;
 #[path = "all/tool_results.rs"]
 mod tool_results;
 #[path = "all/transcript_stores.rs"]

@@ -166,7 +166,7 @@ async fn selected_effort_reaches_requests_and_new_chats() {
     let workdir = directory.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();
     let mut model_config = tickloop_agent_model::cards::ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-messages")
+        .get("deepseek-api", "deepseek-flash")
         .unwrap();
     model_config.api_key_env = "PATH".into();
     let model = Arc::new(ScriptedModel::new(vec![text("first"), text("second")]));
@@ -230,7 +230,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
     .unwrap();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let selected = tickloop_agent_model::cards::ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-messages")
+        .get("deepseek-api", "deepseek-flash")
         .unwrap();
     let settings_path = root.join("settings.json");
     let invalid = b"{\"defaultModel\":";

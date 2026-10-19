@@ -13,6 +13,7 @@ fn startup_config(model: &str) -> ModelConfig {
     }
     let mut config = tickloop_agent_test_support::config();
     config.model = model.into();
+    config.name = model.into();
     config.protocol = Protocol::ChatCompletions;
     config
 }
@@ -80,6 +81,7 @@ fn startup_status_pty_fixture() {
                     &console,
                     input,
                     StartupState {
+                        launch_arguments: Vec::new(),
                         chat: StartupChat::New,
                         user_settings: None,
                     },
@@ -159,7 +161,12 @@ fn assert_clean_startup_status(frame: &str, rows: &str, model: &str) {
             .lines()
             .find(|line| line.contains("⏵⏵ Auto"))
             .unwrap_or_else(|| panic!("missing core status: {frame}"));
-        assert_eq!(status.matches(model).count(), 1, "{status}");
+        let label = if model == STARTUP_MODEL {
+            "DeepSeek Flash"
+        } else {
+            model
+        };
+        assert_eq!(status.matches(label).count(), 1, "{status}");
         assert!(status.contains("Context 0% used"), "{status}");
         assert!(!status.contains("ChatCompletions"), "{status}");
     }

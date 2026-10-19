@@ -669,7 +669,13 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
     let worker_socket = std::fs::read_dir(&fixture.runtime)
         .unwrap()
         .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+        .find(|entry| {
+            entry.file_name().to_string_lossy().starts_with("w-")
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
+        })
         .unwrap()
         .path();
     let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
@@ -1092,7 +1098,13 @@ async fn real_daemon_preserves_replacement_endpoint_after_shutdown_dispatch() {
         let worker_endpoint = std::fs::read_dir(&fixture.runtime)
             .unwrap()
             .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+            .find(|entry| {
+                entry.file_name().to_string_lossy().starts_with("w-")
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "sock")
+            })
             .unwrap()
             .path();
         let worker = LocalAgentClient::connect(&worker_endpoint).await.unwrap();

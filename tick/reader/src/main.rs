@@ -55,6 +55,13 @@ fn main() -> ExitCode {
         println!("{}", env!("TICKLOOP_BUILD_IDENTITY"));
         return ExitCode::SUCCESS;
     }
+    let _lease = match tickhost_connect::executable_lease::retain_current_executable() {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("tick-reader: cannot retain running executable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     entry::run(execute)
 }
 

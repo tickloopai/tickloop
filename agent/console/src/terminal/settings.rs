@@ -39,6 +39,17 @@ pub(super) fn model_choices_with_profiles(
     choices
 }
 
+pub(super) fn model_name(config: &ModelConfig) -> &str {
+    if let Some(series) = tickloop_agent_model::access::AccessCatalog::defaults().series_for(config)
+    {
+        &series.name
+    } else if config.name.trim().is_empty() {
+        &config.model
+    } else {
+        &config.name
+    }
+}
+
 pub(super) fn model_label(config: &ModelConfig) -> String {
     let protocol = match config.protocol {
         Protocol::Messages => "Messages",
@@ -94,33 +105,32 @@ mod tests {
     use tickloop_agent_model::ModelConfigExt;
 
     #[test]
-    fn preferred_profiles_keep_visible_current_and_hide_legacy_adapter_duplicates() {
-        for source in [
-            tickloop_agent_test_support::legacy_models::DEEPSEEK_CONFIG,
-            tickloop_agent_test_support::legacy_models::DEEPSEEK_RESPONSES_CONFIG,
-            tickloop_agent_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG,
-            tickloop_agent_test_support::legacy_models::DEEPSEEK_V4_PRO_CONFIG,
-        ] {
-            let current: ModelConfig = tickloop_agent_model::cards::migrate_legacy_model(
-                serde_json::from_str(source).unwrap(),
-            );
-            let choices = model_choices(&current);
-            assert_eq!(choices.len(), built_in_model_profiles().len());
-            if tickloop_agent_model::cards::is_default_visible(&current) {
-                assert!(choices.contains(&current));
-                assert_eq!(choices.iter().filter(|value| **value == current).count(), 1);
-            } else {
-                assert_eq!(choices, built_in_model_profiles());
-                assert!(!choices.contains(&current));
-            }
-            assert!(
-                choices
-                    .iter()
-                    .filter(|model| model.provider_id == "deepseek-api")
-                    .all(|model| model.adapter()
-                        == tickloop_agent_protocol::Adapter::DeepseekChatCompletions)
-            );
-        }
+    fn ordinary_profiles_offer_only_the_deepseek_primary_protocol() {
+        let current = tickloop_agent_model::cards::migrate_legacy_model(
+            serde_json::from_str(tickloop_agent_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG)
+                .unwrap(),
+        );
+        let choices = model_choices(&current);
+        assert_eq!(choices.len(), built_in_model_profiles().len());
+        assert_eq!(choices.iter().filter(|model| **model == current).count(), 1);
+        assert!(
+            choices
+                .iter()
+                .filter(|model| model.provider_id == "deepseek-api")
+                .all(|model| model.adapter()
+                    == tickloop_agent_protocol::Adapter::DeepseekChatCompletions)
+        );
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        assert!(
+            catalog
+                .get("deepseek-api", "deepseek-flash-messages")
+                .is_none()
+        );
+        assert!(
+            catalog
+                .get("deepseek-api", "deepseek-flash-responses")
+                .is_none()
+        );
     }
 
     #[test]
@@ -130,7 +140,7 @@ mod tests {
                 .unwrap(),
         );
         let default = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-chat-completions")
+            .get("deepseek-api", "deepseek-flash")
             .unwrap();
         assert_eq!(default.connection(), example.connection());
         example.connection = default.connection.clone();

@@ -1,9 +1,21 @@
 //! Installation and updates belong to the executable, independently of Agent execution.
 
+mod activation;
+mod development;
+pub use development::register_development;
 mod bundle;
+pub use activation::{SelectedRuntime, follow_daemon_runtime, selected_runtime};
+mod homebrew;
 mod notice;
+mod progress;
+use progress::ProgressReporter;
+pub use progress::{UpdateProgress, UpdateStage};
 mod release;
+mod retention;
+mod runtime_source;
 pub use notice::{UpdateMonitor, UpdateNotice};
+pub use retention::cleanup_unused_runtimes;
+pub use runtime_source::ensure_same_runtime_source;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -23,7 +35,7 @@ use tickloop_agent_base::private_fs::{
     create_private_directory, replace_file_atomically, verify_private_directory,
 };
 
-use source::{Installation, Source};
+pub use source::{Installation, Source};
 
 pub const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -51,6 +63,8 @@ struct UpdateState {
     activity: Option<UpdateActivity>,
     #[serde(default)]
     failed: bool,
+    #[serde(default)]
+    progress: Option<UpdateProgress>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -63,6 +77,11 @@ enum UpdateActivity {
 impl UpdateState {
     fn set_activity(&mut self, path: &Path, activity: UpdateActivity) -> Result<()> {
         self.activity = Some(activity);
+        self.progress = None;
+        self.write(path)
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
         replace_file_atomically(path, &serde_json::to_vec(self)?, 0o600)?;
         Ok(())
     }
@@ -131,7 +150,15 @@ impl Drop for Lock {
 pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
     let reported_executable = std::env::current_exe()?;
     let executable = reported_executable.canonicalize()?;
-    let Some(installation) = Installation::detect(&executable)? else {
+    prepare_runtime(&reported_executable, &executable, build)
+}
+
+fn prepare_runtime(
+    reported_executable: &Path,
+    executable: &Path,
+    build: &Build,
+) -> Result<Option<PathBuf>> {
+    let Some(installation) = Installation::detect(executable)? else {
         return Ok(None);
     };
     if installation.pinned
@@ -145,7 +172,7 @@ pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
         {
             bail!("This executable does not match its installation record");
         }
-        return Ok((reported_executable != executable).then_some(executable));
+        return Ok((reported_executable != executable).then(|| executable.to_owned()));
     }
     let root = installation.state_directory()?.join("runtimes");
     private_directory(&root)?;
@@ -362,6 +389,7 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     state.set_activity(&state_path, UpdateActivity::Checking)?;
     let result = update(&installation, &build, check, &mut state, &state_path).await;
     state.activity = None;
+    state.progress = None;
     match &result {
         Ok(message) => {
             state.checked_at = now();
@@ -376,8 +404,11 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     println!("{}", state.message);
     if result.is_ok() && !check {
         println!(
-            "Running Agents and Ticks were left running. A new launch may ask which running version to use."
+            "Running Agents and Ticks continue while compatible processes switch automatically."
         );
+        if let Err(error) = cleanup_unused_runtimes() {
+            eprintln!("Unused runtime cleanup deferred: {error:#}");
+        }
     }
     result.map(|_| ())
 }
@@ -423,7 +454,13 @@ async fn update(
                 ));
             }
             state.set_activity(state_path, UpdateActivity::Installing)?;
-            bundle::download_install(root, &release, installation.source.clone()).await?;
+            bundle::download_install(
+                root,
+                &release,
+                installation.source.clone(),
+                &mut ProgressReporter::new(state, state_path),
+            )
+            .await?;
             Ok(format!(
                 "Installed {}. Available on the next launch.",
                 release.version
@@ -443,7 +480,11 @@ async fn update(
                     .env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
                     .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1");
             }
-            run_process(&mut command).await?;
+            if check {
+                run_process(&mut command).await?;
+            } else {
+                homebrew::run(&mut command, &mut ProgressReporter::new(state, state_path)).await?;
+            }
             Ok(if check {
                 "Homebrew update check completed."
             } else {
@@ -532,19 +573,32 @@ async fn update(
 }
 
 async fn run_process(command: &mut tokio::process::Command) -> Result<()> {
+    run_process_with_output(command, async { Ok(()) }).await
+}
+
+async fn run_process_with_output(
+    command: &mut tokio::process::Command,
+    output: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
     command
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
     let child = command.spawn()?;
+    // Release the parent's PTY writers so output reaches EOF after the installer exits.
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     let mut group = ProcessGroup {
         process_id: child.id().context("Installer has no process id")?,
         child,
         is_armed: true,
     };
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let completion = async {
+        output.await?;
+        Ok::<_, anyhow::Error>(group.child.wait().await?)
+    };
     let status = tokio::select! {
-        result = tokio::time::timeout(COMMAND_TIMEOUT, group.child.wait()) => {
+        result = tokio::time::timeout(COMMAND_TIMEOUT, completion) => {
             result.context("Update command timed out; inspect the installer before retrying")??
         }
         signal = tokio::signal::ctrl_c() => {

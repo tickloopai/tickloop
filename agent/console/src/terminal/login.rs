@@ -991,13 +991,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), original);
-        for title in ["Connection · OpenAI", "Choose Provider"] {
+        for title in ["Connection · OpenAI", "Choose Provider · All"] {
+            let title_with_details = format!("{title} · ");
             let mark = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
             let deadline = Instant::now() + PTY_TIMEOUT;
-            while !output.lock().unwrap()[mark..].contains(title) {
-                assert!(Instant::now() < deadline, "PTY missing fresh {title}");
+            loop {
+                let text = output.lock().unwrap().clone();
+                let frame = screen::visible_screen(&text, 150, 40);
+                if text[mark..].contains(SYNCHRONIZED_FRAME_END)
+                    && frame.lines().any(|line| {
+                        let line = line.trim();
+                        line == title || line.starts_with(&title_with_details)
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY missing fresh completed {title}; latest frame:\n{frame}"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -1152,11 +1166,18 @@ mod tests {
                         serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
                     assert!(body["input"].to_string().contains("hello from terminal"));
                     assert_eq!(body["store"], false);
-                    assert_eq!(body["model"], selected_model.unwrap_or("gpt-6-astra"));
                     let is_title = body["tools"].as_array().is_none_or(Vec::is_empty)
                         && body
                             .to_string()
                             .contains("Generate a short sentence-case Chat title");
+                    assert_eq!(
+                        body["model"],
+                        if is_title {
+                            "gpt-6-luna"
+                        } else {
+                            selected_model.unwrap_or("gpt-6-astra")
+                        }
+                    );
                     model_seen = !is_title;
                     let reply = if is_title {
                         "Terminal greeting"

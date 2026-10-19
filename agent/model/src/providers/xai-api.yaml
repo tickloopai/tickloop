@@ -11,9 +11,15 @@ auth: api_key_env
 api_key_env: XAI_API_KEY
 endpoints:
   responses: https://api.x.ai/v1
+selection:
+  auxiliary_model: grok-4.7
+  series:
+  - id: grok
+    name: Grok
+    model: grok-4.7
+    capability_order: 0
 models:
 - id: grok-4.7
-  service_model_id: grok-4.7
   display_name: Grok 4.7
   adapter: responses
   max_output_tokens: 32768

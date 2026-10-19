@@ -363,7 +363,7 @@ fn is_replacement_for(replacement: &str, content: &str) -> bool {
 }
 
 /// Claude Code `ContentReplacementState`：只存在于运行期，恢复时由内容替换条目重建。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct ContentReplacementState {
     /// 已经过预算检查的结果；之后永远不会再被新替换。
     seen: HashSet<String>,

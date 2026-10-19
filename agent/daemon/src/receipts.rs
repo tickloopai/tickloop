@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -22,7 +23,72 @@ struct Entry {
     updated: Instant,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReceiptCheckpoint {
+    entries: Vec<RetainedReceipt>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RetainedReceipt {
+    digest: [u8; 32],
+    receipt: CommandReceipt,
+    age: Duration,
+}
+
 impl ReceiptStore {
+    pub async fn checkpoint(&self) -> Result<ReceiptCheckpoint, AccessError> {
+        let entries = self.entries.lock().await;
+        if entries.values().any(|entry| {
+            matches!(
+                entry.receipt.state,
+                ReceiptState::Accepted | ReceiptState::Running
+            )
+        }) {
+            return Err(AccessError::unavailable(
+                "commands are still being dispatched",
+            ));
+        }
+        Ok(ReceiptCheckpoint {
+            entries: entries
+                .values()
+                .map(|entry| RetainedReceipt {
+                    digest: entry.digest,
+                    receipt: entry.receipt.clone(),
+                    age: entry.updated.elapsed(),
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn restore(&self, checkpoint: ReceiptCheckpoint) -> Result<(), AccessError> {
+        let mut entries = self.entries.lock().await;
+        if !entries.is_empty() || checkpoint.entries.len() > RECEIPT_CAPACITY {
+            return Err(AccessError::invalid("invalid receipt handoff"));
+        }
+        let now = Instant::now();
+        for retained in checkpoint.entries {
+            if retained.receipt.daemon_epoch != self.epoch
+                || matches!(
+                    retained.receipt.state,
+                    ReceiptState::Accepted | ReceiptState::Running
+                )
+            {
+                return Err(AccessError::invalid("receipt handoff is not settled"));
+            }
+            if retained.age < Duration::from_secs(RECEIPT_RETENTION_SECONDS) {
+                entries.insert(
+                    retained.receipt.command_id,
+                    Entry {
+                        digest: retained.digest,
+                        receipt: retained.receipt,
+                        updated: now.checked_sub(retained.age).unwrap_or(now),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(epoch: Uuid) -> Self {
         Self {
             epoch,

@@ -33,6 +33,12 @@ impl Default for InternalEventReader {
 }
 
 impl InternalEventReader {
+    pub(crate) fn input_buffer_is_empty(&self) -> bool {
+        !self.events.iter().any(|event| matches!(event, InternalEvent::Event(_)))
+            && !self.skipped_events.iter().any(|event| matches!(event, InternalEvent::Event(_)))
+            && self.source.as_ref().is_some_and(|source| source.input_buffer_is_empty())
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {

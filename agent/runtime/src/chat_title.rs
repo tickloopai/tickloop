@@ -1,12 +1,9 @@
 use super::{Agent, approval_context};
-use std::{sync::atomic::Ordering, time::Duration};
-use tickloop_agent_model::{ModelOutput, ModelRequest, ReasoningEffortExt};
-use tickloop_agent_protocol::{
-    ChatId, Content, Message, ModelConfig, ReasoningEffort, Role, short_chat_title,
-};
+use std::sync::atomic::Ordering;
+use tickloop_agent_model::{ModelOutput, ModelRequest};
+use tickloop_agent_protocol::{ChatId, Content, Message, Role, short_chat_title};
 use tokio_util::sync::CancellationToken;
 
-const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
 
 /// A Chat's title request in flight.
@@ -25,7 +22,7 @@ impl Agent {
         if pending.contains_key(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
-        let (client, prompt, message_id, reasoning_effort) = {
+        let (client, prompt, message_id) = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
                 return;
@@ -59,7 +56,6 @@ impl Agent {
                     .rev()
                     .collect::<String>(),
                 original.message_id,
-                side_request_effort(&chat.snapshot.model),
             )
         };
         let job = TitleJob {
@@ -71,6 +67,7 @@ impl Agent {
         let agent = self.clone();
         self.inner.tasks.spawn(async move {
             let _done = job.done.drop_guard();
+            let _upgrade = agent.inner.upgrade_gate.read().await;
             let request = ModelRequest {
                 history_sources: Vec::new(),
                 messages: vec![
@@ -88,20 +85,30 @@ impl Agent {
                 tools: Vec::new(),
                 structured_output: None,
                 temperature: None,
-                reasoning_effort,
+                reasoning_effort: None,
             };
             let cancel = job.cancel;
-            let output = agent
+            let response = agent
                 .tracked_model_request(
                     super::model_request::RequestContext::title(chat_id),
                     client,
                     request,
                     cancel.clone(),
-                    Some(TITLE_TIMEOUT),
+                    None,
                 )
-                .await
-                .ok()
-                .map(|response| response.output);
+                .await;
+            let output = match response {
+                Ok(response) => agent
+                    .finish_model_request(
+                        chat_id,
+                        response.sequence,
+                        tickloop_agent_protocol::RequestOutcome::Accepted,
+                    )
+                    .await
+                    .ok()
+                    .map(|_| response.output),
+                Err(_) => None,
+            };
             cancel.cancel();
             if let Some(text) = output.as_ref().and_then(side_request_text) {
                 let title = short_chat_title(text.trim().trim_matches('"'));
@@ -127,15 +134,6 @@ impl Agent {
             agent.inner.title_requests.lock().await.remove(&chat_id);
         });
         drop(admission);
-    }
-}
-
-/// The cheapest reasoning effort the Chat's model accepts, for short side requests such as titles.
-pub(super) fn side_request_effort(model: &ModelConfig) -> Option<ReasoningEffort> {
-    if tickloop_agent_model::validate_reasoning_effort(model, Some(ReasoningEffort::Off)).is_ok() {
-        Some(ReasoningEffort::Off)
-    } else {
-        ReasoningEffort::choices(model).first().copied()
     }
 }
 

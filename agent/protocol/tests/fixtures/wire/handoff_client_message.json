@@ -1,0 +1,31 @@
+[
+  {
+    "Hello": {
+      "major": 26,
+      "minor": 2,
+      "handoff": {
+        "version": 1
+      }
+    }
+  },
+  {
+    "Hello": {
+      "major": 26,
+      "minor": 2,
+      "handoff": {
+        "version": 1,
+        "resume": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "session_id": "00000000-0000-0000-0000-000000000051",
+          "token": "test-only-session-secret",
+          "transfer_id": "00000000-0000-0000-0000-000000000071"
+        }
+      }
+    }
+  },
+  {
+    "HandoffReady": {
+      "transfer_id": "00000000-0000-0000-0000-000000000071"
+    }
+  }
+]

@@ -265,6 +265,87 @@ async fn group_ends(pid: u32) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn planned_shell_handoff_preserves_process_and_fences_previous_owner() {
+    let fixture = Fixture::start().await;
+    let workdir = fixture.workdir("handoff");
+    let binding = fixture.binding("while :; do sleep 1; done", &workdir);
+    let mut original = start(&fixture, &binding, &[]).await;
+    let pid = original.submitted.spawned.pid;
+    let handoff = shell::ShellHandoff {
+        endpoint: fixture.paths.socket(),
+        instance: original.submitted.spawned.instance.clone(),
+        owner_token: original.submitted.spawned.owner_token.clone(),
+        handoff: uuid::Uuid::new_v4(),
+    };
+    let mut successor = shell::adopt(&handoff).await.unwrap();
+    successor.stops.commit_handoff().await.unwrap();
+    assert_eq!(successor.spawned.pid, pid);
+    assert_eq!(successor.spawned.instance, handoff.instance);
+    assert_ne!(successor.spawned.owner_token, handoff.owner_token);
+    original.submitted.stops.stop("stale owner").await.unwrap();
+    drop(original);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(group_exists(pid));
+    let mut stolen = handoff.clone();
+    stolen.handoff = uuid::Uuid::new_v4();
+    assert!(shell::adopt(&stolen).await.is_err());
+    drop(successor);
+    group_ends(pid).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_successor_hello_without_adoption_leaves_original_owner_in_control() {
+    let fixture = Fixture::start().await;
+    let workdir = fixture.workdir("prepare");
+    let binding = fixture.binding("while :; do sleep 1; done", &workdir);
+    let original = start(&fixture, &binding, &[]).await;
+    let pid = original.submitted.spawned.pid;
+    let prepared = HostConnection::connect(
+        &fixture.paths.socket(),
+        Role::ShellSuccessor {
+            instance: original.submitted.spawned.instance.clone(),
+            owner_token: original.submitted.spawned.owner_token.clone(),
+            handoff: uuid::Uuid::new_v4(),
+        },
+        &[hosted::CAPABILITY_SHELL_HANDOFF],
+    )
+    .await
+    .unwrap();
+    drop(prepared);
+    assert!(group_exists(pid));
+    drop(original);
+    group_ends(pid).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_unconfirmed_handoff_can_recover_with_its_original_operation() {
+    let fixture = Fixture::start().await;
+    let workdir = fixture.workdir("retry-handoff");
+    let binding = fixture.binding("while :; do sleep 1; done", &workdir);
+    let original = start(&fixture, &binding, &[]).await;
+    let pid = original.submitted.spawned.pid;
+    let handoff = shell::ShellHandoff {
+        endpoint: fixture.paths.socket(),
+        instance: original.submitted.spawned.instance.clone(),
+        owner_token: original.submitted.spawned.owner_token.clone(),
+        handoff: uuid::Uuid::new_v4(),
+    };
+    let interrupted = shell::adopt(&handoff).await.unwrap();
+    drop(interrupted);
+    drop(original);
+    let mut recovered = shell::adopt(&handoff).await.unwrap();
+    assert_eq!(recovered.spawned.pid, pid);
+    recovered.stops.commit_handoff().await.unwrap();
+    recovered.stops.stop("test complete").await.unwrap();
+    assert_eq!(
+        recovered.exits.exited().await.unwrap().reason.as_deref(),
+        Some("test complete")
+    );
+    drop(recovered);
+    group_ends(pid).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_granted_task_runs_in_pipe_mode_in_its_passed_directory_and_reports_its_exit() {
     let fixture = Fixture::start().await;
     let workdir = fixture.workdir("pipe");

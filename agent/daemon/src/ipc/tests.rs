@@ -37,6 +37,29 @@ struct ControlledFeed {
     initial: Option<ObservationValue>,
 }
 
+fn transcript_initial(text: String) -> ObservationValue {
+    ObservationValue::Transcript(Box::new(RecordedTranscript {
+        record: TranscriptRef {
+            store_root: "/tmp/transcripts".into(),
+            chat_id: Uuid::new_v4(),
+        },
+        title: None,
+        folder: "/tmp/workdir".into(),
+        messages: vec![RecordedMessage {
+            id: Uuid::new_v4(),
+            message: tickloop_agent_protocol::Message {
+                role: tickloop_agent_protocol::Role::User,
+                content: vec![tickloop_agent_protocol::Content::Text { text }],
+            },
+            loop_id: None,
+            run_id: None,
+            timestamp: String::new(),
+        }],
+        total_messages: 1,
+        warnings: Vec::new(),
+    }))
+}
+
 #[async_trait]
 impl AgentAccess for ControlledFeed {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
@@ -112,7 +135,11 @@ async fn older_business_peers_are_fenced_before_a_query_can_dispatch() {
         ));
         write_frame(
             &mut client,
-            &ClientMessage::Hello { major, minor },
+            &ClientMessage::Hello {
+                major,
+                minor,
+                handoff: None,
+            },
             HANDSHAKE_FRAME_BYTES,
         )
         .await
@@ -172,6 +199,8 @@ async fn a_hello_announcing_unusable_limits_is_an_incompatible_peer() {
                 limits,
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -368,6 +397,7 @@ async fn completing_a_cancelled_lookup_returns_exactly_one_terminal_reply() {
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -525,6 +555,8 @@ async fn cancelling_a_backpressured_lookup_keeps_the_live_request_frame_whole() 
                 limits: AccessLimits::DEFAULT.into(),
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -650,6 +682,8 @@ async fn dropped_opened_feed_cannot_keep_a_backpressured_client_alive() {
                     limits: AccessLimits::DEFAULT.into(),
                     build: None,
                     executable: None,
+                    upgrade_protocol: None,
+                    handoff: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -764,6 +798,8 @@ async fn backpressured_observation_write_stops_on_eof_or_last_client_drop() {
                     limits: AccessLimits::DEFAULT.into(),
                     build: None,
                     executable: None,
+                    upgrade_protocol: None,
+                    handoff: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -864,6 +900,7 @@ async fn canceling_an_observation_mid_frame_never_corrupts_the_shared_connection
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -1075,6 +1112,54 @@ async fn cancel_immediately_after_opened_closes_the_source_before_feed_start() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spilled_history_is_complete_in_single_frame_and_chunked_transfers() {
+    let text = "x".repeat(crate::chunked::RESPONSE_MEMORY_BYTES + 1);
+    for limits in [AccessLimits::DEFAULT, TRANSPORT_LIMITS] {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("spilled.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let initial = transcript_initial(text.clone());
+        let expected = serde_json::to_vec(&initial).unwrap();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: Some(initial),
+        });
+        let server_source = source.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, server_source, epoch, limits)
+                .await
+                .unwrap();
+        });
+        let client = LocalAgentClient::connect(socket).await.unwrap();
+        let observation = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page::default(),
+                after: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&observation.initial).unwrap(), expected);
+        drop(observation);
+        let sender = source.sender.lock().await.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sender.closed())
+            .await
+            .expect("dropping a received snapshot must cancel its source feed");
+        drop(client);
+        server.abort();
+        if let Err(error) = server.await {
+            assert!(error.is_cancelled());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_published() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let socket = temporary.path().join("chunk-cancel.sock");
@@ -1083,28 +1168,7 @@ async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_
     let source = Arc::new(ControlledFeed {
         sender: Mutex::new(None),
         epoch,
-        initial: Some(ObservationValue::Transcript(Box::new(RecordedTranscript {
-            record: TranscriptRef {
-                store_root: temporary.path().to_path_buf(),
-                chat_id: Uuid::new_v4(),
-            },
-            title: None,
-            folder: temporary.path().to_path_buf(),
-            messages: vec![RecordedMessage {
-                id: Uuid::new_v4(),
-                message: tickloop_agent_protocol::Message {
-                    role: tickloop_agent_protocol::Role::User,
-                    content: vec![tickloop_agent_protocol::Content::Text {
-                        text: "x".repeat(FRAME_BYTES),
-                    }],
-                },
-                loop_id: None,
-                run_id: None,
-                timestamp: String::new(),
-            }],
-            total_messages: 1,
-            warnings: Vec::new(),
-        }))),
+        initial: Some(transcript_initial("x".repeat(FRAME_BYTES))),
     });
     let server_source = source.clone();
     let server = tokio::spawn(async move {
@@ -1119,6 +1183,7 @@ async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -1213,6 +1278,8 @@ async fn a_reply_written_before_the_daemon_closed_survives_a_failed_write() {
                 limits: TRANSPORT_LIMITS.into(),
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
         );
         let ClientMessage::ShutdownDaemon { request_id, .. } = read(&mut stream) else {

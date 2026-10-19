@@ -13,6 +13,8 @@ mod retained;
 mod store;
 
 pub use jsonl::JsonlTranscriptStore;
+#[cfg(test)]
+pub(crate) use jsonl::load_file;
 pub use listing::TranscriptSummary;
 pub use retained::retained_before;
 pub use store::{

@@ -110,6 +110,7 @@ fn prompt_suggestion_pty_fixture() {
                         &console,
                         input,
                         crate::terminal::StartupState {
+                            launch_arguments: Vec::new(),
                             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
                             user_settings: Some(tickloop_agent_config::UserSettings::in_root(
                                 &directory,
@@ -262,7 +263,7 @@ async fn prompt_suggestion_pty_chinese_bash_kimi_with_completed_child_shows_and_
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     let frame = fixture.wait(|frame| frame.contains("查看 README.md"));
     assert!(
@@ -284,6 +285,7 @@ async fn prompt_suggestion_pty_chinese_bash_kimi_with_completed_child_shows_and_
         .unwrap()
         .unwrap();
     assert_eq!(body["model"], "kimi-k3");
+    assert_eq!(body["reasoning_effort"], "low");
     assert_eq!(body["max_completion_tokens"], 1_024);
     assert!(body.get("tools").is_none());
     assert!(body.to_string().contains("列出当前目录下的文件"));
@@ -321,7 +323,7 @@ async fn prompt_suggestion_pty_delegated_chinese_bash_explains_suppression_witho
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     let frame = fixture
         .wait(|frame| super::super::shows_turn_summary(frame) && frame.contains("当前目录包含"));
@@ -357,7 +359,7 @@ async fn prompt_suggestion_pty_provider_failure_is_quiet_and_status_has_no_priva
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     requests.recv().await.unwrap();
     let editor = || {

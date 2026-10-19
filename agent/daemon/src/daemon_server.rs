@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use uuid::Uuid;
 
 use super::{
@@ -20,12 +21,33 @@ use tickloop_agent_protocol::{
     AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, Cursor, DisplayReceipt,
     DisplayUpdate, ExecutionAvailability, ExecutionRef, FEED_CAPACITY, LaunchSpec, MAX_PAGE_LIMIT,
     Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    OtherTickhost, Page, PersistenceState, REPLAY_CAPACITY, ResetReason, TranscriptRef,
-    chat_display_title, chat_has_work, chat_preview,
+    OtherTickhost, Page, PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion,
+    TranscriptRef, chat_display_title, chat_has_work, chat_preview,
 };
 
 #[async_trait]
 pub trait WorkerFactory: Send + Sync {
+    async fn request_upgrade(&self, _executable: &std::path::Path) -> Result<(), AccessError> {
+        Err(AccessError::new(
+            AccessErrorCode::Unsupported,
+            "this runtime does not support process upgrades",
+        ))
+    }
+    async fn runtime_version(
+        &self,
+        _routes: &[(ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> RuntimeVersion {
+        RuntimeVersion {
+            executable: std::env::current_exe().unwrap_or_default(),
+            build_id: tickloop_agent_protocol::build_identity()
+                .unwrap_or_default()
+                .into(),
+            requested_executable: None,
+            upgrading: false,
+            error: None,
+            workers: Vec::new(),
+        }
+    }
     async fn start(
         &self,
         launch: &LaunchSpec,
@@ -66,6 +88,25 @@ struct DaemonInner {
     views: ViewRegistry,
     sequence: AtomicU64,
     changes: broadcast::Sender<ObservationUpdate>,
+    admission: Arc<RwLock<()>>,
+    retired: AtomicBool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DaemonCheckpoint {
+    workers: Vec<WorkerCheckpoint>,
+    routes: Vec<(ExecutionRef, usize)>,
+    lost: HashSet<ExecutionRef>,
+    records: Vec<(TranscriptRef, ExecutionRef)>,
+    receipts: super::receipts::ReceiptCheckpoint,
+    views: super::views::ViewCheckpoint,
+    sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkerCheckpoint {
+    launch: LaunchSpec,
+    last_directory: Vec<AgentSummary>,
 }
 
 impl DaemonServer {
@@ -83,6 +124,8 @@ impl DaemonServer {
                 views: ViewRegistry::default(),
                 sequence: AtomicU64::new(0),
                 changes: broadcast::channel(REPLAY_CAPACITY).0,
+                admission: Arc::new(RwLock::new(())),
+                retired: AtomicBool::new(false),
             }),
         };
         tokio::spawn(monitor_directory(Arc::downgrade(&daemon.inner)));
@@ -90,6 +133,110 @@ impl DaemonServer {
     }
     pub fn daemon_epoch(&self) -> Uuid {
         self.inner.epoch
+    }
+    #[cfg(test)]
+    pub(crate) async fn pause(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.inner.admission.clone().write_owned().await
+    }
+    pub(crate) fn try_pause(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.inner.admission.clone().try_write_owned().ok()
+    }
+    pub(crate) fn retire(&self) {
+        self.inner.retired.store(true, Ordering::SeqCst);
+    }
+
+    fn ensure_active(&self) -> Result<(), AccessError> {
+        if self.inner.retired.load(Ordering::SeqCst) {
+            Err(AccessError::new(
+                AccessErrorCode::HandoffNotAccepted,
+                "Agent daemon transferred ownership before accepting the request",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn checkpoint(
+        &self,
+        access: &[Arc<dyn AgentAccess>],
+    ) -> Result<DaemonCheckpoint, AccessError> {
+        let workers = self.inner.workers.lock().await;
+        let index = |worker: &Arc<dyn AgentAccess>| {
+            access
+                .iter()
+                .position(|entry| Arc::ptr_eq(entry, worker))
+                .ok_or_else(|| AccessError::invalid("unknown worker during handoff"))
+        };
+        let mut saved_workers = Vec::with_capacity(access.len());
+        for entry in access {
+            let worker = workers
+                .iter()
+                .find(|worker| Arc::ptr_eq(&worker.access, entry))
+                .ok_or_else(|| AccessError::invalid("missing worker launch during handoff"))?;
+            saved_workers.push(WorkerCheckpoint {
+                launch: worker.launch.clone(),
+                last_directory: worker.last_directory.clone(),
+            });
+        }
+        let mut routes = Vec::new();
+        for (execution, worker) in self.inner.routes.lock().await.iter() {
+            routes.push((*execution, index(worker)?));
+        }
+        Ok(DaemonCheckpoint {
+            workers: saved_workers,
+            routes,
+            lost: self.inner.lost.lock().await.clone(),
+            records: self
+                .inner
+                .records
+                .lock()
+                .await
+                .iter()
+                .map(|(record, execution)| (record.clone(), *execution))
+                .collect(),
+            receipts: self.inner.receipts.checkpoint().await?,
+            views: self.inner.views.checkpoint().await,
+            sequence: self.inner.sequence.load(Ordering::SeqCst),
+        })
+    }
+
+    pub(crate) async fn restore(
+        &self,
+        checkpoint: DaemonCheckpoint,
+        access: &[Arc<dyn AgentAccess>],
+    ) -> Result<(), AccessError> {
+        if checkpoint.workers.len() != access.len() {
+            return Err(AccessError::invalid("worker handoff count mismatch"));
+        }
+        let mut routes = HashMap::new();
+        for (execution, index) in checkpoint.routes {
+            let worker = access
+                .get(index)
+                .ok_or_else(|| AccessError::invalid("invalid handoff worker index"))?;
+            if execution.daemon_epoch != self.inner.epoch {
+                return Err(AccessError::invalid("invalid handoff execution epoch"));
+            }
+            routes.insert(execution, worker.clone());
+        }
+        *self.inner.workers.lock().await = checkpoint
+            .workers
+            .into_iter()
+            .zip(access)
+            .map(|(worker, access)| Worker {
+                access: access.clone(),
+                launch: worker.launch,
+                last_directory: worker.last_directory,
+            })
+            .collect();
+        *self.inner.routes.lock().await = routes;
+        *self.inner.records.lock().await = checkpoint.records.into_iter().collect();
+        *self.inner.lost.lock().await = checkpoint.lost;
+        self.inner.receipts.restore(checkpoint.receipts).await?;
+        self.inner.views.restore(checkpoint.views).await;
+        self.inner
+            .sequence
+            .store(checkpoint.sequence, Ordering::SeqCst);
+        Ok(())
     }
     async fn workers(&self) -> Vec<Arc<dyn AgentAccess>> {
         self.inner
@@ -130,34 +277,66 @@ impl DaemonServer {
                 )
             })
     }
-    /// Verifies that `chat` currently runs in `worker` and is not lost, refreshing the directory
-    /// first, and returns its execution. A worker can only act for its own Chats, whatever it
+    /// Verifies that `chat` currently runs in `worker` and is not lost, refreshing that Worker's
+    /// directory first, and returns its execution. A worker can only act for its own Chats, whatever it
     /// claims.
     pub async fn verify_worker_chat(
         &self,
         chat: Uuid,
         worker: &Arc<dyn AgentAccess>,
     ) -> Result<ExecutionRef, AccessError> {
-        let agents = self.directory().await?;
+        let agents = worker_directory(worker.as_ref()).await?;
+        let lost = self.inner.lost.lock().await;
         let execution = agents
             .iter()
             .find(|entry| {
-                entry.chat_id == chat && entry.availability != ExecutionAvailability::Lost
+                entry.chat_id == chat
+                    && entry.execution.daemon_epoch == self.inner.epoch
+                    && entry.availability != ExecutionAvailability::Lost
+                    && !lost.contains(&entry.execution)
             })
             .map(|entry| entry.execution)
             .ok_or_else(|| {
                 AccessError::new(
                     AccessErrorCode::AccessDenied,
-                    "the Chat is not running in this daemon",
+                    "the Chat is not running in this Worker",
                 )
             })?;
-        let routed = self.inner.routes.lock().await.get(&execution).cloned();
-        if !routed.is_some_and(|routed| Arc::ptr_eq(&routed, worker)) {
+        let mut workers = self.inner.workers.lock().await;
+        let known = workers
+            .iter_mut()
+            .find(|known| Arc::ptr_eq(&known.access, worker))
+            .ok_or_else(|| {
+                AccessError::new(
+                    AccessErrorCode::AccessDenied,
+                    "the Worker is not registered in this daemon",
+                )
+            })?;
+        let mut routes = self.inner.routes.lock().await;
+        if routes
+            .get(&execution)
+            .is_some_and(|routed| !Arc::ptr_eq(routed, worker))
+        {
             return Err(AccessError::new(
                 AccessErrorCode::AccessDenied,
-                "the Chat belongs to another worker",
+                "the Chat belongs to another Worker",
             ));
         }
+        let mut records = self.inner.records.lock().await;
+        for entry in &agents {
+            if entry.execution.daemon_epoch != self.inner.epoch
+                || routes
+                    .get(&entry.execution)
+                    .is_some_and(|routed| !Arc::ptr_eq(routed, worker))
+            {
+                continue;
+            }
+            routes.insert(entry.execution, worker.clone());
+            if let Some(record) = &entry.record {
+                records.insert(record.clone(), entry.execution);
+            }
+        }
+        known.last_directory = agents;
         Ok(execution)
     }
     fn cursor(&self) -> Cursor {
@@ -456,6 +635,10 @@ impl DaemonServer {
     ) -> Result<(CommandResult, PersistenceState), AccessError> {
         self.validate_origin(&envelope.command).await?;
         match &envelope.command {
+            AgentCommand::UpgradeRuntime { executable } => {
+                self.inner.factory.request_upgrade(executable).await?;
+                Ok((CommandResult::Done, PersistenceState::NotApplicable))
+            }
             AgentCommand::Create { launch, .. } => {
                 self.execute_worker(self.start(launch).await?, envelope)
                     .await
@@ -593,7 +776,26 @@ impl DaemonServer {
 #[async_trait]
 impl AgentAccess for DaemonServer {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+        let _admission = self.inner.admission.read().await;
+        self.ensure_active()?;
         match query {
+            ObservationRequest::RuntimeVersion => {
+                let routes = self
+                    .inner
+                    .routes
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(execution, worker)| (*execution, worker.clone()))
+                    .collect::<Vec<_>>();
+                Ok(Observation::single(
+                    ObservationValue::RuntimeVersion(Box::new(
+                        self.inner.factory.runtime_version(&routes).await,
+                    )),
+                    self.cursor(),
+                    None,
+                ))
+            }
             ObservationRequest::Receipt { epoch, command_id } => Ok(Observation::single(
                 ObservationValue::Receipt(
                     self.inner
@@ -724,6 +926,8 @@ impl AgentAccess for DaemonServer {
         }
     }
     async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let _admission = self.inner.admission.read().await;
+        self.ensure_active()?;
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
@@ -749,6 +953,8 @@ impl AgentAccess for DaemonServer {
         Ok(receipt)
     }
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        let _admission = self.inner.admission.read().await;
+        self.ensure_active()?;
         if let DisplayUpdate::Displayed { execution, .. } = &update {
             self.worker(*execution).await?;
         }
@@ -770,6 +976,7 @@ async fn monitor_directory(daemon: Weak<DaemonInner>) {
             break;
         };
         let daemon = DaemonServer { inner };
+        let _admission = daemon.inner.admission.read().await;
         if let Ok(directory) = daemon.directory().await
             && let Ok(current) = serde_json::to_vec(&directory)
             && previous != current

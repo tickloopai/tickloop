@@ -2582,6 +2582,23 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    pub(super) async fn adopt_upgrade_transcript(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) -> Result<(), AgentError> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        let loaded = self.load_saved_transcript(snapshot.id).await?;
+        let (restored, _) = restore_chain(&loaded.chain);
+        let checkpoints = restored.plan_checkpoints();
+        recorder.adopt(snapshot.id, restored.links, restored.meta_messages, loaded);
+        recorder.adopt_restored_loops(snapshot, bookkeeping, &checkpoints);
+        recorder.adopt_lifecycle(snapshot.id, &bookkeeping.lifecycle);
+        Ok(())
+    }
+
     pub(super) async fn checkpoint_transcript(
         &self,
         snapshot: &ChatSnapshot,
@@ -3479,6 +3496,7 @@ impl Agent {
                 needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
+                upgrade_wait: None,
                 parked: HashMap::new(),
                 releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
@@ -3605,6 +3623,10 @@ pub(super) enum RestoreTarget {
     /// 写入新 chatId 的 Transcript。
     NewChat { source: ChatId },
 }
+
+#[cfg(test)]
+#[path = "transcript_replay_tests.rs"]
+mod transcript_replay_tests;
 
 #[cfg(test)]
 mod history_tests {

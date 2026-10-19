@@ -677,6 +677,13 @@ impl Tools {
     pub async fn commands(&self) -> Vec<CommandSnapshot> {
         self.commands.snapshots().await
     }
+    /// A busy command returns `None`; unsupported ownership transfer remains an error.
+    pub async fn checkpoint_shells(&self) -> Result<Option<Value>, ToolError> {
+        self.commands.checkpoint().await
+    }
+    pub async fn restore_shells(&self, checkpoint: Value) -> Result<(), ToolError> {
+        self.commands.restore(checkpoint).await
+    }
     pub async fn background(&self, id: uuid::Uuid) -> Result<CommandSnapshot, ToolError> {
         self.commands.background(id).await
     }
@@ -1011,6 +1018,15 @@ impl From<(ToolResult, FileReadRecord)> for FileOutcome {
 
 /// Prepares a call outside any Chat: nothing has been read, so `Write` and `Edit` only accept
 /// files that do not exist yet.
+pub fn is_concurrency_safe(workspace: &Workspace, name: &str, input: &Value) -> bool {
+    match name {
+        READ_TOOL_NAME | GLOB_TOOL_NAME | GREP_TOOL_NAME | WEB_FETCH_TOOL_NAME
+        | WEB_SEARCH_TOOL_NAME => true,
+        BASH_TOOL_NAME => shell::is_read_only_input(workspace, input),
+        _ => false,
+    }
+}
+
 pub fn prepare(
     workspace: &Workspace,
     name: &str,

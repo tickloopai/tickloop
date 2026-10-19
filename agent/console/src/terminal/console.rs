@@ -24,6 +24,8 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_layout;
+mod upgrade;
+pub(super) use upgrade::ConsoleUpgrade;
 mod file_index_worker;
 use file_index_worker::{FileIndexWorker, IndexRequest};
 #[cfg(test)]
@@ -666,6 +668,8 @@ impl ArtifactMetadataSink {
 struct Lifetime {
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
+    pause_requested: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     reader: Mutex<Option<JoinHandle<()>>>,
     interactive: bool,
     surface: TerminalSurface,
@@ -722,6 +726,7 @@ pub(super) struct State {
     scrollback: Scrollback,
     /// Startup and local feedback from before this View's draft created its Chat.
     creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
+    agent_runtime_banners: HashMap<Uuid, String>,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
     /// Agent Colors of every Agent this View has learned of, shared by all its conversations.
@@ -745,6 +750,7 @@ pub(super) struct State {
     editor: Editor,
     editor_cache: HashMap<Option<Uuid>, ChatInput>,
     view_cache: HashMap<Option<Uuid>, ViewPresentation>,
+    pending_upgrade_scroll: HashMap<Option<Uuid>, super::scrollback::ScrollCheckpoint>,
     paste_blocks: PasteBlocks,
     restored_contexts: Vec<InputContext>,
     input_stash: Option<InputStash>,
@@ -920,6 +926,7 @@ struct EscapeConfirmation {
     requested_at: Instant,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SubmittedPrompt {
     family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     draft: String,
@@ -939,6 +946,7 @@ struct ChatInput {
     owner: Uuid,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InputStash {
     family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     paste_blocks: PasteBlocks,
@@ -2496,6 +2504,62 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn ensure_chat_banner(
+        &self,
+        chat: Uuid,
+        banner: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.interactive {
+            state
+                .creation_prefixes
+                .entry(Some(chat))
+                .or_insert_with(|| {
+                    banner
+                        .iter()
+                        .map(|(text, role)| {
+                            CreationPrefixEntry::Output(ConversationPiece::Styled(
+                                text.clone(),
+                                *role,
+                            ))
+                        })
+                        .collect()
+                });
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_agent_runtime(
+        &self,
+        chat: Uuid,
+        build: Option<String>,
+        pending: bool,
+    ) -> Result<(), String> {
+        let line = build
+            .map(|build| display_single_line(&build).trim().to_owned())
+            .filter(|build| !build.is_empty())
+            .map(|build| format!("Agent v{build}{}", if pending { " · pending" } else { "" }));
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive || state.agent_runtime_banners.get(&chat) == line.as_ref() {
+            return Ok(());
+        }
+        match line {
+            Some(line) => {
+                state.agent_runtime_banners.insert(chat, line);
+            }
+            None => {
+                state.agent_runtime_banners.remove(&chat);
+            }
+        }
+        let changed = state.apply_agent_runtime_banner(chat);
+        if changed && state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn select_created_chat(
         &self,
         chat: Uuid,
@@ -2539,6 +2603,7 @@ impl Console {
                     .collect(),
             );
         }
+        state.apply_agent_runtime_banner(chat);
         Ok(())
     }
 
@@ -3023,21 +3088,27 @@ impl Console {
         interactive: bool,
         preferences: DisplayPreferences,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
-        Self::start_with_startup(interactive, preferences, None, None)
+        Self::start_with_startup(interactive, preferences, None, None, false)
     }
 
     pub(super) fn start_with_workspace_trust(
         preferences: DisplayPreferences,
         workdir: PathBuf,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
-        Self::start_with_startup(true, preferences, Some(WorkspaceTrust::new(workdir)), None)
+        Self::start_with_startup(
+            true,
+            preferences,
+            Some(WorkspaceTrust::new(workdir)),
+            None,
+            false,
+        )
     }
 
     pub(super) fn start_with_startup_menu(
         preferences: DisplayPreferences,
         menu: Menu,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
-        Self::start_with_startup(true, preferences, None, Some(menu))
+        Self::start_with_startup(true, preferences, None, Some(menu), false)
     }
 
     fn start_with_startup(
@@ -3045,6 +3116,7 @@ impl Console {
         preferences: DisplayPreferences,
         workspace_trust: Option<WorkspaceTrust>,
         startup_menu: Option<Menu>,
+        pause_input: bool,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let choice =
@@ -3074,6 +3146,8 @@ impl Console {
         let surface = initial.surface.clone();
         let state = Arc::new(Mutex::new(initial));
         let stop = Arc::new(AtomicBool::new(false));
+        let pause_requested = Arc::new(AtomicBool::new(pause_input));
+        let paused = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         if interactive {
             terminal::enable_raw_mode().map_err(|error| error.to_string())?;
@@ -3099,11 +3173,19 @@ impl Console {
             }
         }
         let reader_stop = Arc::clone(&stop);
+        let reader_pause_requested = Arc::clone(&pause_requested);
+        let reader_paused = Arc::clone(&paused);
         let reader = thread::Builder::new()
             .name("agent-console-input".into())
             .spawn(move || {
                 let result = if interactive {
-                    read_keys(&reader_state, &reader_stop, &sender)
+                    read_keys(
+                        &reader_state,
+                        &reader_stop,
+                        &reader_pause_requested,
+                        &reader_paused,
+                        &sender,
+                    )
                 } else {
                     read_lines(&reader_stop, &sender)
                 };
@@ -3131,6 +3213,8 @@ impl Console {
                 _lifetime: Arc::new(Lifetime {
                     state,
                     stop,
+                    pause_requested,
+                    paused,
                     reader: Mutex::new(Some(reader)),
                     interactive,
                     surface,
@@ -4796,10 +4880,19 @@ impl Console {
 /// when an earlier one fails, so a single failure cannot leave the terminal
 /// half restored; the first error is reported.
 fn restore_terminal(output: &mut impl Write, surface: &TerminalSurface) -> io::Result<()> {
+    let screen = release_terminal_surface(output, surface);
+    let mode = if super::view_upgrade::handoff_in_progress() {
+        Ok(())
+    } else {
+        terminal::disable_raw_mode()
+    };
+    screen.and(mode)
+}
+
+fn release_terminal_surface(output: &mut impl Write, surface: &TerminalSurface) -> io::Result<()> {
     let screen = surface.release(surface.renderer(), output);
     let cursor = execute!(output, Show);
-    let mode = terminal::disable_raw_mode();
-    screen.and(cursor).and(mode)
+    screen.and(cursor)
 }
 
 /// Bracketed paste, focus reporting and disambiguated keys go on and off together with the
@@ -5314,6 +5407,9 @@ impl State {
         self.awaiting_input_echoes.clear();
         self.rendered_execution_losses.clear();
         self.scrollback.set_auto_scroll(auto_scroll);
+        if let Some(checkpoint) = self.pending_upgrade_scroll.remove(&self.chat) {
+            self.scrollback.restore_upgrade_checkpoint(checkpoint);
+        }
         self.rendered_region = None;
     }
 
@@ -5334,7 +5430,32 @@ impl State {
                 }
             }
         }
+        self.apply_agent_runtime_banner(chat);
         self.reset_chat_surfaces(chat, preserve_editor_context);
+    }
+
+    fn apply_agent_runtime_banner(&mut self, chat: Uuid) -> bool {
+        let Some(prefix) = self.creation_prefixes.get(&Some(chat)) else {
+            return false;
+        };
+        let mut at = 0;
+        for entry in prefix {
+            let CreationPrefixEntry::Output(ConversationPiece::Styled(text, _)) = entry else {
+                break;
+            };
+            at += text.bytes().filter(|byte| *byte == b'\n').count();
+        }
+        if at == 0 {
+            return false;
+        }
+        let text = self.agent_runtime_banners.get(&chat).map(String::as_str);
+        if self.chat == Some(chat) {
+            self.scrollback.set_agent_runtime_banner(at, text)
+        } else {
+            self.view_cache
+                .get_mut(&Some(chat))
+                .is_some_and(|view| view.scrollback.set_agent_runtime_banner(at, text))
+        }
     }
 
     fn switch_view_chat(&mut self, chat: Option<Uuid>) {
@@ -5538,6 +5659,7 @@ impl State {
             height: usize::from(height).max(1),
             scrollback: Scrollback::new(),
             creation_prefixes: HashMap::new(),
+            agent_runtime_banners: HashMap::new(),
             echoed_inputs: HashSet::new(),
             awaiting_input_echoes: HashSet::new(),
             agent_colors: AgentColors::default(),
@@ -5558,6 +5680,7 @@ impl State {
             editor: Editor::new(),
             editor_cache: HashMap::new(),
             view_cache: HashMap::new(),
+            pending_upgrade_scroll: HashMap::new(),
             paste_blocks: PasteBlocks::new(),
             restored_contexts: Vec::new(),
             input_stash: None,
@@ -6293,7 +6416,21 @@ impl State {
             (self.overview.projection.is_none() && !self.full_review && self.transcript.is_none())
                 .then(|| self.scrollback.next_flash_frame_ms(now_ms, self.display))
                 .flatten();
-        monitor.into_iter().chain(panel).chain(conversation).min()
+        let update = (!self.full_review && self.transcript.is_none() && !self.help_open)
+            .then(|| {
+                super::update_notice::next_frame_ms(
+                    self.update_notice.as_ref(),
+                    self.display,
+                    now_ms,
+                )
+            })
+            .flatten();
+        monitor
+            .into_iter()
+            .chain(panel)
+            .chain(conversation)
+            .chain(update)
+            .min()
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -8144,8 +8281,12 @@ impl State {
                         HINT_NOTICE_GAP_COLUMNS
                     };
                     let available = self.width.saturating_sub(shortcut_columns + gap_columns);
-                    notice_line =
-                        super::update_notice::line(self.update_notice.as_ref().unwrap(), available);
+                    notice_line = super::update_notice::line(
+                        self.update_notice.as_ref().unwrap(),
+                        available,
+                        self.display,
+                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                    );
                 }
                 if self.execution_connection_notice.is_some()
                     && self.ordinary_input_is_visible()
@@ -11883,13 +12024,33 @@ impl State {
 fn read_keys(
     state: &Arc<Mutex<State>>,
     stop: &AtomicBool,
+    pause_requested: &AtomicBool,
+    paused: &AtomicBool,
     sender: &mpsc::Sender<InputEvent>,
 ) -> io::Result<()> {
+    if pause_requested.load(Ordering::Acquire) {
+        paused.store(true, Ordering::Release);
+        while pause_requested.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        paused.store(false, Ordering::Release);
+    }
     // A drag reports every cell it crosses; frames wait until the queued motion is read, so a
     // resize or selection re-lays the conversation once per batch instead of once per cell.
     let mut deferred_frame = false;
     while !stop.load(Ordering::Acquire) {
         let input_was_idle = !event::poll(Duration::ZERO)?;
+        if input_was_idle
+            && pause_requested.load(Ordering::Acquire)
+            && event::input_buffer_is_empty()
+        {
+            paused.store(true, Ordering::Release);
+            while pause_requested.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            paused.store(false, Ordering::Release);
+            continue;
+        }
         if input_was_idle {
             let mut state = state
                 .lock()
@@ -12875,6 +13036,8 @@ mod tests {
             _lifetime: Arc::new(Lifetime {
                 state,
                 stop: Arc::new(AtomicBool::new(false)),
+                pause_requested: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
                 reader: Mutex::new(None),
                 interactive: false,
                 surface,

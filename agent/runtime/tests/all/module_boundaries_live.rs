@@ -221,13 +221,13 @@ async fn verify_live_lifecycle(provider: &str, model: &str) {
 #[tokio::test]
 #[ignore = "calls the billed DeepSeek API and reviews an authorized temporary file command"]
 async fn deepseek_model_module_lifecycle() {
-    verify_live_lifecycle("deepseek-api", "deepseek-flash-messages").await;
+    verify_live_lifecycle("deepseek-api", "deepseek-flash").await;
 }
 
 #[tokio::test]
 #[ignore = "uses existing Tickloop Codex credentials and reviews an authorized temporary file command"]
 async fn codex_model_module_lifecycle() {
-    verify_live_lifecycle("openai-codex", "gpt-5.6-sol-responses").await;
+    verify_live_lifecycle("openai-codex", "gpt-5.6-sol").await;
 }
 
 #[tokio::test]
@@ -237,8 +237,8 @@ async fn environment_proxy_text_requests() {
         .canonicalize()
         .unwrap();
     for (provider, model) in [
-        ("deepseek-api", "deepseek-flash-messages"),
-        ("openai-codex", "gpt-5.6-sol-responses"),
+        ("deepseek-api", "deepseek-flash"),
+        ("openai-codex", "gpt-5.6-sol"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let config = ModelCatalog::defaults().get(provider, model).unwrap();

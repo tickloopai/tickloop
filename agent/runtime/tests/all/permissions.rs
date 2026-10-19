@@ -575,7 +575,7 @@ async fn invalid_classifications_request_a_human_after_both_stages_fail() {
         assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|request| {
             request.tools.is_empty()
-                && request.temperature == Some(0.0)
+                && request.temperature.is_none()
                 && request
                     .structured_output
                     .as_ref()
@@ -1908,7 +1908,7 @@ async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_fil
     let mut checker = built_in_model_profiles()
         .into_iter()
         .find(|profile| {
-            profile.provider_id == "deepseek-api" && profile.model_id == "deepseek-flash-messages"
+            profile.provider_id == "deepseek-api" && profile.model_id == "deepseek-flash"
         })
         .unwrap();
     checker.max_output_tokens = 1024;

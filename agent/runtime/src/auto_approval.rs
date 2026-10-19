@@ -483,9 +483,6 @@ impl Agent {
             reported_model: None,
         };
         let mut request = auto_mode::classifier_request(context, stage);
-        if client.supports_reasoning_effort(tickloop_agent_protocol::ReasoningEffort::Off) {
-            request.reasoning_effort = Some(tickloop_agent_protocol::ReasoningEffort::Off);
-        }
         let mut attempts = Vec::new();
         let mut invalid_reason = "invalid classification";
         for _ in 0..max_attempts {

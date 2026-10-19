@@ -54,7 +54,12 @@ impl Agent {
         let admission = self.inner.tasks.token();
         let (plan, sequence, client, cancel) = {
             let mut chats = self.inner.chats.lock().await;
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
+                || self
+                    .inner
+                    .upgrade_paused
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(AgentError::Invalid("agent host has shut down".into()));
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;

@@ -20,6 +20,7 @@ sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tickloop-agent-base = { path = "../base" }
-tokio = { version = "1", features = ["full"] }
+tickloop-tickhost-connect = { path = "../../tickhost/connect" }
+tokio = { version = "1.53.3", features = ["full"] }
 
 [dev-dependencies]

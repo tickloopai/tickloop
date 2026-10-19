@@ -166,6 +166,7 @@ impl Agent {
     }
 
     async fn record_watched_command(&self, chat_id: ChatId, command: CommandSnapshot) {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         loop {
             match self.record_command(chat_id, command.clone()).await {
                 Ok(_) => return,

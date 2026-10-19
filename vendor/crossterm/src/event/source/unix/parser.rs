@@ -18,6 +18,10 @@ pub(super) struct Parser {
 }
 
 impl Parser {
+    pub(super) fn input_buffer_is_empty(&self) -> bool {
+        self.buffer.is_empty() && self.internal_events.is_empty()
+    }
+
     pub(super) fn has_events(&self) -> bool {
         !self.internal_events.is_empty()
     }

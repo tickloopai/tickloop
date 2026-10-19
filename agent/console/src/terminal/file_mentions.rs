@@ -6,13 +6,13 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use tickloop_agent_protocol::ExecutionRef;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum MentionKind {
     File,
     Directory,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct FamilyMentionTarget {
     pub execution: ExecutionRef,
     pub handle: String,
@@ -20,7 +20,7 @@ pub(super) struct FamilyMentionTarget {
     pub available: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct AcceptedFamilyMention {
     pub target: FamilyMentionTarget,
     pub replacement_range: Range<usize>,
@@ -58,7 +58,7 @@ pub(super) struct AppliedMention {
     pub token: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct AcceptedMention {
     pub token: String,
     pub canonical_path: PathBuf,
@@ -289,7 +289,6 @@ impl FileMentionState {
         self.selected
     }
 
-    #[cfg(test)]
     pub(super) fn accepted_mentions(&self) -> impl ExactSizeIterator<Item = &AcceptedMention> {
         self.accepted.iter()
     }

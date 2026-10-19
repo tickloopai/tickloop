@@ -1,0 +1,56 @@
+[
+  {
+    "Hello": {
+      "process_id": 4242,
+      "major": 26,
+      "minor": 2,
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "session_id": "00000000-0000-0000-0000-000000000051",
+      "capabilities": [
+        "Overview",
+        "ChunkedResponses"
+      ],
+      "limits": {
+        "frame_bytes": 134217728,
+        "source_items": 4096,
+        "feed_items": 1024,
+        "feed_bytes": 8388608,
+        "change_bytes": 1048576,
+        "receipt_items": 4096,
+        "receipt_seconds": 600,
+        "view_lease_seconds": 45,
+        "page_items": 256,
+        "default_page_items": 100,
+        "chunk_bytes": 4194304
+      },
+      "build": "0.2.0+00c0ffee00c0ffee",
+      "executable": "/opt/tickloop/bin/tickloop",
+      "handoff": {
+        "version": 1,
+        "resume_token": "test-only-session-secret"
+      }
+    }
+  },
+  {
+    "HandoffPrepare": {
+      "transfer_id": "00000000-0000-0000-0000-000000000071"
+    }
+  },
+  {
+    "HandoffAbort": {
+      "transfer_id": "00000000-0000-0000-0000-000000000071"
+    }
+  },
+  {
+    "NotAccepted": {
+      "request_id": "00000000-0000-0000-0000-000000000003",
+      "transfer_id": "00000000-0000-0000-0000-000000000071"
+    }
+  },
+  {
+    "HandoffCommit": {
+      "transfer_id": "00000000-0000-0000-0000-000000000071",
+      "successor_process_id": 4243
+    }
+  }
+]

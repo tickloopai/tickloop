@@ -1,9 +1,8 @@
 //! The Agent daemon's single controller of the Tickhost. The daemon starts the host on its first
 //! open or Shell spawn, keeps the controller key in its private runtime directory so a restarted
-//! daemon fences the previous one, and never replaces a host it cannot verify. It works only with
-//! a host of its own build, which the host's frozen management hello names: a host of another
-//! build that runs nothing is replaced at once, and one that runs Ticks, Shell tasks or
-//! connections only on the user's word. An Agent without a daemon that is given a host of its
+//! daemon fences the previous one, and never replaces a host it cannot verify. Compatible hosts
+//! keep their instances across product upgrades; changed host content is replaced once empty.
+//! An Agent without a daemon that is given a host of its
 //! own, as in tests, controls one served inside its process.
 
 use std::{
@@ -26,8 +25,8 @@ use tickhost::{
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
-        BUILD_VERSION, BUSINESS_MAJOR, BUSINESS_MINOR, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT,
-        HelloReply, HostConnection, ManagementConnection, Role,
+        BUSINESS_MAJOR, BUSINESS_MINOR, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HelloReply,
+        HostConnection, ManagementConnection, Role,
     },
 };
 use tickloop_agent_protocol::{HostedViewGrant, OtherTickhost, TickhostOccupancy};
@@ -57,7 +56,7 @@ const INCOMPATIBLE_HOST: &str = "IncompatibleHost";
 /// A host of another build that ran nothing was stopped, so one of this build may start.
 const HOST_REPLACED: &str = "HostReplaced";
 /// What a request meets while a Tickhost of another build runs Ticks, Shell tasks or connections.
-pub const OTHER_TICKHOST_BUILD: &str = "The running Tickhost is another version; restart tickloop and choose to restart the Tickhost at the prompt, or run `tickhost stop` (its Ticks end)";
+pub const OTHER_TICKHOST_BUILD: &str = "The running Tickhost uses an incompatible protocol; its existing work is preserved and activation is deferred. `tickhost stop` explicitly ends its Ticks and Shells";
 /// How a host older than the build field appears in a mismatch.
 const UNNAMED_TICKHOST_BUILD: &str = "unknown (an older Tickhost)";
 /// Stopping a host ends each of its Ticks after their terminate grace, side by side.
@@ -196,6 +195,76 @@ impl HostController {
 
     pub fn daemon_epoch(&self) -> Uuid {
         self.daemon_epoch
+    }
+
+    /// Keeps the existing daemon generation connected while its successor takes ownership.
+    /// The successor constructs this controller with the preserved epoch before calling here.
+    pub async fn prepare_daemon_handoff(&self) -> Result<(), HostError> {
+        let connection = match self.connect_running().await {
+            Ok(connection) => connection,
+            Err(error) if error.code == HOST_NOT_RUNNING => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        *self.lifeline.lock().await = Some(connection);
+        Ok(())
+    }
+
+    /// Releases this daemon's connections after its successor connects and old callers quiesce.
+    pub async fn relinquish_daemon(&self) {
+        let _starting = self.starting.lock().await;
+        self.idle.lock().await.clear();
+        self.lifeline.lock().await.take();
+    }
+
+    /// Retires changed, empty content without starting a host or adding pooled connections.
+    pub async fn maintain_upgrade(&self) -> Result<(), HostError> {
+        if self.verified_epoch.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let Ok(_starting) = self.starting.try_lock() else {
+            return Ok(());
+        };
+        let Some(management) = self.management().await? else {
+            return Ok(());
+        };
+        let epoch = management.hello().epoch;
+        if is_this_build(management.hello()) {
+            *self.verified_epoch.lock().unwrap() = Some(epoch);
+            return Ok(());
+        }
+        let own_connections = self
+            .idle
+            .lock()
+            .await
+            .iter()
+            .filter(|connection| connection.epoch() == epoch)
+            .count()
+            + self.lifeline.try_lock().map_or(0, |lifeline| {
+                usize::from(
+                    lifeline
+                        .as_ref()
+                        .is_some_and(|connection| connection.epoch() == epoch),
+                )
+            });
+        if runs_nothing(management.hello(), own_connections)
+            && management
+                .shutdown_idle_host(own_connections, HOST_SHUTDOWN_TIMEOUT)
+                .await?
+        {
+            self.wait_stopped().await?;
+            self.idle
+                .lock()
+                .await
+                .retain(|connection| connection.epoch() != epoch);
+            let mut lifeline = self.lifeline.lock().await;
+            if lifeline
+                .as_ref()
+                .is_some_and(|connection| connection.epoch() == epoch)
+            {
+                lifeline.take();
+            }
+        }
+        Ok(())
     }
 
     pub fn endpoint(&self) -> PathBuf {
@@ -550,7 +619,12 @@ impl HostController {
         // A connection to a host that has since exited fails before anything is sent; that one
         // request is safely retried on a fresh connection, starting a new host if needed.
         for attempt in 0..2 {
-            let idle = self.idle.lock().await.pop();
+            let idle = self
+                .idle
+                .lock()
+                .await
+                .pop()
+                .filter(|connection| self.is_verified(connection.epoch()));
             let mut connection = match (idle, start) {
                 (Some(connection), _) => connection,
                 (None, Start::OnDemand) => self.connect_or_start().await?,
@@ -671,10 +745,7 @@ impl HostController {
         }
     }
 
-    /// Connects as this daemon's controller to a host of its build, which the host's management
-    /// hello names once per host process. A host of another build that runs nothing is stopped,
-    /// and `HOST_REPLACED` lets one of this build start; one that runs Ticks, Shell tasks or
-    /// connections is refused with what the user can do.
+    /// Negotiates protocol compatibility before choosing whether changed content can be replaced.
     async fn connect(&self, key: &str) -> Result<HostConnection, HostError> {
         let connection = HostConnection::connect(
             &self.paths.socket(),
@@ -699,16 +770,30 @@ impl HostController {
             Err(_) => return Err(other_build()),
         };
         if is_this_build(management.hello()) {
-            *self.verified_epoch.lock().unwrap() = Some(management.hello().epoch);
+            if connection.is_ok() {
+                *self.verified_epoch.lock().unwrap() = Some(management.hello().epoch);
+            }
             return connection;
         }
         // The host counts the business connection this daemon just made among its own.
-        let own_connections = usize::from(connection.is_ok());
-        drop(connection);
+        let own_connections = usize::from(connection.is_ok())
+            + self.idle.lock().await.len()
+            + self
+                .lifeline
+                .try_lock()
+                .map_or(0, |lifeline| usize::from(lifeline.is_some()));
         if !runs_nothing(management.hello(), own_connections) {
-            return Err(other_build());
+            return connection.map_err(|_| other_build());
         }
-        self.stop(management).await?;
+        if !management
+            .shutdown_idle_host(own_connections, HOST_SHUTDOWN_TIMEOUT)
+            .await?
+        {
+            return connection.map_err(|_| other_build());
+        }
+        drop(connection);
+        self.wait_stopped().await?;
+        self.idle.lock().await.clear();
         Err(HostError::before(
             HOST_REPLACED,
             "stopped a Tickhost of another build that ran nothing",
@@ -741,6 +826,15 @@ impl HostController {
     /// end Ticks, Shell tasks or connections, or it cannot say; one that runs nothing is replaced
     /// at once.
     pub async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, HostError> {
+        match self.connect_running().await {
+            Ok(connection) => {
+                self.idle.lock().await.push(connection);
+                return Ok(None);
+            }
+            Err(error) if error.code == HOST_NOT_RUNNING => return Ok(None),
+            Err(error) if error.code == INCOMPATIBLE_HOST => {}
+            Err(error) => return Err(error),
+        }
         let _starting = self.starting.lock().await;
         let Some(management) = self.management().await? else {
             return Ok(None);
@@ -748,10 +842,6 @@ impl HostController {
         let hello = management.hello().clone();
         if is_this_build(&hello) {
             *self.verified_epoch.lock().unwrap() = Some(hello.epoch);
-            return Ok(None);
-        }
-        if runs_nothing(&hello, 0) {
-            self.stop(management).await?;
             return Ok(None);
         }
         Ok(Some(OtherTickhost {
@@ -794,6 +884,10 @@ impl HostController {
     /// this build can take it at once.
     async fn stop(&self, management: ManagementConnection) -> Result<(), HostError> {
         management.shutdown_host(HOST_SHUTDOWN_TIMEOUT).await?;
+        self.wait_stopped().await
+    }
+
+    async fn wait_stopped(&self) -> Result<(), HostError> {
         let deadline = tokio::time::Instant::now() + START_WAIT;
         while self
             .paths
@@ -811,13 +905,13 @@ impl HostController {
         Ok(())
     }
 
-    /// Refuses to start a Tickhost of another build: its version must be this daemon's.
+    /// Only the selected executable's component content may start a new host.
     fn check_executable(&self) -> Result<(), HostError> {
         let HostProgram::Executable(executable) = &self.program else {
             return Ok(());
         };
         let output = std::process::Command::new(executable)
-            .arg("--version")
+            .arg("--content-identity")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -831,7 +925,7 @@ impl HostController {
                 )
             })?;
         let reported = String::from_utf8_lossy(&output.stdout);
-        let expected = format!("{TICKHOST_EXECUTABLE} {BUILD_VERSION}");
+        let expected = tickhost::host::BUILD_IDENTITY;
         if !output.status.success() || reported.trim() != expected {
             return Err(HostError::before(
                 "IncompatibleHost",
@@ -893,14 +987,13 @@ fn is_definite_refusal(error: &HostError) -> bool {
     matches!(error.code.as_str(), INCOMPATIBLE_HOST | "Forbidden")
 }
 
-/// Whether a management hello names this daemon's build and business protocol; a host too old to
-/// name its build is another.
+/// Product versions do not change the identity of unchanged Tickhost content.
 fn is_this_build(hello: &HelloReply) -> bool {
-    hello.version == BUILD_VERSION
-        && hello.host.as_ref().is_some_and(|host| {
-            host.build == tickhost::host::BUILD_IDENTITY
-                && (host.business_major, host.business_minor) == (BUSINESS_MAJOR, BUSINESS_MINOR)
-        })
+    hello.host.as_ref().is_some_and(|host| {
+        host.build == tickhost::host::BUILD_IDENTITY
+            && host.business_major == BUSINESS_MAJOR
+            && host.business_minor == BUSINESS_MINOR
+    })
 }
 
 /// Whether stopping the host ends nothing beyond `own_connections` of this daemon's; a host too
@@ -911,6 +1004,7 @@ fn runs_nothing(hello: &HelloReply, own_connections: usize) -> bool {
         occupancy.ticks.is_empty()
             && occupancy.shells == 0
             && occupancy.pending == Some(0)
+            && occupancy.views == Some(0)
             && occupancy.connections <= own_connections
     })
 }

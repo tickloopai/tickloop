@@ -56,6 +56,18 @@ pub(super) struct DialogState {
 }
 
 impl DialogState {
+    pub(super) fn blocks_upgrade(&self) -> bool {
+        self.menu.is_some()
+            || self.picker_search.is_some()
+            || self.artifacts_picker.is_some()
+            || self.ticks_panel.is_some()
+            || self.conversation_picker.is_some()
+            || self.menu_comment.is_some()
+            || self.question_menu.is_some()
+            || self.permissions_surface.is_some()
+            || self.history_search.is_some()
+    }
+
     fn complete_login(&mut self, id: Uuid, status: &str, notice: &str) -> bool {
         self.menu.as_mut().is_some_and(|menu| {
             complete_login_menu(menu, &mut self.picker_presentation, id, status, notice)

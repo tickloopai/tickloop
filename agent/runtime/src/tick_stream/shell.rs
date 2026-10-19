@@ -365,7 +365,7 @@ impl ShellObserver {
             owned.iter().copied(),
         );
         for watch in owned.difference(&self.ready).copied().collect::<Vec<_>>() {
-            self.publisher.ready(watch);
+            self.publisher.ready_at(watch, u64::from(is_ended));
             self.ready.insert(watch);
             if !is_ended {
                 self.awaiting_exit.insert(watch);

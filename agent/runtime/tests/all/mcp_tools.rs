@@ -2028,10 +2028,7 @@ async fn login_reveals_the_tools_and_an_approved_edit_is_sent_once() {
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
-    assert!(
-        !permission.input.to_string().contains("# Private"),
-        "the approval shows a digest of the body"
-    );
+    assert_eq!(permission.input["content"], "# Private");
     assert!(service.tool_calls().is_empty());
     agent
         .answer_permission(chat, permission.id, true)

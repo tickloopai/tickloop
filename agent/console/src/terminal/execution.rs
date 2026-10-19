@@ -274,6 +274,7 @@ impl EventRecovery {
 
 struct Inner {
     access: Arc<dyn AgentAccess>,
+    upgrades_supported: bool,
     epoch: Uuid,
     launch: LaunchSpec,
     recovery: Option<RecoveringAgentClient>,
@@ -561,6 +562,8 @@ impl ConsoleExecution {
         host: Option<HostLocation>,
     ) -> Self {
         let epoch = client.daemon_epoch();
+        let upgrades_supported = client.protocol().upgrade_protocol
+            == Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION);
         let view = ViewRef {
             session_id: client.session_id(),
             view_id: Uuid::new_v4(),
@@ -579,9 +582,9 @@ impl ConsoleExecution {
         );
         let mut execution =
             Self::from_access(Arc::new(recovery.clone()), epoch, view, launch, host);
-        Arc::get_mut(&mut execution.inner)
-            .expect("new connection is unique")
-            .recovery = Some(recovery);
+        let inner = Arc::get_mut(&mut execution.inner).expect("new connection is unique");
+        inner.recovery = Some(recovery);
+        inner.upgrades_supported = upgrades_supported;
         execution
     }
 
@@ -595,6 +598,7 @@ impl ConsoleExecution {
         Self {
             inner: Arc::new(Inner {
                 access,
+                upgrades_supported: false,
                 epoch,
                 launch,
                 recovery: None,
@@ -881,8 +885,12 @@ impl ConsoleExecution {
         }))
     }
 
+    pub(super) fn cached_reference(&self, chat: Uuid) -> Option<ExecutionRef> {
+        self.inner.references.read().unwrap().get(&chat).copied()
+    }
+
     pub(super) async fn reference(&self, chat: Uuid) -> Result<ExecutionRef, AccessError> {
-        if let Some(reference) = self.inner.references.read().unwrap().get(&chat).copied() {
+        if let Some(reference) = self.cached_reference(chat) {
             return Ok(reference);
         }
         self.catalog().await?;
@@ -3339,6 +3347,61 @@ impl ConsoleExecution {
             ObservationValue::OtherTickhost(other) => Ok(other),
             _ => Err(unexpected()),
         }
+    }
+
+    pub(super) fn supports_runtime_upgrade(&self) -> bool {
+        self.inner.upgrades_supported
+    }
+
+    pub(super) fn is_handing_off(&self) -> bool {
+        self.inner
+            .recovery
+            .as_ref()
+            .is_some_and(RecoveringAgentClient::is_handing_off)
+    }
+
+    pub(super) fn upgrade_configuration(&self) -> Result<Option<serde_json::Value>, String> {
+        if self.inner.first_create.lock().unwrap().is_some()
+            || !self.inner.unconfirmed_inputs.lock().unwrap().is_empty()
+        {
+            return Ok(None);
+        }
+        serde_json::to_value(&*self.inner.draft.lock().unwrap())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn restore_upgrade_configuration(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        *self.inner.draft.lock().unwrap() =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(super) async fn runtime_version(
+        &self,
+    ) -> Result<tickloop_agent_protocol::RuntimeVersion, AccessError> {
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::RuntimeVersion)
+            .await?
+            .initial
+        {
+            ObservationValue::RuntimeVersion(version) => Ok(*version),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn request_runtime_upgrade(
+        &self,
+        executable: PathBuf,
+    ) -> Result<(), AccessError> {
+        self.command(AgentCommand::UpgradeRuntime { executable }, None)
+            .await?;
+        Ok(())
     }
     pub(super) async fn hosted_ticks(&self, chat: Uuid) -> Result<Vec<HostedMember>, AccessError> {
         let execution = self.reference(chat).await?;

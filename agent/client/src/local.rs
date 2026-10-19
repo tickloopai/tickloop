@@ -1,7 +1,10 @@
 use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Weak},
+    collections::{BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -11,7 +14,7 @@ use tokio::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -19,11 +22,17 @@ use uuid::Uuid;
 use super::frame::{read_frame, verify_peer, write_frame};
 use super::incoming::IncomingTransfer;
 use tickloop_agent_protocol::{
-    AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess, ClientMessage,
-    CommandEnvelope, CommandReceipt, Cursor, DisplayReceipt, DisplayUpdate, FEED_CAPACITY,
-    HANDSHAKE_FRAME_BYTES, Observation, ObservationRequest, ObservationUpdate, ObservationValue,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, ResetReason, ServerHello, ServerMessage, bounded_update,
+    AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess,
+    CLIENT_HANDOFF_VERSION, ClientHandoffHello, ClientMessage, CommandEnvelope, CommandReceipt,
+    Cursor, DisplayReceipt, DisplayUpdate, FEED_CAPACITY, HANDSHAKE_FRAME_BYTES, Observation,
+    ObservationRequest, ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ResetReason, ServerHello, ServerMessage, bounded_update,
 };
+
+mod handoff;
+#[cfg(test)]
+mod handoff_tests;
+use handoff::{HandoffState, WritePhase};
 
 #[derive(Clone)]
 pub struct LocalAgentClient {
@@ -32,9 +41,12 @@ pub struct LocalAgentClient {
 
 struct ClientInner {
     writer: Arc<Mutex<OwnedWriteHalf>>,
-    hello: ServerHello,
+    hello: RwLock<ServerHello>,
+    endpoint: PathBuf,
+    handoff: watch::Sender<HandoffState>,
+    write_queue: Arc<WriteQueue>,
     limits: AccessLimits,
-    pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<Reply, AccessError>>>>,
+    pending: Mutex<HashMap<Uuid, PendingRequest>>,
     subscriptions: Mutex<HashMap<Uuid, Subscription>>,
     /// Cancelled once the connection takes no more requests: a write failed, the daemon closed
     /// it, or the client was dropped.
@@ -45,12 +57,64 @@ struct ClientInner {
     reader_stop: CancellationToken,
 }
 
+struct PendingRequest {
+    sender: oneshot::Sender<Result<Reply, AccessError>>,
+    written: bool,
+    attempt: Uuid,
+    order: u64,
+    notification: Option<watch::Sender<Option<u64>>>,
+}
+
+struct WriteQueue {
+    next: AtomicU64,
+    waiting: std::sync::Mutex<BTreeSet<u64>>,
+    changed: watch::Sender<()>,
+}
+
+impl WriteQueue {
+    fn remove(&self, order: u64) {
+        self.waiting.lock().unwrap().remove(&order);
+        self.changed.send_replace(());
+    }
+
+    fn is_first(&self, order: u64) -> bool {
+        self.waiting.lock().unwrap().first() == Some(&order)
+    }
+}
+
+struct WriteTicket {
+    queue: Arc<WriteQueue>,
+    order: u64,
+}
+
+impl WriteTicket {
+    fn new(queue: Arc<WriteQueue>) -> Result<Self, AccessError> {
+        let mut waiting = queue.waiting.lock().unwrap();
+        let order = queue
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| AccessError::invalid("client request sequence exhausted"))?;
+        waiting.insert(order);
+        drop(waiting);
+        Ok(Self { queue, order })
+    }
+}
+
+impl Drop for WriteTicket {
+    fn drop(&mut self) {
+        self.queue.remove(self.order);
+    }
+}
+
 struct PendingObservationCancel {
     writer: Weak<Mutex<OwnedWriteHalf>>,
     connection: CancellationToken,
     limits: AccessLimits,
     request_id: Uuid,
-    written: Option<oneshot::Receiver<()>>,
+    handoff: watch::Receiver<HandoffState>,
+    written: Option<watch::Receiver<Option<u64>>>,
 }
 
 async fn write_observation_cancel(
@@ -58,12 +122,23 @@ async fn write_observation_cancel(
     connection: CancellationToken,
     limits: AccessLimits,
     observation_id: Uuid,
+    mut handoff: watch::Receiver<HandoffState>,
+    generation: u64,
 ) {
     let result = tokio::select! {
         biased;
         () = connection.cancelled() => return,
         result = async {
-            write_frame(&mut *writer.lock().await, &ClientMessage::CancelObservation { observation_id }, limits.frame_bytes()).await
+            loop {
+                let mut writer = writer.lock().await;
+                let state = *handoff.borrow_and_update();
+                if state.generation != generation { return Ok(()); }
+                if state.phase == WritePhase::Serving {
+                    return write_frame(&mut *writer, &ClientMessage::CancelObservation { observation_id }, limits.frame_bytes()).await;
+                }
+                drop(writer);
+                handoff.changed().await.map_err(|_| AccessError::unavailable("handoff state closed"))?;
+            }
         } => result,
     };
     if result.is_err() {
@@ -73,7 +148,7 @@ async fn write_observation_cancel(
 
 impl Drop for PendingObservationCancel {
     fn drop(&mut self) {
-        let Some(written) = self.written.take() else {
+        let Some(mut written) = self.written.take() else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -83,16 +158,30 @@ impl Drop for PendingObservationCancel {
         let connection = self.connection.clone();
         let limits = self.limits;
         let observation_id = self.request_id;
+        let handoff = self.handoff.clone();
         runtime.spawn(async move {
-            tokio::select! {
-                biased;
-                () = connection.cancelled() => return,
-                result = written => if result.is_err() { return; },
-            }
+            let generation = loop {
+                if let Some(generation) = *written.borrow_and_update() {
+                    break generation;
+                }
+                tokio::select! {
+                    biased;
+                    () = connection.cancelled() => return,
+                    result = written.changed() => if result.is_err() { return; },
+                }
+            };
             let Some(writer) = writer.upgrade() else {
                 return;
             };
-            write_observation_cancel(writer, connection, limits, observation_id).await;
+            write_observation_cancel(
+                writer,
+                connection,
+                limits,
+                observation_id,
+                handoff,
+                generation,
+            )
+            .await;
         });
     }
 }
@@ -104,6 +193,7 @@ struct Subscription {
 }
 
 enum Reply {
+    NotAccepted,
     Message(Box<ServerMessage>),
     Opened {
         initial: ObservationValue,
@@ -122,16 +212,31 @@ impl Drop for ClientInner {
 
 impl LocalAgentClient {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, AccessError> {
-        let mut stream = UnixStream::connect(path)
+        let endpoint = path.as_ref().to_path_buf();
+        let mut stream = UnixStream::connect(&endpoint)
             .await
             .map_err(|error| AccessError::unavailable(error.to_string()))?;
         verify_peer(&stream)?;
-        let (hello, limits) = negotiate(&mut stream).await?;
+        let (hello, limits) = negotiate_handoff(
+            &mut stream,
+            Some(ClientHandoffHello {
+                version: CLIENT_HANDOFF_VERSION,
+                resume: None,
+            }),
+        )
+        .await?;
         let (reader, writer) = stream.into_split();
         let reader_stop = CancellationToken::new();
         let inner = Arc::new(ClientInner {
             writer: Arc::new(Mutex::new(writer)),
-            hello,
+            hello: RwLock::new(hello),
+            endpoint,
+            handoff: watch::channel(HandoffState::default()).0,
+            write_queue: Arc::new(WriteQueue {
+                next: AtomicU64::new(1),
+                waiting: std::sync::Mutex::new(BTreeSet::new()),
+                changed: watch::channel(()).0,
+            }),
             limits,
             pending: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
@@ -151,11 +256,15 @@ impl LocalAgentClient {
         !self.inner.cancel.is_cancelled()
     }
 
-    pub fn daemon_epoch(&self) -> Uuid {
-        self.inner.hello.daemon_epoch
+    pub fn is_handing_off(&self) -> bool {
+        self.inner.handoff.borrow().phase != WritePhase::Serving
     }
-    pub fn protocol(&self) -> &ServerHello {
-        &self.inner.hello
+
+    pub fn daemon_epoch(&self) -> Uuid {
+        self.inner.hello.read().unwrap().daemon_epoch
+    }
+    pub fn protocol(&self) -> ServerHello {
+        self.inner.hello.read().unwrap().clone()
     }
     pub async fn shutdown_daemon(&self) -> Result<(), AccessError> {
         let request_id = Uuid::new_v4();
@@ -179,11 +288,11 @@ impl LocalAgentClient {
     }
 
     pub fn server_process_id(&self) -> u32 {
-        self.inner.hello.process_id
+        self.inner.hello.read().unwrap().process_id
     }
 
     pub fn session_id(&self) -> Uuid {
-        self.inner.hello.session_id
+        self.inner.hello.read().unwrap().session_id
     }
 
     async fn request(
@@ -199,46 +308,122 @@ impl LocalAgentClient {
         &self,
         request_id: Uuid,
         message: ClientMessage,
-        written: Option<oneshot::Sender<()>>,
+        written: Option<watch::Sender<Option<u64>>>,
+    ) -> Result<Reply, AccessError> {
+        let ticket = WriteTicket::new(self.inner.write_queue.clone())?;
+        loop {
+            let reply = self
+                .request_once(request_id, message.clone(), written.clone(), ticket.order)
+                .await?;
+            if !matches!(reply, Reply::NotAccepted) {
+                return Ok(reply);
+            }
+        }
+    }
+
+    async fn request_once(
+        &self,
+        request_id: Uuid,
+        message: ClientMessage,
+        notification: Option<watch::Sender<Option<u64>>>,
+        order: u64,
     ) -> Result<Reply, AccessError> {
         if self.inner.cancel.is_cancelled() {
             return Err(AccessError::unavailable("daemon connection is closed"));
         }
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(request_id, sender);
-        let detached = written.is_some();
+        let attempt = Uuid::new_v4();
+        self.inner.pending.lock().await.insert(
+            request_id,
+            PendingRequest {
+                sender,
+                written: false,
+                attempt,
+                order,
+                notification,
+            },
+        );
         let inner = Arc::downgrade(&self.inner);
         let writer = self.inner.writer.clone();
         let connection = self.inner.cancel.clone();
         let frame_bytes = self.inner.limits.frame_bytes();
-        let send = async move {
+        let mut handoff = self.inner.handoff.subscribe();
+        let queue = self.inner.write_queue.clone();
+        let mut queue_changed = queue.changed.subscribe();
+        // A canceled caller must never truncate a frame already being written.
+        let send = tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
                 () = connection.cancelled() => Err(AccessError::unavailable("daemon connection is closed")),
-                result = async { write_frame(&mut *writer.lock().await, &message, frame_bytes).await } => result,
+                result = async {
+                    loop {
+                        queue_changed.borrow_and_update();
+                        let Some(client) = inner.upgrade() else { return Ok(()); };
+                        {
+                            let mut requests = client.pending.lock().await;
+                            if requests.get(&request_id).is_none_or(|request| request.sender.is_closed()) {
+                                requests.remove(&request_id);
+                                queue.remove(order);
+                                return Ok(());
+                            }
+                        }
+                        drop(client);
+                        let state = *handoff.borrow_and_update();
+                        if state.phase == WritePhase::Serving && queue.is_first(order) {
+                            let mut writer = writer.lock().await;
+                            let state = *handoff.borrow_and_update();
+                            if state.phase != WritePhase::Serving || !queue.is_first(order) { continue; }
+                            let Some(client) = inner.upgrade() else { return Ok(()); };
+                            {
+                                let mut requests = client.pending.lock().await;
+                                let Some(request) = requests.get_mut(&request_id) else { return Ok(()); };
+                                if request.sender.is_closed() {
+                                    requests.remove(&request_id);
+                                    queue.remove(order);
+                                    return Ok(());
+                                }
+                                request.written = true;
+                            }
+                            drop(client);
+                            write_frame(&mut *writer, &message, frame_bytes).await?;
+                            if let Some(client) = inner.upgrade() {
+                                let requests = client.pending.lock().await;
+                                if let Some(request) = requests.get(&request_id)
+                                    && request.attempt == attempt {
+                                    if let Some(notification) = &request.notification {
+                                        notification.send_replace(Some(state.generation));
+                                    }
+                                    queue.remove(order);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        tokio::select! {
+                            result = handoff.changed() => result.map_err(|_| AccessError::unavailable("handoff state closed"))?,
+                            result = queue_changed.changed() => result.map_err(|_| AccessError::unavailable("write queue closed"))?,
+                        }
+                    }
+                } => result,
             };
-            if let Err(error) = result {
-                if let Some(inner) = inner.upgrade() {
-                    inner.pending.lock().await.remove(&request_id);
+            if let Err(error) = &result {
+                if let Some(client) = inner.upgrade() {
+                    let mut requests = client.pending.lock().await;
+                    if requests
+                        .get(&request_id)
+                        .is_some_and(|request| request.attempt == attempt)
+                    {
+                        requests.remove(&request_id);
+                    }
                 }
+                queue.remove(order);
                 if error.code == AccessErrorCode::Unavailable {
                     connection.cancel();
                 }
-                return Err(error);
             }
-            if let Some(written) = written {
-                let _ = written.send(());
-            }
-            Ok(())
-        };
-        if detached {
-            // Finish the request frame before cancellation is written on the shared stream.
-            tokio::spawn(send)
-                .await
-                .map_err(|_| AccessError::unavailable("observation request writer stopped"))??;
-        } else {
-            send.await?;
-        }
+            result
+        });
+        send.await
+            .map_err(|_| AccessError::unavailable("request writer stopped"))??;
         receiver.await.map_err(|_| {
             AccessError::unavailable("daemon disconnected before returning a result")
         })?
@@ -249,18 +434,22 @@ impl LocalAgentClient {
 impl AgentAccess for LocalAgentClient {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         let request_id = Uuid::new_v4();
-        let (written, waiting) = oneshot::channel();
+        let (written, waiting) = watch::channel(None);
         let mut cancel = PendingObservationCancel {
             writer: Arc::downgrade(&self.inner.writer),
             connection: self.inner.cancel.clone(),
             limits: self.inner.limits,
             request_id,
+            handoff: self.inner.handoff.subscribe(),
             written: Some(waiting),
         };
         let result = self
             .request_with_notification(
                 request_id,
-                ClientMessage::Observe { request_id, query },
+                ClientMessage::Observe {
+                    request_id,
+                    query: query.clone(),
+                },
                 Some(written),
             )
             .await;
@@ -343,11 +532,19 @@ struct PeerVersion {
 pub async fn negotiate(
     stream: &mut UnixStream,
 ) -> Result<(ServerHello, AccessLimits), AccessError> {
+    negotiate_handoff(stream, None).await
+}
+
+async fn negotiate_handoff(
+    stream: &mut UnixStream,
+    handoff: Option<ClientHandoffHello>,
+) -> Result<(ServerHello, AccessLimits), AccessError> {
     write_frame(
         stream,
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -390,6 +587,14 @@ pub async fn negotiate(
             )
         },
     )?;
+    if hello.handoff.as_ref().is_some_and(|handoff| {
+        handoff.version != CLIENT_HANDOFF_VERSION || handoff.resume_token.is_empty()
+    }) {
+        return Err(AccessError::new(
+            AccessErrorCode::VersionMismatch,
+            "unsupported or invalid client handoff protocol",
+        ));
+    }
     Ok((hello, limits))
 }
 
@@ -417,10 +622,13 @@ async fn read_responses(
                 total_bytes,
                 chunk_bytes,
             } => {
-                if !inner
+                let chunks_supported = inner
                     .hello
+                    .read()
+                    .unwrap()
                     .capabilities
-                    .contains(&AccessCapability::ChunkedResponses)
+                    .contains(&AccessCapability::ChunkedResponses);
+                if !chunks_supported
                     || transfer.is_some()
                     || !inner.pending.lock().await.contains_key(&request_id)
                 {
@@ -473,6 +681,44 @@ async fn read_responses(
             response => response,
         };
         match response {
+            ServerMessage::HandoffPrepare { transfer_id } => {
+                if handoff::prepare(&inner, transfer_id).await.is_err() {
+                    break;
+                }
+            }
+            ServerMessage::HandoffAbort { transfer_id } => {
+                if handoff::abort(&inner, transfer_id).is_err() {
+                    break;
+                }
+            }
+            ServerMessage::HandoffCommit {
+                transfer_id,
+                successor_process_id,
+            } => match handoff::commit(&inner, transfer_id, successor_process_id).await {
+                Ok(replacement) => reader = replacement,
+                Err(_) => break,
+            },
+            ServerMessage::NotAccepted {
+                request_id,
+                transfer_id,
+            } => {
+                if !handoff::confirms_not_accepted(&inner, transfer_id) {
+                    break;
+                }
+                if let Some(pending) = inner.pending.lock().await.remove(&request_id) {
+                    if let Some(notification) = &pending.notification {
+                        notification.send_replace(None);
+                    }
+                    {
+                        let mut waiting = inner.write_queue.waiting.lock().unwrap();
+                        if !pending.sender.is_closed() {
+                            waiting.insert(pending.order);
+                        }
+                    }
+                    let _ = pending.sender.send(Ok(Reply::NotAccepted));
+                    inner.write_queue.changed.send_replace(());
+                }
+            }
             ServerMessage::Opened {
                 request_id,
                 observation_id,
@@ -496,6 +742,8 @@ async fn read_responses(
                     let client = Arc::downgrade(&inner);
                     let writer = inner.writer.clone();
                     let connection = cancel.clone();
+                    let handoff = inner.handoff.subscribe();
+                    let generation = handoff.borrow().generation;
                     tokio::spawn(async move {
                         tokio::select! {
                             biased;
@@ -506,14 +754,26 @@ async fn read_responses(
                         if let Some(client) = client.upgrade() {
                             client.subscriptions.lock().await.remove(&observation_id);
                         }
-                        write_observation_cancel(writer, connection, limits, observation_id).await;
+                        write_observation_cancel(
+                            writer,
+                            connection,
+                            limits,
+                            observation_id,
+                            handoff,
+                            generation,
+                        )
+                        .await;
                     });
                     Some(receiver)
                 } else {
                     None
                 };
-                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
-                    let _ = sender.send(Ok(Reply::Opened {
+                if let Some(pending) = inner.pending.lock().await.remove(&request_id) {
+                    if let Some(notification) = &pending.notification {
+                        notification.send_replace(Some(inner.handoff.borrow().generation));
+                    }
+                    inner.write_queue.remove(pending.order);
+                    let _ = pending.sender.send(Ok(Reply::Opened {
                         initial,
                         cursor,
                         reset,
@@ -555,6 +815,8 @@ async fn read_responses(
                         cancel.clone(),
                         limits,
                         observation_id,
+                        inner.handoff.subscribe(),
+                        inner.handoff.borrow().generation,
                     ));
                 }
             }
@@ -562,15 +824,17 @@ async fn read_responses(
                 request_id: Some(request_id),
                 error,
             } => {
-                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
-                    let _ = sender.send(Err(error));
+                if let Some(pending) = inner.pending.lock().await.remove(&request_id) {
+                    inner.write_queue.remove(pending.order);
+                    let _ = pending.sender.send(Err(error));
                 }
             }
             response @ (ServerMessage::Receipt { request_id, .. }
             | ServerMessage::DaemonStopped { request_id }
             | ServerMessage::Display { request_id, .. }) => {
-                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
-                    let _ = sender.send(Ok(Reply::Message(Box::new(response))));
+                if let Some(pending) = inner.pending.lock().await.remove(&request_id) {
+                    inner.write_queue.remove(pending.order);
+                    let _ = pending.sender.send(Ok(Reply::Message(Box::new(response))));
                 }
             }
             _ => {}
@@ -578,8 +842,10 @@ async fn read_responses(
     }
     if let Some(inner) = inner.upgrade() {
         inner.cancel.cancel();
-        for (_, sender) in inner.pending.lock().await.drain() {
-            let _ = sender.send(Err(AccessError::unavailable("daemon connection closed")));
+        for (_, pending) in inner.pending.lock().await.drain() {
+            let _ = pending
+                .sender
+                .send(Err(AccessError::unavailable("daemon connection closed")));
         }
         for (_, subscription) in inner.subscriptions.lock().await.drain() {
             subscription.cancel.cancel();

@@ -240,6 +240,7 @@ async fn run_hidden_view_fixture() {
         }
     });
     let startup = StartupState {
+        launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,
     };

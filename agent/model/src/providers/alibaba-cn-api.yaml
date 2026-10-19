@@ -14,9 +14,23 @@ auth: api_key_env
 api_key_env: DASHSCOPE_API_KEY
 endpoints:
   qwen_chat_completions: https://dashscope.aliyuncs.com/compatible-mode/v1
+selection:
+  auxiliary_model: qwen3.8-flash
+  series:
+  - id: qwen-plus
+    name: Qwen Plus
+    model: qwen3.7-plus-2026-05-26
+    capability_order: 0
+  - id: qwen-max
+    name: Qwen Max
+    model: qwen3.8-max-0902
+    capability_order: 1
+  - id: qwen-flash
+    name: Qwen Flash
+    model: qwen3.8-flash
+    capability_order: 2
 models:
 - id: qwen3.7-plus-2026-05-26
-  service_model_id: qwen3.7-plus-2026-05-26
   display_name: Qwen3.7-Plus
   adapter: qwen_chat_completions
   max_output_tokens: 131072
@@ -27,7 +41,6 @@ models:
   - text
   - image
 - id: qwen3.8-max-0902
-  service_model_id: qwen3.8-max-0902
   display_name: Qwen3.8-Max
   adapter: qwen_chat_completions
   max_output_tokens: 131072
@@ -41,7 +54,6 @@ models:
   - text
   - image
 - id: qwen3.8-flash
-  service_model_id: qwen3.8-flash
   display_name: Qwen3.8-Flash
   adapter: qwen_chat_completions
   max_output_tokens: 131072

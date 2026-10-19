@@ -1,9 +1,18 @@
-//! A Run's tool batch: the calls of one assistant message run in order, each result joins the
+//! A Run's tool batch: the calls of one assistant message run in order, except that consecutive
+//! concurrency-safe calls run together, up to [`MAX_CONCURRENT_TOOL_CALLS`] at once. Writes and
+//! other shared-state calls are ordered barriers between such groups. Each result joins the
 //! conversation as soon as its call ends, and the end of the batch prepares the next model
 //! request. A Run can re-enter its batch at a given call, which is how a Run waiting on a call
 //! continues where the wait left it.
 
-use std::{collections::HashSet, sync::atomic::Ordering};
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::{Arc, atomic::Ordering},
+};
+
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
@@ -11,6 +20,7 @@ use tickloop_agent_protocol::{
     RunId, SubagentReport, ToolResultBlock, ToolResultContent, Usage,
 };
 use tickloop_agent_transcript::{ModelVisibleResult, ResumePoint};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -19,6 +29,66 @@ use super::{
     host_tools::{HostCallStatus, HostEffect},
     monitor_members, shared_tasks,
 };
+
+const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
+enum ToolPermit {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
+struct ToolScope {
+    gate: Arc<RwLock<()>>,
+    permit: Mutex<Option<ToolPermit>>,
+}
+
+tokio::task_local! {
+    static TOOL_SCOPE: Arc<ToolScope>;
+}
+
+async fn coordinate_call(
+    gate: Arc<RwLock<()>>,
+    cancel: CancellationToken,
+    call: impl Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("run interrupted before tool preparation".into()),
+        permit = gate.clone().read_owned() => permit,
+    };
+    TOOL_SCOPE
+        .scope(
+            Arc::new(ToolScope {
+                gate,
+                permit: Mutex::new(Some(ToolPermit::Shared(permit))),
+            }),
+            call,
+        )
+        .await
+}
+
+/// Parking a Run for a human must wait until its other tool calls have settled.
+pub(super) async fn serialize_permission_prompt(cancel: &CancellationToken) -> Result<(), String> {
+    let Ok(scope) = TOOL_SCOPE.try_with(Arc::clone) else {
+        return Ok(());
+    };
+    let mut permit = scope.permit.lock().await;
+    match permit.take() {
+        Some(ToolPermit::Shared(shared)) => drop(shared),
+        Some(ToolPermit::Exclusive(exclusive)) => {
+            *permit = Some(ToolPermit::Exclusive(exclusive));
+            return Ok(());
+        }
+        None => return Err("tool call is no longer active".into()),
+    }
+    let exclusive = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("permission request cancelled".into()),
+        permit = scope.gate.clone().write_owned() => permit,
+    };
+    *permit = Some(ToolPermit::Exclusive(exclusive));
+    Ok(())
+}
 
 /// How a Run starts executing.
 pub(crate) enum RunStart {
@@ -53,6 +123,22 @@ pub(crate) enum BatchExit {
     Continue(ModelRequest),
     /// The Run ended at the end of the batch, as a Subagent whose report was delivered does.
     Ended(Usage),
+}
+
+/// What an ended call leaves for the conversation and the Chat.
+struct CallCompletion {
+    result: ModelVisibleResult,
+    host_effect: Option<HostEffect>,
+    tool_use: Option<monitor_members::ToolUse>,
+}
+
+/// How a call's result joins the conversation.
+#[derive(Clone, Copy)]
+struct CommitMode {
+    /// The result came from the call's wait, not from running it here.
+    is_resumed: bool,
+    /// The batch is entered again, so the chain may already hold the result.
+    is_reentered: bool,
 }
 
 impl Agent {
@@ -133,147 +219,296 @@ impl Agent {
             .await
     }
 
-    /// Runs the batch's calls from `start` in order, appending each result as its call ends,
-    /// then ends the batch. `first_result`, when given, is call `start`'s result: it is appended
-    /// instead of running the call.
+    /// Runs the batch's calls from `start`, appending each result as its call ends, then ends
+    /// the batch. `first_result`, when given, is call `start`'s result: it is appended instead
+    /// of running the call. A safe point comes before each call that runs alone and before each
+    /// group of concurrency-safe calls, so a Run never stops there with a call in flight.
     pub(super) async fn run_batch_from(
         &self,
         receipt: &Receipt,
         registry: &ToolRegistry,
-        batch: ToolBatch,
+        mut batch: ToolBatch,
         start: usize,
-        mut first_result: Option<ModelVisibleResult>,
+        first_result: Option<ModelVisibleResult>,
         cancel: &CancellationToken,
     ) -> Result<BatchExit, String> {
-        for ProposedToolCall {
+        let mut calls = std::mem::take(&mut batch.calls).into_iter().skip(start);
+        if let Some(result) = first_result
+            && let Some(call) = calls.next()
+        {
+            let tool_use = monitor_members::ToolUse::of(&call.name, &call.input);
+            self.commit_call_result(
+                receipt,
+                &call.call_id,
+                CallCompletion {
+                    result,
+                    host_effect: None,
+                    tool_use,
+                },
+                CommitMode {
+                    is_resumed: true,
+                    is_reentered: batch.is_reentered,
+                },
+                cancel,
+            )
+            .await?;
+        }
+        let workspace = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+            super::configured_workspace_for_chat(chat)
+        };
+        let mut concurrent = Vec::new();
+        for call in calls {
+            if batch.is_reentered
+                && self
+                    .inner
+                    .chats
+                    .lock()
+                    .await
+                    .get(&receipt.chat_id)
+                    .is_some_and(|chat| {
+                        has_result_on_chain(&chat.snapshot, receipt.run_id, &call.call_id)
+                    })
+            {
+                continue;
+            }
+            if registry.is_concurrency_safe(&call.name, &call.input, &workspace, self.inner.waits) {
+                concurrent.push(call);
+                continue;
+            }
+            self.execute_concurrent_tools(
+                receipt,
+                &batch,
+                std::mem::take(&mut concurrent),
+                registry,
+                cancel,
+            )
+            .await?;
+            Box::pin(self.stop_at_safe_point(receipt, Some(&call.call_id))).await?;
+            self.execute_and_commit_tool_call(
+                receipt,
+                &batch,
+                call,
+                registry,
+                cancel.clone(),
+                cancel,
+            )
+            .await?;
+        }
+        self.execute_concurrent_tools(receipt, &batch, concurrent, registry, cancel)
+            .await?;
+        self.finish_batch(receipt).await
+    }
+
+    /// Runs a group of concurrency-safe calls together. The first error or panic cancels the
+    /// calls not yet started; calls already started settle so their state is recorded.
+    async fn execute_concurrent_tools(
+        &self,
+        receipt: &Receipt,
+        batch: &ToolBatch,
+        calls: Vec<ProposedToolCall>,
+        registry: &ToolRegistry,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let Some(first) = calls.first() else {
+            return Ok(());
+        };
+        Box::pin(self.stop_at_safe_point(receipt, Some(&first.call_id))).await?;
+        let group_cancel = cancel.child_token();
+        let gate = Arc::new(RwLock::new(()));
+        let mut pending = VecDeque::from(calls);
+        let mut in_flight = FuturesUnordered::new();
+        let mut first_error = None;
+        let mut panic_payload = None;
+        loop {
+            while first_error.is_none()
+                && panic_payload.is_none()
+                && in_flight.len() < MAX_CONCURRENT_TOOL_CALLS
+            {
+                let Some(call) = pending.pop_front() else {
+                    break;
+                };
+                in_flight.push(
+                    AssertUnwindSafe(coordinate_call(
+                        gate.clone(),
+                        group_cancel.clone(),
+                        self.execute_and_commit_tool_call(
+                            receipt,
+                            batch,
+                            call,
+                            registry,
+                            group_cancel.clone(),
+                            cancel,
+                        ),
+                    ))
+                    .catch_unwind(),
+                );
+            }
+            let Some(result) = in_flight.next().await else {
+                break;
+            };
+            match result {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(payload) => {
+                    panic_payload.get_or_insert(payload);
+                }
+            }
+            pending.clear();
+            group_cancel.cancel();
+        }
+        if let Some(payload) = panic_payload {
+            std::panic::resume_unwind(payload);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Runs one call under `call_cancel` and appends its result; a result that ends the Run
+    /// cancels `run_cancel`.
+    async fn execute_and_commit_tool_call(
+        &self,
+        receipt: &Receipt,
+        batch: &ToolBatch,
+        call: ProposedToolCall,
+        registry: &ToolRegistry,
+        call_cancel: CancellationToken,
+        run_cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let ProposedToolCall {
             call_id,
             name,
             input,
-        } in batch.calls.into_iter().skip(start)
-        {
-            let tool_use = monitor_members::ToolUse::of(&name, &input);
-            let (result, host_effect, is_resumed) = match first_result.take() {
-                Some(result) => (result, None, true),
-                None if batch.is_reentered
-                    && self
-                        .inner
-                        .chats
-                        .lock()
-                        .await
-                        .get(&receipt.chat_id)
-                        .is_some_and(|chat| {
-                            has_result_on_chain(&chat.snapshot, receipt.run_id, &call_id)
-                        }) =>
-                {
-                    continue;
-                }
-                None => {
-                    Box::pin(self.stop_at_safe_point(receipt, Some(&call_id))).await?;
-                    let invocation = ToolInvocation::new(
-                        call_id.clone(),
-                        name.clone(),
-                        input,
-                        registry.resolve(&name),
-                    );
-                    let outcome = self
-                        .execute_registered_call(
-                            receipt,
-                            batch.message_id,
-                            invocation,
-                            cancel.clone(),
-                        )
-                        .await;
-                    let (result, host_effect) = self
-                        .complete_call(receipt, &call_id, &name, outcome)
-                        .await?;
-                    (result, host_effect, false)
-                }
-            };
-            let mut chats = self.inner.chats.lock().await;
-            let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            // A Run released while it waited leaves without its result: from the release on it
-            // writes nothing.
-            if Agent::release_of(chat, receipt.run_id).is_cancelled() {
-                return Err(super::suspension::RUN_RELEASED.into());
-            }
-            let is_appended =
-                append_call_result(chat, receipt.run_id, &call_id, &result, batch.is_reentered);
-            if is_resumed
-                && is_appended
-                && let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
-                    operation.run_id == receipt.run_id && operation.call_id == call_id
-                })
-                && operation.state == OperationState::Admitted
-            {
-                operation.state = if result.tool.is_error {
-                    OperationState::Failed
-                } else {
-                    OperationState::Completed
-                };
-            }
-            if is_appended
-                && !result.tool.is_error
-                && let Some(tool_use) = tool_use
-            {
-                self.mark_tool_use(chat, tool_use);
-            }
-            match host_effect {
-                Some(HostEffect::CreatedArtifact(tick)) => {
-                    if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
-                        self.mark_joined(chat, [instance]);
-                    }
-                }
-                Some(HostEffect::ReadArtifact(tick)) => {
-                    if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
-                        self.mark_taken_in(chat, [instance]);
-                    }
-                }
-                Some(HostEffect::RenamedArtifact { instance, title }) => {
-                    self.retitle_artifact_tick(chat, &instance, &title)
-                }
-                Some(HostEffect::OpenedTick {
-                    instance,
-                    title,
-                    is_terminal,
-                }) => {
-                    if let Some(operation) = chat.snapshot.operations.iter().find(|operation| {
-                        operation.run_id == receipt.run_id
-                            && operation.call_id == call_id
-                            && operation.state == OperationState::Completed
-                    }) {
-                        chat.bookkeeping.tick_creation_receipts.push(
-                            approval_context::TickCreationReceipt {
-                                loop_id: receipt.loop_id,
-                                operation_id: operation.id,
-                                instance: instance.clone(),
-                            },
-                        );
-                    }
-                    self.record_opened_tick(chat, instance, title, is_terminal);
-                }
-                None => {}
-            }
-            self.save(&chat.snapshot);
-            if is_appended {
-                self.emit(
-                    chat,
-                    receipt,
-                    EventKind::ToolCompleted {
-                        call_id: call_id.clone(),
-                        result: result.tool.clone(),
-                    },
-                );
-            }
-            // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
-            if result.ends_run {
-                chat.user_cancelled_runs.insert(receipt.run_id);
-            }
-            if chat.user_cancelled_runs.contains(&receipt.run_id) {
-                cancel.cancel();
-                return Err(result.tool.content);
-            }
+        } = call;
+        let tool_use = monitor_members::ToolUse::of(&name, &input);
+        let invocation = ToolInvocation::new(
+            call_id.clone(),
+            name.clone(),
+            input,
+            registry.resolve(&name),
+        );
+        let outcome = self
+            .execute_registered_call(receipt, batch.message_id, invocation, call_cancel)
+            .await;
+        let (result, host_effect) = self
+            .complete_call(receipt, &call_id, &name, outcome)
+            .await?;
+        self.commit_call_result(
+            receipt,
+            &call_id,
+            CallCompletion {
+                result,
+                host_effect,
+                tool_use,
+            },
+            CommitMode {
+                is_resumed: false,
+                is_reentered: batch.is_reentered,
+            },
+            run_cancel,
+        )
+        .await
+    }
+
+    /// Appends a call's result to the conversation and applies its host effect. A Run released
+    /// while it waited leaves without its result: from the release on it writes nothing.
+    async fn commit_call_result(
+        &self,
+        receipt: &Receipt,
+        call_id: &str,
+        completion: CallCompletion,
+        mode: CommitMode,
+        run_cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let CallCompletion {
+            result,
+            host_effect,
+            tool_use,
+        } = completion;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+        if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+            return Err(super::suspension::RUN_RELEASED.into());
         }
-        self.finish_batch(receipt).await
+        let is_appended =
+            append_call_result(chat, receipt.run_id, call_id, &result, mode.is_reentered);
+        if mode.is_resumed
+            && is_appended
+            && let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
+                operation.run_id == receipt.run_id && operation.call_id == call_id
+            })
+            && operation.state == OperationState::Admitted
+        {
+            operation.state = if result.tool.is_error {
+                OperationState::Failed
+            } else {
+                OperationState::Completed
+            };
+        }
+        if is_appended
+            && !result.tool.is_error
+            && let Some(tool_use) = tool_use
+        {
+            self.mark_tool_use(chat, tool_use);
+        }
+        match host_effect {
+            Some(HostEffect::CreatedArtifact(tick)) => {
+                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
+                    self.mark_joined(chat, [instance]);
+                }
+            }
+            Some(HostEffect::ReadArtifact(tick)) => {
+                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
+                    self.mark_taken_in(chat, [instance]);
+                }
+            }
+            Some(HostEffect::RenamedArtifact { instance, title }) => {
+                self.retitle_artifact_tick(chat, &instance, &title)
+            }
+            Some(HostEffect::OpenedTick {
+                instance,
+                title,
+                is_terminal,
+            }) => {
+                if let Some(operation) = chat.snapshot.operations.iter().find(|operation| {
+                    operation.run_id == receipt.run_id
+                        && operation.call_id == call_id
+                        && operation.state == OperationState::Completed
+                }) {
+                    chat.bookkeeping.tick_creation_receipts.push(
+                        approval_context::TickCreationReceipt {
+                            loop_id: receipt.loop_id,
+                            operation_id: operation.id,
+                            instance: instance.clone(),
+                        },
+                    );
+                }
+                self.record_opened_tick(chat, instance, title, is_terminal);
+            }
+            None => {}
+        }
+        self.save(&chat.snapshot);
+        if is_appended {
+            self.emit(
+                chat,
+                receipt,
+                EventKind::ToolCompleted {
+                    call_id: call_id.into(),
+                    result: result.tool.clone(),
+                },
+            );
+        }
+        // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
+        if result.ends_run {
+            chat.user_cancelled_runs.insert(receipt.run_id);
+        }
+        if chat.user_cancelled_runs.contains(&receipt.run_id) {
+            run_cancel.cancel();
+            return Err(result.tool.content);
+        }
+        Ok(())
     }
 
     /// Turns an executed call's outcome into the result the conversation records, and the host

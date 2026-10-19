@@ -413,6 +413,7 @@ async fn an_outside_symlink_requires_the_resolved_path_approval_and_cannot_chang
 }
 
 async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>) -> Vec<String> {
+    let count = reads.len();
     let agent = Agent::new_embedded(
         config(),
         Arc::new(ToolsAndAnswer(
@@ -433,7 +434,7 @@ async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>
         .submit(chat, None, "Read the notes".into())
         .await
         .unwrap();
-    let mut results = Vec::new();
+    let mut results = std::collections::HashMap::new();
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
             .await
@@ -441,10 +442,10 @@ async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>
             .unwrap()
             .kind
         {
-            EventKind::ToolCompleted { result, .. } => {
+            EventKind::ToolCompleted { call_id, result } => {
                 assert!(!result.is_error, "{}", result.content);
                 assert!(result.output_ref.is_none());
-                results.push(result.content);
+                assert!(results.insert(call_id, result.content).is_none());
             }
             EventKind::Completed { .. } => break,
             EventKind::Failed(error) => panic!("{error}"),
@@ -452,7 +453,9 @@ async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>
         }
     }
     agent.shutdown().await;
-    results
+    (0..count)
+        .map(|index| results.remove(&format!("read-{index}")).unwrap())
+        .collect()
 }
 
 #[tokio::test]

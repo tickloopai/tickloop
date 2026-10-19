@@ -1,8 +1,3 @@
-model_aliases:
-  "glm-5.3-chat-completions": "glm-5.3"
-  "glm-5.3-flash-chat-completions": "glm-5.3-flash"
-  "glm-5.3-flashx-chat-completions": "glm-5.3-flashx"
-  "glm-5.2-chat-completions": "glm-5.2"
 connection:
   vendor: "Zhipu GLM"
   product: "Pay-as-you-go API"
@@ -16,9 +11,31 @@ auth: "api_key_env"
 api_key_env: "ZAI_API_KEY"
 endpoints:
   glm_chat_completions: "https://api.z.ai/api/paas/v4"
+selection:
+  auxiliary_model: glm-4.7-flash
+  series:
+    - id: "glm"
+      name: "GLM"
+      model: "glm-5.3"
+      capability_order: 0
+    - id: "glm-flash"
+      name: "GLM Flash"
+      model: "glm-5.3-flash"
+      capability_order: 1
+    - id: "glm-flashx"
+      name: "GLM FlashX"
+      model: "glm-5.3-flashx"
+      capability_order: 2
+    - id: "glm-air"
+      name: "GLM Air"
+      model: "glm-4.5-air"
+      capability_order: 3
+    - id: "glm-flash-small"
+      name: "GLM Flash 30B"
+      model: "glm-4.7-flash"
+      capability_order: 4
 models:
   - id: "glm-5.3"
-    service_model_id: "glm-5.3"
     display_name: "GLM-5.3"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072
@@ -28,7 +45,6 @@ models:
     effort_levels: ["low", "high", "max"]
     input_modalities: ["text"]
   - id: "glm-5.3-flash"
-    service_model_id: "glm-5.3-flash"
     display_name: "GLM-5.3-Flash"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072
@@ -38,7 +54,6 @@ models:
     effort_levels: ["low", "high", "max"]
     input_modalities: ["text", "image"]
   - id: "glm-5.3-flashx"
-    service_model_id: "glm-5.3-flashx"
     display_name: "GLM-5.3-FlashX"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072
@@ -48,7 +63,6 @@ models:
     effort_levels: ["low", "high", "max"]
     input_modalities: ["text", "image"]
   - id: "glm-5.2"
-    service_model_id: "glm-5.2"
     display_name: "GLM-5.2"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072
@@ -56,4 +70,20 @@ models:
     thinking: "toggle"
     adaptive_by_default: false
     effort_levels: ["high", "max"]
+    input_modalities: ["text"]
+  - id: "glm-4.5-air"
+    display_name: "GLM-4.5-Air"
+    adapter: "glm_chat_completions"
+    max_output_tokens: 98304
+    context_window_tokens: 131072
+    thinking: "toggle"
+    effort_levels: []
+    input_modalities: ["text"]
+  - id: "glm-4.7-flash"
+    display_name: "GLM-4.7-Flash"
+    adapter: "glm_chat_completions"
+    max_output_tokens: 131072
+    context_window_tokens: 200000
+    thinking: "toggle"
+    effort_levels: []
     input_modalities: ["text"]

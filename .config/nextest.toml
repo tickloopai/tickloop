@@ -13,6 +13,20 @@ filter = "test(/production_limits/)"
 test-group = "full-scale"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# This stress case runs four runtime threads while repeatedly encoding full family snapshots.
+[[profile.default.overrides]]
+filter = "test(=agent_message_daemon_diagnosis::accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_family_live)"
+threads-required = 4
+
+# Large fragmented streams keep both the model server and Agent transport busy.
+[[profile.default.overrides]]
+filter = """
+test(=agent_console_pty::hosted_monitor::actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_terminal)
+| test(/^agent_console_pty::reply_visibility::actual_cli_interrupted_state_survives/)
+| test(=agent_console_pty::command_feedback::actual_cli_background_event_reset_keeps_model_command_and_feedback)
+"""
+threads-required = 2
+
 # Tests that drive a real PTY wait on rendered frames, so they share a small concurrency budget.
 # Names without a `pty` token are listed by module: lib modules that re-execute a
 # `*_pty_fixture`, and integration tests that open a PTY: a module of a crate's single `all` test
@@ -22,8 +36,10 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = """
 test(/(^|[_:])pty($|[_:])/)
 | (kind(lib) & test(/^terminal::(recovery_tests|daemon_loss_tests|child_config_tests|late_receipt_tests|mode_cycle_tests)::/))
+| (kind(lib) & test(/^terminal::console::upgrade::/))
+| (kind(lib) & test(/^terminal::login::tests::/))
 | (kind(test)
-    & test(/^(agent_startup_errors|codex_terminal|monitor_attach|monitor_popup|native_visible_stdio|provider_picker)::/))
+    & test(/^(agent_startup_errors|codex_terminal|monitor_attach|monitor_popup|native_visible_stdio|provider_picker|graceful_upgrade|upgrade_races)::/))
 """
 test-group = "pty"
 slow-timeout = { period = "60s", terminate-after = 3 }

@@ -51,7 +51,7 @@ pub(super) enum EditorOutcome {
     Submitted(String),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Editor {
     draft: String,
     cursor: usize,
@@ -65,17 +65,19 @@ pub(super) struct Editor {
     preferred_column: Option<usize>,
     /// Time source for undo coalescing; `None` reads the wall clock, tests pin
     /// it so they never sleep.
+    #[serde(skip)]
     pinned_now: Option<Instant>,
+    #[serde(skip)]
     typed_snapshot_at: Option<Instant>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Snapshot {
     draft: String,
     cursor: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct Yank {
     start: usize,
     end: usize,
@@ -90,6 +92,23 @@ struct VisualRow {
 }
 
 impl Editor {
+    pub(super) fn valid_upgrade_state(&self) -> bool {
+        let valid_snapshot = |snapshot: &Snapshot| snapshot.draft.is_char_boundary(snapshot.cursor);
+        self.draft.is_char_boundary(self.cursor)
+            && self
+                .history_position
+                .is_none_or(|position| position < self.history.len())
+            && self.saved_draft.as_ref().is_none_or(valid_snapshot)
+            && self.stash.as_ref().is_none_or(valid_snapshot)
+            && self.undo_stack.iter().all(valid_snapshot)
+            && self.last_yank.is_none_or(|yank| {
+                yank.start <= yank.end
+                    && self.draft.is_char_boundary(yank.start)
+                    && self.draft.is_char_boundary(yank.end)
+                    && yank.ring_index < self.kill_ring.len()
+            })
+    }
+
     pub(super) fn new() -> Self {
         Self::default()
     }

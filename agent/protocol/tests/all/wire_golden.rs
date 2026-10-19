@@ -30,6 +30,39 @@ use tickloop_agent_protocol::{
     ToolResult, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
+#[test]
+fn worker_runtime_scope_defaults_to_unknown_for_older_daemons_and_round_trips_when_present() {
+    use tickloop_agent_protocol::WorkerRuntimeVersion;
+    let legacy = json!({
+        "process_id": 4242,
+        "executable": "/runtime/tickloop",
+        "build_id": "previous-build",
+        "upgrading": true,
+    });
+    let mut worker: WorkerRuntimeVersion = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(worker.executions.is_empty());
+    assert!(worker.error.is_none());
+    assert_eq!(serde_json::to_value(&worker).unwrap(), legacy);
+    let root = ExecutionRef {
+        daemon_epoch: Uuid::from_u128(1),
+        agent_id: Uuid::from_u128(2),
+        generation: 3,
+    };
+    let child = ExecutionRef {
+        agent_id: Uuid::from_u128(4),
+        ..root
+    };
+    worker.executions = vec![root, child];
+    worker.error = Some("retained Shell cannot transfer".into());
+    let wire = serde_json::to_value(&worker).unwrap();
+    assert_eq!(wire["executions"], json!([root, child]));
+    assert_eq!(wire["error"], "retained Shell cannot transfer");
+    assert_eq!(
+        serde_json::from_value::<WorkerRuntimeVersion>(wire).unwrap(),
+        worker
+    );
+}
+
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -118,7 +151,6 @@ fn model_config() -> ModelConfig {
         model_id: "example-large".into(),
         card: Some(ModelCard {
             id: "example-large".into(),
-            service_model_id: "example-large-2026".into(),
             display_name: "Example Large".into(),
             adapter: Adapter::Messages,
             max_output_tokens: 32_000,
@@ -137,6 +169,23 @@ fn model_config() -> ModelConfig {
         }),
         input_modalities: vec![InputModality::Text, InputModality::Image],
     }
+}
+
+#[test]
+fn recorded_model_cards_load_the_retired_duplicate_field_without_reintroducing_it() {
+    let model = model_config();
+    let mut recorded = serde_json::to_value(&model).unwrap();
+    recorded["card"]["service_model_id"] = json!(model.model);
+    assert_eq!(
+        serde_json::from_value::<ModelConfig>(recorded.clone()).unwrap(),
+        model
+    );
+    assert!(serde_json::from_value::<ModelCard>(recorded["card"].clone()).is_err());
+    assert!(
+        serde_json::to_value(model).unwrap()["card"]
+            .get("service_model_id")
+            .is_none()
+    );
 }
 
 fn permission_rule(value: u128, decision: Decision, persistent: bool) -> PermissionRule {
@@ -603,6 +652,7 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::FlushTranscripts,
             AgentCommand::ReplaceTickhost,
+            AgentCommand::UpgradeRuntime { executable: "/opt/tickloop/versions/0.2.10/tickloop".into() },
             AgentCommand::EditHistory {
                 execution: execution(),
                 action: HistoryAction::TakeBackInterruptedPrompt { run_id: id(0x20) },
@@ -687,6 +737,7 @@ fn observation_requests_keep_their_recorded_wire() {
                 after: None,
             },
             ObservationRequest::OtherTickhost,
+            ObservationRequest::RuntimeVersion,
         ],
     );
 }
@@ -808,6 +859,14 @@ fn observation_values_keep_their_recorded_wire() {
                 }),
             })),
             ObservationValue::OtherTickhost(None),
+            ObservationValue::RuntimeVersion(Box::new(tickloop_agent_protocol::RuntimeVersion {
+                executable: "/opt/tickloop/versions/0.2.9/tickloop".into(),
+                build_id: "0.2.9+0000000000000000".into(),
+                requested_executable: Some("/opt/tickloop/versions/0.2.10/tickloop".into()),
+                upgrading: true,
+                error: None,
+                workers: Vec::new(),
+            })),
         ],
     );
 }
@@ -956,6 +1015,7 @@ fn client_messages_keep_their_recorded_wire() {
             ClientMessage::Hello {
                 major: PROTOCOL_MAJOR,
                 minor: PROTOCOL_MINOR,
+                handoff: None,
             },
             ClientMessage::ShutdownDaemon {
                 request_id: id(0x01),
@@ -1034,6 +1094,8 @@ fn server_messages_keep_their_recorded_wire() {
                 },
                 build: Some("0.2.0+00c0ffee00c0ffee".into()),
                 executable: Some("/opt/tickloop/bin/tickloop".into()),
+                upgrade_protocol: None,
+                handoff: None,
             }),
             ServerMessage::Opened {
                 request_id: id(0x02),
@@ -1115,4 +1177,75 @@ fn task_board_mode_preserves_legacy_teams_and_new_solo_boards() {
     let solo = board.clone();
     board.is_team = true;
     assert_golden("task_board", &vec![solo, board]);
+}
+
+#[test]
+fn negotiated_handoff_frames_have_stable_wire_and_redacted_debug() {
+    use tickloop_agent_protocol::{
+        CLIENT_HANDOFF_VERSION, ClientHandoffHello, ServerHandoffHello, SessionResume,
+    };
+    let proof = SessionResume {
+        daemon_epoch: id(0xe0),
+        session_id: id(0x51),
+        transfer_id: id(0x71),
+        token: "test-only-session-secret".into(),
+    };
+    let clients = vec![
+        ClientMessage::Hello {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            handoff: Some(ClientHandoffHello {
+                version: CLIENT_HANDOFF_VERSION,
+                resume: None,
+            }),
+        },
+        ClientMessage::Hello {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            handoff: Some(ClientHandoffHello {
+                version: CLIENT_HANDOFF_VERSION,
+                resume: Some(proof),
+            }),
+        },
+        ClientMessage::HandoffReady {
+            transfer_id: id(0x71),
+        },
+    ];
+    assert!(!format!("{clients:?}").contains("test-only-session-secret"));
+    assert_golden("handoff_client_message", &clients);
+    let ServerMessage::Hello(mut hello) = recorded::<ServerMessage>("server_message").remove(0)
+    else {
+        panic!("first recorded server message is its Hello");
+    };
+    hello.handoff = Some(ServerHandoffHello {
+        version: CLIENT_HANDOFF_VERSION,
+        resume_token: "test-only-session-secret".into(),
+    });
+    let servers = vec![
+        ServerMessage::Hello(hello),
+        ServerMessage::HandoffPrepare {
+            transfer_id: id(0x71),
+        },
+        ServerMessage::HandoffAbort {
+            transfer_id: id(0x71),
+        },
+        ServerMessage::NotAccepted {
+            request_id: id(0x03),
+            transfer_id: id(0x71),
+        },
+        ServerMessage::HandoffCommit {
+            transfer_id: id(0x71),
+            successor_process_id: 4243,
+        },
+    ];
+    assert!(!format!("{servers:?}").contains("test-only-session-secret"));
+    assert_golden("handoff_server_message", &servers);
+    assert_eq!(
+        serde_json::to_value(AccessErrorCode::HandoffNotAccepted).unwrap(),
+        json!("HandoffNotAccepted")
+    );
+    assert_eq!(
+        serde_json::from_value::<AccessErrorCode>(json!("HandoffNotAccepted")).unwrap(),
+        AccessErrorCode::HandoffNotAccepted
+    );
 }

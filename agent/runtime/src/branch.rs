@@ -264,6 +264,7 @@ impl Agent {
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
+                upgrade_wait: None,
                 parked: Default::default(),
                 releases: Default::default(),
                 ready_runs: Default::default(),

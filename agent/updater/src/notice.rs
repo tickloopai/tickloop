@@ -5,15 +5,17 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::{Installation, Source, UpdateActivity, UpdateState, source};
+use crate::{Installation, Source, UpdateActivity, UpdateProgress, UpdateState, source};
 
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateNotice {
     Checking,
-    Installing,
+    Installing { progress: UpdateProgress },
     Ready { version: String },
+    PendingAgent,
+    Deferred { reason: String },
     Failed,
 }
 
@@ -77,7 +79,9 @@ impl UpdateMonitor {
         };
         if busy {
             return Some(match state.activity {
-                Some(UpdateActivity::Installing) => UpdateNotice::Installing,
+                Some(UpdateActivity::Installing) => UpdateNotice::Installing {
+                    progress: state.progress.unwrap_or_default(),
+                },
                 _ => UpdateNotice::Checking,
             });
         }
@@ -174,13 +178,36 @@ mod tests {
                 UpdateActivity::Installing,
             )
             .unwrap();
-        assert_eq!(monitor.notice(), Some(UpdateNotice::Installing));
+        assert_eq!(
+            monitor.notice(),
+            Some(UpdateNotice::Installing {
+                progress: UpdateProgress::default()
+            })
+        );
         drop(lock);
         assert_eq!(
             monitor.notice(),
             None,
             "a crashed updater must not leave a permanent progress notice"
         );
+    }
+
+    #[test]
+    fn download_progress_is_visible_only_while_the_updater_holds_its_lock() {
+        let (_root, directory, monitor) = fixture();
+        let path = directory.path().join("status.json");
+        let mut state = UpdateState::default();
+        let lock = Lock::acquire(&directory.path().join("update.lock")).unwrap();
+        let progress = UpdateProgress::download(58, Some(100));
+        crate::ProgressReporter::new(&mut state, &path)
+            .report(progress)
+            .unwrap();
+        assert_eq!(
+            monitor.notice(),
+            Some(UpdateNotice::Installing { progress })
+        );
+        drop(lock);
+        assert_eq!(monitor.notice(), None);
     }
 
     #[test]

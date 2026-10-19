@@ -392,6 +392,11 @@ impl Agent {
         chat.snapshot = snapshot;
         self.discard_replaced_trigger_inputs(chat, loop_id);
         self.save(&chat.snapshot);
+        self.inner
+            .trigger_tried_through
+            .lock()
+            .unwrap()
+            .remove(&(chat_id, loop_id));
         if let Some(previous) = chat.trigger_cancellations.remove(&loop_id) {
             previous.cancel();
         }
@@ -671,8 +676,15 @@ impl Agent {
         self.inner.tasks.spawn(async move {
             // 拿不到租约时下一次重试获取的时间；期间到点的触发直接跳过。
             let mut lease_retry_at: Option<tokio::time::Instant> = None;
-            // The scheduled times this timer has tried so far, fired or passed.
-            let mut tried_through: Option<u64> = None;
+            // The scheduled times this timer has tried so far, fired or passed. A Worker upgrade
+            // hands them to its successor.
+            let mut tried_through: Option<u64> = agent
+                .inner
+                .trigger_tried_through
+                .lock()
+                .unwrap()
+                .get(&(chat_id, loop_id))
+                .copied();
             let expires = async {
                 if let Some(deadline) = deadline {
                     tokio::time::sleep_until(deadline).await;
@@ -691,6 +703,7 @@ impl Agent {
                     _ = agent.inner.shutdown.cancelled() => break,
                     _ = cancel.cancelled() => break,
                     _ = &mut expires => {
+                        let _upgrade = agent.inner.upgrade_gate.read().await;
                         let _ = agent.end_goal(chat_id, loop_id, LoopState::Expired, Some(&cancel)).await;
                         break;
                     },
@@ -714,11 +727,13 @@ impl Agent {
                             None => std::future::pending::<()>().await,
                         }
                     } => {
+                        let _upgrade = agent.inner.upgrade_gate.read().await;
                         let now = agent.inner.schedule_clock.now_ms();
                         if next.is_none_or(|next| now < next) {
                             continue;
                         }
                         tried_through = Some(now);
+                        agent.inner.trigger_tried_through.lock().unwrap().insert((chat_id, loop_id), now);
                         if lease_retry_at.is_some() {
                             continue;
                         }

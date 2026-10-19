@@ -24,7 +24,7 @@ use input_projection::{InputPurpose, project_tool_input};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v8";
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v9";
 pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v19";
 /// Images carry no review evidence in serialized text; their base64 never enters the snapshot.
 const IMAGE_PLACEHOLDER: &str = "[image omitted from the approval context]";
@@ -83,7 +83,7 @@ pub(super) struct DependencyEvidence {
     pub unchanged_since_loop_start: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(super) struct TickCreationReceipt {
     pub loop_id: Uuid,
     pub operation_id: Uuid,

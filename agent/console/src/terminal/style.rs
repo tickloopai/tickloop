@@ -417,7 +417,7 @@ const AGENT_COLORS: [Style; 8] = [
     fg(8, 145, 178),
 ];
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ThemeName {
     #[default]
     ClaudeCodeDark,

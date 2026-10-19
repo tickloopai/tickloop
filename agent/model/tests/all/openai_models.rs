@@ -44,11 +44,7 @@ fn api_cards_are_independent_and_recommendations_keep_exact_versions() {
         api.endpoints,
         BTreeMap::from([(Adapter::Responses, "https://api.openai.com/v1".into())])
     );
-    for model in [
-        "gpt-6-astra-responses",
-        "gpt-6.1-sol-responses",
-        "gpt-6-luna-responses",
-    ] {
+    for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-luna"] {
         let profile = catalog.get("openai-api", model).unwrap();
         let card = profile.card.as_ref().unwrap();
         assert_eq!(card.context_window_tokens, Some(1_050_000));
@@ -58,11 +54,11 @@ fn api_cards_are_independent_and_recommendations_keep_exact_versions() {
         assert_eq!(card.display_name, profile.name);
         assert_eq!(
             validate_reasoning_effort(&profile, Some(ReasoningEffort::Off)).is_ok(),
-            model.contains("luna")
+            (model.contains("luna") || model.contains("terra"))
         );
         assert_eq!(
             card.thinking,
-            if model.contains("luna") {
+            if model.contains("luna") || model.contains("terra") {
                 ThinkingControl::Toggle
             } else {
                 ThinkingControl::AlwaysOn
@@ -74,11 +70,11 @@ fn api_cards_are_independent_and_recommendations_keep_exact_versions() {
             .iter()
             .filter(|profile| profile.provider_id == "openai-api")
             .count(),
-        3
+        4
     );
     assert_eq!(
         catalog
-            .get("openai-codex", "gpt-5.5-responses")
+            .get("openai-codex", "gpt-5.5")
             .unwrap()
             .card
             .unwrap()
@@ -188,7 +184,7 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
     let configuration = config(
         &root,
         endpoint.trim_end_matches("/anthropic").to_owned() + "/v1",
-        "gpt-6.1-sol-responses",
+        "gpt-6.1-sol",
     );
     let client = LocalModelClients::new(Some(root.to_path_buf()))
         .client(&configuration)
@@ -331,7 +327,7 @@ async fn discovery_uses_same_private_key_and_failures_preserve_it() {
         "",
     )
     .await;
-    let config = config(&root, endpoint, "gpt-6-astra-responses");
+    let config = config(&root, endpoint, "gpt-6-astra");
     let cache = AccountModelDiscovery::default();
     let directory = cache
         .discover(&config, Some(&root), false, &CancellationToken::new())

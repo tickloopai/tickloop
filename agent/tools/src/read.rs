@@ -426,6 +426,16 @@ struct RecentRead {
 }
 
 impl FileReadState {
+    pub fn upgrade_checkpoint(&self) -> Vec<(PathBuf, FileReadRecord)> {
+        let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut entries = reads.entries.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(_, entry)| entry.last_used);
+        entries
+            .into_iter()
+            .map(|(path, entry)| (path.clone(), entry.record.clone()))
+            .collect()
+    }
+
     pub fn get(&self, path: &Path) -> Option<FileReadRecord> {
         let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
         reads.clock += 1;

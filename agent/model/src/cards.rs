@@ -20,8 +20,8 @@ pub const MIN_ANSWER_TOKENS: u32 = 1024;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub model_aliases: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<super::access::ProviderSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<ProviderConnection>,
     pub id: String,
@@ -48,35 +48,40 @@ pub struct ModelSelection {
 
 impl ModelCatalog {
     pub fn defaults() -> Self {
-        let providers = [
-            include_str!("providers/deepseek-api.yaml"),
-            include_str!("providers/anthropic-api.yaml"),
-            include_str!("providers/openai-api.yaml"),
-            include_str!("providers/openai-codex.yaml"),
-            include_str!("providers/minimax-cn-api.yaml"),
-            include_str!("providers/minimax-global-api.yaml"),
-            include_str!("providers/minimax-cn-oauth.yaml"),
-            include_str!("providers/minimax-global-oauth.yaml"),
-            include_str!("providers/zhipu-cn-api.yaml"),
-            include_str!("providers/zhipu-cn-coding.yaml"),
-            include_str!("providers/zai-global-api.yaml"),
-            include_str!("providers/zai-global-coding.yaml"),
-            include_str!("providers/github-copilot.yaml"),
-            include_str!("providers/kimi-cn-api.yaml"),
-            include_str!("providers/kimi-global-api.yaml"),
-            include_str!("providers/kimi-code-oauth.yaml"),
-            include_str!("providers/alibaba-cn-api.yaml"),
-            include_str!("providers/google-gemini-api.yaml"),
-            include_str!("providers/google-gemini-oauth.yaml"),
-            include_str!("providers/google-vertex-service-account.yaml"),
-            include_str!("providers/google-vertex-oauth.yaml"),
-            include_str!("providers/xai-api.yaml"),
-            include_str!("providers/xai-oauth.yaml"),
-        ]
-        .into_iter()
-        .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
-        .collect();
-        Self { providers }
+        static BUNDLED: OnceLock<ModelCatalog> = OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                let providers = [
+                    include_str!("providers/deepseek-api.yaml"),
+                    include_str!("providers/anthropic-api.yaml"),
+                    include_str!("providers/openai-api.yaml"),
+                    include_str!("providers/openai-codex.yaml"),
+                    include_str!("providers/minimax-cn-api.yaml"),
+                    include_str!("providers/minimax-global-api.yaml"),
+                    include_str!("providers/minimax-cn-oauth.yaml"),
+                    include_str!("providers/minimax-global-oauth.yaml"),
+                    include_str!("providers/zhipu-cn-api.yaml"),
+                    include_str!("providers/zhipu-cn-coding.yaml"),
+                    include_str!("providers/zai-global-api.yaml"),
+                    include_str!("providers/zai-global-coding.yaml"),
+                    include_str!("providers/github-copilot.yaml"),
+                    include_str!("providers/kimi-cn-api.yaml"),
+                    include_str!("providers/kimi-global-api.yaml"),
+                    include_str!("providers/kimi-code-oauth.yaml"),
+                    include_str!("providers/alibaba-cn-api.yaml"),
+                    include_str!("providers/google-gemini-api.yaml"),
+                    include_str!("providers/google-gemini-oauth.yaml"),
+                    include_str!("providers/google-vertex-service-account.yaml"),
+                    include_str!("providers/google-vertex-oauth.yaml"),
+                    include_str!("providers/xai-api.yaml"),
+                    include_str!("providers/xai-oauth.yaml"),
+                ]
+                .into_iter()
+                .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
+                .collect();
+                Self { providers }
+            })
+            .clone()
     }
 
     pub fn from_providers(providers: Vec<ProviderDefinition>) -> Result<Self, String> {
@@ -187,17 +192,6 @@ impl ModelCatalog {
                     "{location}.api_key_env: a valid environment variable name is required"
                 ));
             }
-            for (alias, target) in &provider.model_aliases {
-                if alias.trim().is_empty()
-                    || target.trim().is_empty()
-                    || provider.models.iter().any(|model| model.id == *alias)
-                    || !provider.models.iter().any(|model| model.id == *target)
-                {
-                    return Err(format!(
-                        "{location}.model_aliases: aliases must point directly to concrete cards without shadowing card ids"
-                    ));
-                }
-            }
             let mut model_ids = HashSet::new();
             for model in &provider.models {
                 let location = format!("{location}.models[{}]", model.id);
@@ -208,13 +202,8 @@ impl ModelCatalog {
                         "{location}.adapter: Codex Responses requires Codex subscription auth"
                     ));
                 }
-                if model.id.trim().is_empty()
-                    || model.service_model_id.trim().is_empty()
-                    || model.display_name.trim().is_empty()
-                {
-                    return Err(format!(
-                        "{location}: id, service_model_id and display_name are required"
-                    ));
+                if model.id.trim().is_empty() || model.display_name.trim().is_empty() {
+                    return Err(format!("{location}: id and display_name are required"));
                 }
                 if !model_ids.insert(&model.id) {
                     return Err(format!("{location}: duplicate model id"));
@@ -296,7 +285,7 @@ impl ModelCatalog {
                 validate_model_config(&profile).map_err(|error| format!("{location}: {error}"))?;
             }
         }
-        Ok(())
+        super::access::AccessCatalog::from_catalog(self).validate(self)
     }
 
     fn profile(
@@ -313,7 +302,7 @@ impl ModelCatalog {
             name: model.display_name.clone(),
             protocol: model.adapter.protocol(),
             base_url: base_url.into(),
-            model: model.service_model_id.clone(),
+            model: model.id.clone(),
             api_key_env: provider.api_key_env.clone(),
             max_output_tokens: model.max_output_tokens,
             provider: if provider.auth == ModelAuthSource::CodexSubscription {
@@ -378,9 +367,6 @@ impl ModelCatalog {
         for patch in providers {
             let location = format!("providers[{}]", patch.id);
             if let Some(existing) = self.providers.iter_mut().find(|entry| entry.id == patch.id) {
-                if let Some(aliases) = patch.model_aliases {
-                    existing.model_aliases.extend(aliases);
-                }
                 if let Some(value) = patch.connection {
                     existing.connection = Some(value);
                 }
@@ -397,17 +383,7 @@ impl ModelCatalog {
                     existing.endpoints.extend(endpoints);
                 }
                 if let Some(models) = patch.models {
-                    let mut effective_ids = HashSet::new();
-                    for mut model in models {
-                        if let Some(canonical) = existing.model_aliases.get(&model.id) {
-                            model.id = canonical.clone();
-                        }
-                        if !effective_ids.insert(model.id.clone()) {
-                            return Err(format!(
-                                "{location}.models: duplicate model id or alias target `{}`",
-                                model.id
-                            ));
-                        }
+                    for model in models {
                         if let Some(current) = existing
                             .models
                             .iter_mut()
@@ -427,7 +403,7 @@ impl ModelCatalog {
                     .map(|model| model.into_new(&location))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.providers.push(ProviderDefinition {
-                    model_aliases: patch.model_aliases.unwrap_or_default(),
+                    selection: None,
                     connection: patch.connection,
                     id: patch.id,
                     display_name: patch.display_name.ok_or_else(|| {
@@ -455,24 +431,7 @@ impl ModelCatalog {
         Ok(self)
     }
 
-    pub fn canonical_model_id(&self, provider_id: &str, model_id: &str) -> Option<&str> {
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)?;
-        let target = provider
-            .model_aliases
-            .get(model_id)
-            .map_or(model_id, String::as_str);
-        provider
-            .models
-            .iter()
-            .find(|model| model.id == target)
-            .map(|model| model.id.as_str())
-    }
-
     pub fn get(&self, provider_id: &str, model_id: &str) -> Option<ModelConfig> {
-        let model_id = self.canonical_model_id(provider_id, model_id)?;
         self.profiles()
             .into_iter()
             .find(|profile| profile.provider_id == provider_id && profile.model_id == model_id)
@@ -522,23 +481,6 @@ pub fn provider_connection(provider_id: &str) -> Option<&'static ProviderConnect
         .as_ref()
 }
 
-pub fn builtin_canonical_model_id(provider_id: &str, model_id: &str) -> Option<&'static str> {
-    static DEFAULTS: OnceLock<ModelCatalog> = OnceLock::new();
-    DEFAULTS
-        .get_or_init(ModelCatalog::defaults)
-        .canonical_model_id(provider_id, model_id)
-}
-
-fn canonicalize_builtin_identity(config: &mut ModelConfig) {
-    let Some(canonical) = builtin_canonical_model_id(&config.provider_id, &config.model_id) else {
-        return;
-    };
-    config.model_id = canonical.to_owned();
-    if let Some(card) = &mut config.card {
-        card.id = canonical.to_owned();
-    }
-}
-
 pub fn provider_group(provider_id: &str) -> Option<&'static str> {
     provider_connection(provider_id).map(|connection| connection.vendor.as_str())
 }
@@ -575,7 +517,6 @@ fn legacy_builtin_name(profile: &ModelConfig) -> Option<String> {
 }
 
 pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
-    canonicalize_builtin_identity(&mut config);
     if config.card.is_some() {
         return config;
     }
@@ -671,14 +612,14 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
             .iter()
             .find(|provider| provider.id == default_provider_id)
             .and_then(|provider| {
-                provider.models.iter().find(|model| {
-                    model.adapter == adapter && model.service_model_id == config.model
-                })
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.adapter == adapter && model.id == config.model)
             })
             .cloned()
             .unwrap_or(ModelCard {
                 id: config.model_id.clone(),
-                service_model_id: config.model.clone(),
                 display_name: config.name.clone(),
                 adapter,
                 max_output_tokens: config.max_output_tokens,
@@ -763,12 +704,9 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
     if config.provider_name.is_empty() {
         config.provider_name = "Custom API".into();
     }
-    if config.model_id.is_empty() {
-        config.model_id = config.model.clone();
-    }
+    config.model_id = config.model.clone();
     config.card = Some(ModelCard {
         id: config.model_id.clone(),
-        service_model_id: config.model.clone(),
         display_name: config.name.clone(),
         adapter: config.protocol.into(),
         max_output_tokens: config.max_output_tokens,
@@ -802,6 +740,47 @@ pub fn upgrade_saved_legacy_builtin_model(config: ModelConfig) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_catalog_copies_keep_nested_changes_local_to_each_caller() {
+        let original = ModelCatalog::defaults();
+        let mut edited = ModelCatalog::defaults();
+        let mut removed = ModelCatalog::defaults();
+        edited.providers[0].display_name = "Local display override".into();
+        edited.providers[0].endpoints.clear();
+        edited.providers[0].models[0].display_name = "Local model override".into();
+        edited.providers[0].models[0].input_modalities.clear();
+        removed.providers.clear();
+
+        assert_ne!(edited, original);
+        assert!(removed.providers.is_empty());
+        assert_eq!(ModelCatalog::defaults(), original);
+    }
+
+    #[test]
+    #[ignore = "manual construction-cost measurement; no machine-dependent pass threshold"]
+    fn measure_repeated_default_catalog_construction() {
+        use std::{hint::black_box, time::Instant};
+        const ITERATIONS: usize = 129;
+        let reference = ModelCatalog::defaults();
+        assert!(!reference.providers.is_empty());
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(ModelCatalog::defaults());
+        }
+        let defaults = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(reference.clone());
+        }
+        let cloning = started.elapsed();
+        eprintln!(
+            "catalog construction: iterations={ITERATIONS}, defaults_us={}, clone_us={}, defaults_to_clone_ratio={:.2}",
+            defaults.as_micros(),
+            cloning.as_micros(),
+            defaults.as_secs_f64() / cloning.as_secs_f64()
+        );
+    }
 
     #[test]
     fn saved_builtin_cards_inherit_new_capabilities_without_replacing_explicit_overrides() {
@@ -884,16 +863,12 @@ mod tests {
     fn historical_builtin_names_upgrade_to_current_model_cards() {
         let defaults = ModelCatalog::defaults();
         for (provider_id, model_id) in [
-            ("deepseek-api", "deepseek-flash-messages"),
-            ("deepseek-api", "deepseek-flash-responses"),
-            ("deepseek-api", "deepseek-flash-chat-completions"),
-            ("deepseek-api", "deepseek-v4-pro-messages"),
-            ("deepseek-api", "deepseek-v4-pro-responses"),
-            ("deepseek-api", "deepseek-v4-pro-chat-completions"),
-            ("openai-codex", "gpt-5.5-responses"),
-            ("openai-codex", "gpt-5.6-sol-responses"),
-            ("openai-codex", "gpt-5.6-terra-responses"),
-            ("openai-codex", "gpt-5.6-luna-responses"),
+            ("deepseek-api", "deepseek-flash"),
+            ("deepseek-api", "deepseek-v4-pro"),
+            ("openai-codex", "gpt-5.5"),
+            ("openai-codex", "gpt-5.6-sol"),
+            ("openai-codex", "gpt-5.6-terra"),
+            ("openai-codex", "gpt-5.6-luna"),
         ] {
             let current = defaults.get(provider_id, model_id).unwrap();
             let mut legacy = current.clone();
@@ -911,7 +886,7 @@ mod tests {
     #[test]
     fn historical_builtin_name_does_not_override_custom_fields() {
         let current = ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("deepseek-api", "deepseek-flash")
             .unwrap();
         let mut legacy = current.clone();
         legacy.name = legacy_builtin_name(&current).unwrap();
@@ -943,7 +918,7 @@ mod tests {
         custom_identity.provider_id = "research-gateway".into();
         let migrated = migrate_legacy_model(custom_identity);
         assert_eq!(migrated.provider_id, "research-gateway");
-        assert_eq!(migrated.name, "DeepSeek");
+        assert_eq!(migrated.name, legacy.name);
 
         legacy.max_output_tokens = 4096;
         assert_eq!(upgrade_saved_legacy_builtin_model(legacy), current);

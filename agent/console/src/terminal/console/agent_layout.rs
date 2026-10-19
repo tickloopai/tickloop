@@ -554,7 +554,7 @@ impl AgentOverview {
 
 /// A selectable overview line: a group heading, an Agent row, or the counter that folds the
 /// rest of the Done group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum OverviewTarget {
     Heading(AttentionGroup),
     Agent(Uuid),

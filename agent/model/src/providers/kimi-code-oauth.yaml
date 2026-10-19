@@ -11,15 +11,30 @@ auth: kimi_oauth
 api_key_env: ''
 endpoints:
   kimi_chat_completions: https://api.kimi.com/coding/v1
+selection:
+  auxiliary_model: k3-256k
+  series:
+  - id: kimi
+    name: Kimi
+    model: k3
+    capability_order: 0
+  - id: kimi-256k
+    name: Kimi 256K
+    model: k3-256k
+    capability_order: 2
+  notice: Kimi Code OAuth uses the registered Kimi Code client. K3 uses a 1M context
+    window and requires Pro / Allegretto or above for that window. Plus / Moderato
+    accounts should select K3 256K (k3-256k).
+    Model listing does not verify plan access. K3 is the default recommendation.
+    A usage-limit refusal may also mean
+    the plan does not include the model. Check the provider's subscription link.
 models:
 - id: kimi-for-coding
-  service_model_id: kimi-for-coding
   display_name: Kimi for Coding (K2.8 Preview)
   adapter: kimi_chat_completions
   max_output_tokens: 4096
   context_window_tokens: 1048576
 - id: k3
-  service_model_id: k3
   display_name: Kimi K3
   adapter: kimi_chat_completions
   max_output_tokens: 131072
@@ -33,7 +48,6 @@ models:
   - text
   - image
 - id: k3-256k
-  service_model_id: k3-256k
   display_name: Kimi K3 (256K)
   adapter: kimi_chat_completions
   max_output_tokens: 131072

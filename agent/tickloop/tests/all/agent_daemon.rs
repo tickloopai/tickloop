@@ -992,9 +992,16 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
                 .unwrap()
                 .to_string_lossy()
                 .starts_with("w-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
         })
         .collect::<Vec<_>>();
     assert_eq!(worker_sockets.len(), 2);
+    let worker_endpoints = worker_sockets
+        .iter()
+        .flat_map(|socket| [socket.clone(), socket.with_extension("upgrade")])
+        .collect::<Vec<_>>();
     replacement.shutdown_daemon().await.unwrap();
     let daemon_lock = std::fs::OpenOptions::new()
         .read(true)
@@ -1003,7 +1010,7 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
         .unwrap();
     tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, async {
         loop {
-            if !worker_sockets.iter().any(|path| path.exists())
+            if !worker_endpoints.iter().any(|path| path.exists())
                 && unsafe { libc::flock(daemon_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
                     == 0
             {
@@ -1098,6 +1105,9 @@ async fn start_daemon_with_agent(
                 .unwrap()
                 .to_string_lossy()
                 .starts_with("w-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
         })
         .expect("the daemon published its worker's socket");
     let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();

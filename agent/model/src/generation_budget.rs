@@ -19,6 +19,14 @@ pub struct GenerationBudget {
 }
 
 impl GenerationBudget {
+    pub fn timeout(self) -> Duration {
+        self.deadline
+    }
+
+    pub fn output_tokens(self) -> u32 {
+        self.output_tokens
+    }
+
     pub fn new(output_tokens: u32, deadline: Duration) -> Self {
         Self {
             output_tokens,

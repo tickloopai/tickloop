@@ -152,7 +152,7 @@ impl FirstCreate {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct NewAgentDraft {
     changes: Vec<ConfigurationChange>,
     additional_directories: Option<Vec<PathBuf>>,
@@ -336,7 +336,7 @@ mod tests {
     fn base() -> AgentConfiguration {
         AgentConfiguration {
             search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
-            model: model("deepseek-api", "deepseek-flash-chat-completions"),
+            model: model("deepseek-api", "deepseek-flash"),
             pending_model: None,
             reasoning_effort: None,
             thinking_enabled: true,

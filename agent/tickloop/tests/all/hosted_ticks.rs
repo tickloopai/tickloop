@@ -3401,7 +3401,7 @@ for line in sys.stdin:
 
     /// An update over the 512 KiB limit once encoded, though its line is within it, is a
     /// protocol violation of its own Tick: the host never forwards it, the call that published
-    /// it has an unknown outcome, and that Tick's Watch becomes IdentityUncertain without
+    /// it has an unknown outcome, and that Tick's Watch reaches a terminal state without
     /// delivering it, while the Watch of another Tick in the same stream keeps delivering its
     /// updates and that Tick keeps running.
     #[tokio::test(flavor = "multi_thread")]
@@ -3497,12 +3497,16 @@ for line in sys.stdin:
             "the refused update is never forwarded"
         );
         drop(raw);
+        // Latest-only watches may coalesce the protocol error with the Tick's subsequent exit.
         let refused = wait_for(
             &mut handle.events,
             &mut seen,
             grown,
-            "the large Watch losing its Tick's identity",
-            |event| is_state(event, large, TickConnectionState::IdentityUncertain),
+            "the violating Tick's link ending",
+            |event| {
+                is_state(event, large, TickConnectionState::IdentityUncertain)
+                    || is_state(event, large, TickConnectionState::Gone)
+            },
         )
         .await;
 

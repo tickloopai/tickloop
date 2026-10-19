@@ -6,7 +6,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,7 +28,7 @@ use tickhost_connect::{
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream},
-    sync::Mutex,
+    sync::{Mutex, Notify, RwLock},
 };
 use uuid::Uuid;
 
@@ -70,6 +73,19 @@ pub struct WorkerControl {
     /// Per config root: reconciled with the host once since this daemon started.
     reconciled: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<()>>>>,
     daemon: OnceLock<DaemonServer>,
+    admission: Arc<RwLock<()>>,
+    retired: AtomicBool,
+    connections: AtomicUsize,
+    connections_changed: Notify,
+}
+
+struct ConnectionActivity(Arc<WorkerControl>);
+
+impl Drop for ConnectionActivity {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+        self.0.connections_changed.notify_one();
+    }
 }
 
 impl WorkerControl {
@@ -82,6 +98,10 @@ impl WorkerControl {
             registry: Registry::default(),
             reconciled: std::sync::Mutex::new(HashMap::new()),
             daemon: OnceLock::new(),
+            admission: Arc::new(RwLock::new(())),
+            retired: AtomicBool::new(false),
+            connections: AtomicUsize::new(0),
+            connections_changed: Notify::new(),
         }
     }
 
@@ -92,6 +112,13 @@ impl WorkerControl {
 
     pub fn endpoint(&self) -> &Path {
         &self.endpoint
+    }
+
+    pub(crate) fn try_pause(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.admission.clone().try_write_owned().ok()
+    }
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
     }
 
     /// Completes the daemon wiring once the daemon server exists.
@@ -119,15 +146,7 @@ impl WorkerControl {
         config_root: Option<&Path>,
     ) {
         let root = config_root.and_then(root_identity);
-        self.grants.lock().await.insert(
-            grant.binding,
-            Grant {
-                capability: grant.capability.clone(),
-                worker,
-                root: root.clone(),
-                config_root: config_root.map(Path::to_path_buf),
-            },
-        );
+        self.restore_grant(grant, worker, config_root).await;
         if let (Some(config_root), Some(root)) = (config_root.map(Path::to_path_buf), root) {
             let control = self.clone();
             // A failed reconcile is tried again by the root's next request.
@@ -137,6 +156,23 @@ impl WorkerControl {
         }
     }
 
+    pub(crate) async fn restore_grant(
+        &self,
+        grant: &WorkerControlGrant,
+        worker: Arc<dyn AgentAccess>,
+        config_root: Option<&Path>,
+    ) {
+        self.grants.lock().await.insert(
+            grant.binding,
+            Grant {
+                capability: grant.capability.clone(),
+                worker,
+                root: config_root.and_then(root_identity),
+                config_root: config_root.map(Path::to_path_buf),
+            },
+        );
+    }
+
     pub async fn revoke(&self, worker: &Arc<dyn AgentAccess>) {
         self.grants
             .lock()
@@ -144,12 +180,24 @@ impl WorkerControl {
             .retain(|_, grant| !Arc::ptr_eq(&grant.worker, worker));
     }
 
+    pub(crate) async fn drain(&self) {
+        let _ = tokio::time::timeout(CONTROL_TIMEOUT, async {
+            while self.connections.load(Ordering::SeqCst) != 0 {
+                self.connections_changed.notified().await;
+            }
+        })
+        .await;
+    }
+
     pub async fn serve(self: Arc<Self>, listener: UnixListener) {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let control = self.clone();
+                    control.connections.fetch_add(1, Ordering::SeqCst);
+                    let activity = ConnectionActivity(control.clone());
                     tokio::spawn(async move {
+                        let _activity = activity;
                         let _ = control.connection(stream).await;
                     });
                 }
@@ -185,6 +233,13 @@ impl WorkerControl {
     }
 
     async fn handle(&self, envelope: WorkerEnvelope) -> Result<Value, HostError> {
+        let _admission = self.admission.read().await;
+        if self.retired.load(Ordering::SeqCst) {
+            return Err(HostError::before(
+                "DaemonTransferred",
+                "Agent daemon transferred ownership",
+            ));
+        }
         if envelope.daemon_epoch != self.epoch {
             return Err(HostError::before(
                 "EpochChanged",
@@ -824,6 +879,66 @@ mod tests {
     use super::*;
 
     const KEY: &str = "sample-key-41c7";
+
+    #[tokio::test]
+    async fn retired_control_drains_accepted_requests_with_an_explicit_predispatch_reply() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let epoch = Uuid::new_v4();
+        let controller = Arc::new(HostController::new(
+            directory.path(),
+            tickhost::paths::HostPaths {
+                runtime: directory.path().join("host"),
+            },
+            epoch,
+            directory.path().join("unused-tickhost"),
+            Duration::from_secs(1),
+        ));
+        let control = Arc::new(WorkerControl::new(directory.path(), epoch, controller));
+        let (listener, identity) = crate::private_listener(control.endpoint()).unwrap();
+        let gate = control.try_pause().unwrap();
+        let service = tokio::spawn(control.clone().serve(listener));
+        let client = UnixStream::connect(control.endpoint()).await.unwrap();
+        let (reader, mut writer) = client.into_split();
+        let request_id = Uuid::new_v4();
+        let envelope = WorkerEnvelope {
+            daemon_epoch: epoch,
+            binding: Uuid::new_v4(),
+            capability: "private-grant".into(),
+            request: WorkerRequest::ListHostedTicks {
+                chat: Uuid::new_v4(),
+                cursor: None,
+            },
+        };
+        write_frame(
+            &mut writer,
+            &json!({"id":request_id,"envelope":envelope}),
+            REQUEST_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.connections.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        control.retire();
+        service.abort();
+        let _ = service.await;
+        drop(gate);
+        control.drain().await;
+        assert_eq!(control.connections.load(Ordering::SeqCst), 0);
+        let reply = read_frame(&mut BufReader::new(reader), BUSINESS_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["id"], json!(request_id));
+        assert_eq!(reply["error"]["code"], "DaemonTransferred");
+        assert_eq!(reply["error"]["dispatched"], false);
+        assert!(!directory.path().join("host").exists());
+        crate::remove_owned_socket(control.endpoint(), identity).unwrap();
+    }
 
     /// Installs the package `name` that logs in as `auth` declares into `config_root`, from
     /// sources in `directory`, and returns the canonical path of its program.

@@ -24,6 +24,7 @@ use tickloop_agent_protocol::{
 
 pub mod access;
 pub mod auth;
+pub mod auxiliary;
 pub mod availability;
 pub mod cards;
 mod chat_completions;
@@ -225,13 +226,14 @@ pub fn validate_reasoning_effort(
     effort: Option<ReasoningEffort>,
 ) -> Result<(), ModelError> {
     let is_supported = effort.is_none_or(|effort| match effort {
-        ReasoningEffort::On => {
-            matches!(
-                config.adapter(),
-                Adapter::MinimaxMessages | Adapter::QwenChatCompletions
-            ) && cards::model_card(config)
-                .is_some_and(|card| card.thinking == ThinkingControl::Toggle)
-        }
+        ReasoningEffort::On => cards::model_card(config).is_some_and(|card| {
+            card.thinking == ThinkingControl::Toggle
+                && (matches!(
+                    config.adapter(),
+                    Adapter::MinimaxMessages | Adapter::QwenChatCompletions
+                ) || config.adapter() == Adapter::GlmChatCompletions
+                    && card.effort_levels.is_empty())
+        }),
         ReasoningEffort::Off => {
             cards::model_card(config).is_some_and(|card| card.thinking == ThinkingControl::Toggle)
         }
@@ -582,6 +584,13 @@ fn request_transport_error(error: reqwest::Error) -> ModelError {
 
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    fn auxiliary_client(
+        &self,
+        _task: auxiliary::AuxiliaryTask,
+    ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+        Ok(None)
+    }
+
     fn connection_id(&self) -> Option<String> {
         None
     }
@@ -590,6 +599,19 @@ pub trait ModelClient: Send + Sync {
 
     fn supports_reasoning_effort(&self, _effort: ReasoningEffort) -> bool {
         false
+    }
+
+    fn minimum_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        [
+            ReasoningEffort::Off,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ]
+        .into_iter()
+        .find(|effort| self.supports_reasoning_effort(*effort))
     }
 
     async fn generate_title(
@@ -665,7 +687,7 @@ pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
     if let Some(card) = &config.card
         && (config.provider_id.is_empty()
             || config.model_id != card.id
-            || config.model != card.service_model_id
+            || config.model != card.id
             || config.name != card.display_name
             || config.protocol != card.adapter.protocol()
             || config.max_output_tokens != card.max_output_tokens)
@@ -1256,6 +1278,24 @@ impl HttpModelClient {
 
 #[async_trait]
 impl ModelClient for HttpModelClient {
+    fn auxiliary_client(
+        &self,
+        task: auxiliary::AuxiliaryTask,
+    ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+        let Some(config) = auxiliary::auxiliary_model_config(&self.config, task) else {
+            return Ok(None);
+        };
+        validate_model_config(&config)?;
+        let mut client = Self::assemble(
+            config,
+            self.endpoint.clone(),
+            self.credentials.clone(),
+            self.provenance.clone(),
+        )?;
+        client.cache_id = self.cache_id;
+        Ok(Some(Arc::new(client)))
+    }
+
     fn connection_id(&self) -> Option<String> {
         Some(self.config.provider_id.clone())
     }
@@ -1753,6 +1793,7 @@ pub(crate) fn uses_prompted_structured_output(
         config.adapter(),
         Adapter::DeepseekMessages | Adapter::MinimaxMessages
     ) || config.provider_id == "kimi-code-oauth"
+        || config.adapter() == Adapter::KimiChatCompletions && config.model == kimi::CODE_MODEL_ID
         || config.adapter() == Adapter::QwenChatCompletions
             && request
                 .messages
@@ -2284,6 +2325,17 @@ pub fn fixture_client(client: Arc<dyn ModelClient>) -> Arc<dyn ModelClient> {
     struct FixtureClient(Arc<dyn ModelClient>);
     #[async_trait]
     impl ModelClient for FixtureClient {
+        fn supports_reasoning_effort(&self, effort: ReasoningEffort) -> bool {
+            self.0.supports_reasoning_effort(effort)
+        }
+
+        fn auxiliary_client(
+            &self,
+            task: auxiliary::AuxiliaryTask,
+        ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+            Ok(self.0.auxiliary_client(task)?.map(fixture_client))
+        }
+
         fn identity(&self) -> ModelIdentity {
             self.0.identity()
         }
@@ -2424,11 +2476,11 @@ mod tests {
 
     #[test]
     fn known_deepseek_models_share_the_published_context_window() {
-        for model in ["deepseek-flash-messages", "deepseek-v4-pro-messages"] {
+        for model in ["deepseek-flash", "deepseek-v4-pro"] {
             let config = default_model("deepseek-api", model);
             assert_eq!(config.maximum_context_window_tokens(), Some(1_000_000));
         }
-        let mut config = default_model("deepseek-api", "deepseek-v4-flash-messages");
+        let mut config = default_model("deepseek-api", "deepseek-v4-flash");
         assert_eq!(config.maximum_context_window_tokens(), None);
         config.base_url = "https://gateway.example/anthropic".into();
         assert!(validate_model_config(&config).is_ok());
@@ -2436,7 +2488,7 @@ mod tests {
 
     #[test]
     fn private_history_source_distinguishes_provider_adapter_and_nondefault_port() {
-        let mut source = default_model("deepseek-api", "deepseek-flash-messages");
+        let mut source = default_model("deepseek-api", "deepseek-flash");
         source.base_url = "https://api.deepseek.com:443/anthropic/".into();
         let mut same = source.clone();
         same.base_url = "https://api.deepseek.com/anthropic".into();
@@ -2550,7 +2602,7 @@ mod tests {
 
     #[test]
     fn credential_provenance_uses_the_same_normalized_endpoint_as_private_history() {
-        let original = default_model("anthropic-api", "claude-sonnet-4-6-messages");
+        let original = default_model("anthropic-api", "claude-sonnet-4-6");
         let mut equivalent = original.clone();
         equivalent.base_url = format!("{}:443", original.base_url);
         let clients = vendor_clients();
@@ -2560,40 +2612,24 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_reaches_each_deepseek_protocol() {
+    fn deepseek_primary_protocol_encodes_effort_and_off() {
         let mut request = structured_request();
         request.structured_output = None;
         request.reasoning_effort = Some(ReasoningEffort::Max);
-        let mut config = default_model("deepseek-api", "deepseek-flash-messages");
-
-        let messages = messages_request(&config, request.clone()).unwrap();
-        assert_eq!(messages["thinking"], json!({"type":"enabled"}));
-        assert_eq!(messages["output_config"]["effort"], "max");
-
-        config = default_model("deepseek-api", "deepseek-flash-responses");
-        let responses = responses::encode_request(&config, request.clone()).unwrap();
-        assert_eq!(responses["reasoning"]["effort"], "max");
-
-        config = default_model("deepseek-api", "deepseek-flash-chat-completions");
+        let config = default_model("deepseek-api", "deepseek-flash");
         let chat = chat_completions::encode_request(&config, request.clone()).unwrap();
         assert_eq!(chat["thinking"], json!({"type":"enabled"}));
         assert_eq!(chat["reasoning_effort"], "max");
-
         request.reasoning_effort = Some(ReasoningEffort::Off);
         assert_eq!(
-            chat_completions::encode_request(&config, request.clone()).unwrap()["thinking"],
+            chat_completions::encode_request(&config, request).unwrap()["thinking"],
             json!({"type":"disabled"})
-        );
-        config = default_model("deepseek-api", "deepseek-flash-responses");
-        assert_eq!(
-            responses::encode_request(&config, request).unwrap()["reasoning"]["effort"],
-            "none"
         );
     }
 
     #[test]
     fn effort_choices_match_deepseek_and_claude_capabilities() {
-        let mut config = default_model("deepseek-api", "deepseek-v4-pro-messages");
+        let mut config = default_model("deepseek-api", "deepseek-v4-pro");
         assert_eq!(
             ReasoningEffort::choices(&config),
             &[
@@ -2603,7 +2639,7 @@ mod tests {
             ]
         );
 
-        config = default_model("anthropic-api", "claude-sonnet-5-messages");
+        config = default_model("anthropic-api", "claude-sonnet-5");
         assert_eq!(
             ReasoningEffort::choices(&config),
             &[
@@ -2615,16 +2651,16 @@ mod tests {
             ]
         );
 
-        config = default_model("anthropic-api", "claude-opus-4-6-messages");
+        config = default_model("anthropic-api", "claude-opus-4-6");
         assert_eq!(ReasoningEffort::choices(&config).len(), 4);
-        config = default_model("anthropic-api", "claude-opus-5-messages");
+        config = default_model("anthropic-api", "claude-opus-5");
         assert_eq!(ReasoningEffort::choices(&config).len(), 5);
-        config = default_model("anthropic-api", "claude-fable-5-messages");
+        config = default_model("anthropic-api", "claude-fable-5");
         assert!(validate_reasoning_effort(&config, Some(ReasoningEffort::Off)).is_err());
     }
 
     #[test]
-    fn model_card_lists_preferred_deepseek_protocol_and_keeps_legacy_adapters() {
+    fn model_card_lists_only_the_preferred_deepseek_protocol() {
         let profiles = cards::built_in_model_profiles();
         for model in ["deepseek-flash", "deepseek-v4-pro"] {
             let protocols = profiles
@@ -2639,19 +2675,12 @@ mod tests {
                 .filter(|profile| profile.model == model)
                 .map(|profile| profile.protocol)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                legacy_protocols,
-                [
-                    Protocol::Messages,
-                    Protocol::Responses,
-                    Protocol::ChatCompletions
-                ]
-            );
+            assert_eq!(legacy_protocols, [Protocol::ChatCompletions]);
         }
 
-        let config = default_model("anthropic-api", "claude-opus-5-messages");
+        let config = default_model("anthropic-api", "claude-opus-5");
         assert_eq!(config.protocol, Protocol::Messages);
-        let config = default_model("anthropic-api", "claude-fable-5-messages");
+        let config = default_model("anthropic-api", "claude-fable-5");
         assert_eq!(
             cards::model_card(&config).unwrap().thinking,
             ThinkingControl::AlwaysOn
@@ -2660,16 +2689,16 @@ mod tests {
 
     #[test]
     fn claude_messages_can_disable_thinking_without_an_effort_level() {
-        let mut config = default_model("anthropic-api", "claude-opus-5-messages");
+        let mut config = default_model("anthropic-api", "claude-opus-5");
         let mut request = structured_request();
         let default_body = messages_request(&config, request.clone()).unwrap();
         assert_eq!(default_body["thinking"], json!({"type":"adaptive"}));
-        config = default_model("anthropic-api", "claude-opus-4-8-messages");
+        config = default_model("anthropic-api", "claude-opus-4-8");
         assert_eq!(
             messages_request(&config, request.clone()).unwrap()["thinking"],
             json!({"type":"adaptive"})
         );
-        config = default_model("anthropic-api", "claude-opus-5-messages");
+        config = default_model("anthropic-api", "claude-opus-5");
         request.reasoning_effort = Some(ReasoningEffort::Off);
         let body = messages_request(&config, request).unwrap();
         assert_eq!(body["thinking"], json!({"type":"disabled"}));
@@ -2681,12 +2710,12 @@ mod tests {
         let mut request = structured_request();
         request.structured_output = None;
         request.reasoning_effort = Some(ReasoningEffort::Medium);
-        let mut config = default_model("deepseek-api", "deepseek-flash-messages");
+        let mut config = default_model("deepseek-api", "deepseek-flash");
         assert!(matches!(
-            messages_request(&config, request.clone()),
+            chat_completions::encode_request(&config, request.clone()),
             Err(ModelError::Configuration(_))
         ));
-        config = default_model("anthropic-api", "claude-sonnet-4-6-messages");
+        config = default_model("anthropic-api", "claude-sonnet-4-6");
         let body = messages_request(&config, request).unwrap();
         assert_eq!(body["thinking"], json!({"type":"adaptive"}));
         assert_eq!(body["output_config"]["effort"], "medium");
@@ -2696,7 +2725,7 @@ mod tests {
     fn claude_effort_and_structured_output_share_output_config() {
         let mut request = structured_request();
         request.reasoning_effort = Some(ReasoningEffort::Medium);
-        let config = default_model("anthropic-api", "claude-sonnet-4-6-messages");
+        let config = default_model("anthropic-api", "claude-sonnet-4-6");
         let body = messages_request(&config, request).unwrap();
         assert_eq!(body["output_config"]["effort"], "medium");
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
@@ -2767,7 +2796,7 @@ mod tests {
         config.model_id = config.model.clone();
         let card = config.card.as_mut().unwrap();
         card.id = config.model.clone();
-        card.service_model_id = config.model.clone();
+        card.id = config.model.clone();
         let mut request = structured_request();
         request.reasoning_effort = Some(ReasoningEffort::Off);
         request.temperature = Some(0.0);
@@ -2817,16 +2846,8 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_compatibility_protocols_use_their_supported_structured_channels() {
-        let mut messages_config = default_model("deepseek-api", "deepseek-flash-messages");
-        messages_config.base_url = "https://compatible.example/anthropic".into();
-        let messages = messages_request(&messages_config, structured_request()).unwrap();
-        assert!(messages.get("tools").is_none());
-        assert!(messages.get("tool_choice").is_none());
-        assert!(messages["system"].to_string().contains("JSON Schema"));
-        assert!(messages.get("output_config").is_none());
-
-        let mut chat_config = default_model("deepseek-api", "deepseek-flash-chat-completions");
+    fn deepseek_primary_uses_json_mode_for_structured_output() {
+        let mut chat_config = default_model("deepseek-api", "deepseek-flash");
         chat_config.base_url = "https://compatible.example".into();
         let chat = chat_completions::encode_request(&chat_config, structured_request()).unwrap();
         assert_eq!(chat["response_format"], json!({"type":"json_object"}));

@@ -7,9 +7,9 @@ use tickhost_connect::hosted::{
 
 const OTHER_BUILD: &str = "0.0.0+an-older-build";
 const RESTART_MENU: &str = "Restart the running Tickhost?";
-const OTHER_TICKHOST_GUIDANCE: &str = "The running Tickhost is another version; restart tickloop and choose to restart the Tickhost at the prompt, or run `tickhost stop` (its Ticks end)";
+const OTHER_TICKHOST_GUIDANCE: &str = "The running Tickhost uses an incompatible protocol; its existing work is preserved and activation is deferred. `tickhost stop` explicitly ends its Ticks and Shells";
 /// The part of the guidance a Shell's collapsed result shows.
-const SHOWN_GUIDANCE: &str = "The running Tickhost is another version; restart tickloop and choose to restart the Tickhost at the prompt";
+const SHOWN_GUIDANCE: &str = "The running Tickhost uses an incompatible protocol";
 
 /// The fixture's daemon key, and a Tickhost of another build that runs a Tick and a Shell and is
 /// starting one more at the daemon's Tickhost endpoint. Its Tick's launcher and a data client
@@ -44,13 +44,6 @@ fn words(frame: &str) -> String {
     frame.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn restart_menu(view: &mut PtyView) -> String {
-    view.wait_for("the Tickhost restart menu", |frame| {
-        frame.contains(RESTART_MENU) && frame.contains("Stop the old Tickhost")
-    })
-    .await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_restarting_a_tickhost_of_another_build_stops_it_and_runs_shells_in_this_build()
 {
@@ -58,19 +51,17 @@ async fn actual_cli_restarting_a_tickhost_of_another_build_stops_it_and_runs_she
     let (key, host) = other_build_running_a_tick(&fixture);
     let mut view = PtyView::start(&fixture);
 
-    let menu = words(&restart_menu(&mut view).await);
-    assert!(
-        menu.contains(&format!("Running Tickhost build {OTHER_BUILD}"))
-            && menu.contains("Restarting it ends these Ticks: Quote board.")
-            && menu.contains("It also ends 1 running Shell.")
-            && menu.contains("It also ends 1 Tick or Shell still starting.")
-            && !menu.contains("open view"),
-        "the menu names the build and what restarting ends, and no connection as a view: {menu}"
-    );
-    assert!(!host.was_stopped(), "nothing ends before the user chooses");
-    view.send(b"k");
-    view.send(b"\r");
-    view.wait_for("input ready", new_input_is_visible).await;
+    let frame = view
+        .wait_for("input ready without a restart prompt", new_input_is_visible)
+        .await;
+    assert!(!frame.contains(RESTART_MENU));
+    assert!(!host.was_stopped(), "startup preserves the occupied host");
+    ManagementConnection::connect(&fixture.path("tickhost/host.sock"), &key)
+        .await
+        .unwrap()
+        .shutdown_host(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(host.was_stopped());
 
     view.send(b"!printf 'restarted-%s' tickhost; sleep 30\r");
@@ -140,10 +131,17 @@ async fn actual_cli_after_restarting_a_tickhost_of_another_build_opens_and_reads
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start_with_flags(&fixture, &["--dangerously-skip-permissions"]);
 
-    restart_menu(&mut view).await;
-    view.send(b"k");
-    view.send(b"\r");
-    view.wait_for("input ready", new_input_is_visible).await;
+    let frame = view
+        .wait_for("input ready without a restart prompt", new_input_is_visible)
+        .await;
+    assert!(!frame.contains(RESTART_MENU));
+    assert!(!host.was_stopped());
+    ManagementConnection::connect(&fixture.path("tickhost/host.sock"), &key)
+        .await
+        .unwrap()
+        .shutdown_host(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(host.was_stopped());
 
     view.send(b"Open the counter and read it.\r");
@@ -195,9 +193,10 @@ async fn actual_cli_keeping_a_tickhost_of_another_build_refuses_ticks_and_shells
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start_with_flags(&fixture, &["--dangerously-skip-permissions"]);
 
-    restart_menu(&mut view).await;
-    view.send(b"\r");
-    view.wait_for("input ready", new_input_is_visible).await;
+    let frame = view
+        .wait_for("input ready without a restart prompt", new_input_is_visible)
+        .await;
+    assert!(!frame.contains(RESTART_MENU));
 
     view.send(b"!printf never-runs\r");
     view.wait_for("the Shell refused with what to do", |frame| {

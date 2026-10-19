@@ -39,22 +39,28 @@ mod skill;
 mod tick_subscriptions;
 mod tool;
 mod tools;
+mod upgrade;
 mod usage;
+
+pub use upgrade::{
+    RUNTIME_HANDOFF_VERSION, RuntimeBinaryInfo, RuntimeVersion, WorkerRuntimeVersion,
+};
 
 pub use access::{
     AccessCapability, AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand,
-    AgentDetailQuery, AgentFilter, AgentSummary, ChunkedResponseKind, ClientMessage,
-    CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange, Cursor,
-    DEFAULT_PAGE_LIMIT, DisplayReceipt, DisplayUpdate, DisplayedView, EnvironmentValue,
-    ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation, HostWorkContext,
-    InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction, LoopRef,
-    MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure, ObservationRequest,
-    ObservationUpdate, ObservationValue, OtherTickhost, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page,
-    PendingRequestKind, PersistenceState, ProtocolLimits, ProviderCredentialScope,
-    QueuedCommandFailure, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS, REPLAY_CAPACITY,
-    ReceiptState, RecordedMessage, RecordedTranscript, RequestRef, ResetReason, ServerHello,
-    ServerMessage, TaskAction, TaskOrigin, TaskRef, TickhostOccupancy, TranscriptRef, UserInput,
-    VIEW_LEASE_SECONDS, ViewRef, bounded_update, build_identity, set_build_identity,
+    AgentDetailQuery, AgentFilter, AgentSummary, CLIENT_HANDOFF_VERSION, ChunkedResponseKind,
+    ClientHandoffHello, ClientMessage, CommandEnvelope, CommandReceipt, CommandResult,
+    ConfigurationChange, Cursor, DEFAULT_PAGE_LIMIT, DisplayReceipt, DisplayUpdate, DisplayedView,
+    EnvironmentValue, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
+    HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
+    LoopRef, MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure,
+    ObservationRequest, ObservationUpdate, ObservationValue, OtherTickhost, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits,
+    ProviderCredentialScope, QueuedCommandFailure, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS,
+    REPLAY_CAPACITY, ReceiptState, RecordedMessage, RecordedTranscript, RequestRef, ResetReason,
+    ServerHandoffHello, ServerHello, ServerMessage, SessionResume, TaskAction, TaskOrigin, TaskRef,
+    TickhostOccupancy, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update,
+    build_identity, set_build_identity,
 };
 pub use approvals::{
     ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,

@@ -162,12 +162,7 @@ fn config(identity: &ModelIdentity) -> ModelConfig {
         max_output_tokens: 1024,
         provider_id: "deepseek-api".into(),
         provider_name: "DeepSeek API".into(),
-        model_id: match identity.protocol {
-            Protocol::Responses => "deepseek-flash-responses",
-            Protocol::ChatCompletions => "deepseek-flash",
-            _ => "deepseek-flash-messages",
-        }
-        .into(),
+        model_id: identity.requested_model.clone(),
         connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],
@@ -850,13 +845,13 @@ async fn operations_not_needing_review_create_no_auto_review_request_record() {
 #[tokio::test]
 async fn switching_models_never_relabels_old_requests() {
     let directory = tempfile::tempdir().unwrap();
-    let archive = directory.path().join("archive");
     let first_model = Arc::new(UsageModel::new(
         main_identity(),
         vec![ResponseStep::reply(text("First"), counters(10, 1, 0, 0))],
     ));
+    let archive = directory.path().join("archive");
     let models = ChosenModels::new(first_model.clone());
-    let agent = opened_agent(archive.clone(), config(&main_identity()), models.clone());
+    let agent = opened_agent(archive, config(&main_identity()), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent

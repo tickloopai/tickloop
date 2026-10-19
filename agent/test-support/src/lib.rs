@@ -160,7 +160,8 @@ pub fn persisted_config() -> ModelConfig {
     let mut model = config();
     model.provider_id = "deepseek-api".into();
     model.provider_name = "DeepSeek API".into();
-    model.model_id = "deepseek-flash-messages".into();
+    model.model_id = "deepseek-flash".into();
+    model.model = "deepseek-flash".into();
     model
 }
 
