@@ -53,6 +53,7 @@ fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: vec![allow_web_fetch()],
+            task_tools: None,
             waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )
@@ -392,6 +393,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         host: AgentHostOptions::embedded_defaults(),
         tools: ToolPolicy::local(),
         host_rules: Vec::new(),
+        task_tools: None,
         waits: tickloop_agent_runtime::WaitHosting::Process,
     };
     let root = tempfile::tempdir().unwrap();

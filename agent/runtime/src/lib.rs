@@ -784,6 +784,7 @@ fn local_options(
         host,
         tools: ToolPolicy::local(),
         host_rules: Vec::new(),
+        task_tools: None,
         waits: WaitHosting::Process,
     }
 }
@@ -1767,6 +1768,7 @@ impl Agent {
             host: host_options,
             tools: tool_policy,
             host_rules,
+            task_tools,
             waits,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
@@ -1776,7 +1778,9 @@ impl Agent {
             .map(Path::to_path_buf);
         let task_tools_enabled = settings
             .as_ref()
-            .is_some_and(|settings| settings.load().task_tools_enabled());
+            .map_or(task_tools.unwrap_or(false), |settings| {
+                settings.load().task_tools_enabled()
+            });
         let agent = Self {
             inner: Arc::new(Inner {
                 selected_model: std::sync::Mutex::new(chat_settings::SelectedModel {
@@ -3577,7 +3581,9 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
-        self.settle_task_claims(&receipt).await;
+        if is_settled {
+            self.settle_task_claims(&receipt).await;
+        }
         self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;

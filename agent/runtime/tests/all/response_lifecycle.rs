@@ -161,6 +161,7 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
             host: AgentHostOptions::embedded_defaults(),
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
+            task_tools: None,
             waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )

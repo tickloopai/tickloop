@@ -591,10 +591,11 @@ impl Agent {
                 );
             }
             let target = &chats[&target_id].snapshot;
-            if target
-                .agent_message_origins
-                .values()
-                .any(|source| source["message_id"] == message_id.to_string())
+            if chats[&target_id].bookkeeping.lifecycle.is_input(message_id)
+                || target
+                    .agent_message_origins
+                    .values()
+                    .any(|source| source["message_id"] == message_id.to_string())
                 || target.pending_inputs.iter().any(|input| {
                     input
                         .agent_message

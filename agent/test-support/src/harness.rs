@@ -74,6 +74,7 @@ fn local_options(
         host: AgentHostOptions::embedded_defaults(),
         tools: ToolPolicy::local(),
         host_rules: Vec::new(),
+        task_tools: None,
         waits: tickloop_agent_runtime::WaitHosting::Process,
     }
 }

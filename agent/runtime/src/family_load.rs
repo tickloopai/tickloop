@@ -10,7 +10,7 @@ use serde_json::json;
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, Content, DelegationMetadata, FamilyCompletion, LoopId, Message, Receipt,
     RunId, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
-    SubagentRegistration, ToolResult, projection::HistoryCall,
+    SubagentRegistration, TaskBoard, ToolResult, projection::HistoryCall,
 };
 use tickloop_agent_transcript::{Line, ModelVisibleResult, WaitKind};
 use uuid::Uuid;
@@ -28,6 +28,8 @@ pub(crate) struct FamilyRecords {
     launched: HashMap<(ChatId, RunId, String), LaunchedChild>,
     /// Every input some member accepted, by its id, with where it was accepted.
     accepted: HashMap<Uuid, Receipt>,
+    run_loops: HashMap<(ChatId, RunId), LoopId>,
+    task_boards: HashMap<(ChatId, LoopId), TaskBoard>,
 }
 
 struct LaunchedChild {
@@ -41,6 +43,13 @@ impl FamilyRecords {
     fn of(loaded: &HashMap<ChatId, LoadedTranscript>) -> Self {
         let mut records = Self::default();
         for (id, transcript) in loaded {
+            if let Some(entry) = &transcript.metadata.task_boards
+                && entry.chat_id == *id
+            {
+                for (loop_id, board) in &entry.boards {
+                    records.task_boards.insert((*id, *loop_id), board.clone());
+                }
+            }
             let inputs = transcript.lifecycle.iter().filter_map(|line| match line {
                 Line::Input(entry) => Some(entry),
                 _ => None,
@@ -53,6 +62,7 @@ impl FamilyRecords {
                     run_id: entry.run_id,
                 };
                 task.get_or_insert_with(|| receipt.clone());
+                records.run_loops.insert((*id, entry.run_id), entry.loop_id);
                 records.accepted.insert(entry.input_id, receipt);
             }
             let Some(delegation) = transcript
@@ -156,13 +166,28 @@ impl FamilyRecords {
                     output_ref: None,
                 })
             }
+            "TaskCreate" | "TaskUpdate" => {
+                let mutation_id = input["mutation_id"].as_str()?.parse::<Uuid>().ok()?;
+                let (root, loop_id) = snapshot.delegation.as_ref().map_or_else(
+                    || Some((snapshot.id, *self.run_loops.get(&(snapshot.id, run))?)),
+                    |delegation| Some((delegation.root_chat_id(), delegation.root_loop_id())),
+                )?;
+                let board = self.task_boards.get(&(root, loop_id))?;
+                let mutation = board.mutations.get(&mutation_id)?;
+                if mutation.actor != snapshot.id || mutation.input != format!("{name}:{input}") {
+                    return None;
+                }
+                Some(crate::shared_tasks::reconciled_mutation_result(
+                    board, mutation,
+                ))
+            }
             _ => None,
         }
     }
 }
 
 /// The calls of `messages` whose effect stays inside the family: a delegation, a message or a
-/// subtree stop.
+/// subtree stop or a Task mutation.
 pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = String> + '_ {
     messages
         .iter()
@@ -173,6 +198,8 @@ pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = Stri
                     SUBAGENT_TOOL_NAME,
                     SEND_AGENT_MESSAGE_TOOL_NAME,
                     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
+                    "TaskCreate",
+                    "TaskUpdate",
                 ]
                 .contains(&name.as_str()) =>
             {
@@ -325,6 +352,7 @@ impl Agent {
         for member in lost {
             self.settle_lost_member(member).await;
         }
+        self.restore_task_claims(order).await;
         for id in order {
             self.report_ends_decided_at_load(*id).await;
         }

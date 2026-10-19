@@ -558,6 +558,7 @@ pub async fn build_runtime_with_models(
             host: launch.host_options,
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
+            task_tools: None,
             waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )

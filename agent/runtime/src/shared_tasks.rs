@@ -16,6 +16,33 @@ pub(super) fn is_task_tool(name: &str) -> bool {
     matches!(name, "TaskCreate" | "TaskGet" | "TaskList" | "TaskUpdate")
 }
 
+pub(crate) fn reconciled_mutation_result(
+    board: &TaskBoard,
+    mutation: &TaskMutationReceipt,
+) -> ToolResult {
+    let task = board.tasks.iter().find(|task| task.id == mutation.task_id);
+    let value = if mutation.task_cleared {
+        json!({"status":"already_applied","task":null,"task_cleared":true})
+    } else {
+        let notification = mutation
+            .notification
+            .as_ref()
+            .map_or("not_needed", |notification| {
+                if notification.delivered {
+                    "delivered"
+                } else {
+                    "assignment saved; notification pending"
+                }
+            });
+        json!({"status":"already_applied","task":task,"notification":notification})
+    };
+    ToolResult {
+        content: value.to_string(),
+        is_error: false,
+        output_ref: None,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateInput {
@@ -992,6 +1019,10 @@ impl Agent {
         self.refresh_task_tools_setting()
             .await
             .map_err(|error| error.to_string())?;
+        if matches!(name, "TaskCreate" | "TaskUpdate") {
+            // A member's call must survive before its effect is committed to the root's board.
+            self.make_durable(&[receipt.chat_id]).await?;
+        }
         let actor = TaskOwner {
             chat_id: receipt.chat_id,
             name: registrations
@@ -1487,6 +1518,63 @@ impl Agent {
         if changed {
             let _ = self.persist_task_boards(root).await;
             self.publish_task_board(&mut chats, root_id, loop_id);
+        }
+    }
+
+    /// Reconnect claims only after every member's continuation or wait has been registered,
+    /// before any Run starts. A claim whose execution did not come back needs reconciliation.
+    pub(crate) async fn restore_task_claims(&self, members: &[ChatId]) {
+        let mut chats = self.inner.chats.lock().await;
+        let live = members
+            .iter()
+            .filter_map(|id| chats.get(id))
+            .flat_map(|chat| {
+                chat.ready_runs
+                    .iter()
+                    .chain(chat.parked.keys())
+                    .copied()
+                    .chain(chat.active_run)
+                    .chain(
+                        chat.snapshot
+                            .pending_inputs
+                            .iter()
+                            .filter(|pending| pending.task_continuation)
+                            .map(|pending| pending.receipt.run_id),
+                    )
+                    .map(|run| ((chat.snapshot.id, run), chat.family_generation))
+            })
+            .collect::<HashMap<_, _>>();
+        for id in members {
+            let Some(root) = chats.get_mut(id) else {
+                continue;
+            };
+            let mut changed = false;
+            for board in root.snapshot.task_boards.values_mut() {
+                for task in &mut board.tasks {
+                    if task.status != Status::InProgress {
+                        continue;
+                    }
+                    let generation = task
+                        .owner
+                        .as_ref()
+                        .zip(task.claim.as_ref())
+                        .and_then(|(owner, claim)| live.get(&(owner.chat_id, claim.run_id)));
+                    if let Some(generation) = generation {
+                        let claim = task.claim.as_mut().unwrap();
+                        changed |= claim.generation != *generation;
+                        claim.generation = *generation;
+                    } else {
+                        task.status = Status::NeedsAttention;
+                        task.result = Some("Worker restored; reconcile the prior execution before explicit release.".into());
+                        task.revision += 1;
+                        board.revision += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let _ = self.persist_task_boards(root).await;
+            }
         }
     }
 }

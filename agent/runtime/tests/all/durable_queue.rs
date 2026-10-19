@@ -132,6 +132,7 @@ fn harness(store: Arc<dyn TranscriptStore>, model: Arc<Script>, waits: WaitHosti
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: Vec::new(),
+            task_tools: None,
             waits,
         },
     )

@@ -41,6 +41,9 @@ pub struct HarnessOptions {
     /// Permission rules the host imposes on every Chat, at the level of session rules and never
     /// saved.
     pub host_rules: Vec<PermissionRule>,
+    /// Task tools when no settings file is supplied; `None` defaults to off.
+    /// A settings file takes precedence over this host value.
+    pub task_tools: Option<bool>,
     pub waits: WaitHosting,
 }
 
