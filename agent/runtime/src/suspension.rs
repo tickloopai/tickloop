@@ -29,6 +29,7 @@ pub(crate) const RUN_RELEASED: &str = "the waiting run was released to another h
 const QUESTION_CANCELLED: &str = "question was cancelled";
 const QUESTION_EXPIRED: &str = "question expired";
 const HANDED_OVER_RUN_CANCELLED: &str = "the run was cancelled before it went on";
+const HANDOVER_LOST: &str = "the run's handover is no longer recorded";
 
 /// The canonical id of the Run's assistant message that made the call `call_id`.
 pub(crate) fn batch_message_of(snapshot: &ChatSnapshot, run: RunId, call_id: &str) -> Option<Uuid> {
@@ -817,12 +818,12 @@ impl Agent {
     ) -> Result<RunStart, String> {
         waited?;
         let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&receipt.chat_id).ok_or(QUESTION_EXPIRED)?;
+        let chat = chats.get_mut(&receipt.chat_id).ok_or(HANDOVER_LOST)?;
         let at = chat
             .bookkeeping
             .lifecycle
             .wait(wait_id)
-            .ok_or(QUESTION_EXPIRED)?
+            .ok_or(HANDOVER_LOST)?
             .resume
             .clone();
         chat.bookkeeping.lifecycle.end_wait(wait_id);

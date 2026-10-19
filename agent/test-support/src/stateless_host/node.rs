@@ -280,7 +280,9 @@ impl Holding {
             }
             Ok(FamilyEnd::HandedOver(handover)) => {
                 report.end = HoldingEnd::HandedOver(handover);
-                self.shared.chats.finish_holding(&lease, None);
+                // The handover wake writes what the family waits on next; an earlier `wake_at`
+                // would only wake it again under this release's key.
+                self.shared.chats.finish_holding(&lease, Some(None));
             }
             Err(halt) => {
                 if matches!(halt, Halt::DrainTimedOut | Halt::Failed(_)) && !owes_marker {
@@ -407,7 +409,13 @@ impl Holding {
                         turn: Box::new(turn),
                     }),
                     Err(AgentError::Fenced) => Err(self.shared.halt_or(Halt::Fenced)),
-                    Err(error) => Ok(ClaimedWork::Refused(error.to_string())),
+                    // A request the Harness refuses for what it asks, such as an answer to a
+                    // question no longer asked, never runs; any other failure leaves the task
+                    // to be delivered again, counted against its attempts.
+                    Err(error @ AgentError::Invalid(_)) => {
+                        Ok(ClaimedWork::Refused(error.to_string()))
+                    }
+                    Err(error) => Err(self.agent_failure(error)),
                 };
             }
             TaskKind::Wake { due_at } => due_at,

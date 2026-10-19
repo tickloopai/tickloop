@@ -55,10 +55,13 @@ impl Agent {
         }
     }
 
-    /// Whether a Run holds an execution slot and neither waits durably nor left.
+    /// Whether a Run holds an execution slot and neither waits durably nor left, or a Run that
+    /// ended still records its end with its parent and delivers notifications.
     async fn has_running_run(&self) -> bool {
         let chats = self.inner.chats.lock().await;
-        chats.values().any(|chat| running_run(chat).is_some())
+        chats
+            .values()
+            .any(|chat| running_run(chat).is_some() || !chat.family_finishing.is_empty())
     }
 
     /// Ends each Run still going as its host would lose it: it is released, so it leaves this
@@ -71,22 +74,41 @@ impl Agent {
             let Some(run) = running_run(chat) else {
                 continue;
             };
-            chat.releases.entry(run).or_default().cancel();
-            self.end_response(
-                chat,
-                run,
-                ResponseEnding::Interrupted {
-                    by: InterruptedBy::Handover,
-                },
-                Usage::default(),
-            );
-            self.save_now(&chat.snapshot);
+            self.end_for_handover(chat, run);
             if let Some(cancel) = &chat.active {
                 cancel.cancel();
             }
             interrupted.push(run);
         }
         interrupted
+    }
+
+    /// Ends the Run as its host would lose it: released first, so it writes nothing more, then
+    /// its answer ends as `Interrupted{Handover}`, leaving its input open for a continuation.
+    fn end_for_handover(&self, chat: &mut Chat, run: RunId) {
+        chat.releases.entry(run).or_default().cancel();
+        self.end_response(
+            chat,
+            run,
+            ResponseEnding::Interrupted {
+                by: InterruptedBy::Handover,
+            },
+            Usage::default(),
+        );
+        self.save_now(&chat.snapshot);
+    }
+
+    /// A handover stopped the Run's model request before it reached the vendor: the Run stops
+    /// before its model request, or, when its answer cannot be suspended there, ends as at the
+    /// ceiling. Either way it leaves with the release error.
+    pub(crate) async fn leave_before_model_request(&self, receipt: &Receipt) -> String {
+        if let Err(released) = self.stop_at_safe_point(receipt, None).await {
+            return released;
+        }
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
+            self.end_for_handover(chat, receipt.run_id);
+        }
+        suspension::RUN_RELEASED.into()
     }
 
     /// A safe point of `receipt`'s Run: before its call `at_call`, or before its next model

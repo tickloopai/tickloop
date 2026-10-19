@@ -3437,7 +3437,7 @@ impl Agent {
             }
         };
         loop {
-            self.stop_at_safe_point(&receipt, None).await?;
+            Box::pin(self.stop_at_safe_point(&receipt, None)).await?;
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
             self.feedback_account_context(&receipt).await?;
             *is_awaiting_model = true;
@@ -3459,8 +3459,7 @@ impl Agent {
                 Err(AgentError::Model(ModelError::Cancelled))
                     if self.stopped_for_handover(&cancel) =>
                 {
-                    self.stop_at_safe_point(&receipt, None).await?;
-                    return Err(ModelError::Cancelled.to_string());
+                    return Err(Box::pin(self.leave_before_model_request(&receipt)).await);
                 }
                 Err(error) => return Err(error.to_string()),
             };

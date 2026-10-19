@@ -352,7 +352,10 @@ impl Agent {
                 (family_state(&chats, &members), members)
             };
             match state {
-                Some((true, _)) if !self.inner.shutdown.is_cancelled() => {}
+                // Nothing starts once the instance shuts down or hands its families over.
+                Some((true, _))
+                    if !self.inner.shutdown.is_cancelled()
+                        && !self.inner.handover.is_cancelled() => {}
                 Some((_, Some(waits))) => break (Quiescence::Waiting(waits), members),
                 _ => break (Quiescence::Idle, members),
             }
@@ -480,6 +483,7 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
 fn has_startable_input(chat: &Chat) -> bool {
     let snapshot = &chat.snapshot;
     let is_held_back = !snapshot.pending_commands.is_empty()
+        || chat.has_foreground_user_shell()
         || snapshot
             .user_shells
             .iter()

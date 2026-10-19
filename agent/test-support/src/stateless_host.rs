@@ -1404,17 +1404,21 @@ impl Shared {
         state.lagged = true;
     }
 
-    fn events_caught_up(&self, closed: bool) {
+    /// The latest request to receive every event broadcast so far, read before draining the
+    /// broadcast, so draining it meets that request and none made afterwards.
+    fn catch_up_request(&self) -> u64 {
+        self.state.lock().unwrap().catch_up_requested
+    }
+
+    /// The broadcast is drained, or closed: every event broadcast before the request
+    /// `requested` was read is received.
+    fn events_caught_up(&self, closed: bool, requested: u64) {
         let mut state = self.state.lock().unwrap();
         if closed || state.flush_requested {
             state.events_drained = true;
             self.progress.notify_waiters();
         }
-        let caught_up = if closed {
-            u64::MAX
-        } else {
-            state.catch_up_requested
-        };
+        let caught_up = if closed { u64::MAX } else { requested };
         if state.caught_up < caught_up {
             state.caught_up = caught_up;
             self.progress.notify_waiters();
@@ -1591,16 +1595,17 @@ async fn publish_events(
 ) {
     let mut open = true;
     loop {
+        let requested = shared.catch_up_request();
         while open {
             match events.try_recv() {
                 Ok(event) => shared.receive(event),
                 Err(broadcast::error::TryRecvError::Lagged(_)) => shared.lagged(),
                 Err(broadcast::error::TryRecvError::Empty) => {
-                    shared.events_caught_up(false);
+                    shared.events_caught_up(false, requested);
                     break;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    shared.events_caught_up(true);
+                    shared.events_caught_up(true, requested);
                     open = false;
                 }
             }
@@ -1621,7 +1626,7 @@ async fn publish_events(
                 Ok(event) => shared.receive(event),
                 Err(broadcast::error::RecvError::Lagged(_)) => shared.lagged(),
                 Err(broadcast::error::RecvError::Closed) => {
-                    shared.events_caught_up(true);
+                    shared.events_caught_up(true, u64::MAX);
                     open = false;
                 }
             },

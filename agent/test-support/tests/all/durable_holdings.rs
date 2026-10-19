@@ -605,6 +605,7 @@ async fn sigterm_mid_model_request_lets_the_stream_finish_and_the_next_holder_ma
         ResponseState::Suspended
     );
     assert_eq!(calls_and_results(&lines, "list"), (1, 0));
+    assert_eq!(cloud.chats.waiting(cloud.root), None);
 
     let report = cloud
         .node("next", NodeConfig::default())
