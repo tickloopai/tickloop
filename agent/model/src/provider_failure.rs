@@ -236,12 +236,19 @@ fn normalize_text(text: &str) -> String {
         props::{DefaultIgnorableCodePoint, GeneralCategory},
     };
     let text = terminal_escapes().replace_all(text, "");
-    let normalized = icu_normalizer::ComposingNormalizer::new_nfkc().normalize(&text);
+    let normalized = if text.is_ascii() {
+        std::borrow::Cow::Borrowed(text.as_ref())
+    } else {
+        icu_normalizer::ComposingNormalizer::new_nfkc().normalize(&text)
+    };
     let categories = CodePointMapData::<GeneralCategory>::new();
     let ignorables = CodePointSetData::new::<DefaultIgnorableCodePoint>();
     let visible: String = normalized
         .chars()
         .filter(|character| {
+            if character.is_ascii() {
+                return !character.is_ascii_control();
+            }
             !matches!(
                 categories.get(*character),
                 GeneralCategory::Control
@@ -374,13 +381,16 @@ fn normalization_changes_framing(source: &str) -> bool {
     terminal_escapes()
         .find_iter(source)
         .any(|escape| contains_authentication_boundary(escape.as_str()))
-        || source.chars().any(|character| {
-            let original = character.to_string();
-            let normalized = normalizer.normalize(&original);
-            normalized != original
-                && (contains_authentication_boundary(&original)
-                    || contains_authentication_boundary(&normalized))
-        })
+        || source
+            .chars()
+            .filter(|character| !character.is_ascii())
+            .any(|character| {
+                let original = character.to_string();
+                let normalized = normalizer.normalize(&original);
+                normalized != original
+                    && (contains_authentication_boundary(&original)
+                        || contains_authentication_boundary(&normalized))
+            })
 }
 
 fn terminal_escapes() -> &'static Regex {

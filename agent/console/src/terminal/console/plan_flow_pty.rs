@@ -421,8 +421,11 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     assert_eq!(state["requests"][0]["plan_mode"], false);
 
     std::fs::write(flow.directory.path().join(GO_FILE), "").unwrap();
-    let (frame, state) = flow.wait("the first plan approval", |frame, _| {
+    // The terminal and the periodically recorded state reach each approval independently.
+    let (frame, state) = flow.wait("the first plan approval", |frame, state| {
         approval_dialog(frame).is_some_and(|dialog| dialog.contains("First plan"))
+            && state["plans"][0]["version"] == 1
+            && state["permissions"] == json!(["ExitPlanMode"])
     });
     let requests = state["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 2, "{state}");
@@ -448,8 +451,10 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
         frame.contains("Add a test note")
     });
     flow.fixture.send(b"\r");
-    let (frame, state) = flow.wait("the revised plan approval", |frame, _| {
+    let (frame, state) = flow.wait("the revised plan approval", |frame, state| {
         approval_dialog(frame).is_some_and(|dialog| dialog.contains("Revised plan"))
+            && state["plans"][0]["version"] == 2
+            && state["permissions"] == json!(["ExitPlanMode"])
     });
     let requests = state["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 3, "{state}");

@@ -113,6 +113,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             text("finished with the correction"),
         ]));
         let agent = Agent::new_embedded(model_config, model.clone());
+        agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::AcceptEdits)
@@ -138,17 +139,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             .submit(chat, None, "inspect the workspace".into())
             .await
             .unwrap();
-        loop {
-            let event = next_event(&mut events).await;
-            match event.kind {
-                EventKind::PermissionRequested { request } => agent
-                    .answer_permission(chat, request.id, true)
-                    .await
-                    .unwrap(),
-                EventKind::ToolStarted { .. } => break,
-                _ => {}
-            }
-        }
+        wait_for_running_shell(&agent, chat, "slow-shell", &mut events).await;
         let queued = agent
             .submit(
                 chat,
@@ -548,18 +539,51 @@ async fn allow_bash(agent: &Agent, chat: uuid::Uuid) {
         .unwrap();
 }
 
-async fn wait_for_tool_start(
+async fn wait_for_running_shell(
     agent: &Agent,
     chat: uuid::Uuid,
+    call_id: &str,
     events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
 ) {
+    let mut operation_id = None;
     loop {
-        match next_event(events).await.kind {
+        let event = next_event(events).await;
+        if event.chat_id != chat {
+            continue;
+        }
+        match event.kind {
             EventKind::PermissionRequested { request } => agent
                 .answer_permission(chat, request.id, true)
                 .await
                 .unwrap(),
-            EventKind::ToolStarted { .. } => break,
+            EventKind::ToolStarted {
+                call_id: started, ..
+            } if started == call_id => {
+                operation_id = Some(
+                    agent
+                        .snapshot(chat)
+                        .await
+                        .unwrap()
+                        .operations
+                        .iter()
+                        .find(|operation| operation.call_id == call_id)
+                        .expect("the admitted Shell has an operation record")
+                        .id,
+                );
+            }
+            EventKind::CommandUpdated { command }
+                if operation_id == Some(command.operation_id)
+                    && command.state == tickloop_agent_protocol::CommandState::Running
+                    && command.pid.is_some() =>
+            {
+                return;
+            }
+            EventKind::ToolCompleted {
+                call_id: completed,
+                result,
+            } if completed == call_id => {
+                panic!("Shell {call_id} completed before reporting a running process: {result:?}");
+            }
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
@@ -574,6 +598,7 @@ async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the
         text("answered now"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     allow_bash(&agent, chat).await;
     let mut events = agent.subscribe();
@@ -581,7 +606,7 @@ async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the
         .submit(chat, None, "start the long work".into())
         .await
         .unwrap();
-    wait_for_tool_start(&agent, chat, &mut events).await;
+    wait_for_running_shell(&agent, chat, "long-shell", &mut events).await;
     let queued = agent
         .submit(chat, Some(active.loop_id), "how is it going".into())
         .await
@@ -651,6 +676,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
         requests: Mutex::new(Vec::new()),
     });
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     allow_bash(&agent, chat).await;
     let mut events = agent.subscribe();
@@ -665,7 +691,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
             .unwrap()
             .is_empty()
     );
-    wait_for_tool_start(&agent, chat, &mut events).await;
+    wait_for_running_shell(&agent, chat, "short-shell", &mut events).await;
     let joined = agent
         .submit(chat, Some(active.loop_id), "fold this in".into())
         .await

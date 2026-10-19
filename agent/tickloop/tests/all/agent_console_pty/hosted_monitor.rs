@@ -10,6 +10,16 @@ async fn view_with_keys_ticks(
     count: usize,
     extra_reply: Option<String>,
 ) -> PtyView {
+    view_with_keys_ticks_progress(fixture, environment, count, extra_reply, None).await
+}
+
+async fn view_with_keys_ticks_progress(
+    fixture: &PrivateFixture,
+    environment: &[(&str, &std::path::Path)],
+    count: usize,
+    extra_reply: Option<String>,
+    progress: Option<model_http_support::ResponseProgress>,
+) -> PtyView {
     let script = fixture.path("work/keys.py");
     std::fs::write(&script, include_str!("../../support/keys_tick.py")).unwrap();
     let mut replies: Vec<_> = (0..count)
@@ -29,7 +39,12 @@ async fn view_with_keys_ticks(
         .collect();
     replies.push((200, chat_reply(None, "Keys Ticks opened.")));
     replies.extend(extra_reply.map(|reply| (200, reply)));
-    let (base_url, _requests) = model_http_support::serve_responses(replies).await;
+    let (base_url, _requests) = match progress {
+        Some(progress) => {
+            model_http_support::serve_responses_with_progress(replies, progress).await
+        }
+        None => model_http_support::serve_responses(replies).await,
+    };
     fixture.set_chat_model(&base_url);
     let mut view =
         PtyView::start_with_environment(fixture, &["--dangerously-skip-permissions"], environment);
@@ -482,13 +497,14 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
     const THINKING_DELTAS: usize = 8192;
     const ATTACHED_REPLY: &str = "Reply tail received while the Tick owned the terminal.";
     let fixture = PrivateFixture::new();
+    let progress = model_http_support::ResponseProgress::default();
     let result = AssertUnwindSafe(async {
         let thinking_delta = format!(
             "data: {}\n\n",
             json!({"id":"cli-fixture","choices":[{"index":0,"delta":{"reasoning_content":"思"},"finish_reason":null}]})
         );
         let stream = thinking_delta.repeat(THINKING_DELTAS) + &chat_reply(None, ATTACHED_REPLY);
-        let mut view = view_with_keys_ticks(&fixture, &[], 1, Some(stream)).await;
+        let mut view = view_with_keys_ticks_progress(&fixture, &[], 1, Some(stream), Some(progress.clone())).await;
         view.send(b"\x1b[C");
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
@@ -565,6 +581,9 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
     })
     .catch_unwind()
     .await;
+    if result.is_err() {
+        eprintln!("Attached stream response progress: {}", progress.summary());
+    }
     fixture.shutdown().await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -889,17 +908,44 @@ async fn view_with_local_ticks(
     replies.push((200, chat_reply(None, LOCAL_TICKS_OPENED)));
     // The turns the Shells' ends start.
     replies.extend((0..2).map(|_| (200, chat_reply(None, "Noted."))));
-    let (base_url, _requests) = model_http_support::serve_responses(replies).await;
+    let progress = model_http_support::ResponseProgress::default();
+    let (base_url, _requests) =
+        model_http_support::serve_responses_with_progress(replies, progress.clone()).await;
     fixture.set_chat_model(&base_url);
     let mut view =
         PtyView::start_with_environment(fixture, &["--dangerously-skip-permissions"], environment);
     view.wait_for("input ready", new_input_is_visible).await;
     view.send(b"Open the local Ticks.\r");
     let members = format!("Monitor {rows}");
-    view.wait_for("the local Ticks join Monitor", |frame| {
+    let ready = AssertUnwindSafe(view.wait_for("the local Ticks join Monitor", |frame| {
         frame.contains(&members) && frame.contains(LOCAL_TICKS_OPENED)
-    })
+    }))
+    .catch_unwind()
     .await;
+    if let Err(panic) = ready {
+        eprintln!("Local Tick setup response progress: {}", progress.summary());
+        let observed = tokio::time::timeout(
+            Duration::from_secs(1),
+            AssertUnwindSafe(async {
+                let client = fixture.client().await;
+                let rows = catalog(&client).await;
+                if let Some(row) = rows.first() {
+                    let state = snapshot(&client, row.execution).await;
+                    snapshot_diagnostic(&state)
+                } else {
+                    "no Agent execution was registered".into()
+                }
+            })
+            .catch_unwind(),
+        )
+        .await;
+        match observed {
+            Ok(Ok(state)) => eprintln!("Local Tick setup Agent state: {state}"),
+            Ok(Err(_)) => eprintln!("Local Tick setup Agent state could not be read"),
+            Err(_) => eprintln!("Local Tick setup Agent state query exceeded 1s"),
+        }
+        std::panic::resume_unwind(panic);
+    }
     view
 }
 

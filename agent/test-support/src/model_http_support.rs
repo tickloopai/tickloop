@@ -1,9 +1,81 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
+use std::{
+    io::ErrorKind,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+
+#[derive(Clone)]
+pub struct ResponseProgress {
+    started: Instant,
+    responses: Arc<Mutex<Vec<ResponseWrite>>>,
+}
+
+#[derive(Debug)]
+struct ResponseWrite {
+    ordinal: usize,
+    total_bytes: usize,
+    written_bytes: usize,
+    started_ms: u128,
+    updated_ms: u128,
+    finished_ms: Option<u128>,
+    error: Option<ErrorKind>,
+}
+
+impl Default for ResponseProgress {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            responses: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl ResponseProgress {
+    pub fn summary(&self) -> String {
+        format!(
+            "elapsed_ms={} responses={:?}",
+            self.started.elapsed().as_millis(),
+            self.responses.lock().unwrap()
+        )
+    }
+
+    fn record(
+        &self,
+        ordinal: usize,
+        total_bytes: usize,
+        written_bytes: usize,
+        finished: bool,
+        error: Option<ErrorKind>,
+    ) {
+        let now = self.started.elapsed().as_millis();
+        let mut responses = self.responses.lock().unwrap();
+        if responses
+            .last()
+            .is_none_or(|response| response.ordinal != ordinal)
+        {
+            responses.push(ResponseWrite {
+                ordinal,
+                total_bytes,
+                written_bytes: 0,
+                started_ms: now,
+                updated_ms: now,
+                finished_ms: None,
+                error: None,
+            });
+        }
+        let response = responses.last_mut().unwrap();
+        response.written_bytes = written_bytes;
+        response.updated_ms = now;
+        response.finished_ms = finished.then_some(now);
+        response.error = error;
+    }
+}
 
 pub fn raw_reasoning_prefix_reply(
     added_prefix: bool,
@@ -94,14 +166,35 @@ pub async fn serve_response_with_headers(
 pub async fn serve_responses(
     responses: Vec<(u16, String)>,
 ) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+    serve_responses_inner(responses, None).await
+}
+
+pub async fn serve_responses_with_progress(
+    responses: Vec<(u16, String)>,
+    progress: ResponseProgress,
+) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+    serve_responses_inner(responses, Some(progress)).await
+}
+
+async fn serve_responses_inner(
+    responses: Vec<(u16, String)>,
+    progress: Option<ResponseProgress>,
+) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for (status, body) in responses {
+        for (index, (status, body)) in responses.into_iter().enumerate() {
             let (mut socket, request) = accept_script_request(&listener).await;
             let _ = sender.send(request);
-            write_response(&mut socket, status, "", &body).await;
+            write_response_with_progress(
+                &mut socket,
+                status,
+                "",
+                &body,
+                progress.as_ref().map(|progress| (progress, index + 1)),
+            )
+            .await;
         }
     });
     (format!("http://{address}/anthropic"), receiver)
@@ -283,11 +376,37 @@ pub async fn read_request(socket: &mut TcpStream) -> (String, Value) {
 }
 
 async fn write_response(socket: &mut TcpStream, status: u16, response_headers: &str, body: &str) {
-    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n{response_headers}\r\n",body.len()).as_bytes()).await.unwrap();
+    write_response_with_progress(socket, status, response_headers, body, None).await;
+}
+
+async fn write_response_with_progress(
+    socket: &mut TcpStream,
+    status: u16,
+    response_headers: &str,
+    body: &str,
+    progress: Option<(&ResponseProgress, usize)>,
+) {
+    const PROGRESS_INTERVAL_BYTES: usize = 64 * 1024;
+    let record = |written, finished, error| {
+        if let Some((progress, ordinal)) = progress {
+            progress.record(ordinal, body.len(), written, finished, error);
+        }
+    };
+    record(0, false, None);
+    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n{response_headers}\r\n",body.len()).as_bytes()).await.inspect_err(|error| record(0, true, Some(error.kind()))).unwrap();
+    let mut written = 0;
+    let mut next_progress = PROGRESS_INTERVAL_BYTES;
     for chunk in body.as_bytes().chunks(7) {
-        if socket.write_all(chunk).await.is_err() {
+        if let Err(error) = socket.write_all(chunk).await {
+            record(written, true, Some(error.kind()));
             return;
+        }
+        written += chunk.len();
+        if written >= next_progress {
+            record(written, false, None);
+            next_progress = written.saturating_add(PROGRESS_INTERVAL_BYTES);
         }
         tokio::task::yield_now().await;
     }
+    record(written, true, None);
 }
