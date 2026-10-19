@@ -629,6 +629,12 @@ impl Tools {
     pub async fn commands(&self) -> Vec<CommandSnapshot> {
         self.commands.snapshots().await
     }
+    pub async fn checkpoint_shells(&self) -> Result<Value, ToolError> {
+        self.commands.checkpoint().await
+    }
+    pub async fn restore_shells(&self, checkpoint: Value) -> Result<(), ToolError> {
+        self.commands.restore(checkpoint).await
+    }
     pub async fn background(&self, id: uuid::Uuid) -> Result<CommandSnapshot, ToolError> {
         self.commands.background(id).await
     }

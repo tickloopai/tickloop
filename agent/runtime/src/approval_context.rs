@@ -82,7 +82,7 @@ pub(super) struct DependencyEvidence {
     pub unchanged_since_loop_start: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(super) struct TickCreationReceipt {
     pub loop_id: Uuid,
     pub operation_id: Uuid,

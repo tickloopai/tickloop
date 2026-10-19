@@ -67,6 +67,7 @@ mod system_prompt;
 mod tool_batch;
 mod tool_execution;
 mod tool_results;
+pub mod upgrade;
 mod web_fetch;
 use tool_execution::ToolRegistry;
 mod commands;
@@ -317,6 +318,12 @@ struct Inner {
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::QuestionReply>>>,
     closed: AtomicBool,
+    upgrade_paused: AtomicBool,
+    upgrade_adopted: AtomicBool,
+    trigger_deadlines: std::sync::Mutex<HashMap<(ChatId, LoopId), tokio::time::Instant>>,
+    upgrade_gate: Arc<tokio::sync::RwLock<()>>,
+    upgrade_guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    upgrade_restore: Mutex<Option<upgrade::AgentUpgradeCheckpoint>>,
     auto_reviewer: Mutex<Option<Arc<dyn ModelClient>>>,
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
@@ -337,7 +344,7 @@ struct Inner {
 
 /// Runtime bookkeeping about a Chat's conversation that never leaves this process. Recovery and
 /// Branch copies rebuild it from the conversation chain.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
     dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
@@ -386,6 +393,7 @@ struct Chat {
     needs_plan_mode_exit_notice: bool,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
+    upgrade_wait: Option<Receipt>,
     parked: HashMap<RunId, ParkedRun>,
     ready_runs: VecDeque<RunId>,
     client: Arc<dyn ModelClient>,
@@ -1700,6 +1708,12 @@ impl Agent {
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
+                upgrade_paused: AtomicBool::new(false),
+                upgrade_adopted: AtomicBool::new(false),
+                trigger_deadlines: std::sync::Mutex::new(HashMap::new()),
+                upgrade_gate: Arc::new(tokio::sync::RwLock::new(())),
+                upgrade_guard: Mutex::new(None),
+                upgrade_restore: Mutex::new(None),
                 auto_reviewer: Mutex::new(None),
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
@@ -1827,6 +1841,7 @@ impl Agent {
             OutputStyle,
         )>,
     ) -> Result<ChatId, AgentError> {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         let workdir = workdir
             .canonicalize()
             .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
@@ -1892,6 +1907,7 @@ impl Agent {
                 needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
+                upgrade_wait: None,
                 parked: HashMap::new(),
                 ready_runs: VecDeque::new(),
                 client,
@@ -2186,15 +2202,23 @@ impl Agent {
         } = options;
         let is_feedback = feedback_input.is_some();
         let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(AgentError::Invalid("agent host has shut down".into()));
+        if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
+        {
+            return Err(AgentError::Invalid(
+                "agent is unavailable during shutdown or planned upgrade".into(),
+            ));
         }
         if input.trim().is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
         let mut chats = self.inner.chats.lock().await;
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(AgentError::Invalid("agent host has shut down".into()));
+        if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
+        {
+            return Err(AgentError::Invalid(
+                "agent is unavailable during shutdown or planned upgrade".into(),
+            ));
         }
         if let Some(admission) = &attachment_admission {
             let sessions = self.inner.session_permissions.lock().await;
@@ -3085,24 +3109,14 @@ impl Agent {
                     );
                 }
                 if calls.is_empty() {
-                    if self.wait_for_subagents(&receipt, &cancel).await?
-                        || self.wait_for_task_commands(&receipt, &cancel).await?
+                    if let Some(continuation) =
+                        self.after_complete_response(&receipt, &cancel).await?
                     {
-                        self.merge_queued_messages(&receipt)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let chats = self.inner.chats.lock().await;
-                        request = self.continuation_request(&chats[&receipt.chat_id])?;
+                        request = continuation;
                         continue;
                     }
-                    let mut chats = self.inner.chats.lock().await;
-                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
-                    if handback::remind(chat, &receipt) {
-                        self.save(&chat.snapshot);
-                        request = self.continuation_request(chat)?;
-                        continue;
-                    }
-                    return chat
+                    let chats = self.inner.chats.lock().await;
+                    return chats[&receipt.chat_id]
                         .snapshot
                         .request_usage
                         .run_conversation_usage(receipt.run_id)
@@ -3497,6 +3511,7 @@ impl Agent {
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.upgrade_paused.load(Ordering::SeqCst)
             || chat.active.is_some()
             || chat.has_foreground_user_shell()
         {
@@ -4553,6 +4568,7 @@ impl Agent {
 
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.cancel_upgrade().await;
         self.inner.shutdown.cancel();
         let chat_tools = self
             .inner

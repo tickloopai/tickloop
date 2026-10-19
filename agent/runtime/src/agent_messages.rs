@@ -73,6 +73,7 @@ enum FamilyDelivery<'a> {
     },
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SentMessage {
     target: ChatId,
     message: String,

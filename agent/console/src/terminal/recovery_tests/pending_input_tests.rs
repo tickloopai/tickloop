@@ -190,6 +190,7 @@ fn pending_input_pty_fixture() {
                     Vec::new(),
                 ).unwrap();
                 interact(&agent, workdir, &console, input, StartupState {
+                    launch_arguments: Vec::new(),
                     chat: StartupChat::New,
                                 user_settings: None,
                 }, None).await.unwrap();

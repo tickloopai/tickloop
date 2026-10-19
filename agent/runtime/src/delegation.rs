@@ -111,7 +111,7 @@ mod ancestry_authority_tests {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SubagentInvocation {
     pub receipt: Receipt,
     pub run_in_background: bool,

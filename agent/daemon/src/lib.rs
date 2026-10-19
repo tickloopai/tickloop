@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::FromRawFd,
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             ffi::OsStringExt,
             fs::{MetadataExt, PermissionsExt},
@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    process::{Child, ChildStdin, Command},
-    sync::Mutex,
+    process::{Child, Command},
+    sync::{Mutex, Notify},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -38,7 +38,6 @@ use tickloop_agent_client::{
         CONNECT_INTERVAL, LOCK_NAME, SOCKET_NAME, STARTUP_DEADLINE, check_socket_length,
         remove_stale_socket, validate_directory, validate_file,
     },
-    worker_link,
 };
 use tickloop_agent_config::UserSettings;
 use tickloop_agent_model::{ModelClient, cards::launch_model, model_client};
@@ -52,13 +51,17 @@ pub mod daemon_control;
 mod daemon_management;
 mod daemon_server;
 mod embedded;
+mod ingress;
 mod ipc;
+mod lifecycle;
 mod receipts;
 #[cfg(test)]
 mod status_cost;
 mod summary;
+mod upgrade;
 mod views;
 pub mod worker_control;
+mod worker_upgrade;
 
 pub use daemon_server::{DaemonServer, WorkerFactory};
 pub use embedded::{EmbeddedAgentAccess, ModelClientFactory};
@@ -86,20 +89,39 @@ struct WorkerBootstrap {
     control: tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant,
     /// The transport limits the worker serves its daemon with.
     limits: AccessLimits,
+    #[serde(default)]
+    checkpoint: Option<i32>,
+    #[serde(default)]
+    commit: Option<i32>,
 }
 
 struct ManagedWorker {
     access: Arc<dyn AgentAccess>,
-    process: Arc<Mutex<Child>>,
-    lifeline: ChildStdin,
+    process: Arc<Mutex<Option<Child>>>,
+    lifeline: OwnedFd,
+    pid: u32,
+    build_id: Option<String>,
+    endpoint: PathBuf,
+    grant: tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant,
+    launch: LaunchSpec,
+    executable: PathBuf,
+    link: Arc<std::sync::RwLock<upgrade::WorkerAddress>>,
+    preparation_uncertain: bool,
+    executable_lease: Option<tickhost_connect::executable_lease::ExecutableLease>,
 }
 
 struct ProcessWorkerFactory {
     directory: PathBuf,
+    listener_identity: (u64, u64),
+    control_identity: (u64, u64),
     limits: AccessLimits,
     workers: Mutex<Vec<ManagedWorker>>,
     shutting_down: AtomicBool,
     control: Arc<worker_control::WorkerControl>,
+    upgrade: Mutex<upgrade::UpgradeState>,
+    upgrade_requested: Notify,
+    lifecycle: Arc<lifecycle::DaemonLifecycle>,
+    ingress: Arc<ingress::DaemonIngress>,
 }
 
 impl ProcessWorkerFactory {
@@ -111,9 +133,10 @@ impl ProcessWorkerFactory {
             drop(worker.lifeline);
             exits.spawn(async move {
                 let mut process = worker.process.lock().await;
-                if tokio::time::timeout(STARTUP_DEADLINE, process.wait())
-                    .await
-                    .is_err()
+                if let Some(process) = process.as_mut()
+                    && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                        .await
+                        .is_err()
                 {
                     let _ = process.start_kill();
                     let _ = process.wait().await;
@@ -126,6 +149,13 @@ impl ProcessWorkerFactory {
 
 #[async_trait]
 impl WorkerFactory for ProcessWorkerFactory {
+    async fn request_upgrade(&self, executable: &Path) -> Result<(), AccessError> {
+        self.select_upgrade(executable).await
+    }
+
+    async fn runtime_version(&self) -> tickloop_agent_protocol::RuntimeVersion {
+        self.version().await
+    }
     async fn start(
         &self,
         launch: &LaunchSpec,
@@ -136,9 +166,12 @@ impl WorkerFactory for ProcessWorkerFactory {
         }
         let endpoint = self.directory.join(format!("w-{}.sock", Uuid::new_v4()));
         check_socket_length(&endpoint).map_err(AccessError::unavailable)?;
-        let executable =
-            std::env::current_exe().map_err(|error| AccessError::unavailable(error.to_string()))?;
-        let mut command = Command::new(executable);
+        check_socket_length(&worker_upgrade::endpoint(&endpoint))
+            .map_err(AccessError::unavailable)?;
+        let executable = std::env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|error| AccessError::unavailable(error.to_string()))?;
+        let mut command = Command::new(&executable);
         command
             .arg(WORKER_ARGUMENT)
             .arg(&endpoint)
@@ -153,8 +186,7 @@ impl WorkerFactory for ProcessWorkerFactory {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
         let mut process = command
             .spawn()
             .map_err(|error| AccessError::unavailable(error.to_string()))?;
@@ -168,6 +200,8 @@ impl WorkerFactory for ProcessWorkerFactory {
             launch: launch.clone(),
             control: grant.clone(),
             limits: self.limits,
+            checkpoint: None,
+            commit: None,
         })
         .map_err(|error| AccessError::invalid(error.to_string()))?;
         bootstrap.push(b'\n');
@@ -207,19 +241,28 @@ impl WorkerFactory for ProcessWorkerFactory {
                                 "Agent daemon stopped during worker startup",
                             ));
                         }
-                        let process = Arc::new(Mutex::new(process));
-                        let running = process.clone();
-                        // A worker that shutdown is waiting on counts as stopped, so no link is rebuilt.
-                        let access: Arc<dyn AgentAccess> =
-                            Arc::new(worker_link(client, endpoint, move || {
-                                running
-                                    .try_lock()
-                                    .is_ok_and(|mut process| matches!(process.try_wait(), Ok(None)))
-                            }));
+                        let pid = process.id().ok_or_else(|| {
+                            AccessError::unavailable("worker exited during startup")
+                        })?;
+                        let process = Arc::new(Mutex::new(Some(process)));
+                        let build_id = client.protocol().build.clone();
+                        let (access, link) = upgrade::worker_access(client, endpoint.clone(), pid);
                         workers.push(ManagedWorker {
                             access: access.clone(),
                             process,
-                            lifeline,
+                            lifeline: lifeline
+                                .into_owned_fd()
+                                .map_err(|error| AccessError::unavailable(error.to_string()))?,
+                            pid,
+                            build_id,
+                            endpoint,
+                            grant: grant.clone(),
+                            launch: launch.clone(),
+                            executable_lease: upgrade::retain_executable(&executable)
+                                .map_err(|error| AccessError::unavailable(error.to_string()))?,
+                            executable,
+                            link,
+                            preparation_uncertain: false,
                         });
                         self.control
                             .register(&grant, access.clone(), launch.config_root.as_deref())
@@ -251,9 +294,12 @@ impl WorkerFactory for ProcessWorkerFactory {
             .await
             .iter()
             .find(|managed| Arc::ptr_eq(&managed.access, worker))
-            .map(|managed| managed.process.clone());
+            .map(|managed| (managed.process.clone(), managed.pid));
         let exited = match process {
-            Some(process) => matches!(process.lock().await.try_wait(), Ok(Some(_))),
+            Some((process, pid)) => match process.lock().await.as_mut() {
+                Some(process) => matches!(process.try_wait(), Ok(Some(_))),
+                None => !upgrade::process_exists(pid),
+            },
             None => false,
         };
         if exited {
@@ -280,10 +326,22 @@ impl WorkerFactory for ProcessWorkerFactory {
 }
 
 pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
-    let [directory, descriptor] = arguments else {
+    if !(2..=3).contains(&arguments.len()) {
         return Err("invalid private daemon invocation".into());
-    };
-    let directory = PathBuf::from(directory);
+    }
+    let directory = PathBuf::from(&arguments[0]);
+    let descriptor = &arguments[1];
+    let handoff = arguments
+        .get(2)
+        .map(|value| {
+            let descriptor = value
+                .to_str()
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|value| *value >= 3)
+                .ok_or("invalid daemon handoff descriptor")?;
+            upgrade::read_handoff(descriptor)
+        })
+        .transpose()?;
     validate_directory(&directory)?;
     let descriptor = descriptor
         .to_str()
@@ -301,8 +359,18 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
         return Err("cannot isolate daemon lock from workers".into());
     }
     let endpoint = directory.join(SOCKET_NAME);
-    let (listener, socket_identity) = private_listener(&endpoint)?;
-    let epoch = Uuid::new_v4();
+    let (listener, socket_identity) = if let Some(handoff) = &handoff {
+        let listener = upgrade::inherited_listener(handoff.listener)?;
+        upgrade::validate_inherited_endpoint(&endpoint, handoff.listener_identity)?;
+        (listener, handoff.listener_identity)
+    } else {
+        private_listener(&endpoint)?
+    };
+    let listener_copy =
+        upgrade::duplicate(listener.as_raw_fd()).map_err(|error| error.to_string())?;
+    let epoch = handoff
+        .as_ref()
+        .map_or_else(Uuid::new_v4, |handoff| handoff.epoch);
     let tickhost = std::env::current_exe()
         .and_then(|executable| executable.canonicalize())
         .map_err(|error| error.to_string())?
@@ -322,40 +390,96 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let control_endpoint = control.endpoint().to_path_buf();
     // The daemon lock proves no other daemon serves this endpoint; a socket left by a daemon that
     // was killed is stale.
-    remove_stale_socket(&control_endpoint)?;
-    let (control_listener, control_identity) = private_listener(&control_endpoint)?;
+    let (control_listener, control_identity) = if let Some(handoff) = &handoff {
+        let listener = upgrade::inherited_listener(handoff.control_listener)?;
+        upgrade::validate_inherited_endpoint(&control_endpoint, handoff.control_identity)?;
+        (listener, handoff.control_identity)
+    } else {
+        remove_stale_socket(&control_endpoint)?;
+        private_listener(&control_endpoint)?
+    };
+    let control_listener_copy =
+        upgrade::duplicate(control_listener.as_raw_fd()).map_err(|error| error.to_string())?;
     let limits = AccessLimits::DEFAULT;
+    let shutdown = CancellationToken::new();
+    let lifecycle = Arc::new(lifecycle::DaemonLifecycle::new(shutdown.clone()));
+    let ingress = Arc::new(ingress::DaemonIngress::new(epoch, limits));
     let factory = Arc::new(ProcessWorkerFactory {
         directory: directory.clone(),
+        listener_identity: socket_identity,
+        control_identity,
         limits,
         workers: Mutex::new(Vec::new()),
         shutting_down: AtomicBool::new(false),
         control: control.clone(),
+        upgrade: Mutex::new(upgrade::UpgradeState::default()),
+        upgrade_requested: Notify::new(),
+        lifecycle: lifecycle.clone(),
+        ingress: ingress.clone(),
     });
     let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
     control.attach_daemon((*daemon).clone());
+    if let Some(handoff) = handoff {
+        let mut channel = upgrade::inherited_stream(handoff.handshake)?;
+        factory
+            .restore_workers(handoff, &daemon)
+            .await
+            .map_err(|error| error.to_string())?;
+        control
+            .host_controller()
+            .prepare_daemon_handoff()
+            .await
+            .map_err(|error| error.to_string())?;
+        upgrade::wait_for_commit(&mut channel).await?;
+    }
     let control_service = tokio::spawn(control.clone().serve(control_listener));
-    let shutdown = CancellationToken::new();
-    let service = async {
-        let result = serve_daemon_listener(listener, daemon, epoch, limits, shutdown.clone()).await;
-        shutdown.cancel();
-        result
+    let mut service = tokio::spawn(ipc::serve_daemon_listener_with_lifecycle(
+        listener,
+        daemon.clone(),
+        epoch,
+        limits,
+        lifecycle,
+        ingress,
+    ));
+    let worker_upgrades = tokio::spawn(worker_upgrade::drive(
+        factory.clone(),
+        daemon.clone(),
+        shutdown.clone(),
+    ));
+    let mut transferred = None;
+    let result = tokio::select! {
+        result = &mut service => result.map_err(|error| error.to_string())?.map_err(|error| error.to_string()),
+        reason = step_down_when_unreachable(&endpoint, socket_identity, &lock, &lock_path, &shutdown) => {
+            reason.map_or(Ok(()), Err)
+        }
+        upgraded = upgrade::drive_daemon_upgrade(factory.clone(), daemon, &lock, &listener_copy, &control_listener_copy, &shutdown) => {
+            transferred = upgraded;
+            Ok(())
+        }
     };
-    let (result, step_down) = tokio::join!(
-        service,
-        step_down_when_unreachable(&endpoint, socket_identity, &lock, &lock_path, &shutdown)
-    );
-    factory.shutdown().await;
+    service.abort();
     control_service.abort();
+    let _ = control_service.await;
+    worker_upgrades.abort();
+    if let Some(transfer) = transferred {
+        factory.workers.lock().await.clear();
+        control.host_controller().relinquish_daemon().await;
+        drop(lock);
+        drop(listener_copy);
+        drop(control_listener_copy);
+        transfer.finish().await;
+        control.drain().await;
+        shutdown.cancel();
+        return result;
+    }
+    shutdown.cancel();
+    factory.shutdown().await;
     let cleanup = validate_daemon_lock_path(&lock, &lock_path)
         .and_then(|()| remove_owned_socket(&endpoint, socket_identity))
         .and_then(|()| remove_owned_socket(&control_endpoint, control_identity));
     drop(lock);
-    if let Some(reason) = step_down {
-        return Err(reason);
-    }
     cleanup?;
-    result.map_err(|error| error.to_string())
+    result
 }
 
 /// Where this daemon's Tickhost runs: where the environment says, or for the default daemon the
@@ -423,6 +547,14 @@ fn unreachable_reason(
 }
 
 pub async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
+    run_worker_with_model_clients(arguments, Arc::new(model_client)).await
+}
+
+#[doc(hidden)]
+pub async fn run_worker_with_model_clients(
+    arguments: &[OsString],
+    clients: ModelClientFactory,
+) -> Result<(), String> {
     let [endpoint] = arguments else {
         return Err("invalid private worker invocation".into());
     };
@@ -441,21 +573,76 @@ pub async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
     }
     let bootstrap: WorkerBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
-    let agent = build_runtime(&bootstrap.launch, Some(bootstrap.control.clone())).await?;
-    let access = Arc::new(EmbeddedAgentAccess::for_worker(
+    let model = launch_model(&bootstrap.launch);
+    let client = clients(model, bootstrap.launch.config_root.as_deref())
+        .map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let agent = build_runtime_with_client(
+        &bootstrap.launch,
+        client,
+        Some(bootstrap.control.clone()),
+        &executable,
+    )
+    .await?;
+    let access = Arc::new(EmbeddedAgentAccess::for_worker_with_model_clients(
         agent.clone(),
         bootstrap.epoch,
+        clients,
     ));
+    if let Some(checkpoint) = bootstrap.checkpoint {
+        access
+            .restore_upgrade(worker_upgrade::read_checkpoint(checkpoint)?)
+            .await?;
+    }
     let (listener, socket_identity) = private_listener(&endpoint)?;
+    let upgrade_endpoint = worker_upgrade::endpoint(&endpoint);
+    let (upgrade_listener, upgrade_identity) = private_listener(&upgrade_endpoint)?;
+    let retired = CancellationToken::new();
+    let mut worker_service = tokio::spawn(serve_worker_listener(
+        listener,
+        access.clone(),
+        bootstrap.epoch,
+        bootstrap.limits,
+    ));
+    if let Some(commit) = bootstrap.commit {
+        let mut probe = [0u8; 1];
+        let activation = tokio::select! {
+            activation = worker_upgrade::activate(&access, commit) => activation,
+            ended = stdin.read(&mut probe) => {
+                agent.shutdown().await;
+                ended.map_err(|error| error.to_string()).and_then(|_| Err("daemon ended before Worker activation".into()))
+            }
+        };
+        if let Err(error) = activation {
+            worker_service.abort();
+            remove_owned_socket(&endpoint, socket_identity)?;
+            remove_owned_socket(&upgrade_endpoint, upgrade_identity)?;
+            return Err(error);
+        }
+    }
+    let upgrades = tokio::spawn(worker_upgrade::serve(
+        upgrade_listener,
+        access.clone(),
+        bootstrap.control.capability,
+        retired.clone(),
+    ));
     let mut probe = [0u8; 1];
     let result = tokio::select! {
-        result = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits) => {
-            result.map_err(|error| error.to_string())
+        result = &mut worker_service => {
+            result.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
         }
         result = stdin.read(&mut probe) => result.map(|_| ()).map_err(|error| error.to_string()),
+        () = retired.cancelled() => Ok(()),
     };
-    agent.shutdown().await;
+    upgrades.abort();
+    worker_service.abort();
+    if retired.is_cancelled() {
+        access.shutdown_for_upgrade().await;
+    } else {
+        agent.shutdown().await;
+    }
     remove_owned_socket(&endpoint, socket_identity)?;
+    remove_owned_socket(&upgrade_endpoint, upgrade_identity)?;
     result
 }
 

@@ -1,9 +1,15 @@
 //! Installation and updates belong to the executable, independently of Agent execution.
 
+mod activation;
+mod development;
+pub use development::register_development;
 mod bundle;
+pub use activation::{SelectedRuntime, follow_daemon_runtime, selected_runtime};
 mod notice;
 mod release;
+mod retention;
 pub use notice::{UpdateMonitor, UpdateNotice};
+pub use retention::cleanup_unused_runtimes;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -131,7 +137,15 @@ impl Drop for Lock {
 pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
     let reported_executable = std::env::current_exe()?;
     let executable = reported_executable.canonicalize()?;
-    let Some(installation) = Installation::detect(&executable)? else {
+    prepare_runtime(&reported_executable, &executable, build)
+}
+
+fn prepare_runtime(
+    reported_executable: &Path,
+    executable: &Path,
+    build: &Build,
+) -> Result<Option<PathBuf>> {
+    let Some(installation) = Installation::detect(executable)? else {
         return Ok(None);
     };
     if installation.pinned
@@ -145,7 +159,7 @@ pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
         {
             bail!("This executable does not match its installation record");
         }
-        return Ok((reported_executable != executable).then_some(executable));
+        return Ok((reported_executable != executable).then(|| executable.to_owned()));
     }
     let root = installation.state_directory()?.join("runtimes");
     private_directory(&root)?;
@@ -376,8 +390,11 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     println!("{}", state.message);
     if result.is_ok() && !check {
         println!(
-            "Running Agents and Ticks were left running. A new launch may ask which running version to use."
+            "Running Agents and Ticks continue while compatible processes switch automatically."
         );
+        if let Err(error) = cleanup_unused_runtimes() {
+            eprintln!("Unused runtime cleanup deferred: {error:#}");
+        }
     }
     result.map(|_| ())
 }

@@ -13,7 +13,7 @@ use tickloop_agent_tools::{
     permissions::{SessionPermissionDecision, permission_rule_content},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PermissionOwner {
     chat_id: Uuid,
     loop_id: Uuid,
@@ -44,7 +44,7 @@ pub(crate) fn capture_workspace_scope(
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionPermissionOperation {
     tool: String,
     /// What a grant covers: the call's normalized input, or the rule content of tools whose
@@ -97,10 +97,10 @@ impl SessionPermissionOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionPermissionGrantId(Uuid);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionPermissionRevision(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,7 +144,7 @@ pub(crate) enum SessionPermissionError {
     RevisionExhausted,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct SessionPermissionGrant {
     id: SessionPermissionGrantId,
     owner: PermissionOwner,
@@ -152,17 +152,18 @@ struct SessionPermissionGrant {
     decision: SessionPermissionDecision,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BranchRegistration {
     source_chat_id: Uuid,
     source_loop_id: Option<Uuid>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionPermissionContext {
     revision: u64,
     grants: Vec<SessionPermissionGrant>,
     branches: HashMap<Uuid, BranchRegistration>,
+    #[serde(with = "crate::upgrade::map_entries")]
     owner_parents: HashMap<PermissionOwner, PermissionOwner>,
 }
 

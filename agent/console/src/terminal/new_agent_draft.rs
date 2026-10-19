@@ -152,7 +152,7 @@ impl FirstCreate {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct NewAgentDraft {
     changes: Vec<ConfigurationChange>,
     additional_directories: Option<Vec<PathBuf>>,

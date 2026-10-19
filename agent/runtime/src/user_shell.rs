@@ -77,7 +77,12 @@ impl Agent {
         command: String,
         background: bool,
     ) -> Result<UserShellReceipt, AgentError> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .inner
+                .upgrade_paused
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(AgentError::Invalid("agent is shut down".into()));
         }
         if command.trim().is_empty() || command.contains('\0') {
@@ -88,6 +93,16 @@ impl Agent {
         let command_id = Uuid::new_v4();
         let (tools, should_watch, record) = {
             let mut chats = self.inner.chats.lock().await;
+            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
+                || self
+                    .inner
+                    .upgrade_paused
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(AgentError::Invalid(
+                    "Agent is unavailable during a planned upgrade".into(),
+                ));
+            }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             if loop_id
                 .is_some_and(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == loop_id))
@@ -290,7 +305,7 @@ impl Agent {
         Ok(chat.tools.clone())
     }
 
-    async fn watch_user_shells(&self, chat_id: ChatId, tools: std::sync::Arc<Tools>) {
+    pub(super) async fn watch_user_shells(&self, chat_id: ChatId, tools: std::sync::Arc<Tools>) {
         let queue_ready = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
@@ -332,6 +347,7 @@ impl Agent {
         chat_id: ChatId,
         command: UserCommandSnapshot,
     ) -> bool {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         loop {
             match self.record_user_shell(chat_id, command.clone()).await {
                 Ok(_) => return true,
@@ -356,6 +372,10 @@ impl Agent {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                 if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || self
+                        .inner
+                        .upgrade_paused
+                        .load(std::sync::atomic::Ordering::SeqCst)
                     || chat.active.is_some()
                     || !chat.parked.is_empty()
                     || chat.has_foreground_user_shell()

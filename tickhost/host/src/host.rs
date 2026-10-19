@@ -50,7 +50,7 @@ use crate::{
     screen::Screen,
     shell::{
         CANCELLED_REASON, ShellIdentity, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants,
-        SpawnRequest, SpawnedShell, environment_digest,
+        SpawnRequest, environment_digest,
     },
     views::{ViewGrants, Views},
 };
@@ -58,9 +58,9 @@ use crate::{
 /// A host that was never used exits after this grace.
 pub const INITIAL_GRACE: Duration = Duration::from_secs(5);
 pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
-/// The identity of the sources this host was built from: the one the `tickloop` executable of the
-/// same build computes, which its daemon compares with the host's management hello.
-pub const BUILD_IDENTITY: &str = env!("TICKLOOP_BUILD_IDENTITY");
+/// The identity of this host's production sources and dependencies, compared independently of
+/// the Agent build and release version.
+pub const BUILD_IDENTITY: &str = include_str!(concat!(env!("OUT_DIR"), "/content-identity"));
 /// A released Shell task nobody views for this long is forgotten. Extension and terminal Ticks
 /// never end for idling.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1181,8 +1181,16 @@ impl Host {
     }
 
     /// Releases a task once its spawner left: a task still running is stopped first.
-    async fn release_shell(&self, task: &Arc<ShellTask>) {
-        task.stop(CANCELLED_REASON);
+    async fn release_shell(&self, task: &Arc<ShellTask>, generation: u64) {
+        let Some(recovery) = task.disconnect_owner(generation) else {
+            return;
+        };
+        if !recovery.is_zero() {
+            tokio::time::sleep(recovery).await;
+        }
+        if !task.release_disconnected_owner(generation) {
+            return;
+        }
         task.ended().await;
         task.release();
     }
@@ -1664,7 +1672,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                         version: BUILD_VERSION.to_owned(),
                         major: MANAGEMENT_MAJOR,
                         minor: MANAGEMENT_MINOR,
-                        capabilities: Vec::new(),
+                        capabilities: vec![hosted::CAPABILITY_IDLE_SHUTDOWN.to_owned()],
                         host: Some(HostDescription {
                             build: BUILD_IDENTITY.to_owned(),
                             executable: std::env::current_exe().ok(),
@@ -1766,7 +1774,7 @@ impl Departure {
     fn of(authority: &Authority) -> Self {
         match authority {
             Authority::Controller { generation } => Self::Controller(*generation),
-            Authority::Spawner(_) => Self::Spawner,
+            Authority::Spawner(_) | Authority::ShellSuccessor { .. } => Self::Spawner,
             _ => Self::Other,
         }
     }
@@ -1798,6 +1806,11 @@ enum Authority {
     Shell(Arc<ShellTask>),
     /// The one connection a spawn grant admitted; the task it submits lives as long as it.
     Spawner(SpawnBinding),
+    ShellSuccessor {
+        task: Arc<ShellTask>,
+        owner_token: String,
+        handoff: Uuid,
+    },
     /// A view a grant let in; it can only attach.
     Viewer(Viewed),
     /// The one connection of a pending launch; `verified` once it proved its foreground.
@@ -1915,6 +1928,19 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             state.spawners += 1;
             Ok(Authority::Spawner(binding))
         }
+        Role::ShellSuccessor { instance, owner_token, handoff } => {
+            let mut state = host.state.lock().await;
+            let task = state.shells.values().find(|task| {
+                task.instance == instance
+                    && state.controllers > 0
+                    && Some(task.binding.identity.daemon_epoch) == state.controller_epoch
+                    && task.can_adopt(&owner_token, handoff)
+            }).cloned().ok_or_else(|| HostError::before(
+                "Forbidden", "no live Shell owner accepts this handoff",
+            ))?;
+            state.spawners += 1;
+            Ok(Authority::ShellSuccessor { task, owner_token, handoff })
+        }
     }
 }
 
@@ -1949,15 +1975,24 @@ async fn management_request(host: &Host, request: Value) -> Result<Value, HostEr
     struct Target {
         epoch: Uuid,
         operation: Uuid,
+        #[serde(default)]
+        own_connections: usize,
     }
     let method = request["method"].as_str().unwrap_or_default();
-    if !matches!(method, "shutdown_host" | "shutdown_status") {
+    if !matches!(
+        method,
+        "shutdown_host" | "shutdown_idle_host" | "shutdown_status"
+    ) {
         return Err(HostError::before(
             "MethodNotAllowed",
-            "management accepts only shutdown_host and shutdown_status",
+            "unsupported management method",
         ));
     }
-    let Target { epoch, operation } = parameters(request["params"].clone())?;
+    let Target {
+        epoch,
+        operation,
+        own_connections,
+    } = parameters(request["params"].clone())?;
     if epoch != host.epoch {
         return Err(HostError::before(
             "EpochChanged",
@@ -1972,6 +2007,22 @@ async fn management_request(host: &Host, request: Value) -> Result<Value, HostEr
             json!("unknown")
         };
         return Ok(json!({"operation":operation,"state":state}));
+    }
+    if method == "shutdown_idle_host" {
+        let mut state = host.state.lock().await;
+        if !state.ticks.is_empty()
+            || !state.shells.is_empty()
+            || state.pending_opens != 0
+            || state.spawn_grants.pending(Instant::now()) != 0
+            || state.spawners != 0
+            || host.connections.load(Ordering::SeqCst) > own_connections
+        {
+            return Err(HostError::before(
+                "HostBusy",
+                "Tickhost still has work or attached connections",
+            ));
+        }
+        state.exiting = true;
     }
     host.shutdown_requests.lock().unwrap().insert(operation);
     let mut state = host.shutdown_state.subscribe();
@@ -1992,6 +2043,11 @@ async fn business(
 ) -> Result<(), HostError> {
     match authority {
         Authority::Spawner(binding) => serve_spawner(reader, writer, &host, &binding).await,
+        Authority::ShellSuccessor {
+            task,
+            owner_token,
+            handoff,
+        } => serve_shell_successor(reader, writer, &host, task, owner_token, handoff).await,
         authority => serve_requests(reader, writer, host, authority).await,
     }
 }
@@ -2008,6 +2064,7 @@ async fn serve_requests(
         // A Shell's view keeps showing the task after it ended.
         Authority::Controller { .. }
         | Authority::Spawner(_)
+        | Authority::ShellSuccessor { .. }
         | Authority::Viewer(Viewed::Shell(_)) => CancellationToken::new(),
         Authority::Instance(tick)
         | Authority::Viewer(Viewed::Tick(tick))
@@ -2083,7 +2140,9 @@ async fn serve_requests(
             }
             Authority::Instance(tick) => instance_request(tick, &method, params).await,
             Authority::Shell(task) => shell_request(task, &method),
-            Authority::Spawner(_) => unreachable!("a spawner is served on its own"),
+            Authority::Spawner(_) | Authority::ShellSuccessor { .. } => {
+                unreachable!("a Shell owner is served on its own")
+            }
             Authority::Viewer(_) => Err(HostError::before(
                 "MethodNotAllowed",
                 format!("a view can only attach, not {method:?}"),
@@ -2694,17 +2753,67 @@ async fn serve_spawner(
             return Err(error);
         }
     };
+    serve_shell_owner(reader, writer, host, task, 0, id).await
+}
+
+async fn serve_shell_successor(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    host: &Arc<Host>,
+    task: Arc<ShellTask>,
+    owner_token: String,
+    handoff: Uuid,
+) -> Result<(), HostError> {
+    let request = tokio::time::timeout(
+        CONTROL_TIMEOUT,
+        hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES),
+    )
+    .await
+    .map_err(|_| HostError::before("Timeout", "no Shell adoption request arrived"))??
+    .ok_or_else(|| HostError::before("Disconnected", "Shell successor left before adoption"))?;
+    let id = request["id"].clone();
+    let generation = {
+        let state = host.state.lock().await;
+        if request["method"] != "adopt"
+            || state.controllers == 0
+            || state.controller_epoch != Some(task.binding.identity.daemon_epoch)
+        {
+            Err(HostError::before(
+                "Fenced",
+                "Shell adoption requires its current daemon",
+            ))
+        } else {
+            task.adopt(&owner_token, handoff)
+        }
+    };
+    let generation = match generation {
+        Ok(generation) => generation,
+        Err(error) => {
+            write_within(
+                &mut writer,
+                &hosted::error(&id, &error),
+                BUSINESS_FRAME_BYTES,
+                CONTROL_TIMEOUT,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    serve_shell_owner(reader, writer, host, task, generation, id).await
+}
+
+async fn serve_shell_owner(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    host: &Arc<Host>,
+    task: Arc<ShellTask>,
+    generation: u64,
+    id: Value,
+) -> Result<(), HostError> {
     let served = async {
         write_within(
             &mut writer,
-            &hosted::ok(
-                &id,
-                json!(SpawnedShell {
-                    instance: task.instance.clone(),
-                    pid: task.pid,
-                    data_token: task.data_token.clone(),
-                }),
-            ),
+            &hosted::ok(&id, json!(task.spawned())),
             BUSINESS_FRAME_BYTES,
             CONTROL_TIMEOUT,
         )
@@ -2713,6 +2822,7 @@ async fn serve_spawner(
         #[serde(tag = "method", content = "params", rename_all = "snake_case")]
         enum SpawnerRequest {
             Stop { reason: String },
+            ConfirmHandoff,
         }
         // A stopping host stops the task too, and still reports its exit before it leaves.
         let mut is_stopping = false;
@@ -2726,7 +2836,8 @@ async fn serve_spawner(
                 }
                 request = hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES) => match request? {
                     Some(request) => match parameters(request)? {
-                        SpawnerRequest::Stop { reason } => task.stop(&reason),
+                        SpawnerRequest::Stop { reason } => task.stop_owned(generation, &reason),
+                        SpawnerRequest::ConfirmHandoff => task.confirm_owner(generation),
                     },
                     None => return Ok(()),
                 },
@@ -2746,6 +2857,7 @@ async fn serve_spawner(
                 request = hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES) => match request? {
                     Some(request) => match parameters(request)? {
                         SpawnerRequest::Stop { .. } => {}
+                        SpawnerRequest::ConfirmHandoff => task.confirm_owner(generation),
                     },
                     None => return Ok(()),
                 },
@@ -2753,7 +2865,7 @@ async fn serve_spawner(
         }
     };
     let outcome = served.await;
-    host.release_shell(&task).await;
+    host.release_shell(&task, generation).await;
     outcome
 }
 

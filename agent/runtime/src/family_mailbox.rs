@@ -11,8 +11,9 @@ pub(super) const MAX_SENDER_MESSAGES_PER_MINUTE: usize = 20;
 pub(super) const MAX_PENDING_AGENT_MESSAGES: usize = 128;
 const SENDER_RATE_WINDOW_MS: u64 = 60_000;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct FamilyMailbox {
+    #[serde(with = "crate::upgrade::map_entries")]
     pub sent: HashMap<(RunId, String), agent_messages::SentMessage>,
     chains: HashMap<Uuid, usize>,
     seen: HashSet<Uuid>,

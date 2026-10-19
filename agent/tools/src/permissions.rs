@@ -12,7 +12,7 @@ use tickloop_agent_protocol::{
 /// Claude Code's rule content prefix for the host a `WebFetch` call fetches.
 const WEB_FETCH_DOMAIN_PREFIX: &str = "domain:";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionPermissionDecision {
     Allow,
     Deny,

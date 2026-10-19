@@ -29,6 +29,9 @@ use std::{
 // None -> we're not in the raw mode
 static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
 
+mod raw_mode;
+pub(crate) use raw_mode::{export_raw_mode_state, import_raw_mode_state, validate_raw_mode_state};
+
 pub(crate) fn is_raw_mode_enabled() -> bool {
     TERMINAL_MODE_PRIOR_RAW_MODE.lock().is_some()
 }
@@ -67,7 +70,7 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
         ws_ypixel: 0,
     };
 
-    let file = File::open("/dev/tty").map(|file| (FileDesc::new(file.into_raw_fd(), true)));
+    let file = File::open("/dev/tty").map(|file| FileDesc::new(file.into_raw_fd(), true));
     let fd = if let Ok(file) = &file {
         file.raw_fd()
     } else {

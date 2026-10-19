@@ -14,6 +14,7 @@ clap = { version = "4", features = ["derive"] }
 tickloop-tick-command = { path = "../command" }
 tickloop-tick-market = { path = "../market" }
 tickloop-tick-provider = { path = "../provider" }
+tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 
 [dev-dependencies]
 libc = "0.2"

@@ -4,7 +4,9 @@ use tickloop_agent_protocol::{Image, ImageContext, ImageOrigin};
 pub(super) const LARGE_PASTE_CHARACTER_THRESHOLD: usize = 800;
 pub(super) const LARGE_PASTE_LINE_THRESHOLD: usize = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub(super) struct PasteBlockId(u64);
 
 impl PasteBlockId {
@@ -101,13 +103,13 @@ impl std::error::Error for PasteBlockError {}
 
 /// A folded text block keeps its pasted text in the draft and only shows a label; an
 /// image block's draft text is the literal `[Image #N]` placeholder.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PasteContent {
     Text { line_count: usize },
     Image(Image),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PasteBlock {
     id: PasteBlockId,
     range: Range<usize>,
@@ -115,7 +117,7 @@ struct PasteBlock {
     content: PasteContent,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PasteBlocks {
     next_id: u64,
     blocks: Vec<PasteBlock>,

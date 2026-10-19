@@ -67,6 +67,10 @@ impl UnixInternalEventSource {
 }
 
 impl EventSource for UnixInternalEventSource {
+    fn input_buffer_is_empty(&self) -> bool {
+        self.parser.input_buffer_is_empty()
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         let timeout = PollTimeout::new(timeout);
         let mut has_polled = false;

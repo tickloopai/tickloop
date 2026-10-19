@@ -116,6 +116,45 @@ pub fn is_raw_mode_enabled() -> io::Result<bool> {
     }
 }
 
+/// Terminal attributes changed by raw mode, retained across process replacement.
+/// Other attributes, including baud rates and line discipline, remain on the same tty.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawModeState {
+    /// Input interpretation flags before raw mode.
+    pub input_flags: u64,
+    /// Output processing flags before raw mode.
+    pub output_flags: u64,
+    /// Character format flags before raw mode.
+    pub control_flags: u64,
+    /// Local terminal flags before raw mode, including signal and canonical processing.
+    pub local_flags: u64,
+    /// Original VMIN control byte.
+    pub minimum_read: u8,
+    /// Original VTIME control byte.
+    pub read_timeout: u8,
+}
+
+#[cfg(unix)]
+impl RawModeState {
+    /// Checks that the saved flags fit this platform without touching the terminal.
+    pub fn validate(&self) -> io::Result<()> {
+        sys::validate_raw_mode_state(self)
+    }
+}
+
+/// Exports the attributes to restore when the raw-mode owner eventually exits.
+#[cfg(unix)]
+pub fn export_raw_mode_state() -> io::Result<RawModeState> {
+    sys::export_raw_mode_state()
+}
+
+/// Adopts a predecessor's original attributes and keeps the same terminal in raw mode.
+#[cfg(unix)]
+pub fn import_raw_mode_state(state: &RawModeState) -> io::Result<()> {
+    sys::import_raw_mode_state(state)
+}
+
 /// Enables raw mode.
 ///
 /// Please have a look at the [raw mode](./index.html#raw-mode) section.

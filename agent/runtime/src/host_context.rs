@@ -1,7 +1,7 @@
 use super::*;
 use tickloop_agent_protocol::{HostCallContext, Receipt, RunId};
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct HostContexts {
     pub(super) work: HashMap<ChatId, HostCallContext>,
     pub(super) runs: HashMap<RunId, HostCallContext>,

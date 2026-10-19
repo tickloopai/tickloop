@@ -1,8 +1,9 @@
 //! Shell commands run in the Tickhost. After a command's approval and final check the worker asks
 //! its daemon for a one-time spawn grant, then submits the command on its own spawner connection,
 //! passing the approved directory and the output file as descriptors; the command lives as long as
-//! that connection. A View of the Chat shows a command through a one-time view grant from the same
-//! daemon; the worker keeps an ended command's connection while the Chat's Monitor may list it, so
+//! that connection, until a planned successor takes its ownership. A View of the Chat shows a
+//! command through a one-time view grant from the same daemon; the worker keeps an ended command's
+//! connection while the Chat's Monitor may list it, so
 //! the Tickhost keeps showing it until then. An Agent without a daemon runs no command and shows
 //! none, unless it is given a Tickhost of its own, served inside its process, as tests are.
 
@@ -24,7 +25,7 @@ use tickloop_agent_protocol::{CommandState, HostedViewGrant};
 use tickloop_agent_tools::{
     ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError, ToolError,
 };
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{Mutex, OnceCell, watch};
 use uuid::Uuid;
 
 use super::{
@@ -219,13 +220,26 @@ pub struct ShellTasks {
     grants: RwLock<Arc<dyn ShellGrants>>,
     /// The Agent whose Monitors decide how long an ended command stays viewable.
     agent: OnceLock<WeakAgent>,
+    pending_handoffs: Mutex<Vec<Arc<Mutex<tickhost::shell::ShellStops>>>>,
+    retained_handoffs:
+        std::sync::Mutex<std::collections::HashMap<Uuid, (Uuid, tickhost::shell::ShellHandoff)>>,
 }
 
 impl ShellTasks {
+    pub(crate) async fn commit_handoffs(&self) -> Result<(), HostError> {
+        let handoffs = std::mem::take(&mut *self.pending_handoffs.lock().await);
+        for owner in handoffs {
+            owner.lock().await.commit_handoff().await?;
+        }
+        Ok(())
+    }
+
     pub fn new(grants: Arc<dyn ShellGrants>) -> Arc<Self> {
         Arc::new(Self {
             grants: RwLock::new(grants),
             agent: OnceLock::new(),
+            pending_handoffs: Mutex::new(Vec::new()),
+            retained_handoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -237,24 +251,42 @@ impl ShellTasks {
     /// from forgetting it, for as long as the Chat's Monitor may list it. Closing the connection
     /// leaves the command to the Tickhost, which forgets it once nobody viewed it for its idle
     /// timeout.
-    fn keep_while_listed(&self, chat: Uuid, task: Uuid, connection: tickhost::shell::ShellStops) {
+    fn keep_while_listed(
+        self: &Arc<Self>,
+        chat: Uuid,
+        task: Uuid,
+        connection: Arc<Mutex<tickhost::shell::ShellStops>>,
+        handoff: tickhost::shell::ShellHandoff,
+    ) {
         let Some(agent) = self.agent.get().cloned() else {
             return;
         };
+        self.retained_handoffs
+            .lock()
+            .unwrap()
+            .insert(task, (chat, handoff));
+        let tasks = self.clone();
         tokio::spawn(async move {
-            let _connection = connection;
             loop {
                 let Some(listing) = agent.upgrade() else {
-                    break;
+                    tasks.retained_handoffs.lock().unwrap().remove(&task);
+                    drop(connection);
+                    return;
                 };
-                if !listing.monitor_may_list_shell(chat, task).await {
-                    break;
+                let guard = listing.inner.upgrade_gate.clone().read_owned().await;
+                if listing.inner.shutdown.is_cancelled()
+                    || !listing.monitor_may_list_shell(chat, task).await
+                {
+                    tasks.retained_handoffs.lock().unwrap().remove(&task);
+                    drop(connection);
+                    return;
                 }
                 // Waiting holds no Agent, so an Agent dropped meanwhile closes the connection.
                 let shutdown = listing.inner.shutdown.clone();
+                drop(guard);
                 drop(listing);
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    _ = shutdown.cancelled() => {},
                     _ = tokio::time::sleep(MONITOR_LISTING_CHECK_INTERVAL) => {}
                 }
             }
@@ -306,6 +338,37 @@ fn launch_environment() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[async_trait::async_trait]
 impl ShellHost for ChatShells {
+    async fn retained_handoff(
+        &self,
+        operation: Uuid,
+    ) -> Result<Option<serde_json::Value>, ToolError> {
+        let retained = self.tasks.retained_handoffs.lock().unwrap();
+        let Some((_, handoff)) = retained
+            .get(&operation)
+            .filter(|(chat, _)| *chat == self.chat)
+        else {
+            return Ok(None);
+        };
+        if handoff.owner_token.is_empty() {
+            return Err(ToolError::Rejected(
+                "the existing Tickhost cannot transfer this retained Shell".into(),
+            ));
+        }
+        Ok(Some(
+            serde_json::to_value(handoff).expect("Shell handoff serializes"),
+        ))
+    }
+    async fn adopt(&self, value: serde_json::Value) -> Result<Box<dyn ShellProcess>, ToolError> {
+        let handoff: tickhost::shell::ShellHandoff = serde_json::from_value(value)
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        let submitted = tickhost::shell::adopt(&handoff).await.map_err(|error| {
+            ToolError::Rejected(format!("Shell ownership transfer failed: {error}"))
+        })?;
+        let stops = Arc::new(Mutex::new(submitted.stops));
+        self.tasks.pending_handoffs.lock().await.push(stops.clone());
+        Ok(self.process(submitted.spawned, submitted.exits, stops, handoff.endpoint))
+    }
+
     async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
         let refused = |error: HostError| {
             ShellStartError::NotStarted(ToolError::Rejected(format!(
@@ -367,11 +430,23 @@ impl ShellHost for ChatShells {
                 refused(error)
             }
         })?;
-        let tickhost::shell::SubmittedShell {
-            spawned,
-            mut exits,
-            stops,
-        } = submitted;
+        Ok(self.process(
+            submitted.spawned,
+            submitted.exits,
+            Arc::new(Mutex::new(submitted.stops)),
+            issued.endpoint,
+        ))
+    }
+}
+
+impl ChatShells {
+    fn process(
+        &self,
+        spawned: tickhost::shell::SpawnedShell,
+        mut exits: tickhost::shell::ShellExits,
+        stops: Arc<Mutex<tickhost::shell::ShellStops>>,
+        endpoint: std::path::PathBuf,
+    ) -> Box<dyn ShellProcess> {
         // The exit arrives on its own task, so waiting for it can be given up and resumed.
         let (reported, exit) = watch::channel(None);
         tokio::spawn(async move {
@@ -388,14 +463,26 @@ impl ShellHost for ChatShells {
             };
             reported.send_replace(Some(exit));
         });
-        Ok(Box::new(TickhostProcess {
+        let task = spawned
+            .instance
+            .as_str()
+            .strip_prefix("shell:")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("a submitted Shell has an operation UUID");
+        Box::new(TickhostProcess {
             pid: spawned.pid,
+            handoff: tickhost::shell::ShellHandoff {
+                endpoint,
+                instance: spawned.instance,
+                owner_token: spawned.owner_token,
+                handoff: Uuid::new_v4(),
+            },
             exit,
             stops: Some(stops),
             tasks: self.tasks.clone(),
             chat: self.chat,
-            task: operation_id,
-        }))
+            task,
+        })
     }
 }
 
@@ -417,8 +504,9 @@ fn command_exit(exit: tickhost::shell::ShellExit) -> ShellExit {
 /// passes to the Shell tasks, which keep it while Monitor may list the command.
 struct TickhostProcess {
     pid: u32,
+    handoff: tickhost::shell::ShellHandoff,
     exit: watch::Receiver<Option<ShellExit>>,
-    stops: Option<tickhost::shell::ShellStops>,
+    stops: Option<Arc<Mutex<tickhost::shell::ShellStops>>>,
     tasks: Arc<ShellTasks>,
     chat: Uuid,
     task: Uuid,
@@ -430,6 +518,11 @@ impl ShellProcess for TickhostProcess {
         self.pid
     }
 
+    fn handoff(&self) -> Option<serde_json::Value> {
+        (!self.handoff.owner_token.is_empty())
+            .then(|| serde_json::to_value(&self.handoff).expect("Shell handoff serializes"))
+    }
+
     async fn exited(&mut self) -> ShellExit {
         let exit = self
             .exit
@@ -439,7 +532,8 @@ impl ShellProcess for TickhostProcess {
             .ok()
             .flatten();
         if let Some(stops) = self.stops.take() {
-            self.tasks.keep_while_listed(self.chat, self.task, stops);
+            self.tasks
+                .keep_while_listed(self.chat, self.task, stops, self.handoff.clone());
         }
         exit.unwrap_or_else(|| ShellExit {
             exit_code: None,
@@ -453,7 +547,7 @@ impl ShellProcess for TickhostProcess {
         // A connection that is gone already stopped the command, and one passed on belongs to a
         // command that ended.
         if let Some(stops) = &mut self.stops {
-            let _ = stops.stop(reason).await;
+            let _ = stops.lock().await.stop(reason).await;
         }
     }
 }

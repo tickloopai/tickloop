@@ -74,6 +74,7 @@ mod recovery_tests;
 mod renderer;
 mod reply_lines;
 mod running_shimmer;
+mod runtime_upgrade;
 mod scrollback;
 mod selection;
 mod settings;
@@ -90,6 +91,7 @@ mod ticks_panel;
 mod ticks_work;
 mod transcript;
 mod update_notice;
+mod view_upgrade;
 mod workflows;
 mod workspace_trust;
 
@@ -680,23 +682,6 @@ async fn await_startup_directory_trust(
     }
 }
 
-/// Connects to the Agent daemon at startup, offering at an interactive start to replace a daemon
-/// or Tickhost of another build.
-async fn connect_startup_daemon(
-    interactive: bool,
-    preferences: tickloop_agent_config::DisplayPreferences,
-    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
-) -> Result<Option<tickloop_agent_client::LocalAgentClient>, String> {
-    let Some(client) = connect_daemon_at_startup(interactive, preferences, startup_console).await?
-    else {
-        return Ok(None);
-    };
-    if interactive {
-        offer_tickhost_replacement(&client, preferences, startup_console).await?;
-    }
-    Ok(Some(client))
-}
-
 /// Shows `menu` before the Agent starts and waits for the user's choice. Its last option cancels,
 /// as do esc, ctrl+c and the end of input.
 async fn choose_at_startup(
@@ -735,120 +720,38 @@ async fn choose_at_startup(
     Ok(choice)
 }
 
-/// Offers to replace a running Tickhost of another build whose Ticks, Shells or views replacing
-/// it ends; the daemon replaces one that runs nothing without asking. Cancelling leaves Ticks and
-/// Shells unavailable this session, every request saying what to do.
-async fn offer_tickhost_replacement(
-    client: &tickloop_agent_client::LocalAgentClient,
-    preferences: tickloop_agent_config::DisplayPreferences,
-    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
-) -> Result<(), String> {
-    use tickloop_agent_protocol::{AgentAccess, ObservationRequest, ObservationValue};
-    // A Tickhost the daemon cannot read is left for the requests that need it to report.
-    let Ok(observation) = client.observe(ObservationRequest::OtherTickhost).await else {
-        return Ok(());
-    };
-    let ObservationValue::OtherTickhost(Some(other)) = observation.initial else {
-        return Ok(());
-    };
-    let mut context = vec![
-        "A different Tickhost version is running.".into(),
-        safe_text(&other.description),
-    ];
-    match &other.occupancy {
-        Some(occupancy) => {
-            if !occupancy.ticks.is_empty() {
-                context.push(format!(
-                    "Restarting it ends these Ticks: {}.",
-                    safe_text(&occupancy.ticks.join(", "))
-                ));
-            }
-            if occupancy.shells > 0 {
-                context.push(format!(
-                    "It also ends {} running {}.",
-                    occupancy.shells,
-                    if occupancy.shells == 1 {
-                        "Shell"
-                    } else {
-                        "Shells"
-                    }
-                ));
-            }
-            if occupancy.pending > 0 {
-                context.push(format!(
-                    "It also ends {} still starting.",
-                    if occupancy.pending == 1 {
-                        "1 Tick or Shell".to_owned()
-                    } else {
-                        format!("{} Ticks or Shells", occupancy.pending)
-                    }
-                ));
-            }
-            if let Some(views) = occupancy.views.filter(|views| *views > 0) {
-                context.push(format!(
-                    "Its {views} open {} close.",
-                    if views == 1 { "view" } else { "views" }
-                ));
-            }
-        }
-        None => context.push(
-            "It does not say what it runs; restarting it ends every Tick and Shell in it.".into(),
-        ),
-    }
-    context.push("Ended Ticks show as lost in Monitor, where enter reopens them.".into());
-    let menu_id = uuid::Uuid::new_v4();
-    let menu = console::Menu {
-        id: menu_id,
-        title: "Restart the running Tickhost?".into(),
-        context,
-        options: vec![
-            "Stop the old Tickhost and start this version".into(),
-            "Cancel — Ticks and Shells stay unavailable this session".into(),
-        ],
-        selected: 1,
-        confirmation: true,
-    };
-    let choice = choose_at_startup(menu, preferences, startup_console).await?;
-    let (console, _) = startup_console
-        .as_ref()
-        .expect("startup console initialized");
-    if choice != 0 {
-        return console.finish_menu_submission(menu_id);
-    }
-    console.set_status("Stopping the old Tickhost…")?;
-    let replaced = client
-        .execute(tickloop_agent_protocol::CommandEnvelope {
-            daemon_epoch: client.daemon_epoch(),
-            command_id: uuid::Uuid::new_v4(),
-            command: tickloop_agent_protocol::AgentCommand::ReplaceTickhost,
-        })
-        .await;
-    console.finish_menu_submission(menu_id)?;
-    match replaced {
-        Ok(_) => console.set_status(""),
-        Err(error) => console.set_status(&format!(
-            "Cannot restart the Tickhost: {}",
-            safe_text(&error.to_string())
-        )),
-    }
-}
-
 async fn connect_daemon_at_startup(
     interactive: bool,
     preferences: tickloop_agent_config::DisplayPreferences,
     startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
+    launch_arguments: &[String],
 ) -> Result<Option<tickloop_agent_client::LocalAgentClient>, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let error = match tickloop_agent_client::connect_or_start(executable.clone()).await {
         Ok(client) => return Ok(Some(client)),
         Err(error) => error,
     };
-    if !interactive {
+    if !interactive
+        || launch_arguments
+            .iter()
+            .any(|argument| argument == "--view-handoff")
+    {
         return Err(error.to_string());
     }
     let Some(mismatch) = &error.mismatch else {
         return Err(error.to_string());
     };
+    if let Some(running) = &mismatch.running_executable {
+        use std::os::unix::process::CommandExt;
+        drop(startup_console.take());
+        let error = std::process::Command::new(running)
+            .args(launch_arguments)
+            .exec();
+        return Err(format!(
+            "Cannot open the running version {}: {error}",
+            running.display()
+        ));
+    }
     let prepared = mismatch
         .prepare_stop()
         .await
@@ -892,7 +795,7 @@ async fn connect_daemon_at_startup(
         // The running build's own View takes over this terminal with the same arguments.
         drop(startup_console.take());
         let error = std::process::Command::new(&running)
-            .args(std::env::args_os().skip(1))
+            .args(launch_arguments)
             .exec();
         return Err(format!(
             "Cannot open the running version {}: {error}",
@@ -1024,8 +927,21 @@ pub async fn run() -> Result<(), String> {
     run_with_arguments(std::env::args().skip(1)).await
 }
 
+pub fn check_view_handoff(path: &std::path::Path) -> Result<(), String> {
+    view_upgrade::check_handoff(path)
+}
+
+pub fn prepare_view_handoff(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    view_upgrade::prepare_handoff(arguments)
+}
+
+pub fn recover_view_handoff(arguments: &[std::ffi::OsString]) -> Result<bool, String> {
+    view_upgrade::recover_handoff(arguments)
+}
+
 pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(), String> {
-    let mut arguments = arguments.peekable();
+    let launch_arguments = arguments.collect::<Vec<_>>();
+    let mut arguments = launch_arguments.clone().into_iter().peekable();
     let mut execution_mode_override = None;
     let mut prompt_policy = PromptPolicy::Interactive;
     let mut deny_on_prompt = false;
@@ -1034,12 +950,18 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let mut continue_recent = false;
     let mut resume: Option<Option<uuid::Uuid>> = None;
     let mut exact_chat = None;
+    let mut view_handoff_path = None;
     let mut fork_session = false;
     let mut session_persistence = true;
     let mut workdir = std::env::current_dir()
         .map_err(|_| "cannot read the current directory; use an accessible directory".to_owned())?;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--view-handoff" => {
+                view_handoff_path = Some(PathBuf::from(
+                    arguments.next().ok_or("missing View handoff path")?,
+                ));
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -1106,6 +1028,16 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             }
         }
     }
+    let view_handoff = view_handoff_path
+        .as_deref()
+        .map(view_upgrade::read_handoff)
+        .transpose()?;
+    if let Some(handoff) = &view_handoff {
+        exact_chat = handoff.selection.chat;
+        continue_recent = false;
+        resume = None;
+        fork_session = false;
+    }
     let resumes_saved_chat = continue_recent || resume.is_some();
     if fork_session && !resumes_saved_chat {
         return Err("--fork-session can only be used with --continue or --resume".into());
@@ -1117,7 +1049,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     {
         return Err("--continue, --resume, and --chat-id cannot be combined".into());
     }
-    if !session_persistence && (resumes_saved_chat || exact_chat.is_some()) {
+    if !session_persistence
+        && (resumes_saved_chat || exact_chat.is_some())
+        && view_handoff.is_none()
+    {
         return Err(
             "--no-session-persistence cannot be combined with --continue, --resume, or --chat-id"
                 .into(),
@@ -1128,7 +1063,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             "--deny-on-prompt and --dangerously-skip-permissions cannot be combined".into(),
         );
     }
-    if unrestricted {
+    if unrestricted && view_handoff.is_none() {
         eprintln!(
             "Warning: unrestricted execution skips permission prompts and automatic review; use it only inside an externally isolated environment"
         );
@@ -1160,6 +1095,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     if !caller_managed_trust
         && startup_directory_needs_trust(user_settings.as_ref(), &workdir, interactive_terminal)?
     {
+        if view_handoff.is_some() {
+            return Err("Working-directory trust changed during the View upgrade".into());
+        }
         let settings = user_settings
             .as_ref()
             .expect("trust gate requires user settings");
@@ -1275,10 +1213,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         let core = tickloop_agent_daemon::build_runtime(&launch, None).await?;
         Agent::from_embedded_launch(core, launch)
     } else {
-        let Some(client) = connect_startup_daemon(
+        let Some(client) = connect_daemon_at_startup(
             interactive_terminal,
             display_preferences,
             &mut startup_console,
+            &launch_arguments,
         )
         .await?
         else {
@@ -1288,10 +1227,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     #[cfg(not(test))]
     let agent = {
-        let Some(client) = connect_startup_daemon(
+        let Some(client) = connect_daemon_at_startup(
             interactive_terminal,
             display_preferences,
             &mut startup_console,
+            &launch_arguments,
         )
         .await?
         else {
@@ -1299,15 +1239,23 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         };
         Agent::connected(client, launch, view_host)
     };
-    if (resumes_saved_chat || exact_chat.is_some()) && !agent.saves_chats() {
+    if (resumes_saved_chat || exact_chat.is_some())
+        && !agent.saves_chats()
+        && view_handoff.is_none()
+    {
         return Err(
             "conversations are not saved because cleanupPeriodDays is 0 in settings.json; remove it or set it to a positive number to keep and resume Chats".into(),
         );
     }
     let startup = if let Some(chat) = exact_chat {
-        let (snapshot, has_history) = match agent.resume_chat(chat).await {
+        let opened = if view_handoff.is_some() {
+            agent.snapshot(chat).await
+        } else {
+            agent.resume_chat(chat).await
+        };
+        let (snapshot, has_history) = match opened {
             Ok(snapshot) => (snapshot, true),
-            Err(error) if error.code == AccessErrorCode::NotFound => {
+            Err(error) if error.code == AccessErrorCode::NotFound && view_handoff.is_none() => {
                 agent
                     .restore_empty_chat(chat, workdir.clone())
                     .await
@@ -1348,8 +1296,14 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     } else {
         StartupChat::New
     };
+    let startup = if let Some(handoff) = view_handoff {
+        StartupChat::Upgrade(Box::new(startup), Box::new(handoff))
+    } else {
+        startup
+    };
     let (console, input) = match startup_console.take() {
         Some(started) => started,
+        None if view_handoff_path.is_some() => Console::start_for_upgrade(display_preferences)?,
         None => Console::start_with_display(interactive_terminal, display_preferences)?,
     };
     let console = &console;
@@ -1394,6 +1348,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         StartupState {
             chat: startup,
             user_settings,
+            launch_arguments: launch_arguments.into_iter().map(Into::into).collect(),
         },
         config_root,
     )
@@ -1414,11 +1369,13 @@ enum StartupChat {
     New,
     Resumed(Box<tickloop_agent_protocol::ChatSnapshot>, bool),
     Picker { as_new_chat: bool },
+    Upgrade(Box<StartupChat>, Box<view_upgrade::ViewHandoff>),
 }
 
 struct StartupState {
     chat: StartupChat,
     user_settings: Option<UserSettings>,
+    launch_arguments: Vec<std::ffi::OsString>,
 }
 
 fn initialize_startup_console(
@@ -1671,6 +1628,12 @@ async fn interact(
     };
     let mut update_notice_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     update_notice_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut activation_refresh = tokio::time::interval(runtime_upgrade::CHECK_INTERVAL);
+    activation_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut activation_checks = tokio::task::JoinSet::new();
+    let mut initial_activation = !matches!(&startup.chat, StartupChat::Upgrade(_, _));
+    let mut ready_runtime: Option<tickloop_agent_updater::SelectedRuntime> = None;
+    let mut activation_notice = None;
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
@@ -1776,7 +1739,11 @@ async fn interact(
     let mut backgrounded_shells = HashSet::new();
     // Shell commands this View sent while a turn worked, listed in the queue until they start.
     let mut queued_shells = HashSet::new();
-    match startup.chat {
+    let (startup_chat, view_handoff) = match startup.chat {
+        StartupChat::Upgrade(chat, handoff) => (*chat, Some(*handoff)),
+        chat => (chat, None),
+    };
+    match startup_chat {
         StartupChat::New => {}
         StartupChat::Resumed(snapshot, has_history) => {
             learn_agent_colors(console, agent, &snapshot).await?;
@@ -1792,6 +1759,28 @@ async fn interact(
                 Workflow::chats(agent, &workdir, None, as_new_chat).await?,
             )?;
         }
+        StartupChat::Upgrade(_, _) => return Err("nested View upgrade state".into()),
+    }
+    let mut restored_view_path = None;
+    if let Some(handoff) = view_handoff {
+        global.restore_upgrade_navigation(handoff.selection.navigation);
+        selected_loops = handoff.selection.selected_loops;
+        goal = handoff.selection.goal;
+        overview_active = handoff.selection.overview;
+        agent.restore_upgrade_configuration(handoff.selection.configuration)?;
+        if overview_active {
+            global
+                .interpret(crate::agent_console::Intent::Overview)
+                .map_err(|error| error.to_string())?;
+            global.refresh().await.map_err(|error| error.to_string())?;
+            console.set_global_overview(Some(agent_overview(&global.projection())))?;
+        }
+        console.restore_upgrade(handoff.console)?;
+        if selected_chat.is_none() {
+            console.set_input_context(None, &global.projection().dispatch_directory, &[])?;
+        }
+        restored_view_path = Some(handoff.source_path);
+        ui_selected = selected_chat;
     }
     if let Some(chat) = selected_chat {
         let snapshot = agent
@@ -1812,6 +1801,11 @@ async fn interact(
         process_registry::count_concurrent_processes(root);
         registration
     });
+    if let Some(path) = restored_view_path {
+        view_upgrade::complete_handoff();
+        let _ = std::fs::remove_file(path);
+        console.finish_upgrade_restore();
+    }
     loop {
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
@@ -2392,6 +2386,43 @@ async fn interact(
                 (request, result)
             });
         }
+        if let Some(target) = ready_runtime.as_ref()
+            && !agent.is_handing_off()
+            && pending.is_empty()
+            && compactions.is_empty()
+            && directed_summaries.is_empty()
+            && deferred_events.is_empty()
+            && menu_commands.is_empty()
+            && paused_inputs.is_empty()
+            && foreground_shells.is_empty()
+            && logins.is_empty()
+            && logout.is_none()
+            && !reply_lines.values().any(ReplyLines::has_complete_line)
+            && let Some(navigation) = global.prepare_upgrade_navigation()
+            && let Some(configuration) = agent.upgrade_configuration()?
+        {
+            let selection = view_upgrade::ViewSelection {
+                navigation,
+                chat: selected_chat,
+                goal,
+                overview: overview_active,
+                selected_loops: selected_loops.clone(),
+                configuration,
+            };
+            if let Err(error) = view_upgrade::try_reexec(
+                console,
+                &input,
+                &target.executable,
+                startup.launch_arguments.clone(),
+                selection,
+            )
+            .await
+            {
+                activation_notice =
+                    Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
+                ready_runtime = None;
+            }
+        }
         let discovery_active = menus.discovery_active();
         let search_test_active = menus.search_test_active();
         let active_login = login::active_login_id(&logins, console)?;
@@ -2405,6 +2436,36 @@ async fn interact(
         #[cfg(not(test))]
         let global_refresh_enabled = true;
         tokio::select! {
+            _ = activation_refresh.tick(), if interactive && activation_checks.is_empty() => {
+                let initial = std::mem::take(&mut initial_activation);
+                activation_checks.spawn(runtime_upgrade::check(agent.clone(), initial));
+            },
+            checked = activation_checks.join_next(), if !activation_checks.is_empty() => {
+                ready_runtime = None;
+                match checked {
+                Some(Ok(Ok(activation))) => {
+                    activation_notice = None;
+                    if let Some(target) = activation.target
+                        && !runtime_upgrade::is_current_executable(&target.executable)
+                    {
+                        ready_runtime = Some(target);
+                    }
+                    if activation.waiting {
+                        activation_notice = Some(tickloop_agent_updater::UpdateNotice::Activating);
+                    }
+                    if let Some(error) = activation.error {
+                        activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
+                    }
+                },
+                Some(Ok(Err(error))) => {
+                    activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
+                },
+                Some(Err(error)) => {
+                    activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error.to_string() });
+                },
+                None => {},
+                }
+            },
             result = completed_task_cleanups.join_next(), if !completed_task_cleanups.is_empty() => {
                 match result {
                     Some(Ok(Ok(()))) => {},
@@ -4590,8 +4651,8 @@ async fn interact(
                     }
                 }
             },
-            _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && update_monitor.is_some() => {
-                console.set_update_notice(update_monitor.as_ref().and_then(|monitor| monitor.notice()))?;
+            _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && (update_monitor.is_some() || activation_notice.is_some()) => {
+                console.set_update_notice(activation_notice.clone().or_else(|| update_monitor.as_ref().and_then(|monitor| monitor.notice())))?;
             },
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
                 thinking_frame_due = false;

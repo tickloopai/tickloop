@@ -62,8 +62,9 @@ impl Agent {
         };
         let agent = self.clone();
         let task = tokio::spawn(async move {
+            let _upgrade = agent.inner.upgrade_gate.read().await;
             let cancel = agent.inner.shutdown.child_token();
-            let output = agent
+            let response = agent
                 .tracked_model_request(
                     RequestContext::shell_description(chat_id),
                     client,
@@ -71,9 +72,19 @@ impl Agent {
                     cancel.clone(),
                     None,
                 )
-                .await
-                .ok()
-                .map(|response| response.output);
+                .await;
+            let output = match response {
+                Ok(response) => agent
+                    .finish_model_request(
+                        chat_id,
+                        response.sequence,
+                        tickloop_agent_protocol::RequestOutcome::Accepted,
+                    )
+                    .await
+                    .ok()
+                    .map(|_| response.output),
+                Err(_) => None,
+            };
             cancel.cancel();
             if let Some(description) = output
                 .as_ref()

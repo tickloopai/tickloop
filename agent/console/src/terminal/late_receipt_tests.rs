@@ -301,6 +301,7 @@ async fn run_late_receipt_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        launch_arguments: Vec::new(),
         chat,
         user_settings: None,
     };

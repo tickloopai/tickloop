@@ -4,7 +4,7 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum InputKind {
     #[default]
     Prompt,
@@ -83,15 +83,20 @@ pub(super) enum ShellInputAction {
     Submit(UserShellSubmission),
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct ShellInputState {
     kind: InputKind,
     command: String,
     cursor: usize,
+    #[serde(skip)]
     history_candidates: Vec<ShellHistoryCandidate>,
+    #[serde(skip)]
     path_candidates: Vec<ShellPathCandidate>,
+    #[serde(skip)]
     path_replacement_range: Option<Range<usize>>,
+    #[serde(skip)]
     active_completion: Option<ShellCompletionKind>,
+    #[serde(skip)]
     selected: Option<usize>,
 }
 

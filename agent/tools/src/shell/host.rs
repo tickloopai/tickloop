@@ -50,12 +50,29 @@ pub enum ShellStartError {
 #[async_trait::async_trait]
 pub trait ShellHost: Send + Sync {
     async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError>;
+
+    async fn adopt(&self, _handoff: serde_json::Value) -> Result<Box<dyn ShellProcess>, ToolError> {
+        Err(ToolError::Rejected(
+            "this Shell host cannot transfer running commands".into(),
+        ))
+    }
+
+    async fn retained_handoff(
+        &self,
+        _operation: Uuid,
+    ) -> Result<Option<serde_json::Value>, ToolError> {
+        Ok(None)
+    }
 }
 
 /// A started command. Dropping it stops the command if it still runs.
 #[async_trait::async_trait]
 pub trait ShellProcess: Send {
     fn pid(&self) -> u32;
+
+    fn handoff(&self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// How the command ended, once it did. Cancel-safe: waiting again picks up where it left.
     async fn exited(&mut self) -> ShellExit;

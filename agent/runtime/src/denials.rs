@@ -85,7 +85,7 @@ pub(super) fn allowed_approval_record(
     record
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DenialWindow {
     pub records: VecDeque<ApprovalRecord>,
     pub revision: u64,

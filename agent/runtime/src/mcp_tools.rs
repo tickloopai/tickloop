@@ -62,6 +62,7 @@ pub const ARTIFACT_ACCOUNT_TOOL_NAMES: [&str; 4] = [
 ];
 
 const SERVER_NAME: &str = "tickloop-artifacts";
+const MCP_UPGRADE_CHECKPOINT_VERSION: u32 = 1;
 const PUBLICATION_META: &str = "tickloop.ai/publication";
 const MAX_TOOLS: usize = 128;
 const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -191,13 +192,21 @@ struct PreparedArtifactUpload {
     publication: Option<ArtifactPublication>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 struct ArtifactPublicationAdmission {
     chat: ChatId,
     account: String,
     origin: String,
     artifact: String,
     audience: ArtifactAudience,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpUpgradeCheckpoint {
+    version: u32,
+    publication_admissions: HashSet<ArtifactPublicationAdmission>,
+    native: Option<crate::host_tools::HostToolUpgradeCheckpoint>,
 }
 
 fn artifact_update_id<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
@@ -1225,6 +1234,43 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
+    fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
+        if self.pending_login.lock().unwrap().is_some() {
+            return Ok(None);
+        }
+        let native = match &self.native {
+            Some(native) => match native.upgrade_checkpoint()? {
+                Some(state) => Some(crate::host_tools::HostToolUpgradeCheckpoint { state }),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        serde_json::to_value(McpUpgradeCheckpoint {
+            version: MCP_UPGRADE_CHECKPOINT_VERSION,
+            publication_admissions: self.publication_admissions.read().unwrap().clone(),
+            native,
+        })
+        .map(Some)
+        .map_err(|error| error.to_string())
+    }
+
+    fn restore_upgrade(&self, state: Value) -> Result<(), String> {
+        let checkpoint: McpUpgradeCheckpoint =
+            serde_json::from_value(state).map_err(|error| error.to_string())?;
+        if checkpoint.version != MCP_UPGRADE_CHECKPOINT_VERSION
+            || self.pending_login.lock().unwrap().is_some()
+        {
+            return Err("MCP provider is not ready for this upgrade checkpoint".into());
+        }
+        match (&self.native, checkpoint.native) {
+            (Some(native), Some(checkpoint)) => native.restore_upgrade(checkpoint.state)?,
+            (None, None) => {}
+            _ => return Err("host tool provider composition changed during upgrade".into()),
+        }
+        *self.publication_admissions.write().unwrap() = checkpoint.publication_admissions;
+        Ok(())
+    }
+
     fn is_concurrency_safe(&self, name: &str, input: &Value) -> bool {
         if ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) || name == ARTIFACT_LOGIN_TOOL {
             name == ARTIFACT_READ_TOOL
@@ -1998,5 +2044,172 @@ impl HostToolProvider for McpHostToolProvider {
                 output_ref: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use crate::Agent;
+    use tickloop_agent_test_support::{ScriptedModel, config};
+
+    struct StatelessNative;
+
+    #[async_trait]
+    impl HostToolProvider for StatelessNative {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+            HostToolPermission::ReadOnly
+        }
+        async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
+            panic!("restoring a provider must not execute tools");
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_provider_presence_survives_the_private_checkpoint_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+        original
+            .install_host_tools(Arc::new(StatelessNative))
+            .unwrap();
+        original.create_chat(directory.path().into()).await.unwrap();
+        let checkpoint = original.prepare_upgrade().await.unwrap().unwrap();
+        let successor = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+        successor
+            .install_host_tools(Arc::new(StatelessNative))
+            .unwrap();
+        successor
+            .restore_upgrade(
+                serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap(),
+            )
+            .await
+            .unwrap();
+        successor.activate_upgrade().await.unwrap();
+        original.shutdown_for_upgrade().await;
+        successor.release_upgrade().await.unwrap();
+        successor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_device_login_defers_worker_upgrade_without_cancelling_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(McpHostToolProvider::new(
+            ArtifactClient::new(directory.path()).unwrap(),
+            None,
+        ));
+        let login_cancel = CancellationToken::new();
+        *provider.pending_login.lock().unwrap() = Some(PendingLogin {
+            id: 1,
+            verification_uri: "https://example.test/device".into(),
+            user_code: "FIXTURE".into(),
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(300),
+            cancel: login_cancel.clone(),
+        });
+        let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+        agent.install_host_tools(provider.clone()).unwrap();
+        agent.create_chat(directory.path().into()).await.unwrap();
+        assert!(agent.prepare_upgrade().await.unwrap().is_none());
+        assert!(!login_cancel.is_cancelled());
+        provider.pending_login.lock().unwrap().take();
+        assert!(agent.prepare_upgrade().await.unwrap().is_some());
+        agent.cancel_upgrade().await;
+        agent.shutdown().await;
+    }
+
+    #[test]
+    fn publication_grants_survive_only_with_their_original_owner_and_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = McpHostToolProvider::new(
+            ArtifactClient::new(directory.path()).unwrap(),
+            Some(Arc::new(StatelessNative)),
+        );
+        let chat = uuid::Uuid::new_v4();
+        let credential = CredentialSnapshot {
+            origin: "https://artifacts.example.test".into(),
+            account_id: "account-a".into(),
+            access_token: "fixture".into(),
+        };
+        original.admit_publication(
+            chat,
+            &credential,
+            "artifact-a".into(),
+            ArtifactAudience::Public,
+        );
+        let state = original.upgrade_checkpoint().unwrap().unwrap();
+        let restored = McpHostToolProvider::new(
+            ArtifactClient::new(directory.path()).unwrap(),
+            Some(Arc::new(StatelessNative)),
+        );
+        restored
+            .restore_upgrade(serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap())
+            .unwrap();
+        let publication = ArtifactPublication {
+            audience: ArtifactAudience::Public,
+            membership_revision: 7,
+        };
+        assert_eq!(
+            restored.audience_permission(chat, &credential, "artifact-a", Some(&publication)),
+            Some(HostToolPermission::ArtifactContinuation)
+        );
+        for (owner, identity, artifact) in [
+            (
+                uuid::Uuid::new_v4(),
+                CredentialSnapshot {
+                    origin: "https://artifacts.example.test".into(),
+                    account_id: "account-a".into(),
+                    access_token: "fixture".into(),
+                },
+                "artifact-a",
+            ),
+            (
+                chat,
+                CredentialSnapshot {
+                    origin: "https://artifacts.example.test".into(),
+                    account_id: "account-b".into(),
+                    access_token: "fixture".into(),
+                },
+                "artifact-a",
+            ),
+            (
+                chat,
+                CredentialSnapshot {
+                    origin: "https://other.example.test".into(),
+                    account_id: "account-a".into(),
+                    access_token: "fixture".into(),
+                },
+                "artifact-a",
+            ),
+            (
+                chat,
+                CredentialSnapshot {
+                    origin: "https://artifacts.example.test".into(),
+                    account_id: "account-a".into(),
+                    access_token: "fixture".into(),
+                },
+                "artifact-b",
+            ),
+        ] {
+            assert_eq!(
+                restored.audience_permission(owner, &identity, artifact, Some(&publication)),
+                Some(HostToolPermission::PublicArtifactWrite)
+            );
+        }
+        assert_eq!(
+            restored.audience_permission(
+                chat,
+                &credential,
+                "artifact-a",
+                Some(&ArtifactPublication {
+                    audience: ArtifactAudience::Private,
+                    membership_revision: 7,
+                })
+            ),
+            Some(HostToolPermission::PrivateArtifactWrite)
+        );
+        assert!(restored.directory.read().unwrap().is_none());
+        assert!(restored.skill_files.read().unwrap().is_empty());
     }
 }

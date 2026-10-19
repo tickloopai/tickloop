@@ -81,6 +81,7 @@ fn startup_status_pty_fixture() {
                     &console,
                     input,
                     StartupState {
+                        launch_arguments: Vec::new(),
                         chat: StartupChat::New,
                         user_settings: None,
                     },

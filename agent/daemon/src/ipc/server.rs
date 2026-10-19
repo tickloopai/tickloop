@@ -11,6 +11,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::ingress::{DaemonIngress, SessionTicket};
+use crate::lifecycle::DaemonLifecycle;
 use crate::{chunked::EncodedResponse, views::command_origin};
 use tickloop_agent_client::frame::{read_frame_body, verify_peer, write_frame};
 use tickloop_agent_protocol::{
@@ -30,12 +32,19 @@ struct FeedTask {
     task: AbortHandle,
 }
 
+#[derive(Clone)]
+pub(super) struct DaemonConnection {
+    lifecycle: Arc<DaemonLifecycle>,
+    ingress: Arc<DaemonIngress>,
+}
+
 struct ConnectionCleanup {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     observations: Arc<Mutex<HashMap<Uuid, FeedTask>>>,
     access: Arc<dyn AgentAccess>,
     cancel: CancellationToken,
     session_id: Uuid,
+    session: Option<SessionTicket>,
 }
 
 /// The id of a request whose kind this build does not know: the single externally tagged
@@ -64,15 +73,21 @@ impl Drop for ConnectionCleanup {
         let observations = self.observations.clone();
         let access = self.access.clone();
         let session_id = self.session_id;
+        let close_session = self
+            .session
+            .as_ref()
+            .is_none_or(|session| !session.preserves_lease());
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 for (_, feed) in observations.lock().await.drain() {
                     feed.task.abort();
                 }
                 let _ = writer.lock().await.shutdown().await;
-                let _ = access
-                    .show_view(DisplayUpdate::SessionClosed { session_id })
-                    .await;
+                if close_session {
+                    let _ = access
+                        .show_view(DisplayUpdate::SessionClosed { session_id })
+                        .await;
+                }
             });
         }
     }
@@ -105,11 +120,33 @@ pub async fn serve_daemon_listener(
     limits: AccessLimits,
     shutdown: CancellationToken,
 ) -> Result<(), AccessError> {
+    serve_daemon_listener_with_lifecycle(
+        listener,
+        access,
+        epoch,
+        limits,
+        Arc::new(DaemonLifecycle::new(shutdown)),
+        Arc::new(DaemonIngress::new(epoch, limits)),
+    )
+    .await
+}
+
+pub(crate) async fn serve_daemon_listener_with_lifecycle(
+    listener: UnixListener,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+    limits: AccessLimits,
+    lifecycle: Arc<DaemonLifecycle>,
+    ingress: Arc<DaemonIngress>,
+) -> Result<(), AccessError> {
     loop {
-        let incoming = tokio::select! { _ = shutdown.cancelled() => return Ok(()), incoming = listener.accept() => incoming };
+        let incoming = tokio::select! { _ = lifecycle.shutdown().cancelled() => return Ok(()), incoming = listener.accept() => incoming };
         let (stream, _) = incoming.map_err(|error| AccessError::unavailable(error.to_string()))?;
         let access = access.clone();
-        let shutdown = shutdown.clone();
+        let connection = DaemonConnection {
+            lifecycle: lifecycle.clone(),
+            ingress: ingress.clone(),
+        };
         tokio::spawn(async move {
             let _ = serve_connection_mode(
                 stream,
@@ -117,7 +154,7 @@ pub async fn serve_daemon_listener(
                 epoch,
                 limits,
                 false,
-                Some(shutdown),
+                Some(connection),
                 #[cfg(test)]
                 None,
             )
@@ -179,34 +216,36 @@ pub(super) async fn serve_connection_mode(
     epoch: Uuid,
     limits: AccessLimits,
     forwarded_sessions: bool,
-    daemon_shutdown: Option<CancellationToken>,
+    daemon_shutdown: Option<DaemonConnection>,
     #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
 ) -> Result<(), AccessError> {
     verify_peer(&stream)?;
-    let hello = tickloop_agent_client::daemon_management::read::<
-        _,
-        tickloop_agent_protocol::daemon_management::Request,
-    >(&mut stream)
-    .await
-    .map_err(AccessError::invalid)?;
-    let minor = match hello {
-        Some(tickloop_agent_protocol::daemon_management::Request::Hello {
+    let hello = tickloop_agent_client::daemon_management::read::<_, ClientMessage>(&mut stream)
+        .await
+        .map_err(AccessError::invalid)?;
+    let (minor, handoff) = match hello {
+        Some(ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
+            handoff,
             ..
-        }) => PROTOCOL_MINOR,
-        Some(tickloop_agent_protocol::daemon_management::Request::Hello {
+        }) => (PROTOCOL_MINOR, handoff),
+        Some(ClientMessage::Hello {
             major: tickloop_agent_protocol::daemon_management::CONTROL_MAJOR,
             minor: 0,
+            ..
         }) if daemon_shutdown.is_some() => {
             return crate::daemon_management::serve_shutdown(
                 stream,
                 epoch,
-                daemon_shutdown.expect("daemon management session"),
+                (*daemon_shutdown
+                    .expect("daemon management session")
+                    .lifecycle)
+                    .clone(),
             )
             .await
             .map_err(AccessError::invalid);
         }
-        Some(tickloop_agent_protocol::daemon_management::Request::Hello { major, minor }) => {
+        Some(ClientMessage::Hello { major, minor, .. }) => {
             write_frame(
                 &mut stream,
                 &ServerMessage::Error {
@@ -239,7 +278,28 @@ pub(super) async fn serve_connection_mode(
             return Ok(());
         }
     };
-    let session_id = Uuid::new_v4();
+    let mut session = if let Some(daemon) = &daemon_shutdown {
+        match daemon.ingress.register(handoff) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                write_frame(
+                    &mut stream,
+                    &ServerMessage::Error {
+                        request_id: None,
+                        error,
+                    },
+                    HANDSHAKE_FRAME_BYTES,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let session_id = session
+        .as_ref()
+        .map_or_else(Uuid::new_v4, |session| session.session_id);
     let capabilities = vec![
         AccessCapability::Overview,
         AccessCapability::AgentDetails,
@@ -275,6 +335,10 @@ pub(super) async fn serve_connection_mode(
             limits: limits.into(),
             build: tickloop_agent_protocol::build_identity().map(str::to_owned),
             executable: std::env::current_exe().ok(),
+            upgrade_protocol: daemon_shutdown
+                .as_ref()
+                .map(|_| tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION),
+            handoff: session.as_ref().and_then(|session| session.handoff.clone()),
         }),
         HANDSHAKE_FRAME_BYTES,
     )
@@ -287,13 +351,20 @@ pub(super) async fn serve_connection_mode(
         Arc::new(Mutex::new(HashMap::new()));
     let cancel = daemon_shutdown
         .as_ref()
-        .map_or_else(CancellationToken::new, CancellationToken::child_token);
+        .map_or_else(CancellationToken::new, |lifecycle| {
+            lifecycle.lifecycle.shutdown().child_token()
+        });
+    let peer = session
+        .as_mut()
+        .map(|session| session.attach(writer.clone(), cancel.clone(), frame_bytes));
+    let preserves_lease = session.as_ref().is_some_and(SessionTicket::preserves_lease);
     let _cleanup = ConnectionCleanup {
         writer: writer.clone(),
         observations: observations.clone(),
         access: access.clone(),
         cancel: cancel.clone(),
         session_id,
+        session,
     };
     let result = loop {
         let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame_body(&mut reader, frame_bytes) => incoming };
@@ -344,13 +415,28 @@ pub(super) async fn serve_connection_mode(
                 )
                 .await?;
             } else if let Some(shutdown) = &daemon_shutdown {
+                let stop = match shutdown.lifecycle.reserve_stop() {
+                    Ok(stop) => stop,
+                    Err(error) => {
+                        write_frame(
+                            &mut *writer.lock().await,
+                            &ServerMessage::Error {
+                                request_id: Some(request_id),
+                                error,
+                            },
+                            frame_bytes,
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 write_frame(
                     &mut *writer.lock().await,
                     &ServerMessage::DaemonStopped { request_id },
                     frame_bytes,
                 )
                 .await?;
-                shutdown.cancel();
+                drop(stop);
                 break Ok(());
             } else {
                 write_frame(
@@ -365,6 +451,12 @@ pub(super) async fn serve_connection_mode(
                     frame_bytes,
                 )
                 .await?;
+            }
+            continue;
+        }
+        if let ClientMessage::HandoffReady { transfer_id } = message {
+            if let Some(peer) = &peer {
+                peer.acknowledge(transfer_id);
             }
             continue;
         }
@@ -397,6 +489,10 @@ pub(super) async fn serve_connection_mode(
         } else {
             None
         };
+        let request_activity = peer.as_ref().map(|peer| peer.request());
+        let ingress = daemon_shutdown
+            .as_ref()
+            .map(|daemon| daemon.ingress.clone());
         let pending_observations = pending_observations.clone();
         let access = access.clone();
         let writer = writer.clone();
@@ -405,6 +501,7 @@ pub(super) async fn serve_connection_mode(
         #[cfg(test)]
         let observation_hooks = observation_hooks.clone();
         tokio::spawn(async move {
+            let _request_activity = request_activity;
             let command_response = matches!(&message, ClientMessage::Execute { .. });
             let response = match message {
                 ClientMessage::Observe { request_id, query } => {
@@ -612,6 +709,23 @@ pub(super) async fn serve_connection_mode(
                 }
                 _ => return,
             };
+            let response = match response {
+                ServerMessage::Error {
+                    request_id: Some(request_id),
+                    error,
+                } if error.code == AccessErrorCode::HandoffNotAccepted
+                    && ingress
+                        .as_ref()
+                        .and_then(|ingress| ingress.committed_transfer())
+                        .is_some() =>
+                {
+                    ServerMessage::NotAccepted {
+                        request_id,
+                        transfer_id: ingress.as_ref().unwrap().committed_transfer().unwrap(),
+                    }
+                }
+                response => response,
+            };
             write_response(
                 &mut *writer.lock().await,
                 response,
@@ -627,9 +741,11 @@ pub(super) async fn serve_connection_mode(
     for (_, feed) in observations.lock().await.drain() {
         feed.task.abort();
     }
-    let _ = access
-        .show_view(DisplayUpdate::SessionClosed { session_id })
-        .await;
+    if !preserves_lease {
+        let _ = access
+            .show_view(DisplayUpdate::SessionClosed { session_id })
+            .await;
+    }
     result
 }
 

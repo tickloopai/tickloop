@@ -595,6 +595,7 @@ impl Agent {
                     _ = cancel.cancelled() => break,
                     _ = interval.tick() => {}
                 }
+                let _upgrade = agent.inner.upgrade_gate.read().await;
                 let now = tokio::time::Instant::now();
                 match agent
                     .poll_event_sources_once(chat_id, loop_id, now >= next_poll, &cancel)
@@ -1020,6 +1021,7 @@ impl Agent {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = agent.inner.shutdown.cancelled() => break, _ = interval.tick() => {} }
+                let _upgrade = agent.inner.upgrade_gate.read().await;
                 let Ok(client) = artifact_client(&agent) else {
                     continue;
                 };

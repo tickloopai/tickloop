@@ -176,6 +176,11 @@ impl Agent {
         chat.snapshot = snapshot;
         self.discard_replaced_trigger_inputs(chat, loop_id);
         self.save(&chat.snapshot);
+        self.inner
+            .trigger_deadlines
+            .lock()
+            .unwrap()
+            .remove(&(chat_id, loop_id));
         if let Some(previous) = chat.trigger_cancellations.remove(&loop_id) {
             previous.cancel();
         }
@@ -272,6 +277,15 @@ impl Agent {
     ) -> tokio::task::JoinHandle<()> {
         let agent = self.clone();
         let started = tokio::time::Instant::now();
+        let first_tick = trigger.interval_seconds.map(|seconds| {
+            *self
+                .inner
+                .trigger_deadlines
+                .lock()
+                .unwrap()
+                .entry((chat_id, loop_id))
+                .or_insert(started + std::time::Duration::from_secs(seconds))
+        });
         let deadline = trigger.expires_at_ms.map(|deadline| {
             started
                 + std::time::Duration::from_millis(
@@ -284,7 +298,7 @@ impl Agent {
             let mut lease_retry_at: Option<tokio::time::Instant> = None;
             let mut interval = trigger.interval_seconds.map(|seconds| {
                 let period = std::time::Duration::from_secs(seconds);
-                let mut interval = tokio::time::interval_at(started + period, period);
+                let mut interval = tokio::time::interval_at(first_tick.unwrap(), period);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             });
@@ -302,6 +316,7 @@ impl Agent {
                     _ = agent.inner.shutdown.cancelled() => break,
                     _ = cancel.cancelled() => break,
                     _ = &mut expires => {
+                        let _upgrade = agent.inner.upgrade_gate.read().await;
                         let _ = agent.end_goal(chat_id, loop_id, LoopState::Expired, Some(&cancel)).await;
                         break;
                     },
@@ -319,10 +334,19 @@ impl Agent {
                             }
                         };
                     },
-                    _ = async {
-                        if let Some(interval) = &mut interval { interval.tick().await; }
-                        else { std::future::pending::<()>().await; }
+                    fired_at = async {
+                        if let Some(interval) = &mut interval { interval.tick().await }
+                        else { std::future::pending::<tokio::time::Instant>().await }
                     } => {
+                        let _upgrade = agent.inner.upgrade_gate.read().await;
+                        if let Some(seconds) = trigger.interval_seconds {
+                            let period = std::time::Duration::from_secs(seconds);
+                            let elapsed = tokio::time::Instant::now().saturating_duration_since(fired_at);
+                            let periods = elapsed.as_secs() / seconds + 1;
+                            agent.inner.trigger_deadlines.lock().unwrap().insert(
+                                (chat_id, loop_id), fired_at + period.saturating_mul(periods.min(u64::from(u32::MAX)) as u32),
+                            );
+                        }
                         if lease_retry_at.is_some() {
                             continue;
                         }

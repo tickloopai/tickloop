@@ -745,7 +745,7 @@ async fn observe_terminal_screen(
         }
         screen.join(feed.chat, &joining);
         for watch in adopted.iter().chain(&joining) {
-            publisher.ready(*watch);
+            publisher.ready_at(*watch, screen.last_read.seq);
         }
         screen.adopt(&adopted);
         publisher.metadata(

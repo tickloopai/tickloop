@@ -1,5 +1,6 @@
-//! Shell tasks: commands a Worker approved, run in pipe mode for as long as the spawner connection
-//! that submitted them. The host judges no command: it runs the one request that carries a live
+//! Shell tasks: commands a Worker approved, run in pipe mode for as long as their current owner
+//! connection. A planned successor can take ownership without spawning a new process. The host
+//! judges no command: it runs the one request that carries a live
 //! spawn grant and matches what that grant binds, in the directory and with the output file the
 //! request passed as descriptors, and never resolves a path of its own. Views of a task show the
 //! screen the host draws from its output; one its Worker's daemon granted can keep showing an
@@ -26,8 +27,8 @@ use tick_protocol::InstanceRef;
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
-        self, BUSINESS_FRAME_BYTES, CAPABILITY_SHELL, CONTROL_TIMEOUT, HostConnection, Role,
-        same_secret,
+        self, BUSINESS_FRAME_BYTES, CAPABILITY_SHELL, CAPABILITY_SHELL_HANDOFF, CONTROL_TIMEOUT,
+        HostConnection, Role, same_secret,
     },
 };
 use tokio::{
@@ -46,6 +47,8 @@ use crate::{
 
 /// How long a spawn grant waits for its spawner to connect.
 pub const SPAWN_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A committed but unconfirmed Worker transfer may reconnect before its Shell owner is lost.
+pub const SHELL_HANDOFF_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// A stopped task's process group gets SIGTERM, then SIGKILL once this passed.
 pub const SHELL_TERMINATE_GRACE: Duration = Duration::from_millis(200);
 /// The most output a task may write; a task that writes more is stopped and its file cut here.
@@ -136,6 +139,17 @@ pub struct SpawnedShell {
     pub pid: u32,
     /// The reader token of its `shell:` instance, for its Worker's own reads and watches.
     pub data_token: String,
+    /// A private, one-use token for a planned successor of the submitting Worker.
+    #[serde(default)]
+    pub owner_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ShellHandoff {
+    pub endpoint: PathBuf,
+    pub instance: InstanceRef,
+    pub owner_token: String,
+    pub handoff: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -248,12 +262,21 @@ impl ShellExits {
     }
 }
 
-/// How a spawner asks its task to stop. Closing the connection stops it as well.
+/// How the current owner stops its task. A transferred previous owner's requests are fenced.
 pub struct ShellStops {
     writer: OwnedWriteHalf,
 }
 
 impl ShellStops {
+    pub async fn commit_handoff(&mut self) -> Result<(), HostError> {
+        hosted::write_frame(
+            &mut self.writer,
+            &json!({"method":"confirm_handoff"}),
+            BUSINESS_FRAME_BYTES,
+        )
+        .await
+    }
+
     pub async fn stop(&mut self, reason: &str) -> Result<(), HostError> {
         hosted::write_frame(
             &mut self.writer,
@@ -287,6 +310,32 @@ pub async fn submit(
         .await?;
     let spawned = connection
         .request("spawn", json!(request), CONTROL_TIMEOUT)
+        .await?;
+    let spawned = serde_json::from_value(spawned)
+        .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?;
+    let (reader, writer) = connection.into_parts();
+    Ok(SubmittedShell {
+        spawned,
+        exits: ShellExits { reader },
+        stops: ShellStops { writer },
+    })
+}
+
+/// Adopts an existing task without spawning a command. A successful hello fences the previous
+/// owner's stop requests and disconnect, and rotates the token before returning it.
+pub async fn adopt(handoff: &ShellHandoff) -> Result<SubmittedShell, HostError> {
+    let mut connection = HostConnection::connect(
+        &handoff.endpoint,
+        Role::ShellSuccessor {
+            instance: handoff.instance.clone(),
+            owner_token: handoff.owner_token.clone(),
+            handoff: handoff.handoff,
+        },
+        &[CAPABILITY_SHELL_HANDOFF],
+    )
+    .await?;
+    let spawned = connection
+        .request("adopt", json!({}), CONTROL_TIMEOUT)
         .await?;
     let spawned = serde_json::from_value(spawned)
         .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?;
@@ -359,6 +408,7 @@ pub(crate) struct ShellTask {
     pub(crate) instance: InstanceRef,
     pub(crate) data_token: String,
     pub(crate) pid: u32,
+    ownership: std::sync::Mutex<ShellOwnership>,
     output: std::fs::File,
     /// The first reason it was asked to stop for.
     stop: watch::Sender<Option<String>>,
@@ -373,6 +423,15 @@ pub(crate) struct ShellTask {
     /// When it was last released or left without views; a released task nobody views is
     /// forgotten after the host's idle timeout.
     unviewed_since_ms: AtomicU64,
+}
+
+struct ShellOwnership {
+    generation: u64,
+    token: String,
+    released: bool,
+    previous: Option<(String, Uuid)>,
+    connected: bool,
+    is_handoff_pending: bool,
 }
 
 /// The screen a task's views show and how far its output was read into it.
@@ -451,6 +510,14 @@ impl ShellTask {
             description,
             data_token,
             pid,
+            ownership: std::sync::Mutex::new(ShellOwnership {
+                generation: 0,
+                token: crate::host::random_token(),
+                released: false,
+                previous: None,
+                connected: true,
+                is_handoff_pending: false,
+            }),
             output,
             stop: watch::channel(None).0,
             exit: watch::channel(None).0,
@@ -463,6 +530,91 @@ impl ShellTask {
         });
         tokio::spawn(supervise(task.clone(), child));
         Ok(task)
+    }
+
+    pub(crate) fn spawned(&self) -> SpawnedShell {
+        SpawnedShell {
+            instance: self.instance.clone(),
+            pid: self.pid,
+            data_token: self.data_token.clone(),
+            owner_token: self.ownership.lock().unwrap().token.clone(),
+        }
+    }
+
+    pub(crate) fn can_adopt(&self, token: &str, handoff: Uuid) -> bool {
+        let owner = self.ownership.lock().unwrap();
+        !owner.released
+            && (same_secret(token, &owner.token)
+                || owner
+                    .previous
+                    .as_ref()
+                    .is_some_and(|(previous, operation)| {
+                        *operation == handoff && same_secret(token, previous)
+                    }))
+    }
+
+    pub(crate) fn adopt(&self, token: &str, handoff: Uuid) -> Result<u64, HostError> {
+        let mut owner = self.ownership.lock().unwrap();
+        let is_retry = owner
+            .previous
+            .as_ref()
+            .is_some_and(|(previous, operation)| {
+                *operation == handoff && same_secret(token, previous)
+            });
+        if owner.released || (!same_secret(token, &owner.token) && !is_retry) {
+            return Err(HostError::before(
+                "Forbidden",
+                "unknown or already used Shell owner token",
+            ));
+        }
+        owner.generation = owner
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| HostError::before("Fenced", "Shell owner generation exhausted"))?;
+        if !is_retry {
+            owner.previous = Some((owner.token.clone(), handoff));
+            owner.token = crate::host::random_token();
+        }
+        owner.connected = true;
+        owner.is_handoff_pending = true;
+        Ok(owner.generation)
+    }
+
+    pub(crate) fn stop_owned(&self, generation: u64, reason: &str) {
+        let owner = self.ownership.lock().unwrap();
+        if owner.generation == generation && !owner.released {
+            self.stop(reason);
+        }
+    }
+
+    pub(crate) fn confirm_owner(&self, generation: u64) {
+        let mut owner = self.ownership.lock().unwrap();
+        if owner.generation == generation && !owner.released {
+            owner.is_handoff_pending = false;
+        }
+    }
+
+    pub(crate) fn disconnect_owner(&self, generation: u64) -> Option<Duration> {
+        let mut owner = self.ownership.lock().unwrap();
+        if owner.generation != generation || owner.released {
+            return None;
+        }
+        owner.connected = false;
+        Some(if owner.is_handoff_pending {
+            SHELL_HANDOFF_RECOVERY_TIMEOUT
+        } else {
+            Duration::ZERO
+        })
+    }
+
+    pub(crate) fn release_disconnected_owner(&self, generation: u64) -> bool {
+        let mut owner = self.ownership.lock().unwrap();
+        if owner.generation != generation || owner.released || owner.connected {
+            return false;
+        }
+        owner.released = true;
+        self.stop(CANCELLED_REASON);
+        true
     }
 
     /// Asks the task to stop for `reason`; a task that ended, or was asked already, keeps its

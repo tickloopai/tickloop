@@ -24,6 +24,14 @@ async fn serve_incompatible_daemon(
         );
         write(&mut business, &json!({"Hello":{"major":tickloop_agent_protocol::PROTOCOL_MAJOR-1,"minor":0,"daemon_epoch":epoch,"session_id":uuid::Uuid::new_v4(),"capabilities":[]}})).await.unwrap();
         assert!(read::<_, Value>(&mut business).await.unwrap().is_none());
+        let (mut identity_probe, _) = listener.accept().await.unwrap();
+        assert!(
+            read::<_, Value>(&mut identity_probe)
+                .await
+                .unwrap()
+                .is_none(),
+            "the peer identity probe must not dispatch a request"
+        );
         let (mut management, _) = listener.accept().await.unwrap();
         assert_eq!(
             read::<_, Value>(&mut management).await.unwrap().unwrap(),

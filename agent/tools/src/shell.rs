@@ -361,7 +361,7 @@ pub struct UserCommandSnapshot {
     pub updated_at_ms: Option<u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 enum ProcessSnapshot {
     Agent(CommandSnapshot),
     User(UserCommandSnapshot),
@@ -560,7 +560,7 @@ impl ProcessSnapshot {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Update {
     snapshot: ProcessSnapshot,
     result: Option<ToolResult>,
@@ -571,6 +571,15 @@ struct Entry {
     /// Set when the model stopped the command with `TaskStop`; like Claude Code's `stopTask`, its
     /// end then needs no task notification.
     is_stopped_by_model: bool,
+    handoff: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShellCheckpoint {
+    operation: Uuid,
+    update: Update,
+    is_stopped_by_model: bool,
+    handoff: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -584,6 +593,80 @@ pub(super) struct Registry {
 }
 
 impl Registry {
+    pub(super) async fn checkpoint(&self) -> Result<Value, ToolError> {
+        let entries = self.entries.lock().await;
+        let mut checkpoints = entries
+            .iter()
+            .map(|(operation, entry)| {
+                let update = entry.updates.borrow().clone();
+                if matches!(
+                    update.snapshot.state(),
+                    CommandState::Running | CommandState::Cancelling
+                ) || (update.snapshot.state() == &CommandState::Background
+                    && entry.handoff.is_none())
+                {
+                    return Err(ToolError::Rejected(
+                        "Shell command has not reached a transferable state".into(),
+                    ));
+                }
+                Ok(ShellCheckpoint {
+                    operation: *operation,
+                    update,
+                    is_stopped_by_model: entry.is_stopped_by_model,
+                    handoff: entry.handoff.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ToolError>>()?;
+        drop(entries);
+        for checkpoint in &mut checkpoints {
+            if checkpoint.update.snapshot.state() != &CommandState::Background {
+                checkpoint.handoff = self.host.retained_handoff(checkpoint.operation).await?;
+            }
+        }
+        serde_json::to_value(checkpoints)
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))
+    }
+
+    pub(super) async fn restore(&self, checkpoint: Value) -> Result<(), ToolError> {
+        let checkpoints: Vec<ShellCheckpoint> = serde_json::from_value(checkpoint)
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        if !self.entries.lock().await.is_empty() {
+            return Err(ToolError::Rejected(
+                "Shell restore requires an empty registry".into(),
+            ));
+        }
+        for checkpoint in checkpoints {
+            let is_running = checkpoint.update.snapshot.state() == &CommandState::Background;
+            let process = if is_running || checkpoint.handoff.is_some() {
+                Some(
+                    self.host
+                        .adopt(checkpoint.handoff.clone().ok_or_else(|| {
+                            ToolError::InvalidInput(
+                                "running Shell checkpoint has no owner handoff".into(),
+                            )
+                        })?)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let cancel = CancellationToken::new();
+            self.entries.lock().await.insert(
+                checkpoint.operation,
+                Entry {
+                    updates: watch::channel(checkpoint.update).0,
+                    cancel: cancel.clone(),
+                    is_stopped_by_model: checkpoint.is_stopped_by_model,
+                    handoff: checkpoint.handoff,
+                },
+            );
+            if let Some(process) = process {
+                self.follow(checkpoint.operation, process, cancel, Duration::ZERO, false)
+                    .await;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn new(host: Arc<dyn ShellHost>) -> Self {
         Self::with_shell(interpreter::selected_shell(), host)
     }
@@ -1036,6 +1119,7 @@ impl Registry {
                 updates,
                 cancel: command_cancel.clone(),
                 is_stopped_by_model: false,
+                handoff: None,
             },
         );
         let started = self
@@ -1129,10 +1213,11 @@ impl Registry {
         moves_to_background_on_timeout: bool,
     ) -> ProcessSnapshot {
         let snapshot = {
-            let entries = self.entries.lock().await;
+            let mut entries = self.entries.lock().await;
             let entry = entries
-                .get(&operation_id)
+                .get_mut(&operation_id)
                 .expect("a starting command stays listed");
+            entry.handoff = process.handoff();
             let mut update = entry.updates.borrow().clone();
             update.snapshot.set_pid(process.pid());
             entry.updates.send_replace(update.clone());

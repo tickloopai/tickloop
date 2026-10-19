@@ -725,6 +725,7 @@ impl Agent {
         let mut events = self.subscribe();
         loop {
             {
+                let _upgrade = self.inner.upgrade_gate.read().await;
                 let mut chats = self.inner.chats.lock().await;
                 let (root_id, loop_id) = scope(&chats, receipt)?;
                 let chat = chats.get(&receipt.chat_id).ok_or("Agent is unavailable")?;

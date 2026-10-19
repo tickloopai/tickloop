@@ -2,6 +2,8 @@
 
 #[path = "all/cli.rs"]
 mod cli;
+#[path = "all/content_identity.rs"]
+mod content_identity;
 #[path = "all/hosted_launch.rs"]
 mod hosted_launch;
 #[path = "all/protocol.rs"]

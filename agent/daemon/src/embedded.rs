@@ -9,7 +9,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -63,6 +64,19 @@ struct Inner {
     changes: broadcast::Sender<ObservationUpdate>,
     publishing: Mutex<()>,
     cancel: CancellationToken,
+    admission: Arc<RwLock<()>>,
+    upgrade_paused: AtomicBool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct EmbeddedCheckpoint {
+    pub(crate) runtime: tickloop_agent_runtime::upgrade::AgentUpgradeCheckpoint,
+    executions: Vec<(ExecutionRef, Uuid)>,
+    launches: Vec<(ExecutionRef, LaunchSpec)>,
+    receipts: super::receipts::ReceiptCheckpoint,
+    queue: Vec<(Uuid, QueuedAction)>,
+    queue_failures: VecDeque<QueuedCommandFailure>,
+    sequence: u64,
 }
 
 /// What the serving process knows about a Chat beyond the Chat's own state.
@@ -118,6 +132,8 @@ impl EmbeddedAgentAccess {
             changes: broadcast::channel(REPLAY_CAPACITY).0,
             publishing: Mutex::new(()),
             cancel: CancellationToken::new(),
+            admission: Arc::new(RwLock::new(())),
+            upgrade_paused: AtomicBool::new(false),
         });
         tokio::spawn(watch_runtime(
             Arc::downgrade(&inner),
@@ -157,6 +173,135 @@ impl EmbeddedAgentAccess {
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
         self.inner.agent.shutdown().await;
+    }
+
+    pub(crate) async fn prepare_upgrade(&self) -> Result<Option<EmbeddedCheckpoint>, AccessError> {
+        let Ok(_admission) = self.inner.admission.try_write() else {
+            return Ok(None);
+        };
+        if self.inner.upgrade_paused.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let Some(runtime) = self
+            .inner
+            .agent
+            .prepare_upgrade()
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        for (chat, root) in runtime.chat_roots() {
+            if self.inner.references.lock().await.contains_key(&chat) {
+                continue;
+            }
+            if let Some(root) = root {
+                let parent = self.inner.references.lock().await.get(&root).copied();
+                if let Some(parent) = parent {
+                    let launch = self.inner.launches.lock().await.get(&parent).cloned();
+                    if let Some(launch) = launch {
+                        self.register(chat, launch).await;
+                    }
+                }
+            }
+        }
+        let receipts = match self.inner.receipts.checkpoint().await {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                self.inner.agent.cancel_upgrade().await;
+                return Err(error);
+            }
+        };
+        self.inner.upgrade_paused.store(true, Ordering::SeqCst);
+        Ok(Some(EmbeddedCheckpoint {
+            runtime,
+            executions: self
+                .inner
+                .executions
+                .lock()
+                .await
+                .iter()
+                .map(|(execution, chat)| (*execution, *chat))
+                .collect(),
+            launches: self
+                .inner
+                .launches
+                .lock()
+                .await
+                .iter()
+                .map(|(execution, launch)| (*execution, launch.clone()))
+                .collect(),
+            receipts,
+            queue: self
+                .inner
+                .queue
+                .lock()
+                .await
+                .iter()
+                .map(|(id, action)| (*id, action.clone()))
+                .collect(),
+            queue_failures: self.inner.queue_failures.lock().await.clone(),
+            sequence: self.inner.sequence.load(Ordering::SeqCst),
+        }))
+    }
+
+    pub(crate) async fn cancel_upgrade(&self) {
+        let _admission = self.inner.admission.write().await;
+        self.inner.agent.cancel_upgrade().await;
+        self.inner.upgrade_paused.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn restore_upgrade(
+        &self,
+        checkpoint: EmbeddedCheckpoint,
+    ) -> Result<(), String> {
+        self.inner.upgrade_paused.store(true, Ordering::SeqCst);
+        self.inner
+            .agent
+            .restore_upgrade(checkpoint.runtime)
+            .await
+            .map_err(|error| error.to_string())?;
+        *self.inner.references.lock().await = checkpoint
+            .executions
+            .iter()
+            .map(|(execution, chat)| (*chat, *execution))
+            .collect();
+        *self.inner.executions.lock().await = checkpoint.executions.into_iter().collect();
+        *self.inner.launches.lock().await = checkpoint.launches.into_iter().collect();
+        self.inner
+            .receipts
+            .restore(checkpoint.receipts)
+            .await
+            .map_err(|error| error.to_string())?;
+        *self.inner.queue.lock().await = checkpoint.queue.into_iter().collect();
+        *self.inner.queue_failures.lock().await = checkpoint.queue_failures;
+        self.inner
+            .sequence
+            .store(checkpoint.sequence, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) async fn activate_upgrade(&self) -> Result<(), String> {
+        self.inner
+            .agent
+            .activate_upgrade()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn release_upgrade(&self) -> Result<(), String> {
+        self.inner
+            .agent
+            .release_upgrade()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.inner.upgrade_paused.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_for_upgrade(&self) {
+        self.inner.cancel.cancel();
+        self.inner.agent.shutdown_for_upgrade().await;
     }
 
     async fn register(&self, chat_id: Uuid, launch: LaunchSpec) -> ExecutionRef {
@@ -897,6 +1042,10 @@ impl EmbeddedAgentAccess {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
             }
+            AgentCommand::UpgradeRuntime { .. } => Err(AccessError::new(
+                AccessErrorCode::Unsupported,
+                "runtime upgrades are coordinated by the daemon",
+            )),
             AgentCommand::ReplaceTickhost => Err(AccessError::invalid(
                 "only the Agent daemon replaces its Tickhost",
             )),
@@ -1600,6 +1749,26 @@ impl AgentAccess for EmbeddedAgentAccess {
                 after,
             } => self.observe_agent(execution, detail, after).await,
             // Only the Agent daemon controls a Tickhost whose build can differ from its own.
+            ObservationRequest::RuntimeVersion => Ok(Observation::single(
+                ObservationValue::RuntimeVersion(Box::new(
+                    tickloop_agent_protocol::RuntimeVersion {
+                        executable: std::env::current_exe().unwrap_or_default(),
+                        build_id: tickloop_agent_protocol::build_identity()
+                            .unwrap_or_default()
+                            .into(),
+                        requested_executable: None,
+                        upgrading: false,
+                        error: None,
+                        workers: Vec::new(),
+                    },
+                )),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: self.inner.sequence.load(Ordering::SeqCst),
+                },
+                None,
+            )),
             ObservationRequest::OtherTickhost => Ok(Observation::single(
                 ObservationValue::OtherTickhost(None),
                 Cursor {
@@ -1825,6 +1994,10 @@ impl AgentAccess for EmbeddedAgentAccess {
     }
 
     async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let _admission = self.inner.admission.read().await;
+        if self.inner.upgrade_paused.load(Ordering::SeqCst) {
+            return Err(AccessError::unavailable("Worker is transferring execution"));
+        }
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
@@ -1883,6 +2056,10 @@ async fn watch_runtime(
             break;
         };
         let access = EmbeddedAgentAccess { inner };
+        let _admission = access.inner.admission.read().await;
+        if access.inner.upgrade_paused.load(Ordering::SeqCst) {
+            continue;
+        }
         let mut execution = access.inner.references.lock().await.get(&chat).copied();
         if execution.is_none()
             && let Ok(snapshot) = access.inner.agent.snapshot(chat).await
@@ -1947,6 +2124,10 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
         let access = EmbeddedAgentAccess { inner };
         let executions = access.inner.executions.lock().await.clone();
         for (execution, chat) in executions {
+            let admission = access.inner.admission.clone().read_owned().await;
+            if access.inner.upgrade_paused.load(Ordering::SeqCst) {
+                continue;
+            }
             let Ok(Some(command)) = access.inner.agent.take_next_queued_command(chat).await else {
                 continue;
             };
@@ -1954,6 +2135,7 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
             if let Some((_, target_loop, action)) = queued {
                 let access = access.clone();
                 tokio::spawn(async move {
+                    let _admission = admission;
                     let label = action_label(&action);
                     let result = match action {
                         AfterTurnAction::Submit { input, origin } => {

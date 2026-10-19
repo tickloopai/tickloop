@@ -26,7 +26,7 @@ fn update_notice_shares_the_hint_row_right_edge_without_adding_rows() {
         );
         let notice = lines
             .iter()
-            .find(|line| line.text().contains("Update"))
+            .find(|line| line.text().contains("Update") || line.text().contains("Installed"))
             .unwrap_or_else(|| panic!("{width}: {lines:?}"));
         assert_eq!(display_width(&notice.text()), state.width);
         assert!(
@@ -38,7 +38,9 @@ fn update_notice_shares_the_hint_row_right_edge_without_adding_rows() {
         if width == 120 {
             assert!(notice.text().starts_with("← Agents"), "{notice:?}");
             assert!(
-                notice.text().ends_with("Updated to 1.2.3 · next launch"),
+                notice
+                    .text()
+                    .ends_with("Installed 1.2.3 · switching automatically"),
                 "{notice:?}"
             );
         }
@@ -73,7 +75,7 @@ fn connection_errors_background_permissions_and_input_feedback_take_priority() {
             .map(RoleLine::text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!text.contains("Updated to"), "{priority}: {text}");
+        assert!(!text.contains("Installed"), "{priority}: {text}");
         let expected = match priority {
             "connection" => "Disconnected",
             "background" => "waiting for approval",
@@ -109,7 +111,7 @@ fn updates_remain_on_the_overview_hint_row_and_do_not_steal_input_focus() {
     assert!(
         lines
             .iter()
-            .any(|line| line.text().contains("Updated to 1.2.3")),
+            .any(|line| line.text().contains("Installed 1.2.3")),
         "{lines:?}"
     );
     assert!(lines.iter().all(|line| display_width(&line.text()) <= 120));
@@ -122,6 +124,13 @@ fn checking_installing_failure_and_a_cleared_notice_keep_the_same_layout() {
     for (notice, expected) in [
         (Some(UpdateNotice::Checking), "Checking for updates"),
         (Some(UpdateNotice::Installing), "Updating Tickloop"),
+        (Some(UpdateNotice::Activating), "Applying update"),
+        (
+            Some(UpdateNotice::Deferred {
+                reason: "waiting for the current turn".into(),
+            }),
+            "Update pending",
+        ),
         (
             Some(UpdateNotice::Failed),
             "Update failed · tickloop update",

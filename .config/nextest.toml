@@ -22,8 +22,9 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = """
 test(/(^|[_:])pty($|[_:])/)
 | (kind(lib) & test(/^terminal::(recovery_tests|daemon_loss_tests|child_config_tests|late_receipt_tests|mode_cycle_tests)::/))
+| (kind(lib) & test(/^terminal::console::upgrade::/))
 | (kind(test)
-    & test(/^(agent_startup_errors|codex_terminal|monitor_attach|monitor_popup|native_visible_stdio|provider_picker)::/))
+    & test(/^(agent_startup_errors|codex_terminal|monitor_attach|monitor_popup|native_visible_stdio|provider_picker|graceful_upgrade|upgrade_races)::/))
 """
 test-group = "pty"
 slow-timeout = { period = "60s", terminate-after = 3 }

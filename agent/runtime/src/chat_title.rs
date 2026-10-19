@@ -51,6 +51,7 @@ impl Agent {
         drop(pending);
         let agent = self.clone();
         let task = tokio::spawn(async move {
+            let _upgrade = agent.inner.upgrade_gate.read().await;
             let request = ModelRequest {
                 history_sources: Vec::new(),
                 messages: vec![
@@ -71,7 +72,7 @@ impl Agent {
                 reasoning_effort: None,
             };
             let cancel = agent.inner.shutdown.child_token();
-            let output = agent
+            let response = agent
                 .tracked_model_request(
                     super::model_request::RequestContext::title(chat_id),
                     client,
@@ -79,9 +80,19 @@ impl Agent {
                     cancel.clone(),
                     None,
                 )
-                .await
-                .ok()
-                .map(|response| response.output);
+                .await;
+            let output = match response {
+                Ok(response) => agent
+                    .finish_model_request(
+                        chat_id,
+                        response.sequence,
+                        tickloop_agent_protocol::RequestOutcome::Accepted,
+                    )
+                    .await
+                    .ok()
+                    .map(|_| response.output),
+                Err(_) => None,
+            };
             cancel.cancel();
             if let Some(text) = output.as_ref().and_then(side_request_text) {
                 let title = short_chat_title(text.trim().trim_matches('"'));

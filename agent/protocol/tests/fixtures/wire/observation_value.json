@@ -1064,5 +1064,14 @@
   },
   {
     "OtherTickhost": null
+  },
+  {
+    "RuntimeVersion": {
+      "executable": "/opt/tickloop/versions/0.2.9/tickloop",
+      "build_id": "0.2.9+0000000000000000",
+      "requested_executable": "/opt/tickloop/versions/0.2.10/tickloop",
+      "upgrading": true,
+      "error": null
+    }
   }
 ]

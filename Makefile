@@ -13,7 +13,10 @@ TICK_PACKAGES ?= $(notdir $(patsubst %/tick-package.json,%,$(wildcard ticks/*/ti
 
 .PHONY: dev build install package site test check release release-site release-artifacts prototype-earnings-review package-ticks dev-ticks release-ticks
 
-## Start in the current directory with the global configuration; Tick packages are installed separately with make dev-ticks; example: make dev ARGS="-c"
+## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
+# Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
+# TICKLOOP_TICKHOST_RUNTIME_DIR independently overrides Tickhost. Explicit overrides may share services.
+# An explicit CARGO_TARGET_DIR gets a worktree+branch subdirectory to keep build artifacts isolated.
 dev:
 	"$(DEV_LAUNCHER)" $(ARGS)
 
@@ -56,6 +59,7 @@ release-ticks:
 
 test:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
+	node --test scripts/dev-agent.test.mjs
 	@mkdir -p /tmp/tickloop-test
 	TICKLOOP_CONFIG_DIR=$$(mktemp -d /tmp/tickloop-test/config.XXXXXX) \
 	TICKLOOP_TMPDIR=$$(mktemp -d /tmp/tickloop-test/tmp.XXXXXX) \

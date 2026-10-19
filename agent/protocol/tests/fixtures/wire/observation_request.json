@@ -163,5 +163,8 @@
   },
   {
     "kind": "other_tickhost"
+  },
+  {
+    "kind": "runtime_version"
   }
 ]

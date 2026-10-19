@@ -9,9 +9,22 @@ pub(super) fn line(notice: &UpdateNotice, width: usize) -> RoleLine {
         UpdateNotice::Checking => ("Checking for updates…".into(), "Checking…", Role::MutedText),
         UpdateNotice::Installing => ("Updating Tickloop…".into(), "Updating…", Role::MutedText),
         UpdateNotice::Ready { version } => (
-            format!("Updated to {} · next launch", display_single_line(version)),
+            format!(
+                "Installed {} · switching automatically",
+                display_single_line(version)
+            ),
             "Update ready",
             Role::Success,
+        ),
+        UpdateNotice::Activating => (
+            "Applying update when ready…".into(),
+            "Applying update…",
+            Role::MutedText,
+        ),
+        UpdateNotice::Deferred { reason } => (
+            format!("Update pending · {}", display_single_line(reason)),
+            "Update pending",
+            Role::MutedText,
         ),
         UpdateNotice::Failed => (
             "Update failed · tickloop update".into(),

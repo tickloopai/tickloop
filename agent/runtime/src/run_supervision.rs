@@ -11,6 +11,13 @@ const INTERNAL_RUN_ERROR: &str = "Agent internal error: execution panicked. The 
 const INTERNAL_COMPLETION_ERROR: &str = "Agent internal error while finishing the run. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
 
 pub(super) fn clear_run_state(chat: &mut Chat, run: RunId) {
+    if chat
+        .upgrade_wait
+        .as_ref()
+        .is_some_and(|receipt| receipt.run_id == run)
+    {
+        chat.upgrade_wait = None;
+    }
     chat.snapshot.pending_thinking.remove(&run);
     if chat.active_run == Some(run) {
         chat.active = None;

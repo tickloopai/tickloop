@@ -4,10 +4,11 @@
 //! `tickhost` it is the Tickhost. Otherwise the arguments pick the process: `--cli` runs the
 //! product CLI, a whole product process entry runs as the product starts it, and anything else is
 //! a libtest probe of a target without tests.
+#[path = "../all/graceful_upgrade.rs"]
+mod graceful_upgrade;
 #[path = "mod.rs"]
 mod support;
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -16,28 +17,36 @@ use std::{
 };
 use support::fixture_cli::{BUILD_IDENTITY_MODE, CLI_MODE, build_identity};
 use tickloop_agent_client::DAEMON_RUN_ARGUMENTS;
-use tickloop_agent_daemon::{EmbeddedAgentAccess, WORKER_ARGUMENT, serve_worker_listener};
+use tickloop_agent_daemon::WORKER_ARGUMENT;
 use tickloop_agent_model::model_client;
-use tickloop_agent_protocol::{ATTACH_ARGUMENTS, LaunchSpec, ModelConfig};
+use tickloop_agent_protocol::{ATTACH_ARGUMENTS, ModelConfig};
 use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use uuid::Uuid;
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";
 
-#[derive(Deserialize)]
-struct Bootstrap {
-    epoch: Uuid,
-    launch: LaunchSpec,
-    control: tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant,
-    limits: tickloop_agent_protocol::AccessLimits,
-}
-
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().and_then(|argument| argument.to_str()) == Some("--content-identity") {
+        println!("{}", tickhost::host::BUILD_IDENTITY);
+        return ExitCode::SUCCESS;
+    }
     if arguments.first().and_then(|argument| argument.to_str()) == Some(BUILD_IDENTITY_MODE) {
         println!("{}", build_identity());
+        return ExitCode::SUCCESS;
+    }
+    if arguments.first().and_then(|argument| argument.to_str()) == Some("--runtime-info") {
+        println!(
+            "{}",
+            serde_json::to_string(&tickloop_agent_protocol::RuntimeBinaryInfo {
+                product_version: env!("CARGO_PKG_VERSION").into(),
+                build_id: env!("TICKLOOP_BUILD_IDENTITY").into(),
+                protocol_major: tickloop_agent_protocol::PROTOCOL_MAJOR,
+                protocol_minor: tickloop_agent_protocol::PROTOCOL_MINOR,
+                handoff_version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+            })
+            .unwrap()
+        );
         return ExitCode::SUCCESS;
     }
     let invoked_as_tickhost = std::env::current_exe()
@@ -47,6 +56,13 @@ fn main() -> ExitCode {
     }
     let result = match arguments.first().and_then(|argument| argument.to_str()) {
         Some(CLI_MODE) => run_cli(arguments[1..].to_vec()),
+        Some("probe-upgrade") if arguments.len() == 3 => {
+            runtime().block_on(graceful_upgrade::run_probe(
+                Path::new(&arguments[1]),
+                Path::new(&arguments[2]),
+            ));
+            Ok(())
+        }
         _ if is_worker_entry(&arguments) && std::env::var_os(TRANSPORT_FILE).is_some() => {
             runtime().block_on(worker(&arguments))
         }
@@ -148,52 +164,23 @@ fn use_transport_fixture(path: &OsString) {
 }
 
 async fn worker(arguments: &[OsString]) -> Result<(), String> {
-    let endpoint = PathBuf::from(&arguments[1]);
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut bytes = Vec::new();
-    (&mut stdin)
-        .take(tickloop_agent_daemon::WORKER_BOOTSTRAP_MAX_BYTES as u64 + 1)
-        .read_until(b'\n', &mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let fixture = std::fs::read(std::env::var_os(TRANSPORT_FILE).unwrap())
         .map_err(|error| error.to_string())?;
-    let config: ModelConfig =
+    let transport: ModelConfig =
         serde_json::from_slice(&fixture).map_err(|error| error.to_string())?;
-    let inner = model_client(config.clone(), bootstrap.launch.config_root.as_deref())
-        .map_err(|error| error.to_string())?;
-    let client: Arc<dyn tickloop_agent_model::ModelClient> =
-        Arc::new(TransportClient { inner, config });
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let agent = tickloop_agent_daemon::build_runtime_with_client(
-        &bootstrap.launch,
-        client.clone(),
-        Some(bootstrap.control),
-        &executable,
-    )
-    .await?;
-    let access = Arc::new(EmbeddedAgentAccess::for_worker_with_model_clients(
-        agent.clone(),
-        bootstrap.epoch,
-        // A switch still fails where the Provider client would, but keeps the fixture transport.
-        Arc::new(move |config, root| {
-            model_client(config, root)?;
-            Ok(client.clone())
+    tickloop_agent::name_this_build();
+    tickloop_agent_daemon::run_worker_with_model_clients(
+        &arguments[1..],
+        Arc::new(move |selection, root| {
+            model_client(selection, root)?;
+            let inner = model_client(transport.clone(), root)?;
+            Ok(Arc::new(TransportClient {
+                inner,
+                config: transport.clone(),
+            }))
         }),
-    ));
-    let listener = tokio::net::UnixListener::bind(&endpoint).map_err(|error| error.to_string())?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    let mut probe = [0u8; 1];
-    let result = tokio::select! {
-        result = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits) => result.map_err(|error| error.to_string()),
-        result = stdin.read(&mut probe) => result.map(|_| ()).map_err(|error| error.to_string()),
-    };
-    agent.shutdown().await;
-    let _ = std::fs::remove_file(endpoint);
-    result
+    )
+    .await
 }
 
 struct TransportClient {

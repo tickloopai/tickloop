@@ -52,10 +52,11 @@ use crate::{
 /// 25.0 selects historical feedback when adding an independent Artifact feedback receiver.
 /// 25.1 adds cancellable search connection checks in the selected Agent credential scope.
 /// 26.0 uses the service model ID as the sole ModelCard ID on the wire.
+/// 26.1 adds opt-in planned runtime upgrades and runtime version observations.
 /// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 26;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -387,6 +388,9 @@ pub enum AgentCommand {
         workdir: PathBuf,
     },
     FlushTranscripts,
+    UpgradeRuntime {
+        executable: PathBuf,
+    },
     /// Stops the running Tickhost of another build than the daemon's, ending what it runs; the
     /// next open or Shell starts one of the daemon's build.
     ReplaceTickhost,
@@ -682,6 +686,7 @@ pub enum ObservationRequest {
     /// The running Tickhost when it is another build than the daemon's and replacing it would end
     /// something; the daemon replaces one that runs nothing at once.
     OtherTickhost,
+    RuntimeVersion,
 }
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user
@@ -982,6 +987,7 @@ pub enum ObservationValue {
     Transcript(Box<RecordedTranscript>),
     Receipt(Option<Box<CommandReceipt>>),
     OtherTickhost(Option<OtherTickhost>),
+    RuntimeVersion(Box<crate::RuntimeVersion>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1138,6 +1144,7 @@ pub enum AccessErrorCode {
     Responding,
     VersionConflict,
     Unavailable,
+    HandoffNotAccepted,
     PayloadTooLarge,
     AccessDenied,
     VersionMismatch,
@@ -1294,6 +1301,56 @@ pub struct ServerHello {
     /// The executable the daemon runs, which can open a View of the same build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_protocol: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<ServerHandoffHello>,
+}
+
+pub const CLIENT_HANDOFF_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientHandoffHello {
+    pub version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<SessionResume>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionResume {
+    pub daemon_epoch: Uuid,
+    pub session_id: Uuid,
+    pub token: String,
+    pub transfer_id: Uuid,
+}
+
+impl std::fmt::Debug for SessionResume {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionResume")
+            .field("daemon_epoch", &self.daemon_epoch)
+            .field("session_id", &self.session_id)
+            .field("transfer_id", &self.transfer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerHandoffHello {
+    pub version: u16,
+    pub resume_token: String,
+}
+
+impl std::fmt::Debug for ServerHandoffHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerHandoffHello")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1306,6 +1363,11 @@ pub enum ClientMessage {
     Hello {
         major: u16,
         minor: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<ClientHandoffHello>,
+    },
+    HandoffReady {
+        transfer_id: Uuid,
     },
     Observe {
         request_id: Uuid,
@@ -1332,6 +1394,21 @@ pub enum ChunkedResponseKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
+    HandoffPrepare {
+        transfer_id: Uuid,
+    },
+    HandoffAbort {
+        transfer_id: Uuid,
+    },
+    HandoffCommit {
+        transfer_id: Uuid,
+        successor_process_id: u32,
+    },
+    /// The request never entered the command receipt store and was never dispatched.
+    NotAccepted {
+        request_id: Uuid,
+        transfer_id: Uuid,
+    },
     ResponseStart {
         request_id: Uuid,
         transfer_id: Uuid,

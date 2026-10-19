@@ -98,6 +98,9 @@ impl RecoveringAgentClient {
     pub fn is_connected(&self) -> bool {
         self.inner.client.read().unwrap().is_connected()
     }
+    pub fn is_handing_off(&self) -> bool {
+        self.inner.client.read().unwrap().is_handing_off()
+    }
     fn client(&self) -> LocalAgentClient {
         self.inner.client.read().unwrap().clone()
     }

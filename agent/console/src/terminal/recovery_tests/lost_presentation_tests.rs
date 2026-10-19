@@ -232,6 +232,7 @@ fn lost_presentation_pty_fixture() {
                     &console,
                     input,
                     StartupState {
+                        launch_arguments: Vec::new(),
                         chat: StartupChat::Resumed(Box::new(snapshot), true),
                                         user_settings: None,
                     },

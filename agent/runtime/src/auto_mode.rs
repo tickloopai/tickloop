@@ -281,7 +281,7 @@ pub(super) const HEADLESS_CONTEXT_LIMIT_ERROR: &str =
 
 /// Classifier denials for one Chat in this process, as Claude Code keeps them
 /// for its session.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DenialTracking {
     consecutive: usize,
     total: usize,

@@ -21,7 +21,7 @@ const SYNCHRONIZED_UPDATE_END: &str = "\x1b[?2026l";
 /// Drawing surface the console paints on. `Fullscreen` takes the terminal's
 /// alternate screen buffer; `Inline` paints in the main buffer alongside the
 /// output of other commands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum Renderer {
     Inline,
     Fullscreen,

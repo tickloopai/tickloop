@@ -16,6 +16,105 @@ use tickloop_agent_test_support::TRANSPORT_LIMITS;
 
 const FRAME_BYTES: usize = TRANSPORT_LIMITS.frame_bytes();
 
+struct UnknownCreation {
+    epoch: Uuid,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_protocol::AgentAccess for UnknownCreation {
+    async fn observe(
+        &self,
+        query: tickloop_agent_protocol::ObservationRequest,
+    ) -> Result<tickloop_agent_protocol::Observation, tickloop_agent_protocol::AccessError> {
+        assert!(matches!(
+            query,
+            tickloop_agent_protocol::ObservationRequest::Receipt { .. }
+        ));
+        Ok(tickloop_agent_protocol::Observation::single(
+            tickloop_agent_protocol::ObservationValue::Receipt(None),
+            tickloop_agent_protocol::Cursor {
+                daemon_epoch: self.epoch,
+                execution: None,
+                sequence: 0,
+            },
+            None,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _: tickloop_agent_protocol::CommandEnvelope,
+    ) -> Result<tickloop_agent_protocol::CommandReceipt, tickloop_agent_protocol::AccessError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(tickloop_agent_protocol::AccessError::new(
+            tickloop_agent_protocol::AccessErrorCode::OutcomeUnknown,
+            "creation reply was lost",
+        ))
+    }
+
+    async fn show_view(
+        &self,
+        _: tickloop_agent_protocol::DisplayUpdate,
+    ) -> Result<tickloop_agent_protocol::DisplayReceipt, tickloop_agent_protocol::AccessError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn view_upgrade_keeps_dispatch_directory_and_defers_an_unknown_creation() {
+    use super::Intent;
+    use tickloop_agent_protocol::{AgentFilter, LaunchSpec, UserInput};
+    let epoch = Uuid::new_v4();
+    let access = Arc::new(UnknownCreation {
+        epoch,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut console = AgentConsole::new(access.clone(), epoch, "/original".into(), None);
+    console
+        .interpret(Intent::DispatchDirectory("/chosen/project".into()))
+        .unwrap();
+    console
+        .interpret(Intent::Filter(AgentFilter {
+            workdir: Some("/chosen/project".into()),
+            workspace: Some("work".into()),
+        }))
+        .unwrap();
+    let saved = console.prepare_upgrade_navigation().unwrap();
+    let mut restored = AgentConsole::new(access.clone(), epoch, "/original".into(), None);
+    restored.restore_upgrade_navigation(
+        serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap(),
+    );
+    assert_eq!(
+        restored.projection().dispatch_directory,
+        std::path::PathBuf::from("/chosen/project")
+    );
+    assert_eq!(
+        restored
+            .prepare_upgrade_navigation()
+            .unwrap()
+            .filter
+            .workspace
+            .as_deref(),
+        Some("work")
+    );
+    let input = || UserInput::Text {
+        text: "do this once".into(),
+        contexts: Vec::new(),
+        paths: Vec::new(),
+    };
+    let launch = LaunchSpec::embedded("/original".into());
+    assert!(
+        restored
+            .dispatch(launch.clone(), input(), None)
+            .await
+            .is_err()
+    );
+    assert!(restored.prepare_upgrade_navigation().is_none());
+    assert!(restored.dispatch(launch, input(), None).await.is_err());
+    assert_eq!(access.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_json::Value) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let _: Option<serde_json::Value> = read_frame(&mut stream, HANDSHAKE_FRAME_BYTES)
@@ -33,6 +132,8 @@ async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_js
             limits: TRANSPORT_LIMITS.into(),
             build: None,
             executable: None,
+            upgrade_protocol: None,
+            handoff: None,
         }),
         HANDSHAKE_FRAME_BYTES,
     )

@@ -112,7 +112,11 @@ async fn older_business_peers_are_fenced_before_a_query_can_dispatch() {
         ));
         write_frame(
             &mut client,
-            &ClientMessage::Hello { major, minor },
+            &ClientMessage::Hello {
+                major,
+                minor,
+                handoff: None,
+            },
             HANDSHAKE_FRAME_BYTES,
         )
         .await
@@ -172,6 +176,8 @@ async fn a_hello_announcing_unusable_limits_is_an_incompatible_peer() {
                 limits,
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -368,6 +374,7 @@ async fn completing_a_cancelled_lookup_returns_exactly_one_terminal_reply() {
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -525,6 +532,8 @@ async fn cancelling_a_backpressured_lookup_keeps_the_live_request_frame_whole() 
                 limits: AccessLimits::DEFAULT.into(),
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -650,6 +659,8 @@ async fn dropped_opened_feed_cannot_keep_a_backpressured_client_alive() {
                     limits: AccessLimits::DEFAULT.into(),
                     build: None,
                     executable: None,
+                    upgrade_protocol: None,
+                    handoff: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -764,6 +775,8 @@ async fn backpressured_observation_write_stops_on_eof_or_last_client_drop() {
                     limits: AccessLimits::DEFAULT.into(),
                     build: None,
                     executable: None,
+                    upgrade_protocol: None,
+                    handoff: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -864,6 +877,7 @@ async fn canceling_an_observation_mid_frame_never_corrupts_the_shared_connection
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -1119,6 +1133,7 @@ async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_
         &ClientMessage::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
+            handoff: None,
         },
         HANDSHAKE_FRAME_BYTES,
     )
@@ -1213,6 +1228,8 @@ async fn a_reply_written_before_the_daemon_closed_survives_a_failed_write() {
                 limits: TRANSPORT_LIMITS.into(),
                 build: None,
                 executable: None,
+                upgrade_protocol: None,
+                handoff: None,
             }),
         );
         let ClientMessage::ShutdownDaemon { request_id, .. } = read(&mut stream) else {

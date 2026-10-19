@@ -505,6 +505,7 @@ impl Agent {
         cancel: CancellationToken,
         mut tracking: RetryTracking<'_>,
     ) -> Result<PendingModelResponse, AgentError> {
+        let _upgrade = self.inner.upgrade_gate.read().await;
         let mut retries = 0;
         let max_attempts = if context.kind == ModelRequestKind::PermissionCheck {
             MAX_PERMISSION_CHECK_RETRIES + 1

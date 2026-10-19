@@ -2162,6 +2162,28 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    pub(super) async fn adopt_upgrade_transcript(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) -> Result<(), AgentError> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        let (path, loaded) = self.load_saved_transcript(snapshot.id).await?;
+        let (restored, _) = restore_chain(&loaded.chain);
+        let checkpoints = restored.plan_checkpoints();
+        recorder.adopt(
+            snapshot.id,
+            path,
+            restored.links,
+            restored.meta_messages,
+            loaded,
+        );
+        recorder.adopt_restored_loops(snapshot, bookkeeping, &checkpoints);
+        Ok(())
+    }
+
     pub(super) async fn checkpoint_transcript(
         &self,
         snapshot: &ChatSnapshot,
@@ -2793,6 +2815,7 @@ impl Agent {
                 needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
+                upgrade_wait: None,
                 parked: HashMap::new(),
                 ready_runs: VecDeque::new(),
                 client,

@@ -84,7 +84,7 @@ pub(crate) struct FileHistory {
     pending_snapshots: Vec<PendingSnapshot>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingSnapshot {
     message_id: Uuid,
     tracked_files: Vec<String>,
@@ -122,6 +122,33 @@ struct ComputedFile {
 }
 
 impl FileHistory {
+    pub(super) fn upgrade_checkpoint(&self) -> serde_json::Value {
+        serde_json::json!({
+            "snapshots": self.snapshots,
+            "tracked_files": self.tracked_files,
+            "pending_snapshots": self.pending_snapshots,
+        })
+    }
+
+    pub(super) fn from_upgrade(
+        directory: PrivateDirectory,
+        value: serde_json::Value,
+    ) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        struct Checkpoint {
+            snapshots: Vec<FileHistorySnapshot>,
+            tracked_files: BTreeSet<String>,
+            pending_snapshots: Vec<PendingSnapshot>,
+        }
+        let checkpoint: Checkpoint =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        Ok(Self {
+            directory,
+            snapshots: checkpoint.snapshots,
+            tracked_files: checkpoint.tracked_files,
+            pending_snapshots: checkpoint.pending_snapshots,
+        })
+    }
     pub(crate) fn new(directory: PrivateDirectory) -> Self {
         Self::restore(directory, Vec::new())
     }

@@ -401,6 +401,10 @@
     "kind": "replace_tickhost"
   },
   {
+    "kind": "upgrade_runtime",
+    "executable": "/opt/tickloop/versions/0.2.10/tickloop"
+  },
+  {
     "kind": "edit_history",
     "execution": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",

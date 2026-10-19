@@ -177,6 +177,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         &console,
         input,
         crate::terminal::StartupState {
+            launch_arguments: Vec::new(),
             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
             user_settings: Some(tickloop_agent_config::UserSettings::in_root(&directory)),
         },
@@ -344,7 +345,7 @@ impl PlanFlow {
         loop {
             let frame = self.fixture.frame();
             let state = self.state();
-            if ready(&frame, &state) {
+            if state.is_object() && ready(&frame, &state) {
                 return (frame, state);
             }
             assert!(

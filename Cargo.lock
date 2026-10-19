@@ -4743,6 +4743,7 @@ dependencies = [
  "image",
  "libc",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -4756,6 +4757,7 @@ dependencies = [
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-agent-updater",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
@@ -4931,6 +4933,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tickloop-agent-base",
+ "tickloop-tickhost-connect",
  "tokio",
 ]
 
@@ -5100,6 +5103,7 @@ dependencies = [
  "tickloop-tick-command",
  "tickloop-tick-market",
  "tickloop-tick-provider",
+ "tickloop-tickhost-connect",
 ]
 
 [[package]]
@@ -5148,6 +5152,7 @@ dependencies = [
  "tickloop-tickhost-connect",
  "tokio",
  "tokio-util",
+ "toml",
  "unicode-width",
  "uuid",
  "vt100",

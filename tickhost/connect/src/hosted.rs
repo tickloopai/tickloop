@@ -23,7 +23,7 @@ use tokio::{
 use crate::host_error::HostError;
 use tick_protocol::InstanceRef;
 
-/// The build version every Tickhost peer reports; a client refuses a host of another version.
+/// Product version for diagnostics; protocol versions and capabilities determine compatibility.
 pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MANAGEMENT_MAJOR: u16 = 1;
 pub const MANAGEMENT_MINOR: u16 = 0;
@@ -69,14 +69,17 @@ pub const MAX_COLUMNS: u16 = 500;
 pub const LAUNCH_ENV: &str = "TICKLOOP_TICKHOST_LAUNCH";
 
 pub const CAPABILITY_LIFECYCLE: &str = "lifecycle";
+pub const CAPABILITY_IDLE_SHUTDOWN: &str = "idle_shutdown";
 pub const CAPABILITY_DATA: &str = "data";
 pub const CAPABILITY_LAUNCH: &str = "launch";
 pub const CAPABILITY_SHELL: &str = "shell";
-pub const BUSINESS_CAPABILITIES: [&str; 4] = [
+pub const CAPABILITY_SHELL_HANDOFF: &str = "shell_handoff";
+pub const BUSINESS_CAPABILITIES: [&str; 5] = [
     CAPABILITY_LIFECYCLE,
     CAPABILITY_DATA,
     CAPABILITY_LAUNCH,
     CAPABILITY_SHELL,
+    CAPABILITY_SHELL_HANDOFF,
 ];
 /// The descriptors a spawner passes before its request: the approved working directory and the
 /// output file.
@@ -127,6 +130,12 @@ pub enum Role {
     /// The submitter of one Shell task, holding the one-time spawn grant its daemon asked the
     /// host for; the task lives as long as this connection.
     Spawner { grant: uuid::Uuid, token: String },
+    /// A planned successor presenting the current Shell owner's one-use transfer token.
+    ShellSuccessor {
+        instance: InstanceRef,
+        owner_token: String,
+        handoff: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -146,8 +155,8 @@ pub struct HelloReply {
 /// The build a host runs and what it serves, as its management hello reports it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HostDescription {
-    /// The identity of the sources the host was built from, the one the `tickloop` executable of
-    /// the same build computes.
+    /// The content identity of this host and its production dependencies, independent of the
+    /// Agent's implementation and the product release version.
     pub build: String,
     pub executable: Option<PathBuf>,
     pub business_major: u16,
@@ -223,11 +232,50 @@ impl ManagementConnection {
     }
 
     /// Stops the host: it ends every Tick and Shell task, and answers once its endpoint is gone.
-    pub async fn shutdown_host(mut self, timeout: Duration) -> Result<(), HostError> {
-        let request = json!({"id":1,"method":"shutdown_host","params":{
+    pub async fn shutdown_host(self, timeout: Duration) -> Result<(), HostError> {
+        self.shutdown("shutdown_host", None, timeout).await
+    }
+
+    /// Stops only after the host atomically checks it has no work to preserve.
+    pub async fn shutdown_idle_host(
+        self,
+        own_connections: usize,
+        timeout: Duration,
+    ) -> Result<bool, HostError> {
+        if !self
+            .hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_IDLE_SHUTDOWN)
+        {
+            return Ok(false);
+        }
+        match self
+            .shutdown("shutdown_idle_host", Some(own_connections), timeout)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error) if matches!(error.code.as_str(), "HostBusy" | "MethodNotAllowed") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn shutdown(
+        mut self,
+        method: &str,
+        own_connections: Option<usize>,
+        timeout: Duration,
+    ) -> Result<(), HostError> {
+        let mut params = json!({
             "epoch":self.hello.epoch,
             "operation":uuid::Uuid::new_v4(),
-        }});
+        });
+        if let Some(own_connections) = own_connections {
+            params["own_connections"] = json!(own_connections);
+        }
+        let request = json!({"id":1,"method":method,"params":params});
         write_frame(&mut self.writer, &request, MANAGEMENT_FRAME_BYTES).await?;
         let reply = tokio::time::timeout(
             timeout,
@@ -436,15 +484,6 @@ impl HostConnection {
             .map_err(|error| HostError::before(&error.code, error.message))?;
         let reply: HelloReply = serde_json::from_value(reply)
             .map_err(|error| HostError::before("IncompatibleHost", error.to_string()))?;
-        if reply.version != BUILD_VERSION {
-            return Err(HostError::before(
-                "IncompatibleHost",
-                format!(
-                    "the running Tickhost is version {}, not {BUILD_VERSION}; end it with `tickhost stop`",
-                    reply.version
-                ),
-            ));
-        }
         if reply.major != BUSINESS_MAJOR {
             return Err(HostError::before(
                 "IncompatibleHost",

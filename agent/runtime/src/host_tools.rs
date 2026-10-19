@@ -392,9 +392,28 @@ pub struct McpResourceServer {
     pub authority: HostToolAuthority,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct HostToolUpgradeCheckpoint {
+    pub state: Value,
+}
+
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
+
+    /// Private process-transfer state. `None` defers replacement while the provider owns an
+    /// interaction that cannot move, such as a pending device sign-in.
+    fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
+        Ok(Some(Value::Null))
+    }
+
+    fn restore_upgrade(&self, state: Value) -> Result<(), String> {
+        if state.is_null() {
+            Ok(())
+        } else {
+            Err("this host tool provider cannot restore the supplied upgrade state".into())
+        }
+    }
 
     /// Scheduling capability only; preparation and permission checks remain authoritative.
     fn is_concurrency_safe(&self, _name: &str, _input: &Value) -> bool {

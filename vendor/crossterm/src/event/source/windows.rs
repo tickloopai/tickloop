@@ -41,6 +41,10 @@ impl WindowsEventSource {
 }
 
 impl EventSource for WindowsEventSource {
+    fn input_buffer_is_empty(&self) -> bool {
+        self.surrogate_buffer.is_none()
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<InternalEvent>> {
         let poll_timeout = PollTimeout::new(timeout);
 

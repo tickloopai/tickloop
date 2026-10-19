@@ -260,6 +260,7 @@ fn thinking_stream_pty_fixture() {
                 let (console, input) = Console::start(true).unwrap();
                 console.set_prompt_enabled(true).unwrap();
                 let startup = StartupState {
+                    launch_arguments: Vec::new(),
                     chat: StartupChat::Resumed(
                         Box::new(agent.snapshot(chat).await.unwrap()),
                         false,

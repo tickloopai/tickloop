@@ -5,7 +5,43 @@ use crossterm::style::Stylize;
 const TERMINAL_WORKER_THREADS: usize = 2;
 
 fn main() {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let build = tickloop_agent_updater::Build {
+        version: env!("CARGO_PKG_VERSION").into(),
+        identity: env!("TICKLOOP_BUILD_IDENTITY").into(),
+    };
+    let _development_lease = if arguments
+        .first()
+        .is_some_and(|argument| argument == "--development-root")
+    {
+        let root = arguments
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| fail_startup(&arguments, "Missing development checkout"));
+        let lease =
+            tickloop_agent_updater::register_development(std::path::Path::new(&root), &build)
+                .unwrap_or_else(|error| {
+                    fail_startup(
+                        &arguments,
+                        &format!("Cannot retain development runtime: {error:#}"),
+                    )
+                });
+        arguments.drain(..2);
+        Some(lease)
+    } else {
+        None
+    };
+    if let [command, path] = arguments.as_slice()
+        && command == "--check-view-handoff"
+    {
+        if let Err(error) =
+            tickloop_agent_console::terminal::check_view_handoff(std::path::Path::new(path))
+        {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if arguments.len() == 1 {
         match arguments[0].to_str() {
             Some("--version" | "-V") => {
@@ -16,13 +52,23 @@ fn main() {
                 println!("{}", env!("TICKLOOP_BUILD_IDENTITY"));
                 return;
             }
+            Some("--runtime-info") => {
+                let info = tickloop_agent_protocol::RuntimeBinaryInfo {
+                    product_version: env!("CARGO_PKG_VERSION").into(),
+                    build_id: env!("TICKLOOP_BUILD_IDENTITY").into(),
+                    protocol_major: tickloop_agent_protocol::PROTOCOL_MAJOR,
+                    protocol_minor: tickloop_agent_protocol::PROTOCOL_MINOR,
+                    handoff_version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&info).expect("runtime metadata")
+                );
+                return;
+            }
             _ => {}
         }
     }
-    let build = tickloop_agent_updater::Build {
-        version: env!("CARGO_PKG_VERSION").into(),
-        identity: env!("TICKLOOP_BUILD_IDENTITY").into(),
-    };
     let is_console = !arguments.first().is_some_and(|arg| {
         matches!(
             arg.to_str(),
@@ -38,29 +84,64 @@ fn main() {
                 let error = std::process::Command::new(executable)
                     .args(&arguments)
                     .exec();
-                eprintln!("Error: Cannot open the pinned Tickloop runtime: {error}");
-                std::process::exit(1);
+                fail_startup(
+                    &arguments,
+                    &format!("Cannot open the pinned Tickloop runtime: {error}"),
+                );
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("Error: Cannot preserve this Tickloop runtime: {error:#}");
-                std::process::exit(1);
+                fail_startup(
+                    &arguments,
+                    &format!("Cannot preserve this Tickloop runtime: {error:#}"),
+                );
             }
         }
     }
     tickloop_agent::name_this_build();
+    if let Err(error) = tickloop_agent_console::terminal::prepare_view_handoff(&arguments) {
+        fail_startup(
+            &arguments,
+            &format!("Cannot prepare View restoration: {error}"),
+        );
+    }
+    let _lease = match tickhost_connect::executable_lease::retain_current_executable() {
+        Ok(lease) => lease,
+        Err(error) => {
+            fail_startup(
+                &arguments,
+                &format!("Cannot retain running executable: {error}"),
+            );
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(TERMINAL_WORKER_THREADS)
         .enable_all()
         .build()
-        .expect("cannot start the Agent terminal runtime");
+        .unwrap_or_else(|error| {
+            fail_startup(
+                &arguments,
+                &format!("Cannot start the Agent terminal runtime: {error}"),
+            )
+        });
     let result = runtime.block_on(async {
         if arguments.first().is_some_and(|arg| arg == "update") {
-            return tickloop_agent_updater::command(&arguments[1..], build)
+            let result = tickloop_agent_updater::command(&arguments[1..], build)
                 .await
                 .map_err(|error| format!("{error:#}"));
+            if result.is_ok()
+                && arguments
+                    .get(1)
+                    .is_some_and(|argument| argument == "--status")
+            {
+                report_running_versions().await;
+            }
+            return result;
         }
         if is_console {
+            drop(tokio::task::spawn_blocking(
+                tickloop_agent_updater::cleanup_unused_runtimes,
+            ));
             // Automatic checks must never prevent opening a Console.
             let _ = tickloop_agent_updater::start_background(
                 &arguments,
@@ -79,10 +160,27 @@ fn main() {
         }
         match tickloop_agent::run_internal(&arguments).await {
             Some(result) => result,
-            None => tickloop_agent_console::terminal::run().await,
+            None => {
+                let console_arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        argument
+                            .clone()
+                            .into_string()
+                            .map_err(|_| "Console arguments must be valid UTF-8".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                tickloop_agent_console::terminal::run_with_arguments(console_arguments.into_iter())
+                    .await
+            }
         }
     });
     if let Err(error) = result {
+        if let Err(recovery_error) =
+            tickloop_agent_console::terminal::recover_view_handoff(&arguments)
+        {
+            eprintln!("View recovery unavailable: {recovery_error}");
+        }
         let stderr = io::stderr();
         let use_color = stderr.is_terminal()
             && std::env::var_os("NO_COLOR").is_none()
@@ -99,5 +197,74 @@ fn main() {
             let _ = writeln!(output, "{body}");
         }
         std::process::exit(1);
+    }
+}
+
+fn fail_startup(arguments: &[std::ffi::OsString], message: &str) -> ! {
+    if let Err(error) = tickloop_agent_console::terminal::recover_view_handoff(arguments) {
+        eprintln!("View recovery unavailable: {error}");
+    }
+    eprintln!(
+        "Error: {}",
+        tickloop_agent_console::terminal::safe_text(message)
+    );
+    std::process::exit(1);
+}
+
+async fn report_running_versions() {
+    use tickloop_agent_client::daemon_endpoint::STARTUP_DEADLINE;
+    use tickloop_agent_protocol::{AgentAccess, ObservationRequest, ObservationValue};
+    let endpoint = tickloop_agent_client::daemon_endpoint::runtime_directory()
+        .join(tickloop_agent_client::daemon_endpoint::SOCKET_NAME);
+    let Ok(Ok(client)) = tokio::time::timeout(
+        STARTUP_DEADLINE,
+        tickloop_agent_client::LocalAgentClient::connect(&endpoint),
+    )
+    .await
+    else {
+        println!("Daemon: not reachable");
+        return;
+    };
+    println!(
+        "Daemon: {}",
+        client
+            .protocol()
+            .build
+            .as_deref()
+            .unwrap_or("unknown build")
+    );
+    if client.protocol().upgrade_protocol != Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION)
+    {
+        println!("Automatic runtime handoff: unavailable in this daemon");
+        return;
+    }
+    if let Ok(Ok(observation)) = tokio::time::timeout(
+        STARTUP_DEADLINE,
+        client.observe(ObservationRequest::RuntimeVersion),
+    )
+    .await
+        && let ObservationValue::RuntimeVersion(version) = observation.initial
+    {
+        if let Some(target) = version.requested_executable {
+            println!("Pending activation: {}", target.display());
+        }
+        for worker in version.workers {
+            println!(
+                "Worker {}: {}{}",
+                worker.process_id,
+                worker.build_id.as_deref().unwrap_or("unknown build"),
+                if worker.upgrading {
+                    " (waiting for a safe point)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if let Some(error) = version.error {
+            println!(
+                "Activation deferred: {}",
+                tickloop_agent_console::terminal::safe_text(&error)
+            );
+        }
     }
 }

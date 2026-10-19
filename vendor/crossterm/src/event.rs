@@ -205,6 +205,13 @@ pub fn poll(timeout: Duration) -> std::io::Result<bool> {
     poll_internal(Some(timeout), &EventFilter)
 }
 
+/// Reports whether this reader retains any input, including incomplete UTF-8, escape
+/// sequences and bracketed pastes. Call after `poll` returns false on the input thread
+/// before replacing a process; unread terminal bytes remain in the operating system.
+pub fn input_buffer_is_empty() -> bool {
+    lock_internal_event_reader().input_buffer_is_empty()
+}
+
 /// Reads a single [`Event`](enum.Event.html).
 ///
 /// This function blocks until an [`Event`](enum.Event.html) is available. Combine it with the

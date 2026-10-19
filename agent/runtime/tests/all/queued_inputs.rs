@@ -108,7 +108,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             vec![Content::ToolUse {
                 id: "slow-shell".into(),
                 name: "Bash".into(),
-                input: serde_json::json!({"command":"sleep 0.2"}),
+                input: serde_json::json!({"command":"while [ ! -f release-queued-turn ]; do sleep 0.01; done"}),
             }],
             text("finished with the correction"),
         ]));
@@ -169,6 +169,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             )
             .await
             .unwrap();
+        std::fs::write(directory.path().join("release-queued-turn"), "ready").unwrap();
         let mut redirected = false;
         loop {
             let event = next_event(&mut events).await;
@@ -643,7 +644,10 @@ async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the
 async fn send_now_leaves_the_run_that_already_answers_the_message() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ToolThenWaitingModel {
-        tool: Mutex::new(Some(bash("short-shell", "sleep 0.2"))),
+        tool: Mutex::new(Some(bash(
+            "short-shell",
+            "while [ ! -f release-joined-turn ]; do sleep 0.01; done",
+        ))),
         requests: Mutex::new(Vec::new()),
     });
     let agent = Agent::new_embedded(config(), model.clone());
@@ -666,6 +670,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
         .submit(chat, Some(active.loop_id), "fold this in".into())
         .await
         .unwrap();
+    std::fs::write(directory.path().join("release-joined-turn"), "ready").unwrap();
     loop {
         let event = next_event(&mut events).await;
         match event.kind {

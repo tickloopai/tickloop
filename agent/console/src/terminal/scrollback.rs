@@ -49,11 +49,30 @@ pub(super) struct ScrollFrame {
     pub(super) unread: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 struct Position {
     line: usize,
     byte: usize,
     tab_cell: usize,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ScrollCheckpoint {
+    anchor: Position,
+    following: bool,
+    auto_scroll: bool,
+    unread: usize,
 }
 
 struct Row {
@@ -282,6 +301,22 @@ impl Default for Scrollback {
 }
 
 impl Scrollback {
+    pub(super) fn upgrade_checkpoint(&self) -> ScrollCheckpoint {
+        ScrollCheckpoint {
+            anchor: self.anchor,
+            following: self.following,
+            auto_scroll: self.auto_scroll,
+            unread: self.unread,
+        }
+    }
+
+    pub(super) fn restore_upgrade_checkpoint(&mut self, checkpoint: ScrollCheckpoint) {
+        self.anchor = checkpoint.anchor;
+        self.following = checkpoint.following;
+        self.auto_scroll = checkpoint.auto_scroll;
+        self.unread = checkpoint.unread;
+    }
+
     pub(super) fn is_following(&self) -> bool {
         self.following
     }
