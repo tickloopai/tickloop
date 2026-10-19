@@ -9,7 +9,7 @@ use tickloop_agent_protocol::ChatId;
 use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
     FamilyCompletionsEntry, FamilyInputsEntry, LastPromptEntry, Line, MonitorMembersEntry,
-    SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
+    ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
 };
 use uuid::Uuid;
 
@@ -31,6 +31,7 @@ pub(crate) struct CachedMetadata {
     pub family_completions: Option<FamilyCompletionsEntry>,
     pub family_inputs: Option<FamilyInputsEntry>,
     pub sent_agent_messages: Option<SentAgentMessagesEntry>,
+    pub provenance: Option<ProvenanceEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,
@@ -48,6 +49,7 @@ impl CachedMetadata {
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
+            Line::Provenance(entry) => self.provenance = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.delegation = Some(entry.clone()),
@@ -70,6 +72,7 @@ impl CachedMetadata {
                     .clone()
                     .map(Line::SentAgentMessages),
             )
+            .chain(self.provenance.clone().map(Line::Provenance))
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))

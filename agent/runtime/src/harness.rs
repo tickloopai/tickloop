@@ -107,6 +107,10 @@ pub struct ToolPolicy {
     /// an earlier search result or fetched page of the Chat. A URL the model composed, which
     /// injected instructions could use to send data out, is refused.
     pub web_fetch_requires_provenance: bool,
+    /// Whether ArtifactEdit and ArtifactComment write only to Artifacts with provenance: created
+    /// by the Chat's family, named in the user's input, linked to a Loop of the family or shared
+    /// through the host. Those are admitted without review; any other target is refused.
+    pub artifact_writes_require_provenance: bool,
 }
 
 impl ToolPolicy {
@@ -126,12 +130,13 @@ impl ToolPolicy {
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
             web_fetch_requires_provenance: false,
+            artifact_writes_require_provenance: false,
         }
     }
 
-    /// A durable Chat's: WebFetch of URLs with provenance, questions, Subagents and their
-    /// messages, Task tools, goals with schedules and the host's tools, with waits the Transcript
-    /// keeps.
+    /// A durable Chat's: WebFetch of URLs and Artifact writes to targets with provenance,
+    /// questions, Subagents and their messages, Task tools, goals with schedules and the host's
+    /// tools, with waits the Transcript keeps.
     pub const fn durable_chat() -> Self {
         Self {
             web_fetch: true,
@@ -147,6 +152,7 @@ impl ToolPolicy {
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
             web_fetch_requires_provenance: true,
+            artifact_writes_require_provenance: true,
         }
     }
 
@@ -176,13 +182,14 @@ impl ToolPolicy {
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
             web_fetch_requires_provenance: false,
+            artifact_writes_require_provenance: false,
         }
     }
 }
 
 /// The tools whose calls a durable Chat's host admits by its own rule instead of Auto review.
 /// WebFetch fetches only URLs with provenance there, so it carries no data the model composed;
-/// writes to the user's Artifacts are not among them and go through review like any other.
+/// Artifact writes are admitted by their target's provenance instead of a rule.
 const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 5] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,

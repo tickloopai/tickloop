@@ -53,6 +53,7 @@ impl RetainedState {
             Line::SentAgentMessages(entry) => {
                 self.metadata.sent_agent_messages = Some(entry.clone())
             }
+            Line::Provenance(entry) => self.metadata.provenance = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.metadata.family_inputs = Some(entry.clone()),
             Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
             Line::FamilyCompletions(entry) => {

@@ -394,6 +394,8 @@ struct Inner {
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default)]
 struct ChatBookkeeping {
+    /// What the Chat's own work vouches for, as its Transcript keeps it.
+    provenance: tickloop_agent_transcript::ProvenanceEntry,
     dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,

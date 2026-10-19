@@ -27,6 +27,8 @@ pub enum Line {
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
     SentAgentMessages(SentAgentMessagesEntry),
+    /// Where the Chat's WebFetch URLs and Artifact writes may lead; the latest record wins.
+    Provenance(ProvenanceEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
@@ -123,6 +125,7 @@ pub enum MetadataKind {
     Subagents,
     FamilyInputs,
     SentAgentMessages,
+    Provenance,
     TaskBoards,
     FamilyCompletions,
     FileHistorySnapshot,
@@ -149,6 +152,7 @@ impl MetadataKind {
             | Self::Subagents
             | Self::FamilyInputs
             | Self::SentAgentMessages
+            | Self::Provenance
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
@@ -213,6 +217,7 @@ impl Line {
             Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
             Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
+            Self::Provenance(_) => MetadataKind::Provenance,
             Self::LastPrompt(_) => MetadataKind::LastPrompt,
             Self::BranchOrigin(_) => MetadataKind::BranchOrigin,
             Self::Delegation(_) => MetadataKind::Delegation,
@@ -593,6 +598,21 @@ pub struct SentAgentMessagesEntry {
     pub messages: std::collections::BTreeMap<Uuid, AgentMessageSource>,
 }
 
+/// What the Chat's own work vouches for: the links its fetched pages gave on their own origin,
+/// the targets its fetches were redirected to within the same site, and the Artifacts it
+/// created or the user shared with it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenanceEntry {
+    pub chat_id: Uuid,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub page_links: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub redirect_targets: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub artifacts: std::collections::BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskBoardsEntry {
@@ -964,6 +984,10 @@ mod tests {
             Line::SentAgentMessages(SentAgentMessagesEntry {
                 chat_id,
                 messages: Default::default(),
+            }),
+            Line::Provenance(ProvenanceEntry {
+                chat_id,
+                ..Default::default()
             }),
             Line::LastPrompt(LastPromptEntry {
                 chat_id,

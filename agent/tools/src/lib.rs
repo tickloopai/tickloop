@@ -479,8 +479,8 @@ pub struct Tools {
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
-    /// The URLs this Chat's fetched pages linked to and its redirects led to.
-    observed_urls: web_provenance::ObservedUrls,
+    /// What this Chat's fetches saw that may give provenance to later URLs.
+    observed_urls: web_provenance::Observations,
     search_credential_root: Option<PathBuf>,
     file_reads: FileReadState,
     /// The addresses `WebFetch` may reach.
@@ -527,16 +527,17 @@ impl Tools {
             commands,
             search: std::sync::Arc::new(tokio::sync::RwLock::new(SearchConfig::enabled_default())),
             fetched_pages: web::FetchCache::default(),
-            observed_urls: web_provenance::ObservedUrls::default(),
+            observed_urls: web_provenance::Observations::default(),
             search_credential_root: None,
             file_reads: FileReadState::default(),
             reach,
         }
     }
 
-    /// Whether a page this Chat fetched linked to `url`, or a fetch's redirect led there.
-    pub fn has_observed_url(&self, url: &str) -> bool {
-        web_provenance::provenance_key(url).is_some_and(|key| self.observed_urls.contains(&key))
+    /// What this Chat's fetches saw since the last call: links on their pages' origins and
+    /// redirects within a site, for the host to keep.
+    pub fn take_fetch_observations(&self) -> web_provenance::FetchObservations {
+        self.observed_urls.take()
     }
 
     pub fn with_search_configuration(

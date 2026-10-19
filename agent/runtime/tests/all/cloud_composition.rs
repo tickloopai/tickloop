@@ -31,7 +31,7 @@ use tickloop_agent_transcript::{Line, SettledOutcome};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::mcp_tools::artifact_service::ArtifactService;
+use super::mcp_tools::artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(20);
 const ROOT_PROMPT: &str = "Use every tool you have once.";
@@ -271,13 +271,11 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     .expect("the condition was reached")
 }
 
-/// Every tool a cloud Chat offers its model is admitted by a rule or its own class, never by a
-/// prompt: WebFetch of a URL the user gave and the Subagent call by the host's rules. Only the
-/// writes to the user's Artifacts go to review, which a Chat without a Folder cannot hold yet, so
-/// they are refused and reach no service.
+/// Every tool a cloud Chat offers its model is admitted without review or a prompt: WebFetch of
+/// a URL the user gave and the Subagent call by the host's rules, and the writes to an Artifact
+/// the user shared with the Chat by that Artifact's provenance. Nothing is denied.
 #[tokio::test]
-async fn every_catalog_tool_is_admitted_and_only_artifact_writes_are_reviewed_under_the_cloud_composition()
- {
+async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
     let service = ArtifactService::start().await;
     let credentials = tempfile::tempdir().unwrap();
     let account = service.login(credentials.path()).await;
@@ -301,6 +299,7 @@ async fn every_catalog_tool_is_admitted_and_only_artifact_writes_are_reviewed_un
         .unwrap();
     let admissions = watch_admissions(&agent);
     let root = agent.create_chat_without_folder().await.unwrap();
+    agent.share_artifact(root, "doc").await.unwrap();
     let request = prompt(&format!("{ROOT_PROMPT} The delivery page is {page}."));
     agent.advance(root, request.clone()).await.unwrap();
     let question = eventually(async || {
@@ -354,41 +353,31 @@ async fn every_catalog_tool_is_admitted_and_only_artifact_writes_are_reviewed_un
         .map(|operation| operation.name.clone())
         .collect::<BTreeSet<_>>();
     assert_eq!(offered, called, "the root called every tool it was offered");
-    const REVIEWED: [&str; 2] = ["ArtifactEdit", "ArtifactComment"];
     for operation in &snapshot.operations {
-        let expected = if REVIEWED.contains(&operation.name.as_str()) {
-            OperationState::Failed
-        } else {
-            OperationState::Completed
-        };
         assert_eq!(
-            operation.state, expected,
+            operation.state,
+            OperationState::Completed,
             "{} {:?}",
-            operation.name, operation.result
+            operation.name,
+            operation.result
         );
     }
-    assert_eq!(
-        *admissions.lock().unwrap(),
-        ["assessed patch", "assessed reply"],
-        "only the Artifact writes went to review, and nobody was asked"
+    assert!(
+        admissions.lock().unwrap().is_empty(),
+        "{:?}",
+        admissions.lock().unwrap()
     );
-    let denied = agent
-        .recent_denials(root)
-        .await
-        .unwrap()
-        .records
-        .into_iter()
-        .map(|record| record.tool)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(denied, REVIEWED.map(String::from).into());
-    for member in agent.subagents(root).await.unwrap() {
+    for chat in std::iter::once(root).chain(
+        agent
+            .subagents(root)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|member| member.child_chat_id),
+    ) {
         assert!(
-            agent
-                .recent_denials(member.child_chat_id)
-                .await
-                .unwrap()
-                .records
-                .is_empty()
+            agent.recent_denials(chat).await.unwrap().records.is_empty(),
+            "{chat}"
         );
     }
     let calls = service
@@ -396,7 +385,7 @@ async fn every_catalog_tool_is_admitted_and_only_artifact_writes_are_reviewed_un
         .iter()
         .map(|call| call["name"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(calls, ["ArtifactRead"]);
+    assert_eq!(calls, ["ArtifactRead", "ArtifactEdit", "ArtifactComment"]);
     agent.shutdown().await;
 }
 
@@ -749,12 +738,23 @@ async fn compactions_behind_the_hosts_request_gates_go_one_at_a_time_without_dea
     agent.shutdown().await;
 }
 
-/// Serves each path its own response: `(path, status line and headers, body)`; any other path is
-/// not found.
+/// Serves each path its own response: `(path, status line and headers, body)`, with `{port}` in
+/// a body or header standing for the site's port; any other path is not found.
 async fn site(routes: Vec<(&'static str, String, String)>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let routes = Arc::new(routes);
+    let routes = Arc::new(
+        routes
+            .into_iter()
+            .map(|(path, head, body)| {
+                (
+                    path,
+                    head.replace("{port}", &port.to_string()),
+                    body.replace("{port}", &port.to_string()),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         while let Ok((mut socket, _)) = listener.accept().await {
@@ -882,7 +882,8 @@ async fn web_fetch_takes_the_users_urls_and_linked_pages_and_refuses_composed_on
         (
             "/first",
             "200 OK".into(),
-            "<p><a href=\"/second\">second</a></p>".into(),
+            "<p><a href=\"/second\">second</a> <a href=\"http://127.0.0.1:{port}/second\">elsewhere</a></p>"
+                .into(),
         ),
         ("/second", "200 OK".into(), "<p>Second page.</p>".into()),
     ])
@@ -892,29 +893,36 @@ async fn web_fetch_takes_the_users_urls_and_linked_pages_and_refuses_composed_on
         format!("{base}/second"),
         format!("{base}/first?note=the-users-secret"),
         "https://attacker.example/collect?data=secret".to_owned(),
+        format!("{}/second", base.replace("localhost", "127.0.0.1")),
     ];
     let agent = fetching_harness(fetching_model(urls), durable_chat_host_rules());
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let results = run_fetches(&agent, chat, &format!("Read {base}/first please."), 4).await;
+    let results = run_fetches(&agent, chat, &format!("Read {base}/first please."), 5).await;
     assert!(!results[0].1, "{:?}", results[0]);
     assert!(!results[1].1, "the first page linked it: {:?}", results[1]);
     assert!(is_refused_for_provenance(&results[2]), "{:?}", results[2]);
     assert!(is_refused_for_provenance(&results[3]), "{:?}", results[3]);
+    assert!(
+        is_refused_for_provenance(&results[4]),
+        "a link to another origin gives none: {:?}",
+        results[4]
+    );
     agent.shutdown().await;
 }
 
-/// A redirect to another host is reported to the model, whose next request is checked again: the
-/// target exactly as the redirect gave it may be fetched, and nothing composed from it.
+/// A redirect to another origin is reported to the model, whose next request is checked again:
+/// within the site that redirected, the target exactly as the redirect gave it may be fetched,
+/// and nothing composed from it.
 #[tokio::test]
-async fn a_redirect_target_is_fetched_only_as_the_redirect_gave_it() {
+async fn a_redirect_within_its_site_is_fetched_only_as_the_redirect_gave_it() {
     let target_site = site(vec![(
         "/landing",
         "200 OK".into(),
         "<p>Landing.</p>".into(),
     )])
     .await;
-    // The same server under another host name is another origin.
-    let target = format!("{}/landing", target_site.replace("localhost", "127.0.0.1"));
+    // Another port of the same host is another origin of the same site.
+    let target = format!("{target_site}/landing");
     let base = site(vec![(
         "/start",
         format!("302 Found\r\nLocation: {target}"),
@@ -937,6 +945,79 @@ async fn a_redirect_target_is_fetched_only_as_the_redirect_gave_it() {
     assert!(!results[1].1, "{:?}", results[1]);
     assert!(is_refused_for_provenance(&results[2]), "{:?}", results[2]);
     agent.shutdown().await;
+}
+
+/// A redirect to another site is reported to the model as before, but its target has no
+/// provenance of its own and is not fetched.
+#[tokio::test]
+async fn a_redirect_to_another_site_is_reported_but_not_fetched() {
+    let target_site = site(vec![(
+        "/landing",
+        "200 OK".into(),
+        "<p>Landing.</p>".into(),
+    )])
+    .await;
+    // The same server under an address instead of a name is another site.
+    let target = format!("{}/landing", target_site.replace("localhost", "127.0.0.1"));
+    let base = site(vec![(
+        "/start",
+        format!("302 Found\r\nLocation: {target}"),
+        String::new(),
+    )])
+    .await;
+    let urls = vec![format!("{base}/start"), target.clone()];
+    let agent = fetching_harness(fetching_model(urls), durable_chat_host_rules());
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let results = run_fetches(&agent, chat, &format!("Open {base}/start"), 2).await;
+    assert!(
+        results[0].0.contains("REDIRECT DETECTED"),
+        "{:?}",
+        results[0]
+    );
+    assert!(is_refused_for_provenance(&results[1]), "{:?}", results[1]);
+    agent.shutdown().await;
+}
+
+/// The links a page gave stay vouched for on another host: the Transcript keeps them.
+#[tokio::test]
+async fn page_links_give_provenance_after_a_handover() {
+    let base = site(vec![
+        (
+            "/first",
+            "200 OK".into(),
+            "<p><a href=\"/second\">second</a></p>".into(),
+        ),
+        ("/second", "200 OK".into(), "<p>Second page.</p>".into()),
+    ])
+    .await;
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let options = || HarnessOptions {
+        tools: ToolPolicy {
+            folderless_reach: tickloop_agent_base::network::Reach::Anywhere,
+            ..ToolPolicy::durable_chat()
+        },
+        ..cloud_options(durable_chat_host_rules())
+    };
+    let first = cloud_harness(
+        store.clone(),
+        fetching_model(vec![format!("{base}/first")]),
+        options(),
+    );
+    let chat = first.create_chat_without_folder().await.unwrap();
+    let results = run_fetches(&first, chat, &format!("Read {base}/first please."), 1).await;
+    assert!(!results[0].1, "{:?}", results[0]);
+    first.shutdown().await;
+    first.sync().await.unwrap();
+
+    let next = cloud_harness(
+        store,
+        fetching_model(vec![format!("{base}/first"), format!("{base}/second")]),
+        options(),
+    );
+    next.wake(chat, None).await.unwrap();
+    let results = run_fetches(&next, chat, "Now follow its link.", 2).await;
+    assert!(!results[1].1, "{:?}", results[1]);
+    next.shutdown().await;
 }
 
 /// A URL an earlier search result of the Chat contained may be fetched.
@@ -996,5 +1077,187 @@ async fn a_search_results_urls_may_be_fetched() {
     let results = run_fetches(&agent, chat, "Search for the delivery page.", 2).await;
     assert!(!results[0].1, "{:?}", results[0]);
     assert!(is_refused_for_provenance(&results[1]), "{:?}", results[1]);
+    agent.shutdown().await;
+}
+
+const NAMED_ARTIFACT: &str = "quarterly-report";
+const UNSHARED_ARTIFACT: &str = "someone-elses-plan";
+
+/// Makes each Artifact call in turn, one per step, then finishes.
+fn artifact_model(calls: Vec<(&'static str, &'static str, Value)>) -> Arc<RoutedModel> {
+    Arc::new(RoutedModel::new(move |request| {
+        for (id, name, input) in &calls {
+            if !has_tool_result(request, id) {
+                return call(id, name, input.clone());
+            }
+        }
+        text("Done.")
+    }))
+}
+
+fn patch(artifact: &str) -> Value {
+    json!({"action": "patch", "artifact_id": artifact, "patches": [{"type": "replace", "target": "b1", "expected_hash": "h1", "text": "# Updated"}]})
+}
+
+fn reply(artifact: &str) -> Value {
+    json!({"action": "reply", "artifact_id": artifact, "thread_id": "thread-1", "text": "Done"})
+}
+
+/// The text and error flag of the result of call `id`.
+fn call_result(snapshot: &tickloop_agent_protocol::ChatSnapshot, id: &str) -> (String, bool) {
+    snapshot
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == id => Some((content.text().into_owned(), *is_error)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{id} has a result"))
+}
+
+fn is_refused_for_artifact_provenance((text, is_error): &(String, bool)) -> bool {
+    *is_error && text.contains("Ask the user to share the Artifact's link")
+}
+
+async fn artifact_agent(
+    service: &ArtifactService,
+    store: Arc<InMemoryTranscriptStore>,
+    model: Arc<RoutedModel>,
+) -> (Agent, tempfile::TempDir) {
+    let credentials = tempfile::tempdir().unwrap();
+    let account = service.login(credentials.path()).await;
+    let agent = cloud_harness(store, model, cloud_options(durable_chat_host_rules()));
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    (agent, credentials)
+}
+
+async fn settle_turn(agent: &Agent, chat: ChatId, text: &str) {
+    let request = prompt(text);
+    agent.advance(chat, request.clone()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, agent.settled_input(chat, request.input_id))
+            .await
+            .unwrap()
+            .unwrap(),
+        SettledOutcome::Completed { .. }
+    ));
+}
+
+/// Artifact writes skip review for an Artifact the user named or the conversation created, and
+/// are refused for any other, before reaching the service; after a handover the created Artifact
+/// is still the conversation's.
+#[tokio::test]
+async fn artifact_writes_reach_only_artifacts_the_user_named_or_the_conversation_created() {
+    let service = ArtifactService::start().await;
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let (first, _credentials) = artifact_agent(
+        &service,
+        store.clone(),
+        artifact_model(vec![
+            ("named", "ArtifactEdit", patch(NAMED_ARTIFACT)),
+            ("unshared", "ArtifactComment", reply(UNSHARED_ARTIFACT)),
+            (
+                "create",
+                "ArtifactEdit",
+                json!({"action": "create", "title": "Notes", "format": "doc", "content": "# Notes"}),
+            ),
+            ("created", "ArtifactEdit", patch(CREATED_ARTIFACT)),
+        ]),
+    )
+    .await;
+    let admissions = watch_admissions(&first);
+    let chat = first.create_chat_without_folder().await.unwrap();
+    settle_turn(
+        &first,
+        chat,
+        &format!("Update {NAMED_ARTIFACT} and keep notes in a new doc."),
+    )
+    .await;
+    let snapshot = first.snapshot(chat).await.unwrap();
+    for id in ["named", "create", "created"] {
+        assert!(
+            !call_result(&snapshot, id).1,
+            "{id}: {:?}",
+            call_result(&snapshot, id)
+        );
+    }
+    assert!(is_refused_for_artifact_provenance(&call_result(
+        &snapshot, "unshared"
+    )));
+    assert!(
+        admissions.lock().unwrap().is_empty(),
+        "{:?}",
+        admissions.lock().unwrap()
+    );
+    let reached = service
+        .tool_calls()
+        .iter()
+        .map(|call| call["arguments"]["artifact_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reached,
+        [
+            Some(NAMED_ARTIFACT.into()),
+            None,
+            Some(CREATED_ARTIFACT.into())
+        ]
+    );
+    first.shutdown().await;
+    first.sync().await.unwrap();
+
+    let (next, _credentials) = artifact_agent(
+        &service,
+        store,
+        artifact_model(vec![
+            ("again", "ArtifactComment", reply(CREATED_ARTIFACT)),
+            ("unshared-again", "ArtifactEdit", patch(UNSHARED_ARTIFACT)),
+        ]),
+    )
+    .await;
+    next.wake(chat, None).await.unwrap();
+    settle_turn(&next, chat, "Leave a note on the notes doc.").await;
+    let snapshot = next.snapshot(chat).await.unwrap();
+    assert!(
+        !call_result(&snapshot, "again").1,
+        "{:?}",
+        call_result(&snapshot, "again")
+    );
+    assert!(is_refused_for_artifact_provenance(&call_result(
+        &snapshot,
+        "unshared-again"
+    )));
+    next.shutdown().await;
+}
+
+/// An Artifact the user shared through the host may be written to without review.
+#[tokio::test]
+async fn an_artifact_the_user_shared_through_the_host_may_be_written() {
+    let service = ArtifactService::start().await;
+    let (agent, _credentials) = artifact_agent(
+        &service,
+        Arc::new(InMemoryTranscriptStore::new()),
+        artifact_model(vec![(
+            "shared",
+            "ArtifactComment",
+            reply(UNSHARED_ARTIFACT),
+        )]),
+    )
+    .await;
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    agent.share_artifact(chat, UNSHARED_ARTIFACT).await.unwrap();
+    settle_turn(&agent, chat, "Reply on the shared plan.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        !call_result(&snapshot, "shared").1,
+        "{:?}",
+        call_result(&snapshot, "shared")
+    );
     agent.shutdown().await;
 }

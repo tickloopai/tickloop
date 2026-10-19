@@ -18,7 +18,7 @@ use tickloop_agent_base::network::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::web_provenance::{ObservedUrls, page_links, provenance_key};
+use super::web_provenance::{Observations, page_links};
 use super::web_search::DomainFilter;
 use super::web_search::{self, PreparedSearch, SearchRequest};
 use super::{Operation, ToolDefinition, ToolError, shell::BASH_TOOL_NAME, utf16_length};
@@ -410,12 +410,12 @@ impl SearchInput {
 
 /// Claude Code `WebFetchTool.call`: the page comes from the cache or the network, and only the
 /// secondary model's answer to the prompt reaches the conversation.
-/// The links of every page it reads and the target of every redirect it reports are recorded in
-/// `observed`, the provenance of the URLs the model may fetch next.
+/// The links of every page it reads and the target of every redirect it reports go to `observed`,
+/// which keeps those that may give provenance to the URLs the model fetches next.
 pub(super) async fn fetch(
     input: FetchInput,
     cache: &FetchCache,
-    observed: &ObservedUrls,
+    observed: &Observations,
     reach: Reach,
     secondary_model: &dyn SecondaryModel,
     cancel: CancellationToken,
@@ -435,13 +435,13 @@ pub(super) async fn fetch(
                     markdown
                 }
                 FetchedPage::Redirect(redirect) => {
-                    observed.record(provenance_key(redirect.target.as_str()));
+                    observed.record_redirect(&redirect.original, &redirect.target);
                     return Ok(text_result(redirect_message(&redirect, &input.prompt)));
                 }
             }
         }
     };
-    observed.record(page_links(&markdown, &url));
+    observed.record_page(&url, page_links(&markdown, &url));
     let prompt = secondary_model_prompt(&truncate_markdown(&markdown), &input.prompt);
     let answer = secondary_model.respond(prompt, cancel).await?;
     Ok(text_result(answer))

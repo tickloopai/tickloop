@@ -1130,6 +1130,13 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(error));
         }
+        let artifact_admission = match self
+            .check_artifact_provenance(receipt, normalized_name, normalized_input)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+        };
         let mut host_call_status = None;
         let mut host_effect = None;
         let result = if registration
@@ -1233,6 +1240,12 @@ impl Agent {
                     || requires_schedule_consent
                     || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation),
             );
+            // A write to an Artifact with provenance needs no review; rules still decide.
+            if decision == Decision::Check
+                && artifact_admission == super::web_provenance::ArtifactAdmission::Vouched
+            {
+                decision = Decision::Allow;
+            }
             let mut assessment_details = None;
             let mut approval_source = if explicit_ask {
                 PermissionApprovalSource::ExplicitAsk
@@ -1564,6 +1577,15 @@ impl Agent {
                                 .await;
                             host_call_status = Some(host_result.status());
                             let (result, effect) = host_result.into_parts();
+                            if let Some(crate::host_tools::HostEffect::CreatedArtifact(created)) =
+                                &effect
+                            {
+                                self.remember_created_artifact(
+                                    receipt.chat_id,
+                                    &created.artifact_id,
+                                )
+                                .await;
+                            }
                             host_effect = effect;
                             Ok(result)
                         } else {
@@ -2137,6 +2159,8 @@ impl Agent {
                                 context,
                                 &secondary_model,
                             )
+                            .await;
+                        self.remember_fetch_observations(receipt.chat_id, &tools)
                             .await;
                         images = execution.images;
                         execution.result.map_err(|error| error.to_string())
