@@ -565,6 +565,8 @@ impl Agent {
         receiver: (ChatId, LoopId),
         history: ArtifactFeedbackHistory,
     ) -> Result<EventSourceBinding, AgentError> {
+        // The link names the receiving Chat, so it is made as that Chat.
+        let client = client.for_chat(receiver.0);
         let request = AgentLinkRequest {
             binding_id: Uuid::new_v4(),
             client_instance_id: Uuid::new_v4(),
@@ -1214,9 +1216,10 @@ impl Agent {
                         continue;
                     }
                     let link = source.link();
+                    let chat_client = client.for_chat(chat_id);
                     let result = tokio::select! {
                         _ = agent.inner.shutdown.cancelled() => return,
-                        result = client.unlink_agent(&source.account_id, &link) => result,
+                        result = chat_client.unlink_agent(&source.account_id, &link) => result,
                     };
                     match result {
                         Ok(()) | Err(ArtifactError::Service { status: 404, .. }) => {

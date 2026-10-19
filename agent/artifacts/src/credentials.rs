@@ -20,6 +20,12 @@ pub trait ArtifactCredentials: Send + Sync {
     async fn invalidate(&self, _rejected_token: &str) -> Result<(), ArtifactError> {
         Ok(())
     }
+
+    /// The same account's credentials for one Chat of the client's family, for requests that
+    /// act as that Chat (its links); `None` keeps these.
+    fn for_chat(&self, _chat_id: Uuid) -> Option<Arc<dyn ArtifactCredentials>> {
+        None
+    }
 }
 
 pub(super) struct HostedCredentials {
@@ -71,6 +77,26 @@ impl ArtifactClient {
             identity: Uuid::new_v4(),
         }));
         Ok(client)
+    }
+
+    /// This client acting as `chat_id`, when the host's credential source scopes credentials
+    /// by Chat; otherwise the client itself.
+    pub fn for_chat(&self, chat_id: Uuid) -> Self {
+        let Some(hosted) = &self.hosted_credentials else {
+            return self.clone();
+        };
+        let Some(source) = hosted.source.for_chat(chat_id) else {
+            return self.clone();
+        };
+        let mut client = self.clone();
+        client.hosted_credentials = Some(Arc::new(HostedCredentials {
+            account_id: hosted.account_id.clone(),
+            source,
+            cached: RwLock::new(None),
+            renewal: Mutex::new(()),
+            identity: Uuid::new_v4(),
+        }));
+        client
     }
 
     pub fn is_host_managed(&self) -> bool {
