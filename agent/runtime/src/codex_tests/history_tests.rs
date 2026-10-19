@@ -41,6 +41,7 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             models,
         },
         crate::HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: Some(settings),
             host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),

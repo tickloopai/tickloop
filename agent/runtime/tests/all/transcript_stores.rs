@@ -266,6 +266,7 @@ async fn retrying_a_committed_batch_commits_it_once() {
 
 fn options(tools: ToolPolicy) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: tickloop_agent_test_support::config(),
         settings: None,
         host: AgentHostOptions::embedded_defaults(),

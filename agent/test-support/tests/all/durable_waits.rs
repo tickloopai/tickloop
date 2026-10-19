@@ -51,6 +51,7 @@ fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) -
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

@@ -389,6 +389,7 @@ mod channel {
                             models: ChosenModels::new(self.model.clone()),
                         },
                         HarnessOptions {
+                            search: Default::default(),
                             model: tickloop_agent_test_support::config(),
                             settings: None,
                             host: AgentHostOptions::embedded_defaults(),

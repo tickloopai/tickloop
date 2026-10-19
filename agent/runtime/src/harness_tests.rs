@@ -41,6 +41,7 @@ fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions::embedded_defaults(),
@@ -308,6 +309,7 @@ async fn shutdown_waits_for_a_submission_admitted_before_it_registered_its_run()
 /// What the cloud configures: no Folder, durable waits, no prompts, and its host rules.
 fn durable_chat_options() -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: config(),
         settings: None,
         host: AgentHostOptions {

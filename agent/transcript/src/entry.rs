@@ -498,6 +498,8 @@ pub struct BranchOriginEntry {
 pub struct DelegationEntry {
     pub chat_id: Uuid,
     pub delegation: DelegationMetadata,
+    #[serde(default = "tickloop_agent_protocol::SearchConfig::enabled_default")]
+    pub search_config: Option<tickloop_agent_protocol::SearchConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -180,6 +180,7 @@ fn harness(
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host,

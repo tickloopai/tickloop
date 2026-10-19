@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: config(),
         settings: None,
         host: AgentHostOptions {

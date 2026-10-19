@@ -49,6 +49,7 @@ fn harness(
 /// A Harness without a Folder whose Chats may ask questions.
 fn options(waits: WaitHosting) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: config(),
         settings: None,
         host: AgentHostOptions {

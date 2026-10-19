@@ -22,7 +22,8 @@ pub use handover::HandOver;
 mod harness;
 pub use harness::{
     DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
-    PersonWaitKind, Quiescence, ToolPolicy, WaitHosting, Waits, durable_chat_host_rules,
+    PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
+    durable_chat_host_rules,
 };
 pub use triggers::ScheduleDecision;
 mod host_context;
@@ -324,6 +325,7 @@ struct Inner {
     models: Arc<dyn tickloop_agent_model::ModelClients>,
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
     settings: Option<tickloop_agent_config::UserSettings>,
+    search: SearchDefaults,
     host_options: AgentHostOptions,
     waits: WaitHosting,
     /// The shortest time a Trigger's schedule may leave between two runs.
@@ -808,6 +810,7 @@ fn local_options(
     host: AgentHostOptions,
 ) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model,
         settings,
         host,
@@ -1797,6 +1800,7 @@ impl Agent {
         let HarnessOptions {
             model,
             settings,
+            search,
             host: host_options,
             tools: tool_policy,
             host_rules,
@@ -1824,6 +1828,7 @@ impl Agent {
                 }),
                 models,
                 settings,
+                search,
                 host_options,
                 waits,
                 min_schedule_interval,
@@ -2040,6 +2045,7 @@ impl Agent {
                 snapshot.model = parent.model;
                 snapshot.reasoning_effort = parent.reasoning_effort;
                 snapshot.thinking_enabled = parent.thinking_enabled;
+                snapshot.search_config = parent.search_config;
                 snapshot.task_tools_enabled = parent.task_tools_enabled;
                 snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
                 let mut metadata = metadata;
@@ -2050,6 +2056,9 @@ impl Agent {
             } else {
                 self.apply_chat_defaults(&mut snapshot, &mut bookkeeping)
             };
+        if let SearchDefaults::Fixed(config) = &self.inner.search {
+            snapshot.search_config = config.clone();
+        }
         self.inner
             .subagent_registry
             .lock()
@@ -2074,7 +2083,7 @@ impl Agent {
                     }
                 }
             }
-            self.record_delegation(id, metadata.clone());
+            self.record_delegation(id, metadata.clone(), snapshot.search_config.clone());
         }
         self.save(&snapshot);
         chats.insert(
@@ -4363,14 +4372,17 @@ impl Agent {
             .set_search(config.clone())
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        self.inner
-            .chats
-            .lock()
-            .await
-            .get_mut(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .snapshot
-            .search_config = config;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        chat.snapshot.search_config = config;
+        if let Some(delegation) = &chat.snapshot.delegation {
+            self.record_delegation(
+                chat_id,
+                delegation.clone(),
+                chat.snapshot.search_config.clone(),
+            );
+            self.save(&chat.snapshot);
+        }
         Ok(())
     }
 
@@ -4685,7 +4697,11 @@ impl Agent {
                         }
                     }
                     if changed {
-                        self.record_delegation(child.snapshot.id, metadata.clone());
+                        self.record_delegation(
+                            child.snapshot.id,
+                            metadata.clone(),
+                            child.snapshot.search_config.clone(),
+                        );
                         self.save(&child.snapshot);
                     }
                 }

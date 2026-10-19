@@ -511,6 +511,7 @@ async fn a_local_host_without_prompts_refuses_the_models_schedule() {
             models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
         },
         tickloop_agent_runtime::HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: tickloop_agent_protocol::AgentHostOptions {

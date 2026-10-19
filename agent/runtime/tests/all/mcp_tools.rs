@@ -2577,6 +2577,7 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
+                search: Default::default(),
                 model: config(),
                 settings: None,
                 host: tickloop_agent_protocol::AgentHostOptions {

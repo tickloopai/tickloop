@@ -158,6 +158,7 @@ fn cloud_harness(
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
+                search: Default::default(),
                 model: tickloop_agent_test_support::config(),
                 settings: None,
                 host: AgentHostOptions {

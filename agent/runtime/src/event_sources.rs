@@ -1380,6 +1380,7 @@ mod feedback_admission_tests {
                 )),
             },
             crate::HarnessOptions {
+                search: Default::default(),
                 model: config(),
                 settings: None,
                 host: tickloop_agent_protocol::AgentHostOptions {

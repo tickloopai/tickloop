@@ -80,6 +80,7 @@ fn harness(store: Arc<dyn TranscriptStore>) -> Agent {
             models: ChosenModels::new(Arc::new(Answers)),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

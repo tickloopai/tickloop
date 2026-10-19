@@ -819,30 +819,23 @@ impl Agent {
         let Some(provider) = self.inner.host_tools.read().unwrap().clone() else {
             return Ok(());
         };
-        let changed = {
-            let mut chats = self.inner.chats.lock().await;
-            let mut members = super::family_tree::lineage(&chats, chat_id)?
-                .into_iter()
-                .map(|parent| parent.chat_id)
-                .collect::<Vec<_>>();
-            members.push(chat_id);
-            let mut changed = Vec::new();
-            for member in members {
-                if let Some(delegation) = chats
-                    .get_mut(&member)
-                    .and_then(|chat| chat.snapshot.delegation.as_mut())
-                    && record_artifact_account(
-                        &mut delegation.ceiling.host_tools,
-                        provider.as_ref(),
-                    )?
-                {
-                    changed.push((member, delegation.clone()));
-                }
+        let mut chats = self.inner.chats.lock().await;
+        let mut members = super::family_tree::lineage(&chats, chat_id)?
+            .into_iter()
+            .map(|parent| parent.chat_id)
+            .collect::<Vec<_>>();
+        members.push(chat_id);
+        for member in members {
+            if let Some(chat) = chats.get_mut(&member)
+                && let Some(delegation) = chat.snapshot.delegation.as_mut()
+                && record_artifact_account(&mut delegation.ceiling.host_tools, provider.as_ref())?
+            {
+                self.record_delegation(
+                    member,
+                    delegation.clone(),
+                    chat.snapshot.search_config.clone(),
+                );
             }
-            changed
-        };
-        for (member, delegation) in changed {
-            self.record_delegation(member, delegation);
         }
 
         Ok(())

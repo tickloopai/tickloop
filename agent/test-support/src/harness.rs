@@ -69,6 +69,7 @@ fn local_options(
     settings: Option<tickloop_agent_config::UserSettings>,
 ) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model,
         settings,
         host: AgentHostOptions::embedded_defaults(),
