@@ -238,6 +238,18 @@ fn artifact_client(agent: &Agent) -> Result<Arc<ArtifactClient>, AgentError> {
         .ok_or_else(|| AgentError::Invalid("Tickloop Artifacts is unavailable".into()))
 }
 
+/// The client's current credential. A host-owned source is asked, so a cache nothing has
+/// warmed yet (no tool refresh since the host installed the client) does not read as signed out.
+async fn current_credential(
+    client: &ArtifactClient,
+) -> Result<Option<CredentialSnapshot>, ArtifactError> {
+    if client.is_host_managed() {
+        client.access_snapshot().await
+    } else {
+        client.credential_snapshot()
+    }
+}
+
 trait EventSourceBindingExt {
     fn link(&self) -> AgentLink;
     fn is_for(&self, origin: &str, artifact_id: &str) -> bool;
@@ -343,8 +355,8 @@ impl Agent {
         history: ArtifactFeedbackHistory,
     ) -> Result<(), AgentError> {
         let client = artifact_client(self)?;
-        let credential = client
-            .credential_snapshot()
+        let credential = current_credential(&client)
+            .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?
             .ok_or_else(|| AgentError::Invalid("Not signed in to Tickloop Artifacts".into()))?;
         if credential.origin != tick.origin.trim_end_matches('/') {
@@ -476,8 +488,8 @@ impl Agent {
         tick: &ArtifactTick,
     ) -> Result<(), AgentError> {
         let client = artifact_client(self)?;
-        let credential = client
-            .credential_snapshot()
+        let credential = current_credential(&client)
+            .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?
             .ok_or_else(|| AgentError::Invalid("Not signed in to Tickloop Artifacts".into()))?;
         if credential.origin != tick.origin {
@@ -1116,8 +1128,8 @@ impl Agent {
             }
             return Ok(None);
         }
-        let credential = client
-            .credential_snapshot()
+        let credential = current_credential(&client)
+            .await
             .map_err(|error| error.to_string())?
             .ok_or("Sign in to the Artifact account that received this feedback")?;
         if relevant.iter().any(|identity| {

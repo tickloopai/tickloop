@@ -104,11 +104,20 @@ async fn bound_chat(
     store: Arc<InMemoryTranscriptStore>,
     model: Arc<Script>,
 ) -> (Agent, ChatId, LoopId) {
+    bound_chat_at(store, model, ORIGIN).await
+}
+
+/// [`bound_chat`] with its Loop linked to an artifact at `origin`.
+async fn bound_chat_at(
+    store: Arc<InMemoryTranscriptStore>,
+    model: Arc<Script>,
+    origin: &str,
+) -> (Agent, ChatId, LoopId) {
     let setup = harness(store.clone(), Script::new(Vec::new()), WaitHosting::Durable);
     let (chat, target) = ready_chat(&setup).await;
     setup.sync().await.unwrap();
     setup.shutdown().await;
-    let mut lines = linked(store.lines(chat), target);
+    let mut lines = linked_at(store.lines(chat), target, origin);
     for line in &mut lines {
         if let Line::System(entry) = line
             && let Some(record) = &mut entry.loop_record
@@ -493,8 +502,12 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
 /// The Lines with the Loop `loop_id` linked to the artifact for the account's requests, waiting
 /// for them, as linking it records the Loop.
 fn linked(lines: Vec<Line>, loop_id: LoopId) -> Vec<Line> {
+    linked_at(lines, loop_id, ORIGIN)
+}
+
+fn linked_at(lines: Vec<Line>, loop_id: LoopId, origin: &str) -> Vec<Line> {
     let binding = EventSourceBinding {
-        origin: ORIGIN.into(),
+        origin: origin.into(),
         account_id: ACCOUNT.into(),
         artifact_id: ARTIFACT.into(),
         binding_id: Uuid::new_v4(),
@@ -600,4 +613,61 @@ fn delivery_identity_and_input_id_are_independent_of_the_service_id_representati
     assert_eq!(canonical.delivery_id(), compact.delivery_id());
     assert_eq!(canonical.input_id(), compact.input_id());
     assert!(make("zzzzzzzzzzzzzzzzzzzzzz".into()).is_none());
+}
+
+/// A host's delegated token for the account; nothing has asked for it yet.
+struct HostToken;
+
+#[async_trait::async_trait]
+impl tickloop_agent_artifacts::ArtifactCredentials for HostToken {
+    async fn bearer(&self) -> Result<Option<String>, tickloop_agent_artifacts::ArtifactError> {
+        Ok(Some("delegated-token".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_hosted_account_runs_a_delivery_before_anything_warmed_its_credentials() {
+    // Loopback, so the Artifact tools' directory fails fast instead of reaching a service.
+    let origin = "http://127.0.0.1:9";
+    let model = Script::new(Vec::new());
+    let (agent, chat, target) = bound_chat_at(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        origin,
+    )
+    .await;
+    let provider = tickloop_agent_runtime::mcp_tools::McpHostToolProvider::with_credentials(
+        origin,
+        ACCOUNT,
+        Arc::new(HostToken),
+        None,
+    )
+    .unwrap();
+    agent.install_host_tools(Arc::new(provider)).unwrap();
+    let delivery = ExternalDelivery::from_claim(
+        origin,
+        ACCOUNT,
+        ARTIFACT,
+        &ClaimedFeedback {
+            delivery_id: Uuid::new_v4().to_string(),
+            feedback_id: "request-1".into(),
+            claim_id: Uuid::new_v4().to_string(),
+            fencing_token: "fence-secret".into(),
+            lease_expires_at: "2026-10-20T00:00:00Z".into(),
+            input: json!({"messages": [{"text": "Tighten the title"}]}),
+        },
+    )
+    .unwrap();
+    let outcome = outcome(&agent, chat, TurnRequest::deliver(target, delivery)).await;
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        model
+            .requests()
+            .last()
+            .is_some_and(|request| request.contains(&heading("request-1")))
+    );
+    agent.shutdown().await;
 }
