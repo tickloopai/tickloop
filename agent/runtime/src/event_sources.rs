@@ -1355,12 +1355,17 @@ mod feedback_admission_tests {
             crate::HarnessOptions {
                 model: config(),
                 settings: None,
-                host: tickloop_agent_protocol::AgentHostOptions::product_defaults(),
+                host: tickloop_agent_protocol::AgentHostOptions {
+                    prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
+                    ..tickloop_agent_protocol::AgentHostOptions::product_defaults()
+                },
                 tools: crate::ToolPolicy::web_fetch_only(),
                 host_rules: Vec::new(),
                 task_tools: None,
                 min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
             },
         )
         .unwrap();

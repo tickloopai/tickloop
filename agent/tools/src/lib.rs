@@ -35,6 +35,7 @@ pub use shell::{
     TASK_STOP_TOOL_NAME, UserCommandSnapshot,
 };
 mod web;
+pub mod web_provenance;
 pub mod web_search;
 pub use web::SecondaryModel;
 pub use web::{WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
@@ -478,6 +479,8 @@ pub struct Tools {
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
+    /// The URLs this Chat's fetched pages linked to and its redirects led to.
+    observed_urls: web_provenance::ObservedUrls,
     search_credential_root: Option<PathBuf>,
     file_reads: FileReadState,
     /// The addresses `WebFetch` may reach.
@@ -524,10 +527,16 @@ impl Tools {
             commands,
             search: std::sync::Arc::new(tokio::sync::RwLock::new(SearchConfig::enabled_default())),
             fetched_pages: web::FetchCache::default(),
+            observed_urls: web_provenance::ObservedUrls::default(),
             search_credential_root: None,
             file_reads: FileReadState::default(),
             reach,
         }
+    }
+
+    /// Whether a page this Chat fetched linked to `url`, or a fetch's redirect led there.
+    pub fn has_observed_url(&self, url: &str) -> bool {
+        web_provenance::provenance_key(url).is_some_and(|key| self.observed_urls.contains(&key))
     }
 
     pub fn with_search_configuration(
@@ -828,6 +837,7 @@ impl Tools {
             return web::fetch(
                 input.clone(),
                 &self.fetched_pages,
+                &self.observed_urls,
                 self.reach,
                 secondary_model,
                 cancel,

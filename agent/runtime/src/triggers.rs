@@ -1246,12 +1246,17 @@ mod regression_tests {
             HarnessOptions {
                 model: config(),
                 settings: None,
-                host: AgentHostOptions::product_defaults(),
+                host: AgentHostOptions {
+                    prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
+                    ..AgentHostOptions::product_defaults()
+                },
                 tools: ToolPolicy::web_fetch_only(),
                 host_rules: Vec::new(),
                 task_tools: None,
                 min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
             },
         )
         .unwrap();

@@ -2510,7 +2510,10 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
             HarnessOptions {
                 model: config(),
                 settings: None,
-                host: tickloop_agent_protocol::AgentHostOptions::product_defaults(),
+                host: tickloop_agent_protocol::AgentHostOptions {
+                    prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
+                    ..tickloop_agent_protocol::AgentHostOptions::product_defaults()
+                },
                 tools: ToolPolicy {
                     artifacts: true,
                     ..ToolPolicy::web_fetch_only()
@@ -2519,6 +2522,8 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
                 task_tools: None,
                 min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
             },
         )
         .unwrap();
