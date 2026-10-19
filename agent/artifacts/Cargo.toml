@@ -4,6 +4,8 @@ description = "Agent client of the Artifact Service: device login, credentials a
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

@@ -7,8 +7,8 @@ cargo install --locked tickloop
 tickloop
 ```
 
-This crate contains the installer and launcher only. It does not include the
-Tickloop application's source code. During `cargo install`, the build script
+This crate contains the installer and launcher only; the application's source
+code lives at <https://github.com/tickloopai/tickloop>. During `cargo install`, the build script
 downloads the matching official macOS release from `tickloopai/homebrew-tap` on
 GitHub, verifies SHA-256 and the archive contents, and embeds the complete
 `tickloop`, `tickhost`, and `tick-reader` bundle in the installed launchers.
@@ -34,3 +34,5 @@ also updates the launcher when a newer crate version is available.
 Invalid bundles do not replace an existing runtime. Cached application versions are retained for
 running processes. The launcher passes command arguments and the working
 directory unchanged to the official program.
+
+Licensed under the MIT License.

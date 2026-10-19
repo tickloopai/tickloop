@@ -1,5 +1,6 @@
 # Maintainer-local directories and notes
 references/
+CLAUDE.local.md
 prototypes/
 
 # Rust
@@ -7,10 +8,6 @@ prototypes/
 /vendor/*
 !/vendor/crossterm/
 !/vendor/crossterm/**
-!/vendor/dotenv/
-!/vendor/dotenv/**
-!/vendor/longbridge-oauth/
-!/vendor/longbridge-oauth/**
 target/
 /dist/
 *.profraw
@@ -21,18 +18,9 @@ __pycache__/
 *.pyc
 *.pyo
 
-# .scratch/ is the local issue tracker: specs, tickets, notes and scripts are committed.
-# Rules below drop caches, run outputs, snapshots and native binaries generated inside it.
-.scratch/cargo-home/
-.scratch/**/before/
-.scratch/**/results/
-.scratch/**/pycache/
-.scratch/**/python-deps/
-.scratch/**/*.diff
-.scratch/**/*.log
-.scratch/**/*.ansi
-.scratch/**/*-evidence/
-.scratch/**/*.transcript.jsonl
+# Maintainer-local workspace and design records (specs, tickets, ADRs, design notes, evidence); never published.
+.scratch/
+/docs/
 
 # Native binaries compiled ad hoc (keep the .rs source next to them)
 *.dSYM/
@@ -42,18 +30,7 @@ __pycache__/
 *.so
 
 # Local Agent build cache, state and credentials
-/.scratch/agent/cargo-home/
-/.tickloop/*
-!/.tickloop/skills/
-/.tickloop/skills/*
-!/.tickloop/skills/model-integration/
+/.tickloop/
 /.env
-
-# Agent module implementation evidence
-/.scratch/agent-module-boundaries/results/
-
-# Provider hierarchy validation artifacts
-/.scratch/provider-hierarchy/results/
-
-# Provider/model redesign acceptance output
-/.scratch/provider-model-picker/evidence/
+.DS_Store
+/agent/tickloop/README.md

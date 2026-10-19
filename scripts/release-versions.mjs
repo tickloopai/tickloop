@@ -48,26 +48,13 @@ function withTomlVersion(text, name, version) {
   return lines.join("\n");
 }
 
-export function readProducts(root, channel, selection = "") {
+export function readProducts(root, channel) {
+  if (channel !== "binary") throw new Error("Unknown release channel");
   const read = path => readFileSync(join(root, path), "utf8");
-  if (channel === "binary") {
-    const version = tomlValue(read("Cargo.toml"), "workspace.package", "version");
-    const launcherManifest = "distribution/cargo/Cargo.toml";
-    if (tomlValue(read(launcherManifest), "package", "name") !== "tickloop" || tomlValue(read(launcherManifest), "package", "version") !== version) throw new Error("The Cargo launcher must be named tickloop and match the workspace version.");
-    return [{ id: "binary", label: "Tickloop", scope: "tickloop", kind: "workspace", manifest: "Cargo.toml", launcherManifest, version, tagPrefix: "v", workflow: ".github/workflows/release.yml" }];
-  }
-  if (channel !== "ticks") throw new Error("Unknown release channel");
-  const available = readdirSync(join(root, "ticks"), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
-  const names = selection.trim() ? selection.trim().split(/\s+/) : available;
-  if (!names.length || new Set(names).size !== names.length || names.some(name => !/^[a-z][a-z0-9-]*$/.test(name) || !available.includes(name))) throw new Error(`TICK_PACKAGES must select distinct installed source packages: ${available.join(" ")}`);
-  return names.sort().map(name => {
-    const manifest = `ticks/${name}/Cargo.toml`;
-    const version = tomlValue(read(manifest), "package", "version");
-    const packageManifest = `ticks/${name}/tick-package.json`;
-    const metadata = JSON.parse(read(packageManifest));
-    if (metadata.name !== name || metadata.version !== version) throw new Error(`${packageManifest} must match its Cargo package name and version.`);
-    return { id: name, label: name, scope: `tick-${name}`, kind: "tick", manifest, packageManifest, cargoName: tomlValue(read(manifest), "package", "name"), version, tagPrefix: `tick-${name}-v`, workflow: ".github/workflows/release-ticks.yml" };
-  });
+  const version = tomlValue(read("Cargo.toml"), "workspace.package", "version");
+  const launcherManifest = "distribution/cargo/Cargo.toml";
+  if (tomlValue(read(launcherManifest), "package", "name") !== "tickloop" || tomlValue(read(launcherManifest), "package", "version") !== version) throw new Error("The Cargo launcher must be named tickloop and match the workspace version.");
+  return [{ label: "Tickloop", manifest: "Cargo.toml", launcherManifest, version, tagPrefix: "v", workflow: ".github/workflows/release.yml" }];
 }
 
 export function versionChanges(root, products) {
@@ -76,32 +63,24 @@ export function versionChanges(root, products) {
   const cargoVersions = new Map();
   for (const product of products) {
     parseVersion(product.nextVersion);
-    if (product.kind === "tick") {
-      changes.set(product.manifest, withTomlVersion(read(product.manifest), "package", product.nextVersion));
-      const manifest = JSON.parse(read(product.packageManifest));
-      manifest.version = product.nextVersion;
-      changes.set(product.packageManifest, JSON.stringify(manifest, null, 2) + "\n");
-      cargoVersions.set(product.cargoName, { before: product.version, after: product.nextVersion });
-    } else {
-      const workspace = read(product.manifest);
-      changes.set(product.manifest, withTomlVersion(workspace, "workspace.package", product.nextVersion));
-      changes.set(product.launcherManifest, withTomlVersion(read(product.launcherManifest), "package", product.nextVersion));
-      const launcherLock = "distribution/cargo/Cargo.lock";
-      const lockText = read(launcherLock);
-      if (tomlValue(lockText, "[package]", "name") !== "tickloop" || tomlValue(lockText, "[package]", "version") !== product.version) throw new Error("The Cargo launcher lock version must match the workspace version.");
-      changes.set(launcherLock, withTomlVersion(lockText, "[package]", product.nextVersion));
-      const { lines, start, end } = section(workspace, "workspace");
-      const members = lines.slice(start, end).join("\n").match(/\bmembers\s*=\s*\[([\s\S]*?)\]/)?.[1];
-      if (!members) throw new Error("Workspace members are missing");
-      for (const [, member] of members.matchAll(/"([^"]+)"/g)) {
-        const directories = member.endsWith("/*")
-          ? readdirSync(join(root, member.slice(0, -2)), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => `${member.slice(0, -2)}/${entry.name}`)
-          : [member];
-        for (const directory of directories) {
-          const text = read(`${directory}/Cargo.toml`);
-          const { lines, start, end } = section(text, "package");
-          if (lines.slice(start, end).some(line => /^\s*version\.workspace\s*=\s*true\s*(?:#.*)?$/.test(line))) cargoVersions.set(tomlValue(text, "package", "name"), { before: product.version, after: product.nextVersion });
-        }
+    const workspace = read(product.manifest);
+    changes.set(product.manifest, withTomlVersion(workspace, "workspace.package", product.nextVersion));
+    changes.set(product.launcherManifest, withTomlVersion(read(product.launcherManifest), "package", product.nextVersion));
+    const launcherLock = "distribution/cargo/Cargo.lock";
+    const lockText = read(launcherLock);
+    if (tomlValue(lockText, "[package]", "name") !== "tickloop" || tomlValue(lockText, "[package]", "version") !== product.version) throw new Error("The Cargo launcher lock version must match the workspace version.");
+    changes.set(launcherLock, withTomlVersion(lockText, "[package]", product.nextVersion));
+    const { lines, start, end } = section(workspace, "workspace");
+    const members = lines.slice(start, end).join("\n").match(/\bmembers\s*=\s*\[([\s\S]*?)\]/)?.[1];
+    if (!members) throw new Error("Workspace members are missing");
+    for (const [, member] of members.matchAll(/"([^"]+)"/g)) {
+      const directories = member.endsWith("/*")
+        ? readdirSync(join(root, member.slice(0, -2)), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => `${member.slice(0, -2)}/${entry.name}`)
+        : [member];
+      for (const directory of directories) {
+        const text = read(`${directory}/Cargo.toml`);
+        const { lines, start, end } = section(text, "package");
+        if (lines.slice(start, end).some(line => /^\s*version\.workspace\s*=\s*true\s*(?:#.*)?$/.test(line))) cargoVersions.set(tomlValue(text, "package", "name"), { before: product.version, after: product.nextVersion });
       }
     }
   }

@@ -4,6 +4,8 @@ description = "Installing, updating and removing Tick packages from the Tick mar
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

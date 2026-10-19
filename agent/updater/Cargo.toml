@@ -4,6 +4,8 @@ description = "Versioned installation, update checks and pinned executable bundl
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

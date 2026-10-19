@@ -1,7 +1,0 @@
-# Written by Tick Loop: replaces dotenv 0.15 for the Longbridge SDK so that no `.env` file is read.
-[package]
-name = "dotenv"
-version = "0.15.0"
-edition = "2024"
-description = "A dotenv that loads nothing"
-publish = false

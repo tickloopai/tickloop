@@ -4,6 +4,8 @@ description = "Tick packages: the tick-package.json manifest, the Tick marketpla
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "tick_packages"

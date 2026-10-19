@@ -2548,14 +2548,10 @@ mod tests {
         }
     }
 
-    /// The built-in Skills and those of the Tick packages in this repository name a tool by its
-    /// compound name, such as `TickManage`; each such name must be a tool the model can be given.
+    /// The built-in Skills name a tool by its compound name, such as `TickManage`; each such name
+    /// must be a tool the model can be given.
     #[test]
     fn shipped_skills_name_only_tools_the_agent_offers() {
-        const PACKAGE_SKILLS: [&str; 2] = [
-            include_str!("../../../ticks/longbridge/skills/usage/SKILL.md"),
-            include_str!("../../../ticks/futu/skills/usage/SKILL.md"),
-        ];
         const NOT_TOOLS: [&str; 2] = ["OutcomeUnknown", "TickUpdate"];
         let tools = built_in_definitions()
             .into_iter()
@@ -2579,7 +2575,6 @@ mod tests {
         };
         let named = tickloop_agent_config::skills::BUILTIN_SKILLS
             .into_iter()
-            .chain(PACKAGE_SKILLS)
             .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
             .filter(is_compound_name)
             .collect::<HashSet<_>>();

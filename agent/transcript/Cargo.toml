@@ -4,6 +4,8 @@ description = "Transcript record format: Lines, their entries, and the display p
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

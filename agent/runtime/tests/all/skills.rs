@@ -26,19 +26,6 @@ fn write_skill(directory: &std::path::Path, name: &str, frontmatter: &str, body:
 }
 
 #[test]
-fn repository_model_integration_skill_is_discovered_and_expandable() {
-    let workdir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let registry = SkillRegistry::discover(workdir, None);
-    let expansion = registry
-        .expand("/model-integration", "", SkillCaller::User)
-        .unwrap();
-    assert!(matches!(expansion.source, SkillSource::Project { .. }));
-    assert!(expansion.content.contains("model/history.rs"));
-    assert!(registry.model_listing().contains("model-integration"));
-    assert!(expansion.allowed_tools.is_empty());
-}
-
-#[test]
 fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".git")).unwrap();

@@ -4,6 +4,8 @@ description = "Test code shared by the Agent crates' tests: a scripted model, Tr
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

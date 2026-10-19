@@ -1668,8 +1668,7 @@ fn split_overflow(line: &MarkdownLine, width: usize) -> Vec<Vec<(String, Option<
     rows
 }
 
-/// Maps Markdown semantics onto roles; `docs/design/agent-ui.md` records the
-/// precedence when a run carries several marks.
+/// Maps Markdown semantics onto roles; the first matching mark wins when a run carries several.
 fn markdown_role(marks: Marks) -> Option<Role> {
     if let Some(token) = marks.code {
         Some(Role::code(token))

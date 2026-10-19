@@ -18,8 +18,8 @@ use uuid::Uuid;
 use super::Agent;
 use tickloop_agent_tools::permissions::PermissionPolicyExt;
 
-const DATASET: &str = include_str!("../../../.scratch/approval-parity/benchmark-cases.tsv");
-const DIALOGUES: &str = include_str!("../../../.scratch/approval-parity/benchmark-dialogues.json");
+const DATASET: &str = include_str!("../tests/fixtures/approval-parity/benchmark-cases.tsv");
+const DIALOGUES: &str = include_str!("../tests/fixtures/approval-parity/benchmark-dialogues.json");
 
 struct RecordingReviewer {
     client: Arc<dyn ModelClient>,
@@ -147,7 +147,7 @@ fn prepare(case: &Case<'_>, directory: &Path) -> tickloop_agent_tools::PreparedT
 #[test]
 fn benchmark_has_two_balanced_independent_frozen_sets() {
     let frozen: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../.scratch/approval-parity/benchmark-freeze.json"
+        "../tests/fixtures/approval-parity/benchmark-freeze.json"
     ))
     .unwrap();
     assert_eq!(

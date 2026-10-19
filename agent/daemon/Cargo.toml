@@ -4,6 +4,8 @@ description = "Agent daemon and worker processes: the AgentAccess server and the
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

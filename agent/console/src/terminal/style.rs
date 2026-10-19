@@ -5,9 +5,6 @@
 //! at the point where bytes reach the terminal. Body text stays free of escape
 //! sequences: styling and hyperlinks travel in the span structure, not inside
 //! the string.
-//!
-//! The palette and the quantisation choice are recorded in
-//! `docs/design/agent-ui.md`, which cites the Claude Code source it reproduces.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -132,7 +129,7 @@ impl Style {
 /// What a span is in the interface. Content roles are neutral names for the
 /// Claude Code theme keys they reproduce; chrome roles share their names with
 /// the workbench client's roles. Decorations such as bold belong to the role,
-/// never to the call site. The mapping is recorded in `docs/design/agent-ui.md`.
+/// never to the call site.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Role {
     Text,
@@ -819,7 +816,7 @@ const fn squared_distance(left: u8, right: u8) -> u32 {
 /// carries in `native-ts/color-diff`. It compares the 6x6x6 cube candidate
 /// against the grey ramp candidate and takes whichever is closer, which beats
 /// the simpler segmenting quantiser on every palette entry where the two
-/// disagree — see `docs/design/agent-ui.md`.
+/// disagree.
 const fn quantise(colour: Rgb) -> u8 {
     let (red, green, blue) = (colour.red, colour.green, colour.blue);
     let (red_level, green_level, blue_level) =
@@ -854,7 +851,6 @@ const fn quantise(colour: Rgb) -> u8 {
 /// message indistinguishable from body text and an added diff line
 /// indistinguishable from its surroundings. Both are forced onto the colour
 /// cube instead, and Tick Red onto the cube's pure red rather than its orange.
-/// Recorded in `docs/design/agent-ui.md`.
 const fn manual_override(colour: Rgb) -> Option<u8> {
     match (colour.red, colour.green, colour.blue) {
         (44, 122, 57) => Some(29), // Success / light

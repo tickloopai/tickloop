@@ -5,8 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compareVersions, nextVersion, readProducts, versionChanges } from "./release-versions.mjs";
 
-const expectedRepository = "griffinqiu/tickloop";
-const marketplaceRepository = "tickloopai/ticks";
+const expectedRepository = "tickloopai/tickloop";
 const allowedRemoteUrls = new Set([
   `git@github.com:${expectedRepository}`, `git@github.com:${expectedRepository}.git`,
   `ssh://git@github.com/${expectedRepository}`, `ssh://git@github.com/${expectedRepository}.git`,
@@ -16,7 +15,7 @@ const allowedRemoteUrls = new Set([
 const maximumTagsPerPush = 3;
 const maximumSnapshotAttempts = 3;
 const releaseLockPollMilliseconds = 100;
-const channels = new Set(["binary", "ticks"]);
+const channels = new Set(["binary"]);
 
 function command(program, args, options = {}) {
   const result = spawnSync(program, args, { encoding: "utf8", ...options });
@@ -109,16 +108,14 @@ function assertVersionFilesUnchanged(paths) {
   if (changes) throw new Error(`Release version files have local edits that would be overwritten; other working-tree changes are allowed:\n${changes}`);
 }
 
-function assertUnusedTag(tag, remote = "origin") {
+function assertUnusedTag(tag) {
   const ref = `refs/tags/${tag}`;
-  if (remote === "origin") {
-    const result = git(["show-ref", "--verify", "--quiet", ref]);
-    if (result.status === 0) throw new Error(`${tag} already exists locally.`);
-    if (result.status !== 1) throw new Error("Could not inspect local tags.");
-  }
-  const result = git(["ls-remote", "--exit-code", "--refs", remote, ref]);
-  if (result.status === 0) throw new Error(`${tag} already exists on ${remote}.`);
-  if (result.status !== 2) throw new Error(`Could not check tags on ${remote}; no release was started.`);
+  const local = git(["show-ref", "--verify", "--quiet", ref]);
+  if (local.status === 0) throw new Error(`${tag} already exists locally.`);
+  if (local.status !== 1) throw new Error("Could not inspect local tags.");
+  const remote = git(["ls-remote", "--exit-code", "--refs", "origin", ref]);
+  if (remote.status === 0) throw new Error(`${tag} already exists on origin.`);
+  if (remote.status !== 2) throw new Error("Could not check tags on origin; no release was started.");
 }
 
 function checkReleaseTargets(products) {
@@ -136,27 +133,12 @@ function checkReleaseTargets(products) {
     }
     assertUnusedTag(product.tag);
   }
-  const ticks = products.filter(product => product.kind === "tick");
-  if (ticks.length) {
-    const response = command("curl", ["--fail", "--silent", "--show-error", "--location", "--max-time", "30", `https://raw.githubusercontent.com/${marketplaceRepository}/HEAD/marketplace.json`]);
-    if (response.status !== 0) throw new Error("Could not read the Tick marketplace; no release was started.");
-    const marketplace = JSON.parse(response.stdout);
-    if (!Array.isArray(marketplace.packages)) throw new Error("The Tick marketplace has no package list.");
-    for (const product of ticks) {
-      const listed = marketplace.packages.find(entry => entry.name === product.id);
-      if (listed && compareVersions(product.nextVersion, listed.version) <= 0) throw new Error(`${product.label} ${product.nextVersion} is not newer than marketplace version ${listed.version}.`);
-      assertUnusedTag(`${product.id}-v${product.nextVersion}`, `https://github.com/${marketplaceRepository}`);
-    }
-  }
 }
 
-function checksFor(channel, products) {
-  if (channel === "binary") return [
-    ["make", ["build"]],
-    ["cargo", ["package", "--locked", "--allow-dirty", "--no-verify", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
-  ];
-  return [["cargo", ["check", "--locked", ...products.flatMap(product => ["-p", product.cargoName]), "--bins"]]];
-}
+const releaseChecks = [
+  ["make", ["build"]],
+  ["cargo", ["package", "--locked", "--allow-dirty", "--no-verify", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
+];
 
 function prepareAndCheck(channel, state, mode) {
   const parent = mkdtempSync(join(tmpdir(), "tickloop-release-"));
@@ -164,7 +146,7 @@ function prepareAndCheck(channel, state, mode) {
   const added = git(["worktree", "add", "--detach", snapshot, state.commit], { readOnly: false });
   try {
     if (added.status !== 0) throw new Error(`Could not create the release checkout: ${added.stderr.trim()}`);
-    const products = readProducts(snapshot, channel, process.env.TICK_PACKAGES).map(product => {
+    const products = readProducts(snapshot, channel).map(product => {
       const version = nextVersion(product, process.env.VERSION);
       return { ...product, nextVersion: version, tag: `${product.tagPrefix}${version}` };
     });
@@ -174,7 +156,7 @@ function prepareAndCheck(channel, state, mode) {
     if (mode) return { products, changes };
     for (const [path, content] of changes) writeFileSync(join(snapshot, path), content);
     const env = { ...process.env, CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || join(state.root, "target") };
-    for (const [program, args] of checksFor(channel, products)) {
+    for (const [program, args] of releaseChecks) {
       const result = command(program, args, { cwd: snapshot, env, stdio: "inherit" });
       if (result.status !== 0) throw new Error(`${channel} ${program} check failed; no version commit or release tag was created.`);
     }
@@ -223,7 +205,7 @@ function finalizeRelease(products, state, changes) {
 
 try {
   const [channel, mode, ...extra] = process.argv.slice(2);
-  if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] [TICK_PACKAGES='longbridge futu'] node scripts/release.mjs binary|ticks [--check|--dry-run]");
+  if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] node scripts/release.mjs binary [--check|--dry-run]");
   const releaseLock = acquireReleaseLock();
   try {
     const initial = preflight();

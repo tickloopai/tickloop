@@ -2000,7 +2000,7 @@ fn agent_layout_pty_fixture() {
                             if index == 0 { "alpha task" } else { "beta task" },
                         );
                         row.project = format!(
-                            "~/.herdr/worktrees/tickloop/long-common-parent-prefix/shared-nested-directory/another-shared-directory/{project}"
+                            "/Users/someone/.herdr/worktrees/tickloop/long-common-parent-prefix/shared-nested-directory/another-shared-directory/{project}"
                         );
                         row.workspace = Some(format!("workspace-{index}"));
                         row.approvals = 1;

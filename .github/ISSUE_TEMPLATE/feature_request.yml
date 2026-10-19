@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a new capability or an improvement to Tickloop
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please search existing issues first.
+        Ideas for new Tick packages or data sources belong in [tickloopai/ticks](https://github.com/tickloopai/ticks/issues).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what makes it hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you would like Tickloop to behave. Commands, key bindings or example conversations help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or how other tools handle this.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context

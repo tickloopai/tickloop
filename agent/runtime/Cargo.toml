@@ -4,6 +4,8 @@ description = "Agent runtime: Loops, Subagents, Transcripts, Tick streams and ho
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

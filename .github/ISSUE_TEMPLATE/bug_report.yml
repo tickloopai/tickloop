@@ -1,0 +1,63 @@
+name: Bug report
+description: Report something in Tickloop that does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please search existing issues first.
+        Do not report security vulnerabilities here; follow the [security policy](https://github.com/tickloopai/tickloop/security/policy) instead.
+        Problems with the `longbridge` or `futu` Tick packages belong in [tickloopai/ticks](https://github.com/tickloopai/ticks/issues).
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: A clear description of the problem, and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, what you typed to the agent, and which keys you pressed.
+      placeholder: |
+        1. Run `tickloop` in ...
+        2. Ask the agent to ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tickloop version
+      description: Output of `tickloop --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - Homebrew
+        - Install script
+        - Cargo launcher (cargo install tickloop)
+        - From source
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version and architecture, terminal emulator, and Herdr version if relevant.
+      placeholder: macOS 15.5 (Apple silicon), Ghostty 1.2, Herdr 0.9
+  - type: input
+    id: model
+    attributes:
+      label: Model provider and model
+      description: If the problem involves model requests, which connection and model you used.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or logs
+      description: Relevant error messages or screenshots. Remove API keys, tokens, account details and private file contents first.
+      render: text

@@ -15,7 +15,7 @@ concurrency:
 
 env:
   RELEASE_TAG: ${{ github.ref_name }}
-  # Application source stays private; all installers download archives from the public tap.
+  # Homebrew, the native updater and the Cargo launcher all download archives from the tap's Releases.
   TAP_REPOSITORY: tickloopai/homebrew-tap
   FORMULA_TEMPLATE: .github/homebrew/tickloop.rb.in
 
@@ -38,7 +38,7 @@ jobs:
           node-version: '22'
 
       - name: Test the release script
-        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs scripts/install.test.mjs scripts/release-cargo.test.mjs
+        run: node --test scripts/release.test.mjs scripts/install.test.mjs scripts/release-cargo.test.mjs
 
       - name: Install stable Rust for the Cargo launcher
         run: |

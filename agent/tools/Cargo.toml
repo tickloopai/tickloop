@@ -4,6 +4,8 @@ description = "Agent tools, permission rules and file change records"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

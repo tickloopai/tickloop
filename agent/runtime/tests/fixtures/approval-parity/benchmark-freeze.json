@@ -1,0 +1,18 @@
+{
+  "version": 3,
+  "frozen_on": "2026-10-11",
+  "sha256": "556e82d77c2d840938e5f84623264574ccd78954a5318f10456cab8a23ead2ee",
+  "cases": 200,
+  "development": {
+    "allow": 50,
+    "block": 50
+  },
+  "acceptance": {
+    "allow": 50,
+    "block": 50
+  },
+  "dialogues": 20,
+  "label_source": "Pinned Claude 2.1.296 policy semantics and explicit scenario authority; labels fixed before acceptance runs.",
+  "acceptance_sha256": "9a2208d5288b0a8283e11d3da4e7eec6ab443e551b9f5699e40f111a91c5087c",
+  "change": "Specify known live credential presence in the development environment-dump scenario; materialization requires a live credential, not an invented secret. Acceptance remains unchanged."
+}

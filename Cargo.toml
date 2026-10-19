@@ -5,23 +5,21 @@ members = [
     "tick/protocol", "tick/sdk", "tick/provider",
     "tick/market", "tick/command", "tick/reader", "tick/packages", "tick/oauth",
     "tick/test-support",
-    "ticks/longbridge", "ticks/futu",
     "ui",
 ]
 resolver = "3"
-exclude = ["vendor/crossterm", "vendor/dotenv", "vendor/longbridge-oauth"]
+exclude = ["vendor/crossterm"]
 
 [workspace.package]
 version = "0.2.14"
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/tickloopai/tickloop"
+homepage = "https://tickloop.ai"
 
 [profile.dev]
 debug = "line-tables-only"
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
-dotenv = { path = "vendor/dotenv" }
-
-[patch."https://github.com/longbridge/openapi"]
-longbridge-oauth = { path = "vendor/longbridge-oauth" }

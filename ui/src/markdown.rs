@@ -1,8 +1,7 @@
 //! Markdown layout shared by every host that shows Markdown.
 //!
 //! The rules reproduce Claude Code's `formatToken`, `MarkdownTable` and
-//! `StreamingMarkdown`; `docs/design/agent-ui.md` records them together with the
-//! deliberate deviations. Output lines carry semantic [`Marks`] instead of
+//! `StreamingMarkdown`, with a few deliberate deviations. Output lines carry semantic [`Marks`] instead of
 //! styles, so each host maps them onto its own theme.
 
 use std::ops::Range;

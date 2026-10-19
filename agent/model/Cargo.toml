@@ -4,6 +4,8 @@ description = "Agent model clients, provider sign-in and typed judgments"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false

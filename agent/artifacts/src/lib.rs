@@ -1130,8 +1130,7 @@ mod address_tests {
 
     #[test]
     fn artifact_urls_use_the_services_fixed_width_short_ids_under_its_base_path() {
-        // Tickloop Cloud pins the same values in web-artifacts/tests/web-app-paths.test.ts, so both
-        // encoders agree.
+        // The Artifacts service pins the same values, so both encoders agree.
         assert_eq!(
             short_artifact_id("e1b85a39-a57b-4c28-a8a5-ae9233aead3e"),
             "6rvWPvOnhVABug7llbHb26"

@@ -4,6 +4,8 @@ description = "tick-reader: the Reader Tick for original financial documents, bu
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "tick-reader"

@@ -18,14 +18,14 @@ use super::{
     jev_review,
 };
 
-const CASES: &str = include_str!("../../../.scratch/approval-parity/replay-cases.json");
+const CASES: &str = include_str!("../tests/fixtures/approval-parity/replay-cases.json");
 const DEPENDENCY_CASES: &str =
-    include_str!("../../../.scratch/approval-parity/dependency-review-cases.json");
+    include_str!("../tests/fixtures/approval-parity/dependency-review-cases.json");
 const HISTORY_CASES: &str =
-    include_str!("../../../.scratch/approval-parity/history-review-cases.json");
+    include_str!("../tests/fixtures/approval-parity/history-review-cases.json");
 
 const DEFAULT_POLICY_CASES: &str =
-    include_str!("../../../.scratch/approval-parity/default-policy-review-cases.json");
+    include_str!("../tests/fixtures/approval-parity/default-policy-review-cases.json");
 
 fn context(case: &Value) -> ApprovalSnapshot {
     let policy = tickloop_agent_config::AutoSettings::default().policy();

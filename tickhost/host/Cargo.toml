@@ -4,6 +4,8 @@ description = "The tickhost executable and library: runs Agent-opened extension 
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "tickhost"

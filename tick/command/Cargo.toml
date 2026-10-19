@@ -4,6 +4,8 @@ description = "What every Tick Command shares: display flags, configuration, the
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "tick_command"

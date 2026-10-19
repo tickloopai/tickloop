@@ -4,6 +4,8 @@ description = "Leaf utilities of the Agent: private files, HTTP policy, images a
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 doctest = false
