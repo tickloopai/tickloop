@@ -286,14 +286,14 @@ impl Agent {
             )
             .await?;
             Box::pin(self.stop_at_safe_point(receipt, Some(&call.call_id))).await?;
-            self.execute_and_commit_tool_call(
+            Box::pin(self.execute_and_commit_tool_call(
                 receipt,
                 &batch,
                 call,
                 registry,
                 cancel.clone(),
                 cancel,
-            )
+            ))
             .await?;
         }
         self.execute_concurrent_tools(receipt, &batch, concurrent, registry, cancel)
@@ -333,14 +333,14 @@ impl Agent {
                     AssertUnwindSafe(coordinate_call(
                         gate.clone(),
                         group_cancel.clone(),
-                        self.execute_and_commit_tool_call(
+                        Box::pin(self.execute_and_commit_tool_call(
                             receipt,
                             batch,
                             call,
                             registry,
                             group_cancel.clone(),
                             cancel,
-                        ),
+                        )),
                     ))
                     .catch_unwind(),
                 );

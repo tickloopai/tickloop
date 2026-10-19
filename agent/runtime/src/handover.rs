@@ -1,9 +1,10 @@
 //! Voluntary handover. A host that gives up a family it holds, at its holding-time cap or on
 //! SIGTERM, drains it: no Run starts, and each running Run stops at its next safe point, which
-//! is before its next tool call or model request (a wait for a request gate and a retry backoff
-//! count). It records where it stopped as a `Handover` wait of its suspended answer, so the
-//! next holder goes on with the same attempt. A model request that is streaming and a tool call
-//! that is running finish first. Whatever still runs at the ceiling ends as a host would lose
+//! is before its next tool call that runs alone, its next group of concurrency-safe calls, or
+//! its next model request (a wait for a request gate and a retry backoff count). It records
+//! where it stopped as a `Handover` wait of its suspended answer, so the next holder goes on
+//! with the same attempt. A model request that is streaming and tool calls that are running
+//! finish first. Whatever still runs at the ceiling ends as a host would lose
 //! it, as `Interrupted{Handover}`: its input stays open and its Loop as it was, no completion is
 //! recorded, and the next holder continues it without counting it as a lost host.
 
