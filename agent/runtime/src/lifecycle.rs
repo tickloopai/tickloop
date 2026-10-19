@@ -261,6 +261,13 @@ impl Lifecycle {
             .any(|input| input.record.loop_id == loop_id)
     }
 
+    pub(crate) fn feedback_entries(&self) -> impl Iterator<Item = &InputEntry> {
+        self.inputs
+            .values()
+            .map(|input| &input.record)
+            .filter(|input| input.op == InputOp::Feedback)
+    }
+
     /// Every input the ledger has open: accepted or started, and not settled.
     pub(crate) fn open_entries(&self) -> Vec<InputEntry> {
         let mut open = self

@@ -89,6 +89,50 @@ fn time(milliseconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(milliseconds)
 }
 
+#[tokio::test]
+async fn a_legacy_armed_interval_uses_its_record_time_and_fires_after_durable_load() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let first = durable(store.clone(), Script::new(Vec::new()));
+    let (chat, loop_id) = chat_with_goal(&first).await;
+    first
+        .configure_trigger(chat, loop_id, Some(every("every 1h")))
+        .await
+        .unwrap();
+    first.sync().await.unwrap();
+    first.shutdown().await;
+    let armed_at = milliseconds(SystemTime::now()) - HOUR_MS - MINUTE_MS;
+    let mut lines = store.lines(chat);
+    for line in &mut lines {
+        if let Line::System(entry) = line
+            && let Some(record) = &mut entry.loop_record
+            && record.loop_id == loop_id
+            && let Some(trigger) = record.trigger.as_mut().and_then(Value::as_object_mut)
+        {
+            trigger.remove("schedule");
+            trigger.remove("armed_at_ms");
+            trigger.insert("interval_seconds".into(), json!(3600));
+            entry.timestamp = tickloop_agent_base::timestamp::format_timestamp(armed_at);
+        }
+    }
+    let legacy = Arc::new(InMemoryTranscriptStore::new());
+    legacy.seed(chat, lines, StorePosition(1));
+    let model = Script::new(Vec::new());
+    let next = durable(legacy, model.clone());
+    next.wake(chat, None).await.unwrap();
+    assert_eq!(
+        trigger_of(&next, chat, loop_id).await.armed_at_ms,
+        Some(armed_at)
+    );
+    let fire = input_ids::trigger(loop_id, armed_at + HOUR_MS);
+    assert!(matches!(
+        until_settled(&next, chat, fire).await,
+        SettledOutcome::Completed { .. }
+    ));
+    assert_eq!(checks(&model), 1);
+    assert_eq!(wake_at(&next, chat).await, Some(armed_at + 2 * HOUR_MS));
+    next.shutdown().await;
+}
+
 /// A Chat whose first goal has completed, and that goal's Loop.
 async fn chat_with_goal(agent: &Agent) -> (ChatId, LoopId) {
     let chat = agent.create_chat_without_folder().await.unwrap();

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use tickloop_agent_artifacts::ClaimedFeedback;
-use tickloop_agent_protocol::{AgentHostOptions, Content, PromptPolicy};
-use tickloop_agent_runtime::transcript::TranscriptStore;
+use tickloop_agent_protocol::{AgentHostOptions, Content, EventSourceBinding, PromptPolicy};
+use tickloop_agent_runtime::transcript::{LoadRange, TranscriptStore};
 use tickloop_agent_runtime::{
     Agent, Delivery, ExternalDelivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy,
     TurnOp, TurnOutcome, TurnRequest, UserMessage, WaitHosting,
@@ -167,6 +167,40 @@ async fn a_delivery_whose_holder_died_before_acknowledging_enters_the_conversati
                 _ => None,
             })
             .expect("the prompt is a ledger input");
+
+        let chat = cloud.chats.harness_chat(cloud.chat).unwrap();
+        let transcripts = cloud.chats.transcripts();
+        let stored = transcripts
+            .load(chat, LoadRange::Full)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut lines = cloud.lines();
+        let record = lines
+            .iter_mut()
+            .rev()
+            .find_map(|line| match line {
+                Line::System(entry) => entry
+                    .loop_record
+                    .as_mut()
+                    .filter(|record| record.loop_id == target),
+                _ => None,
+            })
+            .unwrap();
+        record.event_sources = vec![
+            serde_json::to_value(EventSourceBinding {
+                origin: "https://tickloop.ai/artifact".into(),
+                account_id: "owner".into(),
+                artifact_id: "doc".into(),
+                binding_id: Uuid::new_v4(),
+                client_instance_id: Uuid::new_v4(),
+                epoch: 1,
+                resume_required: false,
+                last_request_at_ms: None,
+            })
+            .unwrap(),
+        ];
+        transcripts.seed(chat, lines, stored.position);
 
         let request = TurnRequest::deliver(target, delivery());
         let holding = cloud.host("crashing").acquire(cloud.chat).unwrap();

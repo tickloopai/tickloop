@@ -2490,6 +2490,97 @@ async fn feedback_account_provenance_survives_restart_and_stop_works_after_accou
 }
 
 #[tokio::test]
+async fn folderless_feedback_rejects_an_account_change_before_delivery_or_continuation() {
+    use tickloop_agent_runtime::{
+        HarnessOptions, HarnessSeams, ToolPolicy, TurnRequest, WaitHosting,
+    };
+    use tickloop_agent_test_support::harness::ChosenModels;
+
+    for switch_before_delivery in [true, false] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = service.login(directory.path()).await;
+        let model = Arc::new(ScriptedModel::new(vec![text("received")]));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                transcripts: None,
+                environment: None,
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions {
+                model: config(),
+                settings: None,
+                host: tickloop_agent_protocol::AgentHostOptions::product_defaults(),
+                tools: ToolPolicy {
+                    artifacts: true,
+                    ..ToolPolicy::web_fetch_only()
+                },
+                host_rules: Vec::new(),
+                task_tools: None,
+                min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
+                waits: WaitHosting::Durable,
+            },
+        )
+        .unwrap();
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(client, None)))
+            .unwrap();
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        agent
+            .link_artifact(
+                chat,
+                &artifact_tick(&service, "doc"),
+                tickloop_agent_protocol::ArtifactFeedbackHistory::All,
+            )
+            .await
+            .unwrap();
+        let goal = agent.snapshot(chat).await.unwrap().loops[0].clone();
+        let source = &goal.event_sources[0];
+        let delivery = tickloop_agent_runtime::ExternalDelivery::from_claim(
+            &source.origin,
+            &source.account_id,
+            &source.artifact_id,
+            &tickloop_agent_artifacts::ClaimedFeedback {
+                delivery_id: uuid::Uuid::new_v4().to_string(),
+                feedback_id: "private-feedback".into(),
+                claim_id: "claim".into(),
+                fencing_token: "secret-fence".into(),
+                lease_expires_at: "2026-10-20T00:00:00Z".into(),
+                input: json!({"messages": [{"text": "private input"}]}),
+            },
+        )
+        .unwrap();
+        if !switch_before_delivery {
+            let turn = agent
+                .advance(chat, TurnRequest::deliver(goal.id, delivery.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                turn.outcome().await.unwrap(),
+                tickloop_agent_runtime::TurnOutcome::Completed { .. }
+            ));
+        }
+        let requests = model.requests.lock().unwrap().len();
+        service.control.other_account.store(true, Ordering::SeqCst);
+        service.login(directory.path()).await;
+        if switch_before_delivery {
+            agent
+                .advance(chat, TurnRequest::deliver(goal.id, delivery))
+                .await
+                .unwrap();
+        } else {
+            agent
+                .submit(chat, Some(goal.id), "Continue".into())
+                .await
+                .unwrap();
+        }
+        wait_for_loop_state(&agent, chat, goal.id, LoopState::Failed).await;
+        assert_eq!(model.requests.lock().unwrap().len(), requests);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pending_requests() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();

@@ -512,6 +512,7 @@ struct SubmissionOptions {
     trigger_source: Option<TriggerSource>,
     trigger_cancel: Option<CancellationToken>,
     feedback_input: Option<feedback_inbox::FeedbackIdentity>,
+    requires_feedback_binding: bool,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -2421,6 +2422,7 @@ impl Agent {
             trigger_source,
             trigger_cancel,
             feedback_input,
+            requires_feedback_binding,
             invoked_skill,
             host_context,
             agent_message,
@@ -2511,6 +2513,22 @@ impl Agent {
             self.save(&original.snapshot);
             self.inner.ledger_changes.send_replace(());
             return Ok(receipt);
+        }
+        if requires_feedback_binding
+            && let Some(identity) = &feedback_input
+            && !original.snapshot.loops.iter().any(|goal| {
+                goal.id == identity.loop_id
+                    && goal.event_sources.iter().any(|source| {
+                        !source.resume_required
+                            && source.origin == identity.origin
+                            && source.account_id == identity.account_id
+                            && source.artifact_id == identity.artifact_id
+                    })
+            })
+        {
+            return Err(AgentError::Invalid(
+                "the Loop has no active binding for this Artifact delivery".into(),
+            ));
         }
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));

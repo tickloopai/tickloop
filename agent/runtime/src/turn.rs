@@ -403,6 +403,27 @@ impl Agent {
     /// with its outcome, a live one is attached to, and one whose answer lost its host is
     /// continued by another attempt. The same id with another payload is refused.
     pub async fn advance(&self, chat_id: ChatId, request: TurnRequest) -> Result<Turn, AgentError> {
+        self.advance_with_delivery_binding(chat_id, request, true)
+            .await
+    }
+
+    /// The local inbox already received this input; unlinking does not revoke its admission.
+    pub(super) async fn advance_received_delivery(
+        &self,
+        chat_id: ChatId,
+        target: LoopId,
+        delivery: ExternalDelivery,
+    ) -> Result<Turn, AgentError> {
+        self.advance_with_delivery_binding(chat_id, TurnRequest::deliver(target, delivery), false)
+            .await
+    }
+
+    async fn advance_with_delivery_binding(
+        &self,
+        chat_id: ChatId,
+        request: TurnRequest,
+        requires_binding: bool,
+    ) -> Result<Turn, AgentError> {
         // Held through restoring the Chat and every task the input starts: `shutdown` either
         // refuses this or waits for all of it.
         let _admission = self.inner.tasks.token();
@@ -441,7 +462,15 @@ impl Agent {
             }
             Admission::Run { replaces } => {
                 ledger.replaces = replaces;
-                Box::pin(self.run_op(chat_id, op, ledger, delivery, host_context)).await?
+                Box::pin(self.run_op(
+                    chat_id,
+                    op,
+                    ledger,
+                    delivery,
+                    host_context,
+                    requires_binding,
+                ))
+                .await?
             }
         };
         Ok(Turn {
@@ -460,6 +489,7 @@ impl Agent {
         mut ledger: LedgerInput,
         delivery: Delivery,
         host_context: Option<HostCallContext>,
+        requires_binding: bool,
     ) -> Result<Receipt, AgentError> {
         let placement = match op {
             TurnOp::Continue { after, .. } | TurnOp::Skill { after, .. } => placement(after),
@@ -476,6 +506,11 @@ impl Agent {
                 target_loop,
                 delivery,
             } => {
+                if !requires_binding {
+                    return self
+                        .take_received_delivery(chat_id, target_loop, delivery, ledger, false)
+                        .await;
+                }
                 return self
                     .take_delivery(chat_id, target_loop, delivery, ledger)
                     .await;
@@ -606,8 +641,7 @@ impl Agent {
                 due_at.map_or(now, |due_at| due_at.max(now))
             }
         };
-        self.fire_due_triggers(chat_id, until).await;
-        Ok(())
+        self.fire_due_triggers(chat_id, until).await
     }
 
     /// Loads a saved Chat this instance does not hold yet.
