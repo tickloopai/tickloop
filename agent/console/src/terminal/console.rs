@@ -6332,7 +6332,21 @@ impl State {
             (self.overview.projection.is_none() && !self.full_review && self.transcript.is_none())
                 .then(|| self.scrollback.next_flash_frame_ms(now_ms, self.display))
                 .flatten();
-        monitor.into_iter().chain(panel).chain(conversation).min()
+        let update = (!self.full_review && self.transcript.is_none() && !self.help_open)
+            .then(|| {
+                super::update_notice::next_frame_ms(
+                    self.update_notice.as_ref(),
+                    self.display,
+                    now_ms,
+                )
+            })
+            .flatten();
+        monitor
+            .into_iter()
+            .chain(panel)
+            .chain(conversation)
+            .chain(update)
+            .min()
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -8183,8 +8197,12 @@ impl State {
                         HINT_NOTICE_GAP_COLUMNS
                     };
                     let available = self.width.saturating_sub(shortcut_columns + gap_columns);
-                    notice_line =
-                        super::update_notice::line(self.update_notice.as_ref().unwrap(), available);
+                    notice_line = super::update_notice::line(
+                        self.update_notice.as_ref().unwrap(),
+                        available,
+                        self.display,
+                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                    );
                 }
                 if self.execution_connection_notice.is_some()
                     && self.ordinary_input_is_visible()

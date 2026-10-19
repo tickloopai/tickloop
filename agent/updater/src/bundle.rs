@@ -211,29 +211,40 @@ pub(crate) async fn download_install(
     root: &Path,
     candidate: &release::Candidate,
     source: Source,
+    progress: &mut crate::ProgressReporter<'_>,
 ) -> Result<()> {
+    progress.stage(crate::UpdateStage::Downloading)?;
     let name = candidate
         .archive
         .path_segments()
         .and_then(|mut parts| parts.next_back())
         .context("Archive URL has no filename")?;
     let checksum = release::checksum(&release::get(&candidate.checksum, 4096).await?, name)?;
-    let bytes = release::get(&candidate.archive, release::MAX_ARCHIVE_BYTES).await?;
+    let bytes = release::get_with_progress(
+        &candidate.archive,
+        release::MAX_ARCHIVE_BYTES,
+        |downloaded, total| progress.report(crate::UpdateProgress::download(downloaded, total)),
+    )
+    .await?;
+    progress.stage(crate::UpdateStage::Verifying)?;
     let stage = tempfile::Builder::new()
         .prefix(".download-")
         .tempdir_in(root)?;
     let root = root.to_owned();
     let version = candidate.version.to_string();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let (stage, build) = tokio::task::spawn_blocking(move || -> Result<_> {
         unpack(&bytes, &checksum, stage.path())?;
         let build = read_build(stage.path())?;
         if build.version != version {
             bail!("Archive reports another release version");
         }
         verify(stage.path(), &build)?;
-        activate_source(&root, stage.path(), &build, source)
+        Ok((stage, build))
     })
     .await??;
+    progress.stage(crate::UpdateStage::Installing)?;
+    tokio::task::spawn_blocking(move || activate_source(&root, stage.path(), &build, source))
+        .await??;
     Ok(())
 }
 

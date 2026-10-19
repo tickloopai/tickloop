@@ -123,7 +123,12 @@ fn checking_installing_failure_and_a_cleared_notice_keep_the_same_layout() {
     let before = state.normal_styled_frame().0.len();
     for (notice, expected) in [
         (Some(UpdateNotice::Checking), "Checking for updates"),
-        (Some(UpdateNotice::Installing), "Updating Tickloop"),
+        (
+            Some(UpdateNotice::Installing {
+                progress: Default::default(),
+            }),
+            "Updating Tickloop",
+        ),
         (Some(UpdateNotice::Activating), "Applying update"),
         (
             Some(UpdateNotice::Deferred {
@@ -146,4 +151,49 @@ fn checking_installing_failure_and_a_cleared_notice_keep_the_same_layout() {
     }
     state.update_notice = None;
     assert_eq!(state.normal_styled_frame().0.len(), before);
+}
+
+#[test]
+fn progress_keeps_hint_layout_and_input_across_download_and_install_stages() {
+    use tickloop_agent_updater::{UpdateProgress, UpdateStage};
+    for width in [24, 40, 80, 120] {
+        let mut state = state(width, 24);
+        state.insert("keep typing");
+        let before = state.normal_styled_frame().0.len();
+        for progress in [
+            UpdateProgress {
+                stage: UpdateStage::Downloading,
+                percent: Some(58),
+                downloaded_bytes: Some(58_000_000),
+            },
+            UpdateProgress {
+                stage: UpdateStage::Downloading,
+                downloaded_bytes: Some(1_048_576),
+                ..Default::default()
+            },
+            UpdateProgress {
+                stage: UpdateStage::Verifying,
+                ..Default::default()
+            },
+            UpdateProgress::default(),
+        ] {
+            state.update_notice = Some(UpdateNotice::Installing { progress });
+            let lines = state.normal_styled_frame().0;
+            assert_eq!(lines.len(), before);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.text()) <= width)
+            );
+            assert_eq!(state.editor.draft(), "keep typing");
+            if width >= 40 {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.text().contains('[') && line.text().contains('━')),
+                    "{width}: {lines:?}"
+                );
+            }
+        }
+    }
 }
