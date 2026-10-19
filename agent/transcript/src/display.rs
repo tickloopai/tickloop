@@ -451,6 +451,8 @@ impl DisplayProjector {
                     WaitKind::Children { children } => children
                         .first()
                         .map(|chat| DisplayWait::Member { chat: *chat }),
+                    // A handover waits for no one: the answer goes on streaming.
+                    WaitKind::Handover => None,
                 };
                 if let Some(waiting) = waiting {
                     node.status = DisplayStatus::Waiting { r#for: waiting };

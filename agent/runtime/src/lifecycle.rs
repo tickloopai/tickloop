@@ -428,7 +428,9 @@ impl Lifecycle {
         let response_id = self.active.get(&receipt.run_id)?.response_id;
         let wait_id = match &kind {
             WaitKind::Question { request, .. } => request.id,
-            WaitKind::Subagent { .. } | WaitKind::Children { .. } => Uuid::new_v4(),
+            WaitKind::Subagent { .. } | WaitKind::Children { .. } | WaitKind::Handover => {
+                Uuid::new_v4()
+            }
         };
         let revision = self.next_revision();
         let response = self.responses.get_mut(&response_id)?;
@@ -909,8 +911,8 @@ impl Agent {
         self.save_now(&chat.snapshot);
     }
 
-    /// Ends the Run's answer and settles the input it answered. An answer the host lost leaves
-    /// its input open for a continuation.
+    /// Ends the Run's answer and settles the input it answered. An answer the host lost, or a
+    /// handover's host ended at its ceiling, leaves its input open for a continuation.
     pub(crate) fn end_response(
         &self,
         chat: &mut Chat,
@@ -927,7 +929,7 @@ impl Agent {
         );
         let outcome = match ending {
             ResponseEnding::Interrupted {
-                by: InterruptedBy::Host,
+                by: InterruptedBy::Host | InterruptedBy::Handover,
             } => return,
             ResponseEnding::Interrupted { by } => SettledOutcome::Interrupted { by },
             ResponseEnding::Failed { error } => SettledOutcome::Failed { error },

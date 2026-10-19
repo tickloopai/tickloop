@@ -449,6 +449,9 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
             .is_some()
     });
     let runs = ((chat.active.is_some() || chat.active_run.is_some()) && !waits_for_member)
+        || has_startable_input(chat)
+        || !chat.family_finishing.is_empty()
+        // A Run that ended still records its end with its parent and delivers notifications.
         || !chat.ready_runs.is_empty()
         || chat.parked.keys().any(|run| !waits_for_person(run))
         || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
@@ -470,6 +473,32 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
             ..waits_of(chat_id, &chat.snapshot)
         }),
     )
+}
+
+/// Whether an input queued to a Loop that can take it starts once the free execution slot is
+/// taken, as between a Run's end and the next Run's start: the Chat still runs then.
+fn has_startable_input(chat: &Chat) -> bool {
+    let snapshot = &chat.snapshot;
+    let is_held_back = !snapshot.pending_commands.is_empty()
+        || snapshot
+            .user_shells
+            .iter()
+            .any(|record| record.state == UserShellState::Queued);
+    chat.active.is_none()
+        && !is_held_back
+        && snapshot.pending_inputs.iter().any(|pending| {
+            pending.armed
+                && snapshot.loops.iter().any(|goal| {
+                    goal.id == pending.receipt.loop_id
+                        && !matches!(
+                            goal.state,
+                            LoopState::WaitingPermission
+                                | LoopState::WaitingQuestion
+                                | LoopState::Stopped
+                                | LoopState::Expired
+                        )
+                })
+        })
 }
 
 /// The links of the Chat's Loops that have not ended and receive their artifact's requests.

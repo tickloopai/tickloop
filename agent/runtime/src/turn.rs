@@ -1420,20 +1420,24 @@ pub(crate) fn admit_continuation(
     admit_answer_loop(chat, entry.loop_id)
 }
 
-/// An Agent message is no display node of its own: its answer is where the conversation ends
-/// when nothing but that answer's Run, and what a load added, follows the message.
+/// An Agent message, a Trigger's prompt or an @tickloop request is no display node of its own:
+/// its answer is where the conversation ends when nothing but that answer's Run, and what a load
+/// added, follows the message. A Trigger's prompt and a request are found as their Run's first
+/// message.
 fn ends_the_conversation(chat: &Chat, entry: &InputEntry) -> bool {
-    if entry.op != InputOp::AgentMessage {
-        return false;
-    }
     let snapshot = &chat.snapshot;
-    let Some(start) = snapshot
-        .message_ids
-        .iter()
-        .filter(|(_, id)| **id == entry.input_id)
-        .map(|(index, _)| *index)
-        .max()
-    else {
+    let start = match entry.op {
+        InputOp::AgentMessage => snapshot
+            .message_ids
+            .iter()
+            .filter(|(_, id)| **id == entry.input_id)
+            .map(|(index, _)| *index)
+            .max(),
+        InputOp::Trigger | InputOp::Feedback => (0..snapshot.messages.len())
+            .find(|index| snapshot.message_runs.get(index) == Some(&entry.run_id)),
+        _ => None,
+    };
+    let Some(start) = start else {
         return false;
     };
     (start + 1..snapshot.messages.len()).all(|index| {
@@ -1555,7 +1559,8 @@ fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Opt
                     .filter_map(|goal| Some((child.snapshot.id, goal.run_id?)))
             })
             .collect(),
-        tickloop_agent_transcript::WaitKind::Question { .. } => Vec::new(),
+        tickloop_agent_transcript::WaitKind::Question { .. }
+        | tickloop_agent_transcript::WaitKind::Handover => Vec::new(),
     };
     runs.into_iter().find_map(|(member, run)| {
         let wait = waiting_for_person(chats, chats.get(&member)?, run)?;

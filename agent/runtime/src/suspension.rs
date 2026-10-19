@@ -28,9 +28,10 @@ use super::{
 pub(crate) const RUN_RELEASED: &str = "the waiting run was released to another host";
 const QUESTION_CANCELLED: &str = "question was cancelled";
 const QUESTION_EXPIRED: &str = "question expired";
+const HANDED_OVER_RUN_CANCELLED: &str = "the run was cancelled before it went on";
 
 /// The canonical id of the Run's assistant message that made the call `call_id`.
-fn batch_message_of(snapshot: &ChatSnapshot, run: RunId, call_id: &str) -> Option<Uuid> {
+pub(crate) fn batch_message_of(snapshot: &ChatSnapshot, run: RunId, call_id: &str) -> Option<Uuid> {
     let index = (0..snapshot.messages.len()).rev().find(|index| {
         snapshot.message_runs.get(index) == Some(&run)
             && snapshot.messages[*index]
@@ -498,6 +499,7 @@ impl Agent {
                         at_call: call_id.clone(),
                     };
                 }
+                WaitKind::Handover => tail = RebuiltTail::Handover,
             }
             // A wait that ended, or a slot-holding wait whose slot another Run took, goes on once
             // the Run gets the slot.
@@ -612,6 +614,18 @@ impl Agent {
                 }
                 self.subagent_resume_start(&receipt, wait_id, observed)
                     .await
+            }
+            RebuiltTail::Handover => {
+                let waited = tokio::select! {
+                    biased;
+                    _ = release.cancelled() => Err(RUN_RELEASED.to_string()),
+                    _ = cancel.cancelled() => Err(HANDED_OVER_RUN_CANCELLED.to_string()),
+                    _ = resume.notified() => Ok(()),
+                };
+                if self.leave_if_released(&receipt).await {
+                    return;
+                }
+                self.handover_resume_start(&receipt, wait_id, waited).await
             }
             RebuiltTail::Children { at_call } => {
                 let waited = match holds_slot {
@@ -792,6 +806,30 @@ impl Agent {
         }
     }
 
+    /// Where a Run a handover stopped goes on once it has the execution slot: its wait is over
+    /// and its answer goes on in one change, then it takes up the call or the model request it
+    /// stopped before.
+    async fn handover_resume_start(
+        &self,
+        receipt: &Receipt,
+        wait_id: Uuid,
+        waited: Result<(), String>,
+    ) -> Result<RunStart, String> {
+        waited?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id).ok_or(QUESTION_EXPIRED)?;
+        let at = chat
+            .bookkeeping
+            .lifecycle
+            .wait(wait_id)
+            .ok_or(QUESTION_EXPIRED)?
+            .resume
+            .clone();
+        chat.bookkeeping.lifecycle.end_wait(wait_id);
+        self.save_now(&chat.snapshot);
+        Ok(RunStart::Resume { at, result: None })
+    }
+
     /// Where the rebuilt Run goes on: at its waiting call, with the result the reply decided, or
     /// with the error its wait ended in, as the asking Run's own call reports a cancelled or
     /// expired question. An error when the Chat no longer holds the wait.
@@ -870,6 +908,8 @@ enum RebuiltTail {
     Children { at_call: Option<String> },
     /// Nothing: the wait already ended, and the Run waits for the execution slot.
     Ready,
+    /// Nothing but the execution slot: a handover stopped the Run at a safe point.
+    Handover,
 }
 
 /// A Run rebuilt around its wait, and what its wait tail waits on.

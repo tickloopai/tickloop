@@ -168,6 +168,7 @@ impl Agent {
                     continue;
                 }
                 None => {
+                    self.stop_at_safe_point(receipt, Some(&call_id)).await?;
                     let invocation = ToolInvocation::new(
                         call_id.clone(),
                         name.clone(),
