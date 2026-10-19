@@ -1500,30 +1500,18 @@ impl HostToolProvider for McpHostToolProvider {
             authentication: ArtifactAuthentication::SignedOut,
             ..Default::default()
         };
-        let checked_generation = self
-            .artifact
-            .credential_snapshot()
-            .ok()
-            .flatten()
-            .as_ref()
-            .map(Self::credential_key);
-        let (mut status, credential) = match self.artifact.status().await {
-            Ok(Some(user)) => match self.artifact.credential_snapshot() {
-                Ok(Some(credential))
-                    if credential.account_id == user.id
-                        && Some(Self::credential_key(&credential)) == checked_generation =>
-                {
-                    (
-                        ArtifactServiceStatus {
-                            authentication: ArtifactAuthentication::SignedIn,
-                            credential_generation: Some(Self::credential_key(&credential)),
-                            account_id: Some(user.id),
-                            email: Some(user.email),
-                            ..Default::default()
-                        },
-                        Some(credential),
-                    )
-                }
+        let (mut status, credential) = match Box::pin(self.artifact.verified_snapshot()).await {
+            Ok(Some((user, verified))) => match self.artifact.credential_snapshot() {
+                Ok(Some(credential)) if credential.identity_matches(&verified) => (
+                    ArtifactServiceStatus {
+                        authentication: ArtifactAuthentication::SignedIn,
+                        credential_generation: Some(Self::credential_key(&credential)),
+                        account_id: Some(user.id),
+                        email: Some(user.email),
+                        ..Default::default()
+                    },
+                    Some(credential),
+                ),
                 Ok(None) => (signed_out(), None),
                 _ => (ArtifactServiceStatus::default(), None),
             },

@@ -2475,6 +2475,7 @@ async fn interact(
                     Some(LoginUpdate::Finished(result)) => {
                         let session = logins.get_mut(&login_id).unwrap();
                         let provider_label = session.flow.label();
+                        let is_artifact_login = session.flow.is_artifact();
                         let login_chat = session.flow.chat();
                         let from_provider = session.from_provider;
                         session.succeeded = result.is_ok();
@@ -2485,7 +2486,7 @@ async fn interact(
                         }
                         match result {
                             Ok(account) => {
-                                if provider_label == "Artifacts"
+                                if is_artifact_login
                                     && let Some(root) = config_root.as_deref()
                                     && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
                                     outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));

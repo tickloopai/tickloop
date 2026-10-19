@@ -496,7 +496,7 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
         ("Usage", "Usage"),
         ("Theme:", "Choose theme"),
         ("Output style:", "Preferred output style"),
-        ("Artifacts:", "Sign out of Tickloop Artifacts?"),
+        ("Artifacts:", "Sign out of Tickloop Accounts?"),
     ] {
         fixture.send(b"/settings\r");
         let frame = fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));

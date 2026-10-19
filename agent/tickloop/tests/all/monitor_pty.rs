@@ -290,12 +290,16 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             drop(reader);
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
-            let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
-                json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/artifact/device?code=ABCD"),"expires_in":60,"interval":1})
-            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"user":user})
-            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
-                json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
+            let body = if request
+                .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+            {
+                json!({"issuer":format!("{endpoint}/accounts"),"token_endpoint":format!("{endpoint}/accounts/token"),"device_authorization_endpoint":format!("{endpoint}/accounts/device"),"userinfo_endpoint":format!("{endpoint}/accounts/userinfo"),"revocation_endpoint":format!("{endpoint}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+            } else if request.starts_with("POST /accounts/device ") {
+                json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/accounts/device?code=ABCD"),"expires_in":60,"interval":1})
+            } else if request.starts_with("POST /accounts/token ") {
+                json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"refresh_token":"fixture-refresh"})
+            } else if request.starts_with("GET /accounts/userinfo ") {
+                json!({"sub":user["id"],"name":user["name"],"email":user["email"]})
             } else if request.starts_with("GET /artifact/api/v1/artifacts/pinned ") {
                 json!({"artifacts":[],"next_cursor":null})
             } else if request.starts_with("GET /artifact/api/v1/artifacts?") {

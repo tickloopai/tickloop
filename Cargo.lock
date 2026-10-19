@@ -4618,6 +4618,7 @@ dependencies = [
 name = "tickloop-agent-artifacts"
 version = "0.2.8"
 dependencies = [
+ "async-trait",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -4627,6 +4628,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tickloop-agent-base",
  "tickloop-agent-protocol",
+ "tickloop-tick-oauth",
+ "tickloop-tick-test-support",
  "tokio",
  "tokio-util",
  "uuid",
@@ -5065,6 +5068,7 @@ dependencies = [
 name = "tickloop-tick-oauth"
 version = "0.2.8"
 dependencies = [
+ "async-trait",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

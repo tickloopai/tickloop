@@ -79,7 +79,8 @@ impl ArtifactClient {
         limit: usize,
     ) -> Result<T, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         self.catalog_request_with_credential(method, path, query, body, limit, &credential)
             .await
@@ -172,7 +173,8 @@ impl ArtifactClient {
     }
     pub async fn read(&self, id: &str) -> Result<ArtifactMetadata, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         self.read_with_credential(id, &credential).await
     }

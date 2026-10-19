@@ -3554,7 +3554,7 @@ async fn signed_out_offers_only_artifact_login() {
 /// and no credential is saved, though the Agent is still held.
 #[tokio::test]
 async fn shutdown_ends_a_pending_artifact_sign_in_before_it_can_save_a_credential() {
-    const TOKEN_POLL: &str = "POST /artifact/api/v1/auth/device/token ";
+    const TOKEN_POLL: &str = "POST /accounts/token ";
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     service
@@ -3623,7 +3623,7 @@ async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools(
         let started = tool_result_text(&requests[1], "login");
         assert!(started.starts_with("Sign-in started."), "{started}");
         assert!(
-            started.contains(&format!("{}/artifact/device?code=TEST", service.origin))
+            started.contains(&format!("{}/accounts/device?code=TEST", service.origin))
                 && started.contains("confirm the code TEST"),
             "{started}"
         );
@@ -5359,4 +5359,41 @@ impl tickloop_agent_tools::LocalReadAdmission for NoLocalReads {
     async fn admit(&self, _: &tickloop_agent_tools::PreparedTool) -> Result<bool, String> {
         Err("no local file is read here".into())
     }
+}
+
+#[tokio::test]
+async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_same_refresh() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let credentials = std::fs::read_dir(directory.path().join("artifacts/auth"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+    for token in saved["resources"].as_object_mut().unwrap().values_mut() {
+        token["expires_at"] = json!(0);
+    }
+    std::fs::write(&credentials, serde_json::to_vec(&saved).unwrap()).unwrap();
+    service
+        .control
+        .credential_revision
+        .store(1, Ordering::SeqCst);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
+    );
+    assert!(
+        provider
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == "ArtifactRead")
+    );
 }

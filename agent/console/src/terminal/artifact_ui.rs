@@ -361,12 +361,16 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.lines().next().unwrap().to_owned());
-                let user =
-                    serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
-                let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
-                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1})
-                } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
+                let body = if request
+                    .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+                {
+                    serde_json::json!({"issuer":format!("{endpoint}/accounts"),"token_endpoint":format!("{endpoint}/accounts/token"),"device_authorization_endpoint":format!("{endpoint}/accounts/device"),"userinfo_endpoint":format!("{endpoint}/accounts/userinfo"),"revocation_endpoint":format!("{endpoint}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if request.starts_with("GET /accounts/userinfo ") {
+                    serde_json::json!({"sub":"owner","name":"Owner","email":"owner@example.test"})
+                } else if request.starts_with("POST /accounts/device ") {
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/accounts/device?code=CODE"),"expires_in":60,"interval":1})
+                } else if request.starts_with("POST /accounts/token ") {
+                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"refresh_token":"refresh-test-token"})
                 } else if request.starts_with("DELETE /artifact/api/v1/artifacts/doc ") {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
