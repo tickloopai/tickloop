@@ -601,3 +601,70 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
         );
     }
 }
+
+#[test]
+fn answered_question_blocks_survive_snapshots_until_their_answer_is_compacted() {
+    let chat = Uuid::new_v4();
+    let response = Uuid::new_v4();
+    let assistant = Uuid::new_v4();
+    let question = Uuid::new_v4();
+    let call = parse(json!({
+        "type": "assistant", "uuid": assistant, "chatId": chat, "timestamp": TIMESTAMP,
+        "version": "test", "humanFamilyOrigin": null, "responseId": response,
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "ask", "name": "AskUserQuestion", "input": {}}]},
+    }));
+    let result = parse(json!({
+        "type": "user", "uuid": Uuid::new_v4(), "parentUuid": assistant, "chatId": chat,
+        "timestamp": TIMESTAMP, "version": "test", "humanFamilyOrigin": null, "responseId": response,
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "ask", "content": "Selected A", "is_error": false}]},
+    }));
+    let wait = parse(json!({
+        "type": "wait", "waitId": question, "chatId": chat, "loopId": chat, "runId": response,
+        "responseId": response, "timestamp": TIMESTAMP, "state": {"kind": "appended"},
+        "kind": {"kind": "question", "operationId": question, "request": {
+            "id": question, "chat_id": chat, "loop_id": chat, "run_id": response,
+            "call_id": "ask", "questions": [{"question": "Which?", "header": "Choice", "options": []}],
+        }},
+        "resume": {"kind": "inBatch", "assistantMessage": assistant, "callId": "ask"},
+    }));
+    let ended = parse(json!({
+        "type": "response", "responseId": response, "attempt": 1, "runId": response,
+        "loopId": chat, "displayParent": null, "timestamp": TIMESTAMP,
+        "state": {"kind": "ended", "ending": {"kind": "completed"}},
+    }));
+    let lines = vec![call.clone(), result.clone(), wait, ended];
+    let mut fold = RetainedFold::default();
+    for line in &lines {
+        fold.apply(line);
+    }
+    let snapshot = fold.snapshot(chat);
+    let projected = project(&[call, result, snapshot.clone()]);
+    assert_eq!(projected, project(&lines));
+    assert!(
+        matches!(&projected[0].blocks[1], tickloop_agent_transcript::display::DisplayBlock::Question { reply: Some(reply), .. } if reply.text == "Selected A")
+    );
+    let Line::RetainedSnapshot(snapshot) = snapshot else {
+        panic!("snapshot")
+    };
+    assert!(
+        snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::Wait(_)))
+    );
+    let boundary = parse(json!({
+        "type": "system", "uuid": Uuid::new_v4(), "chatId": chat, "timestamp": TIMESTAMP,
+        "version": "test", "humanFamilyOrigin": null, "subtype": "compact_boundary",
+        "message": {"role": "system", "content": []},
+    }));
+    fold.apply(&boundary);
+    let Line::RetainedSnapshot(snapshot) = fold.snapshot(chat) else {
+        panic!("snapshot")
+    };
+    assert!(
+        !snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::Wait(_)))
+    );
+}
