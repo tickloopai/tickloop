@@ -32,6 +32,8 @@ pub(super) enum Step {
     Reply(Vec<Content>),
     /// Holds the request until it is cancelled.
     Hang,
+    /// Fails the request as a misconfigured model does, which no retry mends.
+    Fail,
 }
 
 /// Follows its steps, then answers "answer"; records every request.
@@ -101,6 +103,9 @@ impl ModelClient for Script {
                 cancel.cancelled().await;
                 return Err(ModelError::Cancelled);
             }
+            Some(Step::Fail) => {
+                return Err(ModelError::Configuration("the model is unavailable".into()));
+            }
             None => text("answer"),
         };
         Ok(ModelOutput {
@@ -112,7 +117,11 @@ impl ModelClient for Script {
     }
 }
 
-fn harness(store: Arc<dyn TranscriptStore>, model: Arc<Script>, waits: WaitHosting) -> Agent {
+pub(super) fn harness(
+    store: Arc<dyn TranscriptStore>,
+    model: Arc<Script>,
+    waits: WaitHosting,
+) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
@@ -169,7 +178,7 @@ pub(super) async fn lost_holder(
     next
 }
 
-fn input_state(lines: &[Line], input: Uuid) -> Option<InputState> {
+pub(super) fn input_state(lines: &[Line], input: Uuid) -> Option<InputState> {
     lines.iter().rev().find_map(|line| match line {
         Line::Input(entry) if entry.input_id == input => Some(entry.state.clone()),
         _ => None,

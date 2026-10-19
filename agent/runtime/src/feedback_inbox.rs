@@ -27,6 +27,17 @@ pub(super) struct FeedbackIdentity {
     pub(super) artifact_id: String,
 }
 
+impl FeedbackIdentity {
+    /// The ledger input of the request: the one its delivery names on every host.
+    pub(super) fn input_id(&self) -> Uuid {
+        tickloop_agent_transcript::input_ids::feedback(
+            &self.origin,
+            &self.account_id,
+            self.delivery_id,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FeedbackInput {
@@ -52,7 +63,8 @@ pub(super) struct FeedbackUnlink {
 }
 
 pub(super) struct FeedbackInbox {
-    /// `None` for a Chat without a Folder, which keeps no inbox.
+    /// `None` for a Chat without a Folder, which keeps no inbox: nothing is saved in it, and
+    /// its host delivers each request with `TurnOp::Deliver`.
     root: Option<PrivateDirectory>,
     chat_id: Uuid,
 }
@@ -155,6 +167,9 @@ impl FeedbackInbox {
     }
 
     pub(super) fn pending(&self) -> io::Result<Vec<FeedbackInput>> {
+        if self.root.is_none() {
+            return Ok(Vec::new());
+        }
         let directory = self.directory("pending")?;
         match open_without_following_links(
             directory.path(),
@@ -218,6 +233,9 @@ impl FeedbackInbox {
     }
 
     pub(super) fn unlinks(&self) -> io::Result<Vec<FeedbackUnlink>> {
+        if self.root.is_none() {
+            return Ok(Vec::new());
+        }
         let directory = self.directory("unlinks")?;
         match open_without_following_links(
             directory.path(),
@@ -259,6 +277,9 @@ impl FeedbackInbox {
     }
 
     pub(super) fn identities(&self) -> io::Result<Vec<FeedbackIdentity>> {
+        if self.root.is_none() {
+            return Ok(Vec::new());
+        }
         let mut identities = self
             .pending()?
             .into_iter()
