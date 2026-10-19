@@ -11,7 +11,7 @@ PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 TICK_PACKAGES ?= $(notdir $(patsubst %/tick-package.json,%,$(wildcard ticks/*/tick-package.json)))
 
-.PHONY: dev build install package site test check release prototype-earnings-review package-ticks dev-ticks release-ticks
+.PHONY: dev build install package test check release prototype-earnings-review package-ticks dev-ticks release-ticks
 
 ## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
 # Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
@@ -34,11 +34,6 @@ package:
 	@mkdir -p dist
 	COPYFILE_DISABLE=1 tar --format=ustar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
-
-## 在本地构建官网，输出到 site/dist
-site:
-	npm --prefix site ci
-	npm --prefix site run build
 
 ## Build the Tick packages for Apple Silicon into dist/ticks and print their marketplace.json entries.
 package-ticks:
