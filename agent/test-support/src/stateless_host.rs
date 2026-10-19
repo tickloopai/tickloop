@@ -49,7 +49,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::event_stream::{MemoryEventStream, StreamEntry, StreamError, StreamItem};
+
+mod node;
 use crate::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
+pub use node::{HoldingEnd, HoldingReport, NodeConfig, ReferenceNode};
 
 /// A client that reloads more often than this while catching up once is looping.
 const FOLLOWER_ROUNDS: usize = 64;
@@ -113,6 +116,8 @@ pub struct DurableChats {
     clock: Arc<ManualClock>,
     transcripts: Arc<InMemoryTranscriptStore>,
     rows: Mutex<HashMap<Uuid, ChatRow>>,
+    /// Wakes holders when a task is queued.
+    task_queued: Notify,
 }
 
 #[derive(Default)]
@@ -128,6 +133,22 @@ struct ChatRow {
     acknowledged: HashMap<Uuid, usize>,
     /// What the Chat waited on when its last task was acknowledged; `None` when it was idle.
     waiting: Option<Waits>,
+    /// The family's tasks in the order they were queued; a key queues at most one.
+    tasks: Vec<TaskRow>,
+    /// Holdings in a row that ended without releasing the lease, counted once each when a
+    /// successor or the sweep finds the lease expired; a release clears it.
+    consecutive_unclean: u32,
+    /// The epoch whose unclean end `consecutive_unclean` counted last.
+    counted_unclean: Option<u64>,
+    /// The epoch of the last released lease: the scheduler's wake keys carry it.
+    released_epoch: u64,
+    /// The sweep gave up on the family after three unclean holdings in a row; a user's action
+    /// clears it.
+    needs_attention: bool,
+    /// How many holdings acquired the lease.
+    acquisitions: usize,
+    /// Every load of the family panics, as a poisoned Transcript would make it.
+    poisoned: bool,
 }
 
 impl ChatRow {
@@ -144,6 +165,59 @@ struct LeaseRow {
     released: bool,
 }
 
+/// Unclean holdings in a row after which the sweep stops taking the family over.
+pub const UNCLEAN_HOLDINGS_LIMIT: u32 = 3;
+/// How often a task is delivered before it is dead-lettered.
+pub const TASK_MAX_ATTEMPTS: u32 = 5;
+/// How long a claim stays invisible to other holders unless a heartbeat extends it.
+pub const CLAIM_VISIBILITY: Duration = Duration::from_secs(15);
+
+/// What a task asks the family's holder to do.
+#[derive(Clone, Debug)]
+pub enum TaskKind {
+    /// A user's turn, an answer or a delivered request for the family member `member`, or for
+    /// the root Chat: acknowledged once its input settled, waits, or (an answer or a delivery)
+    /// was accepted, and its events are published.
+    Turn {
+        member: Option<ChatId>,
+        request: Box<TurnRequest>,
+    },
+    /// The scheduler's wake for the time the family asked to be woken at; acknowledged when the
+    /// holding ends.
+    Wake { due_at: Option<SystemTime> },
+    /// The sweep's load of a family whose holder went away; acknowledged when the holding ends.
+    Takeover,
+    /// The load of a family a holder handed over; acknowledged when the holding ends.
+    Handover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Queued,
+    Claimed,
+    Acknowledged,
+    DeadLettered,
+}
+
+/// A task as the queue shows it.
+#[derive(Clone, Debug)]
+pub struct TaskView {
+    pub id: Uuid,
+    pub key: String,
+    pub state: TaskState,
+    /// Deliveries that counted against `max_attempts`; a returned task gives its back.
+    pub attempts: u32,
+    pub max_attempts: u32,
+    /// Every delivery, counted or not.
+    pub deliveries: u32,
+}
+
+struct TaskRow {
+    view: TaskView,
+    kind: TaskKind,
+    visible_at: Duration,
+}
+
 /// An append as the durable side took it.
 struct Commit {
     ack: AppendAck,
@@ -158,6 +232,7 @@ impl DurableChats {
             clock,
             transcripts: Arc::new(InMemoryTranscriptStore::new()),
             rows: Mutex::default(),
+            task_queued: Notify::new(),
         })
     }
 
@@ -184,10 +259,12 @@ impl DurableChats {
                 epoch: row.epoch,
             });
         }
+        count_unclean_ending(row, now);
         let previous = row.lease.as_ref().map(|lease| PreviousLease {
             epoch: row.epoch,
             released: lease.released,
         });
+        row.acquisitions += 1;
         row.epoch += 1;
         row.lease = Some(LeaseRow {
             holder: holder.into(),
@@ -223,6 +300,9 @@ impl DurableChats {
             if let Some(held) = &mut row.lease {
                 held.released = true;
             }
+            row.released_epoch = lease.epoch;
+            row.consecutive_unclean = 0;
+            row.needs_attention = false;
             Ok(())
         });
     }
@@ -292,6 +372,215 @@ impl DurableChats {
             .get(&chat)
             .and_then(|row| row.acknowledged.get(&input).copied())
             .unwrap_or(0)
+    }
+
+    /// Queues a task of the family of the root Chat `root` under `key`, unless a task of that
+    /// key was ever queued: `None` then, as an insert that conflicts does nothing.
+    pub fn enqueue(&self, root: Uuid, key: &str, kind: TaskKind) -> Option<Uuid> {
+        self.enqueue_with(root, key, kind, TASK_MAX_ATTEMPTS)
+    }
+
+    /// A task the user's own action queues, such as a message or an answer: the family is
+    /// taken over again after any number of unclean holdings.
+    pub fn enqueue_by_user(&self, root: Uuid, key: &str, kind: TaskKind) -> Option<Uuid> {
+        {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows.entry(root).or_default();
+            row.consecutive_unclean = 0;
+            row.needs_attention = false;
+        }
+        self.enqueue(root, key, kind)
+    }
+
+    fn enqueue_with(
+        &self,
+        root: Uuid,
+        key: &str,
+        kind: TaskKind,
+        max_attempts: u32,
+    ) -> Option<Uuid> {
+        let id = {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows.entry(root).or_default();
+            if row.tasks.iter().any(|task| task.view.key == key) {
+                return None;
+            }
+            let id = Uuid::new_v4();
+            row.tasks.push(TaskRow {
+                view: TaskView {
+                    id,
+                    key: key.into(),
+                    state: TaskState::Queued,
+                    attempts: 0,
+                    max_attempts,
+                    deliveries: 0,
+                },
+                kind,
+                visible_at: Duration::ZERO,
+            });
+            id
+        };
+        self.task_queued.notify_waiters();
+        Some(id)
+    }
+
+    /// The family's tasks in the order they were queued.
+    pub fn tasks(&self, root: Uuid) -> Vec<TaskView> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map(|row| row.tasks.iter().map(|task| task.view.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The task queued under `key`.
+    pub fn task(&self, root: Uuid, key: &str) -> Option<TaskView> {
+        self.tasks(root).into_iter().find(|task| task.key == key)
+    }
+
+    /// Whether a task of the family is queued or claimed.
+    pub fn has_open_tasks(&self, root: Uuid) -> bool {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .is_some_and(has_open_tasks)
+    }
+
+    pub fn consecutive_unclean(&self, root: Uuid) -> u32 {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map_or(0, |row| row.consecutive_unclean)
+    }
+
+    pub fn needs_attention(&self, root: Uuid) -> bool {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .is_some_and(|row| row.needs_attention)
+    }
+
+    /// How many holdings acquired the family's lease.
+    pub fn acquisitions(&self, root: Uuid) -> usize {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map_or(0, |row| row.acquisitions)
+    }
+
+    /// From now on every load of the family's Chats panics.
+    pub fn poison(&self, root: Uuid, poisoned: bool) {
+        self.rows.lock().unwrap().entry(root).or_default().poisoned = poisoned;
+    }
+
+    fn is_poisoned(&self, root: Uuid) -> bool {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&root)
+            .is_some_and(|row| row.poisoned)
+    }
+
+    /// Claims the family's first queued task for `lease`'s holder; the claim counts a delivery.
+    fn claim_next(&self, lease: &Lease) -> Option<(Uuid, TaskKind)> {
+        let now = self.clock.now();
+        self.holding(lease, |row| {
+            let task = row
+                .tasks
+                .iter_mut()
+                .find(|task| task.view.state == TaskState::Queued);
+            Ok(task.map(|task| {
+                task.view.state = TaskState::Claimed;
+                task.view.attempts += 1;
+                task.view.deliveries += 1;
+                task.visible_at = now + CLAIM_VISIBILITY;
+                (task.view.id, task.kind.clone())
+            }))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// A heartbeat keeps the claims `tasks` invisible to other holders.
+    fn extend_claims(&self, lease: &Lease, tasks: &HashSet<Uuid>) {
+        let now = self.clock.now();
+        let _ = self.holding(lease, |row| {
+            for task in &mut row.tasks {
+                if tasks.contains(&task.view.id) && task.view.state == TaskState::Claimed {
+                    task.visible_at = now + CLAIM_VISIBILITY;
+                }
+            }
+            Ok(())
+        });
+    }
+
+    fn acknowledge_task(&self, lease: &Lease, task: Uuid) -> Result<(), TranscriptError> {
+        self.holding(lease, |row| {
+            let task = row
+                .tasks
+                .iter_mut()
+                .find(|row| row.view.id == task && row.view.state == TaskState::Claimed)
+                .ok_or(TranscriptError::Fenced)?;
+            task.view.state = TaskState::Acknowledged;
+            if let TaskKind::Turn { request, .. } = &task.kind {
+                *row.acknowledged.entry(request.input_id).or_default() += 1;
+            }
+            Ok(())
+        })
+    }
+
+    /// Gives a claimed task back without counting its delivery against its attempts.
+    fn return_task(&self, lease: &Lease, task: Uuid) {
+        let _ = self.holding(lease, |row| {
+            if let Some(task) = row
+                .tasks
+                .iter_mut()
+                .find(|row| row.view.id == task && row.view.state == TaskState::Claimed)
+            {
+                task.view.state = TaskState::Queued;
+                task.view.attempts -= 1;
+            }
+            Ok(())
+        });
+        self.task_queued.notify_waiters();
+    }
+
+    /// The claims nobody extended in time are delivered again, or dead-lettered once their
+    /// attempts are spent.
+    pub fn reclaim_expired_tasks(&self) {
+        let now = self.clock.now();
+        let mut rows = self.rows.lock().unwrap();
+        for task in rows.values_mut().flat_map(|row| &mut row.tasks) {
+            if task.view.state == TaskState::Claimed && task.visible_at <= now {
+                task.view.state = if task.view.attempts >= task.view.max_attempts {
+                    TaskState::DeadLettered
+                } else {
+                    TaskState::Queued
+                };
+            }
+        }
+    }
+
+    /// Writes what the family waits on, then releases the lease, as a holding that ended
+    /// quietly does.
+    pub fn release_waiting(&self, lease: &Lease, waiting: Option<Waits>) {
+        self.finish_holding(lease, Some(waiting));
+    }
+
+    /// A holding ended cleanly: what the family waits on, then the released lease.
+    fn finish_holding(&self, lease: &Lease, waiting: Option<Option<Waits>>) {
+        if let Some(waiting) = waiting {
+            let _ = self.holding(lease, |row| {
+                row.waiting = waiting;
+                Ok(())
+            });
+        }
+        self.release_lease(lease);
     }
 
     /// Runs `change` on the Chat's row while `lease` is its current lease.
@@ -368,6 +657,97 @@ impl DurableChats {
             row.waiting = waiting;
             Ok(())
         })
+    }
+}
+
+fn has_open_tasks(row: &ChatRow) -> bool {
+    row.tasks
+        .iter()
+        .any(|task| matches!(task.view.state, TaskState::Queued | TaskState::Claimed))
+}
+
+/// Counts a holding that ended without releasing its lease once its lease expired, once per
+/// epoch; three in a row need the user's attention.
+fn count_unclean_ending(row: &mut ChatRow, now: Duration) {
+    let Some(lease) = &row.lease else {
+        return;
+    };
+    if lease.released || lease.expires_at > now || row.counted_unclean == Some(row.epoch) {
+        return;
+    }
+    row.counted_unclean = Some(row.epoch);
+    row.consecutive_unclean += 1;
+    if row.consecutive_unclean >= UNCLEAN_HOLDINGS_LIMIT {
+        row.needs_attention = true;
+    }
+}
+
+/// The scheduler of the reference host: it wakes each released family at the time it asked
+/// for, delivers claims nobody extended again, and takes over each family whose holder went
+/// away with nothing left to load it again.
+pub struct ReferenceScheduler {
+    chats: Arc<DurableChats>,
+}
+
+impl ReferenceScheduler {
+    pub fn new(chats: Arc<DurableChats>) -> Self {
+        Self { chats }
+    }
+
+    /// One poll at the wall time `now`; the keys of the tasks it queued.
+    ///
+    /// - A family whose `wake_at` is due gets `wake:{root}:{released_epoch}:{wake_at µs}`,
+    ///   with `due_at = wake_at`: a later release that writes the same time back gets a new
+    ///   key.
+    /// - A family whose lease expired unreleased, with no queued or claimed task and fewer
+    ///   than three unclean holdings in a row, gets `takeover:{root}:{epoch}`, tried once.
+    pub fn tick(&self, now: SystemTime) -> Vec<String> {
+        self.chats.reclaim_expired_tasks();
+        let clock = self.chats.clock.now();
+        let mut due = Vec::new();
+        {
+            let mut rows = self.chats.rows.lock().unwrap();
+            for (root, row) in rows.iter_mut() {
+                if let Some(wake_at) = row.waiting.as_ref().and_then(|waits| waits.wake_at)
+                    && wake_at <= now
+                {
+                    let micros = wake_at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_micros());
+                    due.push((
+                        *root,
+                        format!("wake:{root}:{}:{micros}", row.released_epoch),
+                        TaskKind::Wake {
+                            due_at: Some(wake_at),
+                        },
+                        TASK_MAX_ATTEMPTS,
+                    ));
+                }
+                count_unclean_ending(row, clock);
+                let is_abandoned = row
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.released && lease.expires_at <= clock);
+                if is_abandoned
+                    && row.consecutive_unclean < UNCLEAN_HOLDINGS_LIMIT
+                    && !has_open_tasks(row)
+                {
+                    due.push((
+                        *root,
+                        format!("takeover:{root}:{}", row.epoch),
+                        TaskKind::Takeover,
+                        1,
+                    ));
+                }
+            }
+        }
+        due.into_iter()
+            .filter_map(|(root, key, kind, max_attempts)| {
+                self.chats
+                    .enqueue_with(root, &key, kind, max_attempts)
+                    .map(|_| key)
+            })
+            .collect()
     }
 }
 
@@ -505,6 +885,7 @@ impl ReferenceHost {
             wake: Notify::new(),
             progress: Notify::new(),
             halted: CancellationToken::new(),
+            claims: Mutex::default(),
         });
         let store = Arc::new(FaultyTranscriptStore::new(Arc::new(LeasedTranscripts {
             shared: shared.clone(),
@@ -884,6 +1265,8 @@ struct Shared {
     /// The publisher received events or finished a publish.
     progress: Notify,
     halted: CancellationToken,
+    /// The tasks the holding claimed and has not acknowledged or given back.
+    claims: Mutex<HashSet<Uuid>>,
 }
 
 #[derive(Default)]
@@ -910,8 +1293,14 @@ struct PublishState {
     flush_requested: bool,
     /// Every event the Harness broadcast has been received.
     events_drained: bool,
+    /// The latest request to receive every event broadcast so far.
+    catch_up_requested: u64,
+    /// The latest such request the publisher met.
+    caught_up: u64,
     crash: Option<CrashPoint>,
     halt: Option<Halt>,
+    /// The holding began handing its family over.
+    handing_over: bool,
 }
 
 enum Publishing {
@@ -1015,11 +1404,60 @@ impl Shared {
         state.lagged = true;
     }
 
-    fn events_caught_up(&self, closed: bool) {
+    /// The latest request to receive every event broadcast so far, read before draining the
+    /// broadcast, so draining it meets that request and none made afterwards.
+    fn catch_up_request(&self) -> u64 {
+        self.state.lock().unwrap().catch_up_requested
+    }
+
+    /// The broadcast is drained, or closed: every event broadcast before the request
+    /// `requested` was read is received.
+    fn events_caught_up(&self, closed: bool, requested: u64) {
         let mut state = self.state.lock().unwrap();
         if closed || state.flush_requested {
             state.events_drained = true;
             self.progress.notify_waiters();
+        }
+        let caught_up = if closed { u64::MAX } else { requested };
+        if state.caught_up < caught_up {
+            state.caught_up = caught_up;
+            self.progress.notify_waiters();
+        }
+    }
+
+    /// Waits until every event the Harness broadcast so far up to sequence `through` is
+    /// published and no marker is owed; `false` when that takes longer than `timeout`.
+    async fn publish_through(&self, through: u64, timeout: Duration) -> Result<bool, Halt> {
+        let give_up = tokio::time::Instant::now() + timeout;
+        let request = {
+            let mut state = self.state.lock().unwrap();
+            state.catch_up_requested += 1;
+            state.catch_up_requested
+        };
+        self.wake.notify_one();
+        loop {
+            let progressed = self.progress.notified();
+            tokio::pin!(progressed);
+            progressed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(halt) = &state.halt {
+                    return Err(halt.clone());
+                }
+                if state.caught_up >= request
+                    && state.holding.iter().all(|event| event.sequence > through)
+                    && state.slots.is_empty()
+                    && !state.in_flight
+                    && !state.needs_resync
+                {
+                    return Ok(true);
+                }
+            }
+            tokio::select! {
+                _ = progressed => {}
+                _ = self.halted.cancelled() => {}
+                _ = tokio::time::sleep_until(give_up) => return Ok(false),
+            }
         }
     }
 
@@ -1157,16 +1595,17 @@ async fn publish_events(
 ) {
     let mut open = true;
     loop {
+        let requested = shared.catch_up_request();
         while open {
             match events.try_recv() {
                 Ok(event) => shared.receive(event),
                 Err(broadcast::error::TryRecvError::Lagged(_)) => shared.lagged(),
                 Err(broadcast::error::TryRecvError::Empty) => {
-                    shared.events_caught_up(false);
+                    shared.events_caught_up(false, requested);
                     break;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    shared.events_caught_up(true);
+                    shared.events_caught_up(true, requested);
                     open = false;
                 }
             }
@@ -1187,7 +1626,7 @@ async fn publish_events(
                 Ok(event) => shared.receive(event),
                 Err(broadcast::error::RecvError::Lagged(_)) => shared.lagged(),
                 Err(broadcast::error::RecvError::Closed) => {
-                    shared.events_caught_up(true);
+                    shared.events_caught_up(true, u64::MAX);
                     open = false;
                 }
             },
@@ -1223,6 +1662,9 @@ impl TranscriptStore for LeasedTranscripts {
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
         self.shared.check_chat(chat)?;
+        if self.shared.chats.is_poisoned(self.shared.lease.chat) {
+            panic!("injected: the family's Transcript cannot be loaded");
+        }
         self.shared.chats.transcripts.load(chat, range).await
     }
 

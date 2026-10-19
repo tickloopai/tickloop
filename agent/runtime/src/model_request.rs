@@ -423,6 +423,16 @@ impl Agent {
         Ok(permits)
     }
 
+    /// The handover that stops a request of `context` before it reaches the vendor: a Run's
+    /// conversation request stops at a handover, any other request never does.
+    fn handover_of(&self, context: &RequestContext) -> CancellationToken {
+        if context.kind == ModelRequestKind::Conversation && context.owner.run_id.is_some() {
+            self.inner.handover.clone()
+        } else {
+            CancellationToken::new()
+        }
+    }
+
     pub(super) async fn tracked_model_request(
         &self,
         context: RequestContext,
@@ -600,9 +610,12 @@ impl Agent {
                         },
                     );
                 }
+                // A Run's retry backoff is a safe point for a handover.
+                let handover = self.handover_of(&context);
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
+                    _ = handover.cancelled() => return Err(ModelError::Cancelled.into()),
                     _ = tokio::time::sleep(delay) => {}
                 }
                 retries += 1;
@@ -684,10 +697,13 @@ impl Agent {
                 .await?;
             return Err(ModelError::Cancelled.into());
         }
-        // Waiting at the host's gates spends none of the request's time.
+        // Waiting at the host's gates spends none of the request's time. A Run's conversation
+        // request sends nothing once a handover began: waiting here is a safe point.
+        let handover = self.handover_of(&context);
         let permits = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ModelError::Cancelled),
+            _ = handover.cancelled() => Err(ModelError::Cancelled),
             permits = self.vendor_request_permits() => permits,
         };
         let _permits = match permits {

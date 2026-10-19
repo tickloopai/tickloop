@@ -834,6 +834,9 @@ pub enum WaitKind {
     /// A delegated member waits until every child it delegated has reported.
     #[serde(rename_all = "camelCase")]
     Children { children: Vec<Uuid> },
+    /// A voluntary handover stopped the Run at a safe point: whoever holds the Chat next goes on
+    /// with the same attempt where the wait says, once the Run takes the execution slot.
+    Handover,
 }
 
 /// Where a Run continues.

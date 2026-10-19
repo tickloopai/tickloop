@@ -4895,6 +4895,7 @@ name = "tickloop-agent-test-support"
 version = "0.2.8"
 dependencies = [
  "async-trait",
+ "futures-util",
  "regex",
  "serde_json",
  "tickloop-agent-artifacts",

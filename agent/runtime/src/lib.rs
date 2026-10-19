@@ -17,6 +17,8 @@ mod family_load;
 mod family_tree;
 pub mod file_history;
 mod handback;
+mod handover;
+pub use handover::HandOver;
 mod harness;
 pub use harness::{
     DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
@@ -388,6 +390,9 @@ struct Inner {
     tick_wake: Notify,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
+    /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
+    /// point.
+    handover: CancellationToken,
 }
 
 /// Runtime bookkeeping about a Chat's conversation that never leaves this process. Recovery and
@@ -1875,6 +1880,7 @@ impl Agent {
                     session_permissions::SessionPermissionContext::default(),
                 ),
                 shutdown: CancellationToken::new(),
+                handover: CancellationToken::new(),
             }),
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
@@ -3431,12 +3437,13 @@ impl Agent {
             }
         };
         loop {
+            Box::pin(self.stop_at_safe_point(&receipt, None)).await?;
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
             self.feedback_account_context(&receipt).await?;
             *is_awaiting_model = true;
             let mut registry = self.prepare_tool_registry(&receipt, &cancel).await?;
             request.tools = registry.definitions();
-            let output = self
+            let output = match self
                 .model_request(
                     &receipt,
                     request,
@@ -3445,13 +3452,27 @@ impl Agent {
                     &mut used_calls,
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+            {
+                Ok(output) => output,
+                // A handover stopped the request before it reached the vendor, or in a retry
+                // backoff: the Run stops before its model request.
+                Err(AgentError::Model(ModelError::Cancelled))
+                    if self.stopped_for_handover(&cancel) =>
+                {
+                    return Err(Box::pin(self.leave_before_model_request(&receipt)).await);
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             *is_awaiting_model = false;
             let assistant_message_id = Uuid::new_v4();
             let calls = tool_batch::batch_calls(&output.content);
             {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                // A Run ended at a handover's ceiling leaves without its reply.
+                if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+                    return Err(suspension::RUN_RELEASED.into());
+                }
                 chat.snapshot.pending_thinking.remove(&receipt.run_id);
                 chat.snapshot
                     .message_runs
@@ -3928,6 +3949,7 @@ impl Agent {
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.handover.is_cancelled()
             || chat.active.is_some()
             || chat.has_foreground_user_shell()
         {
