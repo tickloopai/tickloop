@@ -38,7 +38,7 @@ const LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// The task the requesting member was delegated, from the Agent message that opens its
 /// conversation; `None` for the root.
-fn task_of(request: &ModelRequest) -> Option<String> {
+pub(super) fn task_of(request: &ModelRequest) -> Option<String> {
     let first = request
         .messages
         .iter()
@@ -201,14 +201,14 @@ fn results_of(lines: &[Line], call_id: &str) -> Vec<Value> {
 }
 
 /// How many user messages of the Lines carry `text`.
-fn messages_saying(lines: &[Line], text: &str) -> usize {
+pub(super) fn messages_saying(lines: &[Line], text: &str) -> usize {
     lines
         .iter()
         .filter(|line| matches!(line, Line::User(entry) if format!("{:?}", entry.message.content).contains(text)))
         .count()
 }
 
-fn last_completions(lines: &[Line]) -> Vec<tickloop_agent_protocol::FamilyCompletion> {
+pub(super) fn last_completions(lines: &[Line]) -> Vec<tickloop_agent_protocol::FamilyCompletion> {
     lines
         .iter()
         .rev()
