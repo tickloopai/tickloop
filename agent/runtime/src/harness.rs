@@ -103,6 +103,10 @@ pub struct ToolPolicy {
     /// The addresses WebFetch reaches in a Chat without a Folder; a Chat with a Folder reaches
     /// anywhere. Both constructors choose public addresses only.
     pub folderless_reach: Reach,
+    /// Whether WebFetch fetches only URLs with provenance: written by the user, or contained in
+    /// an earlier search result or fetched page of the Chat. A URL the model composed, which
+    /// injected instructions could use to send data out, is refused.
+    pub web_fetch_requires_provenance: bool,
 }
 
 impl ToolPolicy {
@@ -121,11 +125,13 @@ impl ToolPolicy {
             artifacts: true,
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
+            web_fetch_requires_provenance: false,
         }
     }
 
-    /// A durable Chat's: WebFetch, questions, Subagents and their messages, Task tools, goals
-    /// with schedules and the host's tools, with waits the Transcript keeps.
+    /// A durable Chat's: WebFetch of URLs with provenance, questions, Subagents and their
+    /// messages, Task tools, goals with schedules and the host's tools, with waits the Transcript
+    /// keeps.
     pub const fn durable_chat() -> Self {
         Self {
             web_fetch: true,
@@ -140,6 +146,7 @@ impl ToolPolicy {
             artifacts: true,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
+            web_fetch_requires_provenance: true,
         }
     }
 
@@ -168,20 +175,20 @@ impl ToolPolicy {
             artifacts: false,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
+            web_fetch_requires_provenance: false,
         }
     }
 }
 
-/// The tools whose calls a durable Chat's host admits by its own rule: under Auto they would
-/// otherwise wait for a reviewer the host does not have.
-const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 7] = [
+/// The tools whose calls a durable Chat's host admits by its own rule instead of Auto review.
+/// WebFetch fetches only URLs with provenance there, so it carries no data the model composed;
+/// writes to the user's Artifacts are not among them and go through review like any other.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 5] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
     tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
     crate::mcp_tools::ARTIFACT_READ_TOOL,
-    crate::mcp_tools::ARTIFACT_EDIT_TOOL,
-    crate::mcp_tools::ARTIFACT_COMMENT_TOOL,
 ];
 
 /// The host rules of a durable Chat, beside [`ToolPolicy::durable_chat`]: each allows one of

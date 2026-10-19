@@ -315,6 +315,7 @@ async fn a_cached_page_is_answered_again_without_a_second_download() {
         let result = fetch(
             fetch_input(&page, prompt),
             &cache,
+            &ObservedUrls::default(),
             Reach::Anywhere,
             &model,
             CancellationToken::new(),
@@ -350,6 +351,7 @@ async fn a_cross_origin_redirect_asks_for_a_new_call_without_contacting_the_targ
     let result = fetch(
         fetch_input(&format!("{base}/start"), "Summarize \"it\""),
         &FetchCache::default(),
+        &ObservedUrls::default(),
         Reach::Anywhere,
         &model,
         CancellationToken::new(),
@@ -433,6 +435,7 @@ async fn a_silent_server_times_out_and_cancellation_stops_before_the_network() {
         fetch(
             fetch_input(&base, "p"),
             &FetchCache::default(),
+            &ObservedUrls::default(),
             Reach::Anywhere,
             &RecordingModel::default(),
             cancel,

@@ -448,3 +448,20 @@ fn every_host_names_the_durable_chat_rules_alike() {
         rules.len()
     );
 }
+
+#[test]
+fn only_the_durable_chat_preset_asks_web_fetch_for_provenance() {
+    assert!(ToolPolicy::durable_chat().web_fetch_requires_provenance);
+    assert!(!ToolPolicy::local().web_fetch_requires_provenance);
+    assert!(!ToolPolicy::web_fetch_only().web_fetch_requires_provenance);
+    let allowed = durable_chat_host_rules()
+        .into_iter()
+        .map(|rule| rule.tool)
+        .collect::<Vec<_>>();
+    for reviewed in [
+        crate::mcp_tools::ARTIFACT_EDIT_TOOL,
+        crate::mcp_tools::ARTIFACT_COMMENT_TOOL,
+    ] {
+        assert!(!allowed.iter().any(|tool| tool == reviewed), "{reviewed}");
+    }
+}

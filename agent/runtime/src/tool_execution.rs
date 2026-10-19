@@ -1621,6 +1621,9 @@ impl Agent {
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
                     }
+                    if let Err(error) = self.check_web_fetch_provenance(receipt, &prepared).await {
+                        return Ok(ToolCallOutcome::not_admitted(error));
+                    }
                     let session_operation =
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;

