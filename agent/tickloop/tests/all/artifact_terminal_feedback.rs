@@ -88,14 +88,14 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
                 let user =
                     json!({"id":"fixture-owner","name":"Fixture","email":"fixture@example.test"});
                 let (content_type, body) = if path
-                    .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
                 {
-                    ("application/json", json!({"issuer":format!("{origin}/accounts"),"token_endpoint":format!("{origin}/accounts/token"),"device_authorization_endpoint":format!("{origin}/accounts/device"),"userinfo_endpoint":format!("{origin}/accounts/userinfo"),"revocation_endpoint":format!("{origin}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}).to_string())
-                } else if path.starts_with("POST /accounts/device ") {
-                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/accounts/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
-                } else if path.starts_with("POST /accounts/token ") {
+                    ("application/json", json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}).to_string())
+                } else if path.starts_with("POST /account/device ") {
+                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
+                } else if path.starts_with("POST /account/token ") {
                     ("application/json", json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":600,"refresh_token":"fixture-refresh"}).to_string())
-                } else if path.starts_with("GET /accounts/userinfo ") {
+                } else if path.starts_with("GET /account/userinfo ") {
                     (
                         "application/json",
                         json!({"sub":user["id"],"name":user["name"],"email":user["email"]})

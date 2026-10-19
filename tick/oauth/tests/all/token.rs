@@ -150,7 +150,7 @@ async fn revoking_names_the_refresh_token_or_else_the_access_token() {
 
 #[tokio::test]
 async fn resource_refresh_rotates_the_refresh_token_and_keeps_the_selected_audience() {
-    let server = AuthorizationServer::start_with_path("/accounts");
+    let server = AuthorizationServer::start_with_path("/account");
     server.answer_polls([TokenReply::Approve, TokenReply::Approve]);
     let saved = token(&server, Some("refresh-old"));
     let first = tick_oauth::refresh_for_resource(

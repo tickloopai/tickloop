@@ -684,28 +684,28 @@ impl ArtifactService {
                             std::future::pending::<()>().await;
                         }
                         (status, receipt)
-                    } else if target == "/.well-known/oauth-authorization-server/accounts" {
+                    } else if target == "/.well-known/oauth-authorization-server/account" {
                         (
                             200,
-                            json!({"issuer":format!("{origin}/accounts"),"token_endpoint":format!("{origin}/accounts/token"),"device_authorization_endpoint":format!("{origin}/accounts/device"),"userinfo_endpoint":format!("{origin}/accounts/userinfo"),"revocation_endpoint":format!("{origin}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
+                            json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
                         )
-                    } else if target == "/accounts/device" {
+                    } else if target == "/account/device" {
                         (
                             200,
-                            json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/accounts/device?code=TEST"),"expires_in":30,"interval":1}),
+                            json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1}),
                         )
-                    } else if target == "/accounts/token"
+                    } else if target == "/account/token"
                         && control.hold_device_approval.load(Ordering::SeqCst)
                     {
                         (400, json!({"error":"authorization_pending"}))
-                    } else if target == "/accounts/token" {
+                    } else if target == "/account/token" {
                         control.signed_out.store(false, Ordering::SeqCst);
                         let revision = control.credential_revision.load(Ordering::SeqCst);
                         (
                             200,
                             json!({"access_token":format!("test-service-token-{revision}"),"token_type":"Bearer","expires_in":600,"refresh_token":format!("refresh-{revision}")}),
                         )
-                    } else if target == "/accounts/userinfo" {
+                    } else if target == "/account/userinfo" {
                         if control.hold_status_response.load(Ordering::SeqCst) {
                             control.status_response_started.notify_one();
                             control.release_status_response.notified().await;
@@ -714,7 +714,7 @@ impl ArtifactService {
                             200,
                             json!({"sub":account(&control),"name":"One","email":"one@example.test"}),
                         )
-                    } else if target == "/accounts/revoke" {
+                    } else if target == "/account/revoke" {
                         control.signed_out.store(true, Ordering::SeqCst);
                         (200, json!({"revoked":true}))
                     } else if let Some(error) =
@@ -741,16 +741,16 @@ impl ArtifactService {
                     };
                     if (is_mcp && control.reject_mcp.load(Ordering::SeqCst))
                         || (control.signed_out.load(Ordering::SeqCst)
-                            && (is_mcp || target == "/accounts/userinfo"))
+                            && (is_mcp || target == "/account/userinfo"))
                     {
                         status = 401;
                     } else if (is_mcp && control.directory_unavailable.load(Ordering::SeqCst))
-                        || (target == "/accounts/userinfo"
+                        || (target == "/account/userinfo"
                             && control.session_unavailable.load(Ordering::SeqCst))
                     {
                         status = 503;
                     }
-                    if target == "/accounts/userinfo"
+                    if target == "/account/userinfo"
                         && control.hold_session_response.swap(false, Ordering::SeqCst)
                     {
                         control.session_response_started.notify_one();
@@ -774,7 +774,7 @@ impl ArtifactService {
 
     /// Device authorizations the service has started.
     pub fn device_logins_started(&self) -> usize {
-        self.lifecycle_requests("POST /accounts/device ").len()
+        self.lifecycle_requests("POST /account/device ").len()
     }
 
     pub fn client(&self, root: &Path) -> ArtifactClient {

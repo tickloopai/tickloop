@@ -20,7 +20,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let server = AuthorizationServer::start_with_path("/accounts");
+        let server = AuthorizationServer::start_with_path("/account");
         server.edit_metadata(|metadata| {
             metadata
                 .as_object_mut()
@@ -29,7 +29,7 @@ impl Fixture {
         });
         let client = ArtifactClient::for_origin(
             directory.path().canonicalize().unwrap(),
-            server.issuer().strip_suffix("/accounts").unwrap(),
+            server.issuer().strip_suffix("/account").unwrap(),
         )
         .unwrap();
         Self {
@@ -100,7 +100,7 @@ async fn accounts_login_discovers_path_issuer_refreshes_artifacts_and_revokes_th
     let metadata = fixture.server.requests_to(METADATA_PATH);
     assert_eq!(
         metadata[0].path,
-        "/.well-known/oauth-authorization-server/accounts"
+        "/.well-known/oauth-authorization-server/account"
     );
     assert!(fixture.server.requests_to(REGISTRATION_PATH).is_empty());
     let requests = fixture.server.requests_to(DEVICE_AUTHORIZATION_PATH);
@@ -126,6 +126,26 @@ async fn accounts_login_discovers_path_issuer_refreshes_artifacts_and_revokes_th
     assert_eq!(revocations[0].form["token"], "refresh-2");
     assert_eq!(revocations[0].form["client_id"], CLIENT_ID);
     assert_eq!(revocations[0].form["token_type_hint"], "refresh_token");
+    assert!(!fixture.client.credential_path().exists());
+}
+
+#[tokio::test]
+async fn accounts_login_rejects_plural_issuer_metadata_without_a_fallback() {
+    let fixture = Fixture::new();
+    fixture.server.edit_metadata(|metadata| {
+        metadata["issuer"] = json!(format!("{}/accounts", fixture.client.origin()));
+    });
+    assert!(matches!(
+        fixture.client.start_device_login().await,
+        Err(ArtifactError::Login(LoginError::Failed(reason)))
+            if reason.contains("describes another issuer than")
+    ));
+    let requests = fixture.server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/.well-known/oauth-authorization-server/account"
+    );
     assert!(!fixture.client.credential_path().exists());
 }
 
@@ -193,7 +213,7 @@ async fn resource_caches_share_a_rotating_refresh_token_and_serialize_concurrent
         "https://other.example",
     )
     .unwrap();
-    assert_eq!(other.accounts_issuer(), "https://other.example/accounts");
+    assert_eq!(other.accounts_issuer(), "https://other.example/account");
     assert!(other.credential_snapshot().unwrap().is_none());
 }
 
@@ -622,6 +642,7 @@ fn accounts_and_artifacts_follow_the_same_validated_tickloop_origin() {
     let directory = tempfile::tempdir().unwrap();
     for (configured, expected) in [
         (DEFAULT_ORIGIN, "https://tickloop.ai"),
+        ("https://pre.tickloop.ai", "https://pre.tickloop.ai"),
         (
             "https://service.example:8443/",
             "https://service.example:8443",
@@ -629,7 +650,7 @@ fn accounts_and_artifacts_follow_the_same_validated_tickloop_origin() {
         ("http://127.0.0.1:12345/", "http://127.0.0.1:12345"),
     ] {
         let client = ArtifactClient::for_origin(directory.path(), configured).unwrap();
-        assert_eq!(client.accounts_issuer(), format!("{expected}/accounts"));
+        assert_eq!(client.accounts_issuer(), format!("{expected}/account"));
         assert_eq!(client.resource(), format!("{expected}/artifact"));
         assert_eq!(
             mcp_endpoint(client.origin()),

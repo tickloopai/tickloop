@@ -7,7 +7,7 @@ use tick_oauth::{
 
 use super::*;
 
-const ACCOUNTS_BASE_PATH: &str = "/accounts";
+const ACCOUNTS_BASE_PATH: &str = "/account";
 pub(crate) const CLIENT_ID: &str = "tickloop-cli";
 const SCOPES: &str = "openid profile email offline_access artifacts.agent artifacts.console";
 const REFRESH_MARGIN_SECONDS: u64 = 60;

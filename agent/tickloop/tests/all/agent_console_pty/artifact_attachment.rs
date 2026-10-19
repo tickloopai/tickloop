@@ -45,14 +45,14 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                     .unwrap()
                     .push(json!({"path":path,"body":body}));
                 let response = if path
-                    .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
                 {
-                    json!({"issuer":format!("{origin}/accounts"),"token_endpoint":format!("{origin}/accounts/token"),"device_authorization_endpoint":format!("{origin}/accounts/device"),"userinfo_endpoint":format!("{origin}/accounts/userinfo"),"revocation_endpoint":format!("{origin}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
-                } else if path.starts_with("POST /accounts/token ") {
+                    json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if path.starts_with("POST /account/token ") {
                     json!({"access_token":"test-artifact-token","token_type":"Bearer","expires_in":3600,"refresh_token":"fixture-refresh"})
-                } else if path.starts_with("POST /accounts/device ") {
-                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/accounts/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("GET /accounts/userinfo ") {
+                } else if path.starts_with("POST /account/device ") {
+                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("GET /account/userinfo ") {
                     json!({"sub":"owner","name":"Owner","email":"owner@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/document ") {
                     json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/artifact/document"),"publication":{"audience":"private","membership_revision":0}})

@@ -405,7 +405,7 @@ async fn a_preregistered_client_uses_path_discovery_without_registration() {
     use tick_oauth::ClientRegistration;
     use tick_test_support::authorization_server::AuthorizationServer;
     let fixture = Login::new();
-    let server = AuthorizationServer::start_with_path("/accounts");
+    let server = AuthorizationServer::start_with_path("/account");
     server.edit_metadata(|metadata| {
         metadata
             .as_object_mut()
@@ -433,7 +433,7 @@ async fn a_preregistered_client_uses_path_discovery_without_registration() {
     let requests = server.requests();
     assert_eq!(
         requests[0].path,
-        "/.well-known/oauth-authorization-server/accounts"
+        "/.well-known/oauth-authorization-server/account"
     );
     assert!(server.requests_to(REGISTRATION_PATH).is_empty());
     let authorization = &server.requests_to(DEVICE_AUTHORIZATION_PATH)[0];
