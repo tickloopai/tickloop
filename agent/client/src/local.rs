@@ -92,7 +92,7 @@ impl WriteTicket {
         let mut waiting = queue.waiting.lock().unwrap();
         let order = queue
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| AccessError::invalid("client request sequence exhausted"))?;

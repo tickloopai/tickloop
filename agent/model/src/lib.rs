@@ -289,7 +289,7 @@ impl ModelRequestContext {
 
     pub fn try_begin_attempt(&self) -> bool {
         self.used_attempts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < self.max_attempts).then_some(used + 1)
             })
             .is_ok()

@@ -1405,7 +1405,7 @@ impl Agent {
             }
             Err(error) => {
                 if let Some(record) = error.denial {
-                    self.record_final_denial(record).await;
+                    self.record_final_denial(*record).await;
                 }
                 return format!("assignment saved; notification pending: {}", error.message);
             }

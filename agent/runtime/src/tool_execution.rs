@@ -587,7 +587,7 @@ impl ToolCallOutcome {
 
 pub(super) struct ToolCallError {
     pub(super) message: String,
-    pub(super) denial: Option<DenialRecord>,
+    pub(super) denial: Option<Box<DenialRecord>>,
 }
 
 impl From<String> for ToolCallError {
@@ -609,7 +609,7 @@ impl ToolCallError {
     fn denied(message: String, denial: DenialRecord) -> Self {
         Self {
             message,
-            denial: Some(denial),
+            denial: Some(Box::new(denial)),
         }
     }
 }

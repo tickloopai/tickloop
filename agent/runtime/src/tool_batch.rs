@@ -524,7 +524,7 @@ impl Agent {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Some(record) = error.denial {
-                    self.record_final_denial(record).await;
+                    self.record_final_denial(*record).await;
                 }
                 return Err(error.message);
             }
