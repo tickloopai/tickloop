@@ -494,6 +494,14 @@ mod channel {
             let root = directory.path().canonicalize().unwrap();
             let config_root = root.join("state");
             std::fs::create_dir(&config_root).unwrap();
+            // A Herdr worker is built as in production, on the bundled default model; its key is
+            // saved here so no test reads the developer's own.
+            tickloop_agent_model::credentials::save_api_key(
+                &config_root,
+                "DEEPSEEK_API_KEY",
+                "fixture-deepseek-key",
+            )
+            .unwrap();
             let epoch = Uuid::new_v4();
             let controller = Arc::new(HostController::new(
                 &root,

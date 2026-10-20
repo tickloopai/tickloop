@@ -4693,12 +4693,7 @@ mod tests {
         Arc<Recording>,
         ConsoleExecution,
     ) {
-        recording_terminal_with_model(
-            directory,
-            tickloop_agent_model::cards::ModelCatalog::defaults()
-                .get("deepseek-api", "deepseek-flash")
-                .unwrap(),
-        )
+        recording_terminal_with_model(directory, tickloop_agent_test_support::persisted_config())
     }
 
     fn recording_terminal_with_model(
@@ -4970,7 +4965,14 @@ mod tests {
     #[tokio::test]
     async fn new_agent_settings_stay_in_the_view_until_the_first_input_creates_the_agent() {
         let directory = tempfile::tempdir().unwrap();
-        let (runtime, access, terminal) = recording_terminal(directory.path());
+        // The draft reads its model through the bundled catalog, so the created Agent matches it
+        // only when it starts from the catalog model. No input is sent, so no key is read.
+        let (runtime, access, terminal) = recording_terminal_with_model(
+            directory.path(),
+            tickloop_agent_model::cards::ModelCatalog::defaults()
+                .get("deepseek-api", "deepseek-flash")
+                .unwrap(),
+        );
         let defaults = terminal
             .configuration(ConfigTarget::NewDraft)
             .await

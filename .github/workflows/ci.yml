@@ -15,6 +15,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
+  # The popup and Herdr view tests run a private server of this release.
+  HERDR_VERSION: 0.9.0
+  HERDR_MACOS_AARCH64_SHA256: 32b53df09872628059c789a69f02a6b8e29e14ddf26711421f3463f70c1aef17
 
 # The Cargo launcher's build downloads the release matching its version, which does not exist yet
 # when a version commit lands, so CI checks the workspace only; release.yml verifies the launcher.
@@ -43,6 +46,17 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+
+      - name: Install Herdr
+        run: |
+          herdr="$RUNNER_TEMP/herdr/bin/herdr"
+          mkdir -p "${herdr%/*}"
+          curl --fail --silent --show-error --location --retry 3 --output "$herdr" \
+            "https://github.com/herdrdev/herdr/releases/download/v$HERDR_VERSION/herdr-macos-aarch64"
+          echo "$HERDR_MACOS_AARCH64_SHA256  $herdr" | shasum -a 256 --check --strict
+          chmod +x "$herdr"
+          "$herdr" --version
+          echo "${herdr%/*}" >> "$GITHUB_PATH"
 
       - name: Restore the Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

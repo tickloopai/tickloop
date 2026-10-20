@@ -180,22 +180,31 @@ fn reported_build_identity(executable: &Path) -> Option<String> {
     Some(reported.trim_end().to_owned())
 }
 
+/// The default model's key for every fixture CLI, so no test reads the developer's real key;
+/// a test that needs it unset removes it.
+const FIXTURE_API_KEY: (&str, &str) = ("DEEPSEEK_API_KEY", "fixture-default-key");
+
 /// The product CLI through the fixture; callers append CLI arguments.
 pub fn command() -> std::process::Command {
     let mut command = std::process::Command::new(executable());
-    command.arg(CLI_MODE);
+    command
+        .arg(CLI_MODE)
+        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
     command
 }
 
 pub fn tokio_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable());
-    command.arg(CLI_MODE);
+    command
+        .arg(CLI_MODE)
+        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
     command
 }
 
 pub fn pty_command() -> portable_pty::CommandBuilder {
     let mut command = portable_pty::CommandBuilder::new(executable());
     command.arg(CLI_MODE);
+    command.env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
     command
 }
 

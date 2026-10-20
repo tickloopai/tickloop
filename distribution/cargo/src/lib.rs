@@ -258,7 +258,18 @@ mod unix {
                 Err(std::fs::TryLockError::WouldBlock)
             ));
             drop(first);
-            second.try_lock().unwrap();
+            // A child forked by a parallel test briefly shares the first descriptor until it
+            // execs, so the flock can outlive the drop by a moment.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match second.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("The released lock stayed unavailable: {error}"),
+                }
+            }
         }
 
         #[test]
