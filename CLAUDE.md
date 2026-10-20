@@ -80,7 +80,7 @@ Agent 的 HostToolProvider 与 TickStreamPort 是主要接入 Seam：Worker 侧�
 
 公开协作使用 GitHub Issues 与 Pull Request，CI（`.github/workflows/ci.yml`）运行上述三项检查。维护者的本地工单按功能放在 `.scratch/<feature>/issues/`（不纳入 Git），实现前读完整工单、父规格和依赖状态。规范见工单约定（`docs/agents/issue-tracker.md`）与状态映射（`docs/agents/triage-labels.md`）。Status 是分流状态，Progress 才是实施进度，完成必须有验收证据。
 
-脚本产生的日志、results、evidence、transcript、缓存必须被 .gitignore 排除；规格、脚本和结果说明可随仓库保留。本机 core.safecrlf=true；Git 操作仍受用户明确授权约束，避免将 CRLF 运行输出纳入源文件变更。
+脚本产生的日志、results、evidence、transcript、缓存必须被 .gitignore 排除；规格、工单与验证记录只留在维护者本地的 `.scratch/`。Git 操作仍受用户明确授权约束，避免将 CRLF 运行输出纳入源文件变更。
 
 ## 文档导航
 

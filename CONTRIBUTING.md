@@ -39,12 +39,10 @@ This stops every running agent in that daemon. Saved history is kept, and Ticks 
 Every pull request must pass the same checks CI runs (`.github/workflows/ci.yml`):
 
 ```sh
-cargo fmt --all --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-make test
+make check-workspace
 ```
 
-`make check` runs all of them, plus the same checks for the Cargo launcher in `distribution/cargo`. `make test` runs the whole workspace under cargo-nextest (configuration in `.config/nextest.toml`) with isolated state directories and without inherited `HERDR_*` variables. CI also runs `node --test` on the release and install scripts.
+It runs `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `make test-workspace`, which runs the whole workspace under cargo-nextest (configuration in `.config/nextest.toml`) with isolated state directories and without inherited `HERDR_*` variables; CI uses the nextest `ci` profile, which retries timing-sensitive PTY tests. `make check` and `make test` also cover the Cargo launcher in `distribution/cargo`, whose build downloads the release matching its version, so they need network access and fail on a version that is not released yet. CI also runs `node --test` on the release and install scripts.
 
 ### Writing tests
 

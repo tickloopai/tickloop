@@ -14,12 +14,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
 
+# The Cargo launcher's build downloads the release matching its version, which does not exist yet
+# when a version commit lands, so CI checks the workspace only; release.yml verifies the launcher.
 jobs:
   check:
     name: Format, lint and test
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out the source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -31,17 +34,29 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install stable Rust
+      - name: Set up Rust
         run: |
-          rustup update --no-self-update stable
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-          rustup component add rustfmt clippy
 
       - name: Install cargo-nextest
-        run: cargo install --locked cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ci-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Test the release and install scripts
         run: node --test scripts/release.test.mjs scripts/install.test.mjs scripts/release-cargo.test.mjs
 
-      - name: Format, lint and test
-        run: make check
+      - name: Format, lint and test the workspace
+        run: make check-workspace

@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-English | [简体中文](README.zh-CN.md)
+[Website](https://tickloop.ai) · English | [简体中文](README.zh-CN.md)
 
 Tickloop is a terminal AI agent for code and office work. It understands your project, edits code, runs tests, organizes material, writes documents, builds pages and slide decks, and keeps going based on execution results and feedback. Its distinctive idea is the **Tick**: a live terminal program that both you and the agent use at the same time. The agent can read a Tick, call the tools it declares, and subscribe to it so that changes in the program wake the agent's Loop and drive the work forward.
 
@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your Mac, pins the release tag and verifies SHA-256. It refuses to take over an existing installation from another source.
+The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your Mac, pins the release tag and verifies SHA-256. It refuses to take over an existing installation from another source. The script's source is [scripts/install.sh](scripts/install.sh).
 
 ### Cargo launcher
 

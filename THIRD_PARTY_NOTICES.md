@@ -7,7 +7,7 @@ This file records the source and applicable license of third-party code adapted 
 - Upstream project: [Herdr](https://github.com/herdrdev/herdr).
 - Reference revision: `120c682008a85dc17d7a13cc619a2fd5d25f3924`.
 - Upstream source: [src/layout.rs at the reference revision](https://github.com/herdrdev/herdr/blob/120c682008a85dc17d7a13cc619a2fd5d25f3924/src/layout.rs).
-- Former adapted source: `crates/tickloop/src/layout/tree.rs` and its regression tests, removed together with the in-development workspace (ADR 0012).
+- Former adapted source: `crates/tickloop/src/layout/tree.rs` and its regression tests, removed together with the in-development workspace.
 - Applicable upstream license: Apache License, Version 2.0, as declared in Herdr's package metadata and [LICENSE at the reference revision](https://github.com/herdrdev/herdr/blob/120c682008a85dc17d7a13cc619a2fd5d25f3924/LICENSE). An unmodified copy is included in [licenses/Herdr-Apache-2.0.txt](./licenses/Herdr-Apache-2.0.txt).
 
 The former adaptation changed Herdr's Pane terminology to Tickloop's Panel terminology and adjusted its layout types. This attribution and the license copy remain for historical source versions. The referenced upstream layout file contains no separate copyright attribution, and the reference checkout has no top-level NOTICE file.

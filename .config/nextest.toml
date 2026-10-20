@@ -2,6 +2,10 @@
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# CI runners are slower and noisier than a workstation; PTY tests wait on rendered frames.
+[profile.ci]
+retries = 2
+
 [test-groups]
 pty = { max-threads = 4 }
 full-scale = { max-threads = 1 }

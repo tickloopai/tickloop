@@ -1,5 +1,5 @@
 DEV_LAUNCHER := $(shell dirname '$(subst ','"'"',$(strip $(MAKEFILE_LIST)))')/scripts/dev-agent.sh
-# 本地开发入口。密钥放在仓库根目录的 .env（已被 .gitignore 忽略），例如：
+# Local development entry point. Put provider keys in .env at the repository root (ignored by Git), for example:
 #   DEEPSEEK_API_KEY=sk-...
 -include .env
 export
@@ -10,7 +10,7 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev build install package test check release
+.PHONY: dev build install package test test-workspace check check-workspace release
 
 ## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
 # Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
@@ -34,7 +34,12 @@ package:
 	COPYFILE_DISABLE=1 tar --format=ustar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
-test:
+test: test-workspace
+	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
+
+## Workspace tests without the Cargo launcher, whose build downloads the matching release; CI runs
+## these and the release workflow verifies the launcher. NEXTEST_PROFILE=ci retries flaky PTY tests.
+test-workspace:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
 	node --test scripts/dev-agent.test.mjs
 	@mkdir -p /tmp/tickloop-test
@@ -43,15 +48,17 @@ test:
 	NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 	env $$(env | grep -o '^HERDR_[A-Za-z0-9_]*' | sed 's/^/-u /') \
 	cargo nextest run --locked --workspace --no-fail-fast
+
+check: check-workspace
+	cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
-check:
+check-workspace:
 	cargo fmt --all --check
 	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
-	cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
-	$(MAKE) test
+	$(MAKE) test-workspace
 
-## Tickloop 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
+## Bump the Tickloop patch version (VERSION=X.Y.Z names a higher one), check it, commit the version files and push the branch and tag.
 release:
 	@node scripts/release.mjs binary

@@ -13,4 +13,4 @@
 
 ## Notes
 
-<!-- Optional: design decisions, conflicts with existing ADRs, documentation updated, follow-up work. -->
+<!-- Optional: design decisions and trade-offs, documentation updated, follow-up work. -->

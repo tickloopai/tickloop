@@ -2,7 +2,7 @@
 
 # Rendered by .github/workflows/release.yml into tickloopai/homebrew-tap; edit the template here.
 class Tickloop < Formula
-  desc "Terminal agent with market Ticks for self-directed investors"
+  desc "Terminal AI agent for code and office work, driven by live Ticks"
   homepage "https://tickloop.ai"
   version "@VERSION@"
 

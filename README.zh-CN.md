@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-[English](README.md) | 简体中文
+[官网](https://tickloop.ai) · [English](README.md) | 简体中文
 
 Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修改代码、运行测试，整理资料、撰写文档、制作页面与演示，并根据执行结果和反馈继续推进工作。它的独特之处是 **Tick**：人和 Agent 同时使用的一个运行中的终端程序。Agent 可以读取 Tick、调用它声明的工具，并通过订阅让程序中的变化唤醒 Agent 的 Loop，推动工作继续。
 
@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前 Mac 架构选择构建，固定发行标签并校验 SHA-256；遇到其他来源的已有安装时报告冲突，不自动接管。
+脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前 Mac 架构选择构建，固定发行标签并校验 SHA-256；遇到其他来源的已有安装时报告冲突，不自动接管。脚本源码见 [scripts/install.sh](scripts/install.sh)。
 
 ### Cargo 启动器
 
