@@ -16,13 +16,6 @@ const SOURCE_EXTENSIONS: [&str; 9] = [
 const SKIPPED_DIRECTORIES: [&str; 2] = ["target", "node_modules"];
 
 fn main() {
-    // An unoptimized binary's __eh_frame outgrows the 16 MB offsets of Apple's compact unwind
-    // table and ld warns on every link; debug builds skip the table, which only speeds unwinding.
-    if std::env::var("PROFILE").as_deref() == Ok("debug")
-        && std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple")
-    {
-        println!("cargo:rustc-link-arg=-Wl,-no_compact_unwind");
-    }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
     let workspace = manifest.join("../..");
     let mut sources = ROOT_FILES
