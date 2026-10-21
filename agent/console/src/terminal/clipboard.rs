@@ -1,4 +1,4 @@
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 #[cfg(test)]
@@ -8,8 +8,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use ::image::{DynamicImage, ImageFormat, RgbaImage};
 
 use tickloop_agent_base::image::{self};
 use tickloop_agent_protocol::Image;
@@ -188,8 +186,8 @@ fn lists_an_image(clipboard_info: &str) -> bool {
         .any(|image_type| clipboard_info.contains(image_type))
 }
 
-/// Clipboard images arrive as raw RGBA; they are encoded as PNG so every image
-/// entry point goes through the same preparation (Codex `paste_image_as_png`).
+/// Clipboard images arrive as raw RGBA; resize before encoding through the shared
+/// preparation path to avoid a full-size PNG encode/decode round trip.
 fn read_native_image() -> Result<Option<Image>, String> {
     let Ok(pixels) = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image())
     else {
@@ -199,13 +197,7 @@ fn read_native_image() -> Result<Option<Image>, String> {
     else {
         return Err("clipboard image dimensions are too large".into());
     };
-    let rgba = RgbaImage::from_raw(width, height, pixels.bytes.into_owned())
-        .ok_or_else(|| "clipboard image data is incomplete".to_owned())?;
-    let mut png = Vec::new();
-    DynamicImage::ImageRgba8(rgba)
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-        .map_err(|error| format!("cannot encode clipboard image: {error}"))?;
-    image::prepare(&png)
+    image::prepare_rgba(width, height, pixels.bytes.into_owned())
         .map(Some)
         .map_err(|error| error.to_string())
 }
@@ -292,6 +284,8 @@ fn write_osc52(text: &str, output: &mut impl Write) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::image::{DynamicImage, ImageFormat, RgbaImage};
+    use std::io::Cursor;
 
     fn captured() -> (Clipboard, Arc<Mutex<Vec<String>>>) {
         let copies = Arc::new(Mutex::new(Vec::new()));

@@ -24,6 +24,10 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_layout;
+mod delayed_submissions;
+use delayed_submissions::DelayedSubmission;
+#[cfg(test)]
+mod image_preparation_tests;
 mod upgrade;
 pub(super) use upgrade::ConsoleUpgrade;
 mod file_index_worker;
@@ -280,6 +284,10 @@ pub(super) enum InputEvent {
         /// at the next tool boundary.
         send_now: bool,
     },
+    /// A frozen local prompt; claimed only against its original Chat.
+    DelayedPrompt {
+        id: Uuid,
+    },
     /// ctrl+enter with an empty draft sends the oldest queued message now.
     SendQueuedNow {
         run_id: Uuid,
@@ -386,6 +394,10 @@ impl fmt::Debug for InputEvent {
             Self::SendQueuedNow { run_id } => formatter
                 .debug_struct("SendQueuedNow")
                 .field("run_id", run_id)
+                .finish(),
+            Self::DelayedPrompt { id } => formatter
+                .debug_struct("DelayedPrompt")
+                .field("id", id)
                 .finish(),
             Self::UserShellSubmitted(value) => formatter
                 .debug_tuple("UserShellSubmitted")
@@ -762,6 +774,11 @@ pub(super) struct State {
     empty_paste_reads_clipboard_image: bool,
     /// Where pasted images are kept for their `[Image #N]` links; `None` when Chats are not saved.
     image_cache: Option<ImageCache>,
+    image_preparation: super::image_preparation::ImagePreparation,
+    delayed_submissions: std::collections::VecDeque<DelayedSubmission>,
+    active_delayed_submission: Option<Uuid>,
+    delayed_send_now: bool,
+    delayed_restored_contexts: Option<Vec<InputContext>>,
     terminal_shows_links: bool,
     clipboard_hint: ClipboardImageHint,
     shell_input: ShellInputState,
@@ -2466,8 +2483,16 @@ impl Console {
 
     pub fn record_prompt_history(&self, prompt: &str) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let session = state.history_session.clone();
-        let project = state.history_project.clone();
+        let (session, project) = state
+            .active_delayed_submission
+            .and_then(|id| {
+                state
+                    .delayed_submissions
+                    .iter()
+                    .find(|entry| entry.id == id)
+            })
+            .map(|entry| (entry.history_session.clone(), entry.history_project.clone()))
+            .unwrap_or_else(|| (state.history_session.clone(), state.history_project.clone()));
         let pasted_texts = match state.submitted_pasted_texts.take() {
             Some((submitted, pasted_texts)) if submitted == prompt => pasted_texts,
             _ => Vec::new(),
@@ -2567,6 +2592,19 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let is_new_view = state.chat != Some(chat) && !state.view_cache.contains_key(&Some(chat));
+        if state.active_delayed_submission.is_some_and(|id| {
+            state
+                .delayed_submissions
+                .iter()
+                .any(|entry| entry.id == id && entry.chat.is_none())
+        }) {
+            for entry in &mut state.delayed_submissions {
+                if entry.chat.is_none() {
+                    entry.chat = Some(chat);
+                    entry.history_session = chat.to_string();
+                }
+            }
+        }
         let draft_history = (is_new_view && state.captures_creation_prefix())
             .then(|| std::mem::take(&mut state.scrollback));
         if let Some(history) = &draft_history {
@@ -2620,10 +2658,14 @@ impl Console {
     }
 
     pub(super) fn clear_visible_agent(&self) -> Result<(), String> {
-        self.state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .switch_view_chat(None);
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let chat = state.chat;
+        for entry in &mut state.delayed_submissions {
+            if entry.chat == chat && !entry.in_flight {
+                entry.failed = Some("Auto-send cancelled by /clear; take back to edit".into());
+            }
+        }
+        state.switch_view_chat(None);
         Ok(())
     }
 
@@ -4735,6 +4777,9 @@ impl Console {
 
     pub fn take_restored_contexts(&self, draft: &str) -> Result<Vec<InputContext>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(contexts) = state.delayed_restored_contexts.take() {
+            return Ok(contexts);
+        }
         state
             .restored_contexts
             .retain(|context| draft_keeps_context(draft, context));
@@ -5687,6 +5732,11 @@ impl State {
             accepts_images: true,
             empty_paste_reads_clipboard_image: cfg!(target_os = "macos"),
             image_cache: None,
+            image_preparation: super::image_preparation::ImagePreparation::default(),
+            delayed_submissions: std::collections::VecDeque::new(),
+            active_delayed_submission: None,
+            delayed_send_now: false,
+            delayed_restored_contexts: None,
             terminal_shows_links: false,
             clipboard_hint: ClipboardImageHint::new(),
             shell_input: ShellInputState::default(),
@@ -7612,13 +7662,7 @@ impl State {
         input_rows = input.lines.len().max(1);
         let mut candidates = self.candidate_rows(agent_layout::MAX_CANDIDATE_ROWS);
         let mut queue = if !overview {
-            pending_input_lines(
-                &self.queued_inputs,
-                self.width,
-                MAX_PENDING_INPUT_ROWS,
-                self.display,
-                self.can_send_now(),
-            )
+            self.visible_pending_input_lines(MAX_PENDING_INPUT_ROWS)
         } else {
             Vec::new()
         };
@@ -7852,13 +7896,7 @@ impl State {
                 break;
             }
         }
-        queue = pending_input_lines(
-            &self.queued_inputs,
-            self.width,
-            queue.len(),
-            self.display,
-            self.can_send_now(),
-        );
+        queue = self.visible_pending_input_lines(queue.len());
         let mut input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
@@ -8665,47 +8703,284 @@ impl State {
             self.status = IMAGE_INPUT_UNSUPPORTED.into();
             return;
         }
-        match self.clipboard.read_image() {
-            Ok(Some(image)) => self.attach_image(image),
-            Ok(None) if self.clipboard.is_remote() => {
-                self.status = NO_CLIPBOARD_IMAGE_OVER_SSH.into();
-            }
-            Ok(None) => self.status = NO_CLIPBOARD_IMAGE.into(),
-            Err(error) => self.status = format!("Cannot paste image: {error}"),
-        }
+        self.queue_clipboard_image(false);
     }
 
-    fn attach_image(&mut self, image: Image) {
+    fn queue_clipboard_image(&mut self, silent: bool) {
+        let clipboard = self.clipboard.clone();
+        let missing_message = (!silent).then(|| {
+            if clipboard.is_remote() {
+                NO_CLIPBOARD_IMAGE_OVER_SSH.into()
+            } else {
+                NO_CLIPBOARD_IMAGE.into()
+            }
+        });
+        self.prepare_image(String::new(), missing_message, move || {
+            clipboard.read_image()
+        });
+    }
+
+    /// Reserve the atomic marker immediately; no clipboard, decoding or disk work runs here.
+    fn prepare_image(
+        &mut self,
+        fallback: String,
+        missing_message: Option<String>,
+        read: impl FnOnce() -> Result<Option<Image>, String> + Send + 'static,
+    ) -> bool {
+        use super::image_preparation::{Key, Pending};
+        self.poll_prepared_images();
         let id = self.paste_blocks.next_id();
         let placeholder = match PasteBlocks::image_placeholder(id) {
             Ok(placeholder) => placeholder,
             Err(error) => {
                 self.status = format!("Cannot attach image: {error}");
-                return;
+                return false;
             }
         };
-        // Claude Code `storeImage`: best effort, a failed write only costs the link.
-        if let (Some(cache), Some(chat), Ok(image_id)) =
-            (&self.image_cache, self.chat, u32::try_from(id.get()))
-        {
-            let _ = cache.store(chat, image_id, &image);
+        let cache = self
+            .image_cache
+            .clone()
+            .zip(self.chat)
+            .and_then(|(cache, chat)| Some((cache, chat, u32::try_from(id.get()).ok()?)));
+        let key = Key {
+            owner: self.input_owner,
+            id,
+        };
+        if let Err(error) = self.image_preparation.submit(
+            key,
+            Pending {
+                fallback,
+                missing_message,
+            },
+            cache,
+            read,
+        ) {
+            self.status = error;
+            return false;
         }
         let start = self.editor.cursor();
         self.insert_pasted(&placeholder);
-        if let Err(error) = self.paste_blocks.register_image(
+        if let Err(error) = self.paste_blocks.register_pending_image(
             self.editor.draft(),
             start..self.editor.cursor(),
             id,
-            image,
         ) {
             self.status = format!("Cannot attach image: {error}");
+            self.image_preparation.pending.remove(&key);
+            return false;
         }
+        self.status = "Preparing image…".into();
+        true
+    }
+
+    fn finish_prepared_image(
+        editor: &mut Editor,
+        blocks: &mut PasteBlocks,
+        id: super::paste_blocks::PasteBlockId,
+        pending: super::image_preparation::Pending,
+        result: Result<Option<Image>, String>,
+    ) -> Option<String> {
+        if !blocks.pending_image_exists(id) {
+            return None;
+        }
+        let message = match result {
+            Ok(Some(image)) => {
+                return blocks
+                    .complete_pending_image(editor.draft(), id, image)
+                    .then(|| "Image ready".into());
+            }
+            Ok(None) => pending.missing_message.unwrap_or_default(),
+            Err(error) => format!("Cannot paste image: {error}"),
+        };
+        if let Ok(Some(replacement)) =
+            blocks.fail_pending_image(editor.draft(), id, &pending.fallback)
+        {
+            let start = replacement.cursor.saturating_sub(pending.fallback.len());
+            let old_end = start + PasteBlocks::image_placeholder(id).map_or(0, |text| text.len());
+            let cursor = if editor.cursor() >= old_end {
+                editor.cursor().saturating_sub(old_end) + replacement.cursor
+            } else if editor.cursor() > start {
+                replacement.cursor
+            } else {
+                editor.cursor()
+            };
+            editor.replace_draft(replacement.draft, cursor);
+        }
+        Some(message)
+    }
+
+    fn poll_prepared_images(&mut self) -> bool {
+        let mut changed = false;
+        for prepared in self.image_preparation.poll() {
+            let Some(pending) = self.image_preparation.pending.remove(&prepared.key) else {
+                continue;
+            };
+            if self
+                .delayed_submissions
+                .iter()
+                .any(|entry| entry.owner == prepared.key.owner)
+            {
+                self.complete_delayed_image(
+                    prepared.key.owner,
+                    prepared.key.id,
+                    prepared.result,
+                    pending,
+                );
+                changed = true;
+                continue;
+            }
+            if prepared.key.owner == self.input_owner {
+                if let Some(message) = Self::finish_prepared_image(
+                    &mut self.editor,
+                    &mut self.paste_blocks,
+                    prepared.key.id,
+                    pending,
+                    prepared.result,
+                ) {
+                    self.status = message;
+                    self.retry_of = None;
+                    self.refresh_completion();
+                    changed = true;
+                }
+            } else {
+                let owner = prepared.key.owner;
+                let cached_chat = self
+                    .editor_cache
+                    .iter()
+                    .find(|(_, input)| input.owner == owner)
+                    .map(|(chat, _)| *chat);
+                let input = if self.overview_input.owner == owner {
+                    Some(&mut self.overview_input)
+                } else if self
+                    .overview_source_input
+                    .as_ref()
+                    .is_some_and(|input| input.owner == owner)
+                {
+                    self.overview_source_input.as_mut()
+                } else {
+                    self.editor_cache
+                        .values_mut()
+                        .find(|input| input.owner == owner)
+                };
+                if let Some(input) = input {
+                    let message = Self::finish_prepared_image(
+                        &mut input.editor,
+                        &mut input.paste_blocks,
+                        prepared.key.id,
+                        pending,
+                        prepared.result,
+                    );
+                    if let Some(message) = message
+                        && let Some(chat) = cached_chat
+                        && let Some(view) = self.view_cache.get_mut(&chat)
+                    {
+                        view.status = message;
+                    }
+                }
+            }
+        }
+        // A durable draft can contain a reservation whose worker did not survive restart.
+        for id in self.paste_blocks.pending_image_ids() {
+            let key = super::image_preparation::Key {
+                owner: self.input_owner,
+                id,
+            };
+            if !self.image_preparation.pending.contains_key(&key) {
+                Self::finish_prepared_image(
+                    &mut self.editor,
+                    &mut self.paste_blocks,
+                    id,
+                    super::image_preparation::Pending {
+                        fallback: String::new(),
+                        missing_message: None,
+                    },
+                    Err("Image preparation was cancelled; paste the image again".into()),
+                );
+                self.status = "Image preparation was cancelled; paste the image again".into();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Only an empty editor is filled, so nothing typed after sending is overwritten; the
     /// refused text is in the input history either way.
     /// Puts the last sent prompt back unless something was typed since; returns whether it did.
+    fn visible_pending_input_lines(&self, rows: usize) -> Vec<RoleLine> {
+        let local = self.local_delayed_lines();
+        if local.is_empty() {
+            return pending_input_lines(
+                &self.queued_inputs,
+                self.width,
+                rows,
+                self.display,
+                self.can_send_now(),
+            );
+        }
+        if rows == 0 {
+            return Vec::new();
+        }
+        let total = local.len() + self.queued_inputs.len();
+        let shown = if total <= rows {
+            total
+        } else {
+            rows.saturating_sub(1).max(1)
+        };
+        let mut lines = local
+            .iter()
+            .take(shown)
+            .map(|text| {
+                let mut line = RoleLine::role(display_single_line(text), Role::Subtle);
+                line.truncate(self.width);
+                line
+            })
+            .collect::<Vec<_>>();
+        for entry in self
+            .queued_inputs
+            .iter()
+            .take(shown.saturating_sub(lines.len()))
+        {
+            lines.extend(pending_input_lines(
+                std::slice::from_ref(entry),
+                self.width,
+                1,
+                self.display,
+                false,
+            ));
+        }
+        if total > shown {
+            let local_left = local.len().saturating_sub(shown);
+            let queued_left = self
+                .queued_inputs
+                .len()
+                .saturating_sub(shown.saturating_sub(local.len()));
+            let omitted = format!("… {local_left} local · {queued_left} Agent queued");
+            if rows == 1 {
+                let suffix = format!(" · {omitted}");
+                lines[0].truncate(self.width.saturating_sub(display_width(&suffix)));
+                lines[0].push(suffix, Some(Role::Subtle));
+                lines[0].truncate(self.width);
+            } else {
+                let mut line = RoleLine::role(omitted, Role::Subtle);
+                line.truncate(self.width);
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
     fn restore_rejected_prompt(&mut self, contexts: Vec<InputContext>) -> bool {
+        if let Some(id) = self.active_delayed_submission {
+            if let Some(entry) = self
+                .delayed_submissions
+                .iter_mut()
+                .find(|entry| entry.id == id)
+            {
+                entry.failed = Some("Not sent; press Up in an empty input to take back".into());
+                entry.restored_contexts = contexts;
+            }
+            return false;
+        }
         let Some(prompt) = self.submitted_prompt.take() else {
             return false;
         };
@@ -8739,6 +9014,19 @@ impl State {
     /// Puts back a prompt whose acceptance is unknown; the unchanged draft then retries
     /// `retry_of` instead of being a new input.
     fn restore_unknown_prompt(&mut self, contexts: Vec<InputContext>, retry_of: Option<Uuid>) {
+        if let Some(id) = self.active_delayed_submission {
+            if let Some(entry) = self
+                .delayed_submissions
+                .iter_mut()
+                .find(|entry| entry.id == id)
+            {
+                entry.retry_of = retry_of;
+                entry.restored_contexts = contexts;
+                entry.failed =
+                    Some("Acceptance unconfirmed; take back to check receipt, not resend".into());
+            }
+            return;
+        }
         if self.restore_rejected_prompt(contexts) {
             self.retry_of = retry_of;
         }
@@ -9026,6 +9314,11 @@ impl State {
     }
 
     fn stash_input(&mut self) {
+        self.poll_prepared_images();
+        if self.paste_blocks.has_pending_images() {
+            self.hold_status("Images are still preparing; wait before stashing the draft");
+            return;
+        }
         self.last_input_edit = Some(Instant::now());
         if !self.editor.draft().is_empty() {
             self.input_stash = Some(InputStash {
@@ -9871,29 +10164,24 @@ impl State {
     /// missing, unreadable or not an image stays text. Returns false when no image was
     /// attached, leaving the whole paste to the plain text path.
     fn paste_with_image_paths(&mut self, text: &str) -> bool {
-        let mut images = Vec::new();
-        for candidate in find_image_paths(text, self.working_directory()) {
-            match read_pasted_image(&candidate.path) {
-                Some(Ok(image)) => images.push((candidate.range, image)),
-                Some(Err(error)) => {
-                    self.status = format!(
-                        "Cannot attach {} as an image: {error}",
-                        candidate.path.display()
-                    );
-                }
-                None => {}
-            }
-        }
-        if images.is_empty() {
+        let candidates = find_image_paths(text, self.working_directory());
+        if candidates.is_empty() {
             return false;
         }
         let mut pasted_through = 0;
-        for (range, image) in images {
-            if range.start > pasted_through {
-                self.insert_pasted_text(&text[pasted_through..range.start]);
+        for candidate in candidates {
+            if candidate.range.start > pasted_through {
+                self.insert_pasted_text(&text[pasted_through..candidate.range.start]);
             }
-            self.attach_image(image);
-            pasted_through = range.end;
+            let raw = &text[candidate.range.clone()];
+            if !self.prepare_image(raw.to_owned(), None, move || {
+                read_pasted_image(&candidate.path)
+                    .transpose()
+                    .map_err(|error| format!("{}: {error}", candidate.path.display()))
+            }) {
+                self.insert_pasted_text(raw);
+            }
+            pasted_through = candidate.range.end;
         }
         if pasted_through < text.len() {
             self.insert_pasted_text(&text[pasted_through..]);
@@ -9904,12 +10192,11 @@ impl State {
     /// Unlike `Ctrl+V`, an empty paste is silent when the clipboard holds no image: the user
     /// only pasted, and nothing was there to paste.
     fn paste_clipboard_image_after_empty_paste(&mut self) {
-        match self.clipboard.read_image() {
-            Ok(Some(_)) if !self.accepts_images => self.status = IMAGE_INPUT_UNSUPPORTED.into(),
-            Ok(Some(image)) => self.attach_image(image),
-            Ok(None) => {}
-            Err(error) => self.status = format!("Cannot paste image: {error}"),
+        if !self.accepts_images {
+            self.status = IMAGE_INPUT_UNSUPPORTED.into();
+            return;
         }
+        self.queue_clipboard_image(true);
     }
 
     fn command_scope(&self) -> CommandScope {
@@ -10417,6 +10704,11 @@ impl State {
     }
 
     fn request_exit(&mut self, control: char) -> bool {
+        if !self.delayed_submissions.is_empty() {
+            self.exit_confirmation = None;
+            self.hold_status("Unsent local messages remain; return to their Chat, empty input + Up to edit/cancel before exit");
+            return false;
+        }
         if self.pending_exit_control() == Some(control) {
             self.exit_confirmation = None;
             true
@@ -10602,7 +10894,10 @@ impl State {
         {
             return Some(InputEvent::SendQueuedNow { run_id });
         }
-        match self.key(enter) {
+        self.delayed_send_now = true;
+        let submitted = self.key(enter);
+        self.delayed_send_now = false;
+        match submitted {
             Some(InputEvent::Prompt {
                 family_target,
                 text,
@@ -11797,14 +12092,33 @@ impl State {
         match key.code {
             KeyCode::Enter => {
                 if self.shell_input.kind() == InputKind::Shell {
+                    if self.active_delayed_submission.is_some() {
+                        self.hold_status("Message dispatch is finishing; shell draft kept");
+                        return None;
+                    }
                     let action = self.shell_input.submit(ShellExecution::Foreground);
                     return self.apply_shell_action(action);
                 }
+                self.poll_prepared_images();
                 let source_text = self
                     .paste_blocks
                     .source_text(self.editor.draft())
                     .to_owned();
                 let scope = self.command_scope();
+                if source_text.trim() == "/exit" && !self.delayed_submissions.is_empty() {
+                    self.editor.apply(EditorCommand::Clear);
+                    self.completion.dismiss();
+                    self.file_mentions.update_at("", 0, 15);
+                    self.exit_confirmation = None;
+                    self.hold_status("Unsent local messages remain; return to their Chat, empty input + Up to edit/cancel before exit");
+                    return None;
+                }
+                if self.active_delayed_submission.is_some()
+                    && source_text.trim_start().starts_with('/')
+                {
+                    self.hold_status("Message dispatch is finishing; command draft kept");
+                    return None;
+                }
                 if scope == CommandScope::Overview && source_text.trim() == "/help" {
                     self.editor.apply(EditorCommand::Clear);
                     self.completion.dismiss();
@@ -11850,6 +12164,18 @@ impl State {
                         return None;
                     }
                 };
+                if self.paste_blocks.has_pending_images()
+                    || self.active_delayed_submission.is_some()
+                    || (self
+                        .delayed_submissions
+                        .iter()
+                        .any(|entry| entry.chat == self.chat)
+                        && (!source_text.trim_start().starts_with('/')
+                            || self.active_delayed_submission.is_some()))
+                {
+                    self.freeze_delayed_submission(file_references, family_target);
+                    return None;
+                }
                 let pasted_texts = self.pasted_texts();
                 let draft = self.editor.draft().to_owned();
                 let images = self.paste_blocks.images(&draft);
@@ -11882,6 +12208,9 @@ impl State {
                 }
             }
             KeyCode::Up => {
+                if self.take_back_delayed() {
+                    return None;
+                }
                 if !self.queued_inputs.is_empty()
                     && !self.editor.is_browsing_history()
                     && self
@@ -12051,12 +12380,24 @@ fn read_keys(
             paused.store(false, Ordering::Release);
             continue;
         }
-        if input_was_idle {
+        let delayed = {
             let mut state = state
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            if state.release_finished_submissions() || std::mem::take(&mut deferred_frame) {
+            let images_changed = state.poll_prepared_images();
+            let delayed = state.poll_delayed_submission();
+            if images_changed
+                || (input_was_idle && state.release_finished_submissions())
+                || std::mem::take(&mut deferred_frame)
+            {
                 state.draw(&mut io::stdout().lock())?;
+            }
+            delayed
+        };
+        if let Some(delayed) = delayed {
+            // Do not hold the editor or stdout lock while delivering to the consumer.
+            if !send_input(sender, stop, delayed) {
+                break;
             }
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
@@ -17106,7 +17447,23 @@ mod tests {
         }
     }
 
+    fn finish_image_preparations(state: &mut State) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            state.poll_prepared_images();
+            if state.image_preparation.is_idle() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "image preparation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn submitted_images(state: &mut State) -> (String, Vec<ImageContext>) {
+        finish_image_preparations(state);
         match state.key(key(KeyCode::Enter)) {
             Some(InputEvent::Prompt { text, images, .. }) => (text, images),
             other => panic!("Enter should send the prompt, got {other:?}"),
@@ -17231,6 +17588,7 @@ mod tests {
         console.configure_image_cache(Some(root.path())).unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(control(KeyCode::Char('v')));
+        finish_image_preparations(&mut state);
         assert_eq!(
             std::fs::read(cached(1)).unwrap(),
             BASE64.decode(clipboard_image().data).unwrap()
@@ -17331,11 +17689,13 @@ mod tests {
     fn control_v_without_a_clipboard_image_explains_why_and_points_ssh_users_to_paths() {
         let mut state = state_with_clipboard(None, false);
         state.key(control(KeyCode::Char('v')));
+        finish_image_preparations(&mut state);
         assert_eq!(state.status, "No image found in clipboard");
         assert!(state.editor.draft().is_empty());
 
         let mut remote = state_with_clipboard(None, true);
         remote.key(control(KeyCode::Char('v')));
+        finish_image_preparations(&mut remote);
         assert!(
             remote.status.starts_with("No image found in clipboard")
                 && remote.status.contains("remote host")
@@ -18488,6 +18848,7 @@ mod tests {
         state.insert("Explain ");
 
         state.paste(&format!("{escaped} "));
+        finish_image_preparations(&mut state);
 
         assert_eq!(
             submitted_images(&mut state),
@@ -18506,6 +18867,7 @@ mod tests {
         state.paste(&format!(" \"{path}\""));
         state.paste(&format!(" file://{}", path.replace(' ', "%20")));
         state.paste(" chart\\ one.PNG");
+        finish_image_preparations(&mut state);
 
         assert_eq!(
             submitted_images(&mut state),
@@ -18531,6 +18893,8 @@ mod tests {
             "Compare these\n[Image #1] [Image #2]\nnotes one\nnotes two\nnotes three\nnotes four";
         assert_eq!(state.editor.draft(), expected);
         assert_eq!(state.status, "Pasted text #3 folded");
+        finish_image_preparations(&mut state);
+        assert_eq!(state.editor.draft(), expected);
         assert_eq!(
             submitted_images(&mut state),
             (expected.into(), vec![pasted_image(1), pasted_image(2)])
@@ -18553,10 +18917,11 @@ mod tests {
         );
 
         state.paste(&paste);
+        finish_image_preparations(&mut state);
 
         assert_eq!(state.editor.draft(), paste);
         assert!(
-            state.status.starts_with("Cannot attach") && state.status.contains("fake.png"),
+            state.status.starts_with("Cannot paste image") && state.status.contains("fake.png"),
             "{}",
             state.status
         );
@@ -18573,6 +18938,7 @@ mod tests {
         let mut empty = state_with_clipboard(None, false);
         empty.empty_paste_reads_clipboard_image = true;
         empty.paste("");
+        finish_image_preparations(&mut empty);
         assert!(empty.editor.draft().is_empty());
         assert!(empty.status.is_empty(), "{}", empty.status);
 

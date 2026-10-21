@@ -69,6 +69,39 @@ pub fn prepare(bytes: &[u8]) -> Result<Image, ImageError> {
     } else {
         (decoded, bytes.to_vec(), format.output_media_type())
     };
+    finish(pixels, encoded, media_type)
+}
+
+/// Prepares owned clipboard RGBA pixels without encoding and decoding the full-size image.
+/// Dimensions must be nonzero and the buffer must contain exactly four bytes per pixel.
+/// Unlike file input, raw pixels are not subject to the encoded source-file size limit.
+/// PNG preserves transparency unless the shared 5 MB base64 limit requires JPEG fallback.
+pub fn prepare_rgba(width: u32, height: u32, bytes: Vec<u8>) -> Result<Image, ImageError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if width == 0 || height == 0 || expected != Some(bytes.len()) {
+        return Err(ImageError::Undecodable(
+            "invalid RGBA dimensions or buffer length".into(),
+        ));
+    }
+    let rgba = ::image::RgbaImage::from_raw(width, height, bytes)
+        .ok_or_else(|| ImageError::Undecodable("invalid RGBA image".into()))?;
+    let decoded = DynamicImage::ImageRgba8(rgba);
+    let pixels = if width.max(height) > MAX_DIMENSION {
+        decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle)
+    } else {
+        decoded
+    };
+    let encoded = encode(&pixels, ImageMediaType::Png)?;
+    finish(pixels, encoded, ImageMediaType::Png)
+}
+
+fn finish(
+    pixels: DynamicImage,
+    encoded: Vec<u8>,
+    media_type: ImageMediaType,
+) -> Result<Image, ImageError> {
     let mut image = Image {
         media_type,
         data: BASE64.encode(&encoded),
@@ -168,6 +201,66 @@ mod tests {
     }
 
     #[test]
+    fn small_rgba_images_keep_dimensions_and_transparent_pixels() {
+        let rgba = RgbaImage::from_fn(4, 3, |x, y| Rgba([x as u8, y as u8, 128, (x * 60) as u8]));
+
+        let image = prepare_rgba(4, 3, rgba.clone().into_raw()).unwrap();
+
+        assert_eq!(image.media_type, ImageMediaType::Png);
+        assert_eq!((image.width, image.height), (4, 3));
+        assert_eq!(decoded(&image).to_rgba8(), rgba);
+        assert!(image.data.len() <= MAX_BASE64_BYTES);
+    }
+
+    #[test]
+    fn large_rgba_images_resize_before_encoding_without_a_source_file_limit() {
+        let rgba = RgbaImage::from_pixel(4200, 2100, Rgba([80, 120, 160, 128]));
+        assert!(rgba.as_raw().len() > MAX_SOURCE_BYTES);
+
+        let image = prepare_rgba(4200, 2100, rgba.into_raw()).unwrap();
+
+        assert_eq!(image.media_type, ImageMediaType::Png);
+        assert_eq!((image.width, image.height), (2000, 1000));
+        let pixels = decoded(&image).to_rgba8();
+        assert_eq!(pixels.dimensions(), (2000, 1000));
+        assert_eq!(pixels.get_pixel(1000, 500)[3], 128);
+        assert!(image.data.len() <= MAX_BASE64_BYTES);
+    }
+
+    #[test]
+    fn rgba_images_at_the_dimension_limit_are_not_resized() {
+        let image = prepare_rgba(2000, 1, vec![255; 2000 * 4]).unwrap();
+
+        assert_eq!((image.width, image.height), (2000, 1));
+        assert_eq!(decoded(&image).dimensions(), (2000, 1));
+    }
+
+    #[test]
+    fn invalid_rgba_dimensions_and_buffer_lengths_are_rejected() {
+        for (width, height, bytes) in [
+            (0, 1, vec![]),
+            (1, 0, vec![]),
+            (0, 0, vec![]),
+            (1, 1, vec![0; 3]),
+            (1, 1, vec![0; 5]),
+            (u32::MAX, u32::MAX, vec![]),
+        ] {
+            assert!(matches!(
+                prepare_rgba(width, height, bytes),
+                Err(ImageError::Undecodable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_source_files_are_rejected_before_decoding() {
+        assert_eq!(
+            prepare(&vec![0; MAX_SOURCE_BYTES + 1]),
+            Err(ImageError::TooLarge)
+        );
+    }
+
+    #[test]
     fn small_images_keep_their_bytes_and_format_detected_from_the_header() {
         for (format, media_type) in [
             (ImageFormat::Png, ImageMediaType::Png),
@@ -240,8 +333,15 @@ mod tests {
                 noise.wrapping_mul(7),
             ])
         });
-        let bytes = encoded(&DynamicImage::ImageRgb8(noisy), ImageFormat::Png);
+        let noisy = DynamicImage::ImageRgb8(noisy);
+        let bytes = encoded(&noisy, ImageFormat::Png);
         assert!(BASE64.encode(&bytes).len() > MAX_BASE64_BYTES);
+
+        let rgba_image = prepare_rgba(1800, 1800, noisy.to_rgba8().into_raw()).unwrap();
+        assert_eq!(rgba_image.media_type, ImageMediaType::Jpeg);
+        assert!(rgba_image.data.len() <= MAX_BASE64_BYTES);
+        assert_eq!((rgba_image.width, rgba_image.height), (1800, 1800));
+        assert_eq!(decoded(&rgba_image).dimensions(), (1800, 1800));
 
         let image = prepare(&bytes).unwrap();
 
