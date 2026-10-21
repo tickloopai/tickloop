@@ -41,6 +41,7 @@ mod execution;
 mod external_editor;
 mod file_mentions;
 mod footer;
+mod herdr_agent;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -1615,9 +1616,37 @@ async fn interact(
     agent: &Agent,
     workdir: PathBuf,
     console: &Console,
+    input: mpsc::Receiver<InputEvent>,
+    startup: StartupState,
+    config_root: Option<PathBuf>,
+) -> Result<(), String> {
+    // This is a View integration, not a daemon integration: only a terminal actually hosted
+    // by Herdr owns a pane identity. Ordinary terminals never start the reporter.
+    let mut herdr_reporter = herdr_agent::Reporter::from_environment(console.is_interactive());
+    let result = interact_with_herdr(
+        agent,
+        workdir,
+        console,
+        input,
+        startup,
+        config_root,
+        &mut herdr_reporter,
+    )
+    .await;
+    if let Some(reporter) = &mut herdr_reporter {
+        reporter.shutdown().await;
+    }
+    result
+}
+
+async fn interact_with_herdr(
+    agent: &Agent,
+    workdir: PathBuf,
+    console: &Console,
     mut input: mpsc::Receiver<InputEvent>,
     startup: StartupState,
     config_root: Option<PathBuf>,
+    herdr_reporter: &mut Option<herdr_agent::Reporter>,
 ) -> Result<(), String> {
     let user_settings = startup.user_settings;
     console.set_prompt_suggestion_enabled(
@@ -2441,6 +2470,11 @@ async fn interact(
                 selected_loops: selected_loops.clone(),
                 configuration,
             };
+            // exec replaces this process without running destructors. Release the old
+            // pane report first; the replacement View will publish its current state.
+            if let Some(reporter) = herdr_reporter.as_mut() {
+                reporter.shutdown().await;
+            }
             if let Err(error) = view_upgrade::try_reexec(
                 console,
                 &input,
@@ -2455,6 +2489,8 @@ async fn interact(
                 });
                 ready_runtime = None;
             }
+            // A postponed upgrade also returns without replacing the process.
+            *herdr_reporter = herdr_agent::Reporter::from_environment(interactive);
         }
         if interactive {
             let execution = selected_chat
@@ -2488,6 +2524,22 @@ async fn interact(
                 })
                 .or_else(|| installation_notice.clone());
             console.set_update_notice(notice)?;
+        }
+        if let Some(reporter) = herdr_reporter.as_ref() {
+            reporter.update(herdr_view_state(
+                selected_chat,
+                overview_active,
+                &visible_family,
+                pending
+                    .values()
+                    .map(|receipt| receipt.chat_id)
+                    .chain(compaction_chats.values().map(|(chat, _)| *chat))
+                    .chain(directed_summaries.active_chats()),
+                permissions
+                    .values()
+                    .map(|request| request.chat_id)
+                    .chain(questions.values().map(|request| request.chat_id)),
+            ));
         }
         let discovery_active = menus.discovery_active();
         let search_test_active = menus.search_test_active();
@@ -5233,6 +5285,77 @@ impl MemberWork {
             waiting_questions: row.waiting_questions,
         }
     }
+}
+
+/// Report the selected family, or all known work in the overview. A new draft is idle;
+/// stale family membership from the previously selected Chat must not leak into its report.
+fn herdr_view_state(
+    selected: Option<uuid::Uuid>,
+    overview: bool,
+    family: &[uuid::Uuid],
+    mut working: impl Iterator<Item = uuid::Uuid>,
+    mut waiting: impl Iterator<Item = uuid::Uuid>,
+) -> herdr_agent::State {
+    let includes = |chat| {
+        overview
+            || selected.is_some_and(|selected| {
+                selected == chat || (family.contains(&selected) && family.contains(&chat))
+            })
+    };
+    if waiting.any(includes) {
+        herdr_agent::State::Blocked
+    } else if working.any(includes) {
+        herdr_agent::State::Working
+    } else {
+        herdr_agent::State::Idle
+    }
+}
+
+#[test]
+fn herdr_state_follows_selected_family_and_user_requests() {
+    use herdr_agent::State;
+    let root = uuid::Uuid::new_v4();
+    let child = uuid::Uuid::new_v4();
+    let other = uuid::Uuid::new_v4();
+    let state = |selected, overview, family: &[uuid::Uuid], working: Vec<_>, waiting: Vec<_>| {
+        herdr_view_state(
+            selected,
+            overview,
+            family,
+            working.into_iter(),
+            waiting.into_iter(),
+        )
+    };
+    assert_eq!(state(Some(root), false, &[], vec![], vec![]), State::Idle);
+    assert_eq!(
+        state(Some(root), false, &[], vec![root], vec![]),
+        State::Working
+    );
+    assert_eq!(
+        state(Some(root), false, &[], vec![root], vec![root]),
+        State::Blocked
+    );
+    assert_eq!(
+        state(Some(root), false, &[root, child], vec![child], vec![]),
+        State::Working
+    );
+    assert_eq!(
+        state(Some(root), false, &[root, child], vec![root], vec![child]),
+        State::Blocked
+    );
+    assert_eq!(
+        state(Some(other), false, &[root, child], vec![root], vec![child]),
+        State::Idle
+    );
+    assert_eq!(
+        state(None, false, &[root, child], vec![root], vec![child]),
+        State::Idle
+    );
+    assert_eq!(state(None, true, &[], vec![root], vec![]), State::Working);
+    assert_eq!(
+        state(None, true, &[], vec![root], vec![child]),
+        State::Blocked
+    );
 }
 
 /// Tracks the runs and requests of a Chat this View just read in full, as opened or restored.

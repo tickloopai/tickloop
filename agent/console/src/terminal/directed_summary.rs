@@ -52,6 +52,10 @@ impl DirectedSummaryTasks {
         self.metadata.values().any(|metadata| metadata.chat == chat)
     }
 
+    pub(super) fn active_chats(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.metadata.values().map(|metadata| metadata.chat)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
