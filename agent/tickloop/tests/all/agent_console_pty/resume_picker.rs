@@ -169,6 +169,10 @@ async fn run_resume_picker(fixture: &PrivateFixture) {
         .await;
     eprintln!("[resume-picker opened history]\n{history}\n[/resume-picker]");
     assert!(!history.contains(NEWER_DUPLICATE_REPLY), "{history}");
+    assert!(
+        history.contains(&format!("Tickloop v{}", env!("CARGO_PKG_VERSION"))),
+        "a Chat opened from the picker keeps the startup banner: {history}"
+    );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         requests.try_recv().is_err(),

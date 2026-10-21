@@ -44,6 +44,10 @@ pub(super) struct ScrollFrame {
     pub(super) lines: Vec<String>,
     /// The same rows as `lines`, described by role.
     pub(super) styled: Vec<RoleLine>,
+    /// How many of the last `lines` are the live activity block and the blank row under it,
+    /// which a host keeps just above the input. Rows attached to the conversation, such as a
+    /// running command's output, are not counted.
+    pub(super) pinned: usize,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) following: bool,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1219,6 +1223,7 @@ impl Scrollback {
                 top: 0,
                 lines: Vec::new(),
                 styled: Vec::new(),
+                pinned: 0,
                 following: self.following,
                 unread: self.unread,
             };
@@ -1288,6 +1293,7 @@ impl Scrollback {
             top,
             lines: styled.iter().map(RoleLine::text).collect(),
             styled,
+            pinned: end.saturating_sub(top.max(self.conversation_rows + self.attached_tail_rows())),
             following: self.following,
             unread: self.unread,
         }
@@ -1315,17 +1321,10 @@ impl Scrollback {
     /// for a running Bash call, the live activity and its details as a block of their own, then
     /// the blank row that keeps everything above clear of the input.
     fn tail_rows(&self) -> Vec<TailRow<'_>> {
-        let unplaced_hint = self.foreground_command_hint.as_ref().filter(|hint| {
-            hint.calls.iter().any(|call| {
-                call.as_deref()
-                    .and_then(|call| self.call_row_end(call))
-                    .is_none()
-            })
-        });
         let mut rows: Vec<TailRow> = self
             .shell_preview
             .iter()
-            .chain(unplaced_hint.map(|hint| &hint.line))
+            .chain(self.unplaced_hint().map(|hint| &hint.line))
             .map(TailRow::Clipped)
             .collect();
         let has_conversation = self.conversation_rows > 0 || !rows.is_empty();
@@ -1340,6 +1339,23 @@ impl Scrollback {
             rows.push(TailRow::Blank);
         }
         rows
+    }
+
+    /// The hint for a running Bash call whose row is not drawn, which goes under the conversation.
+    fn unplaced_hint(&self) -> Option<&ForegroundCommandHint> {
+        self.foreground_command_hint.as_ref().filter(|hint| {
+            hint.calls.iter().any(|call| {
+                call.as_deref()
+                    .and_then(|call| self.call_row_end(call))
+                    .is_none()
+            })
+        })
+    }
+
+    /// The tail rows that belong right under the conversation: a running command's output and
+    /// the hint for its call.
+    fn attached_tail_rows(&self) -> usize {
+        self.shell_preview.len() + usize::from(self.unplaced_hint().is_some())
     }
 
     fn prepare_frame(&mut self, width: usize, height: usize) {

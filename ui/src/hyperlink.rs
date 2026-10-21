@@ -33,6 +33,9 @@ const ADDITIONAL_HYPERLINK_TERMINALS: [&str; 6] = [
 /// Herdr parses OSC 8 in its panes and opens a link's whole target on a modified click, so the
 /// rows of a wrapped link need it there even when the outer terminal is not recognised.
 const HERDR_ENVIRONMENT: (&str, &str) = ("HERDR_ENV", "1");
+/// Zellij keeps a ctrl+click for itself and passes OSC 8 on to the outer terminal, whose own
+/// link click is then the only way to open a link; it sets this in every pane.
+const ZELLIJ_ENVIRONMENT: &str = "ZELLIJ";
 
 const WEB_URL_SCHEMES: [&str; 2] = ["https://", "http://"];
 /// Punctuation that ends a sentence rather than a URL when it is a URL's last character.
@@ -176,6 +179,7 @@ pub fn supported(variable: impl Fn(&str) -> Option<String>) -> bool {
         })
         || set("TERM").is_some_and(|term| term.contains("kitty"))
         || set(HERDR_ENVIRONMENT.0).as_deref() == Some(HERDR_ENVIRONMENT.1)
+        || set(ZELLIJ_ENVIRONMENT).is_some()
 }
 
 /// `supports-hyperlinks` 3.2 for a terminal stdout on a Unix platform; `set` only

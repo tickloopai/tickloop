@@ -566,6 +566,7 @@ async fn branch_from_terminal(
             return Err(branch_failure_message(&error));
         }
     };
+    ensure_snapshot_banner(console, &outcome.snapshot)?;
     switch_to_saved_branch(console, outcome.child_chat_id)?;
     Ok(outcome)
 }
@@ -1477,6 +1478,18 @@ fn write_banner(
         return Ok(());
     }
     console.write_roles(&startup_banner_spans(config, workdir))
+}
+
+/// Puts the startup banner, for the model and folder `snapshot` names, at the top of its Chat in
+/// this View, unless the Chat already has one there.
+fn ensure_snapshot_banner(
+    console: &Console,
+    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+) -> Result<(), String> {
+    console.ensure_chat_banner(
+        snapshot.id,
+        &startup_banner_spans(&snapshot.model, shown_folder(snapshot.folder.as_deref())),
+    )
 }
 
 fn startup_banner_spans(
@@ -5585,13 +5598,7 @@ fn render_restored_observation(
     message_groups: &mut MessageGroups,
     observation: ExecutionObservation,
 ) -> Result<ExecutionObservation, String> {
-    console.ensure_chat_banner(
-        chat,
-        &startup_banner_spans(
-            &observation.snapshot.model,
-            shown_folder(observation.snapshot.folder.as_deref()),
-        ),
-    )?;
+    ensure_snapshot_banner(console, &observation.snapshot)?;
     let conversation_events = observation.snapshot.conversation_events();
     console.select_chat(Some(chat))?;
     let failed_runs = conversation_events
@@ -7279,10 +7286,7 @@ fn show_opened_chat(
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
     has_history: bool,
 ) -> Result<Option<uuid::Uuid>, String> {
-    console.ensure_chat_banner(
-        snapshot.id,
-        &startup_banner_spans(&snapshot.model, shown_folder(snapshot.folder.as_deref())),
-    )?;
+    ensure_snapshot_banner(console, snapshot)?;
     console.reset_chat(snapshot.id)?;
     let goal = snapshot.default_input_loop();
     outln!(console, "Chat: {}", snapshot.id);
@@ -8022,13 +8026,7 @@ async fn navigate_agent(
                 console.set_global_overview(None)?;
                 let restored = console.activate_agent(chat)?;
                 if !restored {
-                    console.ensure_chat_banner(
-                        chat,
-                        &startup_banner_spans(
-                            &snapshot.model,
-                            shown_folder(snapshot.folder.as_deref()),
-                        ),
-                    )?;
+                    ensure_snapshot_banner(console, &snapshot)?;
                     console.reset_chat(chat)?;
                     learn_agent_colors(console, agent, &snapshot).await?;
                     workflows::write_public_history(console, &snapshot)?;

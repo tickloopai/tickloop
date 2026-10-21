@@ -739,6 +739,8 @@ pub(super) struct State {
     last_click: Option<Click>,
     /// A ctrl+click opened a link, so its drag and release must not select.
     link_press: bool,
+    /// The left button went down here and has not come up yet.
+    left_button_down: bool,
     opener: Opener,
     /// What the last copy did, shown in the status line until it expires.
     copy_notice: Option<CopyNotice>,
@@ -5722,6 +5724,7 @@ impl State {
             selection_drag: None,
             last_click: None,
             link_press: false,
+            left_button_down: false,
             opener: Opener::Terminal,
             copy_notice: None,
             display: DisplayProfile::new(preferences),
@@ -5911,6 +5914,19 @@ impl State {
             row: usize::from(event.row),
             column: usize::from(event.column),
         };
+        let unpressed_release = event.kind == MouseEventKind::Up(MouseButton::Left)
+            && !std::mem::replace(&mut self.left_button_down, false);
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.left_button_down = true;
+        }
+        // Zellij keeps a ctrl+click's press for itself but passes its release on, so there a ctrl
+        // release with no press before it is all that arrives of a ctrl+click.
+        if unpressed_release && event.modifiers.contains(KeyModifiers::CONTROL) {
+            return match self.link_at(at) {
+                Some(url) => self.open_link(&url, output),
+                None => false,
+            };
+        }
         // The release of a ctrl+click that opened a link can be lost to the browser taking focus,
         // so the next press ends it too.
         if self.link_press {
@@ -6856,7 +6872,19 @@ impl State {
             self.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds());
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
-        let padding = body_height.saturating_sub(body.lines.len());
+        // As in Claude Code, a conversation shorter than the screen starts at the top, and the
+        // live activity stays just above the input with the blank rows between the two.
+        let gap = body_height.saturating_sub(body.lines.len());
+        let conversation_shown = body.lines.len() - body.pinned;
+        let body_index = |row: usize| {
+            let row = row.checked_sub(sticky_rows)?;
+            if row < conversation_shown {
+                Some(row)
+            } else {
+                row.checked_sub(gap)
+                    .filter(|index| *index >= conversation_shown)
+            }
+        };
         let side_columns = self.monitor_columns();
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
@@ -6894,10 +6922,16 @@ impl State {
         if monitor_lines.is_some() && !self.monitor.overlay {
             self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
         }
-        let first_body_row = sticky_rows + padding;
+        // The viewport maps screen rows onto content rows one to one, so it ends at the gap; a
+        // row below the gap is selected as part of the screen.
+        let viewport_rows = if gap == 0 {
+            body.lines.len()
+        } else {
+            conversation_shown
+        };
         self.content_viewport = Some(Viewport {
             surface: Surface::Conversation,
-            rows: first_body_row..first_body_row + body.lines.len(),
+            rows: sticky_rows..sticky_rows + viewport_rows,
             columns: if monitor_lines.is_some() {
                 self.width.saturating_sub(side_columns)
             } else {
@@ -6913,9 +6947,7 @@ impl State {
                     None
                 };
                 let pinned_text = pinned.map(RoleLine::text);
-                let line_index = row
-                    .checked_sub(sticky_rows)
-                    .and_then(|row| row.checked_sub(padding));
+                let line_index = body_index(row);
                 let line = pinned_text
                     .as_deref()
                     .or_else(|| {
@@ -6980,8 +7012,7 @@ impl State {
                 {
                     prompt.text()
                 } else {
-                    row.checked_sub(sticky_rows)
-                        .and_then(|row| row.checked_sub(padding))
+                    body_index(row)
                         .and_then(|index| body.lines.get(index))
                         .cloned()
                         .unwrap_or_default()
@@ -13904,6 +13935,35 @@ mod tests {
     }
 
     #[test]
+    fn a_short_conversation_starts_at_the_top_and_its_activity_stays_above_the_input() {
+        let (mut state, copies, _) = state_showing(80, "banner line\nfirst reply\n", false);
+        state
+            .scrollback
+            .set_activity(Some(RoleLine::plain("Working on it")));
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen[0].starts_with("banner line"));
+        let reply = drawn_at(&state, "first reply").0 as usize;
+        let activity = drawn_at(&state, "Working on it").0 as usize;
+        assert!(activity > reply + 1, "{:#?}", state.rendered_screen);
+        assert!(
+            state.rendered_screen[reply + 1..activity]
+                .iter()
+                .all(|row| row.trim().is_empty())
+        );
+
+        let (row, column) = drawn_at(&state, "first");
+        click(&mut state, (row, column), 2, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies).as_deref(), Some("first"));
+        let (row, column) = drawn_at(&state, "Working");
+        click(&mut state, (row, column), 2, KeyModifiers::NONE);
+        assert_eq!(
+            last_copy(&copies).as_deref(),
+            Some("Working"),
+            "a row below the gap is still selectable"
+        );
+    }
+
+    #[test]
     fn a_double_click_copies_the_word_path_or_cjk_run_under_it_and_says_so() {
         let (mut state, copies, _) =
             state_showing(80, "see src/main.rs:12, then 中文句子很长。ok\n", false);
@@ -14034,6 +14094,38 @@ mod tests {
         let (row, column) = drawn_at(&state, "then");
         drag(&mut state, (row, column), (row, column + 4));
         assert_eq!(last_copy(&copies).as_deref(), Some("then"));
+    }
+
+    #[test]
+    fn a_ctrl_release_without_its_press_opens_the_link_as_zellij_forwards_it() {
+        let url = "https://example.com/a/very/long/path/to/the/page.html";
+        let (mut state, _, opened) = state_showing(30, &format!("open {url} now\n"), false);
+        let (row, column) = drawn_at(&state, "page.html");
+        let release = |state: &mut State, modifiers| {
+            state.pointer(
+                MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers,
+                },
+                &mut Vec::new(),
+            );
+        };
+        release(&mut state, KeyModifiers::NONE);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "a plain release opens nothing"
+        );
+        release(&mut state, KeyModifiers::CONTROL);
+        assert_eq!(opened.lock().unwrap().as_slice(), [url]);
+
+        click(&mut state, (row, column), 1, KeyModifiers::CONTROL);
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            2,
+            "a whole ctrl+click opens the link once"
+        );
     }
 
     #[test]

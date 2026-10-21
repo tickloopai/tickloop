@@ -87,6 +87,7 @@ fn terminals_that_show_links_are_detected_like_claude_code() {
         &[("FORCE_HYPERLINK", "1")],
         &[("FORCE_HYPERLINK", ""), ("TERM_PROGRAM", "ghostty")],
         &[("HERDR_ENV", "1"), ("TERM", "xterm-256color")],
+        &[("ZELLIJ", "0"), ("TERM", "xterm-256color")],
     ] {
         assert!(
             supported(environment(supported_terminal)),

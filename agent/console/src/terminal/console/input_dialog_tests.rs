@@ -1130,12 +1130,21 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
     );
     assert_eq!(state.input_dialog_height(), 6);
     let dialog_top = state.height - state.input_dialog_height();
-    assert!(state.rendered_screen[dialog_top - 2].starts_with("Trailing boundary"));
     assert!(
-        state.rendered_screen[dialog_top - 1]
-            .trim_start()
-            .starts_with('│'),
-        "one blank row separates the conversation from the dialog"
+        state.rendered_screen[0].starts_with("Leading boundary"),
+        "a short conversation starts at the top"
+    );
+    let trailing = state
+        .rendered_screen
+        .iter()
+        .position(|row| row.starts_with("Trailing boundary"))
+        .unwrap();
+    assert!(trailing + 1 < dialog_top);
+    assert!(
+        state.rendered_screen[trailing + 1..dialog_top]
+            .iter()
+            .all(|row| row.trim_start().starts_with('│')),
+        "the blank rows sit between the conversation and the dialog"
     );
     assert_eq!(state.rendered_screen[dialog_top], "▔".repeat(state.width));
     assert!(

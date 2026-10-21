@@ -1123,11 +1123,7 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
     let frame = frame_lines(&console);
     for line in ["original draft banner", "draft warning", "draft echo"] {
         assert_eq!(
-            frame
-                .iter()
-                .skip(1)
-                .filter(|text| text.contains(line))
-                .count(),
+            frame.iter().filter(|text| text.contains(line)).count(),
             1,
             "{frame:#?}"
         );
@@ -1151,11 +1147,7 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
             "rebuilt public conversation",
         ] {
             assert_eq!(
-                frame
-                    .iter()
-                    .skip(1)
-                    .filter(|text| text.contains(line))
-                    .count(),
+                frame.iter().filter(|text| text.contains(line)).count(),
                 1,
                 "{frame:#?}"
             );

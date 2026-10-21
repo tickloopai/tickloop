@@ -430,6 +430,7 @@ impl Workflow {
                 }
                 .map_err(|error| error.to_string())?;
                 let chat = snapshot.id;
+                super::ensure_snapshot_banner(console, &snapshot)?;
                 console.reset_chat(chat)?;
                 console.write(&format!(
                     "\nOpened Chat: {} · {}\n",
