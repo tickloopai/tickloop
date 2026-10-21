@@ -83,14 +83,10 @@ jobs:
             exit 1
           fi
 
-  check:
-    name: Check
-    needs: prepare
-    uses: ./.github/workflows/ci.yml
-
+  # The maintainer runs the tests before releasing; CI (ci.yml) can be started by hand.
   build:
     name: Build (${{ matrix.target }})
-    needs: [prepare, check]
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:

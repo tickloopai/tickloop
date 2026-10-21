@@ -114,12 +114,13 @@ make release-publish VERSION=X.Y.Z    # publish a pushed tag again; FROM=step re
 
 `make release` checks a temporary checkout of `HEAD`, creates a dedicated `chore(release): ...` commit and an annotated `vX.Y.Z` tag, and pushes the branch and tag. It then publishes the tag from this Mac with `scripts/release-publish.mjs`, in the same stages as `.github/workflows/release.yml`:
 
-1. `prepare`: the release script tests and the crates.io package audit, and access to the tap, crates.io, Docker and Rosetta;
-2. `check`: `make check-workspace` on macOS and in a Linux container (`scripts/release/linux.Dockerfile`), with a clippy run for the musl target;
-3. `build`: the macOS archives natively and the static musl archives in Linux containers (x86_64 under emulation), each smoke-tested;
-4. `publish`: the archives as a release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap);
-5. `tap`: the Formula;
-6. `cargo`: the crates.io launcher, verified on macOS and Linux.
+1. `prepare`: the crates.io package audit, and access to the tap, crates.io, Docker and Rosetta;
+2. `build`: the macOS archives natively and the static musl archives in Linux containers (`scripts/release/linux.Dockerfile`, x86_64 under emulation), each smoke-tested;
+3. `publish`: the archives as a release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap);
+4. `tap`: the Formula;
+5. `cargo`: the crates.io launcher, verified on macOS and Linux.
+
+Publishing does not run the tests: run `make check` (and the Linux checks when a change touches platform code) before `make release`.
 
 It needs an Apple silicon Mac with Rosetta, Docker (OrbStack), `gh` signed in with push access to the tap, and `cargo login` for crates.io. The tagged source is checked out in `target/release-local/source`, and the archives are kept in `target/release-local/vX.Y.Z/`. `REMOTE=1` starts `release.yml` on GitHub Actions for the pushed tag instead; tags no longer start it on their own.
 

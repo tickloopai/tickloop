@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tickloop_agent_base::{
-    network::{HttpPolicy, build_http_client, is_loopback},
+    network::{HttpPolicy, build_http_client},
     private_fs::{
         OpenTarget, PRIVATE_FILE_MODE, open_without_following_links, replace_file_atomically,
         unix_time_milliseconds, verify_private_directory,
@@ -193,7 +193,7 @@ impl MiniMaxAuth {
     ) -> Result<Self, MiniMaxAuthError> {
         let url = reqwest::Url::parse(origin).map_err(|_| MiniMaxAuthError::InvalidResponse)?;
         if url.scheme() != "http"
-            || !is_loopback(&url)
+            || !tickloop_agent_base::network::is_loopback(&url)
             || url.port().is_none()
             || url.path() != "/"
             || url.query().is_some()

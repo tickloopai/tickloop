@@ -25,7 +25,7 @@ test("local publishing builds every target the workflow, installer and updater k
     const source = read(path);
     for (const triple of triples) assert.ok(source.includes(triple), `${path} lacks ${triple}`);
   }
-  assert.deepEqual(steps, ["prepare", "check", "build", "publish", "tap", "cargo"]);
+  assert.deepEqual(steps, ["prepare", "build", "publish", "tap", "cargo"]);
 });
 
 test("the formula renders every placeholder of the template with its target's checksum", () => {

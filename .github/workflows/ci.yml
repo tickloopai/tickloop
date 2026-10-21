@@ -1,9 +1,8 @@
 name: CI
 
-# Hosted runners are costly, so pushes and pull requests do not start CI: the release workflow
-# runs it before building, and a maintainer can start it by hand from the Actions tab.
+# Hosted runners are costly, so pushes, pull requests and releases do not start CI; a maintainer
+# runs the checks locally and can start this workflow by hand from the Actions tab.
 on:
-  workflow_call:
   workflow_dispatch:
 
 permissions:

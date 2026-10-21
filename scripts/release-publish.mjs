@@ -1,13 +1,13 @@
-// Publishes an existing vX.Y.Z tag from this Mac: checks the tagged source on macOS and Linux,
-// builds the four archives, publishes them on the tap, updates the Homebrew formula and publishes
+// Publishes an existing vX.Y.Z tag from this Mac: builds the four archives of the tagged source, publishes them on the tap, updates the Homebrew formula and publishes
 // the Cargo launcher. --remote starts .github/workflows/release.yml on GitHub Actions instead.
+// The maintainer runs the tests before releasing, so publishing does not run them again.
 // Every step can run again: built archives are reused, and published assets, the formula and the
 // crate are only ever added when missing and refused when they differ.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,7 +15,8 @@ const repository = "tickloopai/tickloop";
 const tapRepository = "tickloopai/homebrew-tap";
 const programs = ["tickhost", "tickloop"];
 const linuxImage = "tickloop-release-linux";
-export const steps = ["prepare", "check", "build", "publish", "tap", "cargo"];
+const uploadAttempts = 3;
+export const steps = ["prepare", "build", "publish", "tap", "cargo"];
 export const targets = [
   { triple: "aarch64-apple-darwin", arch: "arm64" },
   { triple: "x86_64-apple-darwin", arch: "x86_64" },
@@ -103,7 +104,7 @@ function acquireLock(path) {
   return () => rmSync(path, { force: true });
 }
 
-function linux(source, platform, script, { environment = {} } = {}) {
+function linux(source, platform, script) {
   const arch = platform.split("/")[1];
   const image = `${linuxImage}:${arch}`;
   run("docker", ["build", "--quiet", "--platform", platform, "--tag", image,
@@ -114,8 +115,7 @@ function linux(source, platform, script, { environment = {} } = {}) {
     "--volume", `tickloop-release-target-${arch}:${workspace}/target`];
   run("docker", ["run", "--rm", "--platform", platform, ...volumes, image,
     "chown", "builder:builder", "/usr/local/cargo/registry", `${workspace}/target`]);
-  const variables = Object.entries({ HOME: "/home/builder", ...environment }).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
-  run("docker", ["run", "--rm", "--platform", platform, "--user", "builder", ...variables, ...volumes,
+  run("docker", ["run", "--rm", "--platform", platform, "--user", "builder", "--env", "HOME=/home/builder", ...volumes,
     "--volume", `${source}:${workspace}`, "--workdir", workspace, image, "bash", "-euo", "pipefail", "-c", script]);
 }
 
@@ -125,21 +125,12 @@ function prepare(source, version) {
   const workspaceVersion = workspace.match(/\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
   if (workspaceVersion !== version) throw new Error(`The tagged workspace version is ${workspaceVersion}, not ${version}.`);
   if (!succeeds("arch", ["-x86_64", "/usr/bin/true"])) throw new Error("Rosetta is required to test the Intel archive: softwareupdate --install-rosetta --agree-to-license");
-  if (!succeeds("docker", ["info"])) throw new Error("Docker (OrbStack) must be running to check and build the Linux archives.");
+  if (!succeeds("docker", ["info"])) throw new Error("Docker (OrbStack) must be running to build the Linux archives.");
   if (output("gh", ["api", `repos/${tapRepository}`, "--jq", ".permissions.push"]) !== "true") throw new Error(`gh must be signed in with push access to ${tapRepository}.`);
   if (output("gh", ["api", `repos/${tapRepository}/branches?per_page=1`, "--jq", "length"]) === "0") throw new Error(`${tapRepository} has no commits, so a release tag cannot be created there.`);
   const cargoHome = process.env.CARGO_HOME ?? join(homedir(), ".cargo");
   if (!process.env.CARGO_REGISTRY_TOKEN && !existsSync(join(cargoHome, "credentials.toml"))) throw new Error("Sign in to crates.io with cargo login, or set CARGO_REGISTRY_TOKEN.");
-  run("node", ["--test", "scripts/release.test.mjs", "scripts/install.test.mjs", "scripts/release-cargo.test.mjs", "scripts/release-publish.test.mjs"], { cwd: source });
   run("node", ["scripts/release-cargo.mjs", "--check"], { cwd: source });
-}
-
-function check(source) {
-  // One after the other: concurrent full test runs time out each other's PTY tests.
-  run("make", ["check-workspace"], { cwd: source, env: { ...process.env, NEXTEST_PROFILE: "ci" } });
-  linux(source, "linux/arm64",
-    "make check-workspace && cargo clippy --locked --workspace --all-targets --target aarch64-unknown-linux-musl -- -D warnings",
-    { environment: { NEXTEST_PROFILE: "ci" } });
 }
 
 const archiveCheck = `
@@ -196,28 +187,35 @@ function assets(out) {
   });
 }
 
+function releaseAssets(tag) {
+  return JSON.parse(output("gh", ["release", "view", tag, "--repo", tapRepository, "--json", "assets", "--jq", ".assets"]));
+}
+
+// Uploads of the larger archives can time out; an interrupted one may leave an incomplete asset
+// that blocks its name, so it is removed before the next attempt.
+function upload(tag, file) {
+  const name = basename(file);
+  for (let attempt = 1; ; attempt++) {
+    const incomplete = releaseAssets(tag).find(asset => asset.name === name && asset.state !== "uploaded");
+    if (incomplete) run("gh", ["api", "--method", "DELETE", incomplete.apiUrl]);
+    if (succeeds("gh", ["release", "upload", tag, file, "--repo", tapRepository], { stdio: "inherit" })) return;
+    if (attempt === uploadAttempts) throw new Error(`Uploading ${name} failed ${uploadAttempts} times; check the connection to GitHub.`);
+    process.stderr.write(`Uploading ${name} failed; retrying (${attempt + 1}/${uploadAttempts}).\n`);
+  }
+}
+
 function publish(out, tag) {
   const files = assets(out);
-  if (succeeds("gh", ["release", "view", tag, "--repo", tapRepository])) {
-    // A published version is immutable; a rerun may only add missing identical assets.
-    const published = new Set(output("gh", ["release", "view", tag, "--repo", tapRepository, "--json", "assets", "--jq", ".assets[].name"]).split("\n"));
-    const scratch = mkdtempSync(join(tmpdir(), "tickloop-release-assets-"));
-    try {
-      for (const file of files) {
-        const name = file.split("/").pop();
-        if (!published.has(name)) {
-          run("gh", ["release", "upload", tag, file, "--repo", tapRepository]);
-          continue;
-        }
-        run("gh", ["release", "download", tag, "--repo", tapRepository, "--pattern", name, "--dir", scratch]);
-        if (sha256(join(scratch, name)) !== sha256(file)) throw new Error(`Published asset ${name} differs; release a new version instead.`);
-      }
-    } finally {
-      rmSync(scratch, { recursive: true, force: true });
-    }
-  } else {
-    run("gh", ["release", "create", tag, ...files, "--repo", tapRepository, "--draft", "--title", `Tickloop ${tag.slice(1)}`,
+  if (!succeeds("gh", ["release", "view", tag, "--repo", tapRepository])) {
+    run("gh", ["release", "create", tag, "--repo", tapRepository, "--draft", "--title", `Tickloop ${tag.slice(1)}`,
       "--notes", `Prebuilt macOS and Linux archives of Tickloop ${tag.slice(1)}. Install with: brew install tickloopai/tap/tickloop`]);
+  }
+  // A published version is immutable; a rerun may only add missing identical assets.
+  const published = new Map(releaseAssets(tag).filter(asset => asset.state === "uploaded").map(asset => [asset.name, asset]));
+  for (const file of files) {
+    const asset = published.get(basename(file));
+    if (!asset) upload(tag, file);
+    else if (asset.digest !== `sha256:${sha256(file)}`) throw new Error(`Published asset ${asset.name} differs; release a new version instead.`);
   }
   run("gh", ["release", "edit", tag, "--repo", tapRepository, "--draft=false"]);
 }
@@ -299,7 +297,6 @@ function publishLocally(tag, from) {
     checkOut(source, tag, commit);
     const actions = {
       prepare: () => prepare(source, version),
-      check: () => check(source),
       build: () => build(source, out),
       publish: () => publish(out, tag),
       tap: () => tap(source, out, version),

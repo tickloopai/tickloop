@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::copilot::{CLIENT_HEADERS, CLIENT_USER_AGENT};
 use tickloop_agent_base::{
-    network::{HttpPolicy, build_http_client, is_loopback},
+    network::{HttpPolicy, build_http_client},
     private_fs::{
         OpenTarget, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, open_without_following_links,
         replace_file_atomically, unix_time_milliseconds, verify_private_directory,
@@ -197,7 +197,7 @@ impl CopilotAuth {
     ) -> Result<Self, CopilotAuthError> {
         let url = reqwest::Url::parse(origin).map_err(|_| CopilotAuthError::InvalidResponse)?;
         if url.scheme() != "http"
-            || !is_loopback(&url)
+            || !tickloop_agent_base::network::is_loopback(&url)
             || url.port().is_none()
             || url.path() != "/"
             || url.query().is_some()
