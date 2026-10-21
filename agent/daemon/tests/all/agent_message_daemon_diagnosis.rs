@@ -40,7 +40,15 @@ struct MessageBurstModel {
 async fn read_json_frame(stream: &mut UnixStream) -> Option<Value> {
     let length = match stream.read_u32().await {
         Ok(length) => length as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+        // Linux resets the connection when the peer closes with our unread frames still queued.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return None;
+        }
         Err(error) => panic!("{error}"),
     };
     assert!(length <= tickloop_agent_protocol::AccessLimits::DEFAULT.frame_bytes());
@@ -51,7 +59,7 @@ async fn read_json_frame(stream: &mut UnixStream) -> Option<Value> {
 
 #[tokio::test]
 async fn legacy_wire_schema_is_rejected_before_pipelined_create_can_execute() {
-    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let directory = tempfile::tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT).unwrap();
     let socket = directory.path().join("worker.sock");
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::text("fixture reply"),

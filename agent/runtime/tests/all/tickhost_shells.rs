@@ -439,7 +439,7 @@ impl ShellGrants for AnswerlessHost {
 async fn a_spawn_whose_answer_was_lost_is_listed_with_an_unknown_outcome_not_refused() {
     let sockets = tempfile::Builder::new()
         .prefix("ths")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let fixture = Fixture::granting_with(Some(Arc::new(AnswerlessHost::serve(sockets.path()))));
     let prepared = fixture.prepare(json!({"command":"touch probe"})).await;

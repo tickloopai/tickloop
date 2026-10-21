@@ -30,7 +30,7 @@ impl Host {
     async fn start() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tma")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let controller = HostController::new(
             directory.path(),

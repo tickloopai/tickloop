@@ -31,7 +31,7 @@ impl State {
     fn new() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tms")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         std::fs::create_dir(directory.path().join("config")).unwrap();
         std::fs::create_dir(directory.path().join("home")).unwrap();
@@ -351,7 +351,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
 
     let directory = tempfile::Builder::new()
         .prefix("tmp")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let controller = HostController::new(
         directory.path(),

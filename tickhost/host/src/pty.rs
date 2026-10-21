@@ -274,13 +274,14 @@ mod tests {
         let [reader, writer] = pipe;
         let (started, reading) = std::sync::mpsc::channel();
         let read = std::thread::spawn(move || {
-            started.send(unsafe { libc::pthread_self() }).unwrap();
+            started.send(()).unwrap();
             let mut buffer = [0u8; 16];
             read_chunk(reader, &mut buffer).map(|count| buffer[..count].to_vec())
         });
-        let thread = reading.recv().unwrap();
+        reading.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(unsafe { libc::pthread_kill(thread, libc::SIGUSR1) }, 0);
+        let thread = std::os::unix::thread::JoinHandleExt::as_pthread_t(&read);
+        assert_eq!(unsafe { libc::pthread_kill(thread as _, libc::SIGUSR1) }, 0);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(
             unsafe { libc::write(writer, b"tick".as_ptr().cast(), 4) },

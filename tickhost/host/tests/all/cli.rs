@@ -43,7 +43,7 @@ impl Service {
     async fn start() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("thc")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(crate::SHORT_TEMP_ROOT)
             .unwrap();
         let paths = HostPaths {
             runtime: directory.path().join("h"),
@@ -170,7 +170,7 @@ fn stop_never_signals_a_process_the_host_lock_names_unless_it_is_the_live_tickho
     use std::os::fd::AsRawFd;
     let directory = tempfile::Builder::new()
         .prefix("ths")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(crate::SHORT_TEMP_ROOT)
         .unwrap();
     let paths = HostPaths {
         runtime: directory.path().join("h"),

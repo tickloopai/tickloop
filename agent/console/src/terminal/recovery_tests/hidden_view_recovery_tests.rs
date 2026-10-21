@@ -486,7 +486,7 @@ fn double_control_c_in_overview_exits_only_the_view() {
 }
 
 fn run_hidden_view_pty(route: &str) {
-    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let directory = tempfile::tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

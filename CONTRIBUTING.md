@@ -11,7 +11,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 ## Development setup
 
-- macOS (Apple silicon or Intel), the current target platform.
+- macOS (Apple silicon or Intel) or Linux (ARM64 or x86_64); CI checks both.
 - The current stable Rust toolchain (edition 2024), with `rustfmt` and `clippy`.
 - [cargo-nextest](https://nexte.st/): `cargo install --locked cargo-nextest`.
 - Node.js 22 for the script tests.
@@ -113,4 +113,4 @@ make release                 # bump the patch version
 make release VERSION=X.Y.Z   # or pick a higher version
 ```
 
-`make release` checks a temporary checkout of `HEAD`, creates a dedicated `chore(release): ...` commit and an annotated `vX.Y.Z` tag, and pushes the branch and tag. The tag triggers `.github/workflows/release.yml`, which builds the macOS archives, publishes them as a draft release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap), then publishes the release, updates the Formula and publishes the matching crates.io launcher. Assets and crates for an existing version are never replaced with different content; rerun failed jobs instead of bumping again. If pushing the tag fails after the release commit was created, push the missing refs instead of running `make release` again.
+`make release` checks a temporary checkout of `HEAD`, creates a dedicated `chore(release): ...` commit and an annotated `vX.Y.Z` tag, and pushes the branch and tag. The tag triggers `.github/workflows/release.yml`, which builds the macOS and Linux archives, publishes them as a draft release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap), then publishes the release, updates the Formula and publishes the matching crates.io launcher. Assets and crates for an existing version are never replaced with different content; rerun failed jobs instead of bumping again. If pushing the tag fails after the release commit was created, push the missing refs instead of running `make release` again.

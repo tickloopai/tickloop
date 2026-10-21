@@ -21,7 +21,7 @@ struct Fixture {
 fn private_directory() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("th")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(crate::SHORT_TEMP_ROOT)
         .unwrap()
 }
 

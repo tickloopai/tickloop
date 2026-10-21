@@ -30,7 +30,7 @@ use uuid::Uuid;
 fn private_directory(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in("/private/tmp")
+        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
         .unwrap()
 }
 

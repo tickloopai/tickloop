@@ -1,6 +1,11 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
+const SHA256_COMMAND: (&str, &[&str]) = ("/usr/bin/sha256sum", &[]);
+#[cfg(not(target_os = "linux"))]
+const SHA256_COMMAND: (&str, &[&str]) = ("/usr/bin/shasum", &["-a", "256"]);
+
 pub fn unpack(
     archive: &Path,
     checksum: &str,
@@ -15,16 +20,7 @@ pub fn unpack(
     {
         return Err("Invalid release checksum file.".into());
     }
-    let actual = output(
-        Command::new("/usr/bin/shasum")
-            .args(["-a", "256"])
-            .arg(archive),
-    )?;
-    if actual
-        .split_whitespace()
-        .next()
-        .is_none_or(|value| !value.eq_ignore_ascii_case(fields[0]))
-    {
+    if !sha256(archive)?.eq_ignore_ascii_case(fields[0]) {
         return Err("Release SHA-256 mismatch; the existing installation was not replaced.".into());
     }
     let entries = output(Command::new("/usr/bin/tar").arg("-tzf").arg(archive))?;
@@ -49,6 +45,16 @@ pub fn unpack(
         return Err("Cannot extract the verified release.".into());
     }
     Ok(())
+}
+
+pub fn sha256(file: &Path) -> Result<String, String> {
+    let (program, arguments) = SHA256_COMMAND;
+    let digest = output(Command::new(program).args(arguments).arg(file))?;
+    digest
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .ok_or_else(|| "The SHA-256 command printed no digest.".into())
 }
 
 pub fn output(command: &mut Command) -> Result<String, String> {

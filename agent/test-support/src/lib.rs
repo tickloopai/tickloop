@@ -14,6 +14,13 @@ pub mod screen;
 pub mod stateless_host;
 pub mod transcripts;
 
+/// A short canonical directory for test sockets, whose paths are limited to about 100 bytes;
+/// macOS's `/tmp` is a symbolic link to `/private/tmp`.
+#[cfg(target_os = "macos")]
+pub const SHORT_TEMP_ROOT: &str = "/private/tmp";
+#[cfg(not(target_os = "macos"))]
+pub const SHORT_TEMP_ROOT: &str = "/tmp";
+
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
 use tickloop_agent_model::*;

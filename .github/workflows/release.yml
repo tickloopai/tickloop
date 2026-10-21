@@ -86,12 +86,16 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: prepare
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-15 }
+          - { target: x86_64-apple-darwin, runner: macos-15 }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
     env:
       PACKAGE_TARGET: ${{ matrix.target }}
     steps:
@@ -106,19 +110,28 @@ jobs:
           rustup default stable
           rustup target add "$PACKAGE_TARGET"
 
+      # Linux archives are static musl programs, so they run on any glibc or musl distribution.
+      - name: Install the musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
       - name: Build the archive
         run: make package PACKAGE_TARGET="$PACKAGE_TARGET"
 
       # `arch` runs each executable as the target's architecture, so a wrong-architecture archive
       # fails here; the arm64 runner runs the x86_64 archive under Rosetta.
+      # On Linux each runner matches its target's architecture and the programs must be static.
       - name: Smoke-test the archive
         run: |
           case "$PACKAGE_TARGET" in
-            aarch64-apple-darwin) architecture=arm64 ;;
-            x86_64-apple-darwin) architecture=x86_64 ;;
+            aarch64-apple-darwin) run() { arch -arm64 "$@"; } ;;
+            x86_64-apple-darwin) run() { arch -x86_64 "$@"; } ;;
+            *-unknown-linux-musl) run() { "$@"; } ;;
             *) echo "::error::No smoke test for $PACKAGE_TARGET."; exit 1 ;;
           esac
-          if ! arch "-$architecture" /usr/bin/true 2> /dev/null; then
+          if [ "$RUNNER_OS" = macOS ] && ! run /usr/bin/true 2> /dev/null; then
             sudo softwareupdate --install-rosetta --agree-to-license
           fi
           unpacked=$(mktemp -d)
@@ -127,7 +140,11 @@ jobs:
           tar -tzf "dist/tickloop-$PACKAGE_TARGET.tar.gz" | LC_ALL=C sort > "$unpacked/archive-files"
           cmp "$unpacked/expected-files" "$unpacked/archive-files"
           for executable in tickloop tickhost tick-reader; do
-            arch "-$architecture" "$unpacked/$executable" --help > /dev/null
+            run "$unpacked/$executable" --help > /dev/null
+            if [ "$RUNNER_OS" = Linux ] && file "$unpacked/$executable" | grep -q 'dynamically linked'; then
+              echo "::error::$executable is not a static program."
+              exit 1
+            fi
           done
 
       - name: Write the checksum
@@ -185,7 +202,7 @@ jobs:
               --repo "$TAP_REPOSITORY" \
               --draft \
               --title "Tickloop ${RELEASE_TAG#v}" \
-              --notes "Prebuilt macOS archives of Tickloop ${RELEASE_TAG#v}. Install with: brew install tickloopai/tap/tickloop"
+              --notes "Prebuilt macOS and Linux archives of Tickloop ${RELEASE_TAG#v}. Install with: brew install tickloopai/tap/tickloop"
             gh release edit "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --draft=false
           fi
 
@@ -214,6 +231,8 @@ jobs:
             -e "s/@VERSION@/${RELEASE_TAG#v}/g" \
             -e "s/@AARCH64_SHA256@/$(checksum aarch64-apple-darwin)/g" \
             -e "s/@X86_64_SHA256@/$(checksum x86_64-apple-darwin)/g" \
+            -e "s/@LINUX_AARCH64_SHA256@/$(checksum aarch64-unknown-linux-musl)/g" \
+            -e "s/@LINUX_X86_64_SHA256@/$(checksum x86_64-unknown-linux-musl)/g" \
             "$FORMULA_TEMPLATE" > "$RUNNER_TEMP/tickloop.rb"
           if grep -n '@[A-Z0-9_]*@' "$RUNNER_TEMP/tickloop.rb"; then
             echo '::error::The rendered formula still has template placeholders.'
@@ -297,3 +316,22 @@ jobs:
             printf 'https://crates.io/crates/tickloop/%s\n\n' "${RELEASE_TAG#v}"
             printf 'Install: cargo install --locked tickloop\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  cargo-registry-linux:
+    name: Verify the Cargo installer on Linux
+    needs: cargo-registry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install stable Rust
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Verify anonymous installation from crates.io
+        run: |
+          cargo install --locked --registry crates-io --version "${RELEASE_TAG#v}" --root "$RUNNER_TEMP/cargo-registry-smoke" tickloop
+          for program in tickloop tickhost tick-reader; do
+            "$RUNNER_TEMP/cargo-registry-smoke/bin/$program" --help > /dev/null
+          done
+          "$RUNNER_TEMP/cargo-registry-smoke/bin/tl" --version

@@ -17,15 +17,24 @@ env:
   NEXTEST_PROFILE: ci
   # The popup and Herdr view tests run a private server of this release.
   HERDR_VERSION: 0.9.0
-  HERDR_MACOS_AARCH64_SHA256: 32b53df09872628059c789a69f02a6b8e29e14ddf26711421f3463f70c1aef17
 
 # The Cargo launcher's build downloads the release matching its version, which does not exist yet
 # when a version commit lands, so CI checks the workspace only; release.yml verifies the launcher.
 jobs:
   check:
-    name: Format, lint and test
-    runs-on: macos-15
+    name: Format, lint and test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            herdr-asset: herdr-macos-aarch64
+            herdr-sha256: 32b53df09872628059c789a69f02a6b8e29e14ddf26711421f3463f70c1aef17
+          - runner: ubuntu-24.04
+            herdr-asset: herdr-linux-x86_64
+            herdr-sha256: 4fa1a01158dd8043da92d31b270780b0dcc10603038d9b61cac4d81ab63fb71f
     steps:
       - name: Check out the source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -48,12 +57,15 @@ jobs:
           tool: cargo-nextest
 
       - name: Install Herdr
+        env:
+          HERDR_ASSET: ${{ matrix.herdr-asset }}
+          HERDR_SHA256: ${{ matrix.herdr-sha256 }}
         run: |
           herdr="$RUNNER_TEMP/herdr/bin/herdr"
           mkdir -p "${herdr%/*}"
           curl --fail --silent --show-error --location --retry 3 --output "$herdr" \
-            "https://github.com/herdrdev/herdr/releases/download/v$HERDR_VERSION/herdr-macos-aarch64"
-          echo "$HERDR_MACOS_AARCH64_SHA256  $herdr" | shasum -a 256 --check --strict
+            "https://github.com/herdrdev/herdr/releases/download/v$HERDR_VERSION/$HERDR_ASSET"
+          echo "$HERDR_SHA256  $herdr" | shasum -a 256 --check --strict
           chmod +x "$herdr"
           "$herdr" --version
           echo "${herdr%/*}" >> "$GITHUB_PATH"
@@ -74,3 +86,12 @@ jobs:
 
       - name: Format, lint and test the workspace
         run: make check-workspace
+
+      # Release archives for Linux are static musl programs; lint that target too.
+      - name: Lint the Linux release target
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings

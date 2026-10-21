@@ -295,6 +295,7 @@ pub struct TerminalDevice {
 }
 
 impl TerminalDevice {
+    #[allow(clippy::unnecessary_cast, reason = "dev_t is i32 on macOS")]
     pub fn of(descriptor: RawFd) -> std::io::Result<Self> {
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } != 0 {

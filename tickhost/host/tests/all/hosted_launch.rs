@@ -87,7 +87,7 @@ impl Fixture {
     async fn with_idle_timeout(idle_timeout: Duration) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("th")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(crate::SHORT_TEMP_ROOT)
             .unwrap();
         let paths = HostPaths {
             runtime: directory.path().join("h"),
@@ -2116,7 +2116,7 @@ async fn a_launch_token_works_once_and_only_after_a_proven_foreground() {
 async fn a_launcher_without_a_readable_tickhost_launch_never_starts_a_tick() {
     let directory = tempfile::Builder::new()
         .prefix("thctx")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(crate::SHORT_TEMP_ROOT)
         .unwrap();
     let marker = directory.path().join("started");
     let cases: [(&[(&str, &str)], &str); 2] = [
@@ -2299,7 +2299,7 @@ async fn shutdown(fixture: &Fixture) {
 async fn a_launcher_in_a_background_process_group_of_its_terminal_is_refused() {
     let directory = tempfile::Builder::new()
         .prefix("thbg")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(crate::SHORT_TEMP_ROOT)
         .unwrap();
     let marker = directory.path().join("started");
     let status = directory.path().join("status");

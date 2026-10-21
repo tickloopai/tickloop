@@ -442,10 +442,9 @@ pub fn local_now() -> time::OffsetDateTime {
 }
 
 fn local_offset(unix_timestamp: i64) -> time::UtcOffset {
-    let seconds = unix_timestamp as libc::time_t;
     let mut broken_down = unsafe { std::mem::zeroed::<libc::tm>() };
     // localtime_r writes into caller-owned storage and is the thread-safe conversion.
-    if unsafe { libc::localtime_r(&seconds, &mut broken_down) }.is_null() {
+    if unsafe { libc::localtime_r(&unix_timestamp, &mut broken_down) }.is_null() {
         return time::UtcOffset::UTC;
     }
     i32::try_from(broken_down.tm_gmtoff)

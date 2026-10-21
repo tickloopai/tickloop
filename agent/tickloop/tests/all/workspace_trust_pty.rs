@@ -348,7 +348,7 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size
+                    &raw mut size
                 ),
                 0
             );

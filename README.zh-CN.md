@@ -25,7 +25,7 @@ Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修�
 
 ## 运行环境
 
-- macOS（Apple silicon 或 Intel）。
+- macOS（Apple silicon 或 Intel），或 Linux（ARM64 或 x86_64；静态构建，glibc 与 musl 发行版均可运行）。
 - 支持真彩色的终端与 UTF-8 locale。支持 kitty 键盘协议的终端（Ghostty、kitty、WezTerm、开启 CSI u 的 iTerm2）还能使用 `ctrl+enter` 等按键。
 - 可选：[Herdr](https://github.com/herdrdev/herdr)，用于在 Pane 中显示 Tick。
 
@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前 Mac 架构选择构建，固定发行标签并校验 SHA-256；遇到其他来源的已有安装时报告冲突，不自动接管。脚本源码见 [scripts/install.sh](scripts/install.sh)。
+脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前系统与架构选择构建，固定发行标签并校验 SHA-256；遇到其他来源的已有安装时报告冲突，不自动接管。脚本源码见 [scripts/install.sh](scripts/install.sh)。
 
 ### Cargo 启动器
 
@@ -53,7 +53,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 cargo install --locked tickloop
 ```
 
-crates.io 上的 `tickloop` 是一个小型启动器，`cargo install` 期间下载、校验并嵌入同版本的官方 macOS 构建，详见 [distribution/cargo](distribution/cargo/README.md)。
+crates.io 上的 `tickloop` 是一个小型启动器，`cargo install` 期间下载、校验并嵌入同版本的官方 macOS 或 Linux 构建，详见 [distribution/cargo](distribution/cargo/README.md)。
 
 ### 从源码安装
 

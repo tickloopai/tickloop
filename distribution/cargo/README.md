@@ -1,6 +1,6 @@
 # Tickloop
 
-Install the official Tickloop terminal agent on macOS:
+Install the official Tickloop terminal agent on macOS or Linux:
 
 ```sh
 cargo install --locked tickloop
@@ -9,13 +9,15 @@ tickloop
 
 This crate contains the installer and launcher only; the application's source
 code lives at <https://github.com/tickloopai/tickloop>. During `cargo install`, the build script
-downloads the matching official macOS release from `tickloopai/homebrew-tap` on
+downloads the matching official macOS or Linux release from `tickloopai/homebrew-tap` on
 GitHub, verifies SHA-256 and the archive contents, and embeds the complete
 `tickloop`, `tickhost`, and `tick-reader` bundle in the installed launchers.
 If downloading or validation fails, Cargo installation fails.
 
-Apple Silicon and Intel Macs are supported. Installation needs Rust 1.89 or newer,
-network access and the macOS system `curl`, `shasum`, and `tar` commands. The first
+Apple Silicon and Intel Macs and Linux on ARM64 and x86_64 are supported; Linux
+releases are static programs that do not depend on the system C library.
+Installation needs Rust 1.89 or newer, network access and the system `curl` and
+`tar` commands in `/usr/bin`, plus `shasum` on macOS or `sha256sum` on Linux. The first
 launch unpacks and activates the embedded bundle locally; it needs no additional
 download, command, or environment variable. Subsequent automatic updates can
 use the network as usual.

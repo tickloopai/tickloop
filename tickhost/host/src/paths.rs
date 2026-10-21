@@ -212,6 +212,13 @@ pub fn remove_if_identity(path: &Path, identity: (u64, u64)) {
     }
 }
 
+/// A short canonical directory for test sockets, whose paths are limited to about 100 bytes;
+/// macOS's `/tmp` is a symbolic link to `/private/tmp`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) const SHORT_TEMP_ROOT: &str = "/private/tmp";
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) const SHORT_TEMP_ROOT: &str = "/tmp";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,7 +227,7 @@ mod tests {
     fn protocol_ticks_fit_only_while_the_longest_tick_session_directory_fits() {
         let directory = tempfile::Builder::new()
             .prefix("thp")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(crate::paths::SHORT_TEMP_ROOT)
             .unwrap();
         let longest_tick_suffix = format!("/{SESSION_DIRECTORY}/{:x}", u64::MAX);
         let fitting_bytes = MAX_SESSION_DIRECTORY_BYTES - longest_tick_suffix.len();

@@ -121,7 +121,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let directory = tempfile::Builder::new()
         .prefix("tht")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let observed = Arc::new(Observed::default());
@@ -489,7 +489,7 @@ mod channel {
         ) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thc")
-                .tempdir_in("/private/tmp")
+                .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
                 .unwrap();
             let root = directory.path().canonicalize().unwrap();
             let config_root = root.join("state");
@@ -827,7 +827,7 @@ mod channel {
     async fn an_open_approved_for_a_replaced_working_directory_is_refused() {
         let directory = tempfile::Builder::new()
             .prefix("thw")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let work = directory.path().join("work");
         std::fs::create_dir(&work).unwrap();
@@ -882,7 +882,7 @@ mod channel {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let directory = tempfile::Builder::new()
             .prefix("thr")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let endpoint = directory.path().join("w.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
@@ -942,7 +942,7 @@ mod channel {
             &tools,
             chat,
             "TickManage",
-            json!({"action":"open","command":["/bin/sh"],"cwd":"/private/tmp","placement":{"type":"hidden"}}),
+            json!({"action":"open","command":["/bin/sh"],"cwd":tickloop_agent_test_support::SHORT_TEMP_ROOT,"placement":{"type":"hidden"}}),
         )
         .await;
         let HostCallResult::CompletedWithEffect(result, _) = settled else {
@@ -2017,7 +2017,10 @@ for line in sys.stdin:
             json!({"tick_instance_id":instance}),
         )
         .await;
-        assert_eq!(described["descriptor"]["command"], json!(["/bin/cat"]));
+        assert_eq!(
+            described["descriptor"]["command"],
+            json!([std::fs::canonicalize("/bin/cat").unwrap()])
+        );
         assert!(read.get("command").is_none());
         assert_eq!(read["data"]["exit"], Value::Null);
         let refused = tools
@@ -2495,7 +2498,7 @@ for line in sys.stdin:
         use tickloop_agent_protocol::{ConfigurationChange, EventKind};
         let directory = tempfile::Builder::new()
             .prefix("thh")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
@@ -2633,7 +2636,7 @@ for line in sys.stdin:
         use tickloop_agent_protocol::ExecutionMode;
         let directory = tempfile::Builder::new()
             .prefix("thd")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
@@ -4031,7 +4034,7 @@ for line in sys.stdin:
         fn with_idle_timeout(idle_timeout: Duration) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thl")
-                .tempdir_in("/private/tmp")
+                .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
                 .unwrap();
             let paths = HostPaths {
                 runtime: directory.path().join("h"),

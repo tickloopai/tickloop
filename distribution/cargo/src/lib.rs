@@ -13,7 +13,7 @@ pub fn run() {
     }
     #[cfg(not(unix))]
     {
-        eprintln!("Tickloop currently supports macOS Apple Silicon and Intel only.");
+        eprintln!("Tickloop supports macOS and Linux on ARM64 and x86_64 only.");
         std::process::exit(1);
     }
 }
@@ -336,22 +336,14 @@ pwd -P > "$runtime/installer-cwd"
                     .unwrap()
                     .success()
             );
-            let digest = output(
-                Command::new("/usr/bin/shasum")
-                    .args(["-a", "256"])
-                    .arg(&archive),
-            )
-            .unwrap();
+            let digest = crate::bundle::sha256(&archive).unwrap();
             install_release(
                 &runtime,
                 &launcher,
                 "aarch64-apple-darwin",
                 "1.2.3",
                 &std::fs::read(&archive).unwrap(),
-                &format!(
-                    "{}  tickloop-aarch64-apple-darwin.tar.gz\n",
-                    digest.split_whitespace().next().unwrap()
-                ),
+                &format!("{digest}  tickloop-aarch64-apple-darwin.tar.gz\n"),
             )
             .unwrap();
             assert_eq!(std::fs::read(launcher).unwrap(), b"Cargo-owned launcher");

@@ -61,7 +61,7 @@ impl PrivateHerdr {
     pub fn start() -> Self {
         let root = tempfile::Builder::new()
             .prefix("tmh")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         std::fs::write(root.path().join("config.toml"), HERDR_CONFIG).unwrap();
         std::fs::create_dir(root.path().join("home")).unwrap();

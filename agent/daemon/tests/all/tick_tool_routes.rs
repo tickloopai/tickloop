@@ -76,7 +76,7 @@ fn hosted_tools(directory: &Path) -> HostedTickTools {
 fn tools() -> Tools {
     let directory = tempfile::Builder::new()
         .prefix("ttr")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let socket = directory.path().join("herdr.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();

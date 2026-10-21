@@ -48,7 +48,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: macOS version and architecture, terminal emulator, and Herdr version if relevant.
+      description: Operating system version and architecture, terminal emulator, and Herdr version if relevant.
       placeholder: macOS 15.5 (Apple silicon), Ghostty 1.2, Herdr 0.9
   - type: input
     id: model

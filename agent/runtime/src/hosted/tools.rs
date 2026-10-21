@@ -1818,7 +1818,7 @@ mod tests {
     async fn a_view_grant_whose_answer_was_lost_created_no_pane() {
         let directory = tempfile::Builder::new()
             .prefix("htv")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let socket = directory.path().join("herdr.sock");
         let _herdr_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -1857,7 +1857,7 @@ mod tests {
     async fn a_herdr_call_is_not_prepared_while_no_herdr_serves_its_socket() {
         let directory = tempfile::Builder::new()
             .prefix("hte")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let chat = Uuid::new_v4();
         let herdr = std::sync::Arc::new(EmptyHerdr::default());
@@ -1905,7 +1905,7 @@ mod tests {
     async fn an_open_keeps_its_whole_command_under_a_bounded_title() {
         let directory = tempfile::Builder::new()
             .prefix("hto")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let chat = Uuid::new_v4();
         let tools = HostedTickTools::new(listing_daemon(directory.path(), chat, &[]), Vec::new());
@@ -1928,7 +1928,9 @@ mod tests {
         else {
             panic!("an open prepares an open");
         };
-        assert_eq!(command, &["/bin/echo".to_owned(), argument]);
+        // The approved command runs its canonical program, `/usr/bin/echo` where `/bin` is a link.
+        let echo = std::fs::canonicalize("/bin/echo").unwrap();
+        assert_eq!(command, &[echo.to_str().unwrap().to_owned(), argument]);
         assert_eq!(title, &tickhost::host::display_title(&named));
     }
 
@@ -1958,7 +1960,7 @@ mod tests {
     async fn bindings_of_ticks_that_ended_or_were_replaced_are_forgotten() {
         let directory = tempfile::Builder::new()
             .prefix("htb")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let (chat, other) = (Uuid::new_v4(), Uuid::new_v4());
         let hosted = || InstanceRef::hosted(Uuid::new_v4());

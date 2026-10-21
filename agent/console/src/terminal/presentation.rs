@@ -991,7 +991,8 @@ pub(super) fn compact_duration(milliseconds: u64) -> String {
 
 /// `03:45 PM` in local time, as Claude Code stamps a reply.
 fn local_clock_time(milliseconds: u64) -> Option<String> {
-    let timestamp = libc::time_t::try_from(milliseconds / 1_000).ok()?;
+    // `localtime_r` names the type: musl's libc deprecates naming `time_t` directly.
+    let timestamp = (milliseconds / 1_000).try_into().ok()?;
     let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
     // localtime_r initializes the output only when its return pointer is non-null.
     if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {

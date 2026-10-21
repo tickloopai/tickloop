@@ -5,10 +5,19 @@ set -eu
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) target=aarch64-apple-darwin ;;
   Darwin:x86_64) target=x86_64-apple-darwin ;;
-  *) echo 'Tickloop native releases currently support macOS ARM and Intel.' >&2; exit 1 ;;
+  Linux:aarch64 | Linux:arm64) target=aarch64-unknown-linux-musl ;;
+  Linux:x86_64 | Linux:amd64) target=x86_64-unknown-linux-musl ;;
+  *) echo 'Tickloop native releases currently support macOS and Linux on ARM64 and x86_64.' >&2; exit 1 ;;
 esac
 
-for tool in curl shasum tar mktemp; do
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1"; }
+else
+  echo 'Missing required command: sha256sum or shasum' >&2; exit 1
+fi
+for tool in curl tar mktemp; do
   command -v "$tool" >/dev/null 2>&1 || { echo "Missing required command: $tool" >&2; exit 1; }
 done
 : "${HOME:?HOME is not set}"
@@ -36,7 +45,7 @@ for asset in "$archive" "$archive.sha256"; do
 done
 cd "$scratch"
 expected=$(awk -v archive="$archive" 'NF == 2 && $2 == archive && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print tolower($1) }' "$archive.sha256")
-actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+actual=$(sha256 "$archive" | awk '{print tolower($1)}')
 [ "$actual" = "$expected" ] || { echo 'Tickloop archive SHA-256 mismatch.' >&2; exit 1; }
 # Reject links and unexpected paths before tar is allowed to write anything.
 tar -tzf "$archive" > entries

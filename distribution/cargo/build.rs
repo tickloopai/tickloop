@@ -19,13 +19,17 @@ fn main() {
 }
 
 fn prepare() -> Result<(), String> {
-    let target = std::env::var("TARGET").map_err(|error| error.to_string())?;
-    if !matches!(
-        target.as_str(),
-        "aarch64-apple-darwin" | "x86_64-apple-darwin"
-    ) {
-        return Err("Tickloop supports macOS Apple Silicon and Intel only.".into());
-    }
+    // Linux releases are static musl programs, so glibc hosts install the same archive.
+    let target = match std::env::var("TARGET")
+        .map_err(|error| error.to_string())?
+        .as_str()
+    {
+        "aarch64-apple-darwin" => "aarch64-apple-darwin",
+        "x86_64-apple-darwin" => "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => "x86_64-unknown-linux-musl",
+        _ => return Err("Tickloop supports macOS and Linux on ARM64 and x86_64 only.".into()),
+    };
     let version = std::env::var("CARGO_PKG_VERSION").map_err(|error| error.to_string())?;
     let directory = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").ok_or("Missing Cargo build directory")?,
@@ -49,7 +53,7 @@ fn prepare() -> Result<(), String> {
         download(&base, &archive, MAX_ARCHIVE_BYTES)?;
     }
     let checksum = std::fs::read_to_string(&checksum_file).map_err(|error| error.to_string())?;
-    if let Err(error) = bundle::unpack(&archive, &checksum, &target, &validation) {
+    if let Err(error) = bundle::unpack(&archive, &checksum, target, &validation) {
         let _ = std::fs::remove_file(&archive);
         let _ = std::fs::remove_file(&checksum_file);
         return Err(error);

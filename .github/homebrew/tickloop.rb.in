@@ -6,8 +6,6 @@ class Tickloop < Formula
   homepage "https://tickloop.ai"
   version "@VERSION@"
 
-  depends_on :macos
-
   on_macos do
     on_arm do
       url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-aarch64-apple-darwin.tar.gz"
@@ -16,6 +14,17 @@ class Tickloop < Formula
     on_intel do
       url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-x86_64-apple-darwin.tar.gz"
       sha256 "@X86_64_SHA256@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "@LINUX_AARCH64_SHA256@"
+    end
+    on_intel do
+      url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@LINUX_X86_64_SHA256@"
     end
   end
 

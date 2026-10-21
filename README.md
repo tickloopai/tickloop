@@ -25,7 +25,7 @@ The main command is `tickloop` (Homebrew also installs the short alias `tl`).
 
 ## Requirements
 
-- macOS on Apple silicon or Intel.
+- macOS on Apple silicon or Intel, or Linux on ARM64 or x86_64 (static builds that run on glibc and musl distributions).
 - A terminal with true color and a UTF-8 locale. Terminals with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2 with CSI u) get extra key bindings such as `ctrl+enter`.
 - Optional: [Herdr](https://github.com/herdrdev/herdr) to show Ticks in panes.
 
@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your Mac, pins the release tag and verifies SHA-256. It refuses to take over an existing installation from another source. The script's source is [scripts/install.sh](scripts/install.sh).
+The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your platform, pins the release tag and verifies SHA-256. It refuses to take over an existing installation from another source. The script's source is [scripts/install.sh](scripts/install.sh).
 
 ### Cargo launcher
 
@@ -53,7 +53,7 @@ The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`,
 cargo install --locked tickloop
 ```
 
-The `tickloop` crate on crates.io is a small launcher. During `cargo install` it downloads, verifies and embeds the matching official macOS build; see [distribution/cargo](distribution/cargo/README.md).
+The `tickloop` crate on crates.io is a small launcher. During `cargo install` it downloads, verifies and embeds the matching official macOS or Linux build; see [distribution/cargo](distribution/cargo/README.md).
 
 ### From source
 

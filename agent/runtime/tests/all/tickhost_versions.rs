@@ -180,7 +180,7 @@ impl Fixture {
     fn with_other_build(business: Business, description: Option<HostDescription>) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tv")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let paths = HostPaths {
             runtime: directory.path().join("h"),

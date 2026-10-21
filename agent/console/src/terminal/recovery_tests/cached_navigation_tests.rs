@@ -347,7 +347,7 @@ fn a_rejected_display_registration_keeps_the_visible_editor_and_submit_on_the_so
 }
 
 fn run_rejected_navigation_pty(route: &str) {
-    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let directory = tempfile::tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

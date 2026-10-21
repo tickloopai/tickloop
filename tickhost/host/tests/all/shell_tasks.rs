@@ -44,7 +44,7 @@ impl Fixture {
     async fn start_with_idle_timeout(idle_timeout: Duration) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("ths")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(crate::SHORT_TEMP_ROOT)
             .unwrap();
         let paths = HostPaths {
             runtime: directory.path().join("h"),

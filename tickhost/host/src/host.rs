@@ -791,6 +791,10 @@ impl Host {
         }
         let launcher = hosted::spawn_child(|| command.spawn())
             .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
+        // The command keeps this process's copies of the slave. Linux ends the terminal for the
+        // master only once every slave descriptor closed, unlike macOS when the session leader
+        // exits, so they must not outlive the spawn.
+        drop(command);
         let launcher_pid = launcher.id().ok_or_else(|| {
             HostError::before("LaunchFailed", "the launcher exited before it started")
         })?;
@@ -3208,7 +3212,7 @@ mod tests {
     fn session_directory_parent() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("th")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(crate::paths::SHORT_TEMP_ROOT)
             .unwrap()
     }
 

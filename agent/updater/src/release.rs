@@ -34,7 +34,9 @@ pub(crate) fn target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        _ => bail!("Prebuilt Tickloop updates currently support macOS ARM and Intel only"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        _ => bail!("Prebuilt Tickloop updates support macOS and Linux on ARM64 and x86_64 only"),
     }
 }
 
