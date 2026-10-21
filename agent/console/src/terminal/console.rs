@@ -109,7 +109,8 @@ use super::{
     external_editor::{ExternalEditorLauncher, ExternalEditorOutcome, edit_prompt},
     file_mentions::{
         AcceptedMention, FamilyMentionTarget, FileMentionAction, FileMentionIndex, FileMentionKey,
-        FileMentionState, IndexGeneration, IndexReplacement, MentionTarget, draft_mentions_path,
+        FileMentionState, IndexGeneration, IndexReplacement, MentionKind, MentionTarget,
+        draft_mentions_path,
     },
     footer::{FooterFrame, FooterItemId, FooterState},
     hyperlink,
@@ -8499,7 +8500,10 @@ impl State {
                                     };
                                     format!("{kind} · {}", target.description)
                                 }
-                                MentionTarget::File { .. } => "File".into(),
+                                MentionTarget::File { kind, .. } => match kind {
+                                    MentionKind::File => "File".into(),
+                                    MentionKind::Directory => "Dir".into(),
+                                },
                             },
                         )
                     })
@@ -16653,6 +16657,34 @@ mod tests {
                 .any(|line| line.contains(&first_completion))
         );
         assert!(frame[cursor_row].contains("❯\u{a0}/"));
+    }
+
+    #[test]
+    fn file_completion_rows_distinguish_files_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("audit.txt"), "evidence").unwrap();
+        std::fs::create_dir(directory.path().join("audit-dir")).unwrap();
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.file_mentions =
+            FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
+        state.insert("@audit");
+        let candidates = state
+            .candidate_rows(6)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates[0], "Files");
+        assert!(
+            candidates
+                .iter()
+                .any(|row| row.contains("audit.txt") && row.trim_end().ends_with("File"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|row| row.contains("audit-dir/") && row.trim_end().ends_with("Dir"))
+        );
     }
 
     #[test]
