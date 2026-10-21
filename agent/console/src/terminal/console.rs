@@ -8554,7 +8554,7 @@ impl State {
 
     fn input_image_marks(&self) -> Vec<(std::ops::Range<usize>, Role)> {
         if let Some(text) = self.visible_prompt_suggestion() {
-            return vec![(0..text.len(), Role::MutedText)];
+            return vec![(0..text.len(), Role::Subtle)];
         }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
         let projection = self.paste_blocks.projection(

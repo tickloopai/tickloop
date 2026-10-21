@@ -29,7 +29,7 @@ fn prompt_suggestion_is_ghost_text_until_tab_accepts_and_enter_submits() {
         lines
             .iter()
             .flat_map(|line| &line.spans)
-            .any(|span| span.text.contains("进度怎么样了") && span.role == Some(Role::MutedText))
+            .any(|span| span.text.contains("进度怎么样了") && span.role == Some(Role::Subtle))
     );
     assert_eq!(column, 2);
     assert!(
@@ -38,6 +38,13 @@ fn prompt_suggestion_is_ghost_text_until_tab_accepts_and_enter_submits() {
             .is_none()
     );
     assert_eq!(state.editor.draft(), "进度怎么样了");
+    let (lines, _, _) = state.normal_styled_frame();
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.text.contains("进度怎么样了") && span.role.is_none())
+    );
     assert!(
         matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Prompt { text, .. }) if text == "进度怎么样了")
     );
