@@ -551,7 +551,7 @@ async fn a_failed_tool_result_returns_to_the_model_with_each_accepted_request_re
     );
     assert_eq!(snapshot.loops[0].state, LoopState::Completed);
     assert!(snapshot.events.iter().any(|event| {
-        matches!(&event.kind, EventKind::ToolCompleted { call_id, result }
+        matches!(&event.kind, EventKind::ToolCompleted { call_id, result, .. }
             if call_id == "missing" && result.is_error)
     }));
     agent.shutdown().await;

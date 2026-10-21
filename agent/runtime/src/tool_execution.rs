@@ -556,6 +556,7 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
 
 pub(super) struct ToolCallOutcome {
     pub(super) result: ToolResult,
+    pub(super) sources: Option<Vec<tickloop_agent_protocol::CitationSource>>,
     /// Images for the model only, sent after the result text.
     pub(super) images: Vec<tickloop_agent_protocol::Image>,
     pub(super) host_call_status: Option<crate::host_tools::HostCallStatus>,
@@ -574,6 +575,7 @@ impl ToolCallOutcome {
                 is_error: true,
                 output_ref: None,
             },
+            sources: None,
             images: Vec::new(),
             host_call_status: None,
             host_effect: None,
@@ -789,6 +791,14 @@ impl Agent {
                     },
                 );
             }
+            // Numbered web results become observable only after their source association and
+            // conversation node are durable. Recovery must not publish the raw operation early.
+            if outcome
+                .as_ref()
+                .is_ok_and(|outcome| outcome.sources.is_some())
+            {
+                return outcome;
+            }
             let (result, state) = match &outcome {
                 Ok(outcome) => {
                     let state = match (outcome.host_call_status, command_state) {
@@ -927,6 +937,7 @@ impl Agent {
                     is_error: true,
                     output_ref: None,
                 },
+                sources: None,
                 images: Vec::new(),
                 host_call_status: None,
                 host_effect: None,
@@ -947,6 +958,7 @@ impl Agent {
         let mut deterministic_denial_reason = None;
         let mut denial: Option<DenialRecord> = None;
         let mut images = Vec::new();
+        let mut sources = None;
         let (configured_workspace, workspace) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).unwrap();
@@ -1021,6 +1033,7 @@ impl Agent {
                             is_error: true,
                             output_ref: None,
                         },
+                        sources: None,
                         images: Vec::new(),
                         host_call_status: None,
                         host_effect: None,
@@ -2208,7 +2221,20 @@ impl Agent {
                         self.remember_fetch_observations(receipt.chat_id, &tools)
                             .await;
                         images = execution.images;
-                        execution.result.map_err(|error| error.to_string())
+                        match execution.result {
+                            Ok(mut result) => {
+                                sources = self
+                                    .cite_web_result(
+                                        receipt.chat_id,
+                                        &name,
+                                        &mut result,
+                                        execution.web_sources,
+                                    )
+                                    .await?;
+                                Ok(result)
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
                 }
                 Err(error) => Err(error),
@@ -2219,8 +2245,19 @@ impl Agent {
             is_error: true,
             output_ref: None,
         });
+        if sources.is_none()
+            && self.inner.citation_style == crate::CitationStyle::Numbered
+            && matches!(
+                name.as_str(),
+                tickloop_agent_tools::WEB_SEARCH_TOOL_NAME
+                    | tickloop_agent_tools::WEB_FETCH_TOOL_NAME
+            )
+        {
+            sources = Some(Vec::new());
+        }
         Ok(ToolCallOutcome {
             result,
+            sources,
             images,
             host_call_status,
             host_effect,

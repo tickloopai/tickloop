@@ -1697,10 +1697,11 @@ async fn plan_mode_denies_artifact_writes_and_keeps_reads() {
         .await
         .unwrap();
     let reply = loop {
-        if let EventKind::ToolCompleted { call_id, result } =
-            tickloop_agent_test_support::next_event(&mut events)
-                .await
-                .kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
             && call_id == "reply"
         {
             break result;
@@ -1823,9 +1824,9 @@ async fn delegated_artifact_calls_obey_frozen_allow_ask_and_deny() {
                         .await
                         .unwrap();
                 }
-                EventKind::ToolCompleted { call_id, result } if call_id == "child-reply" => {
-                    child_result = Some(result)
-                }
+                EventKind::ToolCompleted {
+                    call_id, result, ..
+                } if call_id == "child-reply" => child_result = Some(result),
                 EventKind::Completed { .. } if event.chat_id == parent => break,
                 _ => {}
             }
@@ -1955,7 +1956,9 @@ async fn delegated_artifact_authority_cannot_expand_after_parent_policy_or_accou
         model.release.notify_one();
         let result = loop {
             let event = tickloop_agent_test_support::next_event(&mut events).await;
-            if let EventKind::ToolCompleted { call_id, result } = event.kind
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = event.kind
                 && call_id == "frozen-write"
             {
                 break result;
@@ -2010,10 +2013,11 @@ async fn a_feedback_delegation_keeps_the_receiving_account_after_login_changes()
     model.release.notify_one();
     tokio::time::timeout(WAIT, async {
         loop {
-            if let EventKind::ToolCompleted { call_id, result } =
-                tickloop_agent_test_support::next_event(&mut events)
-                    .await
-                    .kind
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
                 && call_id == "frozen-write"
             {
                 assert!(result.is_error);
@@ -3055,9 +3059,6 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
-                search: Default::default(),
-                model: config(),
-                settings: None,
                 host: tickloop_agent_protocol::AgentHostOptions {
                     prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
                     ..tickloop_agent_protocol::AgentHostOptions::product_defaults()
@@ -3066,12 +3067,8 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
                     artifacts: true,
                     ..ToolPolicy::web_fetch_only()
                 },
-                host_rules: Vec::new(),
-                task_tools: None,
-                min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
-                system_prompt_addition: None,
-                request_gates: Vec::new(),
+                ..HarnessOptions::local(config())
             },
         )
         .unwrap();
@@ -6496,4 +6493,112 @@ async fn delegated_mcp_401_invalidates_and_retries_the_same_read_edit_and_commen
         );
         assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills() {
+    use tickloop_agent_protocol::{AgentHostOptions, PromptPolicy};
+    use tickloop_agent_runtime::{HarnessOptions, HarnessSeams, ToolPolicy, WaitHosting};
+    use tickloop_agent_test_support::harness::ChosenModels;
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("builtin", "Skill", json!({"skill": "tickloop"})),
+        call(
+            "remote",
+            "Skill",
+            json!({"skill": "tickloop-artifacts:artifact-slides"}),
+        ),
+        text("Ready"),
+    ]));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts: None,
+            environment: None,
+            models: ChosenModels::new(model.clone()),
+        },
+        HarnessOptions {
+            search: tickloop_agent_runtime::SearchDefaults::Fixed(None),
+            host: AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                ..AgentHostOptions::embedded_defaults()
+            },
+            tools: ToolPolicy {
+                web_search: true,
+                ..ToolPolicy::durable_chat()
+            },
+            host_rules: tickloop_agent_runtime::durable_chat_host_rules(),
+            waits: WaitHosting::Durable,
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    assert!(agent.invoke_skill(chat, None, "slides", "").await.is_err());
+    assert!(agent.snapshot(chat).await.unwrap().messages.is_empty());
+    submit_and_wait(&agent, chat, "Prepare slides").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        !snapshot
+            .invoked_skills
+            .iter()
+            .any(|skill| skill.name == "tickloop")
+    );
+    assert!(snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult {tool_use_id, is_error: true, ..} if tool_use_id == "builtin")));
+    assert!(
+        snapshot
+            .invoked_skills
+            .iter()
+            .any(|skill| skill.name == "tickloop-artifacts:artifact-slides")
+    );
+    let requests = model.requests.lock().unwrap().clone();
+    let prompt = requests[0].messages[0]
+        .content
+        .iter()
+        .find_map(|c| {
+            if let Content::Text { text } = c {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let state: Value =
+        serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
+    for field in [
+        "goal",
+        "chat_goals",
+        "plan",
+        "execution_mode",
+        "service_connections",
+        "artifact_ticks",
+        "web_search",
+        "delegation",
+        "family_members",
+    ] {
+        assert!(state.get(field).is_some(), "{field}");
+    }
+    assert_eq!(
+        state["service_connections"]["artifacts"]["authentication"],
+        "signed_in"
+    );
+    assert!(prompt.contains("# Web search is disabled"));
+    assert!(prompt.contains("# Artifacts"));
+    for absent in [
+        "workdir",
+        "family_temp_directory",
+        "scratchpad",
+        "workspace_host",
+    ] {
+        assert!(state.get(absent).is_none(), "{absent}");
+    }
+    for absent in ["Tickhost", "Herdr", "Pane"] {
+        assert!(!prompt.contains(absent), "{absent}");
+    }
+    agent.shutdown().await;
 }

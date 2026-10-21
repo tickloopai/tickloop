@@ -330,6 +330,7 @@ fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
             loop_id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
             kind: EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "read".into(),
                 result: ToolResult {
                     content: "x".repeat(tickloop_agent_protocol::FEED_CHANGE_BYTES),
@@ -480,6 +481,7 @@ async fn status_refresh_of_a_long_busy_chat() {
         loop_id: Uuid::new_v4(),
         run_id: Uuid::new_v4(),
         kind: EventKind::ToolCompleted {
+            sources: Vec::new(),
             call_id: "read".into(),
             result: ToolResult {
                 content: "a line of a long Read result\n".repeat(1_100),

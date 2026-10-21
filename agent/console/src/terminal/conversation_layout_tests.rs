@@ -1041,6 +1041,7 @@ fn parallel_calls_settle_as_their_results_arrive_and_unstarted_ones_stop_with_th
             input: input.clone(),
         });
         present(EventKind::ToolCompleted {
+            sources: Vec::new(),
             call_id: (*id).into(),
             result: ToolResult {
                 content: output.into(),

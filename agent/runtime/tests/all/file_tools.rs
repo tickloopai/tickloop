@@ -442,7 +442,9 @@ async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>
             .unwrap()
             .kind
         {
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 assert!(!result.is_error, "{}", result.content);
                 assert!(result.output_ref.is_none());
                 assert!(results.insert(call_id, result.content).is_none());
@@ -630,7 +632,9 @@ async fn a_file_changed_while_approval_is_pending_is_not_overwritten() {
                     .await
                     .unwrap();
             }
-            EventKind::ToolCompleted { call_id, result } if call_id == "edit" => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "edit" => {
                 assert!(result.is_error, "changed content was overwritten");
                 file_change_error = Some(result.content);
             }
@@ -813,7 +817,9 @@ async fn finish_turn(
                     .await
                     .unwrap();
             }
-            EventKind::ToolCompleted { call_id, result } => results.push((call_id, result)),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => results.push((call_id, result)),
             EventKind::Completed { .. } => return (results, approvals),
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}

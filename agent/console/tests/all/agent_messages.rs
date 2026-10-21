@@ -523,9 +523,9 @@ async fn a_child_continuation_pushes_its_final_result_to_the_completed_parent() 
         .events
         .iter()
         .find_map(|event| match &event.kind {
-            EventKind::ToolCompleted { call_id, result } if call_id == "delegate" => {
-                serde_json::from_str::<Value>(&result.content).ok()
-            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "delegate" => serde_json::from_str::<Value>(&result.content).ok(),
             _ => None,
         })
         .unwrap();
@@ -828,7 +828,7 @@ async fn unrelated_roots_and_forged_parent_targets_are_rejected_by_the_model_vis
             .unwrap();
         completed(&mut events, &receipt).await;
         let snapshot = agent.snapshot(sender).await.unwrap();
-        assert!(snapshot.events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted {call_id,result} if call_id=="send" && result.is_error)),"{target_case} must be rejected");
+        assert!(snapshot.events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted { call_id, result, .. } if call_id=="send" && result.is_error)),"{target_case} must be rejected");
         assert!(agent.snapshot(unrelated).await.unwrap().messages.is_empty());
         agent.shutdown().await;
     }
@@ -894,7 +894,7 @@ async fn same_family_siblings_route_by_the_parent_handle_registry() {
         .unwrap()
         .child_chat_id;
     let attempted = agent.snapshot(second).await.unwrap();
-    assert!(attempted.events.iter().any(|event| matches!(&event.kind, EventKind::ToolCompleted {call_id, result} if call_id == "sibling" && !result.is_error)), "sibling send must be admitted: {:?}", attempted.events);
+    assert!(attempted.events.iter().any(|event| matches!(&event.kind, EventKind::ToolCompleted { call_id, result, .. } if call_id == "sibling" && !result.is_error)), "sibling send must be admitted: {:?}", attempted.events);
     let first = agent
         .subagents(parent)
         .await
@@ -1009,7 +1009,7 @@ async fn ended_parent_does_not_resume_from_child_messages(stopped: bool) {
     );
     assert_eq!(after.messages.len(), before.messages.len());
     assert_eq!(after.loops[0].run_id, before.loops[0].run_id);
-    assert!(agent.snapshot(child.id).await.unwrap().events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted {call_id,result} if call_id=="later" && result.is_error)));
+    assert!(agent.snapshot(child.id).await.unwrap().events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted { call_id, result, .. } if call_id=="later" && result.is_error)));
     agent.shutdown().await;
 }
 

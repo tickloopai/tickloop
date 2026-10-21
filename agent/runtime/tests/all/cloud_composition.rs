@@ -43,9 +43,6 @@ const CLOUD_MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 /// The cloud's composition: what the private host configures for every Harness.
 fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model: config(),
-        settings: None,
         host: AgentHostOptions {
             prompt_policy: PromptPolicy::DenyOnPrompt,
             ..AgentHostOptions::product_defaults()
@@ -55,8 +52,7 @@ fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
         task_tools: Some(true),
         min_schedule_interval: CLOUD_MIN_SCHEDULE_INTERVAL,
         waits: WaitHosting::Durable,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(config())
     }
 }
 
@@ -97,8 +93,8 @@ fn starts_with_prompt(request: &ModelRequest, marker: &str) -> bool {
     request
         .messages
         .iter()
-        .find(|message| message.role == Role::User)
-        .is_some_and(|message| {
+        .filter(|message| message.role == Role::User)
+        .any(|message| {
             message
                 .content
                 .iter()
@@ -199,6 +195,21 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
             ),
             ("members", "ListSubagents", json!({})),
             (
+                "skill",
+                "Skill",
+                json!({"skill": "tickloop-artifacts:artifact-slides"}),
+            ),
+            (
+                "resources-list",
+                "ListMcpResourcesTool",
+                json!({"server": "tickloop-artifacts"}),
+            ),
+            (
+                "resource-read",
+                "ReadMcpResourceTool",
+                json!({"server": "tickloop-artifacts", "uri": "fixture://tickloop-artifacts/info"}),
+            ),
+            (
                 "message",
                 "SendMessage",
                 json!({"to": "helper", "message": "Thanks."}),
@@ -278,6 +289,7 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
 #[tokio::test]
 async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
     let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
     let credentials = tempfile::tempdir().unwrap();
     let account = service.login(credentials.path()).await;
     let page = page_server().await;

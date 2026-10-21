@@ -49,7 +49,9 @@ async fn wait_for_tool_error(
 ) -> String {
     loop {
         match next_event(events).await.kind {
-            EventKind::ToolCompleted { call_id, result } if call_id == expected_call_id => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == expected_call_id => {
                 assert!(result.is_error, "failed file change succeeded");
                 return result.content;
             }

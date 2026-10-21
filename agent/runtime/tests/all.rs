@@ -4,6 +4,8 @@
 mod advance;
 #[path = "all/agent_approval_routing.rs"]
 mod agent_approval_routing;
+#[path = "all/citations.rs"]
+mod citations;
 #[path = "all/cloud_composition.rs"]
 mod cloud_composition;
 #[path = "all/durable_deliveries.rs"]

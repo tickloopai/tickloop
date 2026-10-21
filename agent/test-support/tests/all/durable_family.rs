@@ -82,9 +82,6 @@ fn family_harness_with_tasks(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 execution_mode_override: Some(ExecutionMode::FullAccess),
@@ -97,12 +94,9 @@ fn family_harness_with_tasks(
                 family_messages: true,
                 ..ToolPolicy::web_fetch_only()
             },
-            host_rules: Vec::new(),
             task_tools,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()

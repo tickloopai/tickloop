@@ -6,9 +6,9 @@ use std::{
 };
 
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
-use tickloop_agent_protocol::{AgentHostOptions, ModelConfig};
+use tickloop_agent_protocol::ModelConfig;
 use tickloop_agent_runtime::{
-    Agent, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
+    Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment,
     transcript::JsonlTranscriptStore,
 };
 
@@ -69,16 +69,7 @@ fn local_options(
     settings: Option<tickloop_agent_config::UserSettings>,
 ) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model,
         settings,
-        host: AgentHostOptions::embedded_defaults(),
-        tools: ToolPolicy::local(),
-        host_rules: Vec::new(),
-        task_tools: None,
-        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-        waits: tickloop_agent_runtime::WaitHosting::Process,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(model)
     }
 }

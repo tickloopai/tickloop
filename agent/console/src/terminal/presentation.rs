@@ -1053,7 +1053,9 @@ impl ToolPresentation {
             }
         }
         match &event.kind {
-            EventKind::ToolCompleted { call_id, result } => console.finish_tool_call(
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => console.finish_tool_call(
                 event.run_id,
                 Some((&tool_call_key(event.run_id, call_id), result.is_error)),
             )?,
@@ -1078,7 +1080,9 @@ impl ToolPresentation {
             }
             _ => {}
         }
-        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
             && !self.detailed
         {
             let (name, input) = self.started_call(event, call_id);
@@ -1121,7 +1125,9 @@ impl ToolPresentation {
                     ))?;
                 }
             }
-            EventKind::ToolCompleted { call_id, result } if !self.detailed => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if !self.detailed => {
                 let key = tool_call_key(event.run_id, call_id);
                 let state = if result.is_error {
                     ToolCallState::Failed
@@ -1162,7 +1168,9 @@ impl ToolPresentation {
             }
             _ => console.write_roles(&rendered)?,
         }
-        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
             && !result.is_error
             && let (name, Some(input)) = self.started_call(event, call_id)
             && let Some(instance) =
@@ -1206,20 +1214,23 @@ impl ToolPresentation {
     /// change or the report a Subagent's child delivered.
     pub(super) fn result_source(&self, event: &Event) -> ResultSource {
         match &event.kind {
-            EventKind::ToolCompleted { call_id, result } => {
-                match self.started_call(event, call_id).0 {
-                    EDIT_TOOL_NAME if !result.is_error => ResultSource::Operation,
-                    SUBAGENT_TOOL_NAME => ResultSource::Conversation,
-                    _ => ResultSource::Itself,
-                }
-            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => match self.started_call(event, call_id).0 {
+                EDIT_TOOL_NAME if !result.is_error => ResultSource::Operation,
+                SUBAGENT_TOOL_NAME => ResultSource::Conversation,
+                _ => ResultSource::Itself,
+            },
             _ => ResultSource::Itself,
         }
     }
 
     /// What the result `event` brings shows from `snapshot`, its conversation.
     pub(super) fn call_facts(&self, event: &Event, snapshot: &ChatSnapshot) -> CallFacts {
-        let EventKind::ToolCompleted { call_id, result } = &event.kind else {
+        let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
+        else {
             return CallFacts::default();
         };
         match self.started_call(event, call_id).0 {
@@ -1276,9 +1287,9 @@ impl ToolPresentation {
     fn shows_nothing(&self, event: &Event) -> bool {
         match &event.kind {
             EventKind::ToolStarted { name, .. } => has_no_call_row(name),
-            EventKind::ToolCompleted { call_id, result } => {
-                !result.is_error && shows_only_failure(self.started_call(event, call_id).0)
-            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => !result.is_error && shows_only_failure(self.started_call(event, call_id).0),
             _ => false,
         }
     }
@@ -1300,7 +1311,9 @@ impl ToolPresentation {
                 let summary = tool_summary(name, input, Path::new(""));
                 Some(format!("\n● {}{summary}\n", tool_name(name)))
             }
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 let (name, input) = self.started_call(event, call_id);
                 if name == ASK_USER_QUESTION_TOOL_NAME {
                     return Some(
@@ -1344,7 +1357,9 @@ impl ToolPresentation {
             EventKind::ToolStarted { name, input, .. } => {
                 tool_call_roles(name, input, cwd, display, &self.tick_labels)
             }
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 let (name, input) = self.started_call(event, call_id);
                 compact_result_runs(
                     name,
@@ -1564,7 +1579,9 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
             EventKind::ToolStarted { call_id, .. } => {
                 states.insert((event.run_id, call_id.clone()), ToolCallState::Running);
             }
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 states.insert(
                     (event.run_id, call_id.clone()),
                     if result.is_error {
@@ -1690,7 +1707,9 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
             safe_text(name),
             safe_text(&input.to_string()),
         )),
-        EventKind::ToolCompleted { call_id, result } => {
+        EventKind::ToolCompleted {
+            call_id, result, ..
+        } => {
             let content = if result.is_error {
                 web_search_failure_lines(name, &result.content).map(|lines| {
                     lines
@@ -2927,6 +2946,7 @@ mod tests {
             let completed = event(
                 run,
                 EventKind::ToolCompleted {
+                    sources: Vec::new(),
                     call_id: "call".into(),
                     result: ToolResult {
                         content: succeeded.clone(),
@@ -2943,6 +2963,7 @@ mod tests {
                 let failed = event(
                     run,
                     EventKind::ToolCompleted {
+                        sources: Vec::new(),
                         call_id: "call".into(),
                         result: ToolResult {
                             content: failure.into(),
@@ -3034,6 +3055,7 @@ mod tests {
         let completed = groups.message_id(&event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "read-one".into(),
                 result: ToolResult {
                     content: "read output".into(),
@@ -3397,7 +3419,7 @@ mod tests {
     fn a_failed_subagent_result_keeps_its_readable_error_and_suppresses_internal_ids() {
         let internal = Uuid::new_v4().to_string();
         for status in ["failed", "interrupted"] {
-            let result=ToolResult {content:json!({"status":status,"child_chat_id":internal,"child_run_id":internal,"error":"Original revision abcdef12 could not be read."}).to_string(),is_error:true,output_ref:None};
+            let result=ToolResult { content:json!({"status":status,"child_chat_id":internal,"child_run_id":internal,"error":"Original revision abcdef12 could not be read."}).to_string(),is_error:true,output_ref:None};
             let shown = compact_result(tickloop_agent_protocol::SUBAGENT_TOOL_NAME, None, &result);
             assert!(shown.contains("abcdef12"));
             assert!(!shown.contains(&internal));
@@ -3655,6 +3677,7 @@ mod tests {
         let completed = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "same-call".into(),
                 result: ToolResult {
                     content: format!(
@@ -3708,6 +3731,7 @@ mod tests {
         let launched = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "background-call".into(),
                 result: result.clone(),
             },
@@ -3859,6 +3883,7 @@ mod tests {
         let completed = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "WebFetch".into(),
                 result: ToolResult {
                     content: "Delivery is on Friday.".into(),
@@ -3900,6 +3925,7 @@ mod tests {
         let completed = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "clarify".into(),
                 result: ToolResult {
                     content: unmatched.into(),
@@ -3917,8 +3943,10 @@ mod tests {
         let answered = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "clarify".into(),
                 result: ToolResult {
+
                     content: "User has answered your questions: \"Which report?\"=\"Weekly, with totals\" selected preview:\nRevenue | Costs, \"Which sections?\"=\"Summary, Charts\". You can now continue with the user's answers in mind.".into(),
                     is_error: false,
                     output_ref: None,
@@ -3954,6 +3982,7 @@ mod tests {
         let cancelled = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "clarify".into(),
                 result: ToolResult {
                     content: "question was cancelled".into(),
@@ -4056,6 +4085,7 @@ mod tests {
         let declined = event(
             run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "clarify".into(),
                 result: result.clone(),
             },
@@ -4126,6 +4156,7 @@ mod tests {
             let completed = event(
                 run,
                 EventKind::ToolCompleted {
+                    sources: Vec::new(),
                     call_id: call_id.into(),
                     result: ToolResult {
                         content: content.clone(),
@@ -4386,6 +4417,7 @@ mod tests {
         let completed = event(
             Uuid::new_v4(),
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "detailed-call".into(),
                 result: ToolResult {
                     content: "complete detailed content".into(),
@@ -4430,6 +4462,7 @@ mod tests {
         let completed = event(
             first_run,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "repeated".into(),
                 result: ToolResult {
                     content: "permission denied: protected.txt\u{1b}[31m".into(),

@@ -99,7 +99,9 @@ async fn root_plan_mode_blocks_an_existing_grandchilds_host_mutation() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
-            if let EventKind::ToolCompleted { call_id, result } = event.kind
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = event.kind
                 && call_id == "mutation"
             {
                 assert!(result.is_error);
@@ -299,7 +301,10 @@ async fn grandparent_denial_wins_over_a_pending_grandchild_approval() {
     let (leaf, permission) = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
-            if let EventKind::ToolCompleted { call_id, result } = &event.kind {
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = &event.kind
+            {
                 assert!(!result.is_error, "{call_id}: {}", result.content);
             }
             if let EventKind::Failed(error) = &event.kind {
@@ -345,7 +350,9 @@ async fn grandparent_denial_wins_over_a_pending_grandchild_approval() {
                     _ => {}
                 }
             }
-            if let EventKind::ToolCompleted { call_id, result } = event.kind
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = event.kind
                 && call_id == "write"
             {
                 assert!(result.is_error);

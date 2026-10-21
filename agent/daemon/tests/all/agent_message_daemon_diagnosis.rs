@@ -377,7 +377,7 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         .iter()
         .filter(|event| {
             matches!(&event.kind,
-        tickloop_agent_protocol::EventKind::ToolCompleted { call_id, result }
+        tickloop_agent_protocol::EventKind::ToolCompleted { call_id, result, .. }
         if call_id.starts_with("send-") && !result.is_error && result.content.contains("accepted"))
         })
         .count();
