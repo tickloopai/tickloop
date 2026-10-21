@@ -55,14 +55,13 @@ trap 'rm -rf "$run_directory"' 0
 trap 'exit 1' 1 2 15
 
 cargo build --locked --target-dir "$target_directory" \
-    -p tickloop-agent --bin tickloop -p tickloop-tickhost --bin tickhost \
-    -p tickloop-tick-reader --bin tick-reader
+    -p tickloop-agent --bin tickloop -p tickloop-tickhost --bin tickhost
 if [ "$(development_revision)" != "$dev_revision" ]; then
     echo 'The development checkout changed branches during the build; run make dev again.' >&2
     exit 1
 fi
 mkdir "$bin_directory"
-for program in tickloop tickhost tick-reader; do
+for program in tickloop tickhost; do
     cp "$target_directory/debug/$program" "$bin_directory/$program"
     chmod 0500 "$bin_directory/$program"
 done
@@ -71,7 +70,7 @@ done
 trap - 0 1 2 15
 cd "$launch_directory"
 if "$bin_directory/tickloop" tick list 2>/dev/null | grep -qx 'No Tick packages are installed.'; then
-    echo 'No Tick packages are installed: run make dev-ticks to open Longbridge and Futu Ticks.' >&2
+    echo 'No Tick packages are installed: install them from /ticks in the Agent.' >&2
 fi
 printf 'Development executable: %s\n' "$bin_directory/tickloop" >&2
 exec "$bin_directory/tickloop" --development-root "$repository_root" "$@"

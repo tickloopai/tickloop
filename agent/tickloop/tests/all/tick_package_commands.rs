@@ -18,10 +18,8 @@ use flate2::{Compression, write::GzEncoder};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tick_oauth_test_server::{AuthorizationServer, REVOCATION_PATH, TokenReply, USER_CODE};
 use tick_packages::CURRENT_TARGET;
-use tick_test_support::authorization_server::{
-    AuthorizationServer, REVOCATION_PATH, TokenReply, USER_CODE,
-};
 
 use crate::support;
 

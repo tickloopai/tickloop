@@ -1,6 +1,6 @@
 //! Where an Agent open finds the program of a Tick. A path containing `/` is taken relative to the
-//! working directory; a bare name is a bundled executable beside the Agent first, then the program
-//! of an installed Tick package, then found on PATH relative to the working directory.
+//! working directory; a bare name is the program of an installed Tick package first, then found on
+//! PATH relative to the working directory.
 
 use std::{
     ffi::OsStr,
@@ -12,8 +12,7 @@ use tick_packages::{InstalledPackage, PackageError, PackageStore};
 
 use crate::host_error::HostError;
 
-/// The executables installed beside the Agent, which an open finds there before anything else.
-pub const BUNDLED_EXECUTABLES: [&str; 2] = ["tick-reader", "tickhost"];
+const TICKHOST_EXECUTABLE: &str = "tickhost";
 /// Every Tick package names its program `tick-<package>`.
 const PACKAGE_PROGRAM_PREFIX: &str = "tick-";
 const INVALID_ARGUMENTS: &str = "InvalidArguments";
@@ -37,30 +36,27 @@ pub fn resolve_executable(
     resolve_executable_from(
         program,
         cwd,
-        std::env::current_exe().ok().as_deref(),
         &std::env::var_os("PATH").unwrap_or_default(),
         packages,
     )
 }
 
-pub fn bundled_reader_executable() -> Option<PathBuf> {
-    bundled_executable("tick-reader")
-}
-
+/// The `tickhost` installed beside the Agent, else the one on PATH.
 pub fn bundled_tickhost_executable() -> Option<PathBuf> {
-    bundled_executable("tickhost")
-}
-
-fn bundled_executable(program: &str) -> Option<PathBuf> {
-    resolve_executable(program, &std::env::current_dir().ok()?, None)
-        .ok()
-        .map(|resolved| resolved.path)
+    let beside_agent = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(TICKHOST_EXECUTABLE);
+    executable_file(&beside_agent).or_else(|| {
+        resolve_executable(TICKHOST_EXECUTABLE, &std::env::current_dir().ok()?, None)
+            .ok()
+            .map(|resolved| resolved.path)
+    })
 }
 
 fn resolve_executable_from(
     program: &str,
     cwd: &Path,
-    agent_executable: Option<&Path>,
     search_path: &OsStr,
     packages: Option<&PackageStore>,
 ) -> Result<ResolvedExecutable, HostError> {
@@ -68,17 +64,6 @@ fn resolve_executable_from(
         let path = executable_file(&cwd.join(program)).ok_or_else(|| not_found(program))?;
         let package = packages.and_then(|packages| installed_package_of(&path, packages));
         return Ok(ResolvedExecutable { path, package });
-    }
-    let is_bundled = BUNDLED_EXECUTABLES.contains(&program);
-    if let Some(path) = agent_executable
-        .and_then(Path::parent)
-        .filter(|_| is_bundled)
-        .and_then(|directory| executable_file(&directory.join(program)))
-    {
-        return Ok(ResolvedExecutable {
-            path,
-            package: None,
-        });
     }
     let package_name = program.strip_prefix(PACKAGE_PROGRAM_PREFIX);
     if let (Some(name), Some(packages)) = (package_name, packages) {
@@ -102,9 +87,7 @@ fn resolve_executable_from(
             package: None,
         })
         .ok_or_else(|| {
-            match package_name
-                .filter(|name| !is_bundled && tick_packages::validate_package_name(name).is_ok())
-            {
+            match package_name.filter(|name| tick_packages::validate_package_name(name).is_ok()) {
                 Some(name) => package_not_installed(program, name),
                 None => not_found(program),
             }
@@ -192,78 +175,19 @@ mod tests {
     }
 
     #[test]
-    fn bundled_reader_resolution_uses_its_installed_companion_before_path() {
+    fn an_installed_package_program_comes_before_path() {
         let directory = tempfile::tempdir().unwrap();
-        let installed = directory.path().join("installed");
-        let path_bin = directory.path().join("path-bin");
-        for executable in [installed.join("tick-reader"), path_bin.join("tick-reader")] {
-            write_executable(&executable);
-        }
-        let agent = installed.join("tickloop");
-        let resolve = |program| {
-            resolve_executable_from(
-                program,
-                directory.path(),
-                Some(&agent),
-                path_bin.as_os_str(),
-                None,
-            )
-            .map(|resolved| resolved.path)
-        };
-
-        assert_eq!(
-            resolve("tick-reader").unwrap(),
-            installed.join("tick-reader").canonicalize().unwrap()
-        );
-        assert_eq!(
-            resolve("path-bin/tick-reader").unwrap(),
-            path_bin.join("tick-reader").canonicalize().unwrap()
-        );
-        std::fs::remove_file(installed.join("tick-reader")).unwrap();
-        assert_eq!(
-            resolve("tick-reader").unwrap(),
-            path_bin.join("tick-reader").canonicalize().unwrap()
-        );
-        std::fs::remove_file(path_bin.join("tick-reader")).unwrap();
-        assert_eq!(
-            resolve("tick-reader").unwrap_err().message,
-            "executable not found: tick-reader",
-            "the bundled Reader is no Tick package to install"
-        );
-        write_executable(&installed.join("tickhost"));
-        assert_eq!(
-            resolve("tickhost").unwrap(),
-            installed.join("tickhost").canonicalize().unwrap()
-        );
-        write_executable(&installed.join("tick"));
-        assert!(
-            resolve("tick").is_err(),
-            "a program beside the Agent is found there only when it is bundled"
-        );
-    }
-
-    #[test]
-    fn an_installed_package_program_comes_after_the_bundled_one_and_before_path() {
-        let directory = tempfile::tempdir().unwrap();
-        let installed = directory.path().join("installed");
         let path_bin = directory.path().join("path-bin");
         let packages = PackageStore::in_config_root(&directory.path().join("config"));
         let sources = directory.path().join("sources");
         let sample = install_package(&packages, &sources, "sample");
-        let reader = install_package(&packages, &sources, "reader");
-        for executable in [
-            installed.join("tick-reader"),
-            path_bin.join("tick-sample"),
-            path_bin.join("tick-other"),
-        ] {
+        for executable in [path_bin.join("tick-sample"), path_bin.join("tick-other")] {
             write_executable(&executable);
         }
-        let agent = installed.join("tickloop");
         let resolve = |program: &str| {
             resolve_executable_from(
                 program,
                 directory.path(),
-                Some(&agent),
                 path_bin.as_os_str(),
                 Some(&packages),
             )
@@ -290,17 +214,6 @@ mod tests {
                 package: None,
             }
         );
-
-        assert_eq!(
-            resolve("tick-reader").unwrap(),
-            ResolvedExecutable {
-                path: installed.join("tick-reader").canonicalize().unwrap(),
-                package: None,
-            },
-            "the bundled program comes before a package's program of its name"
-        );
-        std::fs::remove_file(installed.join("tick-reader")).unwrap();
-        assert_eq!(resolve("tick-reader").unwrap().path, reader.executable());
 
         packages.uninstall("sample").unwrap();
         assert_eq!(
@@ -363,7 +276,6 @@ mod tests {
         let error = resolve_executable_from(
             "tick-sample",
             directory.path(),
-            None,
             path_bin.as_os_str(),
             Some(&packages),
         )

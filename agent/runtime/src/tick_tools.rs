@@ -126,7 +126,7 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
 
 fn tick_manage_description(views: bool) -> String {
     let mut parts = vec![
-        "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; the bundled tick-reader and an installed Tick package's program that declares the protocol always do. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
+        "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol always does. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
     ];
     if views {
         parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions.".into());
@@ -145,7 +145,7 @@ fn tick_manage_description(views: bool) -> String {
     );
     parts.push("reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".into());
     parts.push(format!(
-        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the bundled sibling executable (command[0]='tick-reader'), then as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance{}. Use the tickloop Skill for guidance.",
+        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance{}. Use the tickloop Skill for guidance.",
         if views {
             ", whether a Herdr Pane shows it and where"
         } else {
@@ -375,7 +375,7 @@ fn tick_manage_schema(views: bool) -> Value {
         "action": {"type":"string","enum":actions,"description":format!("One of {}; each takes the fields whose description names it.", actions.join(", "))},
         "command": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} The program's argv, executable first.", usage("command", &forms))},
         "cwd": {"type":"string","minLength":1,"description":format!("{} The program's working directory; defaults to the Agent file work directory.", usage("cwd", &forms))},
-        "protocol": {"type":"boolean","description":format!("{} true for a program that speaks the Tick protocol; the bundled tick-reader and an installed Tick package's program that declares the protocol need no flag. Any other program runs as a terminal Tick.", usage("protocol", &forms))},
+        "protocol": {"type":"boolean","description":format!("{} true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol needs no flag. Any other program runs as a terminal Tick.", usage("protocol", &forms))},
         "placement": placement_schema(&forms, views),
         "tick_instance_id": {"type":"string","minLength":1,"description":format!("{} The complete hosted: identity an open returned.", usage("tick_instance_id", &forms))},
         "text": {"type":"string","description":format!("{} Text typed first; pass text, keys or both.", usage("text", &forms))},
@@ -421,9 +421,10 @@ mod tests {
     fn the_tick_manage_description_names_where_bare_programs_are_found() {
         for views in [false, true] {
             let description = tick_manage_description(views);
-            for program in ["command[0]='tick-reader'", "command[0]='tick-<package>'"] {
-                assert!(description.contains(program), "{description}");
-            }
+            assert!(
+                description.contains("command[0]='tick-<package>'"),
+                "{description}"
+            );
             for text in [description, tick_manage_schema(views).to_string()] {
                 let names_tick = text
                     .split(|character: char| {

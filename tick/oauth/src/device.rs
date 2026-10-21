@@ -18,7 +18,7 @@ use crate::{
 
 const CLIENT_NAME: &str = "Tickloop";
 /// Tickloop never takes a redirect, but servers may require a registration to name one (RFC 7591
-/// allows it): this is the one the Longbridge device login has always registered.
+/// allows it): this is the one Tickloop's device logins have always registered.
 const REGISTERED_REDIRECT_URI: &str = "http://localhost:60355/callback";
 const JSON: &str = "application/json";
 /// RFC 8628: the interval when the server names none, and how much slower each `slow_down` makes

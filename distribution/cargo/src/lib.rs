@@ -30,7 +30,7 @@ mod unix {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
+    const PROGRAMS: [&str; 2] = ["tickloop", "tickhost"];
     const LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
     unsafe extern "C" {
@@ -45,7 +45,6 @@ mod unix {
         let program = match executable.file_name().and_then(|name| name.to_str()) {
             Some("tl" | "tickloop") => "tickloop",
             Some("tickhost") => "tickhost",
-            Some("tick-reader") => "tick-reader",
             _ => return Err("Run the launcher from its Cargo-installed entry.".into()),
         };
         let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -305,7 +304,7 @@ if [ "$1" = --version ]; then echo 'tickloop 1.2.3'; exit 0; fi
 [ "$1" = update ] && [ "$2" = --install-cargo ] || exit 2
 runtime="$(dirname "$(dirname "$3")")/.tickloop"
 mkdir -p "$runtime/versions/1.2.3"
-for program in tickloop tickhost tick-reader; do cp "$(dirname "$0")/$program" "$runtime/versions/1.2.3/$program"; done
+for program in tickloop tickhost; do cp "$(dirname "$0")/$program" "$runtime/versions/1.2.3/$program"; done
 printf '{}' > "$runtime/versions/1.2.3/installation.json"
 ln -s versions/1.2.3 "$runtime/current"
 pwd -P > "$runtime/installer-cwd"

@@ -1,6 +1,6 @@
 ---
 name: tickloop
-description: Show stock prices, quotes or K-line charts in Ticks, open or operate a Tick, or subscribe a Loop to Tick updates. Use it for requests such as seeing Tesla's stock price or opening a K-line chart, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
+description: Open or operate a Tick, including the programs of installed Tick packages, or subscribe a Loop to Tick updates. Use it when the user wants to see what an installed Tick package shows, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
 ---
 
 # Tickloop Ticks
@@ -18,7 +18,7 @@ Keep the complete `<type>:<id>` reference. Extension Ticks connect programs thro
 
 TaskStop stops only the current Loop's Agent command and retains its Ask/Deny and Plan behavior; user Shells and other Loops use explicit user UI stops. A program the user starts in a Herdr Pane or another terminal is not a Tick: to read or operate a program, open it as a Tick (section 2).
 
-Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, `reader_executable` is the bundled `tick-reader` to launch, and `tick_packages` lists the installed Tick packages with their login states.
+Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, and `tick_packages` lists the installed Tick packages with their login states.
 
 | Current host state | Action |
 | --- | --- |
@@ -35,7 +35,7 @@ The package Skill describes launch commands, arguments and login prerequisites. 
 
 ## 2. Open and operate Ticks
 
-“看看特斯拉股价” requests a Tick that shows the price even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
+A request to see what an installed Tick package shows asks for its Tick even when the user does not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
 
 ### Open a Tick
 
@@ -43,13 +43,11 @@ The package Skill describes launch commands, arguments and login prerequisites. 
 
 Call `TickManage` with `action: "open"`, a `command` argv array and optional `cwd`. The Tickhost runs the program: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Add a `placement` only when the user asks for a place (section 3).
 
-Market data and other data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description`, `executable` and `login`. Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Any other Skill a package brings is also named `<package>:<skill>`. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as an extension Tick without `protocol: true`. A package the user installs, updates or uninstalls while this Chat runs is listed, opens and has its Skills from the next request on.
+Data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description`, `executable` and `login`. Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Any other Skill a package brings is also named `<package>:<skill>`. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as an extension Tick without `protocol: true`. A package the user installs, updates or uninstalls while this Chat runs is listed, opens and has its Skills from the next request on.
 
-When the data the user wants needs a package that `workspace_host.tick_packages` does not list, or the host reports that a Tick package is not installed, ask the user to install it from the marketplace page of `/ticks` in this Agent. The Tick marketplace offers packages such as `longbridge` for Longbridge quotes, K-lines and community posts and `futu` for Futu OpenD option pricing. Never install, update or uninstall a package yourself, and never search project source for a launcher or build one.
+When the data the user wants needs a package that `workspace_host.tick_packages` does not list, or the host reports that a Tick package is not installed, ask the user to install it from the marketplace page of `/ticks` in this Agent. Never install, update or uninstall a package yourself, and never search project source for a launcher or build one.
 
 A package's `login` says whether its data source is logged in: `logged_in`, `logged_out`, `expired`, `not_required` (the package needs no login) or `unknown` (its saved login could not be read). Before opening a package's Tick, check it: open at once when it is `logged_in` or `not_required`; otherwise ask the user to log in to that package from `/ticks` in this Agent, and open the Tick once they say they have. No Agent restart is needed: the state comes from the login Tickloop saved and is read again for every request.
-
-To read original documents, open the bundled Reader with `workspace_host.reader_executable` as the executable, followed by URLs or local files; if it is null, explain that the companion `tick-reader` is missing and needs to be built or installed (`make build` and `make install` include it). The bundled `tick-reader` always opens as an extension Tick.
 
 Any other program opens with the program itself first in `command`. Pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`; omit `protocol` for an ordinary interactive program (a REPL, `htop`, a log viewer), which opens as a terminal Tick. The host refuses the bundled `tickhost` as a command.
 

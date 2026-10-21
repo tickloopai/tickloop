@@ -335,17 +335,12 @@ impl HostedTickTools {
                             .into(),
                     );
                 }
-                // The bundled tick-reader always speaks the Tick protocol, and so does a Tick
-                // package's program whose manifest declares it.
                 let adapter = if protocol
                     || resolved
                         .package
                         .as_ref()
                         .is_some_and(|package| package.manifest.protocol)
-                    || is_same_file(
-                        &executable,
-                        tickhost_connect::program::bundled_reader_executable(),
-                    ) {
+                {
                     TickAdapter::Protocol
                 } else {
                     TickAdapter::Terminal
@@ -1936,16 +1931,16 @@ mod tests {
     fn a_bundled_executable_is_recognised_through_any_path_that_names_it() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        let bundled = directory.path().join("tick-reader");
+        let bundled = directory.path().join("tickhost");
         std::fs::write(&bundled, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let linked = directory.path().join("linked-reader");
+        let linked = directory.path().join("linked-tickhost");
         std::os::unix::fs::symlink(&bundled, &linked).unwrap();
         let other = directory.path().join("other");
         std::fs::write(&other, "#!/bin/sh\n").unwrap();
         assert!(is_same_file(&linked, Some(bundled.clone())));
         assert!(is_same_file(
-            &directory.path().join("./tick-reader"),
+            &directory.path().join("./tickhost"),
             Some(linked.clone())
         ));
         assert!(!is_same_file(&other, Some(bundled.clone())));

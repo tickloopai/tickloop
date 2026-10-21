@@ -37,7 +37,7 @@ use tickloop_agent_base::private_fs::{
 
 pub use source::{Installation, Source};
 
-pub const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
+pub const PROGRAMS: [&str; 2] = ["tickloop", "tickhost"];
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -529,11 +529,7 @@ async fn update(
                 .arg(stage.path())
                 .arg("--target-dir")
                 .arg(&target)
-                .args([
-                    "tickloop-agent",
-                    "tickloop-tickhost",
-                    "tickloop-tick-reader",
-                ]);
+                .args(["tickloop-agent", "tickloop-tickhost"]);
             run_process(&mut cargo).await?;
             let bin = stage.path().join("bin");
             let candidate = bundle::read_build(&bin)?;
@@ -552,11 +548,7 @@ async fn update(
                 .arg(root)
                 .arg("--target-dir")
                 .arg(&target)
-                .args([
-                    "tickloop-agent",
-                    "tickloop-tickhost",
-                    "tickloop-tick-reader",
-                ]);
+                .args(["tickloop-agent", "tickloop-tickhost"]);
             run_process(&mut cargo).await?;
             bundle::verify(&root.join("bin"), &candidate)?;
             if source::cargo_revision(root)? != revision {

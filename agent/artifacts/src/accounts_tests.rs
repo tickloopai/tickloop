@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde_json::json;
-use tick_test_support::authorization_server::{
+use tick_oauth_test_server::{
     AuthorizationServer, DEVICE_AUTHORIZATION_PATH, METADATA_PATH, REGISTRATION_PATH,
     REVOCATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
 };

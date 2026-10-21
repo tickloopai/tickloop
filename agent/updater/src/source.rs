@@ -157,11 +157,7 @@ pub(crate) fn cargo_source(root: &Path) -> Result<Option<(String, semver::Versio
         return Ok(None);
     };
     let mut sources = Vec::new();
-    for name in [
-        "tickloop-agent",
-        "tickloop-tickhost",
-        "tickloop-tick-reader",
-    ] {
+    for name in ["tickloop-agent", "tickloop-tickhost"] {
         let mut found = installs
             .keys()
             .filter(|key| key.starts_with(&format!("{name} ")));
@@ -217,11 +213,7 @@ fn cargo_checkout(root: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let mut checkout = None;
-    for name in [
-        "tickloop-agent",
-        "tickloop-tickhost",
-        "tickloop-tick-reader",
-    ] {
+    for name in ["tickloop-agent", "tickloop-tickhost"] {
         let Some(key) = installs
             .keys()
             .find(|key| key.starts_with(&format!("{name} ")))
@@ -262,11 +254,7 @@ pub(crate) fn cargo_revision(root: &Path) -> Result<String> {
         .as_object()
         .context("Missing Cargo install metadata")?;
     let mut revision = None;
-    for name in [
-        "tickloop-agent",
-        "tickloop-tickhost",
-        "tickloop-tick-reader",
-    ] {
+    for name in ["tickloop-agent", "tickloop-tickhost"] {
         let key = installs
             .keys()
             .find(|key| key.starts_with(&format!("{name} ")))

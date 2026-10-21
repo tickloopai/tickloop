@@ -15,7 +15,7 @@ function fixture(t, { corrupt = false, linked = false, conflicting = false } = {
   mkdirSync(commands);
   mkdirSync(bundle);
   writeFileSync(join(commands, 'uname'), '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n', { mode: 0o755 });
-  for (const program of ['tickloop', 'tickhost', 'tick-reader']) {
+  for (const program of ['tickloop', 'tickhost']) {
     writeFileSync(join(bundle, program), `#!/bin/sh\nif [ "$1" = --version ]; then echo '${program} 1.2.3'; elif [ "$1" = update ] && [ "$2" = --install ]; then echo INSTALLER_EXECUTED; else exit 2; fi\n`, { mode: 0o755 });
   }
   if (linked) {
@@ -23,7 +23,7 @@ function fixture(t, { corrupt = false, linked = false, conflicting = false } = {
     symlinkSync('tickloop', join(bundle, 'tickhost'));
   }
   const archive = join(root, 'archive.tar.gz');
-  assert.equal(spawnSync('/usr/bin/tar', ['--format=ustar', '-czf', archive, '-C', bundle, 'tickloop', 'tickhost', 'tick-reader'], { env: { ...process.env, COPYFILE_DISABLE: '1' } }).status, 0);
+  assert.equal(spawnSync('/usr/bin/tar', ['--format=ustar', '-czf', archive, '-C', bundle, 'tickloop', 'tickhost'], { env: { ...process.env, COPYFILE_DISABLE: '1' } }).status, 0);
   const hash = createHash('sha256').update(readFileSync(archive)).digest('hex');
   writeFileSync(join(root, 'checksum'), `${hash}  tickloop-aarch64-apple-darwin.tar.gz\n`);
   if (corrupt) writeFileSync(archive, 'corrupted archive');

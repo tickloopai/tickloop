@@ -11,7 +11,7 @@ This crate contains the installer and launcher only; the application's source
 code lives at <https://github.com/tickloopai/tickloop>. During `cargo install`, the build script
 downloads the matching official macOS release from `tickloopai/homebrew-tap` on
 GitHub, verifies SHA-256 and the archive contents, and embeds the complete
-`tickloop`, `tickhost`, and `tick-reader` bundle in the installed launchers.
+`tickloop` and `tickhost` bundle in the installed launchers.
 If downloading or validation fails, Cargo installation fails.
 
 Apple Silicon and Intel Macs are supported. Installation needs Rust 1.89 or newer,
@@ -20,7 +20,7 @@ launch unpacks and activates the embedded bundle locally; it needs no additional
 download, command, or environment variable. Subsequent automatic updates can
 use the network as usual.
 
-The Cargo installation includes `tickloop`, `tl`, `tickhost`, and `tick-reader`.
+The Cargo installation includes `tickloop`, `tl`, and `tickhost`.
 The verified application lives in `.tickloop` inside the Cargo installation root
 (`~/.cargo/.tickloop` by default). Existing Homebrew and native installations are
 not replaced; ensure your intended installation is first on PATH.

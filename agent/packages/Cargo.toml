@@ -20,5 +20,5 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-tickloop-tick-test-support = { path = "../../tick/test-support" }
+tickloop-tick-oauth-test-server = { path = "../../tick/oauth-test-server" }
 tokio-util = "0.7"

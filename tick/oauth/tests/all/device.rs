@@ -8,11 +8,11 @@ use std::{
 
 use serde_json::{Value, json};
 use tick_oauth::{DeviceLogin, LoginError, Progress};
-use tick_packages::LoginState;
-use tick_test_support::authorization_server::{
+use tick_oauth_test_server::{
     DEVICE_AUTHORIZATION_PATH, DEVICE_CODE_GRANT, METADATA_PATH, REGISTRATION_PATH,
     REVOCATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
 };
+use tick_packages::LoginState;
 use tokio_util::sync::CancellationToken;
 
 use crate::support::{Login, http, now};
@@ -403,7 +403,7 @@ async fn the_server_must_describe_itself_and_offer_the_device_grant() {
 #[tokio::test]
 async fn a_preregistered_client_uses_path_discovery_without_registration() {
     use tick_oauth::ClientRegistration;
-    use tick_test_support::authorization_server::AuthorizationServer;
+    use tick_oauth_test_server::AuthorizationServer;
     let fixture = Login::new();
     let server = AuthorizationServer::start_with_path("/account");
     server.edit_metadata(|metadata| {
@@ -492,7 +492,7 @@ async fn preregistered_clients_work_with_a_callers_store_and_never_fall_back_to_
             Ok(())
         }
     }
-    let server = tick_test_support::authorization_server::AuthorizationServer::start();
+    let server = tick_oauth_test_server::AuthorizationServer::start();
     let store = Store::default();
     server.answer_polls([TokenReply::Approve]);
     DeviceLogin::start_with(

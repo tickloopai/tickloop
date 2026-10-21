@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT"
 repository = "https://github.com/tickloopai/tickloop"
 publish = ["crates-io"]
-include = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"]
+include = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs"]
 autobins = false
 
 [workspace]
@@ -28,7 +28,3 @@ path = "src/bin/tl.rs"
 [[bin]]
 name = "tickhost"
 path = "src/bin/tickhost.rs"
-
-[[bin]]
-name = "tick-reader"
-path = "src/bin/tick-reader.rs"

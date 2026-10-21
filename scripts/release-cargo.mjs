@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = "distribution/cargo/Cargo.toml";
 const target = "target/cargo-launcher";
-const sourceFiles = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"];
+const sourceFiles = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs"];
 export const packageFiles = [...sourceFiles, "Cargo.toml.orig", ".cargo_vcs_info.json"];
 
 export function auditFiles(files) {
@@ -27,7 +27,7 @@ export function validateMetadata(value, workspaceVersion) {
   const metadata = value.packages[0];
   if (metadata.dependencies.length !== 0 || value.workspace_members.length !== 1) throw new Error("The public launcher must not depend on the private workspace or other source packages.");
   const bins = metadata.targets.filter(target => target.kind.includes("bin")).map(target => target.name).sort();
-  if (JSON.stringify(bins) !== JSON.stringify(["tick-reader", "tickhost", "tickloop", "tl"])) throw new Error("The Cargo launcher must install all four public entries.");
+  if (JSON.stringify(bins) !== JSON.stringify(["tickhost", "tickloop", "tl"])) throw new Error("The Cargo launcher must install all three public entries.");
   return metadata.version;
 }
 

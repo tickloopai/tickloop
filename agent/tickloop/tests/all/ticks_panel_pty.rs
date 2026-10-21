@@ -12,8 +12,8 @@ use std::{
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
+use tick_oauth_test_server::{AuthorizationServer, TokenReply, USER_CODE};
 use tick_packages::{CURRENT_TARGET, OAuthToken, PackageCredentials};
-use tick_test_support::authorization_server::{AuthorizationServer, TokenReply, USER_CODE};
 use tickloop_agent_test_support::{input_dialog, screen};
 
 use crate::tick_package_commands::{

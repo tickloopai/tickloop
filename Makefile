@@ -20,18 +20,17 @@ dev:
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
-	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick-reader --bins
+	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost --bins
 
 install:
 	cargo install --locked --path agent/tickloop --bins
 	cargo install --locked --path tickhost/host --bin tickhost
-	cargo install --locked --path tick/reader --bin tick-reader
 
-## Package the Agent, the Tickhost and the Reader.
+## Package the Agent and the Tickhost.
 package:
-	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick-reader --bins --target "$(PACKAGE_TARGET)" --target-dir target
+	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost --bins --target "$(PACKAGE_TARGET)" --target-dir target
 	@mkdir -p dist
-	COPYFILE_DISABLE=1 tar --format=ustar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
+	COPYFILE_DISABLE=1 tar --format=ustar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
 test: test-workspace

@@ -18,7 +18,6 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`view.status`",
         "Esc hides the view",
         "An artifact takes no Tick Subscription",
-        "`reader_executable`",
         "`tick_packages`",
         "`<package>:usage`",
         "`<package>:<skill>`",
@@ -76,6 +75,12 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "auth status",
         "login command the package's Skill names",
         "doc or page",
+        "reader_executable",
+        "tick-reader",
+        "longbridge",
+        "futu",
+        "K-line",
+        "stock",
     ] {
         assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
     }

@@ -13,9 +13,9 @@ Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修�
 
 ## 功能
 
-- **Tick。** 一次运行的程序是一个 Tick Instance。**扩展 Tick** 讲 [Tick 协议](tick/protocol/SPECIFICATION.md)，提供结构化的状态、工具和更新；其他交互式程序（日志查看、REPL 等）可以作为 **Terminal Tick** 打开，由 Agent 读取屏幕文字并输入；后台 Shell 命令以 **Shell Tick** 运行。Reader（`tick-reader`）随 Tickloop 安装，可阅读 HTML、Markdown、文本与 PDF 原文。
+- **Tick。** 一次运行的程序是一个 Tick Instance。**扩展 Tick** 讲 [Tick 协议](tick/protocol/SPECIFICATION.md)，提供结构化的状态、工具和更新；其他交互式程序（日志查看、REPL 等）可以作为 **Terminal Tick** 打开，由 Agent 读取屏幕文字并输入；后台 Shell 命令以 **Shell Tick** 运行。
 - **Tickhost。** 本机 Tick 全部由 Tickhost 运行，它由 Agent daemon 按需拉起；离开或关闭视图时 Tick 继续运行。对话旁的 Monitor 列出当前 Chat 的 Tick、订阅、Artifact 与后台 Shell，对某行按 Enter 打开完整视图，Esc 隐藏。
-- **Herdr Pane。** 在 [Herdr](https://github.com/herdrdev/herdr) 中，Tickloop 可以把 Tick 显示在 Agent 旁边的分屏 Pane 中（如“在你当前 Tab 右边打开一个 K 线 Tick”）。Pane 只是视图：移动它保留实例及订阅，关闭它 Tick 继续运行。Herdr 外 Tick 照常工作；tmux、Zellij 的 Pane 中暂不能显示 Tick。
+- **Herdr Pane。** 在 [Herdr](https://github.com/herdrdev/herdr) 中，Tickloop 可以把 Tick 显示在 Agent 旁边的分屏 Pane 中（如“在你当前 Tab 右边打开 counter Tick”）。Pane 只是视图：移动它保留实例及订阅，关闭它 Tick 继续运行。Herdr 外 Tick 照常工作；tmux、Zellij 的 Pane 中暂不能显示 Tick。
 - **订阅推动 Loop。** 订阅属于 Loop，总是明确建立；打开或读取 Tick 不会自动订阅。扩展 Tick 与 Terminal Tick 按高频（每分钟，默认）、中频（10 分钟）或低频（30 分钟）投递，只投递最新状态；Shell Tick 退出时立即投递。
 - **多模型。** 内置目录包括 Anthropic Claude、OpenAI（API 与 ChatGPT/Codex 订阅）、GitHub Copilot、Google Gemini 与 Vertex AI、DeepSeek、Kimi、MiniMax、智谱 GLM / Z.ai、xAI 与阿里云。可用 `/model` 在同一 Chat 中途切换模型，历史按目标协议延续。
 - **权限与模式。** 工具调用经过权限系统，模式有 Auto（默认，由模型审批）、Ask、Plan 与 Full Access。`shift+tab` 切换模式，`/permissions` 管理规则并查看近期决定。
@@ -31,7 +31,7 @@ Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修�
 
 ## 安装
 
-`tickloop`、`tickhost` 与 `tick-reader` 总是一起安装和升级；daemon 只拉起与自己同目录、同构建的 `tickhost`。
+`tickloop` 与 `tickhost` 总是一起安装和升级；daemon 只拉起与自己同目录、同构建的 `tickhost`。
 
 ### Homebrew
 
@@ -61,10 +61,10 @@ crates.io 上的 `tickloop` 是一个小型启动器，`cargo install` 期间下
 
 ```sh
 cargo install --locked --git https://github.com/tickloopai/tickloop \
-  tickloop-agent tickloop-tickhost tickloop-tick-reader
+  tickloop-agent tickloop-tickhost
 ```
 
-加 `--tag vX.Y.Z` 可固定版本。在源码检出中，`make install` 把同样三个程序安装到 `~/.cargo/bin`。
+加 `--tag vX.Y.Z` 可固定版本。在源码检出中，`make install` 把同样两个程序安装到 `~/.cargo/bin`。
 
 ### 更新
 
@@ -125,21 +125,21 @@ Homebrew、安装脚本与 Cargo 启动器安装会在后台检查更新，不�
 
 ## Tick 包
 
-Tick 包提供数据来源，每个包是一个预编译可执行文件、包清单 `tick-package.json`，以及教 Agent 使用它的 Skill。官方包目前有 `longbridge`（报价、自选、K 线、持仓、资讯、财报）与 `futu`（经富途 OpenD 的期权），在 [tickloopai/ticks](https://github.com/tickloopai/ticks) 中开发和发布，那里同时是 Tick 市场。
+Tick 包提供数据来源，每个包是一个预编译可执行文件、包清单 `tick-package.json`，以及教 Agent 使用它的 Skill。官方包在 [tickloopai/ticks](https://github.com/tickloopai/ticks) 中开发和发布，那里同时是 Tick 市场。
 
 ```sh
 tickloop tick list                 # 已安装的包及登录状态
 tickloop tick list --available     # 市场中的包、版本与平台支持
-tickloop tick install longbridge
-tickloop tick login longbridge     # 设备码登录；有多个 issuer 时用 --issuer NAME
-tickloop tick logout longbridge
-tickloop tick uninstall longbridge
+tickloop tick install PACKAGE
+tickloop tick login PACKAGE        # 设备码登录；有多个 issuer 时用 --issuer NAME
+tickloop tick logout PACKAGE
+tickloop tick uninstall PACKAGE
 tickloop tick install --path DIR   # 本地包目录或 .tar.gz，供开发包时使用
 ```
 
 在 Agent 中，`/ticks` 提供同样的安装、更新、卸载、登录与退出登录。OAuth 登录打印验证链接与验证码，在任意设备的浏览器中确认即可，远程主机上也能完成；API Key 登录以不回显方式读入密钥。登录状态有 `logged in`、`needs login`、`login expired`、`no login needed` 与 `login unknown`。
 
-安装包只放置程序与 Skill：不运行包里的程序，不打开、不订阅 Tick，也不授予行情、账户或交易权限。凭据保存在 `~/.tickloop/credentials/<包>/`，只交给该包自己的进程，`uninstall` 时保留。安装后的包从 Agent 的下一次请求起可用，其 Skill 以 `<包>:<skill>` 出现，如 `longbridge:usage`。
+安装包只放置程序与 Skill：不运行包里的程序，不打开、不订阅 Tick，也不授予任何数据、账户或其他权限。凭据保存在 `~/.tickloop/credentials/<包>/`，只交给该包自己的进程，`uninstall` 时保留。安装后的包从 Agent 的下一次请求起可用，其 Skill 以 `<包>:<skill>` 出现，如 `<包>:usage`。
 
 ## Tick 协议
 
@@ -157,7 +157,7 @@ tickloop tick install --path DIR   # 本地包目录或 .tar.gz，供开发包�
 
 ## 参与贡献
 
-欢迎报告问题、提出想法和提交 Pull Request。构建、测试与评审流程见 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）。新的 Tick 包或对 `longbridge`、`futu` 的修改请提交到 [tickloopai/ticks](https://github.com/tickloopai/ticks)。
+欢迎报告问题、提出想法和提交 Pull Request。构建、测试与评审流程见 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）。新的 Tick 包或对官方包的修改请提交到 [tickloopai/ticks](https://github.com/tickloopai/ticks)。
 
 ## 安全
 

@@ -3,6 +3,6 @@ contact_links:
   - name: Report a security vulnerability
     url: https://github.com/tickloopai/tickloop/security/policy
     about: Report vulnerabilities privately as described in the security policy, not in a public issue.
-  - name: Tick packages (longbridge, futu) and the Tick marketplace
+  - name: Official Tick packages and the Tick marketplace
     url: https://github.com/tickloopai/ticks/issues
     about: Issues with Tick packages belong in the tickloopai/ticks repository.

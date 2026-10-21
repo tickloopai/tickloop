@@ -30,11 +30,11 @@ pub fn unpack(
     let entries = output(Command::new("/usr/bin/tar").arg("-tzf").arg(archive))?;
     let mut names = entries.lines().collect::<Vec<_>>();
     names.sort_unstable();
-    if names != ["tick-reader", "tickhost", "tickloop"] {
+    if names != ["tickhost", "tickloop"] {
         return Err("The release archive contains unexpected or missing files.".into());
     }
     let modes = output(Command::new("/usr/bin/tar").arg("-tvzf").arg(archive))?;
-    if modes.lines().count() != 3 || modes.lines().any(|line| !line.starts_with('-')) {
+    if modes.lines().count() != 2 || modes.lines().any(|line| !line.starts_with('-')) {
         return Err("The release archive must contain only regular programs.".into());
     }
     let status = Command::new("/usr/bin/tar")
