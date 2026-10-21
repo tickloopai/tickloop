@@ -44,6 +44,7 @@ mod footer;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
+mod image_preparation;
 mod input_history;
 mod input_view;
 #[cfg(test)]
@@ -2669,11 +2670,25 @@ async fn interact(
                     Some(InputEvent::TickAction { .. }) => continue,
                     other => other,
                 };
+                let (_delayed_guard, line) = match line {
+                    Some(InputEvent::DelayedPrompt { id }) => {
+                        if overview_active || login_active || logout_active || summary_input_locked {
+                            console.repark_delayed_submission(id)?;
+                            continue;
+                        }
+                        match console.begin_delayed_submission(id, selected_chat)? {
+                            Some((event, guard)) => (Some(guard), Some(event)),
+                            None => continue,
+                        }
+                    },
+                    other => (None, other),
+                };
                 match line {
                 None | Some(InputEvent::Eof) => {
                     if interactive { return Ok(()); }
                     eof = true;
                 },
+                Some(InputEvent::DelayedPrompt { .. }) => unreachable!("delayed event normalized above"),
                 Some(InputEvent::Error(error)) => return Err(safe_text(&error)),
                 Some(InputEvent::OpenOverview) => {
                     menus.dismiss(console)?;
@@ -3341,6 +3356,7 @@ async fn interact(
                                 _ => None,
                             }).await {
                             InputSend::Accepted { value: (_, handle), adopted } => {
+                                if let Some(guard) = &_delayed_guard { guard.mark_accepted(); }
                                 console.record_prompt_history(&line)?;
                                 let _ = handle;
                                 if let Some(id) = adopted { console.set_status(&input_adopted(id))?; }
@@ -3988,6 +4004,7 @@ async fn interact(
                             );
                             match send_input(agent,chat_id,retry_of,submission,submitted_receipt).await {
                                 InputSend::Accepted { value: receipt, adopted } => {
+                                    if let Some(guard) = &_delayed_guard { guard.mark_accepted(); }
                                     suggestible_runs.insert(receipt.run_id);
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
@@ -4000,10 +4017,10 @@ async fn interact(
                                     }
                                 },
                                 InputSend::Unknown(id, error) => {
+                                    console.restore_unknown_prompt(submitted_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
                                     if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
-                                    console.restore_unknown_prompt(submitted_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     failed=true;
                                 },
                                 InputSend::Held(error) => {

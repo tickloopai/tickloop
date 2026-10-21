@@ -17,11 +17,77 @@ pub(in crate::terminal) struct ConsoleUpgrade {
     overview: OverviewCheckpoint,
     retry_of: Option<Uuid>,
     submitted_prompt: Option<SubmittedPrompt>,
+    #[serde(default)]
+    delayed_recovery: Vec<DelayedRecovery>,
     monitor_width: Option<usize>,
     conversation_focused: bool,
     renderer: Renderer,
     theme: ThemeName,
     prefers_reduced_motion: bool,
+}
+
+/// Handoffs preserve content, never the authorization to send it automatically.
+#[derive(Serialize, Deserialize)]
+struct DelayedRecovery {
+    chat: Option<Uuid>,
+    owner: Uuid,
+    prompt: SubmittedPrompt,
+    file_references: Vec<PathBuf>,
+    family_target: Option<ExecutionRef>,
+    restored_contexts: Vec<InputContext>,
+    retry_of: Option<Uuid>,
+    history_session: String,
+    history_project: PathBuf,
+}
+
+impl DelayedRecovery {
+    fn from_submission(entry: &DelayedSubmission) -> Self {
+        Self {
+            chat: entry.chat,
+            owner: entry.owner,
+            prompt: entry.prompt.clone(),
+            file_references: entry.file_references.clone(),
+            family_target: entry.family_target,
+            restored_contexts: entry.restored_contexts.clone(),
+            retry_of: entry.retry_of,
+            history_session: entry.history_session.clone(),
+            history_project: entry.history_project.clone(),
+        }
+    }
+
+    fn into_submission(self) -> DelayedSubmission {
+        let pasted_texts = self
+            .prompt
+            .paste_blocks
+            .projection(&self.prompt.draft, 0, usize::MAX)
+            .blocks
+            .into_iter()
+            .filter(|block| !block.is_image)
+            .map(|block| PastedText {
+                id: block.id.get(),
+                range: block.raw_range,
+            })
+            .collect();
+        DelayedSubmission {
+            id: Uuid::new_v4(),
+            chat: self.chat,
+            owner: self.owner,
+            prompt: self.prompt,
+            file_references: self.file_references,
+            family_target: self.family_target,
+            restored_contexts: self.restored_contexts,
+            retry_of: self.retry_of,
+            history_session: self.history_session,
+            history_project: self.history_project,
+            pasted_texts,
+            send_now: false,
+            failed: Some(
+                "Recovered unsent message; press Up in an empty input to edit before sending"
+                    .into(),
+            ),
+            in_flight: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,6 +164,17 @@ impl ConsoleUpgrade {
     pub(in crate::terminal) fn validate(&self) -> Result<(), String> {
         self.current.validate()?;
         self.overview_input.validate()?;
+        for entry in &self.delayed_recovery {
+            if !entry
+                .prompt
+                .paste_blocks
+                .projection(&entry.prompt.draft, 0, 80)
+                .issues
+                .is_empty()
+            {
+                return Err("The saved View has invalid waiting message state".into());
+            }
+        }
         for input in self
             .cached
             .iter()
@@ -194,6 +271,11 @@ impl UpgradePause {
             },
             retry_of: state.retry_of,
             submitted_prompt: state.submitted_prompt.clone(),
+            delayed_recovery: state
+                .delayed_submissions
+                .iter()
+                .map(DelayedRecovery::from_submission)
+                .collect(),
             monitor_width: state.monitor_width,
             conversation_focused: state.conversation_focused,
             renderer: state.renderer,
@@ -231,6 +313,11 @@ impl State {
             && self.diff_screen.is_none()
             && !self.help_open
             && self.submitted_retry_of.is_none()
+            && self.active_delayed_submission.is_none()
+            && self.delayed_submissions.iter().all(|entry| !entry.in_flight)
+            // Worker closures cannot cross a View handoff. Finish preparing first so that
+            // recovery snapshots retain real attachments rather than orphan placeholders.
+            && self.image_preparation.pending.is_empty()
             && self.selection.is_none()
             && self.exit_confirmation.is_none()
             && self.escape_confirmation.is_none()
@@ -352,6 +439,13 @@ impl Console {
         state.overview.input_focused = saved.overview.input_focused;
         state.retry_of = saved.retry_of;
         state.submitted_prompt = saved.submitted_prompt;
+        state.delayed_submissions = saved
+            .delayed_recovery
+            .into_iter()
+            .map(DelayedRecovery::into_submission)
+            .collect();
+        state.active_delayed_submission = None;
+        state.delayed_restored_contexts = None;
         state.monitor_width = saved.monitor_width;
         state.conversation_focused = saved.conversation_focused;
         state.display.set_theme(saved.theme);
@@ -460,6 +554,82 @@ mod tests {
         assert_eq!(state.editor.draft(), "保留草稿");
         assert_eq!(state.editor.cursor(), 6);
         assert!(state.pending_upgrade_scroll.contains_key(&Some(first)));
+    }
+
+    #[test]
+    fn view_checkpoint_recovers_waiting_content_but_revokes_automatic_send() {
+        let chat = Uuid::new_v4();
+        let source = Console::test_interactive_for_chat(chat);
+        let old_id;
+        {
+            let mut state = source.state.lock().unwrap();
+            let id = state.paste_blocks.next_id();
+            let marker = PasteBlocks::image_placeholder(id).unwrap();
+            state.editor.replace_draft(marker.clone(), marker.len());
+            state
+                .paste_blocks
+                .register_image(
+                    &marker,
+                    0..marker.len(),
+                    id,
+                    tickloop_agent_protocol::Image {
+                        media_type: tickloop_agent_protocol::ImageMediaType::Png,
+                        data: "fixture".into(),
+                        width: 1,
+                        height: 1,
+                    },
+                )
+                .unwrap();
+            assert!(state.freeze_delayed_submission(Vec::new(), None));
+            old_id = state.delayed_submissions.front().unwrap().id;
+            state.insert("next draft");
+        }
+        let saved: ConsoleUpgrade =
+            serde_json::from_slice(&serde_json::to_vec(&source.test_upgrade_snapshot()).unwrap())
+                .unwrap();
+        let restored = Console::test_interactive_for_chat(chat);
+        restored.restore_upgrade(saved).unwrap();
+        let mut state = restored.state.lock().unwrap();
+        assert_eq!(state.editor.draft(), "next draft");
+        assert_eq!(state.delayed_submissions.len(), 1);
+        let entry = state.delayed_submissions.front().unwrap();
+        assert_ne!(entry.id, old_id);
+        assert!(entry.failed.is_some());
+        assert!(!entry.in_flight);
+        assert!(!entry.send_now);
+        assert_eq!(
+            entry.prompt.paste_blocks.images(&entry.prompt.draft).len(),
+            1
+        );
+        assert!(state.poll_delayed_submission().is_none());
+        state.editor.replace_draft(String::new(), 0);
+        assert!(state.take_back_delayed());
+        assert_eq!(state.paste_blocks.images(state.editor.draft()).len(), 1);
+        assert!(state.delayed_submissions.is_empty());
+    }
+
+    #[test]
+    fn view_upgrade_waits_for_image_workers_and_unconsumed_delayed_events() {
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut state = console.state.lock().unwrap();
+        let key = super::super::super::image_preparation::Key {
+            owner: state.input_owner,
+            id: state.paste_blocks.next_id(),
+        };
+        state.image_preparation.pending.insert(
+            key,
+            super::super::super::image_preparation::Pending {
+                fallback: String::new(),
+                missing_message: None,
+            },
+        );
+        assert!(!state.ready_for_upgrade());
+        state.image_preparation.pending.clear();
+        state.insert("waiting");
+        assert!(state.freeze_delayed_submission(Vec::new(), None));
+        assert!(state.ready_for_upgrade());
+        state.delayed_submissions.front_mut().unwrap().in_flight = true;
+        assert!(!state.ready_for_upgrade());
     }
 
     #[test]

@@ -105,8 +105,12 @@ impl std::error::Error for PasteBlockError {}
 /// image block's draft text is the literal `[Image #N]` placeholder.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PasteContent {
-    Text { line_count: usize },
+    Text {
+        line_count: usize,
+    },
     Image(Image),
+    /// Persist the reservation, not a worker. Restored drafts must cancel these entries.
+    PendingImage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -187,6 +191,26 @@ impl PasteBlocks {
         id: PasteBlockId,
         image: Image,
     ) -> Result<(), PasteBlockError> {
+        self.register_image_content(draft, range, id, PasteContent::Image(image))
+    }
+
+    /// Reserves an atomic image placeholder before its asynchronous image work begins.
+    pub(super) fn register_pending_image(
+        &mut self,
+        draft: &str,
+        range: Range<usize>,
+        id: PasteBlockId,
+    ) -> Result<(), PasteBlockError> {
+        self.register_image_content(draft, range, id, PasteContent::PendingImage)
+    }
+
+    fn register_image_content(
+        &mut self,
+        draft: &str,
+        range: Range<usize>,
+        id: PasteBlockId,
+        content: PasteContent,
+    ) -> Result<(), PasteBlockError> {
         let text = checked_slice(draft, &range)?;
         if text != Self::image_placeholder(id)? {
             return Err(PasteBlockError::message(
@@ -207,9 +231,79 @@ impl PasteBlocks {
             id,
             range,
             fingerprint: fingerprint(text),
-            content: PasteContent::Image(image),
+            content,
         });
         Ok(())
+    }
+
+    /// Completes only an existing, intact reservation; late results never restore deleted images.
+    pub(super) fn complete_pending_image(
+        &mut self,
+        draft: &str,
+        id: PasteBlockId,
+        image: Image,
+    ) -> bool {
+        let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) else {
+            return false;
+        };
+        if !matches!(block.content, PasteContent::PendingImage)
+            || valid_slice(draft, &block.range).map(fingerprint) != Some(block.fingerprint)
+            || Self::image_placeholder(id).ok().as_deref() != valid_slice(draft, &block.range)
+        {
+            return false;
+        }
+        block.content = PasteContent::Image(image);
+        true
+    }
+
+    pub(super) fn has_pending_images(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|block| matches!(block.content, PasteContent::PendingImage))
+    }
+
+    pub(super) fn pending_image_exists(&self, id: PasteBlockId) -> bool {
+        self.blocks
+            .iter()
+            .any(|block| block.id == id && matches!(block.content, PasteContent::PendingImage))
+    }
+
+    pub(super) fn pending_image_ids(&self) -> Vec<PasteBlockId> {
+        self.blocks
+            .iter()
+            .filter(|block| matches!(block.content, PasteContent::PendingImage))
+            .map(|block| block.id)
+            .collect()
+    }
+
+    /// Replaces a failed reservation with plain fallback text (or removes it if empty).
+    /// Callers must install the returned draft, just as for [`Self::delete`].
+    pub(super) fn fail_pending_image(
+        &mut self,
+        draft: &str,
+        id: PasteBlockId,
+        fallback: &str,
+    ) -> Result<Option<PasteDeletion>, PasteBlockError> {
+        let Some(index) = self.blocks.iter().position(|block| {
+            block.id == id && matches!(block.content, PasteContent::PendingImage)
+        }) else {
+            return Ok(None);
+        };
+        let block = &self.blocks[index];
+        if fingerprint(checked_slice(draft, &block.range)?) != block.fingerprint {
+            return Err(PasteBlockError::message(
+                "pending image placeholder changed",
+            ));
+        }
+        let range = block.range.clone();
+        let mut next_draft = draft.to_owned();
+        next_draft.replace_range(range.clone(), fallback);
+        self.blocks.remove(index);
+        self.reconcile(draft, &next_draft);
+        Ok(Some(PasteDeletion {
+            draft: next_draft,
+            cursor: range.start + fallback.len(),
+        }))
     }
 
     /// Re-attaches an image saved with a prompt to the first free `[Image #id]` placeholder
@@ -259,6 +353,26 @@ impl PasteBlocks {
         self.blocks = saved.blocks;
     }
 
+    /// Ready and total image reservations, without copying image payloads for UI frames.
+    pub(super) fn image_counts(&self, draft: &str) -> (usize, usize) {
+        let mut ready = 0;
+        let mut total = 0;
+        for block in &self.blocks {
+            match &block.content {
+                PasteContent::Image(_)
+                    if valid_slice(draft, &block.range).map(fingerprint)
+                        == Some(block.fingerprint) =>
+                {
+                    ready += 1;
+                    total += 1;
+                }
+                PasteContent::PendingImage => total += 1,
+                _ => {}
+            }
+        }
+        (ready, total)
+    }
+
     /// Images whose placeholders are intact, in placeholder order.
     pub(super) fn images(&self, draft: &str) -> Vec<ImageContext> {
         self.blocks
@@ -273,7 +387,7 @@ impl PasteBlocks {
                     },
                     image: image.clone(),
                 }),
-                PasteContent::Text { .. } => None,
+                PasteContent::Text { .. } | PasteContent::PendingImage => None,
             })
             .collect()
     }
@@ -439,7 +553,10 @@ impl PasteBlocks {
                 raw_range: block.range.clone(),
                 display_range: display_start..display_end,
                 label,
-                is_image: matches!(block.content, PasteContent::Image(_)),
+                is_image: matches!(
+                    block.content,
+                    PasteContent::Image(_) | PasteContent::PendingImage
+                ),
             });
             raw_offset = block.range.end;
         }
@@ -477,7 +594,7 @@ fn block_label(block: &PasteBlock, available_columns: usize) -> String {
             };
             (full, format!("[Paste #{}]", block.id.0))
         }
-        PasteContent::Image(_) => {
+        PasteContent::Image(_) | PasteContent::PendingImage => {
             let placeholder = format!("[Image #{}]", block.id.0);
             (placeholder.clone(), placeholder)
         }
@@ -788,6 +905,111 @@ mod tests {
             .register_image(draft, start..draft.len(), id, image(width))
             .unwrap();
         id
+    }
+
+    fn reserve(blocks: &mut PasteBlocks, draft: &mut String) -> PasteBlockId {
+        let id = blocks.next_id();
+        let start = draft.len();
+        draft.push_str(&PasteBlocks::image_placeholder(id).unwrap());
+        blocks
+            .register_pending_image(draft, start..draft.len(), id)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn pending_images_reserve_ids_and_project_without_model_context() {
+        let mut blocks = PasteBlocks::new();
+        let mut draft = String::new();
+        let first = reserve(&mut blocks, &mut draft);
+        let second = reserve(&mut blocks, &mut draft);
+        assert_eq!(
+            (first.get(), second.get(), blocks.next_id().get()),
+            (1, 2, 3)
+        );
+        assert!(blocks.has_pending_images());
+        assert_eq!(blocks.pending_image_ids(), [first, second]);
+        assert!(blocks.pending_image_exists(first));
+        assert!(blocks.images(&draft).is_empty());
+        let projection = blocks.projection(&draft, draft.len(), 80);
+        assert_eq!(projection.text, "[Image #1][Image #2]");
+        assert!(projection.blocks.iter().all(|block| block.is_image));
+        assert_eq!(blocks.ranges(), [0..10, 10..20]);
+        assert!(blocks.register_pending_image(&draft, 0..10, first).is_err());
+    }
+
+    #[test]
+    fn pending_completion_requires_intact_reservation_and_only_completes_once() {
+        let mut blocks = PasteBlocks::new();
+        let mut draft = String::new();
+        let id = reserve(&mut blocks, &mut draft);
+        assert!(!blocks.complete_pending_image("[Image #9]", id, image(9)));
+        assert!(blocks.pending_image_exists(id));
+        let shifted = format!("前{draft}");
+        blocks.reconcile(&draft, &shifted);
+        assert!(blocks.complete_pending_image(&shifted, id, image(2)));
+        assert!(!blocks.has_pending_images());
+        assert!(!blocks.complete_pending_image(&shifted, id, image(9)));
+        let images = blocks.images(&shifted);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image.width, 2);
+    }
+
+    #[test]
+    fn deleted_or_edited_pending_images_ignore_late_results() {
+        let mut blocks = PasteBlocks::new();
+        let mut draft = String::new();
+        let first = reserve(&mut blocks, &mut draft);
+        let second = reserve(&mut blocks, &mut draft);
+        let deletion = blocks.delete(&draft, first).unwrap().unwrap();
+        assert_eq!(deletion.draft, "[Image #2]");
+        assert!(!blocks.complete_pending_image(&deletion.draft, first, image(1)));
+        blocks.reconcile(&deletion.draft, "[Image #X]");
+        assert!(!blocks.pending_image_exists(second));
+        assert!(!blocks.complete_pending_image("[Image #X]", second, image(2)));
+        assert!(!blocks.has_pending_images());
+    }
+
+    #[test]
+    fn failed_pending_image_fallback_preserves_later_blocks_and_numbering() {
+        let mut blocks = PasteBlocks::new();
+        let mut draft = String::from("前");
+        let first = reserve(&mut blocks, &mut draft);
+        let second = reserve(&mut blocks, &mut draft);
+        let fallback = blocks
+            .fail_pending_image(&draft, first, "path.png")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.draft, "前path.png[Image #2]");
+        assert_eq!(fallback.cursor, "前path.png".len());
+        assert!(!blocks.pending_image_exists(first));
+        assert!(blocks.complete_pending_image(&fallback.draft, second, image(2)));
+        assert_eq!(blocks.images(&fallback.draft).len(), 1);
+        assert_eq!(blocks.next_id().get(), 3);
+        assert!(
+            blocks
+                .fail_pending_image(&fallback.draft, second, "")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_pending_reservations_can_be_cancelled_without_reusing_ids() {
+        let mut blocks = PasteBlocks::new();
+        let mut draft = String::new();
+        let id = reserve(&mut blocks, &mut draft);
+        let serialized = serde_json::to_string(&blocks).unwrap();
+        let mut restored: PasteBlocks = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.pending_image_ids(), [id]);
+        assert!(restored.images(&draft).is_empty());
+        let cancelled = restored
+            .fail_pending_image(&draft, id, "")
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.draft.is_empty());
+        assert!(!restored.has_pending_images());
+        assert_eq!(restored.next_id().get(), 2);
     }
 
     #[test]
