@@ -106,8 +106,21 @@ By contributing you agree that your contributions are licensed under the [MIT Li
 `tickloop` and `tickhost` share one product version, the workspace version in the root `Cargo.toml`. Tick packages are versioned independently in tickloopai/ticks.
 
 ```sh
-make release                 # bump the patch version
-make release VERSION=X.Y.Z   # or pick a higher version
+make release                          # bump the patch version and publish from this Mac
+make release VERSION=X.Y.Z            # or pick a higher version
+make release REMOTE=1                 # publish on GitHub Actions instead
+make release-publish VERSION=X.Y.Z    # publish a pushed tag again; FROM=step resumes, REMOTE=1 uses Actions
 ```
 
-`make release` checks a temporary checkout of `HEAD`, creates a dedicated `chore(release): ...` commit and an annotated `vX.Y.Z` tag, and pushes the branch and tag. The tag triggers `.github/workflows/release.yml`, which builds the macOS and Linux archives, publishes them as a draft release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap), then publishes the release, updates the Formula and publishes the matching crates.io launcher. Assets and crates for an existing version are never replaced with different content; rerun failed jobs instead of bumping again. If pushing the tag fails after the release commit was created, push the missing refs instead of running `make release` again.
+`make release` checks a temporary checkout of `HEAD`, creates a dedicated `chore(release): ...` commit and an annotated `vX.Y.Z` tag, and pushes the branch and tag. It then publishes the tag from this Mac with `scripts/release-publish.mjs`, in the same stages as `.github/workflows/release.yml`:
+
+1. `prepare`: the release script tests and the crates.io package audit, and access to the tap, crates.io, Docker and Rosetta;
+2. `check`: `make check-workspace` on macOS and in a Linux container (`scripts/release/linux.Dockerfile`), with a clippy run for the musl target;
+3. `build`: the macOS archives natively and the static musl archives in Linux containers (x86_64 under emulation), each smoke-tested;
+4. `publish`: the archives as a release in [tickloopai/homebrew-tap](https://github.com/tickloopai/homebrew-tap);
+5. `tap`: the Formula;
+6. `cargo`: the crates.io launcher, verified on macOS and Linux.
+
+It needs an Apple silicon Mac with Rosetta, Docker (OrbStack), `gh` signed in with push access to the tap, and `cargo login` for crates.io. The tagged source is checked out in `target/release-local/source`, and the archives are kept in `target/release-local/vX.Y.Z/`. `REMOTE=1` starts `release.yml` on GitHub Actions for the pushed tag instead; tags no longer start it on their own.
+
+Assets and crates for an existing version are never replaced with different content. When a stage fails after the tag was pushed, fix the cause and resume with `make release-publish VERSION=X.Y.Z FROM=<stage>` (or rerun the failed jobs on GitHub) instead of bumping again. If pushing the tag fails after the release commit was created, push the missing refs instead of running `make release` again.

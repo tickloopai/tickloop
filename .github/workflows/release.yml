@@ -1,10 +1,10 @@
 name: Release
 run-name: Release ${{ github.ref_name }}
 
+# make release publishes from the maintainer's Mac by default; make release REMOTE=1 (or
+# make release-publish VERSION=X.Y.Z REMOTE=1) starts this workflow on the pushed tag instead.
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
 
 permissions:
   contents: read

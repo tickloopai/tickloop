@@ -199,14 +199,30 @@ function finalizeRelease(products, state, changes) {
     const pushed = git(["push", "--porcelain", "--atomic", "origin", ...refspecs], { readOnly: false });
     if (pushed.status !== 0) throw new Error(`Push failed; release commit ${commit} and local tags remain. Earlier tag batches may already be published. Inspect remote refs with git ls-remote origin ${state.branch} ${products.map(product => `refs/tags/${product.tag}`).join(" ")}, then retry only the missing refs with git push --atomic origin ${refspecs.join(" ")}. Do not rerun release to bump versions again. ${pushed.stderr.trim()}`);
   }
-  process.stdout.write(`Committed ${description} as ${commit}. Published ${products.map(product => product.tag).join(", ")} with ${state.branch.slice("refs/heads/".length)}. GitHub Actions will build and deploy the releases.\n`);
+  process.stdout.write(`Committed ${description} as ${commit}. Pushed ${products.map(product => product.tag).join(", ")} with ${state.branch.slice("refs/heads/".length)}.\n`);
   return true;
+}
+
+// TICKLOOP_RELEASE_PUBLISH (set by make release) chooses who builds and publishes the pushed tags:
+// "local" runs scripts/release-publish.mjs here, "remote" starts it on GitHub Actions.
+function publishReleases(products, root) {
+  const mode = process.env.TICKLOOP_RELEASE_PUBLISH;
+  const tags = products.map(product => product.tag);
+  if (!["local", "remote"].includes(mode)) {
+    process.stdout.write(`Publish with: ${tags.map(tag => `make release-publish VERSION=${tag.slice(1)}`).join("; ")} (add REMOTE=1 to use GitHub Actions).\n`);
+    return;
+  }
+  for (const tag of tags) {
+    const result = command("node", ["scripts/release-publish.mjs", ...(mode === "remote" ? ["--remote"] : []), tag], { cwd: root, stdio: "inherit" });
+    if (result.status !== 0) throw new Error(`Publishing ${tag} failed; the tag is pushed, so fix the cause and resume with make release-publish VERSION=${tag.slice(1)}${mode === "remote" ? " REMOTE=1" : ""}.`);
+  }
 }
 
 try {
   const [channel, mode, ...extra] = process.argv.slice(2);
   if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] node scripts/release.mjs binary [--check|--dry-run]");
   const releaseLock = acquireReleaseLock();
+  let released;
   try {
     const initial = preflight();
     for (let attempt = 0; attempt < maximumSnapshotAttempts; attempt++) {
@@ -217,13 +233,17 @@ try {
         process.stdout.write(`Ready to bump ${products.map(product => `${product.label} ${product.version} → ${product.nextVersion}`).join(", ")}, create one version commit and tags ${products.map(product => product.tag).join(", ")}, then push ${state.branch.slice("refs/heads/".length)} and tags. No changes were made.\n`);
         break;
       }
-      if (finalizeRelease(products, state, changes)) break;
+      if (finalizeRelease(products, state, changes)) {
+        released = { products, root: state.root };
+        break;
+      }
       if (attempt + 1 === maximumSnapshotAttempts) throw new Error("HEAD kept advancing during release checks; no version commit or release tag was created. Retry when commits have settled.");
       process.stderr.write("HEAD advanced during checks; preparing and checking the latest committed snapshot again.\n");
     }
   } finally {
     releaseLock();
   }
+  if (released) publishReleases(released.products, released.root);
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = 1;

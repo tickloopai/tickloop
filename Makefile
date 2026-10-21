@@ -10,7 +10,7 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev build install package test test-workspace check check-workspace release
+.PHONY: dev build install package test test-workspace check check-workspace release release-publish
 
 ## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
 # Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
@@ -58,6 +58,12 @@ check-workspace:
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	$(MAKE) test-workspace
 
-## Bump the Tickloop patch version (VERSION=X.Y.Z names a higher one), check it, commit the version files and push the branch and tag.
+## Bump the Tickloop patch version (VERSION=X.Y.Z names a higher one), check it, commit the version files and push the branch and tag,
+## then check, build and publish the release on this Mac (Docker for Linux); REMOTE=1 publishes on GitHub Actions instead.
 release:
-	@node scripts/release.mjs binary
+	@TICKLOOP_RELEASE_PUBLISH=$(if $(REMOTE),remote,local) node scripts/release.mjs binary
+
+## Publish the pushed tag vVERSION again after a failure; FROM=step resumes at prepare, check, build, publish, tap or cargo.
+release-publish:
+	@test -n '$(VERSION)' || { echo 'Usage: make release-publish VERSION=X.Y.Z [FROM=step] [REMOTE=1]' >&2; exit 2; }
+	@node scripts/release-publish.mjs $(if $(REMOTE),--remote) $(if $(FROM),--from '$(FROM)') 'v$(VERSION)'

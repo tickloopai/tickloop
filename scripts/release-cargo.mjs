@@ -67,7 +67,9 @@ async function main() {
   if (!workspaceVersion) throw new Error("Workspace product version is missing.");
   const metadata = JSON.parse(cargo(["metadata", "--locked", "--no-deps", "--format-version", "1", "--manifest-path", manifest]));
   const version = validateMetadata(metadata, workspaceVersion);
-  if (mode === "--publish" && (process.env.GITHUB_ACTIONS !== "true" || process.env.GITHUB_REF_NAME !== `v${version}` || !process.env.CARGO_REGISTRY_TOKEN)) throw new Error("Publishing requires the matching vX.Y.Z Actions run and CARGO_REGISTRY_TOKEN.");
+  // The release workflow names its tag in GITHUB_REF_NAME; a local release sets TICKLOOP_RELEASE_TAG.
+  const releaseTag = process.env.TICKLOOP_RELEASE_TAG ?? (process.env.GITHUB_ACTIONS === "true" ? process.env.GITHUB_REF_NAME : undefined);
+  if (mode === "--publish" && releaseTag !== `v${version}`) throw new Error(`Publishing tickloop ${version} requires its release tag v${version}.`);
   for (const file of sourceFiles) if (!lstatSync(join(root, "distribution/cargo", file)).isFile()) throw new Error(`Refusing a non-regular public source file: ${file}`);
   const base = ["--locked", "--manifest-path", manifest, "--target-dir", target];
   const dirty = mode === "--check" ? ["--allow-dirty"] : [];
