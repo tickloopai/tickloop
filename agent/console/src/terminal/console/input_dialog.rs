@@ -183,9 +183,8 @@ fn complete_login_menu(
         notice.into(),
         "enter returns to Provider; esc leaves editing first, otherwise returns to Provider. Saved credentials remain applied.".into(),
     ];
-    for option in &mut menu.options {
-        *option = "Back to Provider".into();
-    }
+    menu.options = vec!["Back to Provider".into()];
+    menu.selected = 0;
     true
 }
 

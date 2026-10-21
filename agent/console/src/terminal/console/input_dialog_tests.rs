@@ -3,6 +3,38 @@ use crate::monitor_rows::{MonitorAction, TickIntent};
 use tickloop_agent_protocol::ChatSnapshot;
 
 #[test]
+fn completed_login_has_one_return_option() {
+    for status in ["Login saved", "Login failed"] {
+        for selected in [0, 1] {
+            let mut state = State::new(true, 120, 40);
+            let id = Uuid::new_v4();
+            state.menu = Some(Menu {
+                id,
+                title: "Codex browser login".into(),
+                context: Vec::new(),
+                options: vec!["Submit callback URL…".into(), "Cancel login".into()],
+                selected,
+                confirmation: false,
+            });
+
+            assert!(state.complete_login(id, status, "Fixture result"));
+
+            let menu = state.menu.as_ref().unwrap();
+            assert_eq!(menu.options, vec!["Back to Provider"]);
+            assert_eq!(menu.selected, 0);
+            let frame = state.styled_frame().0;
+            assert_eq!(
+                frame
+                    .iter()
+                    .filter(|line| line.text().contains("Back to Provider"))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
 fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
     use crate::terminal::style::{Theme, ThemeName};
     for theme in ThemeName::ALL {
