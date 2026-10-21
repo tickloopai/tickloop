@@ -54,6 +54,7 @@ pub struct ServiceControl {
     pub credential_revision: AtomicUsize,
     pub signed_out: AtomicBool,
     pub hold_device_approval: AtomicBool,
+    pub refuse_token_refresh: AtomicBool,
     pub reject_mcp: AtomicBool,
     pub reject_discovery: AtomicBool,
     pub reject_tool_listing: AtomicBool,
@@ -752,6 +753,10 @@ impl ArtifactService {
                         && control.hold_device_approval.load(Ordering::SeqCst)
                     {
                         (400, json!({"error":"authorization_pending"}))
+                    } else if target == "/account/token"
+                        && control.refuse_token_refresh.load(Ordering::SeqCst)
+                    {
+                        (400, json!({"error":"invalid_grant"}))
                     } else if target == "/account/token" {
                         control.signed_out.store(false, Ordering::SeqCst);
                         let revision = control.credential_revision.load(Ordering::SeqCst);

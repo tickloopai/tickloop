@@ -265,9 +265,7 @@ pub struct CredentialSnapshot {
 
 impl CredentialSnapshot {
     pub fn identity_matches(&self, other: &Self) -> bool {
-        self.origin == other.origin
-            && self.account_id == other.account_id
-            && self.access_token == other.access_token
+        self.origin == other.origin && self.account_id == other.account_id
     }
 }
 
@@ -284,6 +282,14 @@ impl ArtifactClient {
                 account_id: saved.user.id,
                 access_token: saved.access_token,
             }))
+    }
+
+    /// The signed-in account, also while its resource token awaits renewal.
+    pub fn signed_in_account_id(&self) -> Result<Option<String>, ArtifactError> {
+        if let Some(source) = &self.hosted_credentials {
+            return Ok(source.snapshot().map(|snapshot| snapshot.account_id));
+        }
+        Ok(self.read_account()?.map(|account| account.user.id))
     }
 
     pub async fn invalidate_credential(&self, token: &str) -> Result<(), ArtifactError> {

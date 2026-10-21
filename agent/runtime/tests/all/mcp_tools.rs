@@ -2272,6 +2272,174 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
 }
 
 #[tokio::test]
+async fn a_renewed_artifacts_token_keeps_the_account_directory_and_dispatches_with_the_new_token() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let provider = McpHostToolProvider::new(account.clone(), None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    expire_artifacts_tokens(directory.path());
+    service
+        .control
+        .credential_revision
+        .store(1, Ordering::SeqCst);
+    let renewed = account.access_snapshot().await.unwrap().unwrap();
+    assert_eq!(renewed.access_token, "test-service-token-1");
+    let chat = ChatId::new_v4();
+    provider
+        .prepare_call(
+            chat,
+            "ArtifactRead",
+            &json!({"action":"read","artifact_id":"doc"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let edit =
+        json!({"action":"replace","artifact_id":"doc","expected_revision":3,"content":"renewed"});
+    let prepared = provider
+        .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+        .await
+        .unwrap();
+    expire_artifacts_tokens(directory.path());
+    service
+        .control
+        .credential_revision
+        .store(2, Ordering::SeqCst);
+    account.access_snapshot().await.unwrap().unwrap();
+    provider
+        .revalidate_call(chat, &prepared, CancellationToken::new())
+        .await
+        .unwrap();
+    let result = provider
+        .execute_prepared(chat, prepared, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        HostCallResult::Completed(ToolResult {
+            is_error: false,
+            ..
+        })
+    ));
+    let calls = service
+        .requests()
+        .into_iter()
+        .filter(|request| request["body"]["method"] == "tools/call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]["headers"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-service-token-2")
+    );
+
+    service.control.other_account.store(true, Ordering::SeqCst);
+    service.login(directory.path()).await;
+    assert_eq!(
+        provider
+            .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+            .await
+            .err()
+            .unwrap(),
+        "Artifact account changed before MCP preparation"
+    );
+    assert_eq!(service.tool_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn an_expired_artifacts_token_is_renewed_when_a_call_needs_it() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let chat = ChatId::new_v4();
+    let edit =
+        json!({"action":"replace","artifact_id":"doc","expected_revision":3,"content":"renewed"});
+    let expire_with_next_revision = |revision| {
+        expire_artifacts_tokens(directory.path());
+        service
+            .control
+            .credential_revision
+            .store(revision, Ordering::SeqCst);
+    };
+
+    expire_with_next_revision(1);
+    assert!(
+        provider
+            .call_authority("ArtifactEdit", &edit)
+            .unwrap()
+            .is_some()
+    );
+    provider
+        .prepare_call(
+            chat,
+            "ArtifactRead",
+            &json!({"action":"read","artifact_id":"doc"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let prepared = provider
+        .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+        .await
+        .unwrap();
+    expire_with_next_revision(2);
+    provider
+        .revalidate_call(chat, &prepared, CancellationToken::new())
+        .await
+        .unwrap();
+    expire_with_next_revision(3);
+    let result = provider
+        .execute_prepared(chat, prepared, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        HostCallResult::Completed(ToolResult {
+            is_error: false,
+            ..
+        })
+    ));
+    let calls = service
+        .requests()
+        .into_iter()
+        .filter(|request| request["body"]["method"] == "tools/call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]["headers"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-service-token-3")
+    );
+
+    expire_artifacts_tokens(directory.path());
+    service
+        .control
+        .refuse_token_refresh
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        provider
+            .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+            .await
+            .err()
+            .unwrap(),
+        "Artifact login is no longer active"
+    );
+    assert!(
+        service
+            .client(directory.path())
+            .credential_snapshot()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(service.tool_calls().len(), 1);
+}
+
+#[tokio::test]
 async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
@@ -2358,6 +2526,13 @@ async fn account_status_cache_requires_the_current_credential_generation() {
         .control
         .credential_revision
         .store(1, Ordering::SeqCst);
+    service.login(directory.path()).await;
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in",
+        "a new token for the same account keeps the account's status"
+    );
+    service.control.other_account.store(true, Ordering::SeqCst);
     service.login(directory.path()).await;
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
@@ -5739,14 +5914,8 @@ impl tickloop_agent_tools::LocalReadAdmission for NoLocalReads {
     }
 }
 
-#[tokio::test]
-async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_same_refresh() {
-    let service = ArtifactService::start().await;
-    let directory = tempfile::tempdir().unwrap();
-    let account = service.login(directory.path()).await;
-    let provider = McpHostToolProvider::new(account, None);
-    provider.refresh(CancellationToken::new()).await.unwrap();
-    let credentials = std::fs::read_dir(directory.path().join("artifacts/auth"))
+fn expire_artifacts_tokens(root: &std::path::Path) {
+    let credentials = std::fs::read_dir(root.join("artifacts/auth"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| {
@@ -5759,6 +5928,16 @@ async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_s
         token["expires_at"] = json!(0);
     }
     std::fs::write(&credentials, serde_json::to_vec(&saved).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_same_refresh() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    expire_artifacts_tokens(directory.path());
     service
         .control
         .credential_revision

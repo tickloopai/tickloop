@@ -221,6 +221,42 @@ async fn resource_caches_share_a_rotating_refresh_token_and_serialize_concurrent
 }
 
 #[tokio::test]
+async fn a_renewed_artifacts_token_keeps_the_account_identity_and_cache_key() {
+    let fixture = Fixture::new();
+    fixture.login().await;
+    let signed_in = fixture.client.credential_snapshot().unwrap().unwrap();
+    let mut account = fixture.client.read_account().unwrap().unwrap();
+    account
+        .resources
+        .get_mut(&fixture.client.resource())
+        .unwrap()
+        .expires_at = now_seconds();
+    fixture.client.save_account(&account).unwrap();
+    fixture.server.answer_polls([TokenReply::Approve]);
+    let renewed = fixture.client.access_snapshot().await.unwrap().unwrap();
+    assert_ne!(renewed.access_token, signed_in.access_token);
+    assert!(fixture.client.credentials_match(&signed_in, &renewed));
+    assert_eq!(
+        fixture.client.credential_key(&signed_in),
+        fixture.client.credential_key(&renewed)
+    );
+    let other_account = CredentialSnapshot {
+        account_id: "other-account".into(),
+        ..renewed.clone()
+    };
+    assert!(!fixture.client.credentials_match(&signed_in, &other_account));
+    assert_ne!(
+        fixture.client.credential_key(&signed_in),
+        fixture.client.credential_key(&other_account)
+    );
+    let other_origin = CredentialSnapshot {
+        origin: "https://other.example".into(),
+        ..renewed
+    };
+    assert!(!fixture.client.credentials_match(&signed_in, &other_origin));
+}
+
+#[tokio::test]
 async fn status_renews_userinfo_with_the_latest_refresh_token_before_renewing_artifacts() {
     let fixture = Fixture::new();
     fixture.login().await;

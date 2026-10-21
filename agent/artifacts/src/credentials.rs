@@ -127,8 +127,8 @@ impl ArtifactClient {
         Ok(snapshot)
     }
 
-    /// Host token renewal preserves the fixed account authority. File-backed sessions also bind
-    /// the exact token, so replacing a local login still invalidates already-prepared work.
+    /// Token renewal preserves the account authority: a host-owned client stays bound to its
+    /// fixed account, a file-backed login to its origin and account.
     pub fn credentials_match(
         &self,
         expected: &CredentialSnapshot,
@@ -147,17 +147,16 @@ impl ArtifactClient {
         }
     }
 
-    /// Scopes MCP caches to this host client, independently of renewable delegated token bytes.
+    /// Scopes MCP caches to the account, and a host-owned source to this client, independently
+    /// of renewable token bytes.
     pub fn credential_key(&self, snapshot: &CredentialSnapshot) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(snapshot.origin.as_bytes());
         digest.update([0]);
         digest.update(snapshot.account_id.as_bytes());
-        digest.update([0]);
         if let Some(source) = &self.hosted_credentials {
+            digest.update([0]);
             digest.update(source.identity.as_bytes());
-        } else {
-            digest.update(snapshot.access_token.as_bytes());
         }
         digest.finalize().into()
     }

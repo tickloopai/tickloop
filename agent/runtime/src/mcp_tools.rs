@@ -556,12 +556,22 @@ impl McpHostToolProvider {
     fn mcp_authority(&self) -> Result<Option<HostToolAuthority>, String> {
         Ok(self
             .artifact
-            .credential_snapshot()
+            .signed_in_account_id()
             .map_err(|_| "Artifact credential unavailable")?
-            .map(|credential| HostToolAuthority::Mcp {
-                server_id: credential.origin,
-                account_id: credential.account_id,
+            .map(|account_id| HostToolAuthority::Mcp {
+                server_id: self.artifact.origin().to_owned(),
+                account_id,
             }))
+    }
+
+    /// The credential a call sends. A file-backed login renews an expired or expiring resource
+    /// token here, so a long model turn does not read as signed out.
+    async fn call_credential(&self) -> Result<Option<CredentialSnapshot>, ArtifactError> {
+        if self.artifact.is_host_managed() {
+            self.artifact.credential_snapshot()
+        } else {
+            self.artifact.access_snapshot().await
+        }
     }
 
     fn directory_tool(&self, name: &str) -> Option<(DiscoveredTool, [u8; 32], [u8; 32])> {
@@ -955,8 +965,8 @@ impl McpHostToolProvider {
             .as_str()
             .ok_or("file_path must be a string")?;
         let credential = self
-            .artifact
-            .credential_snapshot()
+            .call_credential()
+            .await
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login is no longer active")?;
         if self.credential_key(&credential) != expected_key {
@@ -1046,8 +1056,8 @@ impl McpHostToolProvider {
             return Err("ArtifactUpload was cancelled".into());
         }
         let current = self
-            .artifact
-            .credential_snapshot()
+            .call_credential()
+            .await
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login ended before the upload")?;
         if !self
@@ -1082,7 +1092,16 @@ impl McpHostToolProvider {
         if cancel.is_cancelled() {
             return HostCallResult::NotDispatched("ArtifactUpload was cancelled".into());
         }
-        if !self.credential_is_current(&upload.credential) {
+        if !self
+            .call_credential()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|current| {
+                self.artifact
+                    .credentials_match(&upload.credential, &current)
+            })
+        {
             return HostCallResult::NotDispatched(
                 "Artifact account changed before the upload".into(),
             );
@@ -1777,8 +1796,8 @@ impl HostToolProvider for McpHostToolProvider {
             return Err("MCP call cancelled".into());
         }
         let credential = self
-            .artifact
-            .credential_snapshot()
+            .call_credential()
+            .await
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login is no longer active")?;
         if self.credential_key(&credential) != expected_key {
@@ -1894,8 +1913,8 @@ impl HostToolProvider for McpHostToolProvider {
             return Err("MCP call cancelled".into());
         }
         let current = self
-            .artifact
-            .credential_snapshot()
+            .call_credential()
+            .await
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login ended before MCP dispatch")?;
         if !self
@@ -1979,12 +1998,21 @@ impl HostToolProvider for McpHostToolProvider {
         if cancel.is_cancelled() {
             return HostCallResult::NotDispatched("MCP call cancelled".into());
         }
-        if !self.credential_is_current(&prepared.credential) {
-            return HostCallResult::NotDispatched(
-                "Artifact account changed before MCP dispatch".into(),
-            );
-        }
-        let (service, http) = match self.open_session(&prepared.credential).await {
+        let current = match self.call_credential().await {
+            Ok(Some(current))
+                if self
+                    .artifact
+                    .credentials_match(&prepared.credential, &current) =>
+            {
+                current
+            }
+            _ => {
+                return HostCallResult::NotDispatched(
+                    "Artifact account changed before MCP dispatch".into(),
+                );
+            }
+        };
+        let (service, http) = match self.open_session(&current).await {
             Ok(session) => session,
             Err(error) => return HostCallResult::NotDispatched(error),
         };
@@ -2016,7 +2044,7 @@ impl HostToolProvider for McpHostToolProvider {
             result = tokio::time::timeout(CALL_TIMEOUT, service.peer().call_tool_once(params)) => result,
         };
         if http.unauthorized() {
-            self.invalidate(&prepared.credential.access_token).await;
+            self.invalidate(&current.access_token).await;
         }
         if !self.credential_is_current(&prepared.credential) {
             return HostCallResult::OutcomeUnknown(
@@ -2070,11 +2098,11 @@ impl HostToolProvider for McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
-        let mut tool_result = Self::model_result(result, &prepared.credential.access_token);
-        if let Ok(Some(current)) = self.artifact.credential_snapshot() {
+        let mut tool_result = Self::model_result(result, &current.access_token);
+        if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
             tool_result.content = tool_result
                 .content
-                .replace(&current.access_token, "[redacted]");
+                .replace(&latest.access_token, "[redacted]");
         }
         match effect {
             Some(effect) => HostCallResult::CompletedWithEffect(tool_result, Box::new(effect)),
