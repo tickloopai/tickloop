@@ -36,7 +36,7 @@ This stops every running agent in that daemon. Saved history is kept, and Ticks 
 
 ## Checks
 
-Every pull request must pass the same checks CI runs (`.github/workflows/ci.yml`):
+CI (`.github/workflows/ci.yml`) does not start on pushes or pull requests: it runs as part of every release, and maintainers can start it by hand from the Actions tab. Run the same checks locally before opening a pull request:
 
 ```sh
 make check-workspace

@@ -74,7 +74,7 @@ Agent 的 HostToolProvider 与 TickStreamPort 是主要接入 Seam：Worker 侧�
 
 使用当前 Rust stable（edition 2024）。要求 `cargo fmt --all --check`、`make test`（cargo-nextest 全量运行，配置见 `.config/nextest.toml`；安装：`cargo install --locked cargo-nextest`）、`cargo clippy --locked --workspace --all-targets -- -D warnings`。每个 crate 只有一个集成测试二进制（`tests/all.rs` 与 `tests/all/*.rs`），测试放在被测对象所在的 crate，只有需要完整可执行文件或 cli_fixture 的留在 `agent/tickloop/tests`。优先从 Agent 工具/权限、Tick Subscription→Loop 测试；协议使用真实子进程/PTY，宿主使用可控 Adapter 与隔离 Herdr。只清理测试自己创建的资源。分别记录本地自动检查、真实宿主、真实模型和用户操作证据。
 
-公开协作使用 GitHub Issues 与 Pull Request，CI（`.github/workflows/ci.yml`）运行上述三项检查。维护者的本地工单按功能放在 `.scratch/<feature>/issues/`（不纳入 Git），实现前读完整工单、父规格和依赖状态。规范见工单约定（`docs/agents/issue-tracker.md`）与状态映射（`docs/agents/triage-labels.md`）。Status 是分流状态，Progress 才是实施进度，完成必须有验收证据。
+公开协作使用 GitHub Issues 与 Pull Request，CI（`.github/workflows/ci.yml`）运行上述三项检查；它不随 push 或 PR 触发，只在发布流程中运行或由维护者在 Actions 中手动启动，提交 PR 前在本地跑齐检查。维护者的本地工单按功能放在 `.scratch/<feature>/issues/`（不纳入 Git），实现前读完整工单、父规格和依赖状态。规范见工单约定（`docs/agents/issue-tracker.md`）与状态映射（`docs/agents/triage-labels.md`）。Status 是分流状态，Progress 才是实施进度，完成必须有验收证据。
 
 脚本产生的日志、results、evidence、transcript、缓存必须被 .gitignore 排除；规格、工单与验证记录只留在维护者本地的 `.scratch/`。Git 操作仍受用户明确授权约束，避免将 CRLF 运行输出纳入源文件变更。
 

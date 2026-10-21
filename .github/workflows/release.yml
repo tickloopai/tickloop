@@ -83,9 +83,14 @@ jobs:
             exit 1
           fi
 
+  check:
+    name: Check
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build (${{ matrix.target }})
-    needs: prepare
+    needs: [prepare, check]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:

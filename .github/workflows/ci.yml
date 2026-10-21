@@ -1,16 +1,13 @@
 name: CI
 
+# Hosted runners are costly, so pushes and pull requests do not start CI: the release workflow
+# runs it before building, and a maintainer can start it by hand from the Actions tab.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
