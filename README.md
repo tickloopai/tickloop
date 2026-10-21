@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your platform, pins the release tag and verifies SHA-256. It refuses to take over an existing installation from another source. The script's source is [scripts/install.sh](scripts/install.sh).
+The script installs into `~/.local/bin` and `~/.local/share/tickloop/versions/`, picks the build for your platform, pins the release tag and verifies SHA-256. When `~/.local/bin` is not on PATH, it adds it once to your shell configuration (`~/.zshrc`, `~/.bashrc` and `~/.profile`, or fish's `conf.d`) and names the files it changed. It refuses to take over an existing installation from another source. The script's source is [scripts/install.sh](scripts/install.sh).
 
 ### Cargo launcher
 

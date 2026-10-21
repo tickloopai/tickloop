@@ -58,3 +58,44 @@ tar -tvzf "$archive" > modes
 tar -xzf "$archive"
 [ "$(./tickloop --version)" = "tickloop ${tag#v}" ] || { echo 'Archive reports an unexpected version.' >&2; exit 1; }
 ./tickloop update --install
+
+# Put ~/.local/bin on PATH for new shells, once, in the configuration of the user's login shell.
+bin=$HOME/.local/bin
+case ":${PATH:-}:" in *":$bin:"*) exit 0 ;; esac
+marker='# Added by the Tickloop installer'
+case "${SHELL##*/}" in
+  zsh) set -- "${ZDOTDIR:-$HOME}/.zshrc" ;;
+  bash)
+    login=$HOME/.profile
+    [ -f "$HOME/.bash_profile" ] && login=$HOME/.bash_profile
+    set -- "$HOME/.bashrc" "$login" ;;
+  fish) set -- "$HOME/.config/fish/conf.d/tickloop.fish" ;;
+  *) set -- "$HOME/.profile" ;;
+esac
+added=
+configured=
+for profile in "$@"; do
+  if [ -f "$profile" ] && grep -Fqx "$marker" "$profile"; then
+    configured="$configured $profile"
+    continue
+  fi
+  case "$profile" in
+    *.fish) line='contains $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH' ;;
+    *) line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ;;
+  esac
+  if mkdir -p "${profile%/*}" 2>/dev/null && printf '\n%s\n%s\n' "$marker" "$line" >> "$profile" 2>/dev/null; then
+    added="$added $profile"
+  fi
+done
+if [ -n "$added" ]; then
+  echo "Added $bin to your PATH in:$added"
+fi
+if [ -n "$configured" ]; then
+  echo "$bin is already added to your PATH in:$configured"
+fi
+if [ -n "$added$configured" ]; then
+  echo "Open a new terminal, or run this in the current one:"
+else
+  echo "Could not update your shell configuration; add $bin to PATH yourself, for example:"
+fi
+echo '  export PATH="$HOME/.local/bin:$PATH"'

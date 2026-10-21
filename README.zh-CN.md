@@ -45,7 +45,7 @@ brew install tickloopai/tap/tickloop
 curl -fsSL https://tickloop.ai/install.sh | sh
 ```
 
-脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前系统与架构选择构建，固定发行标签并校验 SHA-256；遇到其他来源的已有安装时报告冲突，不自动接管。脚本源码见 [scripts/install.sh](scripts/install.sh)。
+脚本安装到 `~/.local/bin` 与 `~/.local/share/tickloop/versions/`，按当前系统与架构选择构建，固定发行标签并校验 SHA-256；`~/.local/bin` 不在 PATH 中时，会在 shell 配置（`~/.zshrc`、`~/.bashrc` 与 `~/.profile`，或 fish 的 `conf.d`）里加入一次，并列出改动的文件；遇到其他来源的已有安装时报告冲突，不自动接管。脚本源码见 [scripts/install.sh](scripts/install.sh)。
 
 ### Cargo 启动器
 

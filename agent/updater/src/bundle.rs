@@ -295,7 +295,7 @@ pub(crate) async fn install_native(build: Build) -> Result<()> {
         }
     }
     println!(
-        "Installed Tickloop {} in {}.\nEnsure {} is on PATH.",
+        "Installed Tickloop {} in {}, linked from {}.",
         build.version,
         root.display(),
         bin.display()
