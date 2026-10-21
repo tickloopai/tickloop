@@ -6,6 +6,7 @@
 //! sequences: styling and hyperlinks travel in the span structure, not inside
 //! the string.
 
+use tickloop_ui::markdown::Continuation;
 use unicode_width::UnicodeWidthChar;
 
 use super::hyperlink::Hyperlink;
@@ -1051,6 +1052,9 @@ pub(super) struct RoleLine {
     pub(super) fill_start: usize,
     pub(super) band: Option<BandFill>,
     pub(super) link: Option<String>,
+    /// Set when the row continues the logical line of the row above it after wrapping, so a
+    /// copy joins the two rows instead of breaking the line.
+    pub(super) continuation: Option<Continuation>,
 }
 
 /// A background role over a row's `columns`, such as a bar that runs from a mark in its lead.

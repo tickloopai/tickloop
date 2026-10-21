@@ -22,7 +22,10 @@ const OSC52_LIMIT_BYTES: usize = 74_994;
 /// the user is actually sitting at. A local pasteboard command runs as well when
 /// the session is not remote, because some terminals ship with OSC 52 disabled.
 /// Over SSH that command would fill the remote machine's pasteboard instead, so
-/// it is skipped there. This mirrors Claude Code's `setClipboard`.
+/// it is skipped there. Inside tmux, whose default `set-clipboard external`
+/// drops an application's OSC 52, the sequence is passed through to the outer
+/// terminal and the text is loaded into a tmux buffer, which `-w` also hands to
+/// the outer clipboard. This mirrors Claude Code's `setClipboard`.
 ///
 /// Images are read from the clipboard of the machine Tickloop runs on, which
 /// over SSH is the remote host rather than the user's own machine.
@@ -30,6 +33,7 @@ const OSC52_LIMIT_BYTES: usize = 74_994;
 pub(super) enum Clipboard {
     Terminal {
         native: bool,
+        tmux: bool,
     },
     #[cfg(test)]
     Captured {
@@ -54,6 +58,23 @@ const PASTEBOARD_IMAGE_TYPES: &[&str] = &[
 #[cfg(target_os = "macos")]
 const PASTEBOARD_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// tmux 3.2 added `-w`; an older tmux still takes the buffer without it.
+const TMUX_BUFFER_COMMANDS: &[&[&str]] = &[
+    &["tmux", "load-buffer", "-w", "-"],
+    &["tmux", "load-buffer", "-"],
+];
+
+/// Which copy reached the user, which decides what the copy notice promises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CopyRoute {
+    /// The local pasteboard took it, so pasting works anywhere.
+    Native,
+    /// Only a tmux buffer is sure to hold it; the system clipboard depends on tmux settings.
+    TmuxBuffer,
+    /// Only the OSC 52 sequence went out; the terminal may refuse clipboard access.
+    Terminal,
+}
+
 const PASTEBOARD_COMMANDS: &[&[&str]] = &[
     &["pbcopy"],
     &["wl-copy"],
@@ -67,30 +88,46 @@ impl Clipboard {
     pub(super) fn detect() -> Self {
         Self::Terminal {
             native: std::env::var_os("SSH_CONNECTION").is_none(),
+            tmux: std::env::var_os("TMUX").is_some(),
         }
     }
 
-    pub(super) fn write(&self, text: &str, output: &mut impl Write) -> Result<(), String> {
+    pub(super) fn write(&self, text: &str, output: &mut impl Write) -> Result<CopyRoute, String> {
         match self {
-            Self::Terminal { native } => {
-                // The local command goes first so a quick switch to another
-                // window and paste does not beat it.
+            Self::Terminal { native, tmux } => {
+                // The local commands go first so a quick switch to another
+                // window and paste does not beat them.
                 let native_result = native.then(|| write_native(text));
-                match (write_osc52(text, output), native_result) {
-                    (Ok(()), _) | (Err(_), Some(Ok(()))) => Ok(()),
-                    (Err(osc_error), Some(Err(native_error))) => {
-                        Err(format!("{osc_error}; {native_error}"))
-                    }
-                    (Err(osc_error), None) => Err(osc_error),
+                let tmux_result = tmux.then(|| write_first_command(TMUX_BUFFER_COMMANDS, text));
+                let osc_result = write_osc52(text, output, *tmux);
+                if let Some(Ok(())) = native_result {
+                    return Ok(CopyRoute::Native);
                 }
+                if let Some(Ok(())) = tmux_result {
+                    return Ok(CopyRoute::TmuxBuffer);
+                }
+                let osc_error = match osc_result {
+                    Ok(()) => return Ok(CopyRoute::Terminal),
+                    Err(error) => error,
+                };
+                Err([Some(Err(osc_error)), native_result, tmux_result]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::err)
+                    .collect::<Vec<_>>()
+                    .join("; "))
             }
             #[cfg(test)]
-            Self::Captured { copies, .. } => {
+            Self::Captured { copies, remote, .. } => {
                 copies
                     .lock()
                     .map_err(|error| error.to_string())?
                     .push(text.to_owned());
-                Ok(())
+                Ok(if *remote {
+                    CopyRoute::Terminal
+                } else {
+                    CopyRoute::Native
+                })
             }
         }
     }
@@ -98,7 +135,7 @@ impl Clipboard {
     /// Whether the session runs over SSH, so the clipboard read is the remote host's.
     pub(super) fn is_remote(&self) -> bool {
         match self {
-            Self::Terminal { native } => !native,
+            Self::Terminal { native, .. } => !native,
             #[cfg(test)]
             Self::Captured { remote, .. } => *remote,
         }
@@ -203,8 +240,13 @@ fn read_native_image() -> Result<Option<Image>, String> {
 }
 
 fn write_native(text: &str) -> Result<(), String> {
+    write_first_command(PASTEBOARD_COMMANDS, text)
+}
+
+/// Runs `commands` in turn until one takes `text`.
+fn write_first_command(commands: &[&[&str]], text: &str) -> Result<(), String> {
     let mut last_error = String::from("no pasteboard command is available");
-    for command in PASTEBOARD_COMMANDS {
+    for command in commands {
         match write_with_command(command, text) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
@@ -268,7 +310,10 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-fn write_osc52(text: &str, output: &mut impl Write) -> Result<(), String> {
+/// Writes the OSC 52 sequence, inside tmux wrapped in its DCS passthrough with every ESC
+/// doubled. tmux forwards the payload only with `allow-passthrough` on and otherwise drops the
+/// whole sequence silently, so the wrapping never leaves stray bytes on the screen.
+fn write_osc52(text: &str, output: &mut impl Write, tmux: bool) -> Result<(), String> {
     let encoded = encode_base64(text.as_bytes());
     if encoded.len() > OSC52_LIMIT_BYTES {
         return Err(format!(
@@ -276,7 +321,14 @@ fn write_osc52(text: &str, output: &mut impl Write) -> Result<(), String> {
             encoded.len()
         ));
     }
-    write!(output, "\x1b]52;c;{encoded}\x07")
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    let sequence = if tmux {
+        format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
+    } else {
+        sequence
+    };
+    output
+        .write_all(sequence.as_bytes())
         .and_then(|()| output.flush())
         .map_err(|error| format!("cannot reach the terminal clipboard: {error}"))
 }
@@ -361,17 +413,31 @@ mod tests {
     #[test]
     fn a_remote_session_writes_osc52_and_skips_the_local_pasteboard() {
         let mut output = Vec::new();
-        Clipboard::Terminal { native: false }
-            .write("hi", &mut output)
-            .unwrap();
+        let route = Clipboard::Terminal {
+            native: false,
+            tmux: false,
+        }
+        .write("hi", &mut output)
+        .unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "\x1b]52;c;aGk=\x07");
+        assert_eq!(route, CopyRoute::Terminal);
+    }
+
+    #[test]
+    fn inside_tmux_osc52_is_passed_through_with_its_escapes_doubled() {
+        let mut output = Vec::new();
+        write_osc52("hi", &mut output, true).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
     }
 
     #[test]
     fn osc52_refuses_a_selection_the_terminal_would_truncate() {
         let mut output = Vec::new();
         let oversized = "x".repeat(OSC52_LIMIT_BYTES);
-        let error = write_osc52(&oversized, &mut output).unwrap_err();
+        let error = write_osc52(&oversized, &mut output, false).unwrap_err();
         assert!(error.contains("nothing was copied"), "{error}");
         assert!(
             output.is_empty(),
@@ -383,7 +449,7 @@ mod tests {
     fn osc52_accepts_a_selection_that_fits() {
         let mut output = Vec::new();
         let largest = "x".repeat(OSC52_LIMIT_BYTES / 4 * 3);
-        write_osc52(&largest, &mut output).unwrap();
+        write_osc52(&largest, &mut output, false).unwrap();
         assert!(!output.is_empty());
     }
 }

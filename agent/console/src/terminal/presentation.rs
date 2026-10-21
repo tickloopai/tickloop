@@ -390,7 +390,7 @@ pub(super) fn transcript_document(
                     Some(Role::Error),
                     BLOCK_INDENT,
                 );
-                writer.linked(&safe_text(error), Some(Role::Error), BLOCK_INDENT);
+                writer.hanging(safe_text(error), Some(Role::Error), BLOCK_INDENT);
                 writer.text("\n", None);
             }
             ConversationBlockKind::Outcome(ConversationOutcome::Interrupted) => {
@@ -545,20 +545,6 @@ impl TranscriptWriter {
         }
     }
 
-    /// Text with each web address in it linked.
-    fn linked(&mut self, text: &str, role: Option<Role>, hang: usize) {
-        let links = hyperlink::web_links(text);
-        for (run, link) in hyperlink::runs(text, &links) {
-            self.document.push(TranscriptPiece::Text {
-                text: run.to_owned(),
-                role,
-                fill: None,
-                hang,
-                link: link.cloned(),
-            });
-        }
-    }
-
     fn prompt(&mut self, text: &str, links: &[LinkRange]) {
         self.block();
         self.filled(
@@ -669,17 +655,13 @@ impl TranscriptWriter {
                 link: None,
             });
             for (text, role) in line.spans {
-                if role == Some(Role::Error) {
-                    self.linked(&text, role, RESULT_INDENT);
-                } else {
-                    self.document.push(TranscriptPiece::Text {
-                        text,
-                        role,
-                        fill: line.fill,
-                        hang: RESULT_INDENT,
-                        link: None,
-                    });
-                }
+                self.document.push(TranscriptPiece::Text {
+                    text,
+                    role,
+                    fill: line.fill,
+                    hang: RESULT_INDENT,
+                    link: None,
+                });
             }
             self.text("\n", None);
         }

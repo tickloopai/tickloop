@@ -88,7 +88,7 @@ fn nested_markdown_roles_patch_inherited_modifiers_and_restore_surrounding_text(
 mod layout {
     use tickloop_ui::{
         format::width,
-        markdown::{MarkdownLine, StreamingLayout, layout, plain_text},
+        markdown::{Continuation, MarkdownLine, StreamingLayout, layout, plain_text},
         settings::AmbiguousWidth,
     };
 
@@ -293,6 +293,84 @@ mod layout {
         assert_eq!(
             plain_text("**a** long line that never wraps\n\n- item"),
             "a long line that never wraps\n\n- item"
+        );
+    }
+
+    /// Each run of `lines` that links somewhere, as (text, target).
+    fn linked_runs(lines: &[MarkdownLine]) -> Vec<(String, String)> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter_map(|span| Some((span.text.clone(), span.link.as_deref()?.to_owned())))
+            .collect()
+    }
+
+    #[test]
+    fn every_row_of_a_wrapped_url_links_to_the_whole_url() {
+        let url = "https://example.com/a/very/long/path?query=value";
+        let lines = layout(&format!("see {url}, ok"), 20, AmbiguousWidth::Narrow);
+        assert!(lines.len() > 2, "{:?}", texts(&lines));
+        let runs = linked_runs(&lines);
+        assert_eq!(
+            runs.iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>(),
+            url
+        );
+        assert!(runs.iter().all(|(_, target)| target == url), "{runs:?}");
+    }
+
+    #[test]
+    fn a_labelled_link_and_its_destination_both_link_to_the_destination() {
+        let lines = layout(
+            "[文档](https://a.io/x) and `https://b.io` <https://c.io>",
+            200,
+            AmbiguousWidth::Narrow,
+        );
+        assert_eq!(
+            linked_runs(&lines),
+            [
+                ("文档".to_owned(), "https://a.io/x".to_owned()),
+                ("https://a.io/x".to_owned(), "https://a.io/x".to_owned()),
+                ("https://b.io".to_owned(), "https://b.io".to_owned()),
+                ("https://c.io".to_owned(), "https://c.io".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_rows_say_how_they_continue_the_row_above() {
+        let lines = layout(
+            "- alpha beta gamma\n\nabcdefghijkl\n\n```\nxy\n```",
+            8,
+            AmbiguousWidth::Narrow,
+        );
+        let rows: Vec<(String, Option<Continuation>)> = lines
+            .iter()
+            .map(|line| (line.text(), line.continuation))
+            .collect();
+        let spaced = |indent| {
+            Some(Continuation {
+                indent,
+                after_space: true,
+            })
+        };
+        let split = Some(Continuation {
+            indent: 0,
+            after_space: false,
+        });
+        assert_eq!(
+            rows,
+            [
+                ("- alpha".to_owned(), None),
+                ("  beta".to_owned(), spaced(2)),
+                ("  gamma".to_owned(), spaced(2)),
+                (String::new(), None),
+                ("abcdefgh".to_owned(), None),
+                ("ijkl".to_owned(), split),
+                (String::new(), None),
+                ("xy".to_owned(), None),
+            ]
         );
     }
 }

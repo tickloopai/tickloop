@@ -6,7 +6,8 @@ use std::{
 
 use tickloop_agent_protocol::ModelRequestKind;
 use tickloop_ui::{
-    markdown::{MarkdownLine, Marks, StreamingLayout},
+    hyperlink::web_url_ranges,
+    markdown::{Continuation, MarkdownLine, Marks, StreamingLayout},
     settings::AmbiguousWidth,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -619,23 +620,11 @@ impl Scrollback {
     fn append_rows(&mut self, runs: &[(String, Option<Role>)], hang: usize) {
         let first_line = self.lines.len() - 1 + usize::from(self.last_line_is_markdown());
         for (text, role) in runs {
-            self.append_linked_runs(text, *role);
+            self.append_as(text, *role, None);
         }
         let last_line = self.lines.len() - usize::from(self.lines.last().unwrap().is_empty());
         for style in &mut self.line_styles[first_line.min(last_line)..last_line] {
             style.hang = hang;
-        }
-    }
-
-    /// Text whose error runs open the web addresses they name.
-    fn append_linked_runs(&mut self, text: &str, role: Option<Role>) {
-        if role == Some(Role::Error) {
-            let links = super::hyperlink::web_links(text);
-            for (run, link) in super::hyperlink::runs(text, &links) {
-                self.append_span(run, role, None, link);
-            }
-        } else {
-            self.append_as(text, role, None);
         }
     }
 
@@ -1304,17 +1293,22 @@ impl Scrollback {
         }
     }
 
-    /// Text of the rows in `range`, numbered as a frame numbers them: the conversation, then its
-    /// tail. Rows past the end are left out.
-    pub(super) fn row_texts(&mut self, range: Range<usize>) -> Vec<String> {
+    /// The rows in `range`, numbered as a frame numbers them: the conversation, then its tail.
+    /// Rows past the end are left out.
+    pub(super) fn rows_in(&mut self, range: Range<usize>) -> Vec<RoleLine> {
         self.refresh_rows();
         let tail = self.tail_rows();
         range
             .map_while(|index| match index.checked_sub(self.conversation_rows) {
-                None => Some(self.rows[index].styled.text()),
-                Some(tail_index) => Some(tail.get(tail_index)?.styled(self.width).text()),
+                None => Some(self.rows[index].styled.clone()),
+                Some(tail_index) => Some(tail.get(tail_index)?.styled(self.width)),
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn row_texts(&mut self, range: Range<usize>) -> Vec<String> {
+        self.rows_in(range).iter().map(RoleLine::text).collect()
     }
 
     /// The rows below the conversation: a running command's output under its echo and the hint
@@ -1593,15 +1587,30 @@ fn push_markdown_rows(rows: &mut Vec<Row>, block: &mut MarkdownBlock, line: usiz
             .into_iter()
             .enumerate()
         {
-            let lead = if row_index == 0 {
-                lead.clone()
+            let (lead, continuation) = if row_index == 0 {
+                (
+                    lead.clone(),
+                    markdown_line.continuation.map(|continuation| Continuation {
+                        indent: hang + continuation.indent,
+                        ..continuation
+                    }),
+                )
             } else {
-                Lead::indent(hang)
+                (
+                    Lead::indent(hang),
+                    Some(Continuation {
+                        indent: hang,
+                        after_space: false,
+                    }),
+                )
             };
-            let mut styled = RoleLine::default();
+            let mut styled = RoleLine {
+                continuation,
+                ..RoleLine::default()
+            };
             styled.push(lead.text, lead.role);
-            for (text, role) in content {
-                styled.push(text, role);
+            for (text, role, link) in content {
+                styled.push_linked(text, role, link);
             }
             let byte = markdown_line.source_offset;
             let tab_cell = rows
@@ -1644,23 +1653,29 @@ impl Lead {
     }
 }
 
+type MarkdownRun = (String, Option<Role>, Option<Hyperlink>);
+
 /// The layout already fits its width; only a key-value table cell with a
-/// minimum value width can overflow, and it continues on further rows.
-fn split_overflow(line: &MarkdownLine, width: usize) -> Vec<Vec<(String, Option<Role>)>> {
+/// minimum value width can overflow, and it continues on further rows. Only web
+/// targets become links, so a Markdown link cannot open a local file.
+fn split_overflow(line: &MarkdownLine, width: usize) -> Vec<Vec<MarkdownRun>> {
     let mut rows = vec![Vec::new()];
     let mut columns = 0;
     for span in &line.spans {
         let role = markdown_role(span.marks);
+        let link = span.link.as_deref().and_then(Hyperlink::web);
         for character in span.text.chars() {
             let character_width = character.width().unwrap_or(0);
             if columns > 0 && columns + character_width > width {
                 rows.push(Vec::new());
                 columns = 0;
             }
-            let row: &mut Vec<(String, Option<Role>)> = rows.last_mut().unwrap();
+            let row: &mut Vec<MarkdownRun> = rows.last_mut().unwrap();
             match row.last_mut() {
-                Some((text, last_role)) if *last_role == role => text.push(character),
-                _ => row.push((character.to_string(), role)),
+                Some((text, last_role, last_link)) if *last_role == role && *last_link == link => {
+                    text.push(character)
+                }
+                _ => row.push((character.to_string(), role, link.clone())),
             }
             columns += character_width;
         }
@@ -1711,11 +1726,16 @@ impl Cell<'_> {
     }
 }
 
-fn line_cells<'a>(text: &str, style: &'a LineStyle, width: usize) -> Vec<Cell<'a>> {
+fn line_cells<'a>(
+    text: &str,
+    style: &'a LineStyle,
+    links: &'a [(Range<usize>, Hyperlink)],
+    width: usize,
+) -> Vec<Cell<'a>> {
     let mut cells = Vec::with_capacity(text.len());
     let mut logical_column = 0;
     let mut marks = style.marks.iter().peekable();
-    let mut links = style.links.iter().peekable();
+    let mut links = links.iter().peekable();
     for (byte, character) in text.char_indices() {
         while marks.peek().is_some_and(|(range, _)| range.end <= byte) {
             marks.next();
@@ -1766,7 +1786,8 @@ fn line_cells<'a>(text: &str, style: &'a LineStyle, width: usize) -> Vec<Cell<'a
 /// inside that hanging lead. A word longer than a row breaks between characters.
 fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, width: usize) {
     let hang = if style.hang < width { style.hang } else { 0 };
-    let cells = line_cells(text, style, width);
+    let links = links_with_plain_urls(text, &style.links);
+    let cells = line_cells(text, style, &links, width);
     let mut row_start = 0;
     let mut indent = 0;
     let mut columns = 0;
@@ -1797,7 +1818,7 @@ fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, wi
                 indent,
                 style,
                 line,
-                row_start == 0,
+                continuation_at(&cells, row_start, indent),
             );
             pushed = true;
             if next >= cells.len() {
@@ -1841,9 +1862,37 @@ fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, wi
             indent,
             style,
             line,
-            row_start == 0,
+            continuation_at(&cells, row_start, indent),
         );
     }
+}
+
+/// How a row whose first cell is `row_start` continues the logical line, which is not at all
+/// for the row that starts it.
+fn continuation_at(cells: &[Cell], row_start: usize, indent: usize) -> Option<Continuation> {
+    (row_start > 0).then(|| Continuation {
+        indent,
+        after_space: cells[row_start - 1].is_space(),
+    })
+}
+
+/// `links` with every web URL written as plain text in `text` linked too, in text order. A URL
+/// that overlaps a link already recorded is left to that link.
+fn links_with_plain_urls(
+    text: &str,
+    links: &[(Range<usize>, Hyperlink)],
+) -> Vec<(Range<usize>, Hyperlink)> {
+    let mut merged = links.to_vec();
+    for range in web_url_ranges(text) {
+        let overlaps = links
+            .iter()
+            .any(|(linked, _)| linked.start < range.end && range.start < linked.end);
+        if !overlaps && let Some(link) = Hyperlink::web(&text[range.clone()]) {
+            merged.push((range, link));
+        }
+    }
+    merged.sort_by_key(|(range, _)| range.start);
+    merged
 }
 
 fn trim_trailing_spaces(cells: &[Cell], start: usize, end: usize) -> usize {
@@ -1859,10 +1908,10 @@ fn push_row(
     indent: usize,
     style: &LineStyle,
     line: usize,
-    starts_line: bool,
+    continuation: Option<Continuation>,
 ) {
     let start = match cells.first() {
-        Some(cell) if !starts_line => Position {
+        Some(cell) if continuation.is_some() => Position {
             line,
             byte: cell.byte,
             tab_cell: cell.tab_cell,
@@ -1875,6 +1924,7 @@ fn push_row(
     };
     let mut styled = RoleLine {
         fill: style.fill,
+        continuation,
         ..Default::default()
     };
     styled.push(" ".repeat(indent), None);
@@ -2152,6 +2202,33 @@ mod tests {
         assert_eq!(scrollback.frame(40, 5).lines, ["❯ see [Image #1] now", ""]);
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
         assert_eq!(linked_text(&mut scrollback, 12), ["[Image", "#1]"]);
+    }
+
+    #[test]
+    fn a_plain_text_url_links_every_row_it_wraps_onto_to_the_whole_url() {
+        let url = "https://example.com/a/very/long/path/page.html";
+        let mut scrollback = Scrollback::new();
+        scrollback.append_body(&[(format!("open {url} now\n"), Some(Role::Error))]);
+        let frame = scrollback.frame(24, 8);
+        let linked: Vec<_> = frame
+            .styled
+            .iter()
+            .flat_map(|row| row.spans.iter())
+            .filter_map(|span| Some((span.text.as_str(), span.link.as_ref()?.url())))
+            .collect();
+        assert!(linked.len() > 1, "the URL must wrap: {:?}", frame.lines);
+        assert_eq!(
+            linked.iter().map(|(text, _)| *text).collect::<String>(),
+            url
+        );
+        assert!(linked.iter().all(|(_, target)| *target == url));
+        assert!(
+            frame.styled[1..]
+                .iter()
+                .take(linked.len() - 1)
+                .all(|row| row.continuation.is_some()),
+            "rows after the first continue the line"
+        );
     }
 
     #[test]

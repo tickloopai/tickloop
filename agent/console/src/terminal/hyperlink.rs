@@ -65,17 +65,6 @@ impl Hyperlink {
     }
 }
 
-pub(super) fn web_links(text: &str) -> Vec<(Range<usize>, Hyperlink)> {
-    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    URL.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>\[\]"']+"#).expect("valid URL regex"))
-        .find_iter(text)
-        .filter_map(|found| {
-            let url = found.as_str().trim_end_matches(['.', ',', ';', ')']);
-            Hyperlink::web(url).map(|link| (found.start()..found.start() + url.len(), link))
-        })
-        .collect()
-}
-
 /// Splits `text` into non-empty runs, each carrying the link of its byte range or none.
 /// Ranges are sorted, disjoint and on character boundaries.
 pub(super) fn runs<'a>(

@@ -399,9 +399,9 @@ impl Transcript {
     }
 
     /// Text of the content rows in `range`; rows past the end are left out.
-    pub(super) fn row_texts(&self, range: Range<usize>) -> &[String] {
-        let end = range.end.min(self.texts.len());
-        &self.texts[range.start.min(end)..end]
+    pub(super) fn rows_in(&self, range: Range<usize>) -> &[RoleLine] {
+        let end = range.end.min(self.rows.len());
+        &self.rows[range.start.min(end)..end]
     }
 
     /// The blank row, the dim rule and either the hint row or the open search bar, with the

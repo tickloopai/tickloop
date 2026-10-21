@@ -11,7 +11,9 @@ use ratatui::{
     text::{Line, Text},
     widgets::Paragraph,
 };
-use tickloop_ui::hyperlink::{OSC8_START, link_rows, linked, split_rows, supported};
+use tickloop_ui::hyperlink::{
+    OSC8_START, link_rows, linked, split_rows, supported, web_url_ranges,
+};
 
 const TARGET: &str = "https://example.com/oauth2/device?user_code=ABCD-EFGH&client_id=tickloop";
 
@@ -84,6 +86,7 @@ fn terminals_that_show_links_are_detected_like_claude_code() {
         &[("CI", "1"), ("TERM_PROGRAM", "kitty")],
         &[("FORCE_HYPERLINK", "1")],
         &[("FORCE_HYPERLINK", ""), ("TERM_PROGRAM", "ghostty")],
+        &[("HERDR_ENV", "1"), ("TERM", "xterm-256color")],
     ] {
         assert!(
             supported(environment(supported_terminal)),
@@ -197,4 +200,38 @@ fn a_link_that_is_not_shown_or_could_break_out_of_its_escape_leaves_the_buffer_a
             .iter()
             .all(|cell| cell.diff_option == CellDiffOption::None)
     );
+}
+
+fn urls(text: &str) -> Vec<&str> {
+    web_url_ranges(text)
+        .into_iter()
+        .map(|range| &text[range])
+        .collect()
+}
+
+#[test]
+fn plain_text_urls_end_where_the_sentence_resumes() {
+    assert_eq!(
+        urls("see https://example.com/a?b=1, then http://x.io."),
+        ["https://example.com/a?b=1", "http://x.io"]
+    );
+    assert_eq!(
+        urls("(https://en.wikipedia.org/wiki/Rust_(language)) and [http://a.b/c]"),
+        [
+            "https://en.wikipedia.org/wiki/Rust_(language)",
+            "http://a.b/c"
+        ]
+    );
+    assert_eq!(
+        urls("打开https://example.com/路径，然后 \"https://q.io/x\""),
+        ["https://example.com/", "https://q.io/x"]
+    );
+    assert_eq!(urls("<https://a.io/x>`"), ["https://a.io/x"]);
+}
+
+#[test]
+fn a_scheme_alone_or_another_scheme_is_not_a_url() {
+    assert!(urls("http:// https://").is_empty());
+    assert!(urls("ftp://a.io file:///tmp/x httpx://a.io").is_empty());
+    assert!(urls("").is_empty());
 }

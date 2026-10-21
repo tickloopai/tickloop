@@ -5,6 +5,7 @@
 //! styles, so each host maps them onto its own theme.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -16,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     format::width,
     highlight::{CodeLine, CodeToken},
+    hyperlink::web_url_ranges,
     settings::AmbiguousWidth,
     styles::RendererStyles,
 };
@@ -55,6 +57,17 @@ pub struct Marks {
 pub struct MarkdownSpan {
     pub text: String,
     pub marks: Marks,
+    /// The target this run links to: a link's destination, or a URL written as plain text.
+    pub link: Option<Arc<str>>,
+}
+
+/// How a row continues the source line of the row above it, when wrapping broke that line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Continuation {
+    /// Columns of prefix before the continued text, such as a list item's indent.
+    pub indent: usize,
+    /// Whether the break took the place of a space, which a copy of both rows puts back.
+    pub after_space: bool,
 }
 
 /// One laid-out row. `source_offset` is a byte offset into the Markdown source
@@ -64,6 +77,8 @@ pub struct MarkdownSpan {
 pub struct MarkdownLine {
     pub source_offset: usize,
     pub spans: Vec<MarkdownSpan>,
+    /// Set on every row after the first that one wrapped source line takes.
+    pub continuation: Option<Continuation>,
 }
 
 impl MarkdownLine {
@@ -71,18 +86,20 @@ impl MarkdownLine {
         self.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
-    fn push(&mut self, text: &str, marks: Marks) {
+    fn push(&mut self, text: &str, marks: Marks, link: Option<&Arc<str>>) {
         if text.is_empty() {
             return;
         }
         if let Some(last) = self.spans.last_mut()
             && last.marks == marks
+            && last.link.as_ref() == link
         {
             last.text.push_str(text);
         } else {
             self.spans.push(MarkdownSpan {
                 text: text.to_owned(),
                 marks,
+                link: link.cloned(),
             });
         }
     }
@@ -252,6 +269,7 @@ struct Piece {
     text: String,
     marks: Marks,
     offset: usize,
+    link: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -631,6 +649,7 @@ impl TreeBuilder {
                 text: text.to_owned(),
                 marks,
                 offset,
+                link: None,
             });
         }
     }
@@ -654,8 +673,12 @@ impl TreeBuilder {
                 text: address.to_owned(),
                 marks,
                 offset,
+                link: None,
             });
-        } else if label.is_empty() || label == link.destination {
+            return;
+        }
+        let target: Arc<str> = Arc::from(link.destination.as_str());
+        if label.is_empty() || label == link.destination {
             pieces.truncate(first_piece);
             pieces.push(Piece {
                 text: link.destination,
@@ -664,13 +687,24 @@ impl TreeBuilder {
                     ..marks
                 },
                 offset,
+                link: Some(target),
             });
         } else {
-            pieces.push(Piece {
-                text: format!(" ({})", link.destination),
-                marks,
-                offset,
-            });
+            for piece in &mut pieces[first_piece..] {
+                piece.link.get_or_insert_with(|| target.clone());
+            }
+            for (text, link) in [
+                (" (".to_owned(), None),
+                (link.destination, Some(target)),
+                (")".to_owned(), None),
+            ] {
+                pieces.push(Piece {
+                    text,
+                    marks,
+                    offset,
+                    link,
+                });
+            }
         }
     }
 }
@@ -681,6 +715,7 @@ struct Cell {
     marks: Marks,
     offset: usize,
     width: usize,
+    link: Option<Arc<str>>,
 }
 
 impl Cell {
@@ -713,7 +748,7 @@ impl Writer<'_> {
             if let Some(previous) = previous
                 && self.separated(previous, block.range.start)
             {
-                self.emit(&[], Vec::new(), block.range.start);
+                self.emit(&[], Vec::new(), block.range.start, None);
             }
             let prefix = if index == 0 { first } else { rest };
             self.write_block(block, prefix, rest, list_level);
@@ -740,7 +775,7 @@ impl Writer<'_> {
                 self.write_code(text, info, first, rest, block.range.start)
             }
             BlockKind::Rule => {
-                let cells = self.cells(RULE, Marks::default(), block.range.start);
+                let cells = self.cells(RULE, Marks::default(), None, block.range.start);
                 self.write_rows(&cells, first, rest, block.range.start);
             }
             BlockKind::Quote(blocks) => {
@@ -782,7 +817,7 @@ impl Writer<'_> {
             if let Some(previous) = previous
                 && self.separated(previous, item.range.start)
             {
-                self.emit(&[], Vec::new(), item.range.start);
+                self.emit(&[], Vec::new(), item.range.start, None);
             }
             let marker = match start {
                 Some(start) => format!("{}. ", list_number(list_level, start + index as u64)),
@@ -798,7 +833,7 @@ impl Writer<'_> {
                 BlockKind::Item(blocks) if !blocks.is_empty() => {
                     self.write_sequence(blocks, &item_first, &item_rest, list_level + 1, None);
                 }
-                _ => self.emit(&item_first, Vec::new(), item.range.start),
+                _ => self.emit(&item_first, Vec::new(), item.range.start, None),
             }
             previous = Some(BlockEnd {
                 end: item.range.end,
@@ -814,15 +849,22 @@ impl Writer<'_> {
             for (index, segment) in piece.text.split('\n').enumerate() {
                 if index > 0 {
                     let prefix = if is_first_line { first } else { rest };
+                    link_bare_urls(&mut logical_line);
                     self.write_rows(&logical_line, prefix, rest, offset);
                     logical_line.clear();
                     is_first_line = false;
                 }
                 let text = segment.replace('\t', " ");
-                logical_line.extend(self.cells(&text, piece.marks, piece.offset));
+                logical_line.extend(self.cells(
+                    &text,
+                    piece.marks,
+                    piece.link.as_ref(),
+                    piece.offset,
+                ));
             }
         }
         let prefix = if is_first_line { first } else { rest };
+        link_bare_urls(&mut logical_line);
         self.write_rows(&logical_line, prefix, rest, offset);
     }
 
@@ -830,10 +872,11 @@ impl Writer<'_> {
         let highlighted = crate::highlight::highlight_fenced(info, text);
         let mut line_offset = offset;
         for (index, line) in text.split('\n').enumerate() {
-            let cells = match highlighted.as_ref().and_then(|lines| lines.get(index)) {
+            let mut cells = match highlighted.as_ref().and_then(|lines| lines.get(index)) {
                 Some(classes) => self.code_cells(line, classes, line_offset),
-                None => self.cells(&expand_tabs(line), Marks::default(), line_offset),
+                None => self.cells(&expand_tabs(line), Marks::default(), None, line_offset),
             };
+            link_bare_urls(&mut cells);
             let prefix = if index == 0 { first } else { rest };
             self.write_rows(&cells, prefix, rest, line_offset);
             line_offset += line.len() + 1;
@@ -862,6 +905,7 @@ impl Writer<'_> {
                     marks,
                     offset: offset + index,
                     width: 1,
+                    link: None,
                 }));
                 column += spaces;
             } else if !grapheme.chars().any(char::is_control) {
@@ -870,6 +914,7 @@ impl Writer<'_> {
                     marks,
                     offset: offset + index,
                     width: width(grapheme, self.ambiguous),
+                    link: None,
                 });
                 column += grapheme.chars().count();
             }
@@ -879,9 +924,22 @@ impl Writer<'_> {
 
     fn write_rows(&mut self, cells: &[Cell], first: &Prefix, rest: &Prefix, offset: usize) {
         let (first, rest, available) = self.fit_prefixes(first, rest);
-        for (index, row) in wrap(cells, available, true).into_iter().enumerate() {
+        let indent = prefix_width(rest, self.ambiguous);
+        for (index, (row, after_space)) in wrap_rows(cells, available, true).into_iter().enumerate()
+        {
             let row_offset = row.first().map_or(offset, |cell| cell.offset);
-            self.emit(if index == 0 { first } else { rest }, row, row_offset);
+            let (prefix, continuation) = if index == 0 {
+                (first, None)
+            } else {
+                (
+                    rest,
+                    Some(Continuation {
+                        indent,
+                        after_space,
+                    }),
+                )
+            };
+            self.emit(prefix, row, row_offset, continuation);
         }
     }
 
@@ -899,23 +957,30 @@ impl Writer<'_> {
         }
     }
 
-    fn emit(&mut self, prefix: &Prefix, cells: Vec<Cell>, offset: usize) {
+    fn emit(
+        &mut self,
+        prefix: &Prefix,
+        cells: Vec<Cell>,
+        offset: usize,
+        continuation: Option<Continuation>,
+    ) {
         let previous_offset = self.lines.last().map_or(0, |line| line.source_offset);
         let mut line = MarkdownLine {
             source_offset: offset.max(previous_offset),
             spans: Vec::new(),
+            continuation,
         };
         for (text, marks) in prefix {
-            line.push(text, *marks);
+            line.push(text, *marks, None);
         }
         for cell in &cells {
-            line.push(&cell.grapheme, cell.marks);
+            line.push(&cell.grapheme, cell.marks, cell.link.as_ref());
         }
         line.trim_end();
         self.lines.push(line);
     }
 
-    fn cells(&self, text: &str, marks: Marks, offset: usize) -> Vec<Cell> {
+    fn cells(&self, text: &str, marks: Marks, link: Option<&Arc<str>>, offset: usize) -> Vec<Cell> {
         text.grapheme_indices(true)
             .filter(|(_, grapheme)| !grapheme.chars().any(char::is_control))
             .map(|(index, grapheme)| Cell {
@@ -923,6 +988,7 @@ impl Writer<'_> {
                 marks,
                 offset: offset + index,
                 width: width(grapheme, self.ambiguous),
+                link: link.cloned(),
             })
             .collect()
     }
@@ -955,21 +1021,24 @@ impl Writer<'_> {
             .horizontal(&header, &rows, alignments, columns)
             .unwrap_or_else(|| table_vertical(&header, &rows, columns, self.ambiguous));
         for (index, cells) in lines.into_iter().enumerate() {
-            self.emit(if index == 0 { first } else { rest }, cells, offset);
+            self.emit(if index == 0 { first } else { rest }, cells, offset, None);
         }
     }
 
     fn table_cell(&self, pieces: &[Piece]) -> Vec<Cell> {
-        pieces
+        let mut cells: Vec<Cell> = pieces
             .iter()
             .flat_map(|piece| {
                 self.cells(
                     &piece.text.replace(['\n', '\t'], " "),
                     piece.marks,
+                    piece.link.as_ref(),
                     piece.offset,
                 )
             })
-            .collect()
+            .collect();
+        link_bare_urls(&mut cells);
+        cells
     }
 }
 
@@ -1067,6 +1136,14 @@ fn breaks_between(previous: &Cell, next: &Cell) -> bool {
 /// spaces, splits words longer than a row only when `hard`, and keeps leading
 /// whitespace. Graphemes wider than a whole row are dropped.
 fn wrap(cells: &[Cell], columns: usize, hard: bool) -> Vec<Vec<Cell>> {
+    wrap_rows(cells, columns, hard)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// [`wrap`], with whether each row starts where the wrap took the place of a space.
+fn wrap_rows(cells: &[Cell], columns: usize, hard: bool) -> Vec<(Vec<Cell>, bool)> {
     let columns = columns.max(1);
     let mut words = Vec::new();
     let mut separator = None;
@@ -1084,15 +1161,16 @@ fn wrap(cells: &[Cell], columns: usize, hard: bool) -> Vec<Vec<Cell>> {
     }
     words.push((separator, &cells[word_start..]));
 
-    let mut rows = vec![Vec::new()];
+    let mut rows = vec![(Vec::new(), false)];
     let mut row_width = 0;
     for (separator, word) in words {
+        let after_space = separator.is_some();
         // A space that falls exactly on a row break is dropped rather than
         // starting the next row, which wrap-ansi with `trim: false` would do.
         if let Some(separator) = separator
             && row_width < columns
         {
-            rows.last_mut().unwrap().push(separator.clone());
+            rows.last_mut().unwrap().0.push(separator.clone());
             row_width += separator.width;
         }
         let word: Vec<&Cell> = word.iter().filter(|cell| cell.width <= columns).collect();
@@ -1102,27 +1180,50 @@ fn wrap(cells: &[Cell], columns: usize, hard: bool) -> Vec<Vec<Cell>> {
             let breaks_starting_this_row = 1 + (word_width - remaining - 1) / columns;
             let breaks_starting_next_row = (word_width - 1) / columns;
             if breaks_starting_next_row < breaks_starting_this_row {
-                rows.push(Vec::new());
+                rows.push((Vec::new(), after_space));
                 row_width = 0;
             }
-            for cell in word {
+            for (index, cell) in word.into_iter().enumerate() {
                 if row_width > 0 && row_width + cell.width > columns {
-                    rows.push(Vec::new());
+                    rows.push((Vec::new(), index == 0 && after_space));
                     row_width = 0;
                 }
-                rows.last_mut().unwrap().push(cell.clone());
+                rows.last_mut().unwrap().0.push(cell.clone());
                 row_width += cell.width;
             }
             continue;
         }
         if row_width > 0 && word_width > 0 && row_width + word_width > columns {
-            rows.push(Vec::new());
+            rows.push((Vec::new(), after_space));
             row_width = 0;
         }
-        rows.last_mut().unwrap().extend(word.into_iter().cloned());
+        rows.last_mut().unwrap().0.extend(word.into_iter().cloned());
         row_width += word_width;
     }
     rows
+}
+
+/// Links the URLs written as plain text across `cells`, which may come from several pieces;
+/// a run that already links somewhere keeps its own target.
+fn link_bare_urls(cells: &mut [Cell]) {
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(cells.len());
+    for cell in cells.iter() {
+        starts.push(text.len());
+        text.push_str(&cell.grapheme);
+    }
+    for range in web_url_ranges(&text) {
+        let first = starts.partition_point(|start| *start < range.start);
+        let end = starts.partition_point(|start| *start < range.end);
+        let covered = &mut cells[first..end];
+        if covered.iter().any(|cell| cell.link.is_some()) {
+            continue;
+        }
+        let target: Arc<str> = Arc::from(&text[range]);
+        for cell in covered {
+            cell.link = Some(target.clone());
+        }
+    }
 }
 
 fn trimmed_rows(cells: &[Cell], columns: usize, hard: bool) -> Vec<Vec<Cell>> {
@@ -1329,6 +1430,7 @@ fn plain_cells(text: &str, ambiguous: AmbiguousWidth) -> Vec<Cell> {
             marks: Marks::default(),
             offset: 0,
             width: width(grapheme, ambiguous),
+            link: None,
         })
         .collect()
 }

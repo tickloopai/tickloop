@@ -6,6 +6,7 @@
 //! link that wraps from any of its rows.
 
 use std::num::NonZeroU16;
+use std::ops::Range;
 
 use ratatui::{
     buffer::{Buffer, CellDiffOption},
@@ -28,6 +29,80 @@ const ADDITIONAL_HYPERLINK_TERMINALS: [&str; 6] = [
     "iTerm.app",
     "iTerm2",
 ];
+
+/// Herdr parses OSC 8 in its panes and opens a link's whole target on a modified click, so the
+/// rows of a wrapped link need it there even when the outer terminal is not recognised.
+const HERDR_ENVIRONMENT: (&str, &str) = ("HERDR_ENV", "1");
+
+const WEB_URL_SCHEMES: [&str; 2] = ["https://", "http://"];
+/// Punctuation that ends a sentence rather than a URL when it is a URL's last character.
+const URL_TRAILING_PUNCTUATION: &str = ".,;:!?'\"`*";
+const URL_BRACKETS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+/// Byte ranges of the http(s) URLs written as plain text in `text`, after Herdr's pane URL
+/// detection. A URL runs to whitespace, a quote or angle bracket, or a wide character such as
+/// CJK text or full-width punctuation, then loses trailing sentence punctuation and any closing
+/// bracket it did not open.
+pub fn web_url_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(start) = next_web_url_start(text, from) {
+        let scheme_end = start
+            + WEB_URL_SCHEMES
+                .iter()
+                .find(|scheme| text[start..].starts_with(*scheme))
+                .map_or(0, |scheme| scheme.len());
+        let run_end = text[scheme_end..]
+            .char_indices()
+            .find(|(_, character)| ends_web_url(*character))
+            .map_or(text.len(), |(offset, _)| scheme_end + offset);
+        let end = start + trimmed_url_len(&text[start..run_end]);
+        if end > scheme_end {
+            ranges.push(start..end);
+        }
+        from = end.max(scheme_end);
+    }
+    ranges
+}
+
+fn next_web_url_start(text: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(offset) = text.get(search..)?.find("http") {
+        let start = search + offset;
+        if WEB_URL_SCHEMES
+            .iter()
+            .any(|scheme| text[start..].starts_with(scheme))
+        {
+            return Some(start);
+        }
+        search = start + "http".len();
+    }
+    None
+}
+
+fn ends_web_url(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_control()
+        || matches!(character, '"' | '<' | '>' | '`')
+        || character.width().unwrap_or(0) > 1
+}
+
+fn trimmed_url_len(url: &str) -> usize {
+    let mut end = url.len();
+    while let Some(last) = url[..end].chars().next_back() {
+        let unopened_closer = URL_BRACKETS.iter().any(|(open, close)| {
+            last == *close && {
+                let body = &url[..end - last.len_utf8()];
+                body.matches(*open).count() <= body.matches(*close).count()
+            }
+        });
+        if !URL_TRAILING_PUNCTUATION.contains(last) && !unopened_closer {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
+}
 
 /// `text` as an OSC 8 hyperlink to `target`.
 pub fn linked(target: &str, text: &str) -> String {
@@ -100,6 +175,7 @@ pub fn supported(variable: impl Fn(&str) -> Option<String>) -> bool {
                 .is_some_and(|terminal| ADDITIONAL_HYPERLINK_TERMINALS.contains(&terminal.as_str()))
         })
         || set("TERM").is_some_and(|term| term.contains("kitty"))
+        || set(HERDR_ENVIRONMENT.0).as_deref() == Some(HERDR_ENVIRONMENT.1)
 }
 
 /// `supports-hyperlinks` 3.2 for a terminal stdout on a Unix platform; `set` only

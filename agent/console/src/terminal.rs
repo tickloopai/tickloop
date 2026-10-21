@@ -61,6 +61,7 @@ pub mod monitor_command;
 #[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
+mod opener;
 mod paste_blocks;
 mod pasted_image_paths;
 mod permissions_surface;

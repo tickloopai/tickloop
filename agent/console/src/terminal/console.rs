@@ -88,7 +88,7 @@ pub(super) use agent_layout::{
 
 use super::{
     agent_messaging::AgentColors,
-    clipboard::Clipboard,
+    clipboard::{Clipboard, CopyRoute},
     clipboard_hint::{CLIPBOARD_IMAGE_HINT, ClipboardImageHint},
     completion::{
         CHILD_AUTHORIZATION_FIXED, CommandScope, Completion, CompletionAction, CompletionKey,
@@ -120,6 +120,7 @@ use super::{
     },
     input_view::InputView,
     monitor::{MONITOR_COLUMNS, Monitor, TickGroup},
+    opener::Opener,
     paste_blocks::{PasteBlocks, PasteRegistration},
     pasted_image_paths::{find_image_paths, read_pasted_image},
     permissions_surface::{
@@ -131,8 +132,8 @@ use super::{
         CollapsedCall, ForegroundCommandHint, InputEcho, ScrollAction, Scrollback, ToolCallState,
     },
     selection::{
-        Cell, ScrollDirection, Selection, SelectionDrag, Surface, Viewport, line_width,
-        split_columns,
+        Cell, Granularity, ScrollDirection, Selection, SelectionDrag, Surface, Viewport, line_at,
+        line_width, split_columns, url_at, word_at,
     },
     shell_input::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
@@ -247,6 +248,19 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// scrolls while a selection drag holds the pointer at its edge.
 const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const SELECTION_SCROLL_ROWS: usize = 2;
+/// Claude Code `MULTI_CLICK_TIMEOUT_MS` and `MULTI_CLICK_DISTANCE`: presses this close in time
+/// and in cells count toward a double or triple click.
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
+const MULTI_CLICK_DISTANCE: usize = 1;
+const MAX_CLICK_COUNT: u8 = 3;
+/// Rows read on each side of a click to find the logical line it falls in.
+const LOGICAL_LINE_SEARCH_ROWS: usize = 256;
+/// How long a copy notice stays. One that only went out over OSC 52 asks the user to check the
+/// terminal, so it stays longer, as in Claude Code.
+const COPY_NOTICE_DURATION: Duration = Duration::from_secs(2);
+const UNCONFIRMED_COPY_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const REMOTE_LINK_COPIED: &str =
+    "Copied the link · this session is remote, open it on your machine";
 const INPUT_CHANNEL_CAPACITY: usize = 128;
 const FOOTER_ROWS: usize = 3;
 const FOOTER_ITEMS_ROWS: usize = 1;
@@ -720,6 +734,14 @@ pub(super) struct State {
     /// there keeps to their content as it scrolls.
     content_viewport: Option<Viewport>,
     selection_drag: Option<SelectionDrag>,
+    /// The last left press, which the next one within reach extends into a double or triple
+    /// click.
+    last_click: Option<Click>,
+    /// A ctrl+click opened a link, so its drag and release must not select.
+    link_press: bool,
+    opener: Opener,
+    /// What the last copy did, shown in the status line until it expires.
+    copy_notice: Option<CopyNotice>,
     pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
@@ -923,6 +945,18 @@ enum RenderedView {
     Overview,
     Transcript,
     DiffScreen,
+}
+
+#[derive(Clone, Copy)]
+struct Click {
+    at: Instant,
+    cell: Cell,
+    count: u8,
+}
+
+struct CopyNotice {
+    text: String,
+    until: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1516,6 +1550,7 @@ impl Console {
             .map_err(|error| error.to_string())?
             .clipboard
             .write(url, &mut io::stdout().lock())
+            .map(|_| ())
     }
     pub(super) fn confirm_tick_action(
         &self,
@@ -3182,6 +3217,7 @@ impl Console {
             initial.surface = TerminalSurface::new(renderer::captures_mouse());
             initial.synchronized_output = renderer::supports_synchronized_output();
             initial.clipboard = Clipboard::detect();
+            initial.opener = Opener::detect();
             initial.terminal_shows_links = hyperlink::supported(|name| std::env::var(name).ok());
             initial.status = choice.notice.unwrap_or_default();
         }
@@ -5110,12 +5146,6 @@ impl ConversationPiece {
             Self::ToolResult { call_key, runs } => scrollback.append_tool_result(call_key, runs),
             Self::Response(runs) => scrollback.append_response(runs),
             Self::Body(runs) => scrollback.append_body(runs),
-            Self::Styled(text, role) if *role == Some(Role::Error) => {
-                let links = hyperlink::web_links(text);
-                for (run, link) in hyperlink::runs(text, &links) {
-                    scrollback.append_span(run, *role, None, link);
-                }
-            }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Input {
                 spans,
@@ -5676,7 +5706,10 @@ impl State {
             renderer: Renderer::Inline,
             surface: TerminalSurface::new(false),
             synchronized_output: false,
-            clipboard: Clipboard::Terminal { native: false },
+            clipboard: Clipboard::Terminal {
+                native: false,
+                tmux: false,
+            },
             external_editor: ExternalEditorLauncher::Terminal,
             rendered_screen: Vec::new(),
             rendered_rows: Vec::new(),
@@ -5687,6 +5720,10 @@ impl State {
             selection: None,
             content_viewport: None,
             selection_drag: None,
+            last_click: None,
+            link_press: false,
+            opener: Opener::Terminal,
+            copy_notice: None,
             display: DisplayProfile::new(preferences),
             colour_depth: ColourDepth::detect(
                 interactive,
@@ -5874,6 +5911,26 @@ impl State {
             row: usize::from(event.row),
             column: usize::from(event.column),
         };
+        // The release of a ctrl+click that opened a link can be lost to the browser taking focus,
+        // so the next press ends it too.
+        if self.link_press {
+            match event.kind {
+                MouseEventKind::Drag(_) => return false,
+                MouseEventKind::Up(_) => {
+                    self.link_press = false;
+                    return false;
+                }
+                MouseEventKind::Down(_) => self.link_press = false,
+                _ => {}
+            }
+        }
+        // Terminals that turn ctrl+click into a right click on macOS still report the control key.
+        if event.kind == MouseEventKind::Down(MouseButton::Right)
+            && event.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(url) = self.link_at(at)
+        {
+            return self.open_link_press(&url, output);
+        }
         // A selection started in scrolling content keeps the pointer until the release, wherever
         // the drag goes.
         if self.selection_drag.is_some()
@@ -5893,7 +5950,7 @@ impl State {
                     }
                     true
                 }
-                MouseEventKind::Down(MouseButton::Left) => self.start_selection(at),
+                MouseEventKind::Down(MouseButton::Left) => self.press(event, at, output),
                 MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                     self.drag_selection(event.kind, at, output)
                 }
@@ -6140,7 +6197,7 @@ impl State {
                     return true;
                 }
                 self.back_to_bottom_pressed = false;
-                self.start_selection(at)
+                self.press(event, at, output)
             }
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_selection(event.kind, at, output)
@@ -6149,20 +6206,201 @@ impl State {
         }
     }
 
-    /// Starts a selection at a press: in the content of the conversation or the transcript under
-    /// it, so the selection keeps to that content as it scrolls, or else on the screen.
-    fn start_selection(&mut self, at: Cell) -> bool {
-        let had_selection = self.selection.is_some();
-        let viewport = self
+    /// A left press where a selection can start: a ctrl+click on a link opens it, and any other
+    /// press starts a selection, by word or by logical line when it continues a double or triple
+    /// click.
+    fn press(&mut self, event: MouseEvent, at: Cell, output: &mut impl Write) -> bool {
+        if event.modifiers.contains(KeyModifiers::CONTROL) {
+            self.last_click = None;
+            if let Some(url) = self.link_at(at) {
+                return self.open_link_press(&url, output);
+            }
+        }
+        let clicks = self.count_click(at, Instant::now());
+        self.start_selection(at, clicks)
+    }
+
+    /// Counts a left press at `cell` into the click it continues, as Claude Code counts them on
+    /// the press so a word or line shows selected at once. A drag in between keeps the count, as
+    /// macOS does, so trackpad jitter does not break a double click.
+    fn count_click(&mut self, cell: Cell, now: Instant) -> u8 {
+        let count = match self.last_click {
+            Some(last)
+                if now.duration_since(last.at) <= MULTI_CLICK_WINDOW
+                    && last.cell.row.abs_diff(cell.row) <= MULTI_CLICK_DISTANCE
+                    && last.cell.column.abs_diff(cell.column) <= MULTI_CLICK_DISTANCE =>
+            {
+                (last.count + 1).min(MAX_CLICK_COUNT)
+            }
+            _ => 1,
+        };
+        self.last_click = Some(Click {
+            at: now,
+            cell,
+            count,
+        });
+        count
+    }
+
+    /// The surface a press at the screen cell `at` selects in and the cell of that surface: the
+    /// content of the conversation or the transcript under it, so the selection keeps to that
+    /// content as it scrolls, or else the screen.
+    fn surface_cell(&self, at: Cell) -> (Surface, Cell, bool) {
+        match self
             .content_viewport
             .as_ref()
-            .filter(|viewport| viewport.contains(at));
-        self.selection = Some(match viewport {
-            Some(viewport) => Selection::started_at(viewport.surface, viewport.content_cell(at)),
-            None => Selection::started_at(Surface::Screen, at),
+            .filter(|viewport| viewport.contains(at))
+        {
+            Some(viewport) => (viewport.surface, viewport.content_cell(at), true),
+            None => (Surface::Screen, at, false),
+        }
+    }
+
+    /// Starts a selection at a press, of the word or logical line under it after a double or
+    /// triple click.
+    fn start_selection(&mut self, at: Cell, clicks: u8) -> bool {
+        let had_selection = self.selection.is_some();
+        let (surface, cell, in_content) = self.surface_cell(at);
+        let granularity = match clicks {
+            1 => Granularity::Character,
+            2 => Granularity::Word,
+            _ => Granularity::Line,
+        };
+        let unit = self.unit_at(surface, granularity, cell);
+        self.selection = Some(match unit {
+            Some(span) => Selection::spanning(surface, granularity, span),
+            None => Selection::started_at(surface, cell),
         });
-        self.selection_drag = viewport.map(|_| SelectionDrag::default());
-        had_selection
+        self.selection_drag = in_content.then(SelectionDrag::default);
+        had_selection || unit.is_some()
+    }
+
+    /// The word or logical line around `cell` of `surface`, the unit a double or triple click
+    /// selects.
+    fn unit_at(
+        &mut self,
+        surface: Surface,
+        granularity: Granularity,
+        cell: Cell,
+    ) -> Option<(Cell, Cell)> {
+        if granularity == Granularity::Character {
+            return None;
+        }
+        let (first_row, rows) = self.rows_around(surface, cell.row);
+        match granularity {
+            Granularity::Word => word_at(&rows, first_row, cell),
+            _ => line_at(&rows, first_row, cell.row),
+        }
+    }
+
+    /// The rows of `surface` within reach of `row`, with the row they start at.
+    fn rows_around(&mut self, surface: Surface, row: usize) -> (usize, Vec<RoleLine>) {
+        let first_row = row.saturating_sub(LOGICAL_LINE_SEARCH_ROWS);
+        let rows = self.surface_rows(surface, first_row..row + LOGICAL_LINE_SEARCH_ROWS + 1);
+        (first_row, rows)
+    }
+
+    /// The rows `range` of `surface`; the screen keeps only the text it drew.
+    fn surface_rows(&mut self, surface: Surface, range: std::ops::Range<usize>) -> Vec<RoleLine> {
+        match surface {
+            Surface::Screen => {
+                let end = range.end.min(self.rendered_screen.len());
+                self.rendered_screen[range.start.min(end)..end]
+                    .iter()
+                    .map(|text| RoleLine::plain(text.as_str()))
+                    .collect()
+            }
+            Surface::Conversation => self.scrollback.rows_in(range),
+            Surface::Transcript => self
+                .transcript
+                .as_ref()
+                .map_or_else(Vec::new, |(_, transcript)| {
+                    transcript.rows_in(range).to_vec()
+                }),
+        }
+    }
+
+    /// The target of the link drawn over the screen cell `at`: the link its run carries, or a
+    /// web URL written as plain text. Either way a link that wrapped yields its whole target.
+    fn link_at(&mut self, at: Cell) -> Option<String> {
+        let (surface, cell, _) = self.surface_cell(at);
+        let (first_row, rows) = self.rows_around(surface, cell.row);
+        let row = rows.get(cell.row.checked_sub(first_row)?)?;
+        let mut column = 0;
+        for span in &row.spans {
+            let end = column + line_width(&span.text);
+            if (column..end).contains(&cell.column) {
+                if let Some(link) = &span.link {
+                    return Some(link.url().to_owned());
+                }
+                break;
+            }
+            column = end;
+        }
+        url_at(&rows, first_row, cell)
+    }
+
+    /// A press that opens a link selects nothing, and neither does the drag and release after it.
+    fn open_link_press(&mut self, url: &str, output: &mut impl Write) -> bool {
+        let had_selection = self.clear_selection();
+        self.link_press = true;
+        self.open_link(url, output) || had_selection
+    }
+
+    /// Opens a link's target with the desktop's handler. A remote session copies it instead,
+    /// since opening it there would start a browser on the remote host. Returns whether the
+    /// frame changed.
+    fn open_link(&mut self, url: &str, output: &mut impl Write) -> bool {
+        if !self.opener.opens_links() {
+            return false;
+        }
+        if self.clipboard.is_remote() {
+            match self.clipboard.write(url, output) {
+                Ok(_) => self.show_copy_notice(REMOTE_LINK_COPIED.into(), COPY_NOTICE_DURATION),
+                Err(error) => self.status = format!("Cannot copy the link: {error}"),
+            }
+            return true;
+        }
+        match self.opener.open(url) {
+            Ok(()) => false,
+            Err(error) => {
+                self.status = format!("Cannot open the link: {error}");
+                true
+            }
+        }
+    }
+
+    fn show_copy_notice(&mut self, text: String, duration: Duration) {
+        self.copy_notice = Some(CopyNotice {
+            text,
+            until: Instant::now() + duration,
+        });
+    }
+
+    fn live_copy_notice(&self) -> Option<&str> {
+        self.copy_notice
+            .as_ref()
+            .filter(|notice| Instant::now() < notice.until)
+            .map(|notice| notice.text.as_str())
+    }
+
+    /// ctrl+c, ctrl+shift+c and cmd+c, where the terminal reports it, copy a visible selection
+    /// instead of reaching the input, as Claude Code's fullscreen does.
+    fn copy_selection_key(&mut self, key: KeyEvent, output: &mut impl Write) -> bool {
+        let copy_modifiers = [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::SUPER,
+        ];
+        let is_copy_key = key.kind != KeyEventKind::Release
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+            && copy_modifiers.contains(&key.modifiers);
+        if !is_copy_key || self.selection.is_none_or(Selection::is_empty) {
+            return false;
+        }
+        self.copy_selection(output);
+        self.clear_selection();
+        true
     }
 
     /// Moves the selection's free end to the pointer, scrolling the content while the drag holds
@@ -6197,8 +6435,18 @@ impl State {
                 .viewport_of(surface)
                 .map(|viewport| viewport.content_cell(at)),
         };
-        if let (Some(selection), Some(head)) = (&mut self.selection, head) {
-            selection.drag_to(head);
+        let Some(head) = head else {
+            return true;
+        };
+        let granularity = self
+            .selection
+            .map_or(Granularity::Character, Selection::granularity);
+        let unit = self.unit_at(surface, granularity, head);
+        if let Some(selection) = &mut self.selection {
+            match (granularity, unit) {
+                (Granularity::Character, _) => selection.drag_to(head),
+                (_, unit) => selection.drag_over(unit.unwrap_or((head, head))),
+            }
         }
         true
     }
@@ -6293,22 +6541,21 @@ impl State {
         }
         let rows = selection.rows();
         let first_row = rows.start;
-        let text = match selection.surface() {
-            Surface::Screen => selection.text(0, &self.rendered_screen),
-            Surface::Conversation => selection.text(first_row, &self.scrollback.row_texts(rows)),
-            Surface::Transcript => self
-                .transcript
-                .as_ref()
-                .map_or_else(String::new, |(_, transcript)| {
-                    selection.text(first_row, transcript.row_texts(rows))
-                }),
-        };
+        let text = selection.text(first_row, &self.surface_rows(selection.surface(), rows));
         if text.is_empty() {
             self.selection = None;
             return true;
         }
-        if let Err(error) = self.clipboard.write(&text, output) {
-            self.status = format!("Cannot copy the selection: {error}");
+        match self.clipboard.write(&text, output) {
+            Ok(route) => {
+                let duration = if route == CopyRoute::Terminal {
+                    UNCONFIRMED_COPY_NOTICE_DURATION
+                } else {
+                    COPY_NOTICE_DURATION
+                };
+                self.show_copy_notice(copy_notice(text.chars().count(), route), duration);
+            }
+            Err(error) => self.status = format!("Cannot copy the selection: {error}"),
         }
         true
     }
@@ -7752,6 +7999,7 @@ impl State {
         let required_status = !self.status.is_empty() && command_feedback.is_none()
             || self.provider_failure.is_some()
             || self.confirmation_hint().is_some()
+            || self.live_copy_notice().is_some()
             || short && !overview && !self.queued_inputs.is_empty()
             || !overview
                 && self
@@ -8183,6 +8431,15 @@ impl State {
                 self.status.as_str()
             };
             let mut notice = self.status_notice(status);
+            // A copy notice sits at the right of the hint row like any notice, so the key hints
+            // stay beside it.
+            if let Some(copied) = self.live_copy_notice() {
+                notice = if notice.is_empty() {
+                    copied.to_owned()
+                } else {
+                    format!("{notice} · {copied}")
+                };
+            }
             if !leading_notice.is_empty() {
                 notice = if notice.is_empty() {
                     leading_notice.clone()
@@ -10821,7 +11078,11 @@ impl State {
         if escape_expired {
             self.escape_confirmation = None;
         }
-        exit_expired || escape_expired
+        let copy_notice_expired = self.copy_notice.is_some() && self.live_copy_notice().is_none();
+        if copy_notice_expired {
+            self.copy_notice = None;
+        }
+        exit_expired || escape_expired || copy_notice_expired
     }
 
     fn request_escape(&mut self, action: EscapeAction) -> bool {
@@ -12450,6 +12711,7 @@ fn read_keys(
             })
         );
         let input = match event {
+            Event::Key(key) if state.copy_selection_key(key, &mut output) => None,
             Event::Key(key) => {
                 state.clear_selection();
                 state.key(legacy_escape(key))
@@ -12769,6 +13031,27 @@ pub(super) fn display_single_line(text: &str) -> String {
 }
 
 /// How one wheel step moves the conversation.
+/// What a copy notice says, after Claude Code's: how much was copied and, when the local
+/// clipboard did not take it, where it went instead.
+fn copy_notice(characters: usize, route: CopyRoute) -> String {
+    let amount = if characters == 1 {
+        "1 character".to_owned()
+    } else {
+        format!("{characters} characters")
+    };
+    match route {
+        CopyRoute::Native => format!("Copied {amount}"),
+        CopyRoute::TmuxBuffer => {
+            format!("Copied {amount} to the tmux buffer · paste with prefix ]")
+        }
+        CopyRoute::Terminal => {
+            format!(
+                "Sent {amount} via OSC 52 · check the terminal's clipboard setting if paste fails"
+            )
+        }
+    }
+}
+
 fn wheel_scroll(kind: MouseEventKind) -> Option<ScrollAction> {
     match kind {
         MouseEventKind::ScrollUp => Some(ScrollAction::LinesUp(renderer::WHEEL_SCROLL_LINES)),
@@ -13561,6 +13844,271 @@ mod tests {
         );
 
         assert_eq!(copies.lock().unwrap().as_slice(), [expected]);
+    }
+
+    /// What a test clipboard copied or a test opener opened, in order.
+    type Captured = Arc<Mutex<Vec<String>>>;
+
+    /// A View `width` columns wide showing `text` in its conversation, with a test clipboard
+    /// and a test link opener.
+    fn state_showing(width: u16, text: &str, remote: bool) -> (State, Captured, Captured) {
+        let mut state = State::new(true, width, 24);
+        state.prompt_enabled = true;
+        state.scrollback.append(text);
+        let copies = Arc::new(Mutex::new(Vec::new()));
+        state.clipboard = Clipboard::Captured {
+            copies: Arc::clone(&copies),
+            image: None,
+            remote,
+        };
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        state.opener = Opener::Captured(Arc::clone(&opened));
+        state.draw(&mut Vec::new()).unwrap();
+        (state, copies, opened)
+    }
+
+    /// The screen row and column where `needle` is drawn.
+    fn drawn_at(state: &State, needle: &str) -> (u16, u16) {
+        let row = state
+            .rendered_screen
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {:#?}", state.rendered_screen));
+        let line = &state.rendered_screen[row];
+        let column = display_width(&line[..line.find(needle).unwrap()]);
+        (row as u16, column as u16)
+    }
+
+    fn click(state: &mut State, (row, column): (u16, u16), times: usize, modifiers: KeyModifiers) {
+        let mut output = Vec::new();
+        for _ in 0..times {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                state.pointer(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers,
+                    },
+                    &mut output,
+                );
+            }
+        }
+    }
+
+    fn last_copy(copies: &Captured) -> Option<String> {
+        copies.lock().unwrap().last().cloned()
+    }
+
+    #[test]
+    fn a_double_click_copies_the_word_path_or_cjk_run_under_it_and_says_so() {
+        let (mut state, copies, _) =
+            state_showing(80, "see src/main.rs:12, then 中文句子很长。ok\n", false);
+        let (row, column) = drawn_at(&state, "main");
+        click(&mut state, (row, column + 1), 2, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies).as_deref(), Some("src/main.rs:12"));
+        assert_eq!(state.live_copy_notice(), Some("Copied 14 characters"));
+        state.draw(&mut Vec::new()).unwrap();
+        let hint_row = state
+            .rendered_screen
+            .iter()
+            .find(|line| line.contains("Copied 14 characters"))
+            .expect("the copy notice should be drawn");
+        assert!(
+            hint_row.trim_end().ends_with("Copied 14 characters"),
+            "the notice sits at the right edge: {hint_row:?}"
+        );
+        assert!(
+            hint_row.contains("? help"),
+            "the key hints stay beside the notice: {hint_row:?}"
+        );
+
+        let (row, column) = drawn_at(&state, "句子");
+        click(&mut state, (row, column), 2, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies).as_deref(), Some("中文句子很长"));
+    }
+
+    #[test]
+    fn a_single_click_copies_nothing_and_a_triple_click_copies_the_whole_wrapped_line() {
+        let paragraph = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+        let (mut state, copies, _) = state_showing(24, &format!("{paragraph}\nnext line\n"), false);
+        let continued = drawn_at(&state, "epsilon");
+        assert_ne!(
+            continued.0,
+            drawn_at(&state, "alpha").0,
+            "the paragraph must wrap"
+        );
+
+        click(&mut state, continued, 1, KeyModifiers::NONE);
+        assert!(copies.lock().unwrap().is_empty(), "a click must not copy");
+
+        click(&mut state, continued, 3, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies).as_deref(), Some(paragraph));
+    }
+
+    #[test]
+    fn dragging_over_wrapped_rows_copies_them_as_one_line() {
+        let paragraph = "alpha beta gamma delta epsilon zeta eta theta";
+        let (mut state, copies, _) = state_showing(24, &format!("{paragraph}\n"), false);
+        let from = drawn_at(&state, "alpha");
+        let (row, column) = drawn_at(&state, "theta");
+        drag(&mut state, from, (row, column + "theta".len() as u16));
+        assert_eq!(last_copy(&copies).as_deref(), Some(paragraph));
+    }
+
+    #[test]
+    fn a_ctrl_click_on_any_row_of_a_wrapped_url_opens_the_whole_url() {
+        let url = "https://example.com/a/very/long/path/to/the/page.html";
+        let (mut state, copies, opened) = state_showing(30, &format!("open {url} now\n"), false);
+        let tail = drawn_at(&state, "page.html");
+        assert_ne!(tail.0, drawn_at(&state, "open").0, "the URL must wrap");
+
+        click(&mut state, tail, 1, KeyModifiers::CONTROL);
+        let at = drawn_at(&state, "https");
+        click(&mut state, at, 1, KeyModifiers::CONTROL);
+
+        assert_eq!(opened.lock().unwrap().as_slice(), [url, url]);
+        assert!(state.selection.is_none(), "opening a link selects nothing");
+        assert!(copies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_ctrl_click_opens_a_markdown_link_that_wrapped_across_rows() {
+        let url = "https://docs.example.com/guide/getting-started.html";
+        let (mut state, _, opened) = state_showing(30, "", false);
+        state.scrollback.append_markdown(
+            &format!("Read [the guide]({url}) first.\n\n"),
+            "● ",
+            true,
+        );
+        state.draw(&mut Vec::new()).unwrap();
+
+        let at = drawn_at(&state, "guide");
+        click(&mut state, at, 1, KeyModifiers::CONTROL);
+        let at = drawn_at(&state, "started");
+        click(&mut state, at, 1, KeyModifiers::CONTROL);
+
+        assert_eq!(opened.lock().unwrap().as_slice(), [url, url]);
+    }
+
+    #[test]
+    fn a_ctrl_click_reported_as_a_right_click_still_opens_the_link() {
+        let (mut state, _, opened) = state_showing(80, "see https://example.com/x\n", false);
+        let (row, column) = drawn_at(&state, "example");
+        let mut output = Vec::new();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            state.pointer(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::CONTROL,
+                },
+                &mut output,
+            );
+        }
+        assert_eq!(opened.lock().unwrap().as_slice(), ["https://example.com/x"]);
+        assert!(!state.link_press);
+    }
+
+    #[test]
+    fn a_lost_release_after_opening_a_link_does_not_swallow_the_next_drag() {
+        let (mut state, copies, _) =
+            state_showing(80, "see https://example.com/x then text\n", false);
+        let link = drawn_at(&state, "example");
+        state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: link.1,
+                row: link.0,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            &mut Vec::new(),
+        );
+        let (row, column) = drawn_at(&state, "then");
+        drag(&mut state, (row, column), (row, column + 4));
+        assert_eq!(last_copy(&copies).as_deref(), Some("then"));
+    }
+
+    #[test]
+    fn a_ctrl_click_beside_a_link_selects_as_usual() {
+        let (mut state, _, opened) = state_showing(80, "no link here\n", false);
+        let at = drawn_at(&state, "link");
+        click(&mut state, at, 2, KeyModifiers::CONTROL);
+        assert!(opened.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_remote_session_copies_the_link_instead_of_opening_it() {
+        let (mut state, copies, opened) = state_showing(80, "see https://example.com/x\n", true);
+        let at = drawn_at(&state, "example");
+        click(&mut state, at, 1, KeyModifiers::CONTROL);
+        assert!(opened.lock().unwrap().is_empty());
+        assert_eq!(last_copy(&copies).as_deref(), Some("https://example.com/x"));
+        assert_eq!(state.live_copy_notice(), Some(REMOTE_LINK_COPIED));
+    }
+
+    #[test]
+    fn a_terminal_that_opens_links_itself_is_left_to_open_them() {
+        let (mut state, copies, _) = state_showing(80, "see https://example.com/x\n", true);
+        state.opener = Opener::Terminal;
+        let at = drawn_at(&state, "example");
+        click(&mut state, at, 1, KeyModifiers::CONTROL);
+        assert!(copies.lock().unwrap().is_empty());
+        assert!(state.selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_copies_a_selection_instead_of_reaching_the_input() {
+        let (mut state, copies, _) = state_showing(80, "keep this text\n", false);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut output = Vec::new();
+        assert!(
+            !state.copy_selection_key(ctrl_c, &mut output),
+            "without a selection ctrl+c reaches the input"
+        );
+
+        let (row, column) = drawn_at(&state, "this");
+        drag(&mut state, (row, column), (row, column + 4));
+        for key in [
+            ctrl_c,
+            KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ] {
+            state.last_click = None;
+            drag(&mut state, (row, column), (row, column + 4));
+            copies.lock().unwrap().clear();
+            assert!(state.copy_selection_key(key, &mut output), "{key:?}");
+            assert_eq!(copies.lock().unwrap().as_slice(), ["this"]);
+            assert!(
+                state.selection.is_none(),
+                "copying with a key clears the highlight"
+            );
+            assert!(state.pending_exit_control().is_none());
+        }
+    }
+
+    #[test]
+    fn a_copy_notice_names_the_route_and_expires() {
+        assert_eq!(copy_notice(1, CopyRoute::Native), "Copied 1 character");
+        assert!(copy_notice(5, CopyRoute::TmuxBuffer).contains("tmux buffer"));
+        assert!(copy_notice(5, CopyRoute::Terminal).contains("OSC 52"));
+
+        let (mut state, _, _) = state_showing(80, "text\n", false);
+        state.show_copy_notice("Copied 4 characters".into(), COPY_NOTICE_DURATION);
+        assert!(!state.expire_key_confirmations());
+        state.copy_notice.as_mut().unwrap().until = Instant::now() - Duration::from_millis(1);
+        assert!(state.expire_key_confirmations());
+        assert!(state.live_copy_notice().is_none());
     }
 
     #[test]
