@@ -99,13 +99,12 @@ impl Reporter {
     /// Drop also closes the channel, but cannot keep a departing runtime alive.
     pub(super) async fn shutdown(&mut self) {
         self.sender.take();
-        if let Some(mut worker) = self.worker.take() {
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut worker)
+        if let Some(mut worker) = self.worker.take()
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut worker)
                 .await
                 .is_err()
-            {
-                worker.abort();
-            }
+        {
+            worker.abort();
         }
     }
 }
