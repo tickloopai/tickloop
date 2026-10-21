@@ -1,8 +1,27 @@
 {
+  "initialize": {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {
+      "resources": {
+        "listChanged": true
+      },
+      "extensions": {
+        "io.modelcontextprotocol/skills": {}
+      },
+      "tools": {
+        "listChanged": true
+      }
+    },
+    "serverInfo": {
+      "name": "tickloop-artifacts",
+      "version": "0.1.42"
+    },
+    "instructions": "Saves are live. Choose the artifact type by the user's intent, in any language: a doc for writing such as reports, notes and plans; a page for visual explanations, UI, prototypes, mockups, wireframes, dashboards and interactive tools; slides for anything someone presents, including every request for a PPT, 幻灯片, 演示文稿, deck, slides, presentation, pitch or talk. Create it with ArtifactEdit create. Honor an explicit local-file or chat-only destination instead of creating an artifact. To work on an artifact the user names by link or id that this Chat has not read or written, take the id from its /artifact/<artifact_id> URL and ArtifactRead read it before writing. What you created or wrote in this Chat is the current content: keep working from it, with expected_revision, expected_hash and expected_title from the latest read or write receipt for that artifact, and read it again only after content_conflict, after a timeout or cancellation that leaves the outcome unknown, or when the user or someone else may have changed it, as with @tickloop feedback. Doc: plain text formatting with # headings, paragraphs, lists, tables, quotes, code blocks, links and basic inline marks; patch blocks using their id and hash; a blank doc has one empty block to replace; a doc's create receipt lists no blocks, so read a new doc once before its first patch. Page: replace the whole page source; use inline <style>/<script>, fit phone widths, and keep <title> equal to the title. Slides: each block is one <section> Slide; patch only the Slides you were asked to change, using their id and hash, changes running in order, or replace all of them. A doc's title is its name and its first \"# \" heading: keep that heading equal to the title, and rename with ArtifactEdit rename, never by writing a different heading. When relevant Skills are listed in your catalog, load them before substantial writing, page creation or redesign. A loaded Skill stays in effect for the whole Chat, so do not load it again. Slides are the exception to loading only for substantial work: load the artifact-slides Skill before writing any Slide, whether you create, patch or replace, however small the change, unless this Chat already loaded it. On content_conflict, read again, merge your change into the latest content and never overwrite other people's changes. Finish by giving the user the artifact URL."
+  },
   "tools": [
     {
       "name": "ArtifactRead",
-      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing), page (a visual page) or slides (a presentation). list: your artifacts and those shared with you; query matches titles. read: a doc or slides as blocks, each with id, hash and text, paged by cursor; each slides block is one <section> Slide, and the first slides page lists its uploaded images as assets with their asset: ref. A page reads as its whole page source. All include revision. threads: comment threads (open by default) with their latest messages and any @tickloop request. access_role is owner, edit or view; view can comment but not edit.",
+      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing), page (a visual page) or slides (a presentation). Actions:\n- list (optional query, cursor, limit): your artifacts and those shared with you, each with its revision; query matches titles.\n- read (artifact_id; optional cursor): a doc or slides as blocks, each with id, hash and text, paged by cursor; each slides block is one <section> Slide, and the first slides page lists its uploaded images as assets with their asset: ref. A page reads as its whole page source. Includes title and revision.\n- threads (artifact_id; optional status, cursor): comment threads (open by default) with their latest messages.\naccess_role is owner, edit or view; view can comment but not edit. What you created or wrote in this Chat is current as its write receipt states; read it again only after content_conflict, an unknown outcome, or when the user or someone else may have changed it.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -18,19 +37,21 @@
           "query": {
             "type": "string",
             "maxLength": 200,
-            "description": "Part of a title"
+            "description": "list: part of a title"
           },
           "cursor": {
             "type": "string",
-            "description": "next_cursor from the previous page"
+            "description": "list, read, threads: next_cursor from the previous page"
           },
           "limit": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 50
+            "maximum": 50,
+            "description": "list: items per page"
           },
           "artifact_id": {
-            "type": "string"
+            "type": "string",
+            "description": "read, threads: the artifact_id, or the id after /artifact/ in its URL"
           },
           "status": {
             "type": "string",
@@ -38,7 +59,8 @@
               "open",
               "resolved",
               "all"
-            ]
+            ],
+            "description": "threads: open (the default), resolved or all"
           }
         },
         "required": [
@@ -52,7 +74,7 @@
     },
     {
       "name": "ArtifactEdit",
-      "description": "create: title, format, content. doc: writing (reports, notes, plans), opens with \"# <title>\". page: visual design, UI, prototypes, mockups, wireframes, dashboards, interactive pages; self-contained page, inline <style>/<script>, only https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js, fit phone widths. slides: presentations, decks, pitches; one or more <section> Slides. patch (doc, slides): target, expected_hash from read; replace, delete or insert before/after a block or Slide; changes run in order, so delete then insert a Slide id to move it. replace (page, slides): whole content, expected_revision from read. rename: title, expected_title from read; an H1 or <title> showing the old title follows. On content_conflict, re-read and merge, never overwrite. On unsupported_doc_syntax, simplify it; on unsupported_slide_markup, apply its fixes. Delete, sharing, members, versions: web only.",
+      "description": "Write Tickloop Artifacts. Actions:\n- create (title, format, content): doc for writing (reports, notes, plans), opening with \"# <title>\"; page for visual design, UI, prototypes, mockups, wireframes, dashboards, interactive pages: a self-contained page, inline <style>/<script>, only https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js, fit phone widths; slides for presentations, decks, pitches: one or more <section> Slides. The receipt has artifact_id, url and revision; a slides receipt also lists blocks with each Slide's id and hash. A doc's create receipt lists no blocks, so read a new doc once before its first patch.\n- patch (artifact_id, patches): a doc or slides; replace, delete or insert before/after a block or Slide; changes run in order, so delete then insert a Slide id to move it. The receipt has the revision and lists changed: the ids and new hashes of blocks or Slides added or changed; the others keep theirs.\n- replace (artifact_id, expected_revision, content): a page or slides, with its whole content. The receipt has the revision; a slides receipt lists blocks.\n- rename (artifact_id, title, expected_title): an H1 or <title> showing the old title follows. The receipt has the title and revision.\nTake expected_revision, expected_hash and expected_title from the latest read or write receipt for that artifact. What you created or wrote in this Chat is the current content: do not read it back before the next edit. A page is stored exactly as sent; doc and slides text is normalized on save, so take ids and hashes from receipts or reads, never from the text you sent. Read again only after content_conflict, after a timeout or cancellation that leaves the outcome unknown, or when the user or someone else may have changed the artifact. On content_conflict, read again, merge your change into the latest content and never overwrite other people's changes. On unsupported_doc_syntax, simplify it; on unsupported_slide_markup, apply its fixes. Delete, sharing, members, versions: web only.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -69,7 +91,8 @@
           "title": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 200
+            "maxLength": 200,
+            "description": "create, rename: the title"
           },
           "format": {
             "type": "string",
@@ -77,13 +100,16 @@
               "doc",
               "page",
               "slides"
-            ]
+            ],
+            "description": "create: doc, page or slides"
           },
           "content": {
-            "type": "string"
+            "type": "string",
+            "description": "create, replace: the whole content"
           },
           "artifact_id": {
-            "type": "string"
+            "type": "string",
+            "description": "patch, replace, rename: the artifact_id, or the id after /artifact/ in its URL"
           },
           "patches": {
             "minItems": 1,
@@ -100,11 +126,11 @@
                     },
                     "target": {
                       "type": "string",
-                      "description": "A block id from read"
+                      "description": "A block or Slide id from the latest read or write receipt"
                     },
                     "expected_hash": {
                       "type": "string",
-                      "description": "That block's hash from read"
+                      "description": "That block's or Slide's hash from the latest read or write receipt"
                     },
                     "text": {
                       "type": "string"
@@ -127,11 +153,11 @@
                     },
                     "target": {
                       "type": "string",
-                      "description": "A block id from read"
+                      "description": "A block or Slide id from the latest read or write receipt"
                     },
                     "expected_hash": {
                       "type": "string",
-                      "description": "That block's hash from read"
+                      "description": "That block's or Slide's hash from the latest read or write receipt"
                     }
                   },
                   "required": [
@@ -150,11 +176,11 @@
                     },
                     "target": {
                       "type": "string",
-                      "description": "A block id from read"
+                      "description": "A block or Slide id from the latest read or write receipt"
                     },
                     "expected_hash": {
                       "type": "string",
-                      "description": "That block's hash from read"
+                      "description": "That block's or Slide's hash from the latest read or write receipt"
                     },
                     "side": {
                       "type": "string",
@@ -177,16 +203,18 @@
                   "additionalProperties": false
                 }
               ]
-            }
+            },
+            "description": "patch: changes applied in order; all apply or none does"
           },
           "expected_revision": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 9007199254740991
+            "maximum": 9007199254740991,
+            "description": "replace: the revision from the latest read or write receipt"
           },
           "expected_title": {
             "type": "string",
-            "description": "The title read or list returned"
+            "description": "rename: the title from the latest read or write receipt or list"
           }
         },
         "required": [
@@ -200,7 +228,7 @@
     },
     {
       "name": "ArtifactComment",
-      "description": "Reply once in an Artifact discussion with a useful answer.",
+      "description": "Reply in an artifact's comment thread as the signed-in user's Agent. Actions:\n- reply (artifact_id, thread_id, text): use thread_id from ArtifactRead threads and write the useful answer once. Feedback delivery is confirmed by Tickloop; do not send a separate completion summary.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -212,14 +240,17 @@
             ]
           },
           "artifact_id": {
-            "type": "string"
+            "type": "string",
+            "description": "reply: the artifact_id, or the id after /artifact/ in its URL"
           },
           "thread_id": {
-            "type": "string"
+            "type": "string",
+            "description": "reply: a thread_id from ArtifactRead threads"
           },
           "text": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "reply: the reply"
           }
         },
         "required": [

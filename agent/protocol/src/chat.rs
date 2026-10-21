@@ -374,15 +374,42 @@ pub enum HostNote {
     /// Claude Code's `plan_mode_exit` attachment: the user left Plan mode without approving a
     /// plan.
     PlanModeExit,
+    /// Guidance the model follows for the rest of the Chat, written into history once where it
+    /// starts to apply so every later request keeps the earlier conversation as its prefix.
+    Guidance(GuidanceNote),
 }
 
 impl HostNote {
     pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::HostTools(announced) => Some(announced),
-            Self::PlanModeExit => None,
+            Self::PlanModeExit | Self::Guidance(_) => None,
         }
     }
+}
+
+/// What a guidance note announces, like Claude Code's Skill messages and
+/// `mcp_instructions_delta` attachment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuidanceNote {
+    /// An invoked Skill's guidance; `digest` identifies its full content, and `truncated` marks
+    /// the shortened copy a compaction restores.
+    Skill {
+        name: String,
+        digest: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// The instructions an MCP server gave when the host connected to it.
+    McpInstructions { server: String, digest: String },
+    /// Guidance announced earlier that no longer applies.
+    Withdrawn {
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        skills: BTreeSet<String>,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        mcp_servers: BTreeSet<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -719,10 +746,11 @@ pub fn chat_preview(conversation: &ChatSnapshot, title: &str) -> Option<String> 
         .enumerate()
         .rev()
         .find_map(|(index, message)| {
-            if conversation
-                .message_ids
-                .get(&index)
-                .is_some_and(|id| conversation.agent_message_origins.contains_key(id))
+            if conversation.host_notes.contains_key(&index)
+                || conversation
+                    .message_ids
+                    .get(&index)
+                    .is_some_and(|id| conversation.agent_message_origins.contains_key(id))
             {
                 return None;
             }

@@ -485,8 +485,11 @@ async fn workspace_host_request_probe() {
     let user_inputs = snapshot
         .messages
         .iter()
-        .filter(|message| message.role == Role::User)
-        .map(|message| match message.content.as_slice() {
+        .enumerate()
+        .filter(|(index, message)| {
+            message.role == Role::User && !snapshot.host_notes.contains_key(index)
+        })
+        .map(|(_, message)| match message.content.as_slice() {
             [Content::Text { text }] => text.as_str(),
             _ => panic!("the probe only submits plain user inputs"),
         })

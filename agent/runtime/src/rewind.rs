@@ -658,7 +658,10 @@ fn interrupted_prompt(chat: &Chat, run_id: RunId) -> Option<(RewindPoint, LoopId
         .messages
         .get(index + 1..)?
         .iter()
-        .all(is_not_a_response)
+        .zip(index + 1..)
+        .all(|(message, index)| {
+            snapshot.host_notes.contains_key(&index) || is_not_a_response(message)
+        })
     {
         return None;
     }
@@ -666,7 +669,8 @@ fn interrupted_prompt(chat: &Chat, run_id: RunId) -> Option<(RewindPoint, LoopId
 }
 
 /// 照 Claude Code `messagesAfterAreOnlySynthetic`：中断标记和没有文字、工具调用的助手消息
-/// （例如只有思考）不算回应，其他消息都算。
+/// （例如只有思考）不算回应，其他消息都算；宿主写给模型的 host note 像 Claude Code 的 meta
+/// 附件，也不算，由调用方按下标排除。
 fn is_not_a_response(message: &Message) -> bool {
     match message.role {
         Role::Assistant => message.content.iter().all(|content| match content {

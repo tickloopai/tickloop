@@ -7,9 +7,16 @@ use uuid::Uuid;
 
 use crate::{
     ActiveConversationItem, BranchPublicItem, BranchPublicSource, ChatSnapshot, CompactTrigger,
-    CompactionMarker, Content, DenialReference, Event, LocalMessage, Message, Protocol,
-    RewindPoint, Role, RunId, render_input_context, render_reference,
+    CompactionMarker, Content, DenialReference, Event, GuidanceNote, HostNote, LocalMessage,
+    Message, Protocol, RewindPoint, Role, RunId, render_input_context, render_reference,
 };
+
+/// The guidance notes the model can still see, by Skill name and by MCP server name.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VisibleGuidance {
+    pub skills: BTreeMap<String, (String, bool)>,
+    pub mcp_servers: BTreeMap<String, String>,
+}
 
 /// A conversation whose tool calls and results cannot be paired into one model history.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -67,6 +74,44 @@ impl ChatSnapshot {
             .range(self.active_start()..)
             .rev()
             .find_map(|(_, note)| note.announced_host_tools().cloned())
+    }
+
+    /// The guidance the model can still see: each Skill's latest note, as its digest and whether
+    /// it was truncated, and each MCP server's latest instructions digest, unless a later note
+    /// withdrew it.
+    pub fn visible_guidance(&self) -> VisibleGuidance {
+        let mut visible = VisibleGuidance::default();
+        for note in self
+            .host_notes
+            .range(self.active_start()..)
+            .map(|(_, note)| note)
+        {
+            match note {
+                HostNote::Guidance(GuidanceNote::Skill {
+                    name,
+                    digest,
+                    truncated,
+                }) => {
+                    visible
+                        .skills
+                        .insert(name.clone(), (digest.clone(), *truncated));
+                }
+                HostNote::Guidance(GuidanceNote::McpInstructions { server, digest }) => {
+                    visible.mcp_servers.insert(server.clone(), digest.clone());
+                }
+                HostNote::Guidance(GuidanceNote::Withdrawn {
+                    skills,
+                    mcp_servers,
+                }) => {
+                    visible.skills.retain(|name, _| !skills.contains(name));
+                    visible
+                        .mcp_servers
+                        .retain(|server, _| !mcp_servers.contains(server));
+                }
+                HostNote::HostTools(_) | HostNote::PlanModeExit => {}
+            }
+        }
+        visible
     }
 
     fn boundary_indexes(&self) -> Vec<usize> {

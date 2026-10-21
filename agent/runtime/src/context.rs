@@ -15,34 +15,6 @@ use tickloop_agent_protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const RESTORED_SKILL_TOKENS: usize = 5_000;
-const RESTORED_SKILLS_TOTAL_TOKENS: usize = 25_000;
-const SKILL_ESTIMATED_BYTES_PER_TOKEN: usize = 4;
-
-fn restored_skill_content(content: &str, remaining_tokens: &mut usize) -> Option<String> {
-    let allowance = (*remaining_tokens).min(RESTORED_SKILL_TOKENS);
-    if allowance == 0 {
-        return None;
-    }
-    let max_bytes = allowance.saturating_mul(SKILL_ESTIMATED_BYTES_PER_TOKEN);
-    let content = if content.len() <= max_bytes {
-        content.to_owned()
-    } else {
-        const NOTICE: &str = "\n[Skill guidance truncated for continuation; invoke Skill to reload the full guidance.]";
-        if max_bytes < NOTICE.len() {
-            return None;
-        }
-        let mut end = max_bytes.saturating_sub(NOTICE.len());
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}{NOTICE}", &content[..end])
-    };
-    *remaining_tokens =
-        remaining_tokens.saturating_sub(content.len().div_ceil(SKILL_ESTIMATED_BYTES_PER_TOKEN));
-    Some(content)
-}
-
 pub(super) fn model_messages(chat: &Chat) -> Result<Vec<Message>, AgentError> {
     Ok(model_history(chat)?.0)
 }
@@ -65,54 +37,6 @@ pub(super) fn model_history(
     for (message, index) in projected {
         sources.push(index.and_then(|index| chat.snapshot.message_sources.get(&index).cloned()));
         messages.push(message);
-    }
-    let position = messages
-        .iter()
-        .take_while(|message| message.role == Role::System)
-        .count();
-    let mut restored_budget = RESTORED_SKILLS_TOTAL_TOKENS;
-    let mut guidance = Vec::new();
-    for invoked in chat.snapshot.invoked_skills.iter().rev() {
-        if matches!(
-            invoked.source,
-            tickloop_agent_protocol::SkillSource::Remote { .. }
-        ) && (chat.active_run.is_none() || invoked.run_id != chat.active_run)
-        {
-            continue;
-        }
-        if invoked.name == "artifact-draft"
-            && invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
-        {
-            continue;
-        }
-        // A built-in Skill only the user invokes, such as /slides, is bound to the run its
-        // invocation started and guides no later run.
-        if invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
-            && invoked.run_id.is_some()
-            && invoked.run_id != chat.active_run
-        {
-            continue;
-        }
-        let content = if chat
-            .bookkeeping
-            .restored_skill_names
-            .contains(&invoked.name)
-        {
-            let Some(content) = restored_skill_content(&invoked.content, &mut restored_budget)
-            else {
-                continue;
-            };
-            content
-        } else {
-            invoked.content.clone()
-        };
-        guidance.push(Message { role: Role::User, content: vec![Content::Text {
-            text: format!("Reference guidance from {} active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n{}", invoked.name, content),
-        }] });
-    }
-    for message in guidance {
-        messages.insert(position, message);
-        sources.insert(position, None);
     }
     let projected = tickloop_agent_model::history::project_request(
         ModelRequest {
@@ -800,8 +724,25 @@ mod tests {
                     source: tickloop_agent_protocol::SkillSource::BuiltIn,
                     run_id: None,
                 });
+            let receipt = Receipt {
+                chat_id: id,
+                loop_id: uuid::Uuid::new_v4(),
+                run_id: uuid::Uuid::new_v4(),
+            };
+            chat.active_run = Some(receipt.run_id);
+            assert!(crate::host_notes::announce_guidance_notes(
+                chat, &receipt, None
+            ));
             let messages = model_messages(chat).unwrap();
-            assert_eq!(messages[0].role, Role::User, "{protocol:?}");
+            let guidance = messages
+                .iter()
+                .find(|message| {
+                    serde_json::to_string(message)
+                        .unwrap()
+                        .contains("authorizes every write")
+                })
+                .unwrap();
+            assert_eq!(guidance.role, Role::User, "{protocol:?}");
             assert!(
                 crate::approval_context::originals_for_active_chain(
                     &chat.snapshot,

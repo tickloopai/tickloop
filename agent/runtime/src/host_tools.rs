@@ -387,6 +387,13 @@ pub struct McpResourceServer {
     pub authority: HostToolAuthority,
 }
 
+/// The instructions an MCP server gave when the host connected to it for an account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServerInstructions {
+    pub server: McpResourceServer,
+    pub text: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct HostToolUpgradeCheckpoint {
     pub state: Value,
@@ -430,6 +437,11 @@ pub trait HostToolProvider: Send + Sync {
 
     fn mcp_resource_server(&self) -> Option<McpResourceServer> {
         None
+    }
+
+    /// The instructions of the MCP servers whose tools this provider currently offers.
+    fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
+        Vec::new()
     }
 
     async fn list_mcp_resources(

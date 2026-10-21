@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tickloop_agent_protocol::{
-    Receipt, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
+    Content, Receipt, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -143,6 +144,13 @@ impl Agent {
             {
                 return Err("MCP resource is outside this Run's current service authority".into());
             }
+            if let Some((definition, relative)) = &prepared.skill {
+                let resource =
+                    crate::remote_skills::resource_entry(definition, relative.as_deref())?;
+                if let Some(earlier) = earlier_read(chat, &resource.digest) {
+                    return Ok(already_read(&resource.uri, &earlier));
+                }
+            }
             (
                 chat.snapshot.policy.revision,
                 crate::delegation::ancestor_revisions(&chats, receipt.chat_id)?,
@@ -183,6 +191,15 @@ impl Agent {
         {
             return Err("MCP resource source, policy or Run changed during reading".into());
         }
+        if prepared.name == READ_MCP_RESOURCE_TOOL
+            && let Some(text) = sole_text(&result)
+            && let Some(earlier) = earlier_read(chat, &digest(text))
+        {
+            return Ok(already_read(
+                prepared.input["uri"].as_str().unwrap_or_default(),
+                &earlier,
+            ));
+        }
         if prepared.name == LIST_MCP_RESOURCES_TOOL {
             if let Some(resources) = result["resources"].as_array_mut() {
                 for resource in resources {
@@ -196,5 +213,65 @@ impl Agent {
             is_error: false,
             output_ref: None,
         })
+    }
+}
+
+/// Like Claude Code's unchanged-file Read, a resource whose text the model can still see in an
+/// earlier `ReadMcpResourceTool` result: Skills share their runtime contract under each Skill's
+/// own URI, and a compaction or a saved-file preview hides the earlier text again.
+fn earlier_read(chat: &crate::Chat, digest_of_text: &str) -> Option<String> {
+    let messages = &chat.snapshot.messages[chat.snapshot.active_start()..];
+    let calls = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Content::ToolUse { id, name, .. } if name == READ_MCP_RESOURCE_TOOL => Some(id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+            } if calls.contains(tool_use_id)
+                && !chat.content_replacements.is_replaced(tool_use_id) =>
+            {
+                let result = serde_json::from_str::<Value>(&content.text()).ok()?;
+                (sole_text(&result).map(digest).as_deref() == Some(digest_of_text))
+                    .then(|| result["contents"][0]["uri"].as_str().map(str::to_owned))
+                    .flatten()
+            }
+            _ => None,
+        })
+}
+
+fn sole_text(result: &Value) -> Option<&str> {
+    match result["contents"].as_array()?.as_slice() {
+        [content] => content["text"].as_str(),
+        _ => None,
+    }
+}
+
+fn digest(text: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn already_read(uri: &str, earlier: &str) -> ToolResult {
+    ToolResult {
+        content: if uri == earlier {
+            format!(
+                "{uri} is unchanged since it was read earlier in this conversation; refer to that result instead of reading it again."
+            )
+        } else {
+            format!(
+                "The content of {uri} is identical to {earlier}, which was already read earlier in this conversation; refer to that result instead of reading it again."
+            )
+        },
+        is_error: false,
+        output_ref: None,
     }
 }

@@ -420,3 +420,37 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
     }
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn guidance_written_after_the_prompt_is_no_reply_and_leaves_with_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = StepModel::new(vec![Step::Block]);
+    let agent =
+        Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .invoke_skill(chat, None, "/tickloop", "show the current Workspace")
+        .await
+        .unwrap();
+    model.entered.notified().await;
+    assert!(
+        model
+            .last_request_text()
+            .contains("Reference guidance from tickloop")
+    );
+    agent.interrupt(chat).await.unwrap();
+    assert!(matches!(
+        wait_for_run_end(&mut events, receipt.run_id).await,
+        EventKind::Interrupted
+    ));
+    let draft = agent
+        .take_back_interrupted_prompt(chat, receipt.run_id)
+        .await
+        .unwrap()
+        .expect("a guidance note after the prompt is not a reply");
+    assert_eq!(draft.prompt, "/tickloop show the current Workspace");
+    let taken_back = agent.snapshot(chat).await.unwrap();
+    assert!(taken_back.messages.is_empty(), "{:?}", taken_back.messages);
+    assert!(taken_back.host_notes.is_empty());
+}

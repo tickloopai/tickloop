@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tickloop_agent_protocol::{
-    ChatSnapshot, CompactionMarker, Content, Message, OriginalUserInput, Role,
+    ChatSnapshot, CompactionMarker, Content, HostNote, Message, OriginalUserInput, Role,
 };
 use tickloop_agent_transcript::ChainEntry;
 use uuid::Uuid;
@@ -60,6 +60,8 @@ struct ObservedMessage<'a> {
     is_human: bool,
     is_agent: bool,
     is_summary: bool,
+    /// Skill or MCP server guidance the host wrote for the model, which no one said in the turn.
+    is_guidance: bool,
     is_proposed_batch: bool,
     message: &'a Message,
 }
@@ -121,6 +123,7 @@ pub(crate) fn capture(
                 && entry.agent_message_origin.is_none(),
             is_agent: entry.agent_message_origin.is_some(),
             is_summary: entry.is_compact_summary,
+            is_guidance: entry.guidance.is_some(),
             is_proposed_batch: false,
             message: &entry.message,
         });
@@ -160,6 +163,7 @@ pub(crate) fn capture(
                     snapshot.message_compactions.get(&index),
                     Some(CompactionMarker::Summary { .. })
                 ),
+                is_guidance: matches!(snapshot.host_notes.get(&index), Some(HostNote::Guidance(_))),
                 is_proposed_batch: proposed_position.is_some_and(|(proposed, _)| proposed == index),
                 message,
             })
@@ -170,6 +174,7 @@ pub(crate) fn capture(
     let mut anchored = HashSet::new();
     for entry in recovered.chain(visible) {
         if entry.is_summary
+            || entry.is_guidance
             || !matches!(entry.message.role, Role::Assistant | Role::User)
             || !observed.insert(entry.id)
         {

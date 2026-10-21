@@ -80,8 +80,8 @@ pub use auto_settings::{
 };
 pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
-    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, InputId,
-    LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
+    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, GuidanceNote, HostNote,
+    InputId, LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
     PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
     ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
     ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
