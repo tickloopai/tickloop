@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for reporting a problem. Please search existing issues first.
         Do not report security vulnerabilities here; follow the [security policy](https://github.com/tickloopai/tickloop/security/policy) instead.
-        Problems with the `longbridge` or `futu` Tick packages belong in [tickloopai/ticks](https://github.com/tickloopai/ticks/issues).
+        Problems with Tick packages from the official marketplace belong in [tickloopai/ticks](https://github.com/tickloopai/ticks/issues).
   - type: textarea
     id: description
     attributes:

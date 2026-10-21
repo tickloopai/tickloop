@@ -35,11 +35,6 @@ fn native_bundle(root: &Path, release: &str) -> PathBuf {
     std::fs::create_dir_all(root.join("versions")).unwrap();
     let directory = root.join("versions").join(release);
     let executable = copy_bundle(Path::new(env!("CARGO_BIN_EXE_tickloop")), &directory);
-    std::fs::copy(
-        support::fixture_cli::executable(),
-        directory.join("tick-reader"),
-    )
-    .unwrap();
     installation(
         &directory,
         json!({"kind":"native","root":root.canonicalize().unwrap()}),

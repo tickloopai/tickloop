@@ -29,7 +29,7 @@ Tick Instance 产生的一次带有来源和时间信息的数据或状态更新
 TickDescribe 查询运行实例的能力与工具目录；TickRead 只读取当前状态；TickCall 调用实例声明的业务工具；TickManage 按 action 管理实例、视图、终端输入与订阅。TickUpdate 是更新送达事件，TickSubscription 是 Loop 与实例之间的订阅关系，二者不是模型调用工具。内容流使用这些正式名称，TickManage 标签按“action · 实例名称 · 补充信息”排列。包 Skill 负责启动命令、参数和登录前提，运行时能力以 TickDescribe 为准。
 
 **Tick Tool（Tick 工具）**：
-扩展 Tick 在自身描述中声明、提供给 Agent 通过 TickCall 调用的能力。查询类工具返回数据，例如取历史 K 线或过去若干期财报；动作类工具改变该 Tick Instance 的内容或呈现，例如在图上标注、切换标的。一个 Tick 可以提供多个 Tick Tool；Tick 因此是 Agent 的工具提供者。Tick Tool 不改变 Layout，也不隐含任何交易授权。
+扩展 Tick 在自身描述中声明、提供给 Agent 通过 TickCall 调用的能力。查询类工具返回数据，例如按区间读取历史记录；动作类工具改变该 Tick Instance 的内容或呈现，例如切换显示的对象、在视图上标注。一个 Tick 可以提供多个 Tick Tool；Tick 因此是 Agent 的工具提供者。Tick Tool 不改变 Layout，也不隐含任何额外授权。
 _Avoid_：Tick Command（已指以命令形式提供的 Tick）、Action（只表示动作类的一种）
 
 **Tick Subscription（Tick 订阅）**：
@@ -341,13 +341,13 @@ Tick 只有四种类型：扩展 Tick、Terminal Tick、Shell Tick 与 Artifact 
 **扩展 Tick（Extension Tick）**：
 通过实现 Tick 协议接入的程序，为 Agent 扩展结构化状态、工具和更新能力。扩展描述接入方式，自带的示例 Tick 也属于这一类型。
 
-实现 Tick 协议的程序，由 Agent 用 TickManage `open` 打开（随 Tickloop 安装的 `tick-reader` 与清单声明协议的已安装 Tick 包程序固定按协议，其他程序声明 `protocol: true`），在 Tickhost 中运行。它提供结构化状态、自己的 Tick Tool 与业务变化的 Tick Update；订阅在高频、中频、低频中选择。
+实现 Tick 协议的程序，由 Agent 用 TickManage `open` 打开（清单声明协议的已安装 Tick 包程序固定按协议，其他程序声明 `protocol: true`），在 Tickhost 中运行。它提供结构化状态、自己的 Tick Tool 与业务变化的 Tick Update；订阅在高频、中频、低频中选择。
 
 **Tick Command**：
-以终端命令形式提供的扩展 Tick，一个可执行文件可以提供几个 Tick（如 `tick-longbridge quote`、`tick-longbridge kline`）。随 Tickloop 安装的只有 Reader（`tick-reader`），其余来自 Tick 包。由 Agent 打开时在 Tickhost 中运行；用户直接在终端中运行时只是独立的终端程序，不是 Tick Instance。
+以终端命令形式提供的扩展 Tick，一个可执行文件可以提供几个 Tick（如 `tick-<包> <子命令>`）。Tickloop 不自带 Tick Command，它们来自 Tick 包。由 Agent 打开时在 Tickhost 中运行；用户直接在终端中运行时只是独立的终端程序，不是 Tick Instance。
 
 **Tick 包（Tick Package）**：
-从 Tick 市场单独安装的一组 Tick Command：一个预编译的可执行文件、一份清单和教 Agent 使用它的 Skill，按数据来源划分，例如 `longbridge` 包提供 `tick-longbridge`（报价、自选、K 线、持仓、资讯、财报与社区动态），`futu` 包提供 `tick-futu`（期权）。它的程序打开后是扩展 Tick，Tick 包本身不是 Tick 类型。安装只放置程序与 Skill，不打开、不订阅 Tick，也不授予行情、账户或交易权限。包在清单中声明认证方式，照 MCP 只有三种：`none`（无需认证）、`api_key`（用户提供的密钥）与 `oauth2`（标准 OAuth 2.0：按授权服务器元数据发现端点、动态注册客户端、设备码授权）。Tickloop 是包的认证客户端：用户在 Agent 的 `/ticks` 或终端里的 `tickloop tick login` 发起登录，Tickloop 完成授权并把凭据保存在配置根下；包的程序启动时经环境变量拿到凭据（OAuth 为标准格式令牌文件的路径，由程序自己刷新）。登录与安装只能由用户发起，模型只提示。认证属于包，同一个包的所有 Tick 共用，不进入 Tick 协议。
+从 Tick 市场单独安装的一组 Tick Command：一个预编译的可执行文件、一份清单和教 Agent 使用它的 Skill，按数据来源划分，程序名为 `tick-<包>`。它的程序打开后是扩展 Tick，Tick 包本身不是 Tick 类型。安装只放置程序与 Skill，不打开、不订阅 Tick，也不授予任何数据、账户或其他权限。包在清单中声明认证方式，照 MCP 只有三种：`none`（无需认证）、`api_key`（用户提供的密钥）与 `oauth2`（标准 OAuth 2.0：按授权服务器元数据发现端点、动态注册客户端、设备码授权）。Tickloop 是包的认证客户端：用户在 Agent 的 `/ticks` 或终端里的 `tickloop tick login` 发起登录，Tickloop 完成授权并把凭据保存在配置根下；包的程序启动时经环境变量拿到凭据（OAuth 为标准格式令牌文件的路径，由程序自己刷新）。登录与安装只能由用户发起，模型只提示。认证属于包，同一个包的所有 Tick 共用，不进入 Tick 协议。
 _Avoid_：Plugin、插件（已指布局宿主插件与策略 Plugin）、builtin provider（Terminal、Shell、Artifact 与协议是 Tick 类型，不是数据来源）
 
 **Tick 市场（Tick Marketplace）**：
@@ -375,15 +375,15 @@ _Avoid_：关联 Artifact（Artifact 关联专指反馈关系）
 把界面语义角色映射到颜色与文本修饰属性的一组配置。Theme 不改变行为、布局、字形或文案。界面字形只有一套，使用普通 Unicode 字符，不需要特殊字体，没有字形集或图标主题设置。
 _Avoid_：Glyph Set、Icon Theme、Nerd Font
 
-### 金融数据
+### 数据来源
 
 **Source（数据源）**：
-向 Tickloop 提供金融数据的来源，可提供行情、账户、持仓、订单状态、新闻、财报或社区动态等信息。Source 描述数据提供能力，下单、改单和撤单属于单独的交易执行能力；以登录账号在社区公开回复也是单独的写入能力，不扩大交易权限。
+经 Tick 包向 Tickloop 提供数据的来源。Source 描述数据提供能力；改变外部状态的操作（以登录账号提交或发布内容等）属于单独的写入能力，读取授权不扩大到写入。
 
 ### 产品版本与发布
 
 **产品版本（Product Version）**：
-标识一个独立发布单元的演进。Tickloop（含 tickhost 与 tick-reader）共享一个版本；每个 Tick 包各自独立；Artifacts 服务与官网随 Tickloop Cloud 发布，不在本仓库。包版本不要求与 Agent 或其他包相等，通信兼容性由各自的协议契约判断。
+标识一个独立发布单元的演进。Tickloop（含 tickhost）共享一个版本；每个 Tick 包各自独立；Artifacts 服务与官网随 Tickloop Cloud 发布，不在本仓库。包版本不要求与 Agent 或其他包相等，通信兼容性由各自的协议契约判断。
 
 **发布提交（Release Commit）**：
 一次发布中仅记录所选产品版本文件变更的提交。默认 patch 加一，并打 `vX.Y.Z` 标签；Tick 包的发布在 tickloopai/ticks 中进行。业务修改先完成，发布从干净工作区开始；目前不生成 release notes。操作、校验和失败恢复见发布设计（`docs/design/releases.md`）。

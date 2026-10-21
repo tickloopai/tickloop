@@ -9,14 +9,6 @@ pub const TICK_SPINNER_INTERVAL_MS: u64 = 110;
 pub enum Icon {
     Connection,
     TickUpdate,
-    Paper,
-    Rise,
-    Fall,
-    MarketPre,
-    MarketOpen,
-    MarketClosed,
-    Position,
-    Kline,
 }
 
 impl Icon {
@@ -24,14 +16,6 @@ impl Icon {
         match self {
             Self::Connection => "●",
             Self::TickUpdate => TICK_SPINNER_FRAMES[0],
-            Self::Paper => "⊕",
-            Self::Rise => "▲",
-            Self::Fall => "▼",
-            Self::MarketPre => "◌",
-            Self::MarketOpen => "▶",
-            Self::MarketClosed => "■",
-            Self::Position => "▦",
-            Self::Kline => "▤",
         }
     }
 }

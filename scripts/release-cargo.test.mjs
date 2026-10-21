@@ -10,7 +10,7 @@ test("public crate audit rejects private paths, duplicate names and missing laun
 });
 
 test("metadata must describe one dependency-free launcher at the product version", () => {
-  const value = { packages: [{ name: "tickloop", version: "0.2.5", dependencies: [], targets: ["tickloop", "tl", "tickhost", "tick-reader"].map(name => ({ name, kind: ["bin"] })) }], workspace_members: ["tickloop"] };
+  const value = { packages: [{ name: "tickloop", version: "0.2.5", dependencies: [], targets: ["tickloop", "tl", "tickhost"].map(name => ({ name, kind: ["bin"] })) }], workspace_members: ["tickloop"] };
   assert.equal(validateMetadata(value, "0.2.5"), "0.2.5");
   assert.throws(() => validateMetadata(value, "0.2.6"));
   const modified = structuredClone(value); modified.packages[0].dependencies.push({ name: "tickloop-agent-runtime" });

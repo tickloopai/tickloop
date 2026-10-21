@@ -3,10 +3,10 @@
 
 use std::fs;
 
-use tick_packages::{ApiKey, LoginState, OAuthIssuer, OAuthToken, PackageAuth, PackageCredentials};
-use tick_test_support::authorization_server::{
+use tick_oauth_test_server::{
     AuthorizationServer, METADATA_PATH, REVOCATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
 };
+use tick_packages::{ApiKey, LoginState, OAuthIssuer, OAuthToken, PackageAuth, PackageCredentials};
 use tickloop_agent_packages::{LoggedOut, LoginError, log_out, start_login};
 use tokio_util::sync::CancellationToken;
 

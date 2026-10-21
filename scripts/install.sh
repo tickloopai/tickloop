@@ -49,12 +49,12 @@ actual=$(sha256 "$archive" | awk '{print tolower($1)}')
 [ "$actual" = "$expected" ] || { echo 'Tickloop archive SHA-256 mismatch.' >&2; exit 1; }
 # Reject links and unexpected paths before tar is allowed to write anything.
 tar -tzf "$archive" > entries
-for program in tickloop tickhost tick-reader; do
+for program in tickloop tickhost; do
   [ "$(grep -Fxc "$program" entries)" = 1 ] || { echo "Missing or duplicate $program in archive." >&2; exit 1; }
 done
-[ "$(wc -l < entries | tr -d ' ')" = 3 ] || { echo 'Unexpected archive paths.' >&2; exit 1; }
+[ "$(wc -l < entries | tr -d ' ')" = 2 ] || { echo 'Unexpected archive paths.' >&2; exit 1; }
 tar -tvzf "$archive" > modes
-[ "$(grep -c '^-' modes)" = 3 ] || { echo 'Archive must contain only regular files.' >&2; exit 1; }
+[ "$(grep -c '^-' modes)" = 2 ] || { echo 'Archive must contain only regular files.' >&2; exit 1; }
 tar -xzf "$archive"
 [ "$(./tickloop --version)" = "tickloop ${tag#v}" ] || { echo 'Archive reports an unexpected version.' >&2; exit 1; }
 ./tickloop update --install

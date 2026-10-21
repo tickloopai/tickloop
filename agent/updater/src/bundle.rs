@@ -90,7 +90,7 @@ pub(crate) fn verify(directory: &Path, build: &Build) -> Result<()> {
             || probe(&path, "--build-identity")? != build.identity
         {
             bail!(
-                "{program} does not belong to the same Tickloop build; reinstall all three programs together"
+                "{program} does not belong to the same Tickloop build; reinstall both programs together"
             );
         }
     }
@@ -260,7 +260,6 @@ pub(crate) async fn install_native(build: Build) -> Result<()> {
         ("tickloop", root.join("current/tickloop")),
         ("tl", std::path::PathBuf::from("tickloop")),
         ("tickhost", root.join("current/tickhost")),
-        ("tick-reader", root.join("current/tick-reader")),
     ];
     for (name, target) in &links {
         let path = bin.join(name);

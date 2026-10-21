@@ -1,7 +1,5 @@
 //! Every ui integration test, compiled as one binary.
 
-#[path = "all/charts.rs"]
-mod charts;
 #[path = "all/hyperlink.rs"]
 mod hyperlink;
 #[path = "all/markdown.rs"]

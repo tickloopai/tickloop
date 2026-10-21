@@ -256,22 +256,18 @@ mod tests {
         let installation = Installation::read(old.parent().unwrap()).unwrap();
         let marker = root.join("candidate-executed");
         selected_candidate(&cargo.join("bin"), &marker);
-        let installs = [
-            "tickloop-agent",
-            "tickloop-tickhost",
-            "tickloop-tick-reader",
-        ]
-        .into_iter()
-        .map(|name| {
-            (
-                format!(
-                    "{name} 2.0.0 (git+https://example.test/another#{})",
-                    "a".repeat(40)
-                ),
-                serde_json::json!({}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+        let installs = ["tickloop-agent", "tickloop-tickhost"]
+            .into_iter()
+            .map(|name| {
+                (
+                    format!(
+                        "{name} 2.0.0 (git+https://example.test/another#{})",
+                        "a".repeat(40)
+                    ),
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         std::fs::write(
             cargo.join(".crates2.json"),
             serde_json::to_vec(&serde_json::json!({"installs":installs})).unwrap(),

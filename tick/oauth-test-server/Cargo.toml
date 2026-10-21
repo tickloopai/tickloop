@@ -1,0 +1,16 @@
+[package]
+name = "tickloop-tick-oauth-test-server"
+description = "Test-only OAuth 2.0 authorization server on 127.0.0.1 for Tick package logins"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tick_oauth_test_server"
+doctest = false
+
+[dependencies]
+serde_json = "1"
+url = "2"

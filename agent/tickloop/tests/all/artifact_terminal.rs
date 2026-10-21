@@ -143,8 +143,7 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
 
 #[test]
 fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_model_or_herdr() {
-    let server =
-        tick_test_support::authorization_server::AuthorizationServer::start_with_path("/account");
+    let server = tick_oauth_test_server::AuthorizationServer::start_with_path("/account");
     server.edit_device_authorization(|device| {
         device["user_code"] = serde_json::json!("ABCD");
         device["verification_uri_complete"] = serde_json::Value::Null;
@@ -199,7 +198,7 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
     reader.join().unwrap();
     assert_eq!(
         server
-            .requests_to(tick_test_support::authorization_server::DEVICE_AUTHORIZATION_PATH)
+            .requests_to(tick_oauth_test_server::DEVICE_AUTHORIZATION_PATH)
             .len(),
         1
     );

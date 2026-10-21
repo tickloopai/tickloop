@@ -6,7 +6,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 - **Bugs and feature requests:** open a [GitHub issue](https://github.com/tickloopai/tickloop/issues/new/choose). Search existing issues first.
 - **Security problems:** report them privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
-- **Tick packages** (`longbridge`, `futu`, or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `agent/packages`, `/ticks`, `tickloop tick ...`) stay in this repository.
+- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `agent/packages`, `/ticks`, `tickloop tick ...`) stay in this repository.
 - **Larger changes:** open an issue to discuss the design before writing a lot of code, especially for changes to the Tick protocol, the permission system or process lifecycle.
 
 ## Development setup
@@ -18,9 +18,9 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 - Optional: [Herdr](https://github.com/herdrdev/herdr) to exercise Tick panes.
 
 ```sh
-make build     # build tickloop, tickhost and tick-reader
+make build     # build tickloop and tickhost
 make dev       # build incrementally and start the agent in the current directory
-make install   # install the three programs into ~/.cargo/bin
+make install   # install both programs into ~/.cargo/bin
 make package   # build a release archive into dist/
 ```
 
@@ -51,7 +51,7 @@ It runs `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targ
 - Prefer testing from the agent's tools and permissions, and from Tick subscriptions driving the Loop.
 - Protocol tests use real child processes and PTYs. Host tests use controllable adapters and an isolated Herdr.
 - Tests must only clean up resources they created.
-- Tests never need real model or brokerage accounts. Tests against live APIs stay behind a feature flag and are ignored by default.
+- Tests never need real model or data-source accounts. Tests against live APIs stay behind a feature flag and are ignored by default.
 
 ## Repository layout
 
@@ -76,12 +76,9 @@ It runs `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targ
 | `tickhost/host` | The `tickhost` executable: runs protocol, Terminal and Shell Ticks with multiple attached views |
 | `tickhost/connect` | Tickhost business channel and client, per-instance Tick sessions, launch contract, program resolution, Herdr pane layout |
 | `tick/protocol`, `tick/sdk` | The Tick standard and the Tick-side protocol implementation |
-| `tick/command` | Shared entry point for Tick Commands |
-| `tick/reader` | The `tick-reader` executable, bundled with Tickloop |
-| `tick/market`, `tick/provider` | Financial Tick views and the provider interfaces that Tick packages implement |
 | `tick/packages` | Tick package manifests, marketplace index, installation and credential files |
 | `tick/oauth` | Standard OAuth 2.0 client used for Tick package logins |
-| `tick/test-support` | Mock data, the test-only `tick-mock` and a fake OAuth server |
+| `tick/oauth-test-server` | Test-only OAuth 2.0 authorization server shared by Tick and agent login tests |
 | `tick/examples` | Runnable examples of external protocol programs |
 | `ui` | Shared terminal presentation, input and formatting rules |
 | `distribution/cargo` | The crates.io launcher crate `tickloop` |
@@ -106,7 +103,7 @@ By contributing you agree that your contributions are licensed under the [MIT Li
 
 ## Releases (maintainers)
 
-`tickloop`, `tickhost` and `tick-reader` share one product version, the workspace version in the root `Cargo.toml`. Tick packages are versioned independently in tickloopai/ticks.
+`tickloop` and `tickhost` share one product version, the workspace version in the root `Cargo.toml`. Tick packages are versioned independently in tickloopai/ticks.
 
 ```sh
 make release                 # bump the patch version

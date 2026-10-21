@@ -27,4 +27,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
-tickloop-tick-test-support = { path = "../../tick/test-support" }
+tickloop-tick-oauth-test-server = { path = "../../tick/oauth-test-server" }

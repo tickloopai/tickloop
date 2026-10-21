@@ -243,19 +243,15 @@ mod tests {
         let marker = root.join("candidate-executed");
         let candidate = probing_executable(&cargo.join("bin/tickloop"), &marker);
         let repository = "https://example.test/original";
-        let installs = [
-            "tickloop-agent",
-            "tickloop-tickhost",
-            "tickloop-tick-reader",
-        ]
-        .into_iter()
-        .map(|name| {
-            (
-                format!("{name} 2.0.0 (git+{repository}#{})", "a".repeat(40)),
-                serde_json::json!({}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+        let installs = ["tickloop-agent", "tickloop-tickhost"]
+            .into_iter()
+            .map(|name| {
+                (
+                    format!("{name} 2.0.0 (git+{repository}#{})", "a".repeat(40)),
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         std::fs::write(
             cargo.join(".crates2.json"),
             serde_json::to_vec(&serde_json::json!({"installs":installs})).unwrap(),

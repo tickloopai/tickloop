@@ -27,8 +27,8 @@ pub fn command_title(words: &[String]) -> String {
 }
 
 /// A Tick's name: its declared title and the positional arguments of `command` (a
-/// [`command_title`]) that follow the word naming its type, such as `Quote · AAPL.US` for
-/// `tick-longbridge quote AAPL.US`. A Tick without such arguments is named by its title alone.
+/// [`command_title`]) that follow the word naming its type, such as `Feed · alpha` for
+/// `tick-sample feed alpha`. A Tick without such arguments is named by its title alone.
 pub fn tick_title(title: &str, kind: &str, command: &str) -> String {
     let type_names = [kind, kind.rsplit('.').next().unwrap_or(kind)];
     let names_type = |word: &&str| {
@@ -106,8 +106,8 @@ mod tests {
     fn a_launch_command_names_its_program_and_paths_by_file_name() {
         for (command, expected) in [
             (
-                "/Users/me/tickloop/target/debug/tick-longbridge quote AAPL.US",
-                "tick-longbridge quote AAPL.US",
+                "/Users/me/ticks/target/debug/tick-sample feed alpha",
+                "tick-sample feed alpha",
             ),
             (
                 "/usr/bin/python3 /Users/me/tick/examples/counter.py --start 3",
@@ -123,36 +123,26 @@ mod tests {
     #[test]
     fn a_tick_is_named_by_its_title_and_the_arguments_after_its_type() {
         for (title, kind, command, expected) in [
+            ("Feed", "feed", "tick-sample feed alpha", "Feed · alpha"),
             (
-                "Quote",
-                "quote",
-                "tick-longbridge quote AAPL.US",
-                "Quote · AAPL.US",
+                "Feed",
+                "feed",
+                "tick-sample feed alpha beta --interval 5",
+                "Feed · alpha beta",
+            ),
+            ("Status", "status", "tick-sample status", "Status"),
+            ("Viewer", "viewer", "viewer ./a.md", "Viewer · ./a.md"),
+            (
+                "Viewer",
+                "viewer",
+                "viewer ./a.md https://example.com/b.html --page 2",
+                "Viewer · ./a.md https://example.com/b.html",
             ),
             (
-                "Quote",
-                "quote",
-                "tick-longbridge quote AAPL.US 700.HK --interval 5",
-                "Quote · AAPL.US 700.HK",
-            ),
-            (
-                "Positions",
-                "positions",
-                "tick-longbridge positions",
-                "Positions",
-            ),
-            ("Reader", "reader", "tick-reader ./a.md", "Reader · ./a.md"),
-            (
-                "Reader",
-                "reader",
-                "tick-reader ./a.md https://example.com/b.html --symbol AAPL.US",
-                "Reader · ./a.md https://example.com/b.html",
-            ),
-            (
-                "Futu Options",
-                "options",
-                "tick-futu options AAPL.US --port 11111",
-                "Futu Options · AAPL.US",
+                "Sample Feed",
+                "feed",
+                "tick-sample feed alpha --port 11111",
+                "Sample Feed · alpha",
             ),
             (
                 "Counter",

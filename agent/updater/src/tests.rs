@@ -288,11 +288,7 @@ fn periodic_checks_are_throttled_after_success_and_retried_after_failure() {
 
 fn cargo_metadata(root: &Path, version: &str, revision: &str) {
     let mut installs = serde_json::Map::new();
-    for name in [
-        "tickloop-agent",
-        "tickloop-tickhost",
-        "tickloop-tick-reader",
-    ] {
+    for name in ["tickloop-agent", "tickloop-tickhost"] {
         installs.insert(format!("{name} {version} (git+https://github.com/example/tickloop?tag=v{version}#{revision})"), serde_json::json!({}));
     }
     std::fs::write(
@@ -440,7 +436,6 @@ fn cargo_path_install_is_retained_as_a_checkout_instead_of_switching_to_binary_r
     for (name, path) in [
         ("tickloop-agent", "agent/tickloop"),
         ("tickloop-tickhost", "tickhost/host"),
-        ("tickloop-tick-reader", "tick/reader"),
     ] {
         let url = reqwest::Url::from_file_path(checkout.join(path)).unwrap();
         installs.insert(format!("{name} 1.2.3 (path+{url})"), serde_json::json!({}));

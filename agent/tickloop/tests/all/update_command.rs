@@ -73,14 +73,12 @@ fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries()
     let identity = String::from_utf8(identity.stdout).unwrap();
     let identity = identity.trim();
     let version = env!("CARGO_PKG_VERSION");
-    for name in ["tickhost", "tick-reader"] {
-        let program = source.join(name);
-        std::fs::write(&program, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo '{name} {version}';;\n--build-identity) echo '{identity}';;\n*) exit 2;;\nesac\n")).unwrap();
-        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let tickhost = source.join("tickhost");
+    std::fs::write(&tickhost, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo 'tickhost {version}';;\n--build-identity) echo '{identity}';;\n*) exit 2;;\nesac\n")).unwrap();
+    std::fs::set_permissions(tickhost, std::fs::Permissions::from_mode(0o700)).unwrap();
     let launcher = cargo_root.join("bin/tickloop");
     std::fs::write(&launcher, b"Cargo owns the launcher").unwrap();
-    let metadata = serde_json::json!({"installs": {format!("tickloop {version} (registry+https://github.com/rust-lang/crates.io-index)"): {"bins":["tickloop","tl","tickhost","tick-reader"]}}});
+    let metadata = serde_json::json!({"installs": {format!("tickloop {version} (registry+https://github.com/rust-lang/crates.io-index)"): {"bins":["tickloop","tl","tickhost"]}}});
     let metadata = serde_json::to_vec(&metadata).unwrap();
     std::fs::write(cargo_root.join(".crates2.json"), &metadata).unwrap();
     let output = Command::new(&payload)
@@ -108,7 +106,7 @@ fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries()
         serde_json::from_slice(&std::fs::read(runtime.join("installation.json")).unwrap()).unwrap();
     assert_eq!(record["source"]["kind"], "cargo_registry");
     assert_eq!(record["build"]["identity"], identity);
-    for name in ["tickloop", "tickhost", "tick-reader"] {
+    for name in ["tickloop", "tickhost"] {
         let output = Command::new(runtime.join(name))
             .arg("--version")
             .output()

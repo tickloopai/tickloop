@@ -263,7 +263,6 @@ pub struct WorkspaceHostContext {
     pub integration: WorkspaceIntegration,
     /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
-    pub reader_executable: Option<PathBuf>,
     /// The installed Tick packages whose programs this Agent can open.
     pub tick_packages: Vec<WorkspaceTickPackage>,
 }
@@ -289,13 +288,9 @@ impl WorkspaceHostContext {
         )
     }
 
-    /// The same container, where this Agent can also run Ticks in the Tickhost, among them the
-    /// bundled `tick-reader`.
+    /// The same container, where this Agent can also run Ticks in the Tickhost.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
-        self.reader_executable = self
-            .reader_executable
-            .or_else(tickhost_connect::program::bundled_reader_executable);
         self
     }
 
@@ -342,7 +337,6 @@ impl WorkspaceHostContext {
             name,
             integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
-            reader_executable: None,
             tick_packages: Vec::new(),
         }
     }

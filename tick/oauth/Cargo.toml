@@ -24,5 +24,5 @@ url = "2"
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
-tickloop-tick-test-support = { path = "../test-support" }
+tickloop-tick-oauth-test-server = { path = "../oauth-test-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

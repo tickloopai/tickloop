@@ -13,9 +13,9 @@ The main command is `tickloop` (Homebrew also installs the short alias `tl`).
 
 ## Features
 
-- **Ticks.** A Tick is one running program, identified as a Tick Instance. *Extension Ticks* speak the [Tick protocol](tick/protocol/SPECIFICATION.en.md) and expose structured state, tools and updates. Any other interactive program (a log viewer, a REPL) can be opened as a *Terminal Tick*, where the agent reads the screen and types input. Background shell commands run as *Shell Ticks*. The Reader (`tick-reader`) ships with Tickloop and reads HTML, Markdown, text and PDF sources.
+- **Ticks.** A Tick is one running program, identified as a Tick Instance. *Extension Ticks* speak the [Tick protocol](tick/protocol/SPECIFICATION.en.md) and expose structured state, tools and updates. Any other interactive program (a log viewer, a REPL) can be opened as a *Terminal Tick*, where the agent reads the screen and types input. Background shell commands run as *Shell Ticks*.
 - **Tickhost.** Every local Tick runs in Tickhost, a host service the agent daemon starts on demand. Ticks keep running when you detach or close a view. The Monitor beside the conversation lists the current Chat's Ticks, subscriptions, artifacts and background shells; press Enter on a row to attach a full view and Esc to hide it again.
-- **Herdr panes.** Inside [Herdr](https://github.com/herdrdev/herdr), Tickloop can show a Tick in a split pane next to the agent ("open a K-line Tick to the right of your tab"). A pane is only a view: moving it keeps the instance and its subscriptions, and closing it leaves the Tick running. Ticks work the same outside Herdr; displaying them in tmux or Zellij panes is not supported yet.
+- **Herdr panes.** Inside [Herdr](https://github.com/herdrdev/herdr), Tickloop can show a Tick in a split pane next to the agent ("open the counter Tick to the right of your tab"). A pane is only a view: moving it keeps the instance and its subscriptions, and closing it leaves the Tick running. Ticks work the same outside Herdr; displaying them in tmux or Zellij panes is not supported yet.
 - **Subscriptions drive the Loop.** Subscriptions belong to a Loop and are always explicit; opening or reading a Tick never subscribes. Extension and Terminal Ticks are delivered at high (every minute, default), medium (10 minutes) or low (30 minutes) frequency, and only the latest state is delivered. Shell Ticks report their exit immediately.
 - **Multiple models.** A built-in catalog covers Anthropic Claude, OpenAI (API and ChatGPT/Codex subscription), GitHub Copilot, Google Gemini and Vertex AI, DeepSeek, Kimi, MiniMax, Zhipu GLM / Z.ai, xAI and Alibaba. Switch models in the middle of a Chat with `/model`; history is carried over to the target protocol.
 - **Permissions and modes.** Tool calls go through a permission system with Auto (default, model-reviewed), Ask, Plan and Full Access modes. `shift+tab` cycles modes, and `/permissions` manages rules and shows recent decisions.
@@ -31,7 +31,7 @@ The main command is `tickloop` (Homebrew also installs the short alias `tl`).
 
 ## Install
 
-`tickloop`, `tickhost` and `tick-reader` are always installed and upgraded together. The daemon only starts a `tickhost` from the same directory and build.
+`tickloop` and `tickhost` are always installed and upgraded together. The daemon only starts a `tickhost` from the same directory and build.
 
 ### Homebrew
 
@@ -61,10 +61,10 @@ Requires the current stable Rust toolchain.
 
 ```sh
 cargo install --locked --git https://github.com/tickloopai/tickloop \
-  tickloop-agent tickloop-tickhost tickloop-tick-reader
+  tickloop-agent tickloop-tickhost
 ```
 
-Add `--tag vX.Y.Z` to pin a release. From a checkout, `make install` installs the same three programs into `~/.cargo/bin`.
+Add `--tag vX.Y.Z` to pin a release. From a checkout, `make install` installs the same two programs into `~/.cargo/bin`.
 
 ### Updating
 
@@ -125,21 +125,21 @@ On the command line, `tickloop -c` continues the most recent Chat in the directo
 
 ## Tick packages
 
-Tick packages add data sources. Each package is a prebuilt executable, a manifest (`tick-package.json`) and Skills that teach the agent how to use it. The official packages, currently `longbridge` (quotes, watchlists, K-lines, positions, news, earnings) and `futu` (options through Futu OpenD), are developed and published in [tickloopai/ticks](https://github.com/tickloopai/ticks), which is also the Tick marketplace.
+Tick packages add data sources. Each package is a prebuilt executable, a manifest (`tick-package.json`) and Skills that teach the agent how to use it. The official packages are developed and published in [tickloopai/ticks](https://github.com/tickloopai/ticks), which is also the Tick marketplace.
 
 ```sh
 tickloop tick list                 # installed packages and their login state
 tickloop tick list --available     # marketplace packages, versions and platform support
-tickloop tick install longbridge
-tickloop tick login longbridge     # device-code sign-in; --issuer NAME when there are several
-tickloop tick logout longbridge
-tickloop tick uninstall longbridge
+tickloop tick install PACKAGE
+tickloop tick login PACKAGE        # device-code sign-in; --issuer NAME when there are several
+tickloop tick logout PACKAGE
+tickloop tick uninstall PACKAGE
 tickloop tick install --path DIR   # a local package directory or .tar.gz, for package development
 ```
 
 Inside the agent, `/ticks` offers the same install, update, uninstall, login and logout actions. OAuth logins print a verification link and code that you confirm in a browser on any device, so they also work on remote machines; API-key logins read the key without echoing it. Login states are `logged in`, `needs login`, `login expired`, `no login needed` and `login unknown`.
 
-Installing a package only places its program and Skills: it never runs the program, opens or subscribes to a Tick, or grants market-data, account or trading permission. Credentials are stored in `~/.tickloop/credentials/<package>/` and handed only to that package's own process; `uninstall` keeps them. Installed packages are available to the agent from its next request, and their Skills appear as `<package>:<skill>`, such as `longbridge:usage`.
+Installing a package only places its program and Skills: it never runs the program, opens or subscribes to a Tick, or grants any data, account or other permission. Credentials are stored in `~/.tickloop/credentials/<package>/` and handed only to that package's own process; `uninstall` keeps them. Installed packages are available to the agent from its next request, and their Skills appear as `<package>:<skill>`, such as `<package>:usage`.
 
 ## Tick protocol
 
@@ -157,7 +157,7 @@ Extension Ticks speak Tick protocol 3: line-delimited JSON-RPC 2.0 over stdin/st
 
 ## Contributing
 
-Bug reports, ideas and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the build, test and review workflow. For new Tick packages or changes to `longbridge` and `futu`, use [tickloopai/ticks](https://github.com/tickloopai/ticks).
+Bug reports, ideas and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the build, test and review workflow. For new Tick packages or changes to the official ones, use [tickloopai/ticks](https://github.com/tickloopai/ticks).
 
 ## Security
 

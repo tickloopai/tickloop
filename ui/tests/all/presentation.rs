@@ -77,20 +77,8 @@ fn the_tick_ring_steps_its_gap_round_all_eight_dots() {
 fn status_icons_are_single_column_unicode_symbols() {
     use tickloop_ui::icons::Icon;
     assert_eq!(Icon::Connection.glyph(), "●");
-    assert_eq!(Icon::MarketOpen.glyph(), "▶");
     assert_eq!(Icon::TickUpdate.glyph(), "⣾");
-    for icon in [
-        Icon::Connection,
-        Icon::TickUpdate,
-        Icon::MarketPre,
-        Icon::MarketOpen,
-        Icon::MarketClosed,
-        Icon::Paper,
-        Icon::Rise,
-        Icon::Fall,
-        Icon::Position,
-        Icon::Kline,
-    ] {
+    for icon in [Icon::Connection, Icon::TickUpdate] {
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(icon.glyph()),
             1,

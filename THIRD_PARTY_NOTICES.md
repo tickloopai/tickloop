@@ -19,17 +19,17 @@ Current Tickloop connects to an independently running Herdr through its API; it 
 - Upstream: [Longbridge Terminal](https://github.com/longbridge/longbridge-terminal).
 - Reference revision: `b834538` (2026-09-07).
 - Upstream sources: `src/utils/text.rs`, `src/utils/number.rs`, `src/tui/nav.rs`, `src/cli/output.rs`.
-- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation), `tick/provider/src/api.rs` (symbol normalization), and `tick/market/src/output.rs` (header keys).
+- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation).
 - Applicable license: Apache License, Version 2.0. An unmodified copy is included in [licenses/Longbridge-Terminal-Apache-2.0.txt](./licenses/Longbridge-Terminal-Apache-2.0.txt).
 
-The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units. Longbridge Terminal is a source reference, not a build dependency. The rate limiter adapted from `src/openapi/rate_limiter.rs` moved with the `longbridge` Tick package to [tickloopai/ticks](https://github.com/tickloopai/ticks), which carries its own notice.
+The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units. Longbridge Terminal is a source reference, not a build dependency. The symbol normalization, header keys and rate limiter adapted from it moved with the financial Ticks to [tickloopai/ticks](https://github.com/tickloopai/ticks), which carries its own notice.
 
-## CLI Candlestick Chart glyph rules
+## Former CLI Candlestick Chart glyph rules
 
 - Upstream: [cli-candlestick-chart](https://github.com/Julien-R44/cli-candlestick-chart).
 - Reference copy: Longbridge Terminal revision `b834538`, `crates/cli-candlestick-chart/src/chart_renderer.rs`.
-- Adapted source: `ui/src/charts.rs`, `candle_glyph`; quarter-cell wick/body boundary rules extracted as a pure function. Braille crossing attribution in the same file also follows `src/ai/chart.rs` in the Apache-2.0 Longbridge Terminal reference above.
-- Applicable license for candle glyph rules: MIT. The copyright notice and license are included in [licenses/Cli-Candlestick-Chart-MIT.txt](./licenses/Cli-Candlestick-Chart-MIT.txt).
+- Former adapted source: `ui/src/charts.rs`, `candle_glyph`; it moved with the financial Ticks to [tickloopai/ticks](https://github.com/tickloopai/ticks), which carries its own notice.
+- Applicable license for candle glyph rules: MIT. The copyright notice and license are included in [licenses/Cli-Candlestick-Chart-MIT.txt](./licenses/Cli-Candlestick-Chart-MIT.txt), which remains for historical source versions.
 
 ## Crossterm input patch
 

@@ -5,8 +5,8 @@ use std::{
 
 use serde_json::Value;
 use tick_oauth::{DeviceLogin, LoginError};
+use tick_oauth_test_server::AuthorizationServer;
 use tick_packages::{OAuthIssuer, PackageAuth, PackageCredentials};
-use tick_test_support::authorization_server::AuthorizationServer;
 use tokio_util::sync::CancellationToken;
 
 /// A package's credentials in a private config root, and a local server to log in with.

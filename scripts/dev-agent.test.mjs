@@ -66,7 +66,7 @@ function fixture(t) {
     const program = ${JSON.stringify(tickloop)}
       .replace('__COMPILED_CHECKOUT__', JSON.stringify(fs.realpathSync('.')))
       .replace('__BUILD_TARGET__', JSON.stringify(fs.realpathSync(target)));
-    for (const name of ['tickloop', 'tickhost', 'tick-reader'])
+    for (const name of ['tickloop', 'tickhost'])
       fs.writeFileSync(path.join(directory, name), program, { mode: 0o755 });
     const switchedBranch = path.join(process.cwd(), 'switch-branch-during-build');
     if (fs.existsSync(switchedBranch)) fs.copyFileSync(switchedBranch, path.join(process.cwd(), 'branch'));
