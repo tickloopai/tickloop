@@ -54,6 +54,7 @@ impl RetainedState {
                 self.metadata.sent_agent_messages = Some(entry.clone())
             }
             Line::Provenance(entry) => self.metadata.provenance = Some(entry.clone()),
+            Line::CitationSources(entry) => self.metadata.citation_sources = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.metadata.family_inputs = Some(entry.clone()),
             Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
             Line::FamilyCompletions(entry) => {
@@ -293,7 +294,11 @@ pub(crate) fn assemble(
             indexed.file_index >= prune.last_boundary_index || prune.preserved.contains(uuid)
         });
     }
-    recover_orphaned_parallel_tool_results(&mut chain, &entries);
+    let has_citation_calls = metadata
+        .citation_sources
+        .as_ref()
+        .is_some_and(|table| !table.calls.is_empty());
+    recover_orphaned_parallel_tool_results(&mut chain, &entries, has_citation_calls);
     let loaded = LoadedTranscript {
         uuids,
         chain,
@@ -442,11 +447,12 @@ fn apply_preserved_segment_relinks(
 fn recover_orphaned_parallel_tool_results(
     chain: &mut Vec<ChainEntry>,
     entries: &HashMap<Uuid, IndexedEntry>,
+    scope_to_batch: bool,
 ) {
     let on_chain = chain.iter().map(|entry| entry.uuid).collect::<HashSet<_>>();
     let mut resolved = chain
         .iter()
-        .flat_map(|entry| entry.message.content.iter())
+        .flat_map(|entry| &entry.message.content)
         .filter_map(|content| match content {
             Content::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
             _ => None,
@@ -455,16 +461,17 @@ fn recover_orphaned_parallel_tool_results(
     let mut position = 0;
     while position < chain.len() {
         let assistant = &chain[position];
-        let unresolved = assistant
+        let calls = assistant
             .message
             .content
             .iter()
             .filter_map(|content| match content {
-                Content::ToolUse { id, .. } if !resolved.contains(id) => Some(id.clone()),
+                Content::ToolUse { id, .. } => Some(id.clone()),
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        if assistant.message.role != Role::Assistant || unresolved.is_empty() {
+        let run = assistant.run_id;
+        if assistant.message.role != Role::Assistant || calls.is_empty() {
             position += 1;
             continue;
         }
@@ -477,6 +484,16 @@ fn recover_orphaned_parallel_tool_results(
         if group_end == position {
             position += 1;
             continue;
+        }
+        if scope_to_batch {
+            resolved = chain[position + 1..=group_end]
+                .iter()
+                .flat_map(|entry| &entry.message.content)
+                .filter_map(|content| match content {
+                    Content::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect();
         }
         let group = chain[position..=group_end]
             .iter()
@@ -492,8 +509,9 @@ fn recover_orphaned_parallel_tool_results(
                         .parent_uuid
                         .is_some_and(|parent| group.contains(&parent))
                     && is_tool_results(&indexed.entry)
+                    && (!scope_to_batch || run.is_none() || indexed.entry.run_id.is_none() || indexed.entry.run_id == run)
                     && indexed.entry.message.content.iter().any(|content| {
-                        matches!(content, Content::ToolResult { tool_use_id, .. } if unresolved.contains(tool_use_id))
+                        matches!(content, Content::ToolResult { tool_use_id, .. } if calls.contains(tool_use_id) && !resolved.contains(tool_use_id))
                     })
             })
             .map(|indexed| {

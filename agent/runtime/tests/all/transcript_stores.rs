@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tickloop_agent_protocol::{AgentHostOptions, ChatId, Content, EventKind, Message, Role};
+use tickloop_agent_protocol::{ChatId, Content, EventKind, Message, Role};
 use tickloop_agent_runtime::transcript::{
     AppendBatch, BatchId, ChatPlacement, JsonlTranscriptStore, LoadRange, StorePosition,
     TranscriptError, TranscriptStore,
@@ -266,17 +266,8 @@ async fn retrying_a_committed_batch_commits_it_once() {
 
 fn options(tools: ToolPolicy) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model: tickloop_agent_test_support::config(),
-        settings: None,
-        host: AgentHostOptions::embedded_defaults(),
         tools,
-        host_rules: Vec::new(),
-        task_tools: None,
-        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-        waits: tickloop_agent_runtime::WaitHosting::Process,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(tickloop_agent_test_support::config())
     }
 }
 

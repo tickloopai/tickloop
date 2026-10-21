@@ -372,7 +372,7 @@ async fn deliveries_queue_behind_the_work_a_load_restores() {
             SettledOutcome::Completed { .. }
         ));
     }
-    let requests = model.requests();
+    let requests = model.conversation_requests();
     assert_eq!(requests.len(), 4, "{requests:#?}");
     assert!(requests[0].contains("first prompt") && !requests[0].contains("second prompt"));
     assert!(requests[1].contains("second prompt") && !requests[1].contains("request-1"));
@@ -427,9 +427,6 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 execution_mode_override: Some(ExecutionMode::FullAccess),
@@ -440,12 +437,8 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
                 family_messages: true,
                 ..ToolPolicy::web_fetch_only()
             },
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()

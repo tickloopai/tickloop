@@ -42,9 +42,6 @@ pub(super) fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
@@ -54,12 +51,9 @@ pub(super) fn harness(
                 questions: true,
                 ..ToolPolicy::web_fetch_only()
             },
-            host_rules: Vec::new(),
-            task_tools: None,
             min_schedule_interval: floor,
             waits: WaitHosting::Durable,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()
@@ -235,7 +229,7 @@ fn earlier_by(
 /// fire's request would carry it twice.
 pub(super) fn checks(model: &Script) -> usize {
     model
-        .requests()
+        .conversation_requests()
         .iter()
         .filter(|request| request.contains(CHECK))
         .count()

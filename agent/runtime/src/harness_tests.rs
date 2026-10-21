@@ -41,17 +41,8 @@ fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
-            host: AgentHostOptions::embedded_defaults(),
             tools,
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: crate::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()
@@ -309,9 +300,6 @@ async fn shutdown_waits_for_a_submission_admitted_before_it_registered_its_run()
 /// What the cloud configures: no Folder, durable waits, no prompts, and its host rules.
 fn durable_chat_options() -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model: config(),
-        settings: None,
         host: AgentHostOptions {
             prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
             ..AgentHostOptions::product_defaults()
@@ -321,8 +309,7 @@ fn durable_chat_options() -> HarnessOptions {
         task_tools: Some(true),
         min_schedule_interval: Duration::from_secs(60),
         waits: WaitHosting::Durable,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(config())
     }
 }
 

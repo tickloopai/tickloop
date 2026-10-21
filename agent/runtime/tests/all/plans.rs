@@ -347,7 +347,9 @@ async fn approving_a_plan_returns_claude_codes_approval_and_the_plan_file_to_the
             .is_none()
     );
     let result = loop {
-        if let EventKind::ToolCompleted { call_id, result } = next_event(&mut events).await.kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = next_event(&mut events).await.kind
             && call_id == "plan"
         {
             break result;
@@ -546,7 +548,9 @@ async fn run_turn_results(
             continue;
         }
         match event.kind {
-            EventKind::ToolCompleted { call_id, result } => results.push((call_id, result)),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => results.push((call_id, result)),
             EventKind::Completed { .. } => return results,
             EventKind::Failed(error) => panic!("turn failed: {error}"),
             EventKind::PermissionRequested { request } => {
@@ -1170,7 +1174,9 @@ async fn plan_files_are_replaced_whole_and_a_failed_write_keeps_the_previous_ver
             continue;
         }
         match event.kind {
-            EventKind::ToolCompleted { call_id, result } if call_id == "plan-3" => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "plan-3" => {
                 assert!(result.is_error, "a plan that cannot be saved must fail");
                 failure = Some(result.content);
             }

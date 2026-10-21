@@ -21,9 +21,6 @@ use uuid::Uuid;
 
 fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model: config(),
-        settings: None,
         host: AgentHostOptions {
             prompt_policy: PromptPolicy::DenyOnPrompt,
             execution_mode_override: Some(ExecutionMode::FullAccess),
@@ -34,12 +31,9 @@ fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
             questions: true,
             ..ToolPolicy::web_fetch_only()
         },
-        host_rules: Vec::new(),
         task_tools,
-        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(config())
     }
 }
 

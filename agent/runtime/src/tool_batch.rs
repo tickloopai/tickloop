@@ -128,6 +128,7 @@ pub(crate) enum BatchExit {
 /// What an ended call leaves for the conversation and the Chat.
 struct CallCompletion {
     result: ModelVisibleResult,
+    sources: Option<Vec<tickloop_agent_protocol::CitationSource>>,
     host_effect: Option<HostEffect>,
     tool_use: Option<monitor_members::ToolUse>,
 }
@@ -242,6 +243,7 @@ impl Agent {
                 &call.call_id,
                 CallCompletion {
                     result,
+                    sources: None,
                     host_effect: None,
                     tool_use,
                 },
@@ -392,17 +394,14 @@ impl Agent {
         let outcome = self
             .execute_registered_call(receipt, batch.message_id, invocation, call_cancel)
             .await;
-        let (result, host_effect) = self
+        let mut completion = self
             .complete_call(receipt, &call_id, &name, outcome)
             .await?;
+        completion.tool_use = tool_use;
         self.commit_call_result(
             receipt,
             &call_id,
-            CallCompletion {
-                result,
-                host_effect,
-                tool_use,
-            },
+            completion,
             CommitMode {
                 is_resumed: false,
                 is_reentered: batch.is_reentered,
@@ -424,17 +423,22 @@ impl Agent {
     ) -> Result<(), String> {
         let CallCompletion {
             result,
+            sources,
             host_effect,
             tool_use,
         } = completion;
         let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+        let mut candidate = sources.as_ref().map(|_| chats[&receipt.chat_id].clone());
+        let chat = match candidate.as_mut() {
+            Some(candidate) => candidate,
+            None => chats.get_mut(&receipt.chat_id).unwrap(),
+        };
         if Agent::release_of(chat, receipt.run_id).is_cancelled() {
             return Err(super::suspension::RUN_RELEASED.into());
         }
         let is_appended =
             append_call_result(chat, receipt.run_id, call_id, &result, mode.is_reentered);
-        if mode.is_resumed
+        if (mode.is_resumed || sources.is_some())
             && is_appended
             && let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
                 operation.run_id == receipt.run_id && operation.call_id == call_id
@@ -489,12 +493,57 @@ impl Agent {
             }
             None => {}
         }
+        if is_appended && let Some(sources) = &sources {
+            let index = chat.snapshot.messages.len() - 1;
+            let message_id = *chat
+                .snapshot
+                .message_ids
+                .entry(index)
+                .or_insert_with(Uuid::new_v4);
+            let table = &mut chat.bookkeeping.citation_sources;
+            table.chat_id = receipt.chat_id;
+            table.calls.push(tickloop_agent_transcript::CitationCall {
+                call_id: call_id.into(),
+                run_id: receipt.run_id,
+                message_id,
+                numbers: sources.iter().map(|source| source.number).collect(),
+                aliases: Vec::new(),
+            });
+            if let Some(recorder) = &self.inner.recorder {
+                recorder.record_citation_sources(table.clone());
+            }
+        }
         self.save(&chat.snapshot);
+        if let Some(candidate) = candidate {
+            if is_appended && let Some(recorder) = &self.inner.recorder {
+                let current = &chats[&receipt.chat_id];
+                if let Err(failure) = recorder.commit_citation_call(current, &candidate).await {
+                    let error = match failure {
+                        crate::persistence::CitationCommitError::Association(error) => error,
+                        crate::persistence::CitationCommitError::ResultNode(error) => {
+                            if matches!(error, crate::transcript::TranscriptError::Storage(_)) {
+                                // The outbox retries this exact result. Keep its execution fact
+                                // in memory too, after the association has become durable.
+                                *chats.get_mut(&receipt.chat_id).unwrap() = candidate;
+                            }
+                            error
+                        }
+                    };
+                    return Err(error.to_string());
+                }
+            }
+            *chats.get_mut(&receipt.chat_id).unwrap() = candidate;
+        }
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+        if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+            return Err(super::suspension::RUN_RELEASED.into());
+        }
         if is_appended {
             self.emit(
                 chat,
                 receipt,
                 EventKind::ToolCompleted {
+                    sources: sources.unwrap_or_default(),
                     call_id: call_id.into(),
                     result: result.tool.clone(),
                 },
@@ -519,7 +568,7 @@ impl Agent {
         call_id: &str,
         name: &str,
         outcome: Result<ToolCallOutcome, super::tool_execution::ToolCallError>,
-    ) -> Result<(ModelVisibleResult, Option<HostEffect>), String> {
+    ) -> Result<CallCompletion, String> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -531,6 +580,7 @@ impl Agent {
         };
         let ToolCallOutcome {
             mut result,
+            sources,
             host_call_status,
             host_effect,
             images,
@@ -571,14 +621,16 @@ impl Agent {
         };
         let host_effect = host_effect
             .filter(|_| !result.is_error && host_call_status == Some(HostCallStatus::Completed));
-        Ok((
-            ModelVisibleResult {
+        Ok(CallCompletion {
+            result: ModelVisibleResult {
                 tool: result,
                 content,
                 ends_run: is_rejected_by_user && !continue_after_denial,
             },
+            sources,
             host_effect,
-        ))
+            tool_use: None,
+        })
     }
 
     /// The end of a batch: deferred local messages and messages queued to the Run's Loop join
@@ -649,6 +701,9 @@ fn append_call_result(
     }) {
         Some(message) => message.content.push(block),
         None => {
+            snapshot
+                .message_ids
+                .insert(snapshot.messages.len(), Uuid::new_v4());
             snapshot
                 .message_runs
                 .insert(snapshot.messages.len(), run_id);

@@ -314,7 +314,7 @@ impl Agent {
         chat: &mut Chat,
         index: usize,
         message_id: Uuid,
-        (candidate, candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
+        (candidate, mut candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
         loop_id: LoopId,
     ) {
         if let Some(recorder) = &self.inner.recorder {
@@ -330,6 +330,7 @@ impl Agent {
             .host_notes
             .range(index..first_reply)
             .any(|(_, note)| *note == HostNote::PlanModeExit);
+        candidate_bookkeeping.citation_sources = chat.bookkeeping.citation_sources.clone();
         chat.snapshot = candidate;
         chat.bookkeeping = candidate_bookkeeping;
         self.inner.ledger_changes.send_replace(());

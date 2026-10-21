@@ -841,6 +841,7 @@ fn observation_values_keep_their_recorded_wire() {
                 loop_id: id(0x10),
                 run_id: id(0x20),
                 kind: EventKind::ToolCompleted {
+                    sources: Vec::new(),
                     call_id: "call-read".into(),
                     result: ToolResult {
                         content: "A result too long for one feed change".into(),

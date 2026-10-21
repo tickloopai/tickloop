@@ -209,6 +209,46 @@ impl CompactionLayout {
                 None => origin.clear_seed(),
             }
         }
+        if rewrites_existing {
+            let messages = crate::citations::snapshot_messages(
+                snapshot,
+                Some(&bookkeeping.continued_message_ids),
+            );
+            for (index, source) in self.sources.iter().enumerate() {
+                let MessageSource::Existing(original) = source else {
+                    continue;
+                };
+                for call in &mut compacted_bookkeeping.citation_sources.calls {
+                    if crate::citations::call_is_visible_in(
+                        call,
+                        std::slice::from_ref(&messages[*original]),
+                    ) {
+                        call.aliases.push(compacted.message_ids[&index]);
+                    }
+                }
+            }
+        }
+        if let Some(summary_index) = self.position(MessageSource::Summary) {
+            let summary_id = compacted.message_ids[&summary_index];
+            let mut summarized = snapshot.clone();
+            let is_full = self.keeps_existing_prefix(snapshot.messages.len());
+            for (index, message) in summarized.messages.iter_mut().enumerate() {
+                if !is_full && self.sources.contains(&MessageSource::Existing(index)) {
+                    message.content.clear();
+                    summarized.message_ids.remove(&index);
+                    summarized.original_message_ids.remove(&index);
+                }
+            }
+            for call in &mut compacted_bookkeeping.citation_sources.calls {
+                if crate::citations::call_is_visible(
+                    call,
+                    &summarized,
+                    &bookkeeping.continued_message_ids,
+                ) {
+                    call.aliases.push(summary_id);
+                }
+            }
+        }
         compacted.announced_host_tools = compacted.visible_announced_host_tools();
         if rewrites_existing {
             for start in compacted_bookkeeping.loop_starts.values_mut() {

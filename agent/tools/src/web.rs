@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use super::web_provenance::{Observations, page_links};
 use super::web_search::DomainFilter;
 use super::web_search::{self, PreparedSearch, SearchRequest};
-use super::{Operation, ToolDefinition, ToolError, shell::BASH_TOOL_NAME, utf16_length};
+use super::{
+    Operation, ToolDefinition, ToolError, ToolExecution, WebSource, shell::BASH_TOOL_NAME,
+    utf16_length,
+};
 use tickloop_agent_protocol::{SearchConfig, ToolResult};
 
 pub const WEB_FETCH_TOOL_NAME: &str = "WebFetch";
@@ -419,7 +422,7 @@ pub(super) async fn fetch(
     reach: Reach,
     secondary_model: &dyn SecondaryModel,
     cancel: CancellationToken,
-) -> Result<ToolResult, ToolError> {
+) -> Result<ToolExecution, ToolError> {
     let url = validate_url(&input.url, false)?;
     let markdown = match cache.get(&input.url) {
         Some(markdown) => markdown,
@@ -436,7 +439,7 @@ pub(super) async fn fetch(
                 }
                 FetchedPage::Redirect(redirect) => {
                     observed.record_redirect(&redirect.original, &redirect.target);
-                    return Ok(text_result(redirect_message(&redirect, &input.prompt)));
+                    return Ok(Ok(text_result(redirect_message(&redirect, &input.prompt))).into());
                 }
             }
         }
@@ -444,7 +447,20 @@ pub(super) async fn fetch(
     observed.record_page(&url, page_links(&markdown, &url));
     let prompt = secondary_model_prompt(&truncate_markdown(&markdown), &input.prompt);
     let answer = secondary_model.respond(prompt, cancel).await?;
-    Ok(text_result(answer))
+    let web_sources = vec![WebSource {
+        url: url.to_string(),
+        title: markdown
+            .lines()
+            .find_map(|line| line.strip_prefix("# "))
+            .unwrap_or(url.as_str())
+            .to_owned(),
+        snippet: answer.clone(),
+    }];
+    Ok(ToolExecution {
+        result: Ok(text_result(answer)),
+        images: Vec::new(),
+        web_sources,
+    })
 }
 
 enum FetchedPage {
@@ -545,7 +561,7 @@ To complete your request, I need to fetch content from the redirected URL. Pleas
 pub(super) async fn search(
     input: SearchInput,
     cancel: CancellationToken,
-) -> Result<ToolResult, ToolError> {
+) -> Result<ToolExecution, ToolError> {
     let prepared = input
         .prepared
         .as_ref()
@@ -555,11 +571,12 @@ pub(super) async fn search(
         Ok(response) => response,
         Err(error) => {
             if let Some(failure) = web_search::failure_details(prepared.kind, &request, &error) {
-                return Ok(ToolResult {
+                return Ok(Ok(ToolResult {
                     content: serde_json::to_string(&failure).expect("search failure serializes"),
                     is_error: true,
                     output_ref: None,
-                });
+                })
+                .into());
             }
             return Err(match error {
                 web_search::SearchError::Cancelled => ToolError::Cancelled,
@@ -583,15 +600,27 @@ pub(super) async fn search(
     let at = time::OffsetDateTime::from(response.searched_at)
         .format(&time::format_description::well_known::Rfc3339)
         .expect("current timestamp has RFC3339 representation");
-    Ok(text_result(format!(
-        "Search source: {source}\nSearched at: {at}\n\n{}{}",
-        search_result_text(&response.query, &links),
-        if response.truncated {
-            "\nAdditional results were omitted."
-        } else {
-            ""
-        }
-    )))
+    let web_sources = links
+        .iter()
+        .map(|link| WebSource {
+            url: link.url.clone(),
+            title: link.title.clone(),
+            snippet: link.summary.clone(),
+        })
+        .collect();
+    Ok(ToolExecution {
+        result: Ok(text_result(format!(
+            "Search source: {source}\nSearched at: {at}\n\n{}{}",
+            search_result_text(&response.query, &links),
+            if response.truncated {
+                "\nAdditional results were omitted."
+            } else {
+                ""
+            }
+        ))),
+        images: Vec::new(),
+        web_sources,
+    })
 }
 
 /// One hit in Claude Code's `Links:` list, with the summary the configured service provides.

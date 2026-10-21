@@ -190,9 +190,6 @@ fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 execution_mode_override: Some(ExecutionMode::FullAccess),
@@ -206,11 +203,9 @@ fn harness(
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: vec![allow_web_fetch()],
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
-            system_prompt_addition: None,
             request_gates,
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()
@@ -441,6 +436,18 @@ fn mentions(request: &ModelRequest, text: &str) -> bool {
     serde_json::to_string(&request.messages)
         .unwrap()
         .contains(text)
+}
+
+fn conversation_mentions(request: &ModelRequest, text: &str) -> bool {
+    serde_json::to_string(
+        &request
+            .messages
+            .iter()
+            .filter(|message| message.role != tickloop_agent_protocol::Role::System)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .contains(text)
 }
 
 fn completed(lines: &[Line], input: Uuid) {
@@ -1309,7 +1316,7 @@ async fn a_failed_holding_spends_no_attempt_of_the_tasks_it_finished() {
     let model = ControlledModel::new({
         let may_finish = may_finish.clone();
         move |request| {
-            if mentions(request, "Second") {
+            if conversation_mentions(request, "Second") {
                 when(&may_finish, text(DONE))
             } else {
                 Reply::Now(text(DONE))
@@ -1329,7 +1336,7 @@ async fn a_failed_holding_spends_no_attempt_of_the_tasks_it_finished() {
         model
             .conversation()
             .iter()
-            .any(|request| mentions(request, "Second"))
+            .any(|request| conversation_mentions(request, "Second"))
     })
     .await;
     assert!(node.crash(cloud.root));

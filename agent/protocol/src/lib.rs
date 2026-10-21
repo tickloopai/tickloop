@@ -175,8 +175,9 @@ pub use tick_subscriptions::{
 pub use tickloop_agent_recurrence::{ParseError as RecurrenceError, Recurrence};
 pub use tool::ToolDefinition;
 pub use tools::{
-    CommandSnapshot, CommandState, FileReadRecord, SearchConfig, SearchProviderKind,
-    SearchTestResult, SearchTestStatus, ToolResult, WebSearchFailure, WebSearchSuggestion,
+    CitationSource, CommandSnapshot, CommandState, FileReadRecord, SearchConfig,
+    SearchProviderKind, SearchTestResult, SearchTestStatus, ToolResult, WebSearchFailure,
+    WebSearchSuggestion,
 };
 pub use usage::{
     CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,

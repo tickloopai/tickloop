@@ -18,9 +18,8 @@ use tickloop_agent_runtime::transcript::{
     TranscriptError, TranscriptStore,
 };
 use tickloop_agent_runtime::{
-    Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, MessageId, ParentSelection,
-    ToolPolicy, Turn, TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage,
-    environment::LocalEnvironment,
+    Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, MessageId, ParentSelection, Turn,
+    TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage, environment::LocalEnvironment,
 };
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 use tickloop_agent_test_support::{call, config, next_event, text};
@@ -180,17 +179,9 @@ fn harness(
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host,
-            tools: ToolPolicy::local(),
             host_rules,
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: tickloop_agent_runtime::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()

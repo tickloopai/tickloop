@@ -34,7 +34,9 @@ async fn run_answering_permissions(
                     .await
                     .unwrap();
             }
-            EventKind::ToolCompleted { call_id, result } => results.push((call_id, result)),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => results.push((call_id, result)),
             EventKind::Completed { .. } | EventKind::Interrupted => break,
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}

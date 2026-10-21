@@ -9,16 +9,16 @@ use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use tickloop_agent_base::image::prepare;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, Content, DirectedSummaryRequest, Event, EventKind, HostCallContext,
-    ImageContext, ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, Receipt,
-    RewindMode, Role, SummaryDirection, Trigger, TriggerPromptSource, Usage,
+    ChatId, Content, DirectedSummaryRequest, Event, EventKind, HostCallContext, ImageContext,
+    ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, Receipt, RewindMode,
+    Role, SummaryDirection, Trigger, TriggerPromptSource, Usage,
 };
 use tickloop_agent_runtime::transcript::{
     AppendBatch, BatchId, ChatPlacement, JsonlTranscriptStore, LoadRange, StorePosition,
     TranscriptStore,
 };
 use tickloop_agent_runtime::{
-    Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
+    Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, ParentSelection, TurnOp,
     TurnRequest, UserMessage, environment::LocalEnvironment,
 };
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
@@ -156,17 +156,7 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
-            host: AgentHostOptions::embedded_defaults(),
-            tools: ToolPolicy::local(),
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: tickloop_agent_runtime::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()

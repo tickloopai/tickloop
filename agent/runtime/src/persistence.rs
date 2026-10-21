@@ -55,6 +55,11 @@ const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 /// 从 Transcript 恢复的 Branch 没有标题时使用的名称。
 const UNTITLED_BRANCH_NAME: &str = "Branch";
 
+pub(super) enum CitationCommitError {
+    Association(TranscriptError),
+    ResultNode(TranscriptError),
+}
+
 pub(super) struct ChatRecorder {
     store: Arc<dyn TranscriptStore>,
     /// The local JSONL store, whose root and Chat files also place denials, plans, File History
@@ -306,6 +311,42 @@ impl ChatRecorder {
             .enqueue(chat_id, vec![Line::Provenance(entry)], None);
     }
 
+    pub(super) async fn commit_citation_call(
+        &self,
+        current: &Chat,
+        candidate: &Chat,
+    ) -> Result<(), CitationCommitError> {
+        self.enqueue_sync(&current.snapshot, &current.bookkeeping);
+        let _appends = self.appends.lock().await;
+        self.append_queued(current.snapshot.id, true)
+            .await
+            .map_err(CitationCommitError::Association)?;
+        self.enqueue_sync(&candidate.snapshot, &candidate.bookkeeping);
+        self.append_queued(candidate.snapshot.id, true)
+            .await
+            .map_err(CitationCommitError::ResultNode)?;
+        Ok(())
+    }
+
+    pub(super) fn citation_links(&self, chat: ChatId) -> HashMap<Uuid, Vec<Uuid>> {
+        self.logs
+            .lock()
+            .unwrap()
+            .get(&chat)
+            .into_iter()
+            .flat_map(|log| &log.links)
+            .filter_map(|link| Some((*link.uuids.first()?, link.uuids.clone())))
+            .collect()
+    }
+
+    pub(super) fn record_citation_sources(
+        &self,
+        entry: tickloop_agent_transcript::CitationSourcesEntry,
+    ) {
+        self.outbox
+            .enqueue(entry.chat_id, vec![Line::CitationSources(entry)], None);
+    }
+
     pub(super) fn record_sent_agent_messages(
         &self,
         chat_id: ChatId,
@@ -547,6 +588,12 @@ impl ChatRecorder {
             custom_title
                 .into_iter()
                 .chain(branch_origin)
+                .chain(metadata.citation_sources.map(|entry| {
+                    Line::CitationSources(tickloop_agent_transcript::CitationSourcesEntry {
+                        chat_id,
+                        ..entry
+                    })
+                }))
                 .chain(metadata.artifact_ticks.map(|entry| {
                     Line::ArtifactTicks(ArtifactTicksEntry {
                         chat_id,
@@ -614,6 +661,14 @@ impl ChatRecorder {
                 custom_title: title.to_owned(),
             }),
         ];
+        if !source_bookkeeping.citation_sources.sources.is_empty() {
+            lines.push(Line::CitationSources(
+                tickloop_agent_transcript::CitationSourcesEntry {
+                    chat_id: child_chat_id,
+                    ..source_bookkeeping.citation_sources.clone()
+                },
+            ));
+        }
         let monitor = source.monitor.for_new_chat();
         if !monitor.is_empty() {
             lines.push(Line::MonitorMembers(MonitorMembersEntry {
@@ -700,6 +755,11 @@ impl ChatRecorder {
             self.outbox.enqueue(compacted.id, lines, events_through);
             return;
         };
+        if compacted_bookkeeping.citation_sources != chat.bookkeeping.citation_sources {
+            lines.push(Line::CitationSources(
+                compacted_bookkeeping.citation_sources.clone(),
+            ));
+        }
         lines.extend(compaction_lines);
         lines.extend(renamed_snapshots.iter().filter_map(|renamed| {
             Some(Line::FileHistorySnapshot(FileHistorySnapshotEntry {
@@ -1975,6 +2035,32 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
     (restored, execution_mode_warnings)
 }
 
+pub(super) fn citations_in_chain(
+    chain: &[ChainEntry],
+    calls: &[tickloop_agent_transcript::CitationCall],
+    sources: &[tickloop_agent_protocol::CitationSource],
+) -> crate::VisibleCitations {
+    let (restored, _) = restore_chain(chain);
+    let messages = restored
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let ids = restored.links[index]
+                .uuids
+                .iter()
+                .copied()
+                .chain(restored.original_message_ids.get(&index).copied())
+                .collect();
+            crate::citations::CitationMessage {
+                ids,
+                content: &message.content,
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::citations::visible_in_messages(calls, sources, &messages)
+}
+
 fn restored_execution_mode(value: &serde_json::Value) -> (ExecutionMode, Option<String>) {
     let (mode, replacement) = match value.as_str() {
         Some("acceptEdits") => return (ExecutionMode::AcceptEdits, None),
@@ -2236,6 +2322,19 @@ fn recover_transcript(
             &loaded.lifecycle,
             chat_id == source_chat_id,
         ),
+        continued_message_ids: restored
+            .links
+            .iter()
+            .filter(|link| link.uuids.len() > 1)
+            .filter_map(|link| Some((*link.uuids.first()?, link.uuids.clone())))
+            .collect(),
+        citation_sources: loaded
+            .metadata
+            .citation_sources
+            .clone()
+            .filter(|entry| entry.chat_id == source_chat_id)
+            .map(|entry| tickloop_agent_transcript::CitationSourcesEntry { chat_id, ..entry })
+            .unwrap_or_default(),
         provenance: loaded
             .metadata
             .provenance
@@ -2632,6 +2731,10 @@ impl Agent {
         if self.inner.waits != WaitHosting::Durable {
             return Ok(());
         }
+        self.commit_transcripts(chat_ids).await
+    }
+
+    pub(super) async fn commit_transcripts(&self, chat_ids: &[ChatId]) -> Result<(), String> {
         let Some(recorder) = &self.inner.recorder else {
             return Ok(());
         };
@@ -3607,6 +3710,7 @@ impl StagedBranch {
         }
         chat.snapshot = snapshot;
         chat.bookkeeping = self.bookkeeping;
+        chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
         chat.content_replacements = self.content_replacements;
         chat.file_history = self.file_history;
         chat.needs_plan_mode_exit_notice = false;

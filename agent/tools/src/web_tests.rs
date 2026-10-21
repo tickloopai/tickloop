@@ -322,6 +322,8 @@ async fn a_cached_page_is_answered_again_without_a_second_download() {
         )
         .await
         .unwrap();
+        assert_eq!(result.web_sources[0].title, "Delivery");
+        let result = result.result.unwrap();
         assert_eq!(result.content, "The delivery is on Friday.");
         assert!(!result.is_error);
     }
@@ -358,6 +360,8 @@ async fn a_cross_origin_redirect_asks_for_a_new_call_without_contacting_the_targ
     )
     .await
     .unwrap();
+    assert!(result.web_sources.is_empty());
+    let result = result.result.unwrap();
     assert!(!result.is_error);
     assert_eq!(
         result.content,

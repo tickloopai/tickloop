@@ -282,12 +282,12 @@ mod channel {
     use tickloop_agent_model::ModelClient;
     use tickloop_agent_protocol::ToolResult;
     use tickloop_agent_protocol::{
-        AccessError, AgentAccess, AgentCommand, AgentHostOptions, CommandEnvelope, CommandResult,
-        EnvironmentValue, EventKind, HostEndpointIdentity, HostToolAuthority, HostWorkContext,
-        LaunchSpec, TickLinkState, TickSubscriptionChange,
+        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EnvironmentValue,
+        EventKind, HostEndpointIdentity, HostToolAuthority, HostWorkContext, LaunchSpec,
+        TickLinkState, TickSubscriptionChange,
     };
     use tickloop_agent_runtime::{
-        Agent, HarnessOptions, HarnessSeams, ToolPolicy,
+        Agent, HarnessOptions, HarnessSeams,
         environment::LocalEnvironment,
         host_tools::{HostCallResult, HostToolProvider},
         hosted::{
@@ -389,18 +389,7 @@ mod channel {
                             models: ChosenModels::new(self.model.clone()),
                         },
                         HarnessOptions {
-                            search: Default::default(),
-                            model: tickloop_agent_test_support::config(),
-                            settings: None,
-                            host: AgentHostOptions::embedded_defaults(),
-                            tools: ToolPolicy::local(),
-                            host_rules: Vec::new(),
-                            task_tools: None,
-                            min_schedule_interval:
-                                tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-                            waits: tickloop_agent_runtime::WaitHosting::Process,
-                            system_prompt_addition: None,
-                            request_gates: Vec::new(),
+                            ..HarnessOptions::local(tickloop_agent_test_support::config())
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
@@ -706,7 +695,9 @@ mod channel {
                 tickloop_agent_test_support::next_event_within(&mut events, HOSTED_EVENT_WAIT)
                     .await;
             match event.kind {
-                EventKind::ToolCompleted { call_id, result } => {
+                EventKind::ToolCompleted {
+                    call_id, result, ..
+                } => {
                     results.insert(call_id, result);
                 }
                 EventKind::Completed { .. } if event.run_id == receipt.run_id => return results,
