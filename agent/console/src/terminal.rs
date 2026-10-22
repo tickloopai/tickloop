@@ -4222,7 +4222,7 @@ async fn interact_with_herdr(
                     if stopped_thinking {
                         thinking_previews.remove(&event.run_id);
                     }
-                    status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_)) || stopped_thinking;
+                    status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_) | EventKind::ToolUseStarted { .. }) || stopped_thinking;
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
@@ -4466,7 +4466,7 @@ async fn interact_with_herdr(
                                 outln!(console, "Queued input joined run {into_run_id}.");
                             }
                         },
-                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } => {},
+                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } | EventKind::ToolUseStarted { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
                         EventKind::GoalEnded {reason,operations} => print_goal_end(console, event.loop_id,&reason,&operations)?,
                         EventKind::Started => {

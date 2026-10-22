@@ -282,6 +282,12 @@ pub enum EventKind {
     Started,
     Text(String),
     Thinking(String),
+    /// The model began writing a tool call whose input still streams. Display only: the call
+    /// itself comes with `AssistantMessageCommitted`, and no Transcript record reflects this.
+    ToolUseStarted {
+        call_id: String,
+        name: String,
+    },
     AssistantMessageCommitted {
         message_id: Uuid,
         tool_calls: Vec<ProposedToolCall>,
@@ -362,7 +368,10 @@ impl EventKind {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::Text(_) | Self::Thinking(_) | Self::ModelRetry { .. }
+            Self::Text(_)
+                | Self::Thinking(_)
+                | Self::ToolUseStarted { .. }
+                | Self::ModelRetry { .. }
         )
     }
 }

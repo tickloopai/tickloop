@@ -312,7 +312,7 @@ impl Agent {
                 ModelDelta::Usage(usage) => usage
                     .output_tokens
                     .is_some_and(|tokens| tokens >= u64::from(limit)),
-                ModelDelta::OutputStarted => false,
+                ModelDelta::ToolUseStarted { .. } | ModelDelta::OutputStarted => false,
             }
         } else {
             false
@@ -383,7 +383,31 @@ impl Agent {
                     let _ = self.inner.events.send(event);
                 }
             }
-            ModelDelta::Text(_) | ModelDelta::Thinking(_) => progress.output_started = true,
+            ModelDelta::ToolUseStarted { id, name } if display_text => {
+                progress.output_started = true;
+                if let Some(receipt) = context.conversation_receipt() {
+                    let mut chats = self.inner.chats.lock().await;
+                    let chat = chats
+                        .get_mut(&receipt.chat_id)
+                        .ok_or(AgentError::NotFound)?;
+                    chat.snapshot.last_sequence += 1;
+                    let event = Event {
+                        sequence: chat.snapshot.last_sequence,
+                        chat_id: receipt.chat_id,
+                        loop_id: receipt.loop_id,
+                        run_id: receipt.run_id,
+                        kind: EventKind::ToolUseStarted { call_id: id, name },
+                    };
+                    chat.snapshot.events.push(event.clone());
+                    if chat.snapshot.events.len() > super::EVENT_REPLAY_LIMIT {
+                        chat.snapshot.events.remove(0);
+                    }
+                    let _ = self.inner.events.send(event);
+                }
+            }
+            ModelDelta::Text(_) | ModelDelta::Thinking(_) | ModelDelta::ToolUseStarted { .. } => {
+                progress.output_started = true
+            }
         }
         if output_exhausted {
             return Err(ModelError::ResponseRejected(ModelResponseRejection::OutputLimit).into());

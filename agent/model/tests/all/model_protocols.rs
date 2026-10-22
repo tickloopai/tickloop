@@ -1442,3 +1442,117 @@ async fn chat_completions_rejects_noncomplete_finish_reasons_before_returning_te
         }
     }
 }
+
+/// Every delta a finished request sent, in order.
+pub(crate) fn sent_deltas(receiver: &mut mpsc::UnboundedReceiver<ModelDelta>) -> Vec<ModelDelta> {
+    std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+}
+
+/// The calls `deltas` announced as started, as `(id, name)`.
+pub(crate) fn started_tool_uses(deltas: &[ModelDelta]) -> Vec<(String, String)> {
+    deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ModelDelta::ToolUseStarted { id, name } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The calls an output carries, as `(id, name)`.
+pub(crate) fn output_tool_uses(content: &[Content]) -> Vec<(String, String)> {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            Content::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn prompt_request(prompt: &str) -> ModelRequest {
+    ModelRequest {
+        history_sources: Vec::new(),
+        messages: vec![message(Role::User, prompt)],
+        tools: vec![],
+        structured_output: None,
+        temperature: None,
+        reasoning_effort: None,
+    }
+}
+
+#[tokio::test]
+async fn chat_completions_announces_each_call_once_its_name_is_whole() {
+    let stream = [
+        chat_chunk(json!({"role":"assistant","content":"Making the page."}), Value::Null),
+        chat_chunk(json!({"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":"}}]}), Value::Null),
+        chat_chunk(json!({"tool_calls":[{"index":0,"function":{"arguments":"\"notes.md\"}"}}]}), Value::Null),
+        chat_chunk(json!({"tool_calls":[{"index":1,"id":"call-2","type":"function","function":{"name":"Artifact","arguments":""}}]}), Value::Null),
+        chat_chunk(json!({"tool_calls":[{"index":1,"function":{"name":"Edit","arguments":"{}"}}]}), Value::Null),
+        chat_chunk(json!({}), json!("tool_calls")),
+        format!("data: {}\n\n", json!({"id":"chat-1","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}})),
+        "data: [DONE]\n\n".into(),
+    ]
+    .concat();
+    let (base_url, _) = serve_response(200, stream).await;
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let output = client
+        .complete(
+            prompt_request("Make a page"),
+            events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let deltas = sent_deltas(&mut receiver);
+    let started = started_tool_uses(&deltas);
+    assert_eq!(
+        started,
+        [
+            ("call-1".to_owned(), "Read".to_owned()),
+            ("call-2".to_owned(), "ArtifactEdit".to_owned())
+        ]
+    );
+    assert_eq!(started, output_tool_uses(&output.content));
+    let text = deltas
+        .iter()
+        .position(|delta| *delta == ModelDelta::Text("Making the page.".into()));
+    let first_start = deltas
+        .iter()
+        .position(|delta| matches!(delta, ModelDelta::ToolUseStarted { .. }));
+    assert!(text < first_start, "{deltas:?}");
+}
+
+#[tokio::test]
+async fn responses_announce_each_call_once_with_the_id_of_its_output() {
+    for stream in [
+        responses_tool_stream(),
+        responses_tool_stream_without_argument_deltas(),
+    ] {
+        let (base_url, _) = serve_response(200, stream).await;
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, Protocol::Responses))
+            .unwrap();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let output = client
+            .complete(
+                prompt_request("Read both"),
+                events,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let started = started_tool_uses(&sent_deltas(&mut receiver));
+        assert_eq!(
+            started,
+            [
+                ("call-1".to_owned(), "Read".to_owned()),
+                ("call-2".to_owned(), "Read".to_owned())
+            ]
+        );
+        assert_eq!(started, output_tool_uses(&output.content));
+    }
+}

@@ -300,6 +300,10 @@ impl GoogleStream {
                             ));
                         }
                         self.call_count += 1;
+                        let _ = events.send(ModelDelta::ToolUseStarted {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
                         Content::ToolUse { id, name, input }
                     } else {
                         if part.get("thoughtSignature").is_some() {

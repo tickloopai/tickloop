@@ -261,6 +261,12 @@ pub struct ModelOutput {
 pub enum ModelDelta {
     Text(String),
     Thinking(String),
+    /// The model began writing a tool call; its input is still streaming. Once per call, as
+    /// soon as its name is known, and only for display: the call itself arrives with the output.
+    ToolUseStarted {
+        id: String,
+        name: String,
+    },
     OutputStarted,
     /// Absolute service-reported counters for this request, never an additive delta.
     Usage(Usage),
@@ -1267,7 +1273,13 @@ impl HttpModelClient {
             cancel,
             structured_response,
             self.config.adapter(),
-            copilot_auth,
+            if self.config.adapter() == Adapter::CodexResponses {
+                responses::ResponsesStream::for_codex()
+            } else if copilot_auth {
+                responses::ResponsesStream::with_rotating_item_ids()
+            } else {
+                responses::ResponsesStream::default()
+            },
         )
         .await?;
         output.private_source = source;
@@ -1353,7 +1365,7 @@ async fn consume_sse_response(
     cancel: CancellationToken,
     mut structured_response: Option<structured_response::StructuredResponsePolicy>,
     adapter: Adapter,
-    rotating_response_item_ids: bool,
+    responses_stream: responses::ResponsesStream,
 ) -> Result<ModelOutput, ModelError> {
     let codex = adapter == Adapter::CodexResponses;
     let has_event_stream_content_type = response
@@ -1385,13 +1397,7 @@ async fn consume_sse_response(
             provisional_input_usage: adapter == Adapter::MinimaxMessages,
             ..MessagesStream::default()
         }),
-        Protocol::Responses => ProtocolStream::Responses(if codex {
-            responses::ResponsesStream::for_codex()
-        } else if rotating_response_item_ids {
-            responses::ResponsesStream::with_rotating_item_ids()
-        } else {
-            responses::ResponsesStream::default()
-        }),
+        Protocol::Responses => ProtocolStream::Responses(responses_stream),
         Protocol::ChatCompletions => {
             ProtocolStream::Chat(chat_completions::ChatStream::for_adapter(adapter))
         }
@@ -1970,6 +1976,10 @@ impl MessagesStream {
                         if !input.is_object() {
                             return Err(invalid_response("tool input must be an object"));
                         }
+                        let _ = events.send(ModelDelta::ToolUseStarted {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
                         Content::ToolUse { id, name, input }
                     }
                     _ => return Err(invalid_response("unsupported content block type")),
