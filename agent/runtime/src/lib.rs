@@ -557,6 +557,16 @@ pub(crate) struct TurnAdmission {
     pub branch: Option<turn::BranchSwitch>,
 }
 
+/// What taking queued Trigger input came to.
+enum TriggerTake {
+    /// It started, and its run runs.
+    Started,
+    /// It waits, for the lease, its source or the Loop.
+    Waits,
+    /// The queue changed meanwhile: look at it again.
+    LookAgain,
+}
+
 /// Queues a Run that continues the conversation without a message of its own.
 fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
@@ -3723,25 +3733,48 @@ impl Agent {
                     return Ok(Some((receipt, request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
-                    if let Some(taken) =
-                        Box::pin(self.take_trigger_input(chat_id, &pending)).await?
-                    {
-                        return Ok(taken);
+                    match self.take_trigger_input(chat_id, *pending).await? {
+                        TriggerTake::LookAgain => {}
+                        // A run it started runs on a task of its own.
+                        TriggerTake::Started | TriggerTake::Waits => return Ok(None),
                     }
                 }
             }
         }
     }
 
-    /// Takes the queued Trigger input `pending` within the Chat's Trigger boundary: under the
-    /// Chat's lease, while no other process paused receiving, once its source proved it again;
-    /// its start is recorded durably before the boundary is left. `Some(None)` when nothing
-    /// starts, as it waits or is withdrawn; `None` to look at the queue again.
+    /// Takes the queued Trigger input `pending` and starts its run on a task of the Agent's own,
+    /// which a caller that stops waiting does not stop: no input is left started and not
+    /// running.
     async fn take_trigger_input(
         &self,
         chat_id: ChatId,
+        pending: PendingInput,
+    ) -> Result<TriggerTake, AgentError> {
+        self.inner
+            .tasks
+            .spawn(self.clone().take_and_start_trigger_input(chat_id, pending))
+            .await
+            .map_err(|error| AgentError::Invalid(format!("taking Trigger input failed: {error}")))?
+    }
+
+    /// The whole take, within the Chat's Trigger boundary: under the Chat's lease, while no
+    /// other process paused receiving, once its source proved it again, the input starts, its
+    /// start is recorded durably before the boundary is left, and its run is started. Its future
+    /// is named, not inferred: the run asks for the next input, which may be taken this way.
+    fn take_and_start_trigger_input(
+        self,
+        chat_id: ChatId,
+        pending: PendingInput,
+    ) -> futures_util::future::BoxFuture<'static, Result<TriggerTake, AgentError>> {
+        Box::pin(async move { self.take_and_start(chat_id, &pending).await })
+    }
+
+    async fn take_and_start(
+        &self,
+        chat_id: ChatId,
         pending: &PendingInput,
-    ) -> Result<Option<Option<(Receipt, ModelRequest, CancellationToken)>>, AgentError> {
+    ) -> Result<TriggerTake, AgentError> {
         let source = pending
             .trigger_source
             .as_ref()
@@ -3754,12 +3787,12 @@ impl Agent {
             }
             | loop_lease::TriggerPermit::Failed(_) => {
                 self.retry_waiting_trigger_input(chat_id);
-                return Ok(Some(None));
+                return Ok(TriggerTake::Waits);
             }
             loop_lease::TriggerPermit::Wait {
                 recoverable: false, ..
             }
-            | loop_lease::TriggerPermit::Withdrawn => return Ok(Some(None)),
+            | loop_lease::TriggerPermit::Withdrawn => return Ok(TriggerTake::Waits),
         };
         // Boxed: proving a source must not enlarge every run's shared async stack.
         let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
@@ -3769,14 +3802,14 @@ impl Agent {
             self.withdraw_trigger_input(chat, &pending.receipt, DiscardReason::SourceEnded);
             self.withdraw_ended_inputs(chat);
             self.save(&chat.snapshot);
-            return Ok(None);
+            return Ok(TriggerTake::LookAgain);
         }
         // Within the boundary nothing releases the lease, but the input waits rather than
         // start under a holding that is gone.
         if !self.inner.chat_leases.stands(chat_id, holding) {
             drop(chats);
             self.retry_waiting_trigger_input(chat_id);
-            return Ok(Some(None));
+            return Ok(TriggerTake::Waits);
         }
         #[cfg(any(test, feature = "test-support"))]
         let chat = {
@@ -3787,9 +3820,16 @@ impl Agent {
             chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?
         };
         match self.select_next_run(chat, Some(pending))? {
-            RunAdmission::Idle => Ok(Some(None)),
-            RunAdmission::ValidateTrigger(_) => Ok(None),
+            RunAdmission::Idle => Ok(TriggerTake::Waits),
+            RunAdmission::ValidateTrigger(_) => Ok(TriggerTake::LookAgain),
             RunAdmission::Ready(receipt, request, cancel) => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    drop(chats);
+                    self.pause_point(chat_id, wakeup::trigger_pauses::PausePoint::TriggerStarted)
+                        .await;
+                    chats = self.inner.chats.lock().await;
+                }
                 // Another process taking the lease over after this boundary finds it started.
                 if let Some(chat) = chats.get(&chat_id)
                     && let Err(error) = self
@@ -3808,7 +3848,8 @@ impl Agent {
                 }
                 drop(chats);
                 drop(boundary);
-                Ok(Some(Some((receipt, request, cancel))))
+                self.run_task((receipt, request, cancel));
+                Ok(TriggerTake::Started)
             }
         }
     }

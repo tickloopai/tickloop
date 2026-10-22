@@ -751,6 +751,8 @@ pub mod trigger_pauses {
         /// Queued Trigger input passed its permit and the check of its holding, and has not
         /// started.
         TriggerChecked,
+        /// Queued Trigger input started, and its start is not recorded durably yet.
+        TriggerStarted,
     }
 
     type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);

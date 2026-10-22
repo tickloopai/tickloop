@@ -962,6 +962,39 @@ async fn a_lease_check_cut_short_by_a_shutdown_leaves_the_lease_free() {
     staying.shutdown().await;
 }
 
+/// A caller that stops waiting while the Trigger input it delivered starts leaves no input
+/// started and not running: the input runs once and the Loop ends idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_dropped_as_its_input_starts_leaves_it_running_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    let started = agent.pause_next_for_tests(chat, PausePoint::TriggerStarted);
+    let delivery = tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            agent
+                .deliver_trigger_for_tests(chat, scheduled("task", 1), "outlives-its-caller")
+                .await
+        }
+    });
+    tokio::time::timeout(WAIT, started.entered)
+        .await
+        .expect("the input started")
+        .unwrap();
+    delivery.abort();
+    assert!(delivery.await.unwrap_err().is_cancelled());
+    drop(started.release);
+    model.wait_seen("outlives-its-caller", 1).await;
+    wait_for_state(&agent, chat, tickloop_agent_protocol::LoopState::Idle).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("outlives-its-caller"), 1);
+    agent.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
