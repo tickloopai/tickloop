@@ -584,7 +584,9 @@ impl Agent {
             let operations = chat.interrupt_every_run();
             let (discarded, kept) = std::mem::take(&mut chat.snapshot.pending_inputs)
                 .into_iter()
-                .partition::<Vec<_>, _>(|pending| pending.trigger_source.is_none());
+                .partition::<Vec<_>, _>(|pending| {
+                    pending.trigger_source.is_none() && pending.agent_message.is_none()
+                });
             chat.snapshot.pending_inputs = kept;
             self.settle_removed_inputs(
                 chat,
@@ -625,6 +627,7 @@ impl Agent {
         if !self.inner.chats.lock().await.contains_key(&chat_id) {
             return Err(AgentError::NotFound);
         }
+        self.resume_family_messages(chat_id).await;
         self.continue_receiving(chat_id).await;
         if let Some(next) = self.next_run(chat_id).await? {
             self.run_task(next);

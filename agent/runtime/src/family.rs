@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent_messages::DispatchRefusal;
 use tickloop_agent_protocol::{
     ChatSnapshot, DirectedHumanSource, EventKind, FamilyCompletion, FamilyInputRecord,
     FamilyMessageRejection, FamilyMessageRejectionCode, HostCallContext, InputContext,
@@ -82,7 +81,25 @@ pub struct FamilyAgent {
     pub idle_since: Option<u64>,
 }
 
+pub(super) fn resume_messages(chat: &mut Chat) {
+    for pending in &mut chat.snapshot.pending_inputs {
+        if pending.agent_message.is_some() {
+            pending.armed = true;
+        }
+    }
+}
+
 impl Agent {
+    pub(super) async fn resume_family_messages(&self, chat_id: ChatId) {
+        let mut mailbox = self.inner.family_mailbox.lock().await;
+        let mut chats = self.inner.chats.lock().await;
+        mailbox.stopped_runs.remove(&chat_id);
+        if let Some(chat) = chats.get_mut(&chat_id) {
+            resume_messages(chat);
+            self.save(&chat.snapshot);
+        }
+    }
+
     pub async fn family_agents(&self, member: ChatId) -> Result<Vec<FamilyAgent>, AgentError> {
         let snapshot = self.snapshot(member).await?;
         let root = snapshot
@@ -250,8 +267,7 @@ impl Agent {
                         }
                         SubagentNotificationDelivery::Rejected(rejection)
                     }
-                    Err(DispatchRefusal::Deferred) => continue,
-                    Err(DispatchRefusal::Refused(message)) => {
+                    Err(message) => {
                         SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
                             code: FamilyMessageRejectionCode::StaleTarget,
                             message,

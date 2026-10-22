@@ -5,7 +5,6 @@ use tickloop_agent_protocol::{ChatId, DelegationParent, MAX_SUBAGENT_DEPTH};
 use crate::Chat;
 use crate::{Agent, AgentError};
 use tickloop_agent_protocol::{CommandState, OperationRecord, Receipt, UserShellState};
-use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Serialize)]
@@ -94,6 +93,7 @@ impl Agent {
     ) -> Result<SubagentStopResult, AgentError> {
         let members = {
             let _creation = self.inner.subagent_invocations.lock().await;
+            let mut mailbox = self.inner.family_mailbox.lock().await;
             let mut chats = self.inner.chats.lock().await;
             let mut ids = descendants(&chats, target).map_err(AgentError::Invalid)?;
             ids.push(target);
@@ -103,13 +103,12 @@ impl Agent {
                 .snapshot
                 .delegation
                 .as_ref()
-                .ok_or_else(|| AgentError::Invalid("a subtree stop requires a Subagent".into()))?
-                .parent_chat_id;
+                .map(|delegation| delegation.parent_chat_id);
             if let Some((expected, sender, cancel)) = admission {
                 let origin = chats.get(&sender.chat_id).ok_or(AgentError::NotFound)?;
                 if cancel.is_cancelled()
                     || origin.active_run != Some(sender.run_id)
-                    || (parent != sender.chat_id
+                    || (parent != Some(sender.chat_id)
                         && root(&chats, target).map_err(AgentError::Invalid)? != sender.chat_id)
                     || ids
                         .iter()
@@ -122,6 +121,28 @@ impl Agent {
                     ));
                 }
             }
+            // Late completion delivery still belongs to this stop after the call returns.
+            let stopped_chats = ids.iter().copied().collect::<HashSet<_>>();
+            let stopped_runs = ids
+                .iter()
+                .flat_map(|id| {
+                    let chat = &chats[id];
+                    chat.active_run
+                        .into_iter()
+                        .chain(chat.parked.keys().copied())
+                        .chain(chat.family_finishing.iter().copied())
+                        .chain(chat.snapshot.chat_loop.run_id)
+                        .chain(
+                            chat.snapshot
+                                .family_completions
+                                .iter()
+                                .filter(|completion| {
+                                    stopped_chats.contains(&completion.child_chat_id)
+                                })
+                                .map(|completion| completion.child_run_id),
+                        )
+                })
+                .collect::<HashSet<_>>();
             let mut members = Vec::new();
             for id in ids {
                 let child = chats.get_mut(&id).ok_or(AgentError::NotFound)?;
@@ -133,26 +154,27 @@ impl Agent {
                 for run in child.parked.values() {
                     run.cancel.cancel();
                 }
+                mailbox
+                    .stopped_runs
+                    .entry(id)
+                    .or_default()
+                    .extend(&stopped_runs);
+                for pending in &mut child.snapshot.pending_inputs {
+                    if pending
+                        .agent_message
+                        .as_ref()
+                        .is_some_and(|source| stopped_chats.contains(&source.sender_chat_id))
+                    {
+                        pending.armed = false;
+                    }
+                }
                 child.snapshot.pending_commands.clear();
-                let discarded = std::mem::take(&mut child.snapshot.pending_inputs);
-                self.settle_removed_inputs(
-                    child,
-                    &discarded,
-                    SettledOutcome::Discarded {
-                        reason: DiscardReason::Stopped,
-                    },
-                );
                 child.ready_runs.clear();
                 let commands = child
                     .snapshot
                     .commands
                     .iter()
-                    .filter(|command| {
-                        matches!(
-                            command.state,
-                            CommandState::Running | CommandState::Background
-                        )
-                    })
+                    .filter(|command| command.state == CommandState::Running)
                     .map(|command| command.operation_id)
                     .collect::<Vec<_>>();
                 let shells = child
@@ -162,11 +184,7 @@ impl Agent {
                     .filter(|shell| {
                         matches!(
                             shell.state,
-                            UserShellState::Running
-                                | UserShellState::Background
-                                | UserShellState::Queued
-                                | UserShellState::WaitingPermission
-                                | UserShellState::Cancelling
+                            UserShellState::Running | UserShellState::Cancelling
                         )
                     })
                     .map(|shell| {
@@ -237,11 +255,19 @@ impl Agent {
                 self.record_family_completion(&receipt, &snapshot).await;
             }
         }
-        let mut chats = self.inner.chats.lock().await;
-        for (id, ..) in members {
-            if let Some(child) = chats.get_mut(&id) {
-                child.family_stopping = false;
+        {
+            let mut chats = self.inner.chats.lock().await;
+            for (id, ..) in &members {
+                if let Some(child) = chats.get_mut(id) {
+                    child.family_stopping = false;
+                }
             }
+        }
+        for (id, ..) in members {
+            let agent = self.clone();
+            self.inner.tasks.spawn(async move {
+                let _ = agent.start_next_agent_run(id).await;
+            });
         }
         Ok(SubagentStopResult {
             operations: unknown,

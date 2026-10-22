@@ -216,7 +216,8 @@ async fn assigning_a_task_cannot_bypass_send_message_denial() {
 }
 
 #[tokio::test]
-async fn a_finished_delegate_with_a_background_shell_blocks_task_release_until_stopped() {
+async fn a_finished_delegate_blocks_task_release_until_its_background_shell_is_explicitly_stopped()
+{
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
         let host = state(request);
@@ -276,6 +277,16 @@ async fn a_finished_delegate_with_a_background_shell_blocks_task_release_until_s
         if !has_tool_result(request, "stop") {
             return call("stop", "StopSubagent", json!({"to":"worker"}));
         }
+        if !has_tool_result(request, "still-blocked-release") {
+            return call("still-blocked-release", "TaskUpdate", release);
+        }
+        if !has_tool_result(request, "shell-stop-gate") {
+            return call(
+                "shell-stop-gate",
+                "Bash",
+                json!({"command":"while [ ! -f shell-stopped ]; do sleep 0.01; done"}),
+            );
+        }
         if !has_tool_result(request, "release") {
             return call("release", "TaskUpdate", release);
         }
@@ -302,6 +313,14 @@ async fn a_finished_delegate_with_a_background_shell_blocks_task_release_until_s
                 {
                     std::fs::write(directory.path().join("release-gate"), "go").unwrap();
                 }
+            }
+            if event.chat_id == root
+                && matches!(&event.kind, EventKind::ToolCompleted {call_id, result, ..} if call_id == "still-blocked-release" && result.is_error)
+            {
+                let worker = core.subagents(root).await.unwrap().into_iter().find(|child| child.handle == "worker").unwrap().child_chat_id;
+                let command = core.commands(worker).await.unwrap().into_iter().find(|command| command.state == tickloop_agent_protocol::CommandState::Background).expect("StopSubagent leaves the Shell running");
+                core.stop_command(worker, command.operation_id).await.unwrap();
+                std::fs::write(directory.path().join("shell-stopped"), "go").unwrap();
             }
             if event.chat_id == root && event.run_id == receipt.run_id {
                 match event.kind {

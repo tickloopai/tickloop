@@ -158,11 +158,9 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
     core.flush_transcripts().await;
     copy_test_store(store.path(), copied.path());
     core.shutdown().await;
-    let model = Arc::new(ScriptedModel::new(vec![
-        text("attempted completion"),
-        text("resolved completion"),
-        text("continued completion"),
-    ]));
+    let model = Arc::new(tickloop_agent_test_support::routed::RoutedModel::new(
+        |_| text("completion"),
+    ));
     let restored = Agent::open_embedded(copied.path().into(), config(), model).unwrap();
     restored.resume_chat(leaf).await.unwrap();
     let mut events = restored.subscribe();
@@ -615,4 +613,154 @@ async fn family_handles_remain_unique_across_delegating_parents() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["helper", "helper-2"]);
     core.shutdown().await;
+}
+
+async fn stopped_subtree_notifications(stop_root: bool) {
+    use tickloop_agent_protocol::{Content, LoopState};
+    use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(
+        |request| match state(request)["delegation"]["task"].as_str() {
+            Some("parent") if !has_tool_result(request, "leaf") => call(
+                "leaf",
+                "Subagent",
+                json!({"task":"leaf", "name":"leaf", "run_in_background":true}),
+            ),
+            Some("parent") => text("parent partial report"),
+            Some("leaf") if !has_tool_result(request, "question") => call(
+                "question",
+                "AskUserQuestion",
+                tickloop_agent_test_support::single_question("Wait"),
+            ),
+            Some("leaf") => text("leaf report"),
+            _ if !has_tool_result(request, "parent") => call(
+                "parent",
+                "Subagent",
+                json!({"task":"parent", "name":"middle", "run_in_background":true}),
+            ),
+            _ if serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains("STOP-MIDDLE")
+                && !has_tool_result(request, "stop-middle") =>
+            {
+                call("stop-middle", "StopSubagent", json!({"to":"middle"}))
+            }
+            _ => text("root report"),
+        },
+    ));
+    let core = Agent::new_embedded(config(), model.clone());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let initial = core.submit(root, "start".into()).await.unwrap();
+    let leaf = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.kind, EventKind::QuestionAsked { .. }) {
+                break event.chat_id;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let parent = core
+        .snapshot(leaf)
+        .await
+        .unwrap()
+        .delegation
+        .unwrap()
+        .parent_chat_id;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while core.snapshot(root).await.unwrap().chat_loop.state != LoopState::Idle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    if stop_root {
+        core.stop(root).await.unwrap();
+    } else {
+        core.submit(root, "STOP-MIDDLE".into()).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let middle = core.snapshot(parent).await.unwrap();
+            let top = core.snapshot(root).await.unwrap();
+            if middle.chat_loop.state == LoopState::Interrupted
+                && middle.family_completions.len() == 1
+                && middle
+                    .pending_inputs
+                    .iter()
+                    .any(|pending| pending.agent_message.is_some() && !pending.armed)
+                && top.family_completions.len() == 1
+                && (stop_root || top.pending_inputs.is_empty())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let has_notification = |snapshot: &tickloop_agent_protocol::ChatSnapshot| {
+        snapshot.messages.iter().flat_map(|message| &message.content).any(|content| {
+            matches!(content, Content::Text { text } if text.starts_with("<task-notification>"))
+        })
+    };
+    let stopped = core.snapshot(parent).await.unwrap();
+    assert!(!has_notification(&stopped));
+    assert!(stopped.family_completions[0].result.is_empty());
+    let top = core.snapshot(root).await.unwrap();
+    assert_eq!(has_notification(&top), !stop_root);
+    if stop_root {
+        assert_eq!(top.chat_loop.run_id, Some(initial.run_id));
+        assert!(
+            top.pending_inputs
+                .iter()
+                .any(|pending| pending.agent_message.is_some() && !pending.armed)
+        );
+        core.submit(root, "ROOT-CONTINUE".into()).await.unwrap();
+    }
+    core.continue_loop(parent).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if has_notification(&core.snapshot(parent).await.unwrap())
+                && has_notification(&core.snapshot(root).await.unwrap())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    if stop_root {
+        let resumed = core.snapshot(root).await.unwrap();
+        let human = resumed
+            .messages
+            .iter()
+            .position(|message| {
+                message.content.iter().any(
+                    |content| matches!(content, Content::Text { text } if text == "ROOT-CONTINUE"),
+                )
+            })
+            .unwrap();
+        let notice = resumed.messages.iter().position(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.starts_with("<task-notification>")))).unwrap();
+        assert!(human < notice, "user input precedes completion context");
+    }
+    assert_eq!(
+        core.snapshot(leaf).await.unwrap().chat_loop.state,
+        LoopState::Interrupted
+    );
+    assert!(core.snapshot(leaf).await.unwrap().questions.is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn root_stop_holds_descendant_notifications_until_continue() {
+    stopped_subtree_notifications(true).await;
+}
+
+#[tokio::test]
+async fn stop_subagent_holds_internal_notifications_and_delivers_outside_the_subtree() {
+    stopped_subtree_notifications(false).await;
 }

@@ -182,7 +182,7 @@
             "notification": {
               "rejected": {
                 "code": "stale_target",
-                "message": "The receiving parent is stopped"
+                "message": "The receiving parent is unavailable"
               }
             },
             "usage": {

@@ -1484,8 +1484,8 @@ for line in sys.stdin:
     }
 
     /// A Loop subscribed to a hosted Tick: the quiet Tick costs no model call, an update wakes
-    /// the Loop with the new content, and stopping the Loop ends its subscription while the Tick
-    /// keeps running.
+    /// the Loop with the new content, and stopping pauses its subscription while both the
+    /// extension and Terminal Tick keep running.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_tick_update_reaches_the_loop_subscribed_to_it() {
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
@@ -1555,6 +1555,14 @@ for line in sys.stdin:
             );
         }
 
+        let terminal = run_tool(
+            &tools,
+            chat,
+            "TickManage",
+            json!({"action":"open","command":["/bin/sh","-c","sleep 300"],"cwd":daemon.root}),
+        )
+        .await;
+        let terminal_pid = terminal["business_pid"].as_u64().unwrap() as u32;
         runtime.stop(chat).await.unwrap();
         assert_eq!(
             runtime.tick_subscriptions(chat).await.unwrap().len(),
@@ -1566,6 +1574,19 @@ for line in sys.stdin:
             super::alive(business_pid),
             "stopping the Loop leaves the Tick running"
         );
+        assert!(
+            super::alive(terminal_pid),
+            "stopping the Loop leaves its Terminal Tick running"
+        );
+        for instance in [instance, terminal["tick_instance_id"].clone()] {
+            run_tool(
+                &tools,
+                chat,
+                "TickManage",
+                json!({"action":"close","tick_instance_id":instance}),
+            )
+            .await;
+        }
     }
 
     /// A Tick whose state holds a thousand candles, about 140 KiB, newest last, and whose
