@@ -128,7 +128,7 @@ impl ModelClient for HoldingModel {
 async fn local_agent(model: Arc<HoldingModel>) -> (tempfile::TempDir, Agent, ChatId) {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), model);
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     (directory, agent, chat)
 }
@@ -411,7 +411,7 @@ async fn a_self_paced_loop_gets_one_fallback_wakeup_and_then_ends() {
 
     // Its turn neither reschedules nor stops: one fallback wakeup 20 minutes later.
     model.scripted.enqueue(text("Still building."));
-    agent.set_scheduled_now(at(10, 1, 0));
+    agent.set_scheduled_now_for_tests(at(10, 1, 0));
     agent
         .run_due_scheduled_tasks(chat, at(10, 1, 0))
         .await
@@ -427,7 +427,7 @@ async fn a_self_paced_loop_gets_one_fallback_wakeup_and_then_ends() {
 
     // The fallback turn does not reschedule either: the loop ends.
     model.scripted.enqueue(text("Nothing to do."));
-    agent.set_scheduled_now(at(10, 21, 0));
+    agent.set_scheduled_now_for_tests(at(10, 21, 0));
     agent
         .run_due_scheduled_tasks(chat, at(10, 21, 0))
         .await
@@ -488,7 +488,7 @@ async fn stop_pauses_timing_and_continuing_waits_for_the_next_time() {
     assert_eq!(model.seen("check the build"), 0);
 
     model.scripted.enqueue(text("Continuing."));
-    agent.set_scheduled_now(at(10, 35, 0));
+    agent.set_scheduled_now_for_tests(at(10, 35, 0));
     turn(&agent, chat, "carry on").await;
     assert!(
         agent
@@ -715,7 +715,7 @@ async fn a_stateless_host_confirms_the_agents_tasks_and_wakes_at_the_reported_ti
         text("Scheduled."),
     ]);
     let agent = stateless_agent(model.clone());
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let chat = agent.create_chat_without_folder().await.unwrap();
     advance(&agent, chat, "check things regularly").await;
     let created = tasks(&agent, chat).await;
@@ -735,7 +735,7 @@ async fn a_stateless_host_confirms_the_agents_tasks_and_wakes_at_the_reported_ti
         .decide_scheduled_task(chat, &created[1].id, ScheduledTaskDecision::Reject)
         .await
         .unwrap();
-    agent.set_scheduled_now(at(10, 3, 0));
+    agent.set_scheduled_now_for_tests(at(10, 3, 0));
     agent
         .decide_scheduled_task(chat, &created[0].id, ScheduledTaskDecision::Confirm)
         .await
@@ -790,12 +790,12 @@ async fn confirming_a_one_shot_task_after_its_time_tells_the_user_it_did_not_run
         text("Reminder set."),
     ]);
     let agent = stateless_agent(model);
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let chat = agent.create_chat_without_folder().await.unwrap();
     advance(&agent, chat, "a reminder at 18:05").await;
     let task = tasks(&agent, chat).await.remove(0);
     // 18:05 in Shanghai is 10:05 UTC.
-    agent.set_scheduled_now(at(10, 6, 0));
+    agent.set_scheduled_now_for_tests(at(10, 6, 0));
     let mut events = agent.subscribe();
     agent
         .decide_scheduled_task(chat, &task.id, ScheduledTaskDecision::Confirm)
@@ -875,7 +875,7 @@ async fn in_the_users_loop_turn_only_the_task_it_reads_needs_no_confirmation() {
         text("Scheduled."),
     ]);
     let agent = unprompted_worker(model);
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     invoke(&agent, chat, "loop", "10m check the build").await;
@@ -902,7 +902,7 @@ async fn in_the_users_loop_turn_only_the_task_it_reads_needs_no_confirmation() {
 async fn the_users_self_paced_loop_starts_with_its_turn_and_falls_back_when_not_rescheduled() {
     let model = HoldingModel::new(vec![text("Checked once.")]);
     let agent = unprompted_worker(model);
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     invoke(&agent, chat, "loop", "check the build").await;
@@ -924,7 +924,7 @@ async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_res
         text("Waiting."),
     ]);
     let agent = stateless_agent(model.clone());
-    agent.set_scheduled_now(at(10, 0, 0));
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
     let chat = agent.create_chat_without_folder().await.unwrap();
     advance(&agent, chat, "pace yourself").await;
     let task = tasks(&agent, chat).await.remove(0);
@@ -936,7 +936,7 @@ async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_res
         .decide_scheduled_task(chat, &task.id, ScheduledTaskDecision::Confirm)
         .await
         .unwrap();
-    agent.set_scheduled_now(at(10, 5, 0));
+    agent.set_scheduled_now_for_tests(at(10, 5, 0));
     model
         .scripted
         .enqueue(wakeup("again", 1200, "do something else"));
@@ -1010,7 +1010,7 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
         text("Reminded."),
     ]);
     let holder = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    holder.set_scheduled_now(at(10, 0, 0));
+    holder.set_scheduled_now_for_tests(at(10, 0, 0));
     let chat = holder.create_chat(directory.path().into()).await.unwrap();
     turn(&holder, chat, "a reminder in a quarter of an hour").await;
     let task = tasks(&holder, chat).await.remove(0);
@@ -1040,7 +1040,7 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     );
     assert_eq!(
         tasks(&holder, chat).await,
-        [task.clone()],
+        [task],
         "the task keeps its time"
     );
     assert_eq!(model.seen("remind me"), 0);

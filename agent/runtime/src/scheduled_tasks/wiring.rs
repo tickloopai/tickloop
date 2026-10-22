@@ -33,16 +33,22 @@ const RETRY_DELAY_MS: u64 = 10_000;
 /// The time zone scheduled tasks read cron expressions in, and the clock they run by.
 pub(crate) struct ScheduleClock {
     zone: Zone,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fixed_now: std::sync::Mutex<Option<DateTime<Utc>>>,
+    /// Stops a wake-up after the ledger of its runs is stored and before the tasks' next times
+    /// are, as a host that goes down there.
+    #[cfg(any(test, feature = "test-support"))]
+    stop_before_recording: std::sync::atomic::AtomicBool,
 }
 
 impl ScheduleClock {
     pub(crate) fn new(zone: Zone) -> Self {
         Self {
             zone,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fixed_now: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            stop_before_recording: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -51,16 +57,11 @@ impl ScheduleClock {
     }
 
     pub(crate) fn now(&self) -> DateTime<Utc> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(now) = *self.fixed_now.lock().unwrap() {
             return now;
         }
         DateTime::from(SystemTime::now())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_now(&self, now: DateTime<Utc>) {
-        *self.fixed_now.lock().unwrap() = Some(now);
     }
 }
 
@@ -191,9 +192,22 @@ impl Agent {
         self.inner.schedule_clock.now()
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_scheduled_now(&self, now: DateTime<Utc>) {
-        self.inner.schedule_clock.set_now(now);
+    /// Fixes the clock scheduled tasks run by.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_scheduled_now_for_tests(&self, now: DateTime<Utc>) {
+        *self.inner.schedule_clock.fixed_now.lock().unwrap() = Some(now);
+    }
+
+    /// Stops each later wake-up after the ledger of its runs is stored and before the tasks'
+    /// next times are, as a host that goes down there.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stop_scheduled_wakeups_before_recording_for_tests(&self) {
+        self.inner
+            .schedule_clock
+            .stop_before_recording
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Records the Chat's scheduled tasks after a change, announces it, and has the timer look
@@ -632,6 +646,20 @@ impl Agent {
         if !taken.is_empty() {
             let mut chats = self.inner.chats.lock().await;
             if let Some(chat) = chats.get_mut(&chat_id) {
+                // The runs' ledger is stored before the tasks' next times: a host that goes down
+                // in between finds the same runs due again, and their records answer them.
+                self.checkpoint_ledger(&chat.snapshot, &chat.bookkeeping)
+                    .await
+                    .map_err(AgentError::Storage)?;
+                #[cfg(any(test, feature = "test-support"))]
+                if self
+                    .inner
+                    .schedule_clock
+                    .stop_before_recording
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(taken.into_iter().map(|(_, receipt)| receipt).collect());
+                }
                 self.commit_taken_runs(chat, &taken);
             }
         }

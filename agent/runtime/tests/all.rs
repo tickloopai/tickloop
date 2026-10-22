@@ -155,6 +155,8 @@ mod rewind_file_safety;
 mod rewind_points;
 #[path = "all/rewind_restore.rs"]
 mod rewind_restore;
+#[path = "all/scheduled_tasks.rs"]
+mod scheduled_tasks;
 #[path = "all/session_permission_branching.rs"]
 mod session_permission_branching;
 #[path = "all/shell_descriptions.rs"]

@@ -2628,6 +2628,23 @@ impl Agent {
             .map_err(|error| error.to_string())
     }
 
+    /// Stores the Chat's ledger and conversation queued so far, before the caller records what
+    /// depends on them; a Chat whose Transcript has not begun has nothing stored to order
+    /// against.
+    pub(super) async fn checkpoint_ledger(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) -> Result<(), String> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        if !recorder.outbox.is_materialized(snapshot.id) {
+            return Ok(());
+        }
+        self.checkpoint_transcript(snapshot, bookkeeping).await
+    }
+
     /// Under durable wait hosting, every Line of the Chats so far is committed now, their first
     /// ones included, before the caller records what depends on them; another instance that
     /// loads the family then finds them. A process host records nothing ahead of its
