@@ -630,6 +630,37 @@ impl TickDeliveries {
             .collect()
     }
 
+    /// The restored delivery's items bound to the watches their subscriptions run now, where the
+    /// subscription, its instance and its authority are still the ones the delivery was
+    /// accepted under: a load or another process watches through a new watch, and the delivery
+    /// stays the same.
+    pub(super) fn rebind_restored_items(
+        &self,
+        chat_id: ChatId,
+        chat_loop: &LoopSnapshot,
+        items: &mut [TickDeliveryItem],
+    ) {
+        for item in items {
+            let Some(configured) = chat_loop.subscriptions.iter().find(|configured| {
+                configured.id == item.subscription && configured.instance == item.instance
+            }) else {
+                continue;
+            };
+            if let Some(runtime) = self
+                .subscriptions
+                .get(&item.subscription)
+                .filter(|runtime| {
+                    runtime.instance == item.instance
+                        && runtime.chat_id == chat_id
+                        && runtime.loop_id == chat_loop.id
+                        && runtime.authority == configured.authority
+                })
+            {
+                item.watch = runtime.watch;
+            }
+        }
+    }
+
     /// Whether an item of a new delivery was delivered already: a delivery prepared before the
     /// lease told what another process delivered does not reach the Loop.
     pub(super) fn holds_delivered_items(&self, items: &[TickDeliveryItem]) -> bool {

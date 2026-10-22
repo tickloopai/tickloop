@@ -2,7 +2,7 @@
 //! accepted with its content, so with durable wait hosting a load queues again what was waiting,
 //! after another attempt at each input whose answer lost its host.
 
-use tickloop_agent_protocol::{ChatId, EventKind, LoopState, PendingInput, Receipt};
+use tickloop_agent_protocol::{ChatId, EventKind, LoopState, PendingInput, Receipt, TriggerSource};
 use tickloop_agent_transcript::{
     InputEntry, InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
 };
@@ -158,6 +158,13 @@ impl Agent {
                 continue;
             }
             pending.receipt.loop_id = chat.snapshot.chat_loop.id;
+            if let Some(TriggerSource::TickUpdate { items }) = &mut pending.trigger_source {
+                self.tick_deliveries().rebind_restored_items(
+                    chat.snapshot.id,
+                    &chat.snapshot.chat_loop,
+                    items,
+                );
+            }
             let chat_loop = &mut chat.snapshot.chat_loop;
             if !matches!(
                 chat_loop.state,

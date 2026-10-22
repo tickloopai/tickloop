@@ -657,3 +657,50 @@ async fn a_process_that_only_loaded_the_chat_ran_nothing_of_it() {
     );
     holder.shutdown().await;
 }
+
+/// A Tick Update accepted and not started when its process went down runs once the Chat is
+/// continued in the next process, which watches the Tick through a watch of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_tick_update_runs_after_a_crash_through_the_new_watch() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let task = Uuid::new_v4();
+    let model = ContractModel::new();
+    let (agent, shell, chat) =
+        subscribed_process(&root, directory.path(), task, model.clone()).await;
+    agent
+        .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    // A foreground `!` command keeps the accepted update from starting.
+    agent
+        .submit_user_shell(chat, "sleep 30".into(), false)
+        .await
+        .unwrap();
+    shell.update(1, "accepted-not-started");
+    tokio::time::timeout(WAIT, async {
+        while !agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .iter()
+            .any(|pending| pending.trigger_source.is_some())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the update waits behind the command");
+    agent.flush_transcripts().await;
+    let image = crash_image(&root, directory.path());
+    agent.shutdown().await;
+
+    let restarted_model = ContractModel::new();
+    let (restarted, _shell) = resumed_process(&image, chat, task, restarted_model.clone()).await;
+    restarted_model.wait_seen("accepted-not-started", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(restarted_model.seen("accepted-not-started"), 1);
+    assert_eq!(model.seen("accepted-not-started"), 0);
+    restarted.shutdown().await;
+}
