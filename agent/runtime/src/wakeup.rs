@@ -110,11 +110,13 @@ pub(super) fn trigger_ledger(
         TriggerSource::TickUpdate { .. }
         | TriggerSource::TickManual { .. }
         | TriggerSource::GoalContinuation { .. }
-        | TriggerSource::ScheduledTask { .. } => lifecycle::LedgerInput::new(
-            tickloop_agent_transcript::input_ids::trigger(chat_id, source),
-            InputOp::Trigger,
-            source,
-        ),
+        | TriggerSource::ScheduledTask { .. } => {
+            // The id is the delivery's whole identity. What another delivery of it may carry
+            // differently, such as the watch it came through, when it was read or how many
+            // updates it merged, is no part of it, so the payload is the id itself.
+            let id = tickloop_agent_transcript::input_ids::trigger(chat_id, source);
+            lifecycle::LedgerInput::new(id, InputOp::Trigger, &id)
+        }
     }
 }
 
@@ -550,6 +552,57 @@ impl Agent {
             self.run_task(next);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickloop_agent_protocol::TickDeliveryItem;
+
+    fn tick_update(watch: u128, updates: u64, items: &[(u128, u64)]) -> TriggerSource {
+        TriggerSource::TickUpdate {
+            items: items
+                .iter()
+                .map(|(subscription, sequence)| TickDeliveryItem {
+                    subscription: Uuid::from_u128(*subscription),
+                    watch: Uuid::from_u128(watch),
+                    instance: "calendar:fixture".parse().unwrap(),
+                    sequence: *sequence,
+                    updates,
+                })
+                .collect(),
+        }
+    }
+
+    /// A delivery repeated through another watch, read again later or merging more updates is
+    /// the same delivery: its ledger input matches, so the ledger replays it instead of refusing
+    /// it as an id reused with another payload.
+    #[test]
+    fn a_repeated_delivery_names_the_same_ledger_input() {
+        let chat = Uuid::new_v4();
+        let same = |left: &TriggerSource, right: &TriggerSource| {
+            let (left, right) = (
+                trigger_ledger(chat, left, "first rendering"),
+                trigger_ledger(chat, right, "second rendering"),
+            );
+            left.id == right.id && left.digest == right.digest
+        };
+        assert!(same(
+            &tick_update(1, 1, &[(10, 4), (11, 7)]),
+            &tick_update(2, 3, &[(11, 7), (10, 4)]),
+        ));
+        assert!(!same(
+            &tick_update(1, 1, &[(10, 4)]),
+            &tick_update(1, 1, &[(10, 5)]),
+        ));
+        let manual = |read_at_ms| TriggerSource::TickManual {
+            instance: "calendar:fixture".parse().unwrap(),
+            sequence: 9,
+            read_at_ms,
+            authority: None,
+        };
+        assert!(same(&manual(1_000), &manual(2_000)));
     }
 }
 
