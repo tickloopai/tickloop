@@ -2821,6 +2821,26 @@ async fn subscribe_loop(agent: &Agent, chat: Uuid, instances: &[InstanceRef]) ->
         .collect()
 }
 
+/// Waits until `root` holds `expected` watermark files, which are written and removed off the
+/// runtime: real time bounds the wait, since paused time would run out before the disk does.
+async fn watermark_files_settle_at(
+    root: &std::path::Path,
+    expected: usize,
+) -> Vec<std::path::PathBuf> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let files = watermark_files(root);
+        if files.len() == expected {
+            return files;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{expected} watermark file(s) expected: {files:?}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn accumulated(agent: &Agent, chat: Uuid, expected: u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2841,9 +2861,9 @@ async fn accumulated(agent: &Agent, chat: Uuid, expected: u64) {
     .unwrap();
 }
 
-/// A delivered update's sequence is recorded durably before the delivery goes out, so the
-/// same update arriving again is never delivered twice; cancelling the subscription removes
-/// that record.
+/// A delivered update's sequence is recorded durably once its acceptance is, so the same
+/// update arriving again is never delivered twice; cancelling the subscription removes that
+/// record.
 #[tokio::test(start_paused = true)]
 async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_watermark() {
     let directory = tempfile::tempdir().unwrap();
@@ -2869,8 +2889,8 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("three"));
-    let files = watermark_files(&root);
-    assert_eq!(files.len(), 1, "{files:?}");
+    // The watermark follows the acceptance on its own, not the turn.
+    let files = watermark_files_settle_at(&root, 1).await;
     let recorded: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
     assert_eq!(recorded["sequence"], 3);
@@ -2896,11 +2916,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
         .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
         .await
         .unwrap();
-    settle().await;
-    assert!(
-        watermark_files(&root).is_empty(),
-        "a cancelled subscription keeps no watermark"
-    );
+    watermark_files_settle_at(&root, 0).await;
     agent.shutdown().await;
 }
 
