@@ -1020,3 +1020,118 @@ async fn a_check_model_that_cannot_be_built_blocks_the_goal() {
     assert!(model.check_requests().is_empty());
     agent.shutdown().await;
 }
+
+/// Two processes holding one saved Chat: `first` with the goal set and held in Plan mode, and
+/// `second`, which loaded the Chat after it.
+async fn two_processes(
+    first_model: Arc<HoldingModel>,
+    second_model: Arc<HoldingModel>,
+) -> (tempfile::TempDir, tempfile::TempDir, Agent, Agent, ChatId) {
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let first = Agent::open(root.path().into(), config(), first_model).unwrap();
+    approve_everything(&first);
+    first
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    first.submit(chat, "hello".into()).await.unwrap();
+    wait_until_idle(&first, chat).await;
+    set_goal(&first, chat, None).await;
+    first.flush_transcripts().await;
+
+    let second = Agent::open(root.path().into(), config(), second_model).unwrap();
+    approve_everything(&second);
+    second.resume_chat(chat).await.unwrap();
+    second
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    (root, folder, first, second, chat)
+}
+
+#[tokio::test]
+async fn a_goal_cleared_in_another_process_is_neither_continued_nor_written_back() {
+    let first_model = HoldingModel::new(vec![text("ready"), text("still here")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) =
+        two_processes(first_model.clone(), second_model).await;
+    second.manage_goal(chat, GoalAction::Clear).await.unwrap();
+
+    // The first process leaves Plan mode and ends another turn with the goal it last knew.
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    first.submit(chat, "anything else?".into()).await.unwrap();
+    wait_until_idle(&first, chat).await;
+    first.continue_loop(chat).await.unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(
+        first_model.continuations(),
+        0,
+        "the cleared goal was continued"
+    );
+    assert_eq!(goal(&first, chat).await, None);
+    second
+        .manage_goal(chat, GoalAction::Resume)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        goal(&second, chat).await,
+        None,
+        "the old goal was written back"
+    );
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_goal_edited_in_another_process_is_continued_with_the_new_objective() {
+    const EDITED: &str = "Ship the import command with tests";
+    let first_model = HoldingModel::new(
+        vec![text("ready"), blocked("b1"), text("Blocked.")],
+        Vec::new(),
+    );
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) =
+        two_processes(first_model.clone(), second_model).await;
+    second
+        .manage_goal(
+            chat,
+            GoalAction::Edit {
+                objective: EDITED.into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    first.submit(chat, "anything else?".into()).await.unwrap();
+    wait_until_idle(&first, chat).await;
+    // The load in the second process paused the goal; the first resumes it.
+    first.manage_goal(chat, GoalAction::Resume).await.unwrap();
+    wait_for_goal(&first, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+
+    let continuation = first_model
+        .turn_requests()
+        .into_iter()
+        .find(|request| newest_user_text(request).contains(CONTINUATION))
+        .expect("the goal was continued");
+    assert!(newest_user_text(&continuation).contains(EDITED));
+    assert!(!newest_user_text(&continuation).contains(OBJECTIVE));
+    first.shutdown().await;
+    second.shutdown().await;
+}

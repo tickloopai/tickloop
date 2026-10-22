@@ -499,6 +499,10 @@ struct Chat {
     /// Another stored branch of the Chat is being restored to replace its conversation: until the
     /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
     branch_reservation: Option<Uuid>,
+    /// The stored goal's generation this process last adopted or wrote.
+    goal_generation: u64,
+    /// When the goal's running time was last settled.
+    goal_clock_ms: u64,
 }
 
 enum RunAdmission {
@@ -1697,10 +1701,14 @@ impl Agent {
 
     /// Esc: interrupts the current turn and pauses an active goal.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        self.pause_goal(chat, goal::state::GoalEvent::Interrupted);
-        Ok(chat.interrupt())
+        let operations = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            chat.interrupt()
+        };
+        self.pause_goal(chat_id, goal::state::GoalEvent::Interrupted)
+            .await;
+        Ok(operations)
     }
 
     /// Sends the queued user message `run_id` now: interrupts the work ahead of it, after which
@@ -2176,6 +2184,8 @@ impl Agent {
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
                 branch_reservation: None,
+                goal_generation: 0,
+                goal_clock_ms: 0,
             },
         );
         Ok(id)
@@ -3485,7 +3495,7 @@ impl Agent {
             EventKind::Failed(error) if !is_closed => goal::GoalTurnEnd::Failed(error.clone()),
             _ => goal::GoalTurnEnd::Interrupted,
         };
-        self.end_goal_turn(chat, &receipt, goal_turn);
+        let goal_turn = self.goal_turn_events(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
         let is_settled = !(self.inner.waits == WaitHosting::Durable
@@ -3516,6 +3526,9 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
+        if let Some(events) = goal_turn {
+            self.end_goal_turn(receipt.chat_id, events).await;
+        }
         if is_settled {
             self.settle_task_claims(&receipt).await;
         }

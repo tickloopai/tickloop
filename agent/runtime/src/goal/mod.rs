@@ -7,4 +7,5 @@ mod runtime;
 
 pub(crate) use runtime::{GoalTurnEnd, charged_tokens};
 pub(crate) mod state;
+mod store;
 pub(crate) mod tools;

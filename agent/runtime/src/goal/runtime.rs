@@ -22,6 +22,7 @@ use super::prompts::{self, GoalPromptContext};
 use super::state::{
     self, ContinuationConditions, GoalEffect, GoalError, GoalEvent, GoalTransition, TurnSummary,
 };
+use super::store::GoalStore;
 use super::tools::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GoalReport, NewGoal, UPDATE_GOAL_TOOL_NAME,
 };
@@ -124,16 +125,120 @@ fn turn_summary(chat: &Chat, run: RunId, failure: Option<String>) -> TurnSummary
     }
 }
 
+/// Why a goal change did not happen.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GoalUpdateError {
+    #[error(transparent)]
+    Goal(#[from] GoalError),
+    #[error("the Chat is no longer loaded")]
+    NotLoaded,
+    #[error("the goal could not be stored: {0}")]
+    Storage(String),
+}
+
+impl From<GoalUpdateError> for AgentError {
+    fn from(error: GoalUpdateError) -> Self {
+        match error {
+            GoalUpdateError::Goal(error) => invalid(error),
+            GoalUpdateError::NotLoaded => AgentError::NotFound,
+            GoalUpdateError::Storage(error) => AgentError::Storage(error),
+        }
+    }
+}
+
+/// Applies `events` in order to `base`; the first that does not apply undoes them all.
+fn apply_events(
+    base: Option<&GoalSnapshot>,
+    events: Vec<GoalEvent>,
+    now_ms: u64,
+) -> Result<(Option<GoalSnapshot>, Vec<GoalEffect>), GoalError> {
+    let mut goal = base.cloned();
+    let mut effects = Vec::new();
+    for event in events {
+        let GoalTransition {
+            goal: next,
+            effects: more,
+        } = state::apply(goal.as_ref(), event, now_ms)?;
+        goal = next;
+        effects.extend(more);
+    }
+    Ok((goal, effects))
+}
+
+fn goal_store(chat: &Chat) -> Option<GoalStore> {
+    chat.tools
+        .chat_directory()
+        .map(GoalStore::in_chat_directory)
+}
+
 impl Agent {
-    /// Applies `event` to the Chat's goal and carries out what it asks for. A goal record is
-    /// written when anything but the running usage changed; usage alone is written when the turn
-    /// ends.
-    pub(crate) fn change_goal(&self, chat: &mut Chat, event: GoalEvent) -> Result<(), GoalError> {
-        let GoalTransition { goal, effects } =
-            state::apply(chat.snapshot.goal.as_ref(), event, unix_time_milliseconds())?;
-        let is_recorded =
-            without_usage(goal.as_ref()) != without_usage(chat.snapshot.goal.as_ref());
-        let previous = std::mem::replace(&mut chat.snapshot.goal, goal);
+    /// Applies `events` to the Chat's goal as the store keeps it, then carries out what they ask
+    /// for. The goal first gets the running time since it was last settled, while a turn runs or
+    /// as `turn_ends`. A goal record is written when anything but the running usage changed, and
+    /// whenever a turn ends with an unfinished goal; the store keeps the usage meanwhile.
+    pub(crate) async fn update_goal(
+        &self,
+        chat_id: ChatId,
+        events: Vec<GoalEvent>,
+        turn_ends: bool,
+    ) -> Result<(), GoalUpdateError> {
+        let now_ms = unix_time_milliseconds();
+        let (store, unstored, events) = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(GoalUpdateError::NotLoaded)?;
+            let is_running = turn_ends || chat.active.is_some() || !chat.parked.is_empty();
+            let started_ms = chat
+                .snapshot
+                .chat_loop
+                .run_started_at
+                .unwrap_or(now_ms)
+                .max(chat.goal_clock_ms);
+            let mut settled = Vec::new();
+            if is_running && now_ms > started_ms {
+                settled.push(GoalEvent::TimeElapsed {
+                    ms: now_ms - started_ms,
+                });
+            }
+            settled.extend(events);
+            (goal_store(chat), chat.snapshot.goal.clone(), settled)
+        };
+        let (generation, goal, effects) = match store {
+            Some(store) => {
+                let (stored, effects) = tokio::task::spawn_blocking(move || {
+                    store.update(unstored, |base| apply_events(base, events, now_ms))
+                })
+                .await
+                .map_err(|error| GoalUpdateError::Storage(error.to_string()))?
+                .map_err(|error| GoalUpdateError::Storage(error.to_string()))??;
+                (Some(stored.generation), stored.goal, effects)
+            }
+            None => {
+                let (goal, effects) = apply_events(unstored.as_ref(), events, now_ms)?;
+                (None, goal, effects)
+            }
+        };
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(GoalUpdateError::NotLoaded)?;
+        chat.goal_clock_ms = chat.goal_clock_ms.max(now_ms);
+        self.adopt_goal(chat, generation, goal, effects, turn_ends);
+        Ok(())
+    }
+
+    /// Takes on a change of the goal: the goal itself unless a newer stored one was adopted
+    /// already, then its effects and its record.
+    fn adopt_goal(
+        &self,
+        chat: &mut Chat,
+        generation: Option<u64>,
+        goal: Option<GoalSnapshot>,
+        effects: Vec<GoalEffect>,
+        turn_ends: bool,
+    ) {
+        let previous = chat.snapshot.goal.clone();
+        if generation.is_none_or(|generation| generation > chat.goal_generation) {
+            chat.snapshot.goal = goal;
+            chat.goal_generation = generation.unwrap_or(chat.goal_generation);
+        }
         let mut notices = Vec::new();
         for effect in effects {
             match effect {
@@ -158,6 +263,14 @@ impl Agent {
                 ),
             }
         }
+        let is_recorded = without_usage(chat.snapshot.goal.as_ref())
+            != without_usage(previous.as_ref())
+            || (turn_ends
+                && chat
+                    .snapshot
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| !goal.status.is_finished()));
         if is_recorded || !notices.is_empty() {
             let subject = chat.snapshot.goal.as_ref().or(previous.as_ref());
             self.record_goal(
@@ -166,7 +279,59 @@ impl Agent {
                 notices,
             );
         }
-        Ok(())
+    }
+
+    /// Adopts the goal another process stored since this one last did: it may have cleared,
+    /// paused or edited it. What waits for a goal no longer active is withdrawn.
+    pub(crate) async fn sync_goal_from_store(&self, chat_id: ChatId) {
+        let Some(store) = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .and_then(goal_store)
+        else {
+            return;
+        };
+        let stored = match tokio::task::spawn_blocking(move || store.read()).await {
+            Ok(Ok(Some(stored))) => stored,
+            Ok(Ok(None)) => return,
+            Ok(Err(error)) => {
+                tracing::warn!(chat = %chat_id, %error, "could not read the stored goal");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "could not read the stored goal");
+                return;
+            }
+        };
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        if stored.generation <= chat.goal_generation {
+            return;
+        }
+        let changed =
+            without_usage(stored.goal.as_ref()) != without_usage(chat.snapshot.goal.as_ref());
+        chat.snapshot.goal = stored.goal;
+        chat.goal_generation = stored.generation;
+        self.withdraw_ended_inputs(chat);
+        self.save(&chat.snapshot);
+        if changed {
+            let receipt = Receipt {
+                chat_id,
+                loop_id: chat.snapshot.chat_loop.id,
+                run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
+            };
+            let goal = chat.snapshot.goal.clone();
+            self.publish_event(
+                chat,
+                &receipt,
+                EventKind::GoalUpdated { goal, notice: None },
+            );
+        }
     }
 
     /// Writes the goal as it is now, one line for each notice, and tells every View.
@@ -259,14 +424,20 @@ impl Agent {
             GoalAction::Clear => GoalEvent::Clear,
             GoalAction::SetBudget { token_budget } => GoalEvent::SetBudget { token_budget },
         };
+        if self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .delegation
+            .is_some()
         {
-            let mut chats = self.inner.chats.lock().await;
-            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            if chat.snapshot.delegation.is_some() {
-                return Err(AgentError::Invalid(SUBAGENT_HAS_NO_GOAL.into()));
-            }
-            self.change_goal(chat, event).map_err(invalid)?;
+            return Err(AgentError::Invalid(SUBAGENT_HAS_NO_GOAL.into()));
         }
+        self.update_goal(chat_id, vec![event], false).await?;
         if starts_work {
             // Nothing ended a turn: the continuation is named by this command alone.
             self.continue_goal(chat_id, Uuid::new_v4()).await;
@@ -282,17 +453,24 @@ impl Agent {
     }
 
     /// Applies an event that pauses an active goal: Esc, `/stop` or a history load.
-    pub(crate) fn pause_goal(&self, chat: &mut Chat, event: GoalEvent) {
-        if let Err(error) = self.change_goal(chat, event) {
-            tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal");
+    pub(crate) async fn pause_goal(&self, chat_id: ChatId, event: GoalEvent) {
+        let has_goal = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .is_some_and(|chat| chat.snapshot.goal.is_some());
+        if has_goal && let Err(error) = self.update_goal(chat_id, vec![event], false).await {
+            tracing::warn!(chat = %chat_id, %error, "could not pause the goal");
         }
     }
 
-    /// An ordinary history load pauses the active goal of a root Chat it brought in.
+    /// An ordinary history load pauses the active goal of a root Chat it brought in, as the
+    /// store keeps it.
     pub(crate) async fn pause_goal_after_history_load(&self, chat_id: ChatId) {
-        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
-            self.pause_goal(chat, GoalEvent::HistoryLoaded);
-        }
+        self.sync_goal_from_store(chat_id).await;
+        self.pause_goal(chat_id, GoalEvent::HistoryLoaded).await;
     }
 
     /// Charges the tokens a model reported for any member of the family to its root's goal.
@@ -300,56 +478,59 @@ impl Agent {
         if tokens == 0 {
             return;
         }
-        let mut chats = self.inner.chats.lock().await;
-        let root = chats.get(&chat_id).map_or(chat_id, |chat| {
-            chat.snapshot
-                .delegation
-                .as_ref()
-                .map_or(chat_id, |delegation| delegation.root_chat_id())
-        });
-        if let Some(chat) = chats.get_mut(&root)
-            && chat.snapshot.goal.is_some()
-            && let Err(error) = self.change_goal(chat, GoalEvent::TokensUsed(tokens))
+        let root = {
+            let chats = self.inner.chats.lock().await;
+            let root = chats.get(&chat_id).map_or(chat_id, |chat| {
+                chat.snapshot
+                    .delegation
+                    .as_ref()
+                    .map_or(chat_id, |delegation| delegation.root_chat_id())
+            });
+            if chats
+                .get(&root)
+                .is_none_or(|chat| chat.snapshot.goal.is_none())
+            {
+                return;
+            }
+            root
+        };
+        if let Err(error) = self
+            .update_goal(root, vec![GoalEvent::TokensUsed(tokens)], false)
+            .await
         {
             tracing::warn!(chat = %root, %error, "could not charge tokens to the goal");
         }
     }
 
-    /// The goal's part in ending the turn `receipt`: the time it ran, what the turn did, and its
-    /// usage written down.
-    pub(crate) fn end_goal_turn(&self, chat: &mut Chat, receipt: &Receipt, ending: GoalTurnEnd) {
+    /// What ending the turn `receipt` tells the root Chat's goal; `None` without a goal.
+    pub(crate) fn goal_turn_events(
+        &self,
+        chat: &Chat,
+        receipt: &Receipt,
+        ending: GoalTurnEnd,
+    ) -> Option<Vec<GoalEvent>> {
         if chat.snapshot.goal.is_none() || chat.snapshot.delegation.is_some() {
-            return;
+            return None;
         }
-        let ran_ms = chat.snapshot.chat_loop.run_started_at.map_or(0, |started| {
-            unix_time_milliseconds().saturating_sub(started)
-        });
-        let mut events = vec![GoalEvent::TimeElapsed { ms: ran_ms }];
-        match ending {
-            GoalTurnEnd::Completed => events.push(GoalEvent::TurnEnded(turn_summary(
+        Some(match ending {
+            GoalTurnEnd::Completed => vec![GoalEvent::TurnEnded(turn_summary(
                 chat,
                 receipt.run_id,
                 None,
-            ))),
-            GoalTurnEnd::Failed(error) => events.push(GoalEvent::TurnEnded(turn_summary(
+            ))],
+            GoalTurnEnd::Failed(error) => vec![GoalEvent::TurnEnded(turn_summary(
                 chat,
                 receipt.run_id,
                 Some(error),
-            ))),
-            GoalTurnEnd::Interrupted => {}
-        }
-        for event in events {
-            if let Err(error) = self.change_goal(chat, event) {
-                tracing::warn!(chat = %receipt.chat_id, %error, "could not end the goal's turn");
-            }
-        }
-        if chat
-            .snapshot
-            .goal
-            .as_ref()
-            .is_some_and(|goal| !goal.status.is_finished())
-        {
-            self.record_goal(chat, None, Vec::new());
+            ))],
+            GoalTurnEnd::Interrupted => Vec::new(),
+        })
+    }
+
+    /// The goal's part in ending a turn: the time it ran, what it did, and its usage recorded.
+    pub(crate) async fn end_goal_turn(&self, chat_id: ChatId, events: Vec<GoalEvent>) {
+        if let Err(error) = self.update_goal(chat_id, events, true).await {
+            tracing::warn!(chat = %chat_id, %error, "could not end the goal's turn");
         }
     }
 
@@ -366,6 +547,7 @@ impl Agent {
         {
             return;
         }
+        self.sync_goal_from_store(chat_id).await;
         let delivery = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
@@ -445,6 +627,7 @@ impl Agent {
         match operation.name.as_str() {
             GET_GOAL_TOOL_NAME => {
                 super::tools::parse_get_goal(&operation.input)?;
+                self.sync_goal_from_store(receipt.chat_id).await;
                 let chats = self.inner.chats.lock().await;
                 let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
                 Ok(tool_result(
@@ -465,11 +648,7 @@ impl Agent {
                     token_budget: token_budget.or_else(|| self.default_goal_budget()),
                     replace: false,
                 };
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats
-                    .get_mut(&receipt.chat_id)
-                    .ok_or("chat is unavailable")?;
-                Ok(match self.change_goal(chat, event) {
+                Ok(match self.update_goal(receipt.chat_id, vec![event], false).await {
                     Ok(()) => tool_result(
                         "Goal set. The host continues it after this turn until a completion check verifies it.".into(),
                         false,
@@ -479,11 +658,8 @@ impl Agent {
             }
             UPDATE_GOAL_TOOL_NAME => match super::tools::parse_update_goal(&operation.input)? {
                 GoalReport::Blocked { reason } => {
-                    let mut chats = self.inner.chats.lock().await;
-                    let chat = chats
-                        .get_mut(&receipt.chat_id)
-                        .ok_or("chat is unavailable")?;
-                    Ok(match self.change_goal(chat, GoalEvent::ReportedBlocked { reason }) {
+                    let blocked = GoalEvent::ReportedBlocked { reason };
+                    Ok(match self.update_goal(receipt.chat_id, vec![blocked], false).await {
                             Ok(()) => tool_result(
                                 "The goal is blocked. Stop working on it and tell the user what would unblock it; the user resumes it with /goal resume.".into(),
                                 false,
@@ -540,6 +716,7 @@ impl Agent {
                 checker,
             )
         };
+        self.sync_goal_from_store(receipt.chat_id).await;
         let check_cancel = cancel.clone();
         let checked = match checker {
             Ok((client, model)) => {
@@ -585,10 +762,6 @@ impl Agent {
                 "the turn was interrupted before the goal completion check finished".into(),
             );
         }
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or("chat is unavailable")?;
         let event = match &verdict {
             Ok(verdict) => GoalEvent::Checked {
                 goal_id,
@@ -601,9 +774,11 @@ impl Agent {
                 error: format!("the goal completion check failed: {error}"),
             },
         };
-        if let Err(error) = self.change_goal(chat, event) {
+        if let Err(error) = self.update_goal(receipt.chat_id, vec![event], false).await {
             return Ok(tool_result(error.to_string(), true));
         }
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
         let still_current = chat.snapshot.goal.as_ref().is_some_and(|goal| {
             (goal.id, goal.objective_revision) == (goal_id, objective_revision)
         });

@@ -29,21 +29,19 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    {
-        let mut chats = agent.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat).unwrap();
-        agent
-            .change_goal(
-                chat,
-                GoalEvent::Set {
-                    id: Uuid::new_v4(),
-                    objective: "Ship the export command".into(),
-                    token_budget: None,
-                    replace: false,
-                },
-            )
-            .unwrap();
-    }
+    agent
+        .update_goal(
+            chat,
+            vec![GoalEvent::Set {
+                id: Uuid::new_v4(),
+                objective: "Ship the export command".into(),
+                token_budget: None,
+                replace: false,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
     let ended_turn = Uuid::new_v4();
     agent.continue_goal(chat, ended_turn).await;
     // The next continuation finds the script exhausted, which fails its turn and blocks the goal.
@@ -62,11 +60,10 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
     let requests = || model.requests.lock().unwrap().len();
     let ran = requests();
 
-    {
-        let mut chats = agent.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat).unwrap();
-        chat.snapshot.goal.as_mut().unwrap().status = GoalStatus::Active;
-    }
+    agent
+        .update_goal(chat, vec![GoalEvent::Resume], false)
+        .await
+        .unwrap();
     agent.continue_goal(chat, ended_turn).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(requests(), ran, "the repeated continuation ran nothing");

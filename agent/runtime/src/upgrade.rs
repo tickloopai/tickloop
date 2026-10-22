@@ -359,6 +359,8 @@ impl Agent {
                     auto_denials: saved.auto_denials.clone(),
                     denial_window: saved.denial_window.clone(),
                     branch_reservation: None,
+                    goal_generation: 0,
+                    goal_clock_ms: 0,
                 },
             );
         }

@@ -3521,6 +3521,8 @@ impl Agent {
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
                 branch_reservation: None,
+                goal_generation: 0,
+                goal_clock_ms: 0,
             },
         );
         if let Some(context) = snapshot

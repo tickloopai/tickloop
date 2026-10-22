@@ -393,9 +393,12 @@ impl Agent {
                 self.revalidate_manual_tick_source(chat_id, instance, authority)
                     .await
             }
-            TriggerSource::ArtifactFeedback { .. }
-            | TriggerSource::GoalContinuation { .. }
-            | TriggerSource::ScheduledTask { .. } => Ok(()),
+            // Another process may have cleared, paused or edited the goal since.
+            TriggerSource::GoalContinuation { .. } => {
+                self.sync_goal_from_store(chat_id).await;
+                Ok(())
+            }
+            TriggerSource::ArtifactFeedback { .. } | TriggerSource::ScheduledTask { .. } => Ok(()),
         }
     }
 
@@ -522,6 +525,7 @@ impl Agent {
             )
         };
         self.refresh_tick_watermarks(chat_id, delivered).await;
+        self.sync_goal_from_store(chat_id).await;
         if takes_waiting_input {
             self.inner
                 .tasks
@@ -615,12 +619,13 @@ impl Agent {
             })
             .await;
             pause_receiving(chat, PauseReason::Stopped);
-            self.pause_goal(chat, goal::state::GoalEvent::Stopped);
             self.save(&chat.snapshot);
             operations
         };
         // Recorded before the lease is returned: a process taking it over sees the pause.
         self.record_receiving(chat_id, ReceivingChange::Paused)
+            .await;
+        self.pause_goal(chat_id, goal::state::GoalEvent::Stopped)
             .await;
         Ok(operations)
     }
