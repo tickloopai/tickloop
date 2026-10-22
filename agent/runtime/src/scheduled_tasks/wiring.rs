@@ -373,7 +373,12 @@ impl Agent {
                 })
                 .map_err(|error| error.to_string()),
             ScheduledTaskCall::StopWakeup => match tasks.stop_self_paced() {
-                Some(task) => Ok((json!({ "stopped": task.id }), vec![task], Vec::new())),
+                Some(task) => {
+                    let notice = ScheduledTaskNotice::SelfPacedEnded {
+                        task_id: task.id.clone(),
+                    };
+                    Ok((json!({ "stopped": task.id }), vec![task], vec![notice]))
+                }
                 None => Ok((
                     json!({ "stopped": null, "note": "No self-paced loop is running." }),
                     Vec::new(),

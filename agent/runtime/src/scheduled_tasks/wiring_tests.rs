@@ -909,3 +909,43 @@ async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_res
     );
     assert_eq!(rescheduled.next_fire_at_ms, Some(ms(at(10, 25, 0))));
 }
+
+#[tokio::test]
+async fn the_agent_ending_its_self_paced_loop_is_shown_to_the_user() {
+    let model = HoldingModel::new(vec![
+        wakeup("wake", 600, "watch the build"),
+        text("Waiting."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "pace yourself").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    model.scripted.enqueue(call(
+        "stop",
+        tools::SCHEDULE_WAKEUP_TOOL_NAME,
+        json!({"stop": true}),
+    ));
+    model
+        .scripted
+        .enqueue(text("The build is green; the loop is done."));
+    let mut events = agent.subscribe();
+    turn(&agent, chat, "is it done?").await;
+    assert!(tasks(&agent, chat).await.is_empty());
+    let notice = tokio::time::timeout(WAIT, async {
+        loop {
+            if let EventKind::ScheduledTasksChanged {
+                notice: Some(notice),
+            } = tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                return notice;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        notice,
+        ScheduledTaskNotice::SelfPacedEnded { task_id: task.id }
+    );
+}
