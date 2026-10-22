@@ -2104,6 +2104,13 @@ fn recover_transcript(
                     .monitor_members
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
+            })
+            .or_else(|| {
+                loaded
+                    .metadata
+                    .goal
+                    .as_ref()
+                    .and_then(|entry| entry.cwd.clone())
             }),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());

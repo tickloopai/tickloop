@@ -260,7 +260,11 @@ pub(crate) fn assemble(
             || metadata
                 .monitor_members
                 .as_ref()
-                .is_some_and(|entry| entry.materializes_chat());
+                .is_some_and(|entry| entry.materializes_chat())
+            || metadata
+                .goal
+                .as_ref()
+                .is_some_and(|entry| entry.cwd.is_some() && entry.goal.is_some());
         let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
             chain: Vec::new(),

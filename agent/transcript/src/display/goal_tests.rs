@@ -21,6 +21,7 @@ fn snapshot(objective: &str, status: GoalStatus) -> GoalSnapshot {
 fn goal_line(goal: Option<GoalSnapshot>) -> Line {
     Line::Goal(GoalEntry {
         chat_id: Uuid::nil(),
+        cwd: None,
         goal,
     })
 }

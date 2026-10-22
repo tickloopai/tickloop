@@ -922,3 +922,42 @@ async fn a_notification_claiming_the_users_consent_stays_host_input_before_and_a
     );
     reopened.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_goal_set_before_any_message_keeps_the_chat() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let agent = Agent::open(
+        root.path().into(),
+        config(),
+        Arc::new(ScriptedModel::new(Vec::new())),
+    )
+    .unwrap();
+    agent
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    agent.flush_transcripts().await;
+    agent.shutdown().await;
+
+    let reopened = Agent::open(
+        root.path().into(),
+        config(),
+        Arc::new(ScriptedModel::new(Vec::new())),
+    )
+    .unwrap();
+    let goal = reopened
+        .resume_chat(chat)
+        .await
+        .expect("the Chat was kept")
+        .goal
+        .expect("its goal was kept");
+    assert_eq!(goal.objective, OBJECTIVE);
+    reopened.shutdown().await;
+}

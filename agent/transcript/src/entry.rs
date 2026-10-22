@@ -670,6 +670,9 @@ pub struct TaskBoardsEntry {
 #[serde(rename_all = "camelCase")]
 pub struct GoalEntry {
     pub chat_id: Uuid,
+    /// The Chat's folder, which lets a goal set before any message keep the Chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// `None` once the goal was cleared.
     pub goal: Option<tickloop_agent_protocol::GoalSnapshot>,
 }

@@ -181,6 +181,7 @@ impl Agent {
             chat_id,
             Line::Goal(GoalEntry {
                 chat_id,
+                cwd: chat.snapshot.folder.clone(),
                 goal: chat.snapshot.goal.clone(),
             }),
         );
