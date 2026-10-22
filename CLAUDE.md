@@ -9,7 +9,7 @@ Tickloop（tickloop.ai）是面向代码与办公的终端 AI Agent，以 Tick�
 ## 核心行为
 
 - Tick 的一次运行是独立 Tick Instance，身份不等于 Pane ID。本机 Tick（扩展 Tick、Terminal Tick、Shell Tick）全部由 Tickhost 运行，实例为 `hosted:` 与 `shell:`；Artifact Tick 在 Artifacts 服务中。人在 Pane 或终端里自己启动的程序不是 Tick。
-- Loop 持有目标与执行状态，Agent 在其中理解目标并调用工具。Tick Subscription 属于 Loop；打开、发现或读取不自动订阅。
+- 每个 Chat 一个 Loop，持有执行状态；Goal 是可选的完成条件，Agent 在 Loop 中理解目标并调用工具。Tick Subscription 属于 Loop；打开、发现或读取不自动订阅。
 - 扩展 Tick 讲 Tick 协议 3：stdin/stdout 按行 JSON-RPC，`tick/describe`、`tick/read`、`tick/call` 与 `tick/update` 通知，状态只有 `{seq, data, at?}`，审批绑定 Tick 自报的 `revision`。Agent 用 TickManage `open` 打开 Tick：裸程序名依次查配置根中已安装 Tick 包的程序（`tick-<包>`）、PATH；清单声明协议的包程序固定按协议，其他程序声明 `protocol: true` 时按协议，否则作为 Terminal Tick 在 PTY 中运行。
 - Herdr Pane、Monitor 弹窗与普通终端只是附着视图，同一 Tick 可同时有多个视图；`open` 带 placement 时另建一个视图 Pane。关闭视图不结束 Tick，结束 Tick 用 TickManage `close` 或 Monitor。默认当前 Workspace，明确指定时可跨 Workspace；Herdr 外 Tick 照常运行，只是不能显示在 Pane 中。
 - 订阅频率只有四档：及时（Shell 固定）、高频 1 分钟（扩展 Tick 与 Terminal Tick 的默认）、中频 10 分钟、低频 30 分钟。状态类 update 只给最新一份：扩展 Tick 的业务变化、Terminal Tick 到期时与上次送出不同的屏幕文字、Shell 的退出。Artifact 不接受 Tick Subscription，Artifact 关联向同一用户的每个关联 Agent 交付 @tickloop 留言，反馈没有执行任务状态（ADR 0028）。安静无模型调用、忙时合并和停止规则由现有 Loop runtime 持有。
@@ -26,8 +26,8 @@ Agent 的列表与菜单沿用 Vim 导航习惯，文本输入沿用 Claude Code
 - 文本输入（含 Shell 输入）不提供 Vim 模式，编辑键沿用 Claude Code 普通模式；`Ctrl+G` 随时用外部编辑器编辑当前输入。
 - 列表与菜单支持 `j`／`k` 和 `Ctrl+N`／`Ctrl+P` 导航，`Enter` 确认，`Esc` 返回或取消当前界面；文本输入中 `j`／`k` 保持文字输入，候选补全使用 `Ctrl+N`／`Ctrl+P` 导航。
 - 菜单和选择器的选项不显示序号，也不提供看不见的数字快捷选择。Monitor、Subagents 面板等共享 `list_row` 的列表只用选中底色标记当前项，不加行首标记；菜单、选择器、权限与问题页继续用光标 `❯` 标记当前项（可同时带选中底色）。
-- `Esc` 按当前上下文逐层处理：先关闭候选或当前弹层；关闭视图与停止任务分别操作。Agent 运行中没有弹层时，`Esc` 打断当前一轮并暂停 Goal，Trigger 照常送达。
-- Agent 输入框的 `Ctrl+C` 参照 Codex：先交给弹层与候选处理，输入框有文字时清空；运行中且输入框为空时等同 `Esc`；空闲且输入框为空时离开界面，Agent 在 Daemon 中继续。`/stop` 让 Loop 全部停下（打断、暂停 Goal、暂停 Trigger 监听），见 CONTEXT.md 的 Loop。
+- `Esc` 按当前上下文逐层处理：先关闭候选或当前弹层；关闭视图与停止任务分别操作。Agent 主输入界面没有候选或弹层消费时，`Esc` 打断当前一轮（如有）、暂停 active 的 Goal，并撤销自定节奏 `/loop` 的下一次唤醒；其他 Trigger 照常送达。
+- Agent 输入框的 `Ctrl+C` 参照 Codex：先交给弹层与候选处理，输入框有文字时清空；运行中且输入框为空时等同 `Esc`；空闲且输入框为空时离开界面，Agent 在 Daemon 中继续。`/stop` 让 Loop 全部停下（打断、暂停 Goal、暂停接收 Trigger），见 CONTEXT.md 的 Loop。
 - Tick 视图的保留键是 `Esc`（隐藏视图）与 `Ctrl+B`（附着前缀，`Ctrl+B Esc` 把 Esc 发给程序），自带 Tick 不绑定这两个键：Tick 内返回上一层用 `Backspace`，文本输入同样是普通编辑，编辑中 `Ctrl+C` 取消编辑。
 - 按键只作用于当前可见且聚焦的界面；权限、问题和工作流菜单与输入编辑器分别处理按键，隐藏界面不消费输入。界面提示与实际按键行为保持一致。
 
