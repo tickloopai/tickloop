@@ -47,10 +47,6 @@ pub mod mcp_tools;
 mod model_request;
 mod persistence;
 mod remote_skills;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "ticket 08 wires scheduled tasks")
-)]
 mod scheduled_tasks;
 pub mod tick_adapter;
 pub mod tick_stream;
@@ -405,6 +401,11 @@ struct Inner {
     tick_deliveries: std::sync::Mutex<tick_subscriptions::TickDeliveries>,
     /// Wakes the delivery task when the subscription set or a frequency changed.
     tick_wake: Notify,
+    /// The zone scheduled tasks read cron expressions in, and their clock.
+    schedule_clock: scheduled_tasks::ScheduleClock,
+    /// Wakes a Worker's scheduled task timer when a Chat's tasks changed.
+    scheduled_wake: Arc<Notify>,
+    scheduled_timer_started: AtomicBool,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
     /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
@@ -933,6 +934,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         delegation: None,
         family_completions: Vec::new(),
         task_boards: BTreeMap::new(),
+        scheduled_tasks: Vec::new(),
         task_board: None,
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
@@ -1685,14 +1687,21 @@ impl Agent {
             }
             Ok(stopped.operations)
         } else {
-            self.stop_loop(chat_id).await
+            let operations = self.stop_loop(chat_id).await?;
+            if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+                self.cancel_self_paced_wakeup(chat);
+            }
+            Ok(operations)
         }
     }
 
+    /// Esc: interrupts the turn, and cancels the self-paced loop's pending wake-up.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        Ok(chat.interrupt())
+        let operations = chat.interrupt();
+        self.cancel_self_paced_wakeup(chat);
+        Ok(operations)
     }
 
     /// Sends the queued user message `run_id` now: interrupts the work ahead of it, after which
@@ -1840,6 +1849,7 @@ impl Agent {
             system_prompt_addition,
             citation_style,
             request_gates,
+            time_zone,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
@@ -1915,6 +1925,12 @@ impl Agent {
                     tick_subscriptions::TickDeliveries::default(),
                 ),
                 tick_wake: Notify::new(),
+                schedule_clock: scheduled_tasks::ScheduleClock::new(
+                    scheduled_tasks::resolve_zone(time_zone.as_deref())
+                        .unwrap_or(chrono_tz::Tz::UTC),
+                ),
+                scheduled_wake: Arc::new(Notify::new()),
+                scheduled_timer_started: AtomicBool::new(false),
                 session_permissions: Mutex::new(
                     session_permissions::SessionPermissionContext::default(),
                 ),
@@ -3012,6 +3028,7 @@ impl Agent {
                 id.is_empty()
                     || (!available_tools.contains(name)
                         && !shared_tasks::is_task_tool(name)
+                        && !scheduled_tasks::tools::is_scheduled_task_tool(name)
                         && name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
                     || !input.is_object()
                     || !used_calls.insert(id.clone())
@@ -3436,6 +3453,7 @@ impl Agent {
                 EventKind::Failed(error)
             }
         };
+        self.end_self_paced_turn(chat, receipt.run_id);
         let is_closed = self.inner.closed.load(Ordering::SeqCst);
         let (ending, usage) = match &event {
             EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),

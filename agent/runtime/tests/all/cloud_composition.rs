@@ -150,6 +150,8 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
             return text("Done.");
         }
         let task = tool_result(&request.messages, "create").map(|result| result["task"].clone());
+        let scheduled =
+            tool_result(&request.messages, "schedule").map(|result| result["id"].clone());
         let steps: Vec<(&str, &str, Value)> = vec![
             (
                 "fetch",
@@ -213,6 +215,18 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 "reply",
                 "ArtifactComment",
                 json!({"action": "reply", "artifact_id": "doc", "thread_id": "thread-1", "text": "Friday"}),
+            ),
+            (
+                "schedule",
+                "CronCreate",
+                json!({"cron": "7 9 * * *", "prompt": "Check the delivery page."}),
+            ),
+            ("schedules", "CronList", json!({})),
+            ("unschedule", "CronDelete", json!({"id": scheduled})),
+            (
+                "wakeup",
+                "ScheduleWakeup",
+                json!({"delaySeconds": 1200, "reason": "waiting for the delivery", "prompt": "Check the delivery page."}),
             ),
             ("ask", "AskUserQuestion", single_question("Which format?")),
         ];

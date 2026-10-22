@@ -14,6 +14,9 @@ pub struct ScheduledTask {
     /// built-in maintenance instructions each time the task runs.
     pub prompt: String,
     pub creator: ScheduledTaskCreator,
+    /// The IANA time zone its cron expression is read in: the host's local zone, or the user's
+    /// zone a stateless host supplies.
+    pub time_zone: String,
     /// `None` when the task never needed confirming.
     pub confirmation: Option<ScheduledTaskConfirmation>,
     pub created_at_ms: u64,
@@ -26,6 +29,10 @@ pub struct ScheduledTask {
     pub next_fire_at_ms: Option<u64>,
     pub jitter_ms: i64,
     pub last_fired_at_ms: Option<u64>,
+    /// The scheduled time the latest run covered; with the task id it names that run's
+    /// delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scheduled_for_ms: Option<u64>,
     /// Scheduled times passed over without running because the Loop was busy or the host woke
     /// late, summed over the task's life.
     pub skipped: u64,
@@ -82,4 +89,19 @@ pub enum ScheduledTaskConfirmation {
 pub enum ScheduledTaskDecision {
     Confirm,
     Reject,
+}
+
+/// What happened to a scheduled task that the Chat shows once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduledTaskNotice {
+    /// A run came due and was handed to the Loop.
+    Fired { task_id: String },
+    /// Esc or `/stop` cancelled the self-paced task's pending wake-up.
+    WakeupCancelled { task_id: String },
+    /// A self-paced task ended because neither its turn nor the fallback turn rescheduled it.
+    SelfPacedEnded { task_id: String },
+    /// The user confirmed a pending task after its time or its seven days had passed, so it
+    /// was deleted without running.
+    ExpiredUnrun { task_id: String },
 }

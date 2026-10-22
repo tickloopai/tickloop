@@ -61,8 +61,10 @@ use crate::{
 /// 28.0 puts every Trigger on one wake-up base: the Loop carries its receiving switch, with why
 /// it paused, and its Tick Subscriptions; a delivery names its source by type; the explicit
 /// Trigger commands are gone.
+/// 28.1 adds scheduled tasks: the Chat snapshot carries them, Loop actions delete one or answer
+/// a pending one, and an event announces their changes.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -537,6 +539,16 @@ pub enum LoopAction {
     },
     RetryDeniedOperation {
         record_id: Uuid,
+    },
+    /// Cancels one of the Chat's scheduled tasks, as from its Monitor row.
+    DeleteScheduledTask {
+        task_id: String,
+    },
+    /// The user's answer to a scheduled task the Agent created on a host without permission
+    /// requests: confirming starts its timing, rejecting deletes it.
+    DecideScheduledTask {
+        task_id: String,
+        decision: crate::ScheduledTaskDecision,
     },
 }
 

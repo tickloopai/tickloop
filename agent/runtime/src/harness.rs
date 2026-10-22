@@ -57,6 +57,9 @@ pub struct HarnessOptions {
     /// gate per holding and one per node; it holds them for that single request and its stream
     /// alone. Empty for a local Agent.
     pub request_gates: Vec<Arc<tokio::sync::Semaphore>>,
+    /// The IANA time zone scheduled tasks read their cron expressions in: a stateless host
+    /// passes the user's. `None` uses the machine's local zone.
+    pub time_zone: Option<String>,
 }
 
 impl HarnessOptions {
@@ -74,6 +77,7 @@ impl HarnessOptions {
             citation_style: CitationStyle::default(),
             system_prompt_addition: None,
             request_gates: Vec::new(),
+            time_zone: None,
         }
     }
 }
@@ -128,6 +132,8 @@ pub struct ToolPolicy {
     /// ListSubagents, SendMessage and StopSubagent.
     pub family_messages: bool,
     pub tasks: bool,
+    /// CronCreate, CronList, CronDelete and ScheduleWakeup, for the root Agent only.
+    pub scheduled_tasks: bool,
     /// The host's tools, such as the Artifact and Tick tools, and its MCP resources.
     pub artifacts: bool,
     pub tick_subscriptions: bool,
@@ -157,6 +163,7 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
+            scheduled_tasks: true,
             artifacts: true,
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
@@ -179,6 +186,7 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
+            scheduled_tasks: true,
             artifacts: true,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -189,7 +197,12 @@ impl ToolPolicy {
 
     /// Whether a Chat with these tools may wait for a person or keep work past its turn.
     fn waits_or_outlives_the_turn(&self) -> bool {
-        self.questions || self.delegation || self.family_messages || self.tasks || self.artifacts
+        self.questions
+            || self.delegation
+            || self.family_messages
+            || self.tasks
+            || self.scheduled_tasks
+            || self.artifacts
     }
 
     /// WebFetch alone: nothing waits for a person, and nothing outlives the turn.
@@ -204,6 +217,7 @@ impl ToolPolicy {
             delegation: false,
             family_messages: false,
             tasks: false,
+            scheduled_tasks: false,
             artifacts: false,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -216,12 +230,16 @@ impl ToolPolicy {
 /// The tools whose calls a durable Chat's host admits by its own rule instead of Auto review.
 /// WebFetch fetches only URLs with provenance there, so it carries no data the model composed;
 /// Artifact writes are admitted by their target's provenance instead of a rule.
-const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 5] = [
+/// Scheduled tasks the Agent creates there wait for the user to confirm them instead.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 8] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
     tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
     crate::mcp_tools::ARTIFACT_READ_TOOL,
+    crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME,
+    crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME,
+    crate::scheduled_tasks::tools::SCHEDULE_WAKEUP_TOOL_NAME,
 ];
 
 /// The host rules of a durable Chat, beside [`ToolPolicy::durable_chat`]: each allows one of
@@ -295,6 +313,10 @@ pub struct Waits {
     /// The artifact links whose @tickloop requests the family's Loops receive: the host
     /// delivers each with `TurnOp::Deliver`.
     pub deliveries: Vec<DeliveryBinding>,
+    /// Unix milliseconds when a scheduled task of the family comes due: the host calls
+    /// [`Agent::wake_scheduled_tasks`] with this time then. `None` when none is timing or the
+    /// Loop pauses receiving.
+    pub next_wake_at_ms: Option<u64>,
 }
 
 /// A Loop's link to an artifact for one account's @tickloop requests.
@@ -340,6 +362,9 @@ impl Agent {
         }
         if let Some(reason) = invalid_composition(seams.environment.is_some(), &options) {
             return Err(AgentError::Invalid(reason.into()));
+        }
+        if let Some(zone) = &options.time_zone {
+            crate::scheduled_tasks::resolve_zone(Some(zone)).map_err(AgentError::Invalid)?;
         }
         let client = seams.models.client(
             &tickloop_agent_model::cards::model_for_persistent_selection(options.model.clone()),
@@ -432,6 +457,11 @@ fn family_state(
             let family_waits = waits.get_or_insert_with(Waits::default);
             family_waits.people.extend(member_waits.people);
             family_waits.deliveries.extend(member_waits.deliveries);
+            family_waits.next_wake_at_ms = family_waits
+                .next_wake_at_ms
+                .into_iter()
+                .chain(member_waits.next_wake_at_ms)
+                .min();
         }
     }
     found.then_some((runs, waits))
@@ -477,8 +507,10 @@ fn chat_state(agent: &Agent, chat_id: ChatId, chat: &Chat) -> (bool, Option<Wait
         || chat.parked.keys().any(|run| !waits_for_person(run))
         || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
     let deliveries = deliveries_of(chat_id, &chat.snapshot);
+    let next_wake_at_ms = Agent::next_scheduled_wake(chat);
     let waits = !chat.parked.is_empty()
         || !deliveries.is_empty()
+        || next_wake_at_ms.is_some()
         || waits_for_member
         || crate::wakeup::listens(&chat.snapshot.chat_loop)
         || user_shell_in(&[UserShellState::WaitingPermission]);
@@ -486,6 +518,7 @@ fn chat_state(agent: &Agent, chat_id: ChatId, chat: &Chat) -> (bool, Option<Wait
         runs,
         waits.then(|| Waits {
             deliveries,
+            next_wake_at_ms,
             ..waits_of(chat_id, &chat.snapshot)
         }),
     )
@@ -559,6 +592,7 @@ fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> W
     Waits {
         people: questions.chain(permissions).chain(user_shells).collect(),
         deliveries: Vec::new(),
+        next_wake_at_ms: None,
     }
 }
 

@@ -57,6 +57,7 @@ impl RetainedState {
             Line::CitationSources(entry) => self.metadata.citation_sources = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.metadata.family_inputs = Some(entry.clone()),
             Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
+            Line::ScheduledTasks(entry) => self.metadata.scheduled_tasks = Some(entry.clone()),
             Line::FamilyCompletions(entry) => {
                 self.metadata.family_completions = Some(entry.clone())
             }

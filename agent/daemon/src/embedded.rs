@@ -1307,6 +1307,16 @@ impl EmbeddedAgentAccess {
             LoopAction::RetryDeniedOperation { record_id } => Ok(CommandResult::Submitted(
                 agent.request_denial_retry(chat, record_id).await?,
             )),
+            LoopAction::DeleteScheduledTask { task_id } => {
+                agent.delete_scheduled_task(chat, &task_id).await?;
+                Ok(CommandResult::Done)
+            }
+            LoopAction::DecideScheduledTask { task_id, decision } => {
+                agent
+                    .decide_scheduled_task(chat, &task_id, decision)
+                    .await?;
+                Ok(CommandResult::Done)
+            }
         }
     }
 

@@ -619,3 +619,46 @@ fn trigger_deliveries_show_each_delivery_as_its_ledger_last_recorded_it() {
         ]
     );
 }
+
+#[test]
+fn the_latest_scheduled_tasks_record_wins_through_retained_snapshots() {
+    let chat = Uuid::new_v4();
+    let task = |id: &str| -> tickloop_agent_protocol::ScheduledTask {
+        serde_json::from_value(json!({
+            "id": id, "kind": {"type": "recurring", "cron": "*/5 * * * *"},
+            "prompt": "check the deploy", "creator": "user", "time_zone": "Asia/Shanghai",
+            "confirmation": null, "created_at_ms": 1, "expires_at_ms": 604_800_001,
+            "scheduled_for_ms": 300_000, "next_fire_at_ms": 285_000, "jitter_ms": -15_000,
+            "last_fired_at_ms": null, "skipped": 0,
+        }))
+        .unwrap()
+    };
+    let line = |tasks: Vec<tickloop_agent_protocol::ScheduledTask>| {
+        Line::ScheduledTasks(crate::ScheduledTasksEntry {
+            chat_id: chat,
+            tasks,
+        })
+    };
+    assert_eq!(
+        crate::MetadataKind::ScheduledTasks.retention(),
+        crate::Retention::ChatLatest
+    );
+    let lines = [
+        line(vec![task("0a1b2c3d")]),
+        Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
+            chat_id: chat,
+            lines: vec![line(vec![task("0a1b2c3d"), task("11111111")])],
+        }),
+    ];
+    assert_eq!(
+        scheduled_tasks(&lines)
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        ["0a1b2c3d", "11111111"]
+    );
+    assert!(scheduled_tasks(&[lines[0].clone(), line(Vec::new())]).is_empty());
+    let written = serde_json::to_value(line(vec![task("0a1b2c3d")])).unwrap();
+    assert_eq!(written["type"], "scheduled-tasks");
+    assert!(serde_json::from_value::<Line>(written).is_ok());
+}

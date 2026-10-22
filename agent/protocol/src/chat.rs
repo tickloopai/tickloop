@@ -51,6 +51,10 @@ pub struct ChatSnapshot {
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default)]
     pub artifact_ticks: Vec<ArtifactTick>,
+    /// The root Chat's scheduled tasks, at most [`crate::MAX_SCHEDULED_TASKS_PER_CHAT`], one of
+    /// them self-paced at most.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_tasks: Vec<crate::ScheduledTask>,
     #[serde(skip)]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
@@ -334,6 +338,11 @@ pub enum EventKind {
         root_chat_id: ChatId,
         root_loop_id: LoopId,
         revision: u64,
+    },
+    /// The Chat's scheduled tasks changed; the snapshot holds them. `notice` is what the Chat
+    /// shows once about it.
+    ScheduledTasksChanged {
+        notice: Option<crate::ScheduledTaskNotice>,
     },
     ProgressUpdated {
         progress: Progress,

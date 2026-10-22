@@ -478,6 +478,7 @@ impl Agent {
             };
             let resumed = resume_receiving(chat);
             if resumed {
+                self.resume_scheduled_tasks(chat);
                 self.save(&chat.snapshot);
             }
             resumed.then_some(chat.snapshot.chat_loop.id)

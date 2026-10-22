@@ -2135,6 +2135,22 @@ fn recover_transcript(
         .map(|entry| entry.completions.clone())
         .unwrap_or_default();
     if chat_id == source_chat_id {
+        snapshot.scheduled_tasks = loaded
+            .metadata
+            .scheduled_tasks
+            .as_ref()
+            .filter(|entry| entry.chat_id == chat_id)
+            .map(|entry| entry.tasks.clone())
+            .unwrap_or_default();
+        // A Worker loading the Chat from its history keeps only the recurring tasks still
+        // running and the one-shot tasks still ahead; a durable host's load is how it runs the
+        // Chat, so it keeps them all.
+        if waits == WaitHosting::Process {
+            super::scheduled_tasks::after_history_load(
+                &mut snapshot.scheduled_tasks,
+                std::time::SystemTime::now().into(),
+            );
+        }
         snapshot.task_boards = loaded
             .metadata
             .task_boards

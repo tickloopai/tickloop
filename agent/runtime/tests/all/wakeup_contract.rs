@@ -1,11 +1,13 @@
 //! The contract every Trigger source keeps with the wake-up base, run once per source. A source
 //! only says how it hands a delivery over, how it ends, and what a crash or a second host is for
-//! it; each case below is the same for every source. Goal continuations and scheduled tasks add
-//! their instances when they join the base.
+//! it; each case below is the same for every source. Goal continuations add their instance when
+//! they join the base.
 //!
 //! The Tick instance runs where Tick streams run, in a process that keeps its own waits; the
-//! artifact feedback instance runs where @tickloop requests are pushed, on a durable host. Tick
-//! Updates have no durable host to push them, so the durable push case is feedback's alone.
+//! artifact feedback instance runs where @tickloop requests are pushed, on a durable host, and the
+//! scheduled task instance where a stateless host wakes the Chat at the time the Harness
+//! reported. Tick Updates have no durable host to push them, so the durable push case is
+//! feedback's alone.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -503,6 +505,7 @@ macro_rules! contract {
 
 contract!(tick_subscription, TickSource);
 contract!(artifact_feedback, FeedbackSource);
+contract!(scheduled_task, ScheduledSource);
 
 /// A Shell Tick subscription of a saved Chat, in a process that keeps its own waits.
 struct TickSource {
@@ -819,4 +822,132 @@ async fn an_unlinked_artifacts_waiting_request_is_withdrawn_with_its_reason() {
         })
     );
     source.agent.shutdown().await;
+}
+
+/// Scheduled tasks of a Chat on a durable host, which wakes it at each task's next fire time.
+/// Each delivery is the run of a task of its own, so deliveries do not merge.
+struct ScheduledSource {
+    store: Arc<InMemoryTranscriptStore>,
+    faults: Arc<FaultyTranscriptStore>,
+    agent: Agent,
+    chat: ChatId,
+    /// The fire time each delivery was handed at, to hand the same run again.
+    fired: Mutex<std::collections::HashMap<u64, u64>>,
+}
+
+impl ScheduledSource {
+    async fn loaded(
+        store: Arc<InMemoryTranscriptStore>,
+        chat: ChatId,
+        model: Arc<ContractModel>,
+        fired: std::collections::HashMap<u64, u64>,
+    ) -> Self {
+        let faults = Arc::new(FaultyTranscriptStore::new(store.clone()));
+        let agent = durable_harness(faults.clone(), model);
+        agent.resume_chat(chat).await.unwrap();
+        Self {
+            store,
+            faults,
+            agent,
+            chat,
+            fired: Mutex::new(fired),
+        }
+    }
+
+    async fn task_with(&self, prompt: &str) -> Option<tickloop_agent_protocol::ScheduledTask> {
+        self.agent
+            .snapshot(self.chat)
+            .await
+            .ok()?
+            .scheduled_tasks
+            .into_iter()
+            .find(|task| task.prompt == prompt)
+    }
+}
+
+#[async_trait]
+impl Source for ScheduledSource {
+    const LATEST_ONLY: bool = false;
+
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let setup = durable_harness(store.clone(), model.clone());
+        let chat = setup.create_chat_without_folder().await.unwrap();
+        let ready = prompt("get ready", ParentSelection::CurrentLeaf);
+        setup.advance(chat, ready.clone()).await.unwrap();
+        settled(&setup, chat, ready.input_id).await;
+        setup.sync().await.unwrap();
+        setup.shutdown().await;
+        Self::loaded(store, chat, model, Default::default()).await
+    }
+
+    fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    fn chat(&self) -> ChatId {
+        self.chat
+    }
+
+    /// The `n`th delivery is the run of its own every-minute task: the host wakes the Chat at
+    /// the task's fire time, and for a run it handed before, at that run's time again.
+    async fn deliver(&self, n: u64, marker: &str) {
+        let prompt = format!("{marker} (task {n})");
+        let task = match self.task_with(&prompt).await {
+            Some(task) => task,
+            None => match self
+                .agent
+                .schedule_task(self.chat, "* * * * *", prompt.clone(), true)
+                .await
+            {
+                Ok(task) => task,
+                Err(_) => return,
+            },
+        };
+        let repeated = self.fired.lock().unwrap().get(&n).copied();
+        let Some(due_at) = repeated.or(task.next_fire_at_ms) else {
+            return;
+        };
+        let _ = self.agent.wake_scheduled_tasks(self.chat, due_at).await;
+        if repeated.is_none()
+            && self
+                .task_with(&prompt)
+                .await
+                .is_some_and(|task| task.last_scheduled_for_ms.is_some())
+        {
+            self.fired.lock().unwrap().insert(n, due_at);
+        }
+    }
+
+    async fn end(&self) {
+        let tasks = self
+            .agent
+            .snapshot(self.chat)
+            .await
+            .unwrap()
+            .scheduled_tasks;
+        for task in tasks {
+            self.agent
+                .delete_scheduled_task(self.chat, &task.id)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The store commits the host's last write and loses its acknowledgement; the next host
+    /// loads what was committed and is woken for the same run again.
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        self.faults.lose_next_acknowledgement();
+        let _ = self.agent.sync().await;
+        self.agent.shutdown().await;
+        let fired = self.fired.into_inner().unwrap();
+        Self::loaded(self.store, self.chat, model, fired).await
+    }
+
+    /// The host the family moves to: this one hands the Chat over first.
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        self.agent.sync().await.unwrap();
+        self.agent.shutdown().await;
+        Self::loaded(self.store.clone(), self.chat, model, Default::default()).await
+    }
 }

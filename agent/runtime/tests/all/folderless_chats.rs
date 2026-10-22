@@ -145,6 +145,10 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
             "ListSubagents",
             "SendMessage",
             "StopSubagent",
+            "CronCreate",
+            "CronList",
+            "CronDelete",
+            "ScheduleWakeup",
             "Skill",
         ]
     );

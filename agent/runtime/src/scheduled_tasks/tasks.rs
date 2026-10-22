@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone};
+use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz as Zone;
 use tickloop_agent_cron::{Run, Schedule, TaskKind, generate_task_id, next_run};
 use tickloop_agent_protocol::{
     MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
@@ -80,7 +81,7 @@ pub(crate) enum SelfPacedTurnEnd {
     /// The turn neither rescheduled nor stopped, so the host wakes it once more later.
     FallbackScheduled,
     /// The fallback turn did not reschedule either, so the task ended.
-    Ended(ScheduledTask),
+    Ended(Box<ScheduledTask>),
 }
 
 /// One task run that came due.
@@ -118,13 +119,12 @@ impl ScheduledTasks {
         &self.tasks
     }
 
-    pub(crate) fn get(&self, id: &str) -> Option<&ScheduledTask> {
-        self.tasks.iter().find(|task| task.id == id)
+    pub(crate) fn into_tasks(self) -> Vec<ScheduledTask> {
+        self.tasks
     }
 
-    /// A Chat branched from this one starts with no scheduled tasks.
-    pub(crate) fn for_branch(&self) -> Self {
-        Self::default()
+    pub(crate) fn get(&self, id: &str) -> Option<&ScheduledTask> {
+        self.tasks.iter().find(|task| task.id == id)
     }
 
     /// A fresh id that no task of this Chat uses.
@@ -137,13 +137,15 @@ impl ScheduledTasks {
         }
     }
 
-    pub(crate) fn create_cron<Tz: TimeZone>(
+    /// A recurring or one-shot task whose cron expression reads times in `zone`.
+    pub(crate) fn create_cron(
         &mut self,
         id: String,
         cron_task: CronTask,
         prompt: String,
         creation: Creation,
-        now: &DateTime<Tz>,
+        zone: Zone,
+        now: &DateTime<Utc>,
     ) -> Result<&ScheduledTask, ScheduledTaskError> {
         self.ensure_room(false)?;
         let (kind, expires_at_ms) = match &cron_task {
@@ -160,12 +162,13 @@ impl ScheduledTasks {
                 None,
             ),
         };
-        let mut task = new_task(id, kind, prompt, creation, now, expires_at_ms);
+        let mut task = new_task(id, kind, prompt, creation, zone, now, expires_at_ms);
         let (schedule, task_kind) = match &cron_task {
             CronTask::Recurring(schedule) => (schedule, TaskKind::Recurring),
             CronTask::OneShot(schedule) => (schedule, TaskKind::OneShot),
         };
-        let run = next_run(schedule, task_kind, &task.id, now)
+        let run = in_zone(now, &zone)
+            .and_then(|now| next_run(schedule, task_kind, &task.id, &now))
             .ok_or_else(|| ScheduledTaskError::NeverRuns(schedule.expression().to_string()))?;
         if !creation.needs_confirmation {
             set_timing(&mut task, &run);
@@ -175,12 +178,20 @@ impl ScheduledTasks {
 
     /// `/loop` without an interval: replaces any self-paced task with one whose first turn is
     /// the one running now, so it waits for that turn to reschedule it.
-    pub(crate) fn start_self_paced<Tz: TimeZone>(
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "ticket 14 starts the self-paced task when the user runs /loop without an interval"
+        )
+    )]
+    pub(crate) fn start_self_paced(
         &mut self,
         id: String,
         prompt: String,
         creation: Creation,
-        now: &DateTime<Tz>,
+        zone: Zone,
+        now: &DateTime<Utc>,
     ) -> Result<&ScheduledTask, ScheduledTaskError> {
         self.ensure_room(true)?;
         self.tasks.retain(|task| !is_self_paced(task));
@@ -189,7 +200,7 @@ impl ScheduledTasks {
             reason: None,
             fallback: false,
         };
-        let task = new_task(id, kind, prompt, creation, now, Some(expiry(now)));
+        let task = new_task(id, kind, prompt, creation, zone, now, Some(expiry(now)));
         Ok(self.push(task))
     }
 
@@ -197,12 +208,13 @@ impl ScheduledTasks {
     /// none. The delay is clamped to one minute through one hour. Rescheduling changes only
     /// the delay and the reason: replacing the instruction would let the Agent swap what the
     /// user started or confirmed without asking again.
-    pub(crate) fn schedule_wakeup<Tz: TimeZone>(
+    pub(crate) fn schedule_wakeup(
         &mut self,
         id: String,
         wakeup: Wakeup,
         creation: Creation,
-        now: &DateTime<Tz>,
+        zone: Zone,
+        now: &DateTime<Utc>,
     ) -> Result<ScheduledWakeup<'_>, ScheduledTaskError> {
         let delay = wakeup.delay.clamp(MIN_WAKEUP_DELAY, MAX_WAKEUP_DELAY);
         let kind = ScheduledTaskKind::SelfPaced {
@@ -218,7 +230,15 @@ impl ScheduledTasks {
             }
             None => {
                 self.ensure_room(false)?;
-                let task = new_task(id, kind, wakeup.prompt, creation, now, Some(expiry(now)));
+                let task = new_task(
+                    id,
+                    kind,
+                    wakeup.prompt,
+                    creation,
+                    zone,
+                    now,
+                    Some(expiry(now)),
+                );
                 self.tasks.push(task);
                 (self.tasks.len() - 1, false)
             }
@@ -242,10 +262,7 @@ impl ScheduledTasks {
     /// A turn of the self-paced task ended. Without a reschedule the host wakes it once more
     /// after [`FALLBACK_WAKEUP_DELAY`]; when that fallback turn does not reschedule either, the
     /// task ends.
-    pub(crate) fn self_paced_turn_ended<Tz: TimeZone>(
-        &mut self,
-        now: &DateTime<Tz>,
-    ) -> SelfPacedTurnEnd {
+    pub(crate) fn self_paced_turn_ended(&mut self, now: &DateTime<Utc>) -> SelfPacedTurnEnd {
         let Some(index) = self.tasks.iter().position(is_self_paced) else {
             return SelfPacedTurnEnd::Unchanged;
         };
@@ -259,11 +276,18 @@ impl ScheduledTasks {
             return SelfPacedTurnEnd::Unchanged;
         };
         if *fallback {
-            return SelfPacedTurnEnd::Ended(self.tasks.remove(index));
+            return SelfPacedTurnEnd::Ended(Box::new(self.tasks.remove(index)));
         }
         *fallback = true;
         set_wake(task, now, FALLBACK_WAKEUP_DELAY);
         SelfPacedTurnEnd::FallbackScheduled
+    }
+
+    /// A run of the task merged into one already waiting: its time is passed over.
+    pub(crate) fn add_skipped(&mut self, id: &str) {
+        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+            task.skipped += 1;
+        }
     }
 
     pub(crate) fn delete(&mut self, id: &str) -> Option<ScheduledTask> {
@@ -273,11 +297,11 @@ impl ScheduledTasks {
 
     /// The user's answer to a pending task: confirming starts its timing from `now`, unless
     /// the task already expired, and rejecting deletes it.
-    pub(crate) fn decide<Tz: TimeZone>(
+    pub(crate) fn decide(
         &mut self,
         id: &str,
         decision: ScheduledTaskDecision,
-        now: &DateTime<Tz>,
+        now: &DateTime<Utc>,
     ) -> Result<DecisionOutcome<'_>, ScheduledTaskError> {
         let index = self
             .tasks
@@ -315,7 +339,7 @@ impl ScheduledTasks {
     /// passed over while the Loop was busy or the host woke late count as skipped, never as
     /// extra runs. One-shot tasks, and recurring or self-paced ones past their expiry, are
     /// deleted after running.
-    pub(crate) fn take_due<Tz: TimeZone>(&mut self, now: &DateTime<Tz>) -> DueTasks {
+    pub(crate) fn take_due(&mut self, now: &DateTime<Utc>) -> DueTasks {
         let now_ms = millis(now);
         let mut due = DueTasks::default();
         let mut kept = Vec::with_capacity(self.tasks.len());
@@ -347,7 +371,7 @@ impl ScheduledTasks {
     /// Receiving resumed: every task waits for its next fire time strictly after `now`, so
     /// nothing missed while paused runs late. One-shot and self-paced tasks whose fire time
     /// passed, jitter included, are deleted. Returns the deleted tasks.
-    pub(crate) fn resume<Tz: TimeZone>(&mut self, now: &DateTime<Tz>) -> Vec<ScheduledTask> {
+    pub(crate) fn resume(&mut self, now: &DateTime<Utc>) -> Vec<ScheduledTask> {
         let now_ms = millis(now);
         let mut removed = Vec::new();
         let mut kept = Vec::with_capacity(self.tasks.len());
@@ -378,10 +402,7 @@ impl ScheduledTasks {
     /// An ordinary history load: the self-paced task is not restored, and one-shot tasks
     /// whose time passed and expired recurring tasks are deleted. Receiving starts paused, so
     /// [`Self::resume`] sets the timing of what remains. Returns the deleted tasks.
-    pub(crate) fn after_history_load<Tz: TimeZone>(
-        &mut self,
-        now: &DateTime<Tz>,
-    ) -> Vec<ScheduledTask> {
+    pub(crate) fn after_history_load(&mut self, now: &DateTime<Utc>) -> Vec<ScheduledTask> {
         let (kept, removed) = std::mem::take(&mut self.tasks)
             .into_iter()
             .partition(|task| !is_self_paced(task) && !has_expired(task, now));
@@ -418,15 +439,15 @@ impl ScheduledTasks {
 }
 
 /// How a task's next run is set from a given time.
-enum Timing<Tz: TimeZone> {
-    Run(Run<Tz>),
+enum Timing {
+    Run(Run<Zone>),
     Wake(Duration),
     /// A self-paced task whose turn has not picked a wake-up yet.
     AwaitingTurn,
     Never,
 }
 
-fn timing_after<Tz: TimeZone>(task: &ScheduledTask, after: &DateTime<Tz>) -> Timing<Tz> {
+fn timing_after(task: &ScheduledTask, after: &DateTime<Utc>) -> Timing {
     let (cron, task_kind) = match &task.kind {
         ScheduledTaskKind::Recurring { cron } => (cron, TaskKind::Recurring),
         ScheduledTaskKind::OneShot { cron } => (cron, TaskKind::OneShot),
@@ -439,14 +460,17 @@ fn timing_after<Tz: TimeZone>(task: &ScheduledTask, after: &DateTime<Tz>) -> Tim
             ..
         } => return Timing::AwaitingTurn,
     };
-    let Ok(schedule) = Schedule::parse(cron) else {
+    let (Ok(schedule), Some(zone)) = (Schedule::parse(cron), zone_of(task)) else {
         return Timing::Never;
     };
-    let mut run = next_run(&schedule, task_kind, &task.id, after);
+    let Some(after) = in_zone(after, &zone) else {
+        return Timing::Never;
+    };
+    let mut run = next_run(&schedule, task_kind, &task.id, &after);
     // A recurring run jittered early can fire no later than `after` (it is then clamped to
     // it); starting the task then would run a time that passed, so it waits for the next.
     if task_kind == TaskKind::Recurring {
-        while let Some(early) = run.take_if(|run| run.fire_at <= *after) {
+        while let Some(early) = run.take_if(|run| run.fire_at <= after) {
             run = next_run(&schedule, task_kind, &task.id, &early.scheduled_for);
         }
     }
@@ -455,14 +479,14 @@ fn timing_after<Tz: TimeZone>(task: &ScheduledTask, after: &DateTime<Tz>) -> Tim
 
 /// Runs a due task: records the run and sets its next one. `None` when the stored schedule
 /// no longer parses, so the task is dropped.
-fn fire<Tz: TimeZone>(task: &mut ScheduledTask, now: &DateTime<Tz>) -> Option<FiredTask> {
+fn fire(task: &mut ScheduledTask, now: &DateTime<Utc>) -> Option<FiredTask> {
     let now_ms = millis(now);
     let mut scheduled_for_ms = task.scheduled_for_ms?;
     let mut skipped = 0;
     match &task.kind {
         ScheduledTaskKind::Recurring { cron } => {
             let schedule = Schedule::parse(cron).ok()?;
-            let zone = now.timezone();
+            let zone = zone_of(task)?;
             let next = loop {
                 let scheduled_for = at(&zone, scheduled_for_ms)?;
                 match next_run(&schedule, TaskKind::Recurring, &task.id, &scheduled_for) {
@@ -495,6 +519,7 @@ fn fire<Tz: TimeZone>(task: &mut ScheduledTask, now: &DateTime<Tz>) -> Option<Fi
         clear_timing(task);
     }
     task.last_fired_at_ms = Some(now_ms);
+    task.last_scheduled_for_ms = Some(scheduled_for_ms);
     task.skipped += skipped;
     Some(FiredTask {
         task: task.clone(),
@@ -505,39 +530,36 @@ fn fire<Tz: TimeZone>(task: &mut ScheduledTask, now: &DateTime<Tz>) -> Option<Fi
 }
 
 /// Whether a one-shot task's time or a recurring or self-paced task's seven days have passed.
-fn has_expired<Tz: TimeZone>(task: &ScheduledTask, now: &DateTime<Tz>) -> bool {
+fn has_expired(task: &ScheduledTask, now: &DateTime<Utc>) -> bool {
     let now_ms = millis(now);
     match &task.kind {
         ScheduledTaskKind::Recurring { .. } | ScheduledTaskKind::SelfPaced { .. } => task
             .expires_at_ms
             .is_some_and(|expires_at| expires_at <= now_ms),
         ScheduledTaskKind::OneShot { cron } => {
-            one_shot_time(task, cron, now).is_none_or(|scheduled_for| scheduled_for <= now_ms)
+            one_shot_time(task, cron).is_none_or(|scheduled_for| scheduled_for <= now_ms)
         }
     }
 }
 
 /// The scheduled time of a one-shot task: the stored one, or for a pending task the first
 /// time its cron names after creation.
-fn one_shot_time<Tz: TimeZone>(
-    task: &ScheduledTask,
-    cron: &str,
-    now: &DateTime<Tz>,
-) -> Option<u64> {
+fn one_shot_time(task: &ScheduledTask, cron: &str) -> Option<u64> {
     if let Some(scheduled_for) = task.scheduled_for_ms {
         return Some(scheduled_for);
     }
-    let created_at = at(&now.timezone(), task.created_at_ms)?;
+    let created_at = at(&zone_of(task)?, task.created_at_ms)?;
     let schedule = Schedule::parse(cron).ok()?;
     schedule.next_after(&created_at).map(|time| millis(&time))
 }
 
-fn new_task<Tz: TimeZone>(
+fn new_task(
     id: String,
     kind: ScheduledTaskKind,
     prompt: String,
     creation: Creation,
-    now: &DateTime<Tz>,
+    zone: Zone,
+    now: &DateTime<Utc>,
     expires_at_ms: Option<u64>,
 ) -> ScheduledTask {
     ScheduledTask {
@@ -545,6 +567,7 @@ fn new_task<Tz: TimeZone>(
         kind,
         prompt,
         creator: creation.creator,
+        time_zone: zone.name().to_string(),
         confirmation: creation
             .needs_confirmation
             .then_some(ScheduledTaskConfirmation::Pending),
@@ -554,6 +577,7 @@ fn new_task<Tz: TimeZone>(
         next_fire_at_ms: None,
         jitter_ms: 0,
         last_fired_at_ms: None,
+        last_scheduled_for_ms: None,
         skipped: 0,
     }
 }
@@ -564,7 +588,7 @@ fn set_timing<Tz: TimeZone>(task: &mut ScheduledTask, run: &Run<Tz>) {
     task.jitter_ms = run.jitter().num_milliseconds();
 }
 
-fn set_wake<Tz: TimeZone>(task: &mut ScheduledTask, now: &DateTime<Tz>, delay: Duration) {
+fn set_wake(task: &mut ScheduledTask, now: &DateTime<Utc>, delay: Duration) {
     let wake_at_ms =
         millis(now).saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
     task.scheduled_for_ms = Some(wake_at_ms);
@@ -578,11 +602,17 @@ fn clear_timing(task: &mut ScheduledTask) {
     task.jitter_ms = 0;
 }
 
+/// The zone a task's cron expression reads times in; `None` for a name this build does not
+/// know, which drops the task like an expression that no longer parses.
+fn zone_of(task: &ScheduledTask) -> Option<Zone> {
+    task.time_zone.parse().ok()
+}
+
 fn is_self_paced(task: &ScheduledTask) -> bool {
     matches!(task.kind, ScheduledTaskKind::SelfPaced { .. })
 }
 
-fn expiry<Tz: TimeZone>(now: &DateTime<Tz>) -> u64 {
+fn expiry(now: &DateTime<Utc>) -> u64 {
     millis(now).saturating_add(u64::try_from(TASK_LIFETIME.as_millis()).unwrap_or(u64::MAX))
 }
 
@@ -590,7 +620,16 @@ fn millis<Tz: TimeZone>(time: &DateTime<Tz>) -> u64 {
     u64::try_from(time.timestamp_millis()).unwrap_or(0)
 }
 
-fn at<Tz: TimeZone>(zone: &Tz, millis: u64) -> Option<DateTime<Tz>> {
+fn at(zone: &Zone, millis: u64) -> Option<DateTime<Zone>> {
     let millis = i64::try_from(millis).ok()?;
-    zone.timestamp_millis_opt(millis).single()
+    in_zone(&DateTime::from_timestamp_millis(millis)?, zone)
+}
+
+/// `time` in `zone`, or `None` when its local reading falls outside what chrono represents.
+fn in_zone(time: &DateTime<Utc>, zone: &Zone) -> Option<DateTime<Zone>> {
+    let local = time.with_timezone(zone);
+    local
+        .naive_utc()
+        .checked_add_offset(local.offset().fix())
+        .map(|_| local)
 }

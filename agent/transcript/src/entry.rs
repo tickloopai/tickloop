@@ -24,6 +24,8 @@ pub enum Line {
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
     TaskBoards(TaskBoardsEntry),
+    /// The root Chat's scheduled tasks; the latest record wins.
+    ScheduledTasks(ScheduledTasksEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
     SentAgentMessages(SentAgentMessagesEntry),
@@ -129,6 +131,7 @@ pub enum MetadataKind {
     Provenance,
     CitationSources,
     TaskBoards,
+    ScheduledTasks,
     FamilyCompletions,
     FileHistorySnapshot,
     ContentReplacement,
@@ -157,6 +160,7 @@ impl MetadataKind {
             | Self::Provenance
             | Self::CitationSources
             | Self::TaskBoards
+            | Self::ScheduledTasks
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
             Self::FileHistorySnapshot | Self::ContentReplacement => Retention::Accumulating,
@@ -217,6 +221,7 @@ impl Line {
             Self::AiTitle(_) => MetadataKind::AiTitle,
             Self::Subagents(_) => MetadataKind::Subagents,
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
+            Self::ScheduledTasks(_) => MetadataKind::ScheduledTasks,
             Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
             Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
@@ -588,6 +593,15 @@ impl MonitorMembersEntry {
     pub fn materializes_chat(&self) -> bool {
         self.cwd.is_some() && !self.monitor.is_empty()
     }
+}
+
+/// The latest scheduled tasks of one Chat: every creation, run and deletion rewrites the whole
+/// list.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTasksEntry {
+    pub chat_id: Uuid,
+    pub tasks: Vec<tickloop_agent_protocol::ScheduledTask>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
