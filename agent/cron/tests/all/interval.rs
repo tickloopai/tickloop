@@ -1,3 +1,4 @@
+use chrono::{DateTime, TimeZone, Utc};
 use tickloop_agent_cron::{Interval, IntervalError, LoopArguments, Schedule, parse_loop_arguments};
 
 fn minutes(count: u32) -> Interval {
@@ -87,7 +88,14 @@ fn converts_intervals_to_cron_rounding_uneven_ones_to_the_nearest_even_step() {
         ("18h", "1d", "0 0 * * *"),
         ("24h", "1d", "0 0 * * *"),
         ("1d", "1d", "0 0 * * *"),
-        ("3d", "1d", "0 0 * * *"),
+        ("30h", "1d", "0 0 * * *"),
+        ("36h", "2d", "0 0 */2 * *"),
+        ("48h", "2d", "0 0 */2 * *"),
+        ("2d", "2d", "0 0 */2 * *"),
+        ("every 3 days", "3d", "0 0 */3 * *"),
+        ("7d", "7d", "0 0 */7 * *"),
+        ("31d", "31d", "0 0 */31 * *"),
+        ("45d", "31d", "0 0 */31 * *"),
     ] {
         let converted = Interval::parse(requested).unwrap().to_cron();
         assert_eq!(converted.actual.to_string(), actual, "{requested}");
@@ -163,5 +171,23 @@ fn loop_arguments_with_a_zero_interval_are_an_error() {
     assert_eq!(
         parse_loop_arguments("check every 0 minutes"),
         Err(IntervalError::Zero("every 0 minutes".into()))
+    );
+}
+
+#[test]
+fn multi_day_intervals_restart_each_month() {
+    let schedule = Schedule::parse(&minutes(2 * 1440).to_cron().expression).unwrap();
+    let after = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
+    let runs: Vec<DateTime<Utc>> =
+        std::iter::successors(schedule.next_after(&after), |run| schedule.next_after(run))
+            .take(3)
+            .collect();
+    assert_eq!(
+        runs,
+        [
+            Utc.with_ymd_and_hms(2026, 10, 29, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap(),
+        ]
     );
 }

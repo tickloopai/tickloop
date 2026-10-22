@@ -8,10 +8,12 @@ const MINUTES_PER_HOUR: u32 = 60;
 const MINUTES_PER_DAY: u32 = 24 * MINUTES_PER_HOUR;
 const EVERY_KEYWORD: &str = "every";
 const SHORT_UNITS: [char; 4] = ['s', 'm', 'h', 'd'];
-/// Intervals that divide their unit evenly, so a cron step repeats them without a short gap
-/// at the wrap (`*/7` runs at :56 and again at :00).
+/// Minute and hour intervals that divide their unit evenly, so a cron step repeats them
+/// without a short gap at the wrap (`*/7` runs at :56 and again at :00). Day steps restart
+/// each month like Claude Code's `0 0 */N * *`, which is accepted.
 const EVEN_MINUTE_STEPS: [u32; 11] = [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30];
 const EVEN_HOUR_STEPS: [u32; 7] = [1, 2, 3, 4, 6, 8, 12];
+const MAX_DAY_STEP: u32 = 31;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IntervalError {
@@ -100,8 +102,8 @@ impl Interval {
     }
 
     /// Converts to a cron expression. An interval that no cron step repeats evenly, such as
-    /// `7m` or `90m`, becomes the nearest one that does (the longer on a tie, so fewer runs);
-    /// anything longer than a day becomes daily.
+    /// `7m` or `90m`, becomes the nearest one that does (the longer on a tie, so fewer runs).
+    /// Multi-day intervals run at local midnight every N days of the month, up to 31.
     pub fn to_cron(self) -> CronInterval {
         let requested = self.minutes();
         let actual = even_intervals()
@@ -141,7 +143,7 @@ fn even_intervals() -> impl Iterator<Item = u32> {
     EVEN_MINUTE_STEPS
         .into_iter()
         .chain(EVEN_HOUR_STEPS.map(|hours| hours * MINUTES_PER_HOUR))
-        .chain([MINUTES_PER_DAY])
+        .chain((1..=MAX_DAY_STEP).map(|days| days * MINUTES_PER_DAY))
 }
 
 fn cron_expression(minutes: u32) -> String {
@@ -150,7 +152,10 @@ fn cron_expression(minutes: u32) -> String {
         MINUTES_PER_HOUR => "0 * * * *".to_string(),
         MINUTES_PER_DAY => "0 0 * * *".to_string(),
         minutes if minutes < MINUTES_PER_HOUR => format!("*/{minutes} * * * *"),
-        minutes => format!("0 */{} * * *", minutes / MINUTES_PER_HOUR),
+        minutes if minutes < MINUTES_PER_DAY => {
+            format!("0 */{} * * *", minutes / MINUTES_PER_HOUR)
+        }
+        minutes => format!("0 0 */{} * *", minutes / MINUTES_PER_DAY),
     }
 }
 
