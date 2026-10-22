@@ -42,6 +42,7 @@ fn goal(goal_id: u128, after_run: u128) -> TriggerSource {
     TriggerSource::GoalContinuation {
         goal_id: Uuid::from_u128(goal_id),
         after_run: Uuid::from_u128(after_run),
+        objective_revision: 1,
     }
 }
 

@@ -1059,22 +1059,23 @@ stand_in!(ScheduledStandIn, scheduled_run, UnderPlan::Delivered);
 struct GoalSource {
     process: ProcessChat,
     goal_id: Uuid,
+    objective_revision: u64,
     hand_overs: HandOvers,
 }
 
 impl GoalSource {
     async fn with_goal(process: ProcessChat, hand_overs: HandOvers) -> Self {
-        let goal_id = process
+        let goal = process
             .agent
             .snapshot(process.chat)
             .await
             .unwrap()
             .goal
-            .expect("the Chat has its goal")
-            .id;
+            .expect("the Chat has its goal");
         Self {
             process,
-            goal_id,
+            goal_id: goal.id,
+            objective_revision: goal.objective_revision,
             hand_overs,
         }
     }
@@ -1122,6 +1123,7 @@ impl Source for GoalSource {
                 TriggerSource::GoalContinuation {
                     goal_id: self.goal_id,
                     after_run: Uuid::from_u128(u128::from(n)),
+                    objective_revision: self.objective_revision,
                 },
                 marker,
             )

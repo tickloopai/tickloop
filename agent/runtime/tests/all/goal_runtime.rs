@@ -1249,3 +1249,60 @@ async fn running_time_counts_only_while_the_goal_is_active_within_a_turn() {
     );
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_continuation_waiting_through_an_edit_carries_the_new_objective() {
+    const EDITED: &str = "Ship the import command with tests";
+    const QUEUED: &str = "the continuation as it was queued";
+    let model = HoldingModel::new(
+        vec![text("Done with that."), blocked("b1"), text("Blocked.")],
+        Vec::new(),
+    );
+    let (_directory, agent, chat) = new_chat(model.clone()).await;
+    agent.hold_goal_continuations_for_tests();
+    set_goal(&agent, chat, None).await;
+    let held = model.held.notified();
+    tokio::pin!(held);
+    held.as_mut().enable();
+    agent.submit(chat, HOLD.into()).await.unwrap();
+    until_held(held).await;
+    // The continuation after an earlier turn waits behind the user's turn.
+    let goal_before = goal(&agent, chat).await.unwrap();
+    agent
+        .deliver_trigger_for_tests(
+            chat,
+            tickloop_agent_protocol::TriggerSource::GoalContinuation {
+                goal_id: goal_before.id,
+                after_run: uuid::Uuid::new_v4(),
+                objective_revision: goal_before.objective_revision,
+            },
+            QUEUED,
+        )
+        .await
+        .unwrap();
+    agent
+        .manage_goal(
+            chat,
+            GoalAction::Edit {
+                objective: EDITED.into(),
+            },
+        )
+        .await
+        .unwrap();
+    model.release();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+
+    let continuation = model
+        .turn_requests()
+        .into_iter()
+        .find(|request| newest_user_text(request).contains(CONTINUATION))
+        .expect("the waiting continuation was taken");
+    let prompt = newest_user_text(&continuation);
+    assert!(prompt.contains(EDITED), "{prompt}");
+    assert!(!prompt.contains(QUEUED));
+    assert!(!prompt.contains(OBJECTIVE));
+    agent.shutdown().await;
+}

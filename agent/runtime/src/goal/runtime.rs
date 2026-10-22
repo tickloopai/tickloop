@@ -600,6 +600,7 @@ impl Agent {
                 source: TriggerSource::GoalContinuation {
                     goal_id: goal.id,
                     after_run,
+                    objective_revision: goal.objective_revision,
                 },
                 input: prompts::continuation_prompt(&prompt_context(goal)),
                 ledger: None,
@@ -824,6 +825,13 @@ impl Agent {
             .goal_continuations_held
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// The continuation a queued delivery made for `objective_revision` becomes when it is taken:
+/// written again from the goal as it is, if its objective changed meanwhile.
+pub(crate) fn current_continuation(goal: &GoalSnapshot, objective_revision: u64) -> Option<String> {
+    (goal.objective_revision != objective_revision)
+        .then(|| prompts::continuation_prompt(&prompt_context(goal)))
 }
 
 /// What GetGoal shows of the goal, with the remaining budget worked out.

@@ -3657,7 +3657,21 @@ impl Agent {
     /// Writes an accepted input to the conversation. User prompts capture the current execution
     /// mode and create a pending file snapshot as a rewind point. The run completes snapshots
     /// outside the lock through `complete_file_history_snapshots`.
-    fn append_input_message(&self, chat: &mut Chat, pending: PendingInput) {
+    fn append_input_message(&self, chat: &mut Chat, mut pending: PendingInput) {
+        if let Some(TriggerSource::GoalContinuation {
+            goal_id,
+            objective_revision,
+            ..
+        }) = &pending.trigger_source
+            && let Some(input) = chat
+                .snapshot
+                .goal
+                .as_ref()
+                .filter(|goal| goal.id == *goal_id)
+                .and_then(|goal| goal::current_continuation(goal, *objective_revision))
+        {
+            pending.input = input;
+        }
         if let Some(identity) = chat.feedback_inputs.remove(&pending.receipt.run_id) {
             let active = chat.active_run.unwrap_or(pending.receipt.run_id);
             chat.feedback_inputs.entry(active).or_insert(identity);
