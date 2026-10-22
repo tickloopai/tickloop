@@ -6,7 +6,7 @@ use tickloop_agent_protocol::{ImageOrigin, ResourceContext};
 use tickloop_agent_transcript::display::{DisplayBlock, DisplayKind, DisplayNode};
 use tokio_util::sync::CancellationToken;
 
-async fn notify(
+pub(super) async fn notify(
     connection: &ConnectionTo<Client>,
     session_id: &str,
     update: Value,
@@ -162,7 +162,7 @@ pub(super) async fn replay(
                         ..
                     } => {
                         let locations = super::tool_locations(&name, &input);
-                        notify(connection, session_id, json!({"sessionUpdate":"tool_call","toolCallId":call_id,"title":name,"kind":super::tool_kind(&name),"status":"pending","rawInput":super::bounded_value(input),"locations":locations}), budget, cancel).await?;
+                        notify(connection, session_id, json!({"sessionUpdate":"tool_call","toolCallId":call_id,"title":name,"kind":super::tool_kind(&name),"status":"pending","rawInput":super::bounded_value(input, super::MAX_TOOL_CONTENT),"locations":locations}), budget, cancel).await?;
                         if let Some(result) = result {
                             let text = if result.truncated {
                                 format!("{}\n[Recorded display result is truncated]", result.text)

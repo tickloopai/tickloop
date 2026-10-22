@@ -1,4 +1,9 @@
 //! Cancellable stdio without Tokio's uninterruptible blocking-stdin thread.
+//!
+//! The inherited descriptors' flags are never changed: a dup shares its open file description
+//! with the editor's pipe or terminal, which a set O_NONBLOCK would outlive (SIGKILL, other
+//! processes on the same description). The descriptors stay blocking; each read or write instead
+//! follows a poll that says it cannot wait, and a write after POLLOUT is at most PIPE_BUF bytes.
 use std::{
     fs::File,
     io,
@@ -10,32 +15,16 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
+use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, unix::AsyncFd};
 
-struct Descriptor {
-    fd: OwnedFd,
-    flags: i32,
-}
-impl AsRawFd for Descriptor {
-    fn as_raw_fd(&self) -> i32 {
-        self.fd.as_raw_fd()
-    }
-}
-impl Drop for Descriptor {
-    fn drop(&mut self) {
-        // dup shares an open file description with the inherited stdio descriptor.
-        unsafe {
-            libc::fcntl(self.as_raw_fd(), libc::F_SETFL, self.flags);
-        }
-    }
-}
 enum Fd {
-    Ready(AsyncFd<Descriptor>),
-    Immediate(Descriptor),
+    Ready(AsyncFd<OwnedFd>),
+    /// Regular files and /dev/null never wait, and kqueue cannot watch /dev/null.
+    Immediate(OwnedFd),
 }
 
 impl Fd {
-    fn open(raw: i32) -> io::Result<Self> {
+    fn open(raw: i32, interest: Interest) -> io::Result<Self> {
         // The process owns stdio for its lifetime; our duplicate is independently owned.
         let owned = unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?;
         let file = File::from(owned);
@@ -44,18 +33,13 @@ impl Fd {
             || std::fs::metadata("/dev/null")
                 .is_ok_and(|null| metadata.rdev() != 0 && metadata.rdev() == null.rdev());
         let fd: OwnedFd = file.into();
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let descriptor = Descriptor { fd, flags };
         if immediate {
-            return Ok(Self::Immediate(descriptor));
+            return Ok(Self::Immediate(fd));
         }
-        // SAFETY: Descriptor owns the stable nonblocking fd and outlives its reactor registration.
-        Ok(Self::Ready(unsafe { AsyncFd::register(descriptor) }?))
+        // SAFETY: the OwnedFd is a stable descriptor and outlives its reactor registration.
+        Ok(Self::Ready(unsafe {
+            AsyncFd::register_with_interest(fd, interest)
+        }?))
     }
 }
 
@@ -63,11 +47,24 @@ pub(crate) struct Input(Fd);
 pub(crate) struct Output(Fd);
 pub(crate) fn open() -> io::Result<(Input, Output)> {
     Ok((
-        Input(Fd::open(libc::STDIN_FILENO)?),
-        Output(Fd::open(libc::STDOUT_FILENO)?),
+        Input(Fd::open(libc::STDIN_FILENO, Interest::READABLE)?),
+        Output(Fd::open(libc::STDOUT_FILENO, Interest::WRITABLE)?),
     ))
 }
-fn read(fd: &Descriptor, bytes: &mut [u8]) -> io::Result<usize> {
+
+/// Ready also covers POLLHUP/POLLERR/POLLNVAL: the following call reports EOF or the error.
+fn ready_now(fd: &OwnedFd, events: libc::c_short) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut descriptor, 1, 0) } {
+        -1 => Err(io::Error::last_os_error()),
+        ready => Ok(ready > 0),
+    }
+}
+fn read(fd: &OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
     let count = unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
     if count < 0 {
         Err(io::Error::last_os_error())
@@ -75,7 +72,7 @@ fn read(fd: &Descriptor, bytes: &mut [u8]) -> io::Result<usize> {
         Ok(count as usize)
     }
 }
-fn write(fd: &Descriptor, bytes: &[u8]) -> io::Result<usize> {
+fn write(fd: &OwnedFd, bytes: &[u8]) -> io::Result<usize> {
     let count = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
     if count < 0 {
         Err(io::Error::last_os_error())
@@ -94,8 +91,14 @@ impl AsyncRead for Input {
                 Fd::Immediate(fd) => read(fd, buffer.initialize_unfilled()),
                 Fd::Ready(fd) => {
                     let mut ready = ready!(fd.poll_read_ready(cx))?;
-                    match ready.try_io(|inner| read(inner.get_ref(), buffer.initialize_unfilled()))
-                    {
+                    // Reactor readiness can be stale and the descriptor blocks: confirm first.
+                    match ready.try_io(|inner| {
+                        if ready_now(inner.get_ref(), libc::POLLIN)? {
+                            read(inner.get_ref(), buffer.initialize_unfilled())
+                        } else {
+                            Err(io::ErrorKind::WouldBlock.into())
+                        }
+                    }) {
                         Err(_) => continue,
                         Ok(result) => result,
                     }
@@ -123,7 +126,15 @@ impl AsyncWrite for Output {
                 Fd::Immediate(fd) => write(fd, bytes),
                 Fd::Ready(fd) => {
                     let mut ready = ready!(fd.poll_write_ready(cx))?;
-                    match ready.try_io(|inner| write(inner.get_ref(), bytes)) {
+                    // A pipe or socket reporting POLLOUT accepts PIPE_BUF bytes without blocking.
+                    let chunk = &bytes[..bytes.len().min(libc::PIPE_BUF)];
+                    match ready.try_io(|inner| {
+                        if ready_now(inner.get_ref(), libc::POLLOUT)? {
+                            write(inner.get_ref(), chunk)
+                        } else {
+                            Err(io::ErrorKind::WouldBlock.into())
+                        }
+                    }) {
                         Err(_) => continue,
                         Ok(result) => result,
                     }
@@ -156,31 +167,59 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The shared open file description's mode, as the editor's end of stdio sees it.
+    fn nonblocking(fd: &impl AsRawFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        flags & libc::O_NONBLOCK != 0
+    }
+
     #[tokio::test]
-    async fn nonblocking_read_can_be_cancelled_and_flags_are_restored() {
+    async fn pending_read_can_be_cancelled_without_changing_descriptor_flags() {
         let (reader, mut writer) = UnixStream::pair().unwrap();
-        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
-        let mut input = Input(Fd::open(reader.as_raw_fd()).unwrap());
+        let mut input = Input(Fd::open(reader.as_raw_fd(), Interest::READABLE).unwrap());
         let mut byte = [0];
         assert!(
             tokio::time::timeout(Duration::from_millis(1), input.read_exact(&mut byte))
                 .await
                 .is_err()
         );
+        assert!(!nonblocking(&reader));
         writer.write_all(b"x").unwrap();
         input.read_exact(&mut byte).await.unwrap();
         assert_eq!(byte, *b"x");
-        drop(input);
-        assert_eq!(
-            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },
-            flags
-        );
+        drop(writer);
+        assert_eq!(input.read(&mut byte).await.unwrap(), 0);
+        assert!(!nonblocking(&reader));
     }
 
     #[tokio::test]
-    async fn nonblocking_output_reports_broken_pipe() {
+    async fn unread_output_applies_backpressure_without_blocking_the_runtime() {
         let (writer, mut reader) = UnixStream::pair().unwrap();
-        let mut output = Output(Fd::open(writer.as_raw_fd()).unwrap());
+        let mut output = Output(Fd::open(writer.as_raw_fd(), Interest::WRITABLE).unwrap());
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        // A blocking write would stall this single-threaded runtime and the timeout with it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), output.write_all(&payload))
+                .await
+                .is_err()
+        );
+        assert!(!nonblocking(&writer));
+        let drain = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            received.len()
+        });
+        output.write_all(&payload).await.unwrap();
+        drop(output);
+        drop(writer);
+        // The cancelled attempt wrote a prefix; the retry wrote the whole payload after it.
+        assert!(drain.join().unwrap() >= payload.len());
+    }
+
+    #[tokio::test]
+    async fn output_reports_broken_pipe() {
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let mut output = Output(Fd::open(writer.as_raw_fd(), Interest::WRITABLE).unwrap());
         output.write_all(b"x").await.unwrap();
         let mut byte = [0];
         reader.read_exact(&mut byte).unwrap();

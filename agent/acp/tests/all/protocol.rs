@@ -94,6 +94,7 @@ async fn official_sdk_handshake_prompt_and_permission() {
                         .unwrap_or(false)
                 );
                 assert!(initialization.auth_methods.is_empty());
+                assert!(capabilities["sessionCapabilities"]["close"].is_object());
                 let session = cx
                     .send_request(decoded::<NewSessionRequest>(json!({
                         "cwd":std::env::current_dir().unwrap(), "mcpServers":[]
@@ -254,6 +255,7 @@ async fn fast_completion_reset_dedup_and_multiple_assistant_messages() {
         (4, "reset", "recovered"),
         (5, "duplicate", "once"),
         (6, "multi", "workingdone"),
+        (7, "chunked", "Hello world"),
     ] {
         let (result, updates) = peer.prompt(id, &session, prompt).await;
         assert_eq!(result["result"]["stopReason"], "end_turn", "{result}");
@@ -751,6 +753,19 @@ async fn config_select_roundtrip_notifications_and_busy_rejection() {
             .iter()
             .any(|wire| wire["params"]["update"]["currentModeId"] == "ask")
     );
+    // A mode chosen through the config option keeps mode-based clients in step too.
+    let (mode, notifications) = peer
+        .request(
+            9,
+            "session/set_config_option",
+            json!({"sessionId":session,"configId":"mode","type":"select","value":"auto"}),
+        )
+        .await;
+    assert_eq!(mode["result"]["configOptions"][1]["currentValue"], "auto");
+    assert!(notifications.iter().any(|wire| {
+        wire["params"]["update"]["sessionUpdate"] == "current_mode_update"
+            && wire["params"]["update"]["currentModeId"] == "auto"
+    }));
     let (invalid, _) = peer
         .request(
             5,
@@ -999,5 +1014,212 @@ async fn excess_thinking_is_cut_off_without_failing_the_answer() {
     assert_eq!(thoughts.len(), 65);
     assert_eq!(thoughts.last().unwrap(), "\n[Further thinking omitted]");
     assert_eq!(text(&updates), "answered");
+    finish(peer, server).await;
+}
+
+#[tokio::test]
+async fn cancel_request_ends_its_prompt_and_unknown_notifications_are_ignored() {
+    let (fake, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    for method in ["_vendor/ping", "$/progress", "session/unknown"] {
+        peer.send(json!({"jsonrpc":"2.0","method":method,"params":{}}))
+            .await;
+    }
+    // The official SDK sends this when a caller drops a pending request.
+    peer.send(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":99}}))
+        .await;
+    peer.send(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"wait"}]}})).await;
+    assert_eq!(
+        peer.next().await["params"]["update"]["content"]["text"],
+        "partial"
+    );
+    peer.send(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":3}}))
+        .await;
+    let (cancelled, _) = peer.response(3).await;
+    assert_eq!(
+        cancelled["result"]["stopReason"], "cancelled",
+        "{cancelled}"
+    );
+    let (again, _) = peer.prompt(4, &session, "hello").await;
+    assert_eq!(again["result"]["stopReason"], "end_turn");
+    finish(peer, server).await;
+    assert_eq!(fake.submissions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_run_after_a_committed_message_keeps_its_error_and_closes_tools() {
+    let (_, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    let (response, updates) = peer.prompt(3, &session, "fail-after-commit").await;
+    // Provider authentication keeps its own code instead of a stream reconciliation error.
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    let closed: Vec<_> = updates
+        .iter()
+        .map(|wire| &wire["params"]["update"])
+        .filter(|update| update["toolCallId"] == "never-run")
+        .collect();
+    assert_eq!(closed.len(), 2, "{closed:?}");
+    assert_eq!(closed[1]["sessionUpdate"], "tool_call_update");
+    assert_eq!(closed[1]["status"], "failed");
+    finish(peer, server).await;
+}
+
+#[tokio::test]
+async fn load_accepts_only_the_canonical_session_id_and_never_strands_a_lease() {
+    let (fake, mut peer, server) = setup().await;
+    let cwd = std::env::current_dir().unwrap();
+    let id = fake.record(
+        cwd.clone(),
+        vec![vec![history_node(
+            "prompt",
+            json!([{"kind":"text","text":"question"}]),
+        )]],
+    );
+    let aliases = [
+        id.to_string().to_uppercase(),
+        id.simple().to_string(),
+        id.braced().to_string(),
+        id.urn().to_string(),
+    ];
+    for (request, alias) in (2..).zip(aliases) {
+        let (rejected, _) = peer
+            .request(
+                request,
+                "session/load",
+                json!({"sessionId":alias,"cwd":cwd,"mcpServers":[]}),
+            )
+            .await;
+        assert_eq!(rejected["error"]["code"], -32602, "{alias}: {rejected}");
+    }
+    assert!(fake.chat_ids().is_empty());
+    let (loaded, _) = peer
+        .request(
+            6,
+            "session/load",
+            json!({"sessionId":id,"cwd":cwd,"mcpServers":[]}),
+        )
+        .await;
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let (continued, _) = peer.prompt(7, &id.to_string(), "hello").await;
+    assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    finish(peer, server).await;
+    assert_eq!(fake.releases.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn close_cancels_the_turn_releases_the_lease_and_frees_the_slot() {
+    let (fake, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    peer.send(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"wait"}]}})).await;
+    assert_eq!(
+        peer.next().await["params"]["update"]["content"]["text"],
+        "partial"
+    );
+    peer.send(
+        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":session}}),
+    )
+    .await;
+    let (mut prompt, mut close) = (None, None);
+    while prompt.is_none() || close.is_none() {
+        let wire = peer.next().await;
+        match wire["id"].as_u64() {
+            Some(3) if wire.get("method").is_none() => prompt = Some(wire),
+            Some(4) if wire.get("method").is_none() => close = Some(wire),
+            _ => {}
+        }
+    }
+    let (prompt, close) = (prompt.unwrap(), close.unwrap());
+    assert_eq!(prompt["result"]["stopReason"], "cancelled", "{prompt}");
+    assert_eq!(close["result"], json!({}), "{close}");
+    assert_eq!(fake.releases.load(Ordering::SeqCst), 1);
+    let (gone, _) = peer.prompt(5, &session, "hello").await;
+    assert_eq!(gone["error"]["code"], -32602);
+    let (again, _) = peer
+        .request(6, "session/close", json!({"sessionId":session}))
+        .await;
+    assert_eq!(again["error"]["code"], -32602);
+    // The closed session's slot is free: a full set of sessions fits again.
+    for id in 7..23 {
+        peer.new_session(id).await;
+    }
+    let (overflow, _) = peer
+        .request(
+            23,
+            "session/new",
+            json!({"cwd":std::env::current_dir().unwrap(),"mcpServers":[]}),
+        )
+        .await;
+    assert_eq!(overflow["error"]["code"], -32602);
+    finish(peer, server).await;
+    assert_eq!(fake.submissions.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.releases.load(Ordering::SeqCst), 17);
+}
+
+#[tokio::test]
+async fn supplementary_tool_content_degrades_instead_of_failing_the_turn() {
+    let (_, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    let (response, updates) = peer.prompt(3, &session, "tool-flood").await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(text(&updates), "survived");
+    let call = |id: &str, kind: &str| {
+        updates
+            .iter()
+            .map(|wire| &wire["params"]["update"])
+            .find(|update| update["toolCallId"] == id && update["sessionUpdate"] == kind)
+            .unwrap()
+            .clone()
+    };
+    let first = call("flood-0", "tool_call");
+    assert_eq!(
+        first["rawInput"]["command"].as_str().unwrap().len(),
+        31 * 1024
+    );
+    let last = call("flood-39", "tool_call");
+    assert_eq!(last["rawInput"]["truncated"], true, "{last}");
+    let result = call("flood-39", "tool_call_update");
+    assert_eq!(result["status"], "completed");
+    let output = result["content"][0]["content"]["text"].as_str().unwrap();
+    assert!(output.ends_with("[output truncated]"), "{output}");
+    assert!(output.len() < 1024);
+    let sent: usize = updates.iter().map(|wire| wire.to_string().len()).sum();
+    assert!(sent < 2 * 1024 * 1024 + 128 * 1024, "{sent}");
+    finish(peer, server).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_lease_ends_the_turn_and_leaves_cleanup_to_the_daemon() {
+    let (fake, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    fake.lease_lost.store(true, Ordering::SeqCst);
+    // Start between feed recovery ticks: the first renewal (10s) is rejected before the next.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let started = tokio::time::Instant::now();
+    peer.send(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"wait"}]}})).await;
+    assert_eq!(
+        peer.next().await["params"]["update"]["content"]["text"],
+        "partial"
+    );
+    let response = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut line = String::new();
+            peer.input.read_line(&mut line).await.unwrap();
+            let wire: Value = serde_json::from_str(&line).unwrap();
+            if wire["id"] == 3 && wire.get("method").is_none() {
+                return wire;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fake lease rejected"),
+        "{response}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // The daemon's lease expiry owns cleanup: EOF does not wait on a release it cannot answer.
     finish(peer, server).await;
 }

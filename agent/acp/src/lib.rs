@@ -23,8 +23,8 @@ use agent_client_protocol::{
     schema::{
         ProtocolVersion,
         v1::{
-            CancelNotification, ClientRequest, LoadSessionRequest, NewSessionRequest,
-            RequestPermissionRequest,
+            CancelNotification, CancelRequestNotification, ClientRequest, LoadSessionRequest,
+            NewSessionRequest, RequestPermissionRequest,
         },
     },
 };
@@ -39,7 +39,7 @@ use tickloop_agent_protocol::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -149,11 +149,15 @@ impl Options {
 struct Session {
     managed: ManagedSession,
     active: Mutex<Option<CancellationToken>>,
+    /// Woken whenever `active` is cleared, so `session/close` can wait out the active request.
+    idle: Notify,
+    /// Set by `session/close`: the session takes no further requests while it winds down.
+    closed: AtomicBool,
     mcp_servers: Vec<SessionMcpServer>,
     commands: Mutex<Vec<Value>>,
     published: Mutex<Published>,
     output_budget: transport::OutputBudget,
-    _slot: OwnedSemaphorePermit,
+    slot: Mutex<Option<OwnedSemaphorePermit>>,
 }
 /// The session title and context usage last sent to the editor.
 #[derive(Default)]
@@ -162,35 +166,63 @@ struct Published {
     usage: Option<(u64, u64)>,
 }
 impl Session {
-    /// Title and context usage outlive any one turn; each is sent only when it changed.
+    /// Title and context usage outlive any one turn; each is sent only when it changed. Both
+    /// are supplementary: one that cannot be queued now is offered again at the next publish.
     fn publish_status(
         &self,
         connection: &ConnectionTo<Client>,
         id: &str,
         snapshot: &LiveChatSnapshot,
-    ) -> Result<(), Error> {
+    ) {
         let status = snapshot.status().chat;
         let usage = context_usage(&status);
         let mut published = self.published.lock().expect("ACP status");
-        if status.generated_title.is_some() && status.generated_title != published.title {
-            self.output_budget.send(
-                connection,
-                id,
-                json!({"sessionUpdate":"session_info_update", "title":status.generated_title}),
-            )?;
+        if status.generated_title.is_some()
+            && status.generated_title != published.title
+            && self
+                .output_budget
+                .send(
+                    connection,
+                    id,
+                    json!({"sessionUpdate":"session_info_update", "title":status.generated_title}),
+                )
+                .is_ok()
+        {
             published.title = status.generated_title;
         }
         if let Some((used, size)) = usage
             && usage != published.usage
+            && self
+                .output_budget
+                .send(
+                    connection,
+                    id,
+                    json!({"sessionUpdate":"usage_update", "used":used, "size":size}),
+                )
+                .is_ok()
         {
-            self.output_budget.send(
-                connection,
-                id,
-                json!({"sessionUpdate":"usage_update", "used":used, "size":size}),
-            )?;
             published.usage = usage;
         }
-        Ok(())
+    }
+
+    /// Ends the request window opened by setting `active`.
+    fn finish_active(&self) {
+        self.active.lock().expect("ACP active").take();
+        self.idle.notify_waiters();
+    }
+
+    /// Cancels the active request as `session/cancel` would, and waits until it has finished.
+    async fn quiesce(&self) {
+        loop {
+            let idle = self.idle.notified();
+            let mut idle = std::pin::pin!(idle);
+            idle.as_mut().enable();
+            match self.active.lock().expect("ACP active").as_ref() {
+                Some(cancel) => cancel.cancel(),
+                None => return,
+            }
+            idle.await;
+        }
     }
 }
 /// Console's context meter: estimated active-context tokens against the model's window.
@@ -279,6 +311,7 @@ where
     let cancel_state = state.clone();
     let admission = Arc::new(Mutex::new(transport::Admission::default()));
     let cancel_admission = admission.clone();
+    let request_cancel_admission = admission.clone();
     let builder = Agent.builder().name("tickloop-acp")
         .on_receive_request(async move |request: ClientRequest, responder, connection| {
             let state = request_state.clone();
@@ -292,7 +325,7 @@ where
                     responder.respond(json!({
                         "protocolVersion": ProtocolVersion::V1,
                         "agentInfo": {"name":"tickloop", "version":env!("CARGO_PKG_VERSION")},
-                        "agentCapabilities": {"loadSession":true, "promptCapabilities":{"image":true,"embeddedContext":true}, "mcpCapabilities":{}, "sessionCapabilities":{"list":{}}},
+                        "agentCapabilities": {"loadSession":true, "promptCapabilities":{"image":true,"embeddedContext":true}, "mcpCapabilities":{}, "sessionCapabilities":{"list":{}, "close":{}}},
                         "authMethods":[]
                     }))
                 }
@@ -307,23 +340,22 @@ where
                     let output_connection = connection.clone();
                     connection.spawn(async move {
                         let result = async {
-                            let value = state.new_session(request, slot).await?;
-                            let id = value["sessionId"].as_str().ok_or_else(|| invalid("invalid session identity"))?.to_owned();
-                            let session = state.session(&id)?;
+                            let (id, session, value) = state.new_session(request, slot).await?;
                             let prepared = async {
                                 let commands = configuration::available_commands(&session.managed).await?;
                                 let snapshot = session.managed.snapshot().await.map_err(access_error)?;
                                 Ok::<_, Error>((commands, snapshot))
                             }.await;
-                            session.active.lock().expect("ACP active").take();
+                            session.finish_active();
                             match prepared {
                                 Ok((commands, snapshot)) => {
                                     *session.commands.lock().expect("ACP commands") = commands.clone();
                                     Ok((value, id, session, commands, snapshot))
                                 }
                                 Err(error) => {
-                                    state.sessions.lock().expect("ACP sessions").remove(&id);
-                                    session.managed.release().await.map_err(access_error)?;
+                                    if state.detach(&id, &session) {
+                                        release(&session.managed).await.map_err(access_error)?;
+                                    }
                                     Err(error)
                                 }
                             }
@@ -334,12 +366,13 @@ where
                         };
                         responder.respond(value)?;
                         // Editors register a session from this response and drop earlier updates.
-                        state.output_budget.send(
-                            &output_connection,
-                            &id,
-                            json!({"sessionUpdate":"available_commands_update","availableCommands":commands}),
-                        )?;
-                        session.publish_status(&output_connection, &id, &snapshot)
+                        // The session exists now: these updates are best-effort, because an error
+                        // from a spawned task would end the whole connection.
+                        let commands = json!({"sessionUpdate":"available_commands_update","availableCommands":commands});
+                        if state.output_budget.send_wait(&output_connection, &id, commands).await.is_ok() {
+                            session.publish_status(&output_connection, &id, &snapshot);
+                        }
+                        Ok(())
                     })
                 }
                 ClientRequest::LoadSessionRequest(request) => {
@@ -381,11 +414,16 @@ where
                         let result = async {
                             let value = serde_json::to_value(&request).map_err(Error::into_internal_error)?;
                             let id = request.session_id.to_string();
-                            let result = configuration::configure(&session.managed, value["configId"].as_str().ok_or_else(|| invalid("invalid configuration ID"))?, value["value"].clone()).await?;
-                            session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"config_option_update","configOptions":result["configOptions"]}))?;
+                            let config_id = value["configId"].as_str().ok_or_else(|| invalid("invalid configuration ID"))?;
+                            let result = configuration::configure(&session.managed, config_id, value["value"].clone()).await?;
+                            // The change is applied: a dropped notification must not report it as failed.
+                            let _ = session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"config_option_update","configOptions":result["configOptions"]}));
+                            if config_id == "mode" {
+                                let _ = session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"current_mode_update","currentModeId":value["value"]}));
+                            }
                             Ok::<_,Error>(result)
                         }.await;
-                        session.active.lock().expect("ACP active").take();
+                        session.finish_active();
                         match result { Ok(value) => responder.respond(value), Err(error) => responder.respond_with_error(error) }
                     })
                 }
@@ -401,11 +439,12 @@ where
                         let result = async {
                             let id = request.session_id.to_string();
                             let result = configuration::set_mode(&session.managed, &request.mode_id.to_string()).await?;
-                            session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"config_option_update","configOptions":result["configOptions"]}))?;
-                            session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"current_mode_update","currentModeId":request.mode_id}))?;
+                            // The change is applied: a dropped notification must not report it as failed.
+                            let _ = session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"config_option_update","configOptions":result["configOptions"]}));
+                            let _ = session.output_budget.send(&output_connection, &id, json!({"sessionUpdate":"current_mode_update","currentModeId":request.mode_id}));
                             Ok::<_,Error>(json!({}))
                         }.await;
-                        session.active.lock().expect("ACP active").take();
+                        session.finish_active();
                         match result { Ok(value) => responder.respond(value), Err(error) => responder.respond_with_error(error) }
                     })
                 }
@@ -423,20 +462,45 @@ where
                         *active = Some(cancel.clone());
                     }
                     let output_connection = connection.clone();
+                    let requested = responder.cancellation();
                     connection.spawn(async move {
-                        let prepared = tokio::select! {
-                            biased;
-                            () = cancel.cancelled() => Ok(None),
-                            prepared = content::prompt_input(&request) => prepared.map(Some),
+                        let turn = cancel.clone();
+                        let work = async {
+                            let prepared = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => Ok(None),
+                                prepared = content::prompt_input(&request) => prepared.map(Some),
+                            };
+                            match prepared {
+                                Ok(Some(input)) => prompt(session.clone(), request.session_id.to_string(), input, cancel, output_connection).await,
+                                Ok(None) => Ok(json!({"stopReason":"cancelled"})),
+                                Err(error) => Err(error),
+                            }
                         };
-                        let result = match prepared {
-                            Ok(Some(input)) => prompt(session.clone(), request.session_id.to_string(), input, cancel, output_connection).await,
-                            Ok(None) => Ok(json!({"stopReason":"cancelled"})),
-                            Err(error) => Err(error),
+                        let mut work = std::pin::pin!(work);
+                        // `$/cancel_request` for this prompt ends the turn exactly as `session/cancel`.
+                        let result = tokio::select! {
+                            result = &mut work => result,
+                            () = requested.cancelled() => {
+                                turn.cancel();
+                                work.await
+                            }
                         };
-                        session.active.lock().expect("ACP active prompt lock").take();
+                        session.finish_active();
                         match result {
                             Ok(value) => responder.respond(value),
+                            Err(error) => responder.respond_with_error(error),
+                        }
+                    })
+                }
+                ClientRequest::CloseSessionRequest(request) => {
+                    let id = request.session_id.to_string();
+                    let session = match state.session(&id) { Ok(session) => session, Err(error) => return responder.respond_with_error(error) };
+                    // Requests dispatched after this one see an unknown session.
+                    session.closed.store(true, Ordering::Release);
+                    connection.spawn(async move {
+                        match state.close_session(&id, session).await {
+                            Ok(()) => responder.respond(json!({})),
                             Err(error) => responder.respond_with_error(error),
                         }
                     })
@@ -452,6 +516,11 @@ where
                 && let Some(cancel) = session.active.lock().expect("ACP active prompt lock").as_ref() {
                 cancel.cancel();
             }
+            Ok(())
+        }, agent_client_protocol::on_receive_notification!())
+        // The SDK has already marked the request it names; a prompt observes that itself.
+        .on_receive_notification(async move |_: CancelRequestNotification, _connection| {
+            request_cancel_admission.lock().expect("ACP admission lock").acknowledge_cancel();
             Ok(())
         }, agent_client_protocol::on_receive_notification!());
     let protocol = tokio::select! {
@@ -474,9 +543,7 @@ where
         {
             cancel.cancel();
         }
-        session
-            .managed
-            .release()
+        release(&session.managed)
             .await
             .map_err(|error| error.to_string())
     }))
@@ -501,8 +568,34 @@ impl State {
             .lock()
             .expect("ACP session lock")
             .get(id)
+            .filter(|session| !session.closed.load(Ordering::Acquire))
             .cloned()
             .ok_or_else(|| invalid("unknown ACP session"))
+    }
+
+    /// Removes `session` if it is still attached as `id`. Whoever detaches it releases it.
+    fn detach(&self, id: &str, session: &Arc<Session>) -> bool {
+        let mut sessions = self.sessions.lock().expect("ACP session lock");
+        if !sessions
+            .get(id)
+            .is_some_and(|attached| Arc::ptr_eq(attached, session))
+        {
+            return false;
+        }
+        sessions.remove(id);
+        true
+    }
+
+    /// `session/close` lets the cancelled request settle, then releases the managed lease and
+    /// this connection's session slot. A session still attached at EOF is released there.
+    async fn close_session(&self, id: &str, session: Arc<Session>) -> Result<(), Error> {
+        session.quiesce().await;
+        if !self.detach(id, &session) {
+            return Ok(()); // A failed load already released it.
+        }
+        let released = release(&session.managed).await.map_err(access_error);
+        session.slot.lock().expect("ACP session slot").take();
+        released
     }
 
     fn session_launch(&self, cwd: &std::path::Path) -> Result<LaunchSpec, Error> {
@@ -535,7 +628,7 @@ impl State {
         &self,
         request: NewSessionRequest,
         slot: OwnedSemaphorePermit,
-    ) -> Result<Value, Error> {
+    ) -> Result<(String, Arc<Session>, Value), Error> {
         let mut launch = self.session_launch(&request.cwd)?;
         let mcp_servers = session_mcp_servers(&request.mcp_servers, &launch.folder)?;
         launch.session_mcp_servers = mcp_servers.clone();
@@ -550,7 +643,12 @@ impl State {
         connection: &ConnectionTo<Client>,
     ) -> Result<Value, Error> {
         let id = request.session_id.to_string();
-        let uuid = Uuid::parse_str(&id).map_err(|_| invalid("invalid ACP session ID"))?;
+        // Session IDs are opaque: only the canonical form this agent issues names a session, so
+        // the attached-session key and every later request agree on it.
+        let uuid = Uuid::parse_str(&id)
+            .ok()
+            .filter(|uuid| uuid.to_string() == id)
+            .ok_or_else(|| invalid("invalid ACP session ID"))?;
         if self
             .sessions
             .lock()
@@ -563,8 +661,8 @@ impl State {
         let mcp_servers = session_mcp_servers(&request.mcp_servers, &launch.folder)?;
         launch.session_mcp_servers = mcp_servers.clone();
         let managed = self.client.load(uuid, launch).await.map_err(access_error)?;
-        let mut response = self.insert_session(managed, mcp_servers, slot).await?;
-        let session = self.session(&id)?;
+        let (attached, session, mut response) =
+            self.insert_session(managed, mcp_servers, slot).await?;
         let cancel = session
             .active
             .lock()
@@ -572,29 +670,34 @@ impl State {
             .as_ref()
             .expect("loading session guard")
             .clone();
-        let result = tokio::time::timeout(TURN_TIMEOUT, async {
-            history::replay(
-                &session.managed,
-                &id,
-                &cancel,
-                connection,
-                &session.output_budget,
-            )
-            .await?;
-            self.commands(&session, &id, connection).await?;
-            let snapshot = session.managed.snapshot().await.map_err(access_error)?;
-            session.publish_status(connection, &id, &snapshot)?;
-            if cancel.is_cancelled() {
-                return Err(invalid("session history replay cancelled"));
-            }
-            Ok::<_, Error>(())
-        })
-        .await
-        .unwrap_or_else(|_| Err(invalid("session history replay timed out")));
-        session.active.lock().expect("ACP active").take();
+        let result = if attached != id {
+            Err(invalid("loaded session identity changed"))
+        } else {
+            tokio::time::timeout(TURN_TIMEOUT, async {
+                history::replay(
+                    &session.managed,
+                    &id,
+                    &cancel,
+                    connection,
+                    &session.output_budget,
+                )
+                .await?;
+                self.commands(&session, &id, &cancel, connection).await?;
+                let snapshot = session.managed.snapshot().await.map_err(access_error)?;
+                session.publish_status(connection, &id, &snapshot);
+                if cancel.is_cancelled() {
+                    return Err(invalid("session history replay cancelled"));
+                }
+                Ok::<_, Error>(())
+            })
+            .await
+            .unwrap_or_else(|_| Err(invalid("session history replay timed out")))
+        };
+        session.finish_active();
         if let Err(error) = result {
-            self.sessions.lock().expect("ACP sessions").remove(&id);
-            session.managed.release().await.map_err(access_error)?;
+            if self.detach(&attached, &session) {
+                release(&session.managed).await.map_err(access_error)?;
+            }
             return Err(error);
         }
         response
@@ -608,14 +711,19 @@ impl State {
         &self,
         session: &Session,
         id: &str,
+        cancel: &CancellationToken,
         connection: &ConnectionTo<Client>,
     ) -> Result<Vec<Value>, Error> {
         let commands = configuration::available_commands(&session.managed).await?;
-        self.output_budget.send(
+        // Waits for output room like the history replayed before it, rather than failing.
+        history::notify(
             connection,
             id,
             json!({"sessionUpdate":"available_commands_update","availableCommands":commands}),
-        )?;
+            &self.output_budget,
+            cancel,
+        )
+        .await?;
         *session.commands.lock().expect("ACP commands") = commands.clone();
         Ok(commands)
     }
@@ -625,11 +733,11 @@ impl State {
         managed: ManagedSession,
         mcp_servers: Vec<SessionMcpServer>,
         slot: OwnedSemaphorePermit,
-    ) -> Result<Value, Error> {
+    ) -> Result<(String, Arc<Session>, Value), Error> {
         let snapshot = match managed.snapshot().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                managed.release().await.map_err(access_error)?;
+                release(&managed).await.map_err(access_error)?;
                 return Err(access_error(error));
             }
         };
@@ -637,7 +745,7 @@ impl State {
         let mut response = match configuration::response(&managed).await {
             Ok(value) => value,
             Err(error) => {
-                managed.release().await.map_err(access_error)?;
+                release(&managed).await.map_err(access_error)?;
                 return Err(error);
             }
         };
@@ -645,11 +753,13 @@ impl State {
             managed,
             // Publish busy atomically with the session; initialization/history is not a prompt window.
             active: Mutex::new(Some(CancellationToken::new())),
+            idle: Notify::new(),
+            closed: AtomicBool::new(false),
             mcp_servers,
             commands: Mutex::new(Vec::new()),
             published: Mutex::default(),
             output_budget: self.output_budget.clone(),
-            _slot: slot,
+            slot: Mutex::new(Some(slot)),
         });
         let late = {
             let mut sessions = self.sessions.lock().expect("ACP session lock");
@@ -661,13 +771,22 @@ impl State {
             }
         };
         if late {
-            session.managed.release().await.map_err(access_error)?;
+            release(&session.managed).await.map_err(access_error)?;
             return Err(invalid(
                 "ACP connection is closing or session is already attached",
             ));
         }
         response["sessionId"] = json!(id);
-        Ok(response)
+        Ok((id, session, response))
+    }
+}
+
+/// Once the lease is lost, the daemon's lease expiry owns cleanup; a release would only wait on
+/// a daemon that is gone.
+async fn release(managed: &ManagedSession) -> Result<(), AccessError> {
+    match managed.lease_error() {
+        Some(_) => Ok(()),
+        None => managed.release().await,
     }
 }
 
@@ -721,24 +840,33 @@ async fn prompt(
     cancel: CancellationToken,
     connection: ConnectionTo<Client>,
 ) -> Result<Value, Error> {
-    let result = tokio::time::timeout(
-        TURN_TIMEOUT,
-        prompt_inner(&session, session_id, input, &cancel, &connection),
-    )
-    .await;
-    match result {
-        Ok(Ok(response)) => Ok(response),
-        other => {
-            // Uncertain submission is never retried. A settlement is a separate scoped control.
-            let cleanup = session.managed.settle(true).await.map_err(access_error);
-            cleanup?;
-            match other {
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(Error::new(-32603, "ACP prompt timed out and was cancelled")),
-                Ok(Ok(_)) => unreachable!(),
-            }
+    let result = tokio::time::timeout(TURN_TIMEOUT, async {
+        // Feeds keep reconnecting to a daemon that is gone; the lost lease ends the turn instead.
+        tokio::select! {
+            result = prompt_inner(&session, session_id, input, &cancel, &connection) => result,
+            error = session.managed.lease_lost() => Err(access_error(error)),
         }
+    })
+    .await;
+    let mut error = match result {
+        Ok(Ok(response)) => return Ok(response),
+        Ok(Err(error)) => error,
+        Err(_) => Error::new(-32603, "ACP prompt timed out and was cancelled"),
+    };
+    // A lost lease leaves the turn to the daemon's lease expiry.
+    if session.managed.lease_error().is_some() {
+        return Err(error);
     }
+    // Uncertain submission is never retried. A settlement is a separate scoped control, and its
+    // failure must not hide why the turn ended.
+    if let Err(cleanup) = session.managed.settle(true).await {
+        error.message = format!(
+            "{}; cancelling the turn also failed: {}",
+            error.message,
+            access_error(cleanup).message
+        );
+    }
+    Err(error)
 }
 
 async fn prompt_inner(
@@ -777,7 +905,7 @@ async fn prompt_inner(
             if snapshot.execution == session.managed.execution() =>
         {
             // A title generated after the previous turn ended arrives here.
-            session.publish_status(connection, &session_id, snapshot)?;
+            session.publish_status(connection, &session_id, snapshot);
             snapshot.last_sequence
         }
         _ => return Err(invalid("invalid managed observation snapshot")),
@@ -810,8 +938,8 @@ async fn prompt_inner(
             projection
                 .replay(&snapshot, session, cancel, connection)
                 .await?;
-            projection.cancel_tools(connection)?;
-            session.publish_status(connection, &projection.session_id, &snapshot)?;
+            projection.close_tools(connection, "Tool cancelled")?;
+            session.publish_status(connection, &projection.session_id, &snapshot);
             return Ok(json!({"stopReason":"cancelled"}));
         }
         if projection.terminal.is_some() {
@@ -827,14 +955,21 @@ async fn prompt_inner(
                 continue;
             }
             projection.validate_settled(&snapshot)?;
-            projection.final_text(&snapshot, connection)?;
-            if matches!(projection.terminal, Some(Ok(true))) {
-                projection.cancel_tools(connection)?;
-            }
-            session.publish_status(connection, &projection.session_id, &snapshot)?;
-            return match projection.terminal.take().expect("terminal state") {
-                Ok(true) => Ok(json!({"stopReason":"cancelled"})),
-                Ok(false) => Ok(json!({"stopReason":"end_turn"})),
+            // Only a completed run's answer is reconciled with what was streamed. An interrupted
+            // or failed run leaves no announced tool pending.
+            let terminal = projection.terminal.take().expect("terminal state");
+            let closed = match &terminal {
+                Ok(false) => projection.final_text(&snapshot, connection),
+                Ok(true) => projection.close_tools(connection, "Tool cancelled"),
+                Err(_) => {
+                    projection.close_tools(connection, "The run failed before this tool finished")
+                }
+            };
+            session.publish_status(connection, &projection.session_id, &snapshot);
+            return match terminal {
+                Ok(true) => closed.map(|()| json!({"stopReason":"cancelled"})),
+                Ok(false) => closed.map(|()| json!({"stopReason":"end_turn"})),
+                // The run's own failure outranks a lost update about it.
                 Err(message) => Err(run_error(message)),
             };
         }
@@ -882,14 +1017,19 @@ async fn prompt_inner(
 }
 
 impl Projection {
+    /// Only the shared output queue bounds what is sent; a full queue fails the turn.
     fn notify(&mut self, connection: &ConnectionTo<Client>, update: Value) -> Result<(), Error> {
         let value = json!({"sessionId":self.session_id, "update":update});
         self.output_bytes = self.output_bytes.saturating_add(value.to_string().len());
-        if self.output_bytes > MAX_TURN_OUTPUT {
-            return Err(invalid("ACP turn output exceeds 2 MiB"));
-        }
         self.output_budget
             .send(connection, &self.session_id, update)
+    }
+
+    /// What the turn's output budget still allows for supplementary content: tool input and
+    /// output, recorded diffs and plans. Past it they degrade instead of failing a run whose
+    /// tools may already have had side effects.
+    fn supplement(&self) -> usize {
+        MAX_TURN_OUTPUT.saturating_sub(self.output_bytes)
     }
 
     // Permissions and policy refusals precede ToolStarted. Every update/request must
@@ -909,14 +1049,19 @@ impl Projection {
             connection,
             json!({
                 "sessionUpdate":"tool_call", "toolCallId":call_id, "title":name,
-                "kind":tool_kind(name), "locations":tool_locations(name, &input), "status":status, "rawInput":bounded_value(input),
+                "kind":tool_kind(name), "locations":tool_locations(name, &input), "status":status,
+                "rawInput":bounded_value(input, self.supplement().min(MAX_TOOL_CONTENT)),
             }),
         )?;
         self.tools.insert(call_id.to_owned(), false);
         Ok(true)
     }
 
-    fn cancel_tools(&mut self, connection: &ConnectionTo<Client>) -> Result<(), Error> {
+    fn close_tools(
+        &mut self,
+        connection: &ConnectionTo<Client>,
+        reason: &str,
+    ) -> Result<(), Error> {
         let mut active: Vec<_> = self
             .tools
             .iter()
@@ -925,10 +1070,13 @@ impl Projection {
             .collect();
         active.sort();
         for call_id in active {
-            self.notify(connection, json!({
-                "sessionUpdate":"tool_call_update", "toolCallId":call_id, "status":"failed",
-                "content":[{"type":"content", "content":{"type":"text", "text":"Tool cancelled"}}],
-            }))?;
+            self.notify(
+                connection,
+                json!({
+                    "sessionUpdate":"tool_call_update", "toolCallId":call_id, "status":"failed",
+                    "content":[{"type":"content", "content":{"type":"text", "text":reason}}],
+                }),
+            )?;
             self.tools.insert(call_id, true);
         }
         Ok(())
@@ -1079,11 +1227,12 @@ impl Projection {
                 let announced =
                     self.announce_tool(connection, &call_id, &name, input.clone(), "in_progress")?;
                 if !announced {
+                    let input = bounded_value(input, self.supplement().min(MAX_TOOL_CONTENT));
                     self.notify(
                         connection,
                         json!({
                             "sessionUpdate":"tool_call_update", "toolCallId":call_id,
-                            "title":name, "status":"in_progress", "rawInput":bounded_value(input),
+                            "title":name, "status":"in_progress", "rawInput":input,
                         }),
                     )?;
                 }
@@ -1092,9 +1241,10 @@ impl Projection {
                 call_id, result, ..
             } => {
                 self.announce_tool(connection, &call_id, "Tool", Value::Null, "pending")?;
-                let mut content = vec![
-                    json!({"type":"content", "content":{"type":"text", "text":bounded_text(&result.content)}}),
-                ];
+                let output = bounded_text(&result.content, self.supplement().min(MAX_TOOL_CONTENT));
+                let diff_budget = self.supplement().saturating_sub(output.len());
+                let mut content =
+                    vec![json!({"type":"content", "content":{"type":"text", "text":output}})];
                 let review = session
                     .managed
                     .access()
@@ -1111,7 +1261,8 @@ impl Projection {
                     Ok(observation) => match observation.initial {
                         tickloop_agent_protocol::ObservationValue::OperationReview(Some(review)) => {
                             content.push(json!({"type":"content","content":{"type":"text","text":"Recorded unified-diff hunks (not a complete before/after snapshot):"}}));
-                            for text in history::text_chunks(&review.unified_diff) {
+                            let diff = bounded_text(&review.unified_diff, diff_budget);
+                            for text in history::text_chunks(&diff) {
                                 content.push(json!({"type":"content","content":{"type":"text","text":text}}));
                             }
                         }
@@ -1132,12 +1283,13 @@ impl Projection {
             }
             EventKind::ProgressUpdated { progress } => {
                 let entries: Vec<_> = progress.todos.into_iter().take(128).map(|todo| json!({
-                    "content":bounded_text(&todo.content), "priority":"medium", "status":todo.status,
+                    "content":bounded_text(&todo.content, MAX_TOOL_CONTENT), "priority":"medium", "status":todo.status,
                 })).collect();
-                self.notify(
-                    connection,
-                    json!({"sessionUpdate":"plan", "entries":entries}),
-                )?;
+                // Each plan replaces the last, so one that no longer fits is skipped whole.
+                let plan = json!({"sessionUpdate":"plan", "entries":entries});
+                if plan.to_string().len() <= self.supplement() {
+                    self.notify(connection, plan)?;
+                }
             }
             EventKind::PermissionRequested { request } if !cancel.is_cancelled() => {
                 if request.loop_id != self.receipt.loop_id
@@ -1172,7 +1324,7 @@ impl Projection {
     ) -> Result<(), Error> {
         let text = snapshot
             .conversation
-            .run_response_text(self.receipt.run_id)
+            .run_streamed_text(self.receipt.run_id)
             .unwrap_or_default();
         // Recover a dropped tail without replaying chunks the editor has already displayed.
         let displayed = if self.emitted.is_empty() {
@@ -1335,22 +1487,22 @@ fn tool_locations(name: &str, input: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn bounded_text(text: &str) -> String {
-    if text.len() <= MAX_TOOL_CONTENT {
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
         return text.to_owned();
     }
-    let mut end = MAX_TOOL_CONTENT;
+    let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     format!("{}\n[output truncated]", &text[..end])
 }
-fn bounded_value(value: Value) -> Value {
+fn bounded_value(value: Value, limit: usize) -> Value {
     let serialized = value.to_string();
-    if serialized.len() <= MAX_TOOL_CONTENT {
+    if serialized.len() <= limit {
         value
     } else {
-        json!({"truncated":true, "preview":bounded_text(&serialized)})
+        json!({"truncated":true, "preview":bounded_text(&serialized, limit)})
     }
 }
 

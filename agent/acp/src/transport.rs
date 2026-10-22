@@ -113,7 +113,9 @@ impl OutputBudget {
 }
 
 impl Admission {
-    fn incoming(&mut self, line: &str) -> io::Result<()> {
+    /// `Ok(false)` drops a notification this agent does not handle: notifications get no reply,
+    /// and ACP requires unrecognized ones to be ignored rather than end the connection.
+    fn incoming(&mut self, line: &str) -> io::Result<bool> {
         if line.len() > MAX_FRAME {
             return Err(io::Error::other("ACP input frame exceeds limit"));
         }
@@ -142,14 +144,23 @@ impl Admission {
                 self.requests.insert(id, line.len());
                 self.queued_bytes += line.len();
             } else {
-                // Only cancellation is accepted without a response. Limit queued cancels too.
-                if value["method"] != "session/cancel"
-                    || self.notifications >= MAX_IN_FLIGHT
-                    || line.len() > MAX_CONTROL_FRAME
-                {
-                    return Err(io::Error::other(
-                        "unsupported ACP notification or queue limit",
-                    ));
+                // Only cancellations are handled; the SDK itself applies `$/cancel_request` to
+                // the request it names. A malformed one would never reach the handler that
+                // releases its count, so it is dropped like any other unhandled notification.
+                let params = &value["params"];
+                let handled = match value["method"].as_str() {
+                    Some("session/cancel") => params["sessionId"].is_string(),
+                    Some("$/cancel_request") => {
+                        params["requestId"].is_i64() || params["requestId"].is_string()
+                    }
+                    _ => false,
+                };
+                if !handled {
+                    return Ok(false);
+                }
+                // Limit queued cancels too.
+                if self.notifications >= MAX_IN_FLIGHT || line.len() > MAX_CONTROL_FRAME {
+                    return Err(io::Error::other("ACP cancellation queue limit"));
                 }
                 self.notifications += 1;
             }
@@ -162,7 +173,7 @@ impl Admission {
                 "ACP frame has neither method nor response id",
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     fn outgoing(&mut self, line: &str) -> io::Result<()> {
@@ -202,15 +213,18 @@ where
     O: AsyncWrite + Unpin + Send + 'static,
 {
     let incoming_admission = admission.clone();
-    let input =
-        FramedRead::new(input, LinesCodec::new_with_max_length(MAX_FRAME)).map(move |line| {
-            let line = line.map_err(io::Error::other)?;
-            incoming_admission
-                .lock()
-                .expect("ACP admission lock")
-                .incoming(&line)?;
-            Ok(line)
-        });
+    let input = FramedRead::new(input, LinesCodec::new_with_max_length(MAX_FRAME)).filter_map(
+        move |line| {
+            let admitted = line.map_err(io::Error::other).and_then(|line| {
+                let admitted = incoming_admission
+                    .lock()
+                    .expect("ACP admission lock")
+                    .incoming(&line)?;
+                Ok(admitted.then_some(line))
+            });
+            std::future::ready(admitted.transpose())
+        },
+    );
     let framed = FramedWrite::new(output, LinesCodec::new());
     let output =
         <_ as SinkExt<String>>::sink_map_err(framed, io::Error::other).with(move |line: String| {
@@ -235,7 +249,7 @@ mod tests {
     fn aggregate_bytes_are_released_only_by_matching_responses() {
         let mut admission = Admission::default();
         let line = r#"{"id":1,"method":"session/prompt","params":{"prompt":[]}}"#;
-        admission.incoming(line).unwrap();
+        assert!(admission.incoming(line).unwrap());
         assert_eq!(admission.queued_bytes, line.len());
         admission.outgoing(r#"{"id":2,"result":{}}"#).unwrap();
         assert_eq!(admission.queued_bytes, line.len());
@@ -272,5 +286,32 @@ mod tests {
                 .is_err()
         );
         assert!(admission.outgoing(&"x".repeat(MAX_FRAME + 1)).is_err());
+    }
+
+    #[test]
+    fn unknown_notifications_are_dropped_and_cancellations_are_bounded() {
+        let mut admission = Admission::default();
+        for ignored in [
+            r#"{"jsonrpc":"2.0","method":"_vendor/ping","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/progress"}"#,
+            r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":1.5}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{}}"#,
+        ] {
+            assert!(!admission.incoming(ignored).unwrap(), "{ignored}");
+        }
+        assert_eq!(admission.notifications, 0);
+        let cancel = r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"a"}}"#;
+        for _ in 0..MAX_IN_FLIGHT {
+            assert!(admission.incoming(cancel).unwrap());
+        }
+        assert!(admission.incoming(cancel).is_err());
+        admission.acknowledge_cancel();
+        assert!(
+            admission
+                .incoming(
+                    r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}"#
+                )
+                .unwrap()
+        );
     }
 }

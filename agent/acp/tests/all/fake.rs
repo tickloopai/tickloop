@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -22,6 +22,8 @@ pub struct Fake {
     pub started: Notify,
     pub inputs: Mutex<Vec<UserInput>>,
     pub history_requests: AtomicUsize,
+    /// The daemon dropped the leases: renewals are rejected and releases never answered.
+    pub lease_lost: AtomicBool,
     records: Mutex<HashMap<Uuid, Record>>,
 }
 struct Record {
@@ -67,6 +69,7 @@ impl Fake {
             started: Notify::new(),
             inputs: Mutex::new(Vec::new()),
             history_requests: AtomicUsize::new(0),
+            lease_lost: AtomicBool::new(false),
             records: Mutex::new(HashMap::new()),
         })
     }
@@ -131,6 +134,9 @@ impl Entry {
         }
     }
     fn commit(&mut self, text: &str) {
+        self.commit_with(&[text], Vec::new());
+    }
+    fn commit_with(&mut self, blocks: &[&str], tool_calls: Vec<ProposedToolCall>) {
         let run_id = self.run.as_ref().unwrap().run_id;
         let index = self.snapshot.conversation.messages.len();
         self.snapshot
@@ -139,11 +145,16 @@ impl Entry {
             .insert(index, run_id);
         self.snapshot.conversation.messages.push(Message {
             role: Role::Assistant,
-            content: vec![Content::Text { text: text.into() }],
+            content: blocks
+                .iter()
+                .map(|text| Content::Text {
+                    text: (*text).into(),
+                })
+                .collect(),
         });
         self.emit(EventKind::AssistantMessageCommitted {
             message_id: Uuid::new_v4(),
-            tool_calls: Vec::new(),
+            tool_calls,
         });
     }
     fn finish(&mut self, text: &str) {
@@ -253,6 +264,11 @@ impl AgentAccess for Fake {
         ))
     }
     async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        if self.lease_lost.load(Ordering::SeqCst)
+            && matches!(envelope.command, AgentCommand::ManagedRelease { .. })
+        {
+            std::future::pending::<()>().await;
+        }
         let mut entries = self.entries.lock().unwrap();
         let mut target = None;
         let result = match envelope.command {
@@ -515,6 +531,51 @@ impl AgentAccess for Fake {
                         entry.finish("denied");
                     }
                     "failed" => entry.emit(EventKind::Failed("scripted failure".into())),
+                    // Streamed per chunk, as Gemini does: one text block per chunk.
+                    "chunked" => {
+                        let chunks = ["Hello", " ", "world"];
+                        for chunk in chunks {
+                            entry.emit(EventKind::Text(chunk.into()));
+                        }
+                        entry.commit_with(&chunks, Vec::new());
+                        entry.emit(EventKind::Completed {
+                            usage: Usage::default(),
+                        });
+                    }
+                    "fail-after-commit" => {
+                        entry.emit(EventKind::Text("working".into()));
+                        entry.commit_with(
+                            &["working"],
+                            vec![ProposedToolCall {
+                                call_id: "never-run".into(),
+                                name: "Write".into(),
+                                input: serde_json::json!({"file_path":"example.rs"}),
+                            }],
+                        );
+                        entry.emit(EventKind::Text("partial".into()));
+                        entry.emit(EventKind::Failed("API key missing".into()));
+                    }
+                    // Supplementary tool content well past the turn budget, inside the feed.
+                    "tool-flood" => {
+                        for index in 0..40 {
+                            let call_id = format!("flood-{index}");
+                            entry.emit(EventKind::ToolStarted {
+                                call_id: call_id.clone(),
+                                name: "Bash".into(),
+                                input: serde_json::json!({"command":"x".repeat(31 * 1024)}),
+                            });
+                            entry.emit(EventKind::ToolCompleted {
+                                sources: Vec::new(),
+                                call_id,
+                                result: ToolResult {
+                                    content: "y".repeat(31 * 1024),
+                                    is_error: false,
+                                    output_ref: None,
+                                },
+                            });
+                        }
+                        entry.finish("survived");
+                    }
                     "auth" => entry.emit(EventKind::Failed("API key missing".into())),
                     "multi" => {
                         entry.emit(EventKind::Text("working".into()));
@@ -643,6 +704,12 @@ impl AgentAccess for Fake {
                 self.releases.fetch_add(1, Ordering::SeqCst);
                 entries.get_mut(&execution.agent_id).unwrap().released = true;
                 CommandResult::Done
+            }
+            AgentCommand::ManagedHeartbeat { .. } if self.lease_lost.load(Ordering::SeqCst) => {
+                return Err(AccessError::new(
+                    AccessErrorCode::AccessDenied,
+                    "fake lease rejected",
+                ));
             }
             AgentCommand::ManagedHeartbeat { .. } => CommandResult::Done,
             _ => return Err(AccessError::invalid("fake command")),
