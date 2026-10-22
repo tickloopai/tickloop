@@ -31,6 +31,7 @@ impl Agent {
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     return;
                 };
+                chat.bookkeeping.lifecycle.reopen_started_ahead();
                 let waiting = chat
                     .bookkeeping
                     .lifecycle
@@ -55,6 +56,7 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
+        chat.bookkeeping.lifecycle.reopen_started_ahead();
         self.continue_lost_inputs(chat);
         self.requeue_inputs(chat, |_| true);
         self.save(&chat.snapshot);

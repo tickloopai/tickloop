@@ -505,6 +505,8 @@ impl Agent {
                 .get_mut(&chat_id)
                 .ok_or("the Chat is no longer loaded")?;
             chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
+            // Started ahead of the input by a holder gone since, and never begun.
+            chat.bookkeeping.lifecycle.reopen_started_ahead();
             let states = self.inner.trigger_source_states.read().unwrap().clone();
             for state in states {
                 state.take_over(self, chat, &lines);
@@ -932,6 +934,8 @@ pub mod trigger_pauses {
         TriggerChecked,
         /// Queued Trigger input started, and its start is not recorded durably yet.
         TriggerStarted,
+        /// Trigger input's start is recorded ahead of it, and the input has not started.
+        TriggerStartRecorded,
         /// Trigger input whose start could not be recorded is about to wait before trying again.
         TriggerStartRetrying,
         /// A shutdown abandons Trigger input whose start is not recorded, before it takes the

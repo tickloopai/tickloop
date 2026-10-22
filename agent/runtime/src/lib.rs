@@ -3868,12 +3868,18 @@ impl Agent {
         // recorded the start can be taken back by a record after it.
         chat.bookkeeping
             .lifecycle
-            .start_input(pending.receipt.run_id);
+            .start_ahead(pending.receipt.run_id);
         self.save(&chat.snapshot);
         drop(chats);
         let Some(boundary) = self.record_trigger_start(chat_id, pending, boundary).await else {
             return Ok(TriggerTake::Waits);
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(
+            chat_id,
+            wakeup::trigger_pauses::PausePoint::TriggerStartRecorded,
+        )
+        .await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         let admission = self.select_next_run(chat, Some(pending))?;
@@ -3891,6 +3897,11 @@ impl Agent {
                 #[cfg(any(test, feature = "test-support"))]
                 self.pause_point(chat_id, wakeup::trigger_pauses::PausePoint::TriggerStarted)
                     .await;
+                // Its prompt is recorded before its run begins: a load that finds the start
+                // without the prompt after it knows the run never began.
+                if !self.record_trigger_prompt(chat_id, &cancel).await {
+                    return Ok(TriggerTake::Waits);
+                }
                 drop(boundary);
                 self.run_task((receipt, request, cancel));
                 Ok(TriggerTake::Started)
@@ -3973,6 +3984,40 @@ impl Agent {
                     }
                     return None;
                 }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);
+        }
+    }
+
+    /// Records the started input's prompt, trying again while the Transcript cannot be written;
+    /// whether its run may begin: once recorded, or once interrupted, when the run only ends.
+    /// A shutdown leaves the run unbegun: a prompt that never lands has the next load start the
+    /// input again, and one that lands late leaves it as one whose run may have begun.
+    async fn record_trigger_prompt(&self, chat_id: ChatId, cancel: &CancellationToken) -> bool {
+        let mut delay = TRIGGER_START_RETRY_FIRST;
+        loop {
+            let recorded = match self.inner.chats.lock().await.get(&chat_id) {
+                Some(chat) => {
+                    self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                        .await
+                }
+                None => return false,
+            };
+            let Err(error) = recorded else {
+                return true;
+            };
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                format!(
+                    "a Trigger input waits to begin until its prompt is recorded in the \
+                     Transcript: {error}"
+                ),
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return !self.inner.closed.load(Ordering::SeqCst),
+                _ = self.inner.shutdown.cancelled() => return false,
                 _ = tokio::time::sleep(delay) => {}
             }
             delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);

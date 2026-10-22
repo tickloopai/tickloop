@@ -204,6 +204,42 @@ impl Lifecycle {
         }
     }
 
+    /// Records the start of Trigger input `run` ahead of the input itself: started, with its
+    /// queued content kept, so a record of it alone shows the input never entered the
+    /// conversation. The start that follows with the input clears the content.
+    pub(crate) fn start_ahead(&mut self, run: RunId) {
+        let Some(id) = self.open_inputs.get(&run).copied() else {
+            return;
+        };
+        let revision = self.next_revision();
+        if let Some(input) = self.inputs.get_mut(&id) {
+            input.record.state = InputState::Started;
+            input.record.timestamp = now();
+            input.revision = revision;
+        }
+    }
+
+    /// Trigger input whose start was recorded ahead of it and nothing after: it never entered
+    /// the conversation, so its run never began, and it waits again as accepted. Whether any
+    /// did.
+    pub(crate) fn reopen_started_ahead(&mut self) -> bool {
+        let mut reopened = false;
+        for (id, input) in &mut self.inputs {
+            if input.record.trigger.is_some()
+                && input.record.state == InputState::Started
+                && input.record.queued.is_some()
+            {
+                self.revision += 1;
+                input.record.state = InputState::Accepted;
+                input.record.timestamp = now();
+                input.revision = self.revision;
+                self.open_inputs.insert(input.record.run_id, *id);
+                reopened = true;
+            }
+        }
+        reopened
+    }
+
     /// Whether the input of `run` is recorded as started and open.
     pub(crate) fn is_started(&self, run: RunId) -> bool {
         self.open_inputs

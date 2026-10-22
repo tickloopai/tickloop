@@ -1539,6 +1539,32 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     taker.shutdown().await;
 }
 
+/// Trigger input whose start landed and whose prompt did not, its process gone between the
+/// two, never began: the next process runs it once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_recorded_without_its_prompt_runs_once_after_a_crash() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let recorded = here.pause_next_for_tests(chat, PausePoint::TriggerStartRecorded);
+    setup.model.release_held_turn();
+    tokio::time::timeout(WAIT, recorded.entered)
+        .await
+        .expect("the start is recorded ahead of the input")
+        .unwrap();
+    let image = crash_image(&setup.root, setup._directory.path());
+    let restarted_model = ContractModel::new();
+    let restarted = Agent::open_embedded(image, config(), restarted_model.clone()).unwrap();
+    restarted.resume_chat(chat).await.unwrap();
+    complete_turn(&restarted, chat, "carry on").await;
+    restarted_model.wait_seen(WaitingInput::MARKER, 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(restarted_model.seen(WaitingInput::MARKER), 1);
+    restarted.shutdown().await;
+    drop(recorded.release);
+    setup.elsewhere.shutdown().await;
+    here.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
