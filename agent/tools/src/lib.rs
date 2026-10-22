@@ -274,6 +274,8 @@ pub struct ToolExecution {
     pub result: Result<ToolResult, ToolError>,
     /// Images for the model only; `result` carries the text shown in the interface.
     pub images: Vec<Image>,
+    /// Structured web evidence before the runtime assigns family-wide citation numbers.
+    pub web_sources: Vec<WebSource>,
 }
 
 impl From<Result<ToolResult, ToolError>> for ToolExecution {
@@ -281,8 +283,16 @@ impl From<Result<ToolResult, ToolError>> for ToolExecution {
         Self {
             result,
             images: Vec::new(),
+            web_sources: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WebSource {
+    pub url: String,
+    pub title: String,
+    pub snippet: String,
 }
 
 /// What a tool execution knows about the run it serves.
@@ -839,7 +849,9 @@ impl Tools {
         secondary_model: &dyn SecondaryModel,
     ) -> ToolExecution {
         if let Operation::WebSearch(input) = &prepared.operation {
-            return web::search(input.clone(), cancel).await.into();
+            return web::search(input.clone(), cancel)
+                .await
+                .unwrap_or_else(|error| Err(error).into());
         }
         if let Operation::WebFetch(input) = &prepared.operation {
             return web::fetch(
@@ -851,7 +863,7 @@ impl Tools {
                 cancel,
             )
             .await
-            .into();
+            .unwrap_or_else(|error| Err(error).into());
         }
         if let Operation::TaskStop(input) = &prepared.operation {
             if cancel.is_cancelled() {
@@ -982,6 +994,7 @@ impl Tools {
                 ToolExecution {
                     result: Ok(outcome.result),
                     images: outcome.images,
+                    web_sources: Vec::new(),
                 }
             }
             Err(error) => Err(error).into(),

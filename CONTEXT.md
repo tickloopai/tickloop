@@ -197,7 +197,7 @@ Agent 回复用户时的表达方式，决定回复的详略、结构与语气�
 _Avoid_：风格模式、Mode
 
 **Skill**：
-教 Agent 如何组合已有工具完成一类工作的指令集。Skill 不自身提供状态访问、工具能力或额外权限。
+教 Agent 如何组合已有工具完成一类工作的指令集。Skill 不自身提供状态访问、工具能力或额外权限。宿主分别控制模型按需加载与用户显式调用；无 Folder 的 durable Chat 默认允许模型加载内置和宿主下发的 Skill，不开放用户显式调用。
 
 **Tickloop Skill**：
 教 Agent 观察并操作工作台、Layout 与 Tick 的系统级内置 Skill，与 Chat 工作目录和具体项目无关。它使用 `tickloop` 作为稳定名称，用户可以通过 `/tickloop` 显式调用。
@@ -213,6 +213,11 @@ _Avoid_：云服务、server
 **Harness**：
 按 Chat 推进一个回合的开源库：运行 Loop、工具与权限审批、Subagent 与模型调用。它只经 Seam（Transcript Store、Execution Environment、Model Endpoint、Credential Source）访问外部，本地与其他宿主只是 Seam 的实现不同。本地 Worker 与无状态宿主都以库的方式在进程内调用它。持有结束时 Harness 报告家族下次需要宿主的时刻（最早的可触发计划时刻或任一未结束 Loop 的期限）；宿主到时唤醒家族并带上这个时刻，截至这个时刻的计划时刻都算到期，宿主时钟落后也不会漏掉。本地由 Worker 内部的 Trigger 承担同一职责。
 _Avoid_：Agent Runtime、engine
+
+**来源编号（Citation Number）**：
+宿主可在 HarnessOptions 选择 Numbered 引用，默认仍使用 Markdown 超链接。WebSearch 与 WebFetch 的来源按规范化 HTTP(S) URL 在 Chat 家族根的来源表中分配全局编号，之后不重排、不复用；规范化沿用 URL 解析器，去掉 fragment，保留路径和查询参数。来源表通过独立的 citation-sources Transcript 元数据恢复，Branch 和新 Chat 复制继承已有编号。工具正文使用 `[webpage N begin]`／`[webpage N end]`，回复用 `[citation:N]`。ToolCompleted 事件的 sources 旁路字段及 Harness 的 citation_sources 查询提供编号、URL、标题、站点和摘要。每个 Chat 的 citation-sources 元数据还保存逐调用的 callId、runId、messageId、numbers 和保留节点 aliases；visible_citations 按当前分支的实际工具结果和压缩／Branch 别名返回可见来源与调用关联，宿主可自行按每条回复重编号展示。已发送的模型上下文不因新来源而改写；来源表只在压缩摘要中附精简对照表，不进入逐轮重建的 system prompt 或宿主状态。
+
+持久化投影可调用纯函数 `visible_citations_at(lines, physical_leaf, root_sources)`：输入同一 Chat 按存储顺序排列的完整 Lines、目标物理链节点 UUID，以及可选的家族根来源表，返回该节点当时可见的 `VisibleCitations { sources, calls }`。函数不访问 Agent、不取 Agent 锁、不做 I/O，可在 TranscriptStore 的 append 回调中使用。它先截取到目标节点，再复用历史组装、并行续片与压缩／Branch 可见性规则；后续追加不使较早节点的引用有效，logical_parent_uuid 不作为证据祖先。缺失目标节点返回 LeafNotFound，缺少恢复所需祖先返回 IncompleteHistory；成员 Chat 应传根来源表，根表中较晚分配的编号仍受当前节点的调用关联过滤。
 
 **Chat Lease**：
 无状态宿主中同一时刻只允许一个持有者推进某个 Chat 家族的租约，带递增 epoch；写入 Transcript 与发布 Event Stream 时校验 epoch，失去租约的持有者不能再写。一个 Chat 同一时刻只有一个进行中的回合。参考实现与契约测试见 `agent/test-support` 的无状态宿主。

@@ -105,7 +105,9 @@ async fn foreground_subagents_in_the_same_batch_can_work_at_the_same_time() {
                 continue;
             }
             match event.kind {
-                EventKind::ToolCompleted { call_id, result } => {
+                EventKind::ToolCompleted {
+                    call_id, result, ..
+                } => {
                     assert!(!result.is_error, "{}", result.content);
                     reports.insert(call_id);
                 }

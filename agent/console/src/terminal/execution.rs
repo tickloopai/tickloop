@@ -4372,9 +4372,9 @@ mod tests {
         let result = loop {
             let event = tickloop_agent_test_support::next_event(&mut events).await;
             match event.kind {
-                tickloop_agent_protocol::EventKind::ToolCompleted { call_id, result }
-                    if call_id == "source" =>
-                {
+                tickloop_agent_protocol::EventKind::ToolCompleted {
+                    call_id, result, ..
+                } if call_id == "source" => {
                     break result;
                 }
                 tickloop_agent_protocol::EventKind::Failed(error) => panic!("{error}"),

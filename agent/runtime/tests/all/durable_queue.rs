@@ -58,6 +58,24 @@ impl Script {
             .expect("the model holds a request");
     }
 
+    pub(super) fn conversation_requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                format!(
+                    "{:?}",
+                    request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role != tickloop_agent_protocol::Role::System)
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn requests(&self) -> Vec<String> {
         self.requests
             .lock()
@@ -129,9 +147,6 @@ pub(super) fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
@@ -146,12 +161,8 @@ pub(super) fn harness(
                 // such a harness only loads what a durable one wrote.
                 WaitHosting::Process => ToolPolicy::web_fetch_only(),
             },
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()
@@ -231,7 +242,7 @@ async fn a_lost_answer_continues_before_the_inputs_queued_behind_it() {
         settled(&next, chat, lost.input_id).await,
         SettledOutcome::Completed { .. }
     ));
-    let requests = model.requests();
+    let requests = model.conversation_requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].contains("first prompt") && !requests[0].contains("second prompt"));
     assert!(requests[1].contains("first answer") && requests[1].contains("second prompt"));

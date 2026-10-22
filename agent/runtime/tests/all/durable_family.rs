@@ -187,9 +187,6 @@ fn harness(store: Arc<dyn TranscriptStore>, model: Arc<FamilyModel>, waits: Wait
 /// delegation through without review.
 fn options(waits: WaitHosting) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model: config(),
-        settings: None,
         host: AgentHostOptions {
             prompt_policy: PromptPolicy::DenyOnPrompt,
             execution_mode_override: Some(ExecutionMode::FullAccess),
@@ -206,12 +203,8 @@ fn options(waits: WaitHosting) -> HarnessOptions {
             // harness only loads what a durable one wrote.
             WaitHosting::Process => ToolPolicy::web_fetch_only(),
         },
-        host_rules: Vec::new(),
-        task_tools: None,
-        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(config())
     }
 }
 

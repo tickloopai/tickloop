@@ -56,6 +56,7 @@ pub struct HarnessOptions {
     /// more often is refused.
     pub min_schedule_interval: Duration,
     pub waits: WaitHosting,
+    pub citation_style: CitationStyle,
     /// Instructions the host adds to every conversation's system prompt, as a section of their
     /// own after the Output Style; `None` adds nothing.
     pub system_prompt_addition: Option<String>,
@@ -63,6 +64,26 @@ pub struct HarnessOptions {
     /// gate per holding and one per node; it holds them for that single request and its stream
     /// alone. Empty for a local Agent.
     pub request_gates: Vec<Arc<tokio::sync::Semaphore>>,
+}
+
+impl HarnessOptions {
+    /// A local Agent's standard composition; hosts override the capabilities they provide.
+    pub fn local(model: ModelConfig) -> Self {
+        Self {
+            model,
+            settings: None,
+            search: SearchDefaults::default(),
+            host: AgentHostOptions::embedded_defaults(),
+            tools: ToolPolicy::local(),
+            host_rules: Vec::new(),
+            task_tools: None,
+            min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
+            waits: WaitHosting::Process,
+            citation_style: CitationStyle::default(),
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,6 +95,14 @@ pub enum SearchDefaults {
     /// Start every Chat with this configuration, regardless of user settings or its parent.
     /// `None` disables WebSearch.
     Fixed(Option<SearchConfig>),
+}
+
+/// How web evidence is cited. Numbered sources keep the same identity across the family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CitationStyle {
+    #[default]
+    MarkdownLinks,
+    Numbered,
 }
 
 /// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always
@@ -100,6 +129,8 @@ pub struct ToolPolicy {
     pub web_fetch: bool,
     pub web_search: bool,
     pub skills: bool,
+    /// Whether a user may explicitly invoke a Skill; independent of model loading.
+    pub user_skills: bool,
     /// EnterPlanMode and ExitPlanMode.
     pub plan: bool,
     /// AskUserQuestion.
@@ -134,6 +165,7 @@ impl ToolPolicy {
             web_fetch: true,
             web_search: true,
             skills: true,
+            user_skills: true,
             plan: true,
             questions: true,
             delegation: true,
@@ -155,7 +187,8 @@ impl ToolPolicy {
         Self {
             web_fetch: true,
             web_search: false,
-            skills: false,
+            skills: true,
+            user_skills: false,
             plan: false,
             questions: true,
             delegation: true,
@@ -186,6 +219,7 @@ impl ToolPolicy {
             web_fetch: true,
             web_search: false,
             skills: false,
+            user_skills: false,
             plan: false,
             questions: false,
             delegation: false,

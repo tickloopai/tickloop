@@ -22,9 +22,11 @@ mod handback;
 mod handover;
 pub use handover::HandOver;
 mod harness;
+pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
+
 pub use harness::{
-    DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
-    PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
+    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL,
+    PersonWait, PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
     durable_chat_host_rules,
 };
 pub use triggers::ScheduleDecision;
@@ -53,6 +55,7 @@ mod artifact_ticks;
 mod chat_reads;
 mod chat_settings;
 mod chat_title;
+mod citations;
 #[cfg(test)]
 mod codex_tests;
 mod compaction;
@@ -386,6 +389,7 @@ struct Inner {
     /// Where Chats with a Folder run their commands and Ticks; `None` when Chats have no Folder.
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
     tool_policy: ToolPolicy,
+    citation_style: CitationStyle,
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
@@ -413,6 +417,10 @@ struct Inner {
 struct ChatBookkeeping {
     /// What the Chat's own work vouches for, as its Transcript keeps it.
     provenance: tickloop_agent_transcript::ProvenanceEntry,
+    #[serde(default)]
+    citation_sources: tickloop_agent_transcript::CitationSourcesEntry,
+    #[serde(default)]
+    continued_message_ids: HashMap<Uuid, Vec<Uuid>>,
     dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
@@ -821,17 +829,9 @@ fn local_options(
     host: AgentHostOptions,
 ) -> HarnessOptions {
     HarnessOptions {
-        search: Default::default(),
-        model,
         settings,
         host,
-        tools: ToolPolicy::local(),
-        host_rules: Vec::new(),
-        task_tools: None,
-        min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
-        waits: WaitHosting::Process,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(model)
     }
 }
 
@@ -992,7 +992,7 @@ impl Agent {
                 folder,
                 self.inner.config_root.as_deref(),
             ),
-            None => tickloop_agent_config::skills::SkillRegistry::builtin(),
+            None => tickloop_agent_config::skills::SkillRegistry::builtin_without_ticks(),
         })
     }
 
@@ -1843,6 +1843,7 @@ impl Agent {
             min_schedule_interval,
             waits,
             system_prompt_addition,
+            citation_style,
             request_gates,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
@@ -1913,6 +1914,7 @@ impl Agent {
                 ),
                 environment,
                 tool_policy,
+                citation_style,
                 host_rules,
                 system_prompt_addition,
                 request_gates,
@@ -2232,6 +2234,11 @@ impl Agent {
         ledger: lifecycle::LedgerInput,
         turn: TurnAdmission,
     ) -> Result<Receipt, AgentError> {
+        if !self.inner.tool_policy.user_skills {
+            return Err(AgentError::Invalid(
+                "user Skill invocation is not available in this Chat".into(),
+            ));
+        }
         self.rediscover_skills(chat_id).await;
         let invoked = {
             let chats = self.inner.chats.lock().await;
@@ -2287,6 +2294,11 @@ impl Agent {
         arguments: &str,
     ) -> Result<(), AgentError> {
         self.require_environment()?;
+        if !self.inner.tool_policy.user_skills {
+            return Err(AgentError::Invalid(
+                "user Skill invocation is not available in this Chat".into(),
+            ));
+        }
         self.discover_skills(Some(folder))
             .expand(
                 name,
@@ -3071,33 +3083,54 @@ impl Agent {
                 waits: self.inner.waits,
                 min_schedule_interval: self.inner.min_schedule_interval,
                 host_section: self.inner.system_prompt_addition.as_deref(),
+                citation_style: self.inner.citation_style,
             };
             let family_temp = chat.tools.family_temp_directory();
-            let state = match &chat.snapshot.folder {
-                Some(folder) => serde_json::json!({
+            let mut web_search =
+                serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
+            if chat.snapshot.folder.is_some() {
+                web_search["settings_command"] = "/websearch".into();
+            }
+            let mut state = serde_json::json!({
+                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
+                "artifact_ticks": chat.snapshot.artifact_ticks,
+                "delegation": chat.snapshot.delegation,
+                "family_members": family_roster.iter().map(|member| serde_json::json!({
+                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
+                    "name": member.handle, "depth": member.depth, "state": member.availability,
+                    })).collect::<Vec<_>>(),
+                "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
+                "chat_goals": chat.snapshot.loops,
+                "execution_mode": chat.snapshot.policy.mode,
+                "web_search": web_search,
+                "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
+                "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+            });
+            if let Some(folder) = &chat.snapshot.folder {
+                state.as_object_mut().unwrap().extend(serde_json::json!({
                     "workdir": folder,
                     "family_temp_directory": family_temp,
                     "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY)),
-                    "delegation": chat.snapshot.delegation,
-                    "family_members": family_roster.iter().map(|member| serde_json::json!({
-                        "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                        "name": member.handle, "depth": member.depth, "state": member.availability,
-                    })).collect::<Vec<_>>(),
                     "workspace_host": workspace_host,
-                    "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-                    "artifact_ticks": chat.snapshot.artifact_ticks,
-                    "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
-                    "chat_goals": chat.snapshot.loops,
-                    "execution_mode": chat.snapshot.policy.mode,
-                    "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
-                    "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-                }),
-                // Without a Folder the host state names no local path, Loop or host probe.
-                None => serde_json::json!({
-                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-                }),
-            };
+                }).as_object().unwrap().clone());
+            }
+            if chat.snapshot.folder.is_none() {
+                let stable_goal = |goal: &tickloop_agent_protocol::LoopSnapshot| serde_json::json!({ "id": goal.id, "goal": goal.goal, "trigger": goal.trigger });
+                state["goal"] = chat
+                    .snapshot
+                    .loops
+                    .iter()
+                    .find(|goal| goal.id == receipt.loop_id)
+                    .map(stable_goal)
+                    .into();
+                state["chat_goals"] = chat
+                    .snapshot
+                    .loops
+                    .iter()
+                    .map(stable_goal)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(

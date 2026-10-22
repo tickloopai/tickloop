@@ -41,17 +41,8 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             models,
         },
         crate::HarnessOptions {
-            search: Default::default(),
-            model: config(),
             settings: Some(settings),
-            host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
-            tools: crate::ToolPolicy::local(),
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: crate::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..crate::HarnessOptions::local(config())
         },
     )
     .unwrap()

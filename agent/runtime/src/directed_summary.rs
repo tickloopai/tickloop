@@ -129,7 +129,7 @@ impl Agent {
                 RequestContext::directed_compaction(chat_id),
                 sequence,
                 client,
-                summary_request(&plan),
+                summary_request(&plan, self.inner.citation_style),
                 cancel.clone(),
                 None,
             )
@@ -165,6 +165,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<DirectedSummaryOutcome, AgentError> {
         let mut chats = self.inner.chats.lock().await;
+        let sources = crate::citations::sources_for(&chats, chat_id);
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if cancel.is_cancelled() {
             finish_request(self, chat, sequence, RequestOutcome::Cancelled)?;
@@ -179,6 +180,19 @@ impl Agent {
                 "conversation or model changed while summarizing; the previous context was retained",
             );
         }
+        let sources = match sources {
+            Ok(sources) => sources,
+            Err(error) => {
+                finish_request(
+                    self,
+                    chat,
+                    sequence,
+                    RequestOutcome::HostRejected(ResponseRejection::InvalidSummary),
+                )?;
+                return Err(error);
+            }
+        };
+        let summary = crate::citations::append_source_index(&summary, &sources);
         let layout = CompactionLayout {
             sources: plan.sources.clone(),
             logical_parent: plan.logical_parent,
@@ -372,7 +386,10 @@ fn prepare_plan(
     })
 }
 
-fn summary_request(plan: &DirectedSummaryPlan) -> ModelRequest {
+fn summary_request(
+    plan: &DirectedSummaryPlan,
+    citation_style: crate::CitationStyle,
+) -> ModelRequest {
     let direction = match plan.direction {
         SummaryDirection::FromHere => "from the selected prompt through the current end",
         SummaryDirection::UpToHere => "strictly before the selected prompt",
@@ -390,6 +407,11 @@ fn summary_request(plan: &DirectedSummaryPlan) -> ModelRequest {
             }],
         },
     );
+    if citation_style == crate::CitationStyle::Numbered
+        && let Content::Text { text } = &mut messages[0].content[0]
+    {
+        text.push_str(crate::citations::SUMMARY_CITATIONS);
+    }
     let guidance_text = plan.guidance.as_deref().map_or_else(
         || "No additional focus guidance was supplied.".to_owned(),
         |guidance| format!("User focus guidance: {guidance}"),
@@ -510,6 +532,102 @@ mod tests {
     use super::*;
     use tickloop_agent_model::ModelOutput;
     use tickloop_agent_protocol::Usage;
+
+    #[tokio::test]
+    async fn source_lookup_failure_finishes_the_summary_request_and_cancellation_takes_priority() {
+        use tickloop_agent_test_support::{ScriptedModel, config, harness::ChosenModels, text};
+        for is_cancelled in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let agent = Agent::with_seams(
+                crate::HarnessSeams {
+                    transcripts: None,
+                    environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+                    models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("Done")]))),
+                },
+                crate::local_options(
+                    config(),
+                    None,
+                    tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
+                ),
+            )
+            .unwrap();
+            let id = agent.create_chat(directory.path().into()).await.unwrap();
+            agent.submit(id, None, "Discuss".into()).await.unwrap();
+            agent.quiesce(id).await;
+            let (plan, sequence) = {
+                let mut chats = agent.inner.chats.lock().await;
+                let chat = chats.get_mut(&id).unwrap();
+                let plan = prepare_plan(
+                    &chat.snapshot,
+                    &chat.bookkeeping,
+                    DirectedSummaryRequest {
+                        message_id: chat.snapshot.rewind_points()[0].message_id,
+                        direction: SummaryDirection::FromHere,
+                        guidance: None,
+                    },
+                )
+                .unwrap();
+                let sequence = model_request::start_tracked_model_request(
+                    &mut chat.snapshot,
+                    RequestContext::directed_compaction(id),
+                    chat.client.identity(),
+                )
+                .unwrap();
+                chat.snapshot.delegation = Some(tickloop_agent_protocol::DelegationMetadata {
+                    delegation_id: Uuid::new_v4(),
+                    parent_chat_id: id,
+                    parent_loop_id: Uuid::new_v4(),
+                    parent_run_id: Uuid::new_v4(),
+                    parent_call_id: "invalid-ancestry".into(),
+                    ancestors: Vec::new(),
+                    task: String::new(),
+                    ceiling: tickloop_agent_protocol::DelegationCeiling {
+                        folder: chat.snapshot.folder.clone(),
+                        additional_directories: Vec::new(),
+                        policy: chat.snapshot.policy.clone(),
+                        session_denials: None,
+                        host_context: None,
+                        host_tools: Default::default(),
+                        tick_instances: Vec::new(),
+                    },
+                    trusted_user_inputs: None,
+                    trusted_reply_history: None,
+                });
+                (plan, sequence)
+            };
+            let cancel = CancellationToken::new();
+            if is_cancelled {
+                cancel.cancel();
+            }
+            assert!(
+                agent
+                    .commit_directed_summary(id, plan, sequence, "Summary".into(), cancel)
+                    .await
+                    .is_err()
+            );
+            {
+                let mut chats = agent.inner.chats.lock().await;
+                let chat = chats.get_mut(&id).unwrap();
+                let record = chat
+                    .snapshot
+                    .request_usage
+                    .entries()
+                    .iter()
+                    .find(|record| record.sequence == sequence)
+                    .unwrap();
+                assert_eq!(
+                    record.outcome,
+                    if is_cancelled {
+                        RequestOutcome::Cancelled
+                    } else {
+                        RequestOutcome::HostRejected(ResponseRejection::InvalidSummary)
+                    }
+                );
+                chat.snapshot.delegation = None;
+            }
+            agent.shutdown().await;
+        }
+    }
 
     #[test]
     fn complete_summary_keeps_text_block_boundaries() {

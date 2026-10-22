@@ -36,20 +36,13 @@ fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> Ag
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
             },
             tools: ToolPolicy::web_fetch_only(),
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(config())
         },
     )
     .unwrap()

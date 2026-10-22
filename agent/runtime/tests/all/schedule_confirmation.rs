@@ -511,20 +511,11 @@ async fn a_local_host_without_prompts_refuses_the_models_schedule() {
             models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
         },
         tickloop_agent_runtime::HarnessOptions {
-            search: Default::default(),
-            model: config(),
-            settings: None,
             host: tickloop_agent_protocol::AgentHostOptions {
                 prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
                 ..tickloop_agent_protocol::AgentHostOptions::embedded_defaults()
             },
-            tools: tickloop_agent_runtime::ToolPolicy::local(),
-            host_rules: Vec::new(),
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: tickloop_agent_runtime::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..tickloop_agent_runtime::HarnessOptions::local(config())
         },
     )
     .unwrap();

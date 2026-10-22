@@ -42,9 +42,6 @@ fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
             models: ChosenModels::new(model),
         },
         HarnessOptions {
-            search: Default::default(),
-            model: tickloop_agent_test_support::config(),
-            settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
@@ -54,11 +51,7 @@ fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: vec![allow_web_fetch()],
-            task_tools: None,
-            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-            waits: tickloop_agent_runtime::WaitHosting::Process,
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
+            ..HarnessOptions::local(tickloop_agent_test_support::config())
         },
     )
     .unwrap()
@@ -262,7 +255,9 @@ async fn web_fetch_is_allowed_by_the_host_rule_without_review_and_reaches_only_p
     let completed = events
         .iter()
         .find_map(|event| match event {
-            EventKind::ToolCompleted { call_id, result } if call_id == "fetch" => Some(result),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "fetch" => Some(result),
             _ => None,
         })
         .expect("WebFetch ran");
@@ -313,7 +308,9 @@ async fn a_host_that_lets_folderless_chats_reach_anywhere_fetches_a_loopback_pag
     let completed = events
         .iter()
         .find_map(|event| match event {
-            EventKind::ToolCompleted { call_id, result } if call_id == "fetch" => Some(result),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "fetch" => Some(result),
             _ => None,
         })
         .expect("WebFetch ran");
@@ -392,17 +389,7 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
 async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_folder() {
     let models = || ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("answer")])));
     let options = || HarnessOptions {
-        search: Default::default(),
-        model: tickloop_agent_test_support::config(),
-        settings: None,
-        host: AgentHostOptions::embedded_defaults(),
-        tools: ToolPolicy::local(),
-        host_rules: Vec::new(),
-        task_tools: None,
-        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
-        waits: tickloop_agent_runtime::WaitHosting::Process,
-        system_prompt_addition: None,
-        request_gates: Vec::new(),
+        ..HarnessOptions::local(tickloop_agent_test_support::config())
     };
     let root = tempfile::tempdir().unwrap();
     let store = JsonlTranscriptStore::open(root.path().join("state")).unwrap();

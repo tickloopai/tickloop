@@ -437,7 +437,9 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
                 },
             }
         }
-        EventKind::ToolCompleted { call_id, result } => {
+        EventKind::ToolCompleted {
+            call_id, result, ..
+        } => {
             let exchange = exchange(event.chat_id, Some(event.run_id), call_id);
             ConversationBlock {
                 id: tool_result_id(&exchange),
@@ -949,6 +951,7 @@ mod tests {
             run_id,
             91,
             EventKind::ToolCompleted {
+                sources: Vec::new(),
                 call_id: "call-1".into(),
                 result: ToolResult {
                     content: "contents".into(),

@@ -182,6 +182,11 @@ impl Agent {
             last_model_run: None,
         };
         let mut bookkeeping = ChatBookkeeping {
+            continued_message_ids: source.bookkeeping.continued_message_ids.clone(),
+            citation_sources: tickloop_agent_transcript::CitationSourcesEntry {
+                chat_id: child_chat_id,
+                ..source.bookkeeping.citation_sources.clone()
+            },
             restored_skill_names: snapshot
                 .invoked_skills
                 .iter()
@@ -192,6 +197,7 @@ impl Agent {
         };
         let output_style = self.apply_new_chat_settings(&mut snapshot, &mut bookkeeping);
         carry_rewind_points(&mut snapshot, &source.snapshot, &seed);
+        carry_citation_results(&mut snapshot, &mut bookkeeping, source, &seed)?;
         carry_compaction_summaries(&mut snapshot, &source.snapshot, &seed);
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         carry_loops(&mut snapshot, &mut bookkeeping, source, &seed);
@@ -231,6 +237,11 @@ impl Agent {
             recorder
                 .register_branch(&source.snapshot, &source.bookkeeping, child_chat_id, &name)
                 .await?;
+            if !bookkeeping.citation_sources.sources.is_empty()
+                || !bookkeeping.citation_sources.calls.is_empty()
+            {
+                recorder.record_citation_sources(bookkeeping.citation_sources.clone());
+            }
         }
         let tools = self.create_chat_tools(&snapshot);
         let skills = self.discover_skills(Some(&folder));
@@ -410,6 +421,63 @@ fn carry_rewind_points(
             .insert(child_index, point.execution_mode);
         child.inherited_prompts.insert(child_index);
     }
+}
+
+fn carry_citation_results(
+    child: &mut ChatSnapshot,
+    bookkeeping: &mut ChatBookkeeping,
+    source: &Chat,
+    seed: &[(Message, Option<usize>)],
+) -> Result<(), AgentError> {
+    let calls = projection::history_calls_in(
+        &source.snapshot,
+        source.snapshot.active_start()..source.snapshot.messages.len(),
+    )?;
+    let messages = crate::citations::snapshot_messages(
+        &source.snapshot,
+        Some(&source.bookkeeping.continued_message_ids),
+    );
+    for (index, (message, original)) in seed.iter().enumerate() {
+        if let Some(original) = original {
+            for record in &mut bookkeeping.citation_sources.calls {
+                if crate::citations::call_is_visible_in(
+                    record,
+                    std::slice::from_ref(&messages[*original]),
+                ) {
+                    let alias = *child.message_ids.entry(index).or_insert_with(Uuid::new_v4);
+                    if alias != record.message_id && !record.aliases.contains(&alias) {
+                        record.aliases.push(alias);
+                    }
+                }
+            }
+            continue;
+        }
+        for content in &message.content {
+            let Content::ToolResult { tool_use_id, .. } = content else {
+                continue;
+            };
+            let Some(call) = calls.iter().find(|call| &call.wire_id == tool_use_id) else {
+                continue;
+            };
+            let Some((result_index, _)) = call.result else {
+                continue;
+            };
+            let result_ids = &messages[result_index].ids;
+            let Content::ToolUse {
+                id: original_call, ..
+            } = &source.snapshot.messages[call.message_index].content[call.content_index]
+            else {
+                continue;
+            };
+            for record in &mut bookkeeping.citation_sources.calls {
+                if result_ids.contains(&record.message_id) && &record.call_id == original_call {
+                    let alias = *child.message_ids.entry(index).or_insert_with(Uuid::new_v4);
+                    record.aliases.push(alias);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Branch 按当前对话链复制，分出点之前创建的 Loop 就是源 Chat 当前的全部 Loop。它们照重启恢复

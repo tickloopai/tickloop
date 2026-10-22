@@ -62,7 +62,7 @@ async fn live_deepseek_reads_a_temporary_file_through_an_approved_shell_command(
                     if name != "Bash" {return Err("model used an unexpected tool".into());}
                     call = Some(call_id);
                 }
-                EventKind::ToolCompleted {call_id, result} if call.as_ref()==Some(&call_id) => {
+                EventKind::ToolCompleted { call_id, result, .. } if call.as_ref()==Some(&call_id) => {
                     if result.is_error {return Err(format!("actual Shell failed: {}",result.content));}
                     if result.content != marker {return Err("Bash did not return the exact file contents".into());}
                     eprintln!("Actual Shell command: cat source.txt; exit code 0; output bytes {}",marker.len());
@@ -140,7 +140,7 @@ async fn live_deepseek_interval_reuses_the_goal_and_stops_future_execution() {
                     eprintln!("Timed run requested its actual Read operation.");
                     read_call=Some(call_id);
                 }
-                EventKind::ToolCompleted {call_id,result} if read_call.as_ref()==Some(&call_id) => {
+                EventKind::ToolCompleted { call_id, result, .. } if read_call.as_ref()==Some(&call_id) => {
                     if result.is_error || !result.content.contains(&marker) {return Err("timer did not read the actual temporary file".into());}
                     saw_actual_file=true;
                 }

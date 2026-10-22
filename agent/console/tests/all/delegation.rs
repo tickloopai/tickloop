@@ -702,7 +702,9 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
             continue;
         }
         match event.kind {
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 results.insert(call_id, result);
             }
             EventKind::Completed { .. } => break,
@@ -882,7 +884,9 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.chat_id != parent {
             child = Some(event.chat_id);
-            if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = &event.kind
                 && call_id == "child-denied"
             {
                 assert!(
@@ -1110,7 +1114,9 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     let result = loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.chat_id == parent
-            && let EventKind::ToolCompleted { call_id, result } = event.kind
+            && let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = event.kind
             && call_id == "delegate"
         {
             break result;
@@ -1259,7 +1265,9 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
             child = Some(event.chat_id);
         }
         if event.chat_id != parent
-            && let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = &event.kind
         {
             if call_id == "escape" {
                 assert!(!result.is_error, "{}", result.content);
@@ -1328,7 +1336,9 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
                 .unwrap();
             newly_restricted = true;
         }
-        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
             && call_id == "new-restriction"
         {
             assert!(result.is_error);
@@ -2101,6 +2111,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         if let EventKind::ToolCompleted {
             call_id,
             result: output,
+            ..
         } = event.kind
         {
             if call_id == "python" {
@@ -2186,6 +2197,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         if let EventKind::ToolCompleted {
             call_id,
             result: output,
+            ..
         } = event.kind
         {
             if call_id == "python" {
@@ -2451,6 +2463,7 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
                 EventKind::ToolCompleted {
                     call_id,
                     result: output,
+                    ..
                 } if call_id == "python" => result = Some(output),
                 EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
                 _ => {}
@@ -2525,7 +2538,9 @@ async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_chil
             EventKind::ToolStarted { call_id, .. } if call_id == "python" => {
                 panic!("late parent Deny must win over child Once")
             }
-            EventKind::ToolCompleted { call_id, result } if call_id == "python" => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "python" => {
                 refused = result.is_error;
                 break;
             }
@@ -2655,6 +2670,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
             EventKind::ToolCompleted {
                 call_id,
                 result: output,
+                ..
             } if call_id == "read-result" => result = Some(output),
             EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
             _ => {}
@@ -3012,9 +3028,9 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
             EventKind::ToolStarted { call_id, .. } if call_id == "scoped-python" => {
                 panic!("a frozen parent Loop denial must remain a denial")
             }
-            EventKind::ToolCompleted { call_id, result } if call_id == "scoped-python" => {
-                denied = result.is_error
-            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "scoped-python" => denied = result.is_error,
             EventKind::Failed(reason) if event.chat_id != root => {
                 assert!(
                     reason.contains("denies") || reason.contains("denial"),
@@ -3076,7 +3092,9 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
         .unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
-        if let EventKind::ToolCompleted { call_id, result } = event.kind
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = event.kind
             && call_id == "stop-pending"
         {
             assert!(!result.is_error, "{}", result.content);
@@ -3139,6 +3157,7 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
             EventKind::ToolCompleted {
                 call_id,
                 result: output,
+                ..
             } if call_id == "configured-python" => result = Some(output),
             EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
             _ => {}

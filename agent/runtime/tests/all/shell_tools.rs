@@ -484,7 +484,9 @@ async fn run_to_completion(
                 .answer_permission(chat, request.id, true)
                 .await
                 .unwrap(),
-            EventKind::ToolCompleted { call_id, result } => results.push((call_id, result)),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => results.push((call_id, result)),
             EventKind::Completed { .. } => return results,
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}

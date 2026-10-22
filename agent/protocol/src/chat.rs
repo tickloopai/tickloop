@@ -324,6 +324,8 @@ pub enum EventKind {
         input: serde_json::Value,
     },
     ToolCompleted {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<crate::CitationSource>,
         call_id: String,
         result: ToolResult,
     },

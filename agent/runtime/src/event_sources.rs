@@ -1409,6 +1409,7 @@ mod feedback_admission_tests {
                 task_tools: None,
                 min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
+                citation_style: Default::default(),
                 system_prompt_addition: None,
                 request_gates: Vec::new(),
             },

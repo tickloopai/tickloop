@@ -10,6 +10,16 @@ pub struct ToolResult {
     pub output_ref: Option<PathBuf>,
 }
 
+/// A source's stable number within the Chat's family, independent of display numbering.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CitationSource {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub site: String,
+    pub snippet: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchFailure {

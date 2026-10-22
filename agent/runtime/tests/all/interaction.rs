@@ -755,7 +755,9 @@ async fn declining_a_question_rejects_the_call_ends_the_run_and_later_input_star
     let declined = loop {
         let event = next_event(&mut events).await;
         match event.kind {
-            EventKind::ToolCompleted { call_id, result } if call_id == "clarify" => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "clarify" => {
                 assert_eq!(event.run_id, asked.run_id);
                 break result;
             }

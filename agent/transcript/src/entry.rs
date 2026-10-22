@@ -29,6 +29,7 @@ pub enum Line {
     SentAgentMessages(SentAgentMessagesEntry),
     /// Where the Chat's WebFetch URLs and Artifact writes may lead; the latest record wins.
     Provenance(ProvenanceEntry),
+    CitationSources(CitationSourcesEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
@@ -126,6 +127,7 @@ pub enum MetadataKind {
     FamilyInputs,
     SentAgentMessages,
     Provenance,
+    CitationSources,
     TaskBoards,
     FamilyCompletions,
     FileHistorySnapshot,
@@ -153,6 +155,7 @@ impl MetadataKind {
             | Self::FamilyInputs
             | Self::SentAgentMessages
             | Self::Provenance
+            | Self::CitationSources
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
@@ -218,6 +221,7 @@ impl Line {
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
             Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
             Self::Provenance(_) => MetadataKind::Provenance,
+            Self::CitationSources(_) => MetadataKind::CitationSources,
             Self::LastPrompt(_) => MetadataKind::LastPrompt,
             Self::BranchOrigin(_) => MetadataKind::BranchOrigin,
             Self::Delegation(_) => MetadataKind::Delegation,
@@ -602,6 +606,28 @@ pub struct FamilyInputsEntry {
 pub struct SentAgentMessagesEntry {
     pub chat_id: Uuid,
     pub messages: std::collections::BTreeMap<Uuid, AgentMessageSource>,
+}
+
+/// The complete append-only source table, outside the conversation chain and prompt prefix.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CitationSourcesEntry {
+    pub chat_id: Uuid,
+    pub sources: Vec<tickloop_agent_protocol::CitationSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<CitationCall>,
+}
+
+/// A call's sources and the conversation nodes that retain its evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CitationCall {
+    pub call_id: String,
+    pub run_id: tickloop_agent_protocol::RunId,
+    pub message_id: Uuid,
+    pub numbers: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Uuid>,
 }
 
 /// What the Chat's own work vouches for: the links its fetched pages gave on their own origin,
@@ -993,6 +1019,11 @@ mod tests {
             Line::SentAgentMessages(SentAgentMessagesEntry {
                 chat_id,
                 messages: Default::default(),
+            }),
+            Line::CitationSources(CitationSourcesEntry {
+                chat_id,
+                sources: Vec::new(),
+                calls: Vec::new(),
             }),
             Line::Provenance(ProvenanceEntry {
                 chat_id,

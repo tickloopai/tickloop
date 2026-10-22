@@ -579,6 +579,7 @@ async fn wait_for_running_shell(
                 return;
             }
             EventKind::ToolCompleted {
+                sources: _,
                 call_id: completed,
                 result,
             } if completed == call_id => {

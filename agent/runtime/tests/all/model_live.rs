@@ -352,7 +352,7 @@ async fn live_deepseek_searches_and_reads_official_documentation() {
                     agent.answer_permission(chat, request.id, true).await.unwrap();
                 }
                 EventKind::ToolStarted {call_id, name, ..} => { names.insert(call_id, name); }
-                EventKind::ToolCompleted {call_id, result} => {
+                EventKind::ToolCompleted { call_id, result, .. } => {
                     assert!(!result.is_error, "{}", result.content);
                     let name = names.remove(&call_id).unwrap();
                     if name == "WebSearch" {

@@ -32,6 +32,7 @@ pub(crate) struct CachedMetadata {
     pub family_inputs: Option<FamilyInputsEntry>,
     pub sent_agent_messages: Option<SentAgentMessagesEntry>,
     pub provenance: Option<ProvenanceEntry>,
+    pub citation_sources: Option<tickloop_agent_transcript::CitationSourcesEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,
@@ -50,6 +51,7 @@ impl CachedMetadata {
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
             Line::Provenance(entry) => self.provenance = Some(entry.clone()),
+            Line::CitationSources(entry) => self.citation_sources = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.delegation = Some(entry.clone()),
@@ -73,6 +75,7 @@ impl CachedMetadata {
                     .map(Line::SentAgentMessages),
             )
             .chain(self.provenance.clone().map(Line::Provenance))
+            .chain(self.citation_sources.clone().map(Line::CitationSources))
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))
@@ -197,6 +200,11 @@ impl TranscriptOutbox {
         if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
             outbox.written_uuids.extend(uuids);
             outbox.retained = retained;
+            if let Some(sources) = &outbox.metadata.citation_sources {
+                outbox
+                    .retained
+                    .apply(&Line::CitationSources(sources.clone()));
+            }
         }
     }
 
