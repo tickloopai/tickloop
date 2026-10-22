@@ -46,7 +46,9 @@ use super::Agent;
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically,
 };
-use tickloop_agent_protocol::{ChatId, LoopTriggerNotice, LoopTriggerNoticeKind};
+use tickloop_agent_protocol::{
+    ChatId, LoopTriggerNotice, LoopTriggerNoticeKind, PauseReason, Receiving,
+};
 
 const LEASE_DIRECTORY: &str = "trigger";
 const LEASE_FILE: &str = "lease.lock";
@@ -689,19 +691,36 @@ impl Agent {
                     }
                     leases.mark_synced(chat_id, epoch);
                 }
-                let is_receiving = self
+                let receiving = self
                     .inner
                     .chats
                     .lock()
                     .await
                     .get(&chat_id)
-                    .is_some_and(|chat| chat.snapshot.chat_loop.receiving.is_receiving());
-                if !is_receiving {
-                    leases.release(chat_id);
-                    return TriggerPermit::Wait {
-                        reason: "this Chat's Loop is not receiving".into(),
-                        recoverable: false,
-                    };
+                    .map(|chat| chat.snapshot.chat_loop.receiving);
+                match receiving {
+                    Some(Receiving::Receiving) => {}
+                    // The process keeps the lease while its Transcript cannot take a start: no
+                    // other process runs what it may have started.
+                    Some(Receiving::Paused {
+                        reason: PauseReason::TranscriptUnavailable,
+                    }) => {
+                        return TriggerPermit::Wait {
+                            reason: "this Chat's Loop paused: its Transcript cannot be written"
+                                .into(),
+                            recoverable: false,
+                        };
+                    }
+                    Some(Receiving::Paused {
+                        reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
+                    })
+                    | None => {
+                        leases.release(chat_id);
+                        return TriggerPermit::Wait {
+                            reason: "this Chat's Loop is not receiving".into(),
+                            recoverable: false,
+                        };
+                    }
                 }
                 leases.clear_notice(chat_id);
                 TriggerPermit::Fire(LeaseHolding(Some(epoch)))

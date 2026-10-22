@@ -1143,6 +1143,74 @@ async fn trigger_input_never_recorded_as_started_runs_once_after_a_takeover() {
     processes.taken_over_ran_once().await;
 }
 
+/// A shutdown abandons Trigger input whose start was not recorded, and the store taking writes
+/// again before the shutdown's last flush records nothing of it: the process taking the lease
+/// over runs it once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_start_stays_unrecorded_when_the_store_recovers_at_shutdown() {
+    let processes = FaultyProcesses::new().await;
+    processes.start_while_the_store_refuses().await;
+    let abandoned = processes
+        .first
+        .pause_next_for_tests(processes.chat, PausePoint::TriggerStartAbandoned);
+    let shutdown = tokio::spawn({
+        let first = processes.first.clone();
+        async move { first.shutdown().await }
+    });
+    tokio::time::timeout(WAIT, abandoned.entered)
+        .await
+        .expect("the shutdown abandons the start")
+        .unwrap();
+    processes.first_store.heal();
+    drop(abandoned.release);
+    shutdown.await.unwrap();
+    processes.taken_over_ran_once().await;
+}
+
+/// Trigger input whose start cannot be recorded for longer than the budget pauses receiving
+/// here and keeps the lease: no other process takes the Chat over, the user can still send
+/// input, and the input starts here once its start is recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease() {
+    Agent::set_trigger_start_budget_for_tests(std::time::Duration::from_millis(300));
+    let processes = FaultyProcesses::new().await;
+    let (first, chat) = (processes.first.clone(), processes.chat);
+    processes.start_while_the_store_refuses().await;
+    let paused = tickloop_agent_protocol::Receiving::Paused {
+        reason: tickloop_agent_protocol::PauseReason::TranscriptUnavailable,
+    };
+    tokio::time::timeout(WAIT, async {
+        while first.snapshot(chat).await.unwrap().chat_loop.receiving != paused {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("receiving pauses past the budget");
+    assert!(
+        processes
+            .second
+            .deliver_trigger_for_tests(chat, scheduled("elsewhere", 1), "kept-out")
+            .await
+            .is_err(),
+        "the lease stays here"
+    );
+    tokio::time::timeout(WAIT, first.submit(chat, "carry on".into()))
+        .await
+        .expect("the user's input is taken meanwhile")
+        .unwrap();
+    processes.first_store.heal();
+    processes
+        .first_model
+        .wait_seen(FaultyProcesses::MARKER, 1)
+        .await;
+    processes.first_model.wait_seen("carry on", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 1);
+    assert_eq!(processes.second_model.seen("kept-out"), 0);
+    first.shutdown().await;
+    processes.second.shutdown().await;
+}
+
 /// Trigger input interrupted while it waits for its start to be recorded ends without asking
 /// the model.
 #[tokio::test(flavor = "multi_thread")]

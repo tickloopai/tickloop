@@ -562,6 +562,34 @@ pub(crate) struct TurnAdmission {
 const TRIGGER_START_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
 const TRIGGER_START_RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a Trigger input waits for its start to be recorded before receiving pauses.
+const TRIGGER_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(any(test, feature = "test-support"))]
+static TRIGGER_START_BUDGET_FOR_TESTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn trigger_start_budget() -> std::time::Duration {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let millis = TRIGGER_START_BUDGET_FOR_TESTS.load(Ordering::Relaxed);
+        if millis > 0 {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    TRIGGER_START_BUDGET
+}
+
+/// What recording a Trigger input's start came to.
+enum TriggerStart {
+    /// Recorded: its run starts.
+    Recorded,
+    /// Interrupted, or its lease no longer stands behind it: its run only ends.
+    Ended,
+    /// The Agent shut down: nothing of it runs or is recorded.
+    Abandoned,
+}
+
 /// What taking queued Trigger input came to.
 enum TriggerTake {
     /// It started, and its run runs.
@@ -3838,10 +3866,15 @@ impl Agent {
                 drop(chats);
                 // Another process taking the lease over after this boundary finds it started,
                 // so its run is started only once that is recorded.
-                if !self.record_trigger_start(chat_id, &cancel).await {
-                    return Ok(TriggerTake::Waits);
+                match self
+                    .record_trigger_start(chat_id, holding, &cancel, boundary)
+                    .await
+                {
+                    TriggerStart::Recorded => {}
+                    // Its run only ends, without asking the model.
+                    TriggerStart::Ended => cancel.cancel(),
+                    TriggerStart::Abandoned => return Ok(TriggerTake::Waits),
                 }
-                drop(boundary);
                 self.run_task((receipt, request, cancel));
                 Ok(TriggerTake::Started)
             }
@@ -3850,37 +3883,114 @@ impl Agent {
 
     /// Records durably the start of the Trigger input whose run `cancel` stops, trying again
     /// after a delay that doubles while the Transcript cannot be written: the input stays started
-    /// and waits for it. Whether its run may be started: once recorded, or once interrupted,
-    /// when the run only ends without asking the model; not when the Agent shuts down, which
-    /// leaves the input to the next load as accepted and not started.
-    async fn record_trigger_start(&self, chat_id: ChatId, cancel: &CancellationToken) -> bool {
+    /// and waits for it, first within the Chat's boundary, and past the budget with receiving
+    /// paused here and the lease kept, entering the boundary for each try. An interruption, or a
+    /// lease that no longer stands behind the input, ends it; a shutdown abandons it, dropping
+    /// what the Transcript did not take of the Chat, so the next load finds the input accepted
+    /// and not started.
+    async fn record_trigger_start(
+        &self,
+        chat_id: ChatId,
+        holding: loop_lease::LeaseHolding,
+        cancel: &CancellationToken,
+        boundary: loop_lease::TriggerBoundary,
+    ) -> TriggerStart {
+        let began = tokio::time::Instant::now();
         let mut delay = TRIGGER_START_RETRY_FIRST;
+        let mut kept_boundary = Some(boundary);
+        let mut paused_here = false;
         loop {
+            let within = match kept_boundary.take() {
+                Some(boundary) => boundary,
+                None => self.enter_trigger_boundary(chat_id).await,
+            };
+            if !self.inner.chat_leases.stands(chat_id, holding) {
+                return TriggerStart::Ended;
+            }
             let recorded = match self.inner.chats.lock().await.get(&chat_id) {
                 Some(chat) => {
                     self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
                         .await
                 }
-                None => return false,
+                None => return TriggerStart::Abandoned,
             };
             let Err(error) = recorded else {
-                return true;
+                if paused_here {
+                    self.inner.chat_leases.clear_notice(chat_id);
+                }
+                return TriggerStart::Recorded;
             };
-            self.inner.chat_leases.set_notice(
-                chat_id,
-                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
-                format!(
-                    "a Trigger input waits to start until its start is recorded in the \
-                     Transcript: {error}"
-                ),
-            );
+            if !paused_here && began.elapsed() >= trigger_start_budget() {
+                paused_here = true;
+                self.pause_for_unwritable_transcript(chat_id, &error).await;
+            } else if !paused_here {
+                self.inner.chat_leases.set_notice(
+                    chat_id,
+                    tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                    format!(
+                        "a Trigger input waits to start until its start is recorded in the \
+                         Transcript: {error}"
+                    ),
+                );
+            }
+            // Past the budget the boundary is left between tries, so the user can stop or
+            // continue the Chat meanwhile.
+            if !paused_here {
+                kept_boundary = Some(within);
+            } else {
+                drop(within);
+            }
             tokio::select! {
-                _ = cancel.cancelled() => return true,
-                _ = self.inner.shutdown.cancelled() => return false,
+                // A shutdown stops the run with the rest, before or after it says so.
+                _ = cancel.cancelled() => {
+                    if !self.inner.closed.load(Ordering::SeqCst) {
+                        return TriggerStart::Ended;
+                    }
+                    return self.abandon_trigger_start(chat_id).await;
+                }
+                _ = self.inner.shutdown.cancelled() => {
+                    return self.abandon_trigger_start(chat_id).await;
+                }
                 _ = tokio::time::sleep(delay) => {}
             }
             delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);
         }
+    }
+
+    /// The Agent shuts down with a Trigger input's start unrecorded: nothing more of the Chat
+    /// is recorded here, so the next load finds the input accepted and not started.
+    async fn abandon_trigger_start(&self, chat_id: ChatId) -> TriggerStart {
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(
+            chat_id,
+            wakeup::trigger_pauses::PausePoint::TriggerStartAbandoned,
+        )
+        .await;
+        self.withhold_transcript(
+            chat_id,
+            "the Agent shut down before a Trigger input's start was recorded",
+        );
+        TriggerStart::Abandoned
+    }
+
+    /// The Transcript took no start for longer than the budget: receiving pauses here, and the
+    /// user is told; the lease stays, as the input may yet start here.
+    async fn pause_for_unwritable_transcript(&self, chat_id: ChatId, error: &str) {
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+            chat.snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                reason: tickloop_agent_protocol::PauseReason::TranscriptUnavailable,
+            };
+            self.save(&chat.snapshot);
+        }
+        self.inner.chat_leases.set_notice(
+            chat_id,
+            tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+            format!(
+                "this Chat's Transcript cannot be written ({error}); receiving paused, and a \
+                 started Trigger input waits until its start is recorded. Continue the Chat to \
+                 receive again"
+            ),
+        );
     }
 
     fn select_next_run(

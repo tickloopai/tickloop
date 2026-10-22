@@ -738,6 +738,16 @@ impl Agent {
         trigger_pauses::pause_next(self.pause_key(), chat_id, point)
     }
 
+    /// How long Trigger input waits for its start to be recorded before receiving pauses, for
+    /// the tests of this process.
+    #[doc(hidden)]
+    pub fn set_trigger_start_budget_for_tests(budget: std::time::Duration) {
+        super::TRIGGER_START_BUDGET_FOR_TESTS.store(
+            budget.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Holds the Chat at `point` if a test asked to.
     pub(super) async fn pause_point(&self, chat_id: ChatId, point: trigger_pauses::PausePoint) {
         trigger_pauses::wait_if_paused(self.pause_key(), chat_id, point).await;
@@ -781,6 +791,9 @@ pub mod trigger_pauses {
         TriggerChecked,
         /// Queued Trigger input started, and its start is not recorded durably yet.
         TriggerStarted,
+        /// A shutdown abandons Trigger input whose start is not recorded, before it drops
+        /// what the Transcript did not take.
+        TriggerStartAbandoned,
     }
 
     type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
