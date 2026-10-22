@@ -984,22 +984,22 @@ impl TickDeliveries {
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
         for mut item in items {
-            if !item.needs_refill {
-                self.content
-                    .put_back(item.subscription, item.sequence, item.data.clone());
-            }
+            let data = (!item.needs_refill).then(|| item.data.clone());
             item.data = left_out(&item.kind, &item.data);
             item.needs_refill = true;
-            match pending.items.remove(&item.instance) {
-                Some(newer) => {
-                    pending
-                        .items
-                        .insert(item.instance.clone(), newer.superseding(&item));
-                }
-                None => {
-                    pending.items.insert(item.instance.clone(), item);
-                }
+            let (subscription, sequence) = (item.subscription, item.sequence);
+            // Deliveries put back in any order: the newest update of the instance stays.
+            let kept = match pending.items.remove(&item.instance) {
+                Some(waiting) if waiting.sequence >= item.sequence => waiting.superseding(&item),
+                Some(waiting) => item.superseding(&waiting),
+                None => item,
+            };
+            if kept.sequence == sequence
+                && let Some(data) = data
+            {
+                self.content.put_back(subscription, sequence, data);
             }
+            pending.items.insert(kept.instance.clone(), kept);
         }
         self.hold(owner, Instant::now());
     }
@@ -2938,6 +2938,61 @@ mod manual_admission_tests {
             manual_eligibility(&snapshot, &instance),
             Eligibility::Hold(Hold::PlanReview),
             "data must not approve a plan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod put_back_tests {
+    use super::*;
+
+    fn item(subscription: Uuid, instance: &InstanceRef, sequence: u64) -> DeliveryItem {
+        DeliveryItem {
+            title: None,
+            subscription,
+            watch: Uuid::nil(),
+            instance: instance.clone(),
+            first_sequence: sequence,
+            first_observed_at: String::new(),
+            sequence,
+            observed_at: String::new(),
+            updates: 1,
+            waiting_since: Instant::now(),
+            gap: false,
+            kind: ObservationKind::Protocol,
+            recover_with: None,
+            series: Vec::new(),
+            data: json!({ "seq": sequence }),
+            needs_refill: false,
+        }
+    }
+
+    /// Two deliveries of one subscription put back newest first, then the older, within the
+    /// budget: the newer update waits, with its data for a Tick that cannot be read again.
+    #[tokio::test]
+    async fn deliveries_put_back_out_of_order_keep_the_newest_update_and_its_data() {
+        let mut deliveries = TickDeliveries::default();
+        let owner = (Uuid::new_v4(), Uuid::new_v4());
+        let subscription = Uuid::new_v4();
+        let instance: InstanceRef = "calendar:fixture".parse().unwrap();
+        deliveries.restore(owner, vec![item(subscription, &instance, 2)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 1)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].sequence, 2);
+        assert_eq!(waiting[0].updates, 2);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 2),
+            Some(json!({ "seq": 2 }))
+        );
+
+        deliveries.restore(owner, vec![item(subscription, &instance, 3)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 4)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting[0].sequence, 4);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 4),
+            Some(json!({ "seq": 4 }))
         );
     }
 }

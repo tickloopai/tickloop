@@ -78,6 +78,14 @@ impl TickContentCache {
     /// Keeps the data of the update `sequence` of a delivery item put back to wait, for when its
     /// Tick cannot be read again; false when it is larger than the whole budget.
     pub(super) fn put_back(&mut self, subscription: Uuid, sequence: u64, data: Value) -> bool {
+        // What was put back for a newer update of the subscription stays.
+        if self
+            .put_back
+            .get(&subscription)
+            .is_some_and(|kept| kept.sequence > sequence)
+        {
+            return false;
+        }
         self.take_put_back(subscription, sequence);
         let Some(content) = self.make_room(data) else {
             return false;
@@ -214,6 +222,15 @@ mod tests {
         assert!(cache.take(newest).is_none());
         assert_eq!(cache.take_put_back(waiting, 5), Some(json!("x".repeat(40))));
         assert!(cache.used_bytes() <= 100);
+    }
+
+    #[test]
+    fn an_older_update_put_back_later_leaves_the_newer_data() {
+        let mut cache = TickContentCache::with_budget(1024);
+        let subscription = Uuid::new_v4();
+        assert!(cache.put_back(subscription, 2, json!("newer")));
+        assert!(!cache.put_back(subscription, 1, json!("older")));
+        assert_eq!(cache.take_put_back(subscription, 2), Some(json!("newer")));
     }
 
     #[test]
