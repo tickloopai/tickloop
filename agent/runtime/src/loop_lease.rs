@@ -148,6 +148,19 @@ pub(super) enum TriggerPermit {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LeaseHolding(Option<u64>);
 
+/// How long a Chat whose Trigger input waits on a failed permit waits before the first retry,
+/// doubling with each failure up to the longest.
+const PERMIT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const PERMIT_RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The retry of a Chat's waiting Trigger input after failed permits: how many failed in a row,
+/// and the scheduled retry, if one is.
+#[derive(Default)]
+struct PermitRetry {
+    failures: u32,
+    scheduled: Option<tokio_util::sync::CancellationToken>,
+}
+
 /// What taking a Chat's Trigger state over came to.
 enum TakeOver {
     Taken,
@@ -172,6 +185,7 @@ pub(super) struct ChatLeases {
     sync_gates: Mutex<HashMap<ChatId, Arc<tokio::sync::Mutex<()>>>>,
     known_generations: Mutex<HashMap<ChatId, u64>>,
     notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
+    retries: Mutex<HashMap<ChatId, PermitRetry>>,
 }
 
 impl ChatLeases {
@@ -245,6 +259,8 @@ impl ChatLeases {
             return false;
         };
         holding.synced = true;
+        drop(held);
+        self.retries.lock().unwrap().remove(&chat_id);
         true
     }
 
@@ -254,6 +270,40 @@ impl ChatLeases {
         match holding.0 {
             None => true,
             Some(epoch) => self.is_synced(chat_id, epoch),
+        }
+    }
+
+    /// Schedules the retry of the Chat's waiting Trigger input after a failed permit, unless one
+    /// is scheduled: its delay and cancellation.
+    fn schedule_retry(
+        &self,
+        chat_id: ChatId,
+    ) -> Option<(std::time::Duration, tokio_util::sync::CancellationToken)> {
+        let mut retries = self.retries.lock().unwrap();
+        let retry = retries.entry(chat_id).or_default();
+        if retry.scheduled.is_some() {
+            return None;
+        }
+        let delay = PERMIT_RETRY_FIRST
+            .saturating_mul(2u32.saturating_pow(retry.failures))
+            .min(PERMIT_RETRY_LONGEST);
+        retry.failures = retry.failures.saturating_add(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        retry.scheduled = Some(cancel.clone());
+        Some((delay, cancel))
+    }
+
+    fn retry_came_due(&self, chat_id: ChatId) {
+        if let Some(retry) = self.retries.lock().unwrap().get_mut(&chat_id) {
+            retry.scheduled = None;
+        }
+    }
+
+    fn cancel_retry(&self, chat_id: ChatId) {
+        if let Some(retry) = self.retries.lock().unwrap().remove(&chat_id)
+            && let Some(scheduled) = retry.scheduled
+        {
+            scheduled.cancel();
         }
     }
 
@@ -299,12 +349,18 @@ impl ChatLeases {
     pub(super) fn release(&self, chat_id: ChatId) {
         let released = self.held.lock().unwrap().remove(&chat_id);
         drop(released);
+        self.cancel_retry(chat_id);
         self.clear_notice(chat_id);
     }
 
     pub(super) fn release_all(&self) {
         let released = std::mem::take(&mut *self.held.lock().unwrap());
         drop(released);
+        for (_, retry) in std::mem::take(&mut *self.retries.lock().unwrap()) {
+            if let Some(scheduled) = retry.scheduled {
+                scheduled.cancel();
+            }
+        }
         self.notices.lock().unwrap().clear();
     }
 }
@@ -588,6 +644,37 @@ impl Agent {
     /// read under the Chats lock.
     pub(super) fn still_holds_epoch(&self, chat_id: ChatId, epoch: u64) -> bool {
         self.inner.chat_leases.holds_epoch(chat_id, epoch)
+    }
+
+    /// A permit for the Chat's waiting Trigger input failed: it is tried again after a delay
+    /// that doubles with each failure in a row, once at a time, until a takeover succeeds, the
+    /// lease is released as receiving pauses, or the Agent shuts down.
+    pub(super) fn retry_waiting_trigger_input(&self, chat_id: ChatId) {
+        let Some((delay, cancel)) = self.inner.chat_leases.schedule_retry(chat_id) else {
+            return;
+        };
+        self.inner
+            .tasks
+            .spawn(self.clone().retry_after(chat_id, delay, cancel));
+    }
+
+    /// The retry's future is named, not inferred: the run it starts asks for a permit, whose
+    /// failure schedules this again.
+    fn retry_after(
+        self,
+        chat_id: ChatId,
+        delay: std::time::Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = self.inner.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            self.inner.chat_leases.retry_came_due(chat_id);
+            let _ = self.start_next_agent_run(chat_id).await;
+        })
     }
 
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的

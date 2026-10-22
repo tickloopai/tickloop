@@ -761,3 +761,32 @@ async fn a_takeover_released_while_it_read_gives_no_permit() {
     elsewhere.shutdown().await;
     here.shutdown().await;
 }
+
+/// Trigger input waiting on a takeover that could not read the store runs once the store can be
+/// read again, with nothing else delivered or submitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_trigger_input_runs_once_the_store_reads_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), "waits-for-the-store")
+        .await
+        .unwrap();
+    agent.flush_transcripts().await;
+    take_the_lease_away(&root);
+    let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
+    model.release_held_turn();
+    wait_for_notice(&agent, chat, LoopTriggerNoticeKind::Warning).await;
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+    model.wait_seen("waits-for-the-store", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("waits-for-the-store"), 1);
+    agent.shutdown().await;
+}

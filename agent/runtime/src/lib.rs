@@ -3727,7 +3727,10 @@ impl Agent {
                         | loop_lease::TriggerPermit::Withdrawn => {
                             return Ok(None);
                         }
-                        loop_lease::TriggerPermit::Failed(_) => return Ok(None),
+                        loop_lease::TriggerPermit::Failed(_) => {
+                            self.retry_waiting_trigger_input(chat_id);
+                            return Ok(None);
+                        }
                     };
                     // Boxed: proving a source must not enlarge every run's shared async stack.
                     let validation =
