@@ -151,3 +151,57 @@ async fn a_stop_elsewhere_keeps_queued_trigger_input_from_starting() {
     elsewhere.shutdown().await;
     agent.shutdown().await;
 }
+
+/// The ledger record of a delivery merged into one of the same key that waits reaches the
+/// Transcript on its own, without anything else of the Chat changing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_delivery_is_recorded_durably() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("same-key", 1), "waits")
+        .await
+        .unwrap();
+    tokio::time::sleep(SETTLE).await;
+    let merged = scheduled("same-key", 2);
+    agent
+        .deliver_trigger_for_tests(chat, merged.clone(), "merges")
+        .await
+        .unwrap();
+    let merged_id = tickloop_agent_transcript::input_ids::trigger(chat, &merged);
+    let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let recorded = std::fs::read_to_string(&transcript)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<tickloop_agent_transcript::Line>(line).ok())
+                .any(|line| {
+                    matches!(
+                        line,
+                        tickloop_agent_transcript::Line::Input(entry)
+                            if entry.input_id == merged_id
+                                && matches!(
+                                    entry.state,
+                                    tickloop_agent_transcript::InputState::Settled {
+                                        outcome: tickloop_agent_transcript::SettledOutcome::Merged { .. }
+                                    }
+                                )
+                    )
+                });
+            if recorded {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the merged delivery's record reaches the Transcript");
+    model.release_held_turn();
+    agent.shutdown().await;
+}

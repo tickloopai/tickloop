@@ -2618,6 +2618,7 @@ impl Agent {
         {
             self.record_merged_trigger(chat, &ledger, source, &input, &waiting);
             *original = candidate;
+            self.save(&original.snapshot);
             self.inner.ledger_changes.send_replace(());
             return Ok(waiting);
         }
