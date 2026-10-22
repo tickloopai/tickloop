@@ -108,3 +108,46 @@ async fn a_process_taking_the_lease_over_does_not_run_what_the_holder_ran() {
     assert_eq!(other_model.seen(SECOND), 0, "{:?}", other_model.prompts());
     other.shutdown().await;
 }
+
+/// `/stop` in another process holding the same Chat pauses this one before it takes the Trigger
+/// input it queued: the turn running here ends, and nothing starts after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_elsewhere_keeps_queued_trigger_input_from_starting() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("lease", 1), "takes-the-lease")
+        .await
+        .unwrap();
+    model.wait_seen("takes-the-lease", 1).await;
+    agent.flush_transcripts().await;
+
+    let elsewhere = Agent::open_embedded(root, config(), ContractModel::new()).unwrap();
+    elsewhere.resume_chat(chat).await.unwrap();
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("queued", 2), "queued-behind-the-turn")
+        .await
+        .unwrap();
+    elsewhere.stop(chat).await.unwrap();
+    model.release_held_turn();
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        model.seen("queued-behind-the-turn"),
+        0,
+        "{:?}",
+        model.prompts()
+    );
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().chat_loop.receiving,
+        tickloop_agent_protocol::Receiving::Paused {
+            reason: tickloop_agent_protocol::PauseReason::Stopped
+        }
+    );
+    elsewhere.shutdown().await;
+    agent.shutdown().await;
+}

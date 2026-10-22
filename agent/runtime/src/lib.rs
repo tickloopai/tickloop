@@ -3708,6 +3708,14 @@ impl Agent {
                         .trigger_source
                         .as_ref()
                         .expect("only Trigger input is validated");
+                    // Queued Trigger input starts only under the Chat's lease and while no
+                    // other process paused receiving; otherwise it waits.
+                    match Box::pin(self.acquire_trigger_permit(chat_id)).await {
+                        loop_lease::TriggerPermit::Fire => {}
+                        loop_lease::TriggerPermit::Wait(_)
+                        | loop_lease::TriggerPermit::Withdrawn
+                        | loop_lease::TriggerPermit::Failed(_) => return Ok(None),
+                    }
                     // Boxed: proving a source must not enlarge every run's shared async stack.
                     let validation =
                         Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
