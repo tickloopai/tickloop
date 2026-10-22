@@ -564,6 +564,8 @@ impl Agent {
 
     /// Registers a source's own state, taken over from the store with each newly taken lease;
     /// sources register as the Agent is built.
+    // The Goal and the scheduled tasks register theirs as they are wired to the base.
+    #[allow(dead_code)]
     pub(super) fn register_trigger_source_state(&self, state: Arc<dyn TriggerSourceState>) {
         self.inner
             .trigger_source_states
