@@ -395,9 +395,6 @@ enum CommandTiming {
 
 fn command_timing(command: &str) -> CommandTiming {
     let name = command.split_whitespace().next().unwrap_or(command);
-    if name == "/loops" && command.split_whitespace().nth(1) == Some("schedule") {
-        return CommandTiming::AfterTurn;
-    }
     if is_rewind_command(name)
         || matches!(
             name,
@@ -887,7 +884,6 @@ Mode and model stay right-aligned on the lower divider; Context appears only wit
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
 /loops trigger [GOAL_ID] reads its trigger.
-/loops schedule GOAL_ID SECONDS|RULE [--for DURATION_SECONDS] PROMPT sets a local timer, such as 60 or `daily 09:00 +08:00`, and an optional deadline.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
@@ -3936,10 +3932,6 @@ async fn interact_with_herdr(
                                                     let selected=status.loops.iter().find(|item|item.id==id).ok_or("Goal does not belong to the current Chat; use /loops.")?;
                                                     outln!(console,"Goal: {id}\n{}",loops::trigger_lines(selected.trigger.as_ref()).join("\n"));
                                                 },
-                                                loops::LoopCommand::Schedule {goal, arguments} => {
-                                                    let trigger=loops::TimerSchedule::parse(arguments)?.apply(agent,chat,goal).await?;
-                                                    print_trigger(console,&trigger)?;
-                                                },
                                                 _ => unreachable!(),
                                             }
                                             Ok::<_,String>(())
@@ -6026,11 +6018,6 @@ async fn trigger_control(
         id: uuid::Uuid::new_v4(),
         prompt: String::new(),
         prompt_source: TriggerPromptSource::Explicit,
-        schedule: None,
-        armed_at_ms: None,
-        last_fired_at_ms: None,
-        confirmation: None,
-        expires_at_ms: None,
         accepts_events: false,
         armed: true,
         subscriptions: Vec::new(),
@@ -6134,31 +6121,6 @@ async fn parse_after_turn(
                 },
             })
         }
-        "/loops" => {
-            let loops::LoopCommand::Schedule { goal, arguments } =
-                loops::LoopCommand::parse(command).map_err(invalid)?
-            else {
-                return Err(invalid(
-                    "only timer scheduling is an after-turn Loop command",
-                ));
-            };
-            let schedule = loops::TimerSchedule::parse(arguments).map_err(invalid)?;
-            let snapshot = agent.snapshot(chat).await?;
-            let current = snapshot
-                .loops
-                .iter()
-                .find(|item| item.id == goal)
-                .ok_or_else(|| AccessError::not_found("Loop does not exist"))?
-                .trigger
-                .clone();
-            let trigger = schedule.prepare(current).map_err(AccessError::invalid)?;
-            Ok(AfterTurnAction::Loop {
-                action: LoopAction::ConfigureTrigger {
-                    loop_id: goal,
-                    trigger: Some(trigger),
-                },
-            })
-        }
         "/clear-trigger" => Ok(AfterTurnAction::Loop {
             action: LoopAction::ConfigureTrigger {
                 loop_id: selected_loop.ok_or_else(|| invalid("select a Loop first"))?,
@@ -6195,11 +6157,6 @@ async fn parse_after_turn(
                     id: uuid::Uuid::new_v4(),
                     prompt: String::new(),
                     prompt_source: TriggerPromptSource::Explicit,
-                    schedule: None,
-                    armed_at_ms: None,
-                    last_fired_at_ms: None,
-                    confirmation: None,
-                    expires_at_ms: None,
                     accepts_events: false,
                     armed: true,
                     subscriptions: Vec::new(),
@@ -6233,15 +6190,6 @@ async fn parse_after_turn(
     }
 }
 
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn print_trigger(console: &Console, trigger: &Trigger) -> Result<(), String> {
     outln!(
         console,
@@ -6250,16 +6198,6 @@ fn print_trigger(console: &Console, trigger: &Trigger) -> Result<(), String> {
         trigger.armed,
         trigger.accepts_events
     );
-    if let Some(schedule) = &trigger.schedule {
-        outln!(console, "{}", loops::schedule_line(schedule));
-    }
-    if let Some(expiry) = trigger.expires_at_ms {
-        outln!(
-            console,
-            "Expires in {} seconds.",
-            expiry.saturating_sub(current_time_ms()) / 1000
-        );
-    }
     outln!(console, "Prompt: {}", safe_text(&trigger.prompt));
     Ok(())
 }
@@ -9113,12 +9051,7 @@ mod tests {
                 "{command}"
             );
         }
-        for command in [
-            "/compact",
-            "/cwd elsewhere",
-            "/add-dir ../shared",
-            "/loops schedule 00000000-0000-0000-0000-000000000000 60 check",
-        ] {
+        for command in ["/compact", "/cwd elsewhere", "/add-dir ../shared"] {
             assert_eq!(
                 command_timing(command),
                 CommandTiming::AfterTurn,

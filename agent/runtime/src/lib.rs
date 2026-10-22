@@ -30,11 +30,9 @@ mod harness;
 pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
 
 pub use harness::{
-    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL,
-    PersonWait, PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
-    durable_chat_host_rules,
+    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
+    Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits, durable_chat_host_rules,
 };
-pub use triggers::ScheduleDecision;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -339,10 +337,6 @@ struct Inner {
     search: SearchDefaults,
     host_options: AgentHostOptions,
     waits: WaitHosting,
-    /// The shortest time a Trigger's schedule may leave between two runs.
-    min_schedule_interval: std::time::Duration,
-    /// The wall clock Trigger schedules run on.
-    schedule_clock: triggers::ScheduleClock,
     /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
     config_root: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
@@ -382,8 +376,6 @@ struct Inner {
     closed: AtomicBool,
     upgrade_paused: AtomicBool,
     upgrade_adopted: AtomicBool,
-    /// The latest scheduled time each armed Trigger's timer has tried, fired or passed.
-    trigger_tried_through: std::sync::Mutex<HashMap<(ChatId, LoopId), u64>>,
     upgrade_gate: Arc<tokio::sync::RwLock<()>>,
     upgrade_guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
     upgrade_restore: Mutex<Option<upgrade::AgentUpgradeCheckpoint>>,
@@ -558,8 +550,6 @@ struct SubmissionOptions {
     directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
     ledger: Option<lifecycle::LedgerInput>,
-    /// The scheduled time, in Unix milliseconds, a Trigger's timer fires for.
-    scheduled_for: Option<u64>,
     turn: TurnAdmission,
 }
 
@@ -1693,8 +1683,7 @@ impl Agent {
             }
             Ok(stopped.operations)
         } else {
-            self.end_goal(chat_id, loop_id, LoopState::Stopped, None)
-                .await
+            self.end_goal(chat_id, loop_id).await
         }
     }
 
@@ -1845,7 +1834,6 @@ impl Agent {
             tools: tool_policy,
             host_rules,
             task_tools,
-            min_schedule_interval,
             waits,
             system_prompt_addition,
             citation_style,
@@ -1872,8 +1860,6 @@ impl Agent {
                 search,
                 host_options,
                 waits,
-                min_schedule_interval,
-                schedule_clock: triggers::ScheduleClock::new(),
                 config_root,
                 settings_writes: Mutex::new(()),
                 task_tools_enabled: AtomicBool::new(task_tools_enabled),
@@ -1901,7 +1887,6 @@ impl Agent {
                 closed: AtomicBool::new(false),
                 upgrade_paused: AtomicBool::new(false),
                 upgrade_adopted: AtomicBool::new(false),
-                trigger_tried_through: std::sync::Mutex::new(HashMap::new()),
                 upgrade_gate: Arc::new(tokio::sync::RwLock::new(())),
                 upgrade_guard: Mutex::new(None),
                 upgrade_restore: Mutex::new(None),
@@ -2526,7 +2511,6 @@ impl Agent {
             directed_human,
             goal_title,
             ledger,
-            scheduled_for,
             mut turn,
         } = options;
         let is_feedback = feedback_input.is_some();
@@ -2543,11 +2527,6 @@ impl Agent {
             let (id, op) = match (&agent_message, &directed_human) {
                 (Some(source), _) => (source.message_id, InputOp::AgentMessage),
                 (_, Some(source)) => (source.message_id, InputOp::AgentMessage),
-                // A timer's fire is named by its scheduled time, so every host fires it once.
-                _ if let (Some(scheduled), Some(loop_id)) = (scheduled_for, goal) => (
-                    tickloop_agent_transcript::input_ids::trigger(loop_id, scheduled),
-                    InputOp::Trigger,
-                ),
                 _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
                 _ => (Uuid::new_v4(), InputOp::Continue),
             };
@@ -2755,28 +2734,17 @@ impl Agent {
                 "goal has ended; create a new goal".into(),
             ));
         }
-        let resume_watcher =
-            if trigger_source.is_none() && chat.snapshot.resume_triggers.contains(&loop_id) {
-                let trigger = goal
-                    .trigger
-                    .as_mut()
-                    .ok_or_else(|| AgentError::Invalid("restored trigger is unavailable".into()))?;
-                if trigger.expires_at_ms.is_some_and(|deadline| {
-                    deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
-                }) {
-                    return Err(AgentError::Invalid(
-                        "goal deadline has passed; create a new goal".into(),
-                    ));
-                }
-                trigger.arm_at(self.inner.schedule_clock.now_ms());
-                let trigger = trigger.clone();
-                chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
-                let cancel = CancellationToken::new();
-                chat.trigger_cancellations.insert(loop_id, cancel.clone());
-                Some((trigger, cancel))
-            } else {
-                None
-            };
+        let resumes_trigger =
+            trigger_source.is_none() && chat.snapshot.resume_triggers.contains(&loop_id);
+        if resumes_trigger {
+            goal.trigger
+                .as_mut()
+                .ok_or_else(|| AgentError::Invalid("restored trigger is unavailable".into()))?
+                .armed = true;
+            chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
+            chat.trigger_cancellations
+                .insert(loop_id, CancellationToken::new());
+        }
         let is_manual_tick = trigger_source
             .as_ref()
             .is_some_and(|source| source.source == TICK_MANUAL_SOURCE);
@@ -2808,30 +2776,13 @@ impl Agent {
                             .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
                 })
                 .map(|pending| pending.receipt.clone());
-            // A fire deals with its scheduled time. So does a durable host when the Loop cannot
-            // take it or a fire is already queued: the next host does not fire it again. Locally
-            // the timer alone keeps track of those.
-            let fires = is_eligible && pending_receipt.is_none();
-            if let Some(scheduled) = scheduled_for
-                && (fires || self.inner.waits == WaitHosting::Durable)
-                && let Some(trigger) = &mut goal.trigger
-            {
-                trigger.note_scheduled(scheduled);
-            }
             if !is_eligible {
-                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
-                    *original = candidate;
-                    self.save(&original.snapshot);
-                }
                 return Err(AgentError::Invalid(
                     "goal is not eligible for a trigger".into(),
                 ));
             }
             if let Some(pending_receipt) = pending_receipt {
                 *original = candidate;
-                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
-                    self.save(&original.snapshot);
-                }
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
                 if let Some(next) = next {
@@ -2941,9 +2892,8 @@ impl Agent {
                 return Err(error);
             }
         };
-        if let Some((trigger, cancel)) = resume_watcher {
-            self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
-                .await;
+        if resumes_trigger {
+            self.record_armed_trigger(chat_id, loop_id).await;
             self.sync_tick_subscriptions().await;
         }
         if let Some(tools) = watch {
@@ -3086,7 +3036,6 @@ impl Agent {
                 has_folder: chat.snapshot.folder.is_some(),
                 tools: self.inner.tool_policy,
                 waits: self.inner.waits,
-                min_schedule_interval: self.inner.min_schedule_interval,
                 host_section: self.inner.system_prompt_addition.as_deref(),
                 citation_style: self.inner.citation_style,
             };

@@ -190,7 +190,7 @@ impl Agent {
         let mut errors = Vec::new();
         for (id, parent, loops, commands, shells) in &members {
             for loop_id in loops {
-                match self.end_goal(*id, *loop_id, LoopState::Stopped, None).await {
+                match self.end_goal(*id, *loop_id).await {
                     Ok(operations) => unknown.extend(operations),
                     Err(error) => errors.push(SubagentStopFailure {
                         chat_id: *id,

@@ -8,8 +8,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, CommandState, Content, Event, EventKind, LoopState, Message, Role,
-    Trigger, TriggerPromptSource, UserShellState,
+    ChatId, ChatSnapshot, CommandState, Content, Event, EventKind, Message, Role, UserShellState,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
@@ -684,61 +683,6 @@ async fn compaction_is_rejected_while_a_foreground_shell_is_running() {
         snapshot.conversation_messages().unwrap() == expected
     })
     .await;
-    agent.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_expired_loop_cancels_its_model_request_without_interrupt_messages() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(StreamingModel::new(vec![Reply {
-        deltas: vec![ModelDelta::Text("部分回答".into())],
-        finish: CancellationToken::new(),
-        content: text("never committed"),
-    }]));
-    let agent = Agent::new_embedded(config(), model);
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Watch until the deadline".into())
-        .await
-        .unwrap();
-    wait_for(
-        &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == "部分回答"),
-    )
-    .await;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    agent
-        .configure_trigger(
-            chat,
-            receipt.loop_id,
-            Some(Trigger {
-                id: uuid::Uuid::new_v4(),
-                prompt: "check".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                schedule: None,
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: Some(now_ms + 100),
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    wait_for(&mut events, |kind| matches!(kind, EventKind::Interrupted)).await;
-
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::Expired);
-    assert_eq!(
-        snapshot.conversation_messages().unwrap(),
-        vec![user("Watch until the deadline")]
-    );
     agent.shutdown().await;
 }
 

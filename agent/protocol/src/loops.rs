@@ -1,8 +1,7 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ChatId, LoopId, Recurrence, RunId, TickSubscription};
+use crate::{ChatId, LoopId, RunId, TickSubscription};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoopState {
@@ -67,78 +66,18 @@ pub struct EventSourceBinding {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(from = "TriggerRecord")]
 pub struct Trigger {
     pub id: Uuid,
     pub prompt: String,
-    pub prompt_source: TriggerPromptSource,
-    /// When the Trigger fires by the clock; `None` fires on explicit events only.
-    pub schedule: Option<Recurrence>,
-    pub expires_at_ms: Option<u64>,
-    pub accepts_events: bool,
-    pub armed: bool,
-    /// Unix milliseconds when the Trigger was last armed: until it first fires, an `every`
-    /// schedule counts its intervals from here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub armed_at_ms: Option<u64>,
-    /// Unix milliseconds of the latest scheduled time the Loop has dealt with since it was
-    /// armed: one that fired, merged into a fire already queued, or found the Loop unable to
-    /// take it. A later time is due once the clock reaches it; earlier ones never fire again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_fired_at_ms: Option<u64>,
-    /// Whether the user confirmed a schedule the model created; `None` for one the user made.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirmation: Option<ScheduleConfirmation>,
-    /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
-    pub subscriptions: Vec<TickSubscription>,
-}
-
-/// A Trigger as records hold it. Records written before schedules held a whole number of
-/// seconds in `interval_seconds`, which reads as `every <N>s`.
-#[derive(Deserialize)]
-struct TriggerRecord {
-    id: Uuid,
-    prompt: String,
     /// Records written before the source was kept read as explicit, the way they were
     /// delivered.
     #[serde(default)]
-    prompt_source: TriggerPromptSource,
+    pub prompt_source: TriggerPromptSource,
+    pub accepts_events: bool,
+    pub armed: bool,
+    /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
     #[serde(default)]
-    schedule: Option<Recurrence>,
-    #[serde(default)]
-    interval_seconds: Option<u64>,
-    expires_at_ms: Option<u64>,
-    accepts_events: bool,
-    armed: bool,
-    #[serde(default)]
-    armed_at_ms: Option<u64>,
-    #[serde(default)]
-    last_fired_at_ms: Option<u64>,
-    #[serde(default)]
-    confirmation: Option<ScheduleConfirmation>,
-    #[serde(default)]
-    subscriptions: Vec<TickSubscription>,
-}
-
-impl From<TriggerRecord> for Trigger {
-    fn from(record: TriggerRecord) -> Self {
-        let legacy_schedule = record
-            .interval_seconds
-            .and_then(|seconds| Recurrence::parse(&format!("every {seconds}s")).ok());
-        Self {
-            id: record.id,
-            prompt: record.prompt,
-            prompt_source: record.prompt_source,
-            schedule: record.schedule.or(legacy_schedule),
-            expires_at_ms: record.expires_at_ms,
-            accepts_events: record.accepts_events,
-            armed: record.armed,
-            armed_at_ms: record.armed_at_ms,
-            last_fired_at_ms: record.last_fired_at_ms,
-            confirmation: record.confirmation,
-            subscriptions: record.subscriptions,
-        }
-    }
+    pub subscriptions: Vec<TickSubscription>,
 }
 
 impl Trigger {
@@ -149,13 +88,8 @@ impl Trigger {
             id: Uuid::new_v4(),
             prompt: goal.to_owned(),
             prompt_source: TriggerPromptSource::LoopGoal,
-            schedule: None,
-            expires_at_ms: None,
             accepts_events: true,
             armed: true,
-            armed_at_ms: None,
-            last_fired_at_ms: None,
-            confirmation: None,
             subscriptions: Vec::new(),
         }
     }
@@ -166,78 +100,6 @@ impl Trigger {
         self.prompt = prompt;
         self.prompt_source = TriggerPromptSource::Explicit;
     }
-
-    /// Whether the schedule waits for the user to confirm it before it may run.
-    pub fn awaits_confirmation(&self) -> bool {
-        self.confirmation == Some(ScheduleConfirmation::Pending)
-    }
-
-    /// Arms the Trigger at `now_ms`: its schedule counts afresh from here.
-    pub fn arm_at(&mut self, now_ms: u64) {
-        self.armed = true;
-        self.armed_at_ms = Some(now_ms);
-        self.last_fired_at_ms = None;
-    }
-
-    /// The first scheduled time after the latest one the Loop dealt with, which may be past
-    /// already; `None` without a schedule, for a Trigger never armed, or when the schedule has
-    /// no further time.
-    pub fn next_scheduled_ms(&self) -> Option<u64> {
-        let anchor = self.schedule_anchor()?;
-        to_ms(self.schedule?.next_after_previous(anchor, anchor)?)
-    }
-
-    /// The first scheduled time after both the latest one the Loop dealt with and `after_ms`.
-    pub fn next_scheduled_after_ms(&self, after_ms: u64) -> Option<u64> {
-        let anchor = self.schedule_anchor()?;
-        let after = from_ms(after_ms)?.max(anchor);
-        to_ms(self.schedule?.next_after_previous(anchor, after)?)
-    }
-
-    /// The scheduled time a fire at `until_ms` stands for: the latest one due by then that the
-    /// Loop has not dealt with. The ones before it were missed and never fire.
-    pub fn due_scheduled_ms(&self, until_ms: u64) -> Option<u64> {
-        let anchor = self.schedule_anchor()?;
-        to_ms(
-            self.schedule?
-                .latest_after_previous(anchor, from_ms(until_ms)?)?,
-        )
-    }
-
-    /// Records that the Loop dealt with the scheduled time `scheduled_ms`; an earlier time than
-    /// one already dealt with changes nothing.
-    pub fn note_scheduled(&mut self, scheduled_ms: u64) {
-        self.last_fired_at_ms = Some(
-            self.last_fired_at_ms
-                .map_or(scheduled_ms, |last| last.max(scheduled_ms)),
-        );
-    }
-
-    /// Where the schedule's grid counts from: the latest scheduled time dealt with, or else when
-    /// the Trigger was armed.
-    fn schedule_anchor(&self) -> Option<DateTime<Utc>> {
-        from_ms(self.last_fired_at_ms.or(self.armed_at_ms)?)
-    }
-}
-
-fn from_ms(milliseconds: u64) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(i64::try_from(milliseconds).ok()?)
-}
-
-fn to_ms(time: DateTime<Utc>) -> Option<u64> {
-    u64::try_from(time.timestamp_millis()).ok()
-}
-
-/// Where a schedule the model created stands with the user: it runs only once confirmed.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", tag = "state")]
-pub enum ScheduleConfirmation {
-    /// Waits for the user; the Trigger stays disarmed meanwhile.
-    Pending,
-    /// The user confirmed it at `at_ms`, in Unix milliseconds.
-    Confirmed { at_ms: u64 },
-    /// The user rejected it at `at_ms`, which stopped its Loop.
-    Rejected { at_ms: u64 },
 }
 
 /// Where a Trigger's prompt came from, which decides how a firing presents it.

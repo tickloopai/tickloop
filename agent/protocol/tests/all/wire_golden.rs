@@ -402,8 +402,6 @@ fn chat_snapshot() -> ChatSnapshot {
                 "id": id(0x30),
                 "prompt": "Report changes",
                 "prompt_source": "LoopGoal",
-                "schedule": "every 1m",
-                "expires_at_ms": null,
                 "accepts_events": true,
                 "armed": true,
             },
@@ -588,8 +586,6 @@ fn agent_commands_keep_their_recorded_wire() {
                         serde_json::from_value(json!({
                             "id": id(0x30),
                             "prompt": "Report changes",
-                            "schedule": "every 1m",
-                            "expires_at_ms": null,
                             "accepts_events": true,
                             "armed": true,
                             "subscriptions": [{

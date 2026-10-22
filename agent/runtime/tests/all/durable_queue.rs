@@ -233,7 +233,7 @@ async fn a_lost_answer_continues_before_the_inputs_queued_behind_it() {
         Step::Reply(text("second answer")),
     ]);
     let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    next.wake(chat, None).await.unwrap();
+    next.resume_chat(chat).await.unwrap();
     assert!(matches!(
         settled(&next, chat, queued.input_id).await,
         SettledOutcome::Completed { .. }
@@ -247,7 +247,7 @@ async fn a_lost_answer_continues_before_the_inputs_queued_behind_it() {
     assert!(requests[0].contains("first prompt") && !requests[0].contains("second prompt"));
     assert!(requests[1].contains("first answer") && requests[1].contains("second prompt"));
     // Waking a Chat this instance holds loads nothing again.
-    next.wake(chat, None).await.unwrap();
+    next.resume_chat(chat).await.unwrap();
     assert_eq!(model.requests().len(), 2);
     next.shutdown().await;
     first.shutdown().await;
@@ -269,7 +269,7 @@ async fn the_third_lost_host_in_a_row_fails_the_input_and_a_handover_does_not_co
         for _ in 0..2 {
             let model = Script::new(vec![Step::Hang]);
             let holder = harness(store.clone(), model.clone(), WaitHosting::Durable);
-            holder.wake(chat, None).await.unwrap();
+            holder.resume_chat(chat).await.unwrap();
             model.until_holding().await;
             store = lost_holder(&holder, &store, chat).await;
             holders.push(holder);
@@ -297,7 +297,7 @@ async fn the_third_lost_host_in_a_row_fails_the_input_and_a_handover_does_not_co
         }
         let model = Script::new(vec![Step::Reply(text("done at last"))]);
         let last = harness(store.clone(), model.clone(), WaitHosting::Durable);
-        last.wake(chat, None).await.unwrap();
+        last.resume_chat(chat).await.unwrap();
         let outcome = settled(&last, chat, input.input_id).await;
         if with_handover {
             assert!(
@@ -363,7 +363,7 @@ async fn a_goal_queued_for_itself_is_queued_again_only_under_durable_waits() {
             Step::Reply(text("goal done")),
         ]);
         let next = harness(store.clone(), model.clone(), waits);
-        next.wake(chat, None).await.unwrap();
+        next.resume_chat(chat).await.unwrap();
         match waits {
             WaitHosting::Process => {
                 next.sync().await.unwrap();

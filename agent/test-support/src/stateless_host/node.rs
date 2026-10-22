@@ -5,14 +5,14 @@
 //!    its input settled or waits for a person, or for an answer or a delivery once it was
 //!    accepted; `sync` succeeded first, and every event through the commit it reflects is
 //!    published with no marker owed.
-//! 2. `wake`, `takeover` and `handover` tasks load the family with `wake(root, due_at)` and are
+//! 2. `takeover` and `handover` tasks load the family with `resume_chat(root)` and are
 //!    acknowledged when the holding ends. Every heartbeat renews the lease and extends the claim
 //!    of every task the holding has not acknowledged.
 //! 3. The holding ends once the family is quiet and no task is queued: `shutdown → sync →
 //!    drain`, then the remaining acknowledgements, what the family waits on, and the release.
 //! 4. At the holding-time cap or on SIGTERM the holding hands the family over:
 //!    `hand_over(ceiling)`, then `handover:{root}:{epoch}`; a turn task whose input neither
-//!    settled nor waits is given back without counting the delivery, and the handover wake goes
+//!    settled nor waits is given back without counting the delivery, and the handover task goes
 //!    on with it.
 //! 5. A holder that crashes, panics included, writes, acknowledges and releases nothing more;
 //!    the scheduler's sweep takes the family over once the lease expired.
@@ -280,8 +280,7 @@ impl Holding {
             }
             Ok(FamilyEnd::HandedOver(handover)) => {
                 report.end = HoldingEnd::HandedOver(handover);
-                // The handover wake writes what the family waits on next; an earlier `wake_at`
-                // would only wake it again under this release's key.
+                // The handover task's holding writes what the family waits on next.
                 self.shared.chats.finish_holding(&lease, Some(None));
             }
             Err(halt) => {
@@ -394,14 +393,14 @@ impl Holding {
         root: ChatId,
         kind: TaskKind,
     ) -> Result<ClaimedWork, Halt> {
-        let due_at = match kind {
+        match kind {
             TaskKind::Turn { member, request } => {
                 let request = *request;
                 let target = member.unwrap_or(root);
                 let input = request.input_id;
                 let is_done_once_accepted =
                     matches!(request.op, TurnOp::Answer { .. } | TurnOp::Deliver { .. });
-                return match self.guarded(agent.advance(target, request)).await? {
+                match self.guarded(agent.advance(target, request)).await? {
                     Ok(turn) => Ok(ClaimedWork::Turn {
                         target,
                         input,
@@ -416,15 +415,15 @@ impl Holding {
                         Ok(ClaimedWork::Refused(error.to_string()))
                     }
                     Err(error) => Err(self.agent_failure(error)),
-                };
+                }
             }
-            TaskKind::Wake { due_at } => due_at,
-            TaskKind::Takeover | TaskKind::Handover => None,
-        };
-        self.guarded(agent.wake(root, due_at))
-            .await?
-            .map_err(|error| self.agent_failure(error))?;
-        Ok(ClaimedWork::AtHoldingEnd)
+            TaskKind::Takeover | TaskKind::Handover => {
+                self.guarded(agent.resume_chat(root))
+                    .await?
+                    .map_err(|error| self.agent_failure(error))?;
+                Ok(ClaimedWork::AtHoldingEnd)
+            }
+        }
     }
 
     /// Acknowledges every turn task that is done, after `sync` and once everything through the

@@ -70,15 +70,6 @@ async fn completed(events: &mut broadcast::Receiver<Event>) {
 
 #[tokio::test]
 async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
-    triggered_request_after_logout(None).await;
-}
-
-#[tokio::test]
-async fn timed_loop_after_logout_fails_and_does_not_resume_automatically() {
-    triggered_request_after_logout(Some(1)).await;
-}
-
-async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
     let (_directory, state) = state_with_credentials();
     let (endpoint, observed) = serve_scripted_responses(vec![(200, text_stream())]).await;
     let agent = Agent::open_embedded(state.clone(), config(), client(&state, &endpoint)).unwrap();
@@ -102,14 +93,6 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
                 id: Uuid::new_v4(),
                 prompt: "Check fresh evidence".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                schedule: interval_seconds.map(|seconds| {
-                    tickloop_agent_protocol::Recurrence::parse(&format!("every {seconds}s"))
-                        .unwrap()
-                }),
-                expires_at_ms: None,
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
                 accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),
@@ -121,12 +104,10 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
         source: "test-tick".into(),
         payload: json!({"sequence": 1}),
     };
-    if interval_seconds.is_none() {
-        agent
-            .trigger(chat, receipt.loop_id, source())
-            .await
-            .unwrap();
-    }
+    agent
+        .trigger(chat, receipt.loop_id, source())
+        .await
+        .unwrap();
     loop {
         if let EventKind::Failed(error) =
             tokio::time::timeout(Duration::from_secs(8), events.recv())

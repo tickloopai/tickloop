@@ -534,24 +534,19 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
 async fn restored_loops_are_interrupted_and_triggers_disarmed() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let model = SequenceModel::new(vec![Some(text("scheduled")), None]);
+    let model = SequenceModel::new(vec![Some(text("watching")), None]);
     let original = Agent::open_embedded(root.clone(), config(), model).unwrap();
     let chat = original.create_chat(directory.path().into()).await.unwrap();
-    let scheduled = complete_turn(&original, chat, None, "schedule a check").await;
+    let watching = complete_turn(&original, chat, None, "watch for events").await;
     original
         .configure_trigger(
             chat,
-            scheduled.loop_id,
+            watching.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
-                prompt: "periodic check".into(),
+                prompt: "event check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1h").unwrap()),
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: None,
-                accepts_events: false,
+                accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),
             }),
@@ -571,30 +566,30 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
         LoopState::Running
     );
     assert_eq!(
-        state_of(&live.loops, scheduled.loop_id).state,
+        state_of(&live.loops, watching.loop_id).state,
         LoopState::WaitingTrigger
     );
     original.flush_transcripts().await;
 
     // 原进程仍在运行时，另一个实例恢复同一 Chat。
-    let resumed_model = Arc::new(ScriptedModel::new(vec![text("schedule resumed")]));
+    let resumed_model = Arc::new(ScriptedModel::new(vec![text("trigger resumed")]));
     let other = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
     let restored = other.resume_chat(chat).await.unwrap();
     assert_eq!(
         state_of(&restored.loops, running.loop_id).state,
         LoopState::Interrupted
     );
-    let restored_schedule = state_of(&restored.loops, scheduled.loop_id);
-    assert_eq!(restored_schedule.state, LoopState::Interrupted);
-    assert!(!restored_schedule.trigger.unwrap().armed);
-    assert!(restored.resume_triggers.contains(&scheduled.loop_id));
+    let restored_watch = state_of(&restored.loops, watching.loop_id);
+    assert_eq!(restored_watch.state, LoopState::Interrupted);
+    assert!(!restored_watch.trigger.unwrap().armed);
+    assert!(restored.resume_triggers.contains(&watching.loop_id));
     assert!(resumed_model.requests.lock().unwrap().is_empty());
 
-    complete_turn(&other, chat, Some(scheduled.loop_id), "resume the schedule").await;
+    complete_turn(&other, chat, Some(watching.loop_id), "resume the trigger").await;
     let rearmed = other.snapshot(chat).await.unwrap();
-    let schedule = state_of(&rearmed.loops, scheduled.loop_id);
-    assert!(schedule.trigger.unwrap().armed);
-    assert_eq!(schedule.state, LoopState::WaitingTrigger);
+    let watch = state_of(&rearmed.loops, watching.loop_id);
+    assert!(watch.trigger.unwrap().armed);
+    assert_eq!(watch.state, LoopState::WaitingTrigger);
     other.shutdown().await;
     original.shutdown().await;
 }

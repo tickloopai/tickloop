@@ -56,8 +56,6 @@ enum ToolRoute {
 struct DispatchGrant {
     /// The host authority a Tick watch was admitted under.
     watch_authority: Option<HostToolAuthority>,
-    /// Whether a person approved the call: their confirmation of a schedule it creates.
-    was_approved_by_human: bool,
 }
 
 enum PreparedLocalCall {
@@ -718,7 +716,6 @@ impl Agent {
                     &operation.call_id,
                     &operation.name,
                     &operation.input,
-                    grant.was_approved_by_human,
                     cancel,
                 )
                 .await
@@ -1253,15 +1250,10 @@ impl Agent {
             // only a Deny rule or a host without prompts refuses it without asking.
             let requires_plan_mode_consent =
                 name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
-            // A schedule the model creates runs only once the user confirms it: here the prompt
-            // confirms it, while a durable host registers it to await the user's decision. A
-            // process host without prompts has no one to confirm it and refuses it.
-            let requires_schedule_consent = crate::interaction::creates_schedule(&name, &input)
-                && self.inner.waits != WaitHosting::Durable;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
-                _ if requires_plan_mode_consent || requires_schedule_consent => Decision::Ask,
+                _ if requires_plan_mode_consent => Decision::Ask,
                 Decision::Ask
                     if execution_mode == ExecutionMode::Auto
                         && !explicit_ask
@@ -1278,7 +1270,6 @@ impl Agent {
             let mut decision = self.apply_prompt_policy_with_explicit_ask(
                 decision,
                 explicit_ask
-                    || requires_schedule_consent
                     || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation),
             );
             // A write to an Artifact with provenance needs no review; rules still decide.
@@ -1299,8 +1290,6 @@ impl Agent {
                     "an explicit Ask rule requires human approval"
                 } else if requires_plan_mode_consent {
                     "entering plan mode requires the user's confirmation"
-                } else if requires_schedule_consent {
-                    "a schedule the Agent creates runs only once the user confirms it"
                 } else {
                     "the permission policy requires human approval"
                 },
@@ -1659,10 +1648,7 @@ impl Agent {
                                     .as_ref()
                                     .expect("registered local or Host tool"),
                                 prepared_local.as_ref(),
-                                DispatchGrant {
-                                    watch_authority,
-                                    was_approved_by_human,
-                                },
+                                DispatchGrant { watch_authority },
                                 cancel.clone(),
                             )
                             .await

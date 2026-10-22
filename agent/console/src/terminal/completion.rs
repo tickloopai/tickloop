@@ -180,7 +180,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/loops",
         arguments: "[ACTION|GOAL_ID]",
-        description: "Manage goals, their triggers and local timers in this Chat.",
+        description: "Manage goals and their triggers in this Chat.",
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {

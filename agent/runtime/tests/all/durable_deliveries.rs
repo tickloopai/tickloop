@@ -129,7 +129,7 @@ async fn bound_chat_at(
     }
     store.seed(chat, lines, StorePosition(1));
     let agent = harness(store, model, WaitHosting::Durable);
-    agent.wake(chat, None).await.unwrap();
+    agent.resume_chat(chat).await.unwrap();
     (agent, chat, target)
 }
 
@@ -566,7 +566,7 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     durable.seed(chat, lines.clone(), StorePosition(1));
     let model = Script::new(Vec::new());
     let next = harness(durable, model.clone(), WaitHosting::Durable);
-    next.wake(chat, None).await.unwrap();
+    next.resume_chat(chat).await.unwrap();
     let goal = next.snapshot(chat).await.unwrap().loops[0].clone();
     assert_eq!(goal.state, LoopState::WaitingTrigger);
     assert!(!goal.event_sources[0].resume_required);
@@ -591,7 +591,7 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     let local = Arc::new(InMemoryTranscriptStore::new());
     local.seed(chat, lines, StorePosition(1));
     let worker = harness(local, Script::new(Vec::new()), WaitHosting::Process);
-    worker.wake(chat, None).await.unwrap();
+    worker.resume_chat(chat).await.unwrap();
     let goal = worker.snapshot(chat).await.unwrap().loops[0].clone();
     assert_eq!(goal.state, LoopState::Interrupted);
     assert!(goal.event_sources[0].resume_required);

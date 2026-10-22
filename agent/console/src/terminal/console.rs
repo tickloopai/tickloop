@@ -4228,22 +4228,6 @@ impl Console {
         )
     }
 
-    pub(super) fn prepare_command(&self, command: String) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if !state.editor.draft().is_empty() {
-            return Err(
-                "Input already has a draft. Keep or clear it before configuring a timer.".into(),
-            );
-        }
-        let cursor = command.len();
-        state.replace_draft(command, cursor);
-        state.status =
-            "Edit timer command · enter save · ctrl+g external editor · ctrl+c cancel".into();
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
     pub fn show_reviewable_menu(
         &self,
         menu: Menu,
@@ -17196,24 +17180,6 @@ mod tests {
                 ..
             }) if menu_id == replacement_menu_id
         ));
-    }
-
-    #[test]
-    fn prepared_timer_commands_use_normal_editing_and_preserve_existing_drafts() {
-        let mut state = State::new(true, 100, 32);
-        state.prompt_enabled = true;
-        let console = InteractiveConsoleFixture::new(state);
-        let command = "/loops schedule 00000000-0000-0000-0000-000000000001 60 review";
-        console.prepare_command(command.into()).unwrap();
-        assert!(console.prepare_command("replacement".into()).is_err());
-        let mut state = console.state.lock().unwrap();
-        assert_eq!(state.editor.draft(), command);
-        assert!(state.can_edit_in_external_editor());
-        state.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(state.editor.draft(), "");
-        state.key(key(KeyCode::Char('j')));
-        state.key(key(KeyCode::Char('k')));
-        assert_eq!(state.editor.draft(), "jk");
     }
 
     #[test]

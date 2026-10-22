@@ -169,14 +169,13 @@ pub fn project(lines: &[Line]) -> Vec<DisplayNode> {
     projector.nodes().cloned().collect()
 }
 
-/// A Loop's latest recorded state; schedule times come from its Trigger's durable grid.
+/// A Loop's latest recorded state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayLoop {
     pub id: Uuid,
     pub goal: String,
     pub state: LoopState,
     pub trigger: Option<Trigger>,
-    pub next_scheduled_ms: Option<u64>,
     pub trigger_awaits_resume: bool,
     pub state_since: Option<u64>,
     pub run_started_at: Option<u64>,
@@ -203,26 +202,11 @@ pub fn loops(lines: &[Line]) -> Vec<DisplayLoop> {
             let trigger = record
                 .trigger
                 .and_then(|value| serde_json::from_value::<Trigger>(value).ok());
-            let next_scheduled_ms = trigger
-                .as_ref()
-                .filter(|trigger| {
-                    trigger.armed
-                        && !record.trigger_awaits_resume
-                        && !matches!(
-                            state,
-                            LoopState::Completed
-                                | LoopState::Failed
-                                | LoopState::Expired
-                                | LoopState::Stopped
-                        )
-                })
-                .and_then(Trigger::next_scheduled_ms);
             Some(DisplayLoop {
                 id: record.loop_id,
                 goal: record.goal,
                 state,
                 trigger,
-                next_scheduled_ms,
                 trigger_awaits_resume: record.trigger_awaits_resume,
                 state_since: record.state_since.and_then(|value| value.as_u64()),
                 run_started_at: record.run_started_at,

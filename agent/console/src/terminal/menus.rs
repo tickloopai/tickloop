@@ -755,51 +755,6 @@ impl Menus {
         self.help(console, Some(COMMAND_GROUPS.len()))
     }
 
-    async fn edit_loop_timer(
-        &mut self,
-        agent: &Agent,
-        console: &Console,
-        chat: Uuid,
-        goal: Uuid,
-    ) -> Result<(), String> {
-        let snapshot = agent
-            .snapshot(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let selected = snapshot
-            .loops
-            .iter()
-            .find(|item| item.id == goal)
-            .ok_or("The selected goal no longer exists.")?;
-        let trigger = selected.trigger.as_ref();
-        // An `every` schedule is edited as seconds; a wall-clock rule keeps its own text.
-        let schedule = trigger.and_then(|trigger| trigger.schedule).map_or_else(
-            || "60".to_owned(),
-            |schedule| match schedule.interval() {
-                Some(interval) => interval.as_secs().to_string(),
-                None => schedule.to_string(),
-            },
-        );
-        let duration = trigger
-            .and_then(|trigger| trigger.expires_at_ms)
-            .map(|expiry| {
-                format!(
-                    " --for {}",
-                    expiry
-                        .saturating_sub(super::current_time_ms())
-                        .div_ceil(1000)
-                        .max(1)
-                )
-            })
-            .unwrap_or_default();
-        let prompt = trigger
-            .map(|trigger| trigger.prompt.as_str())
-            .filter(|prompt| !prompt.is_empty())
-            .unwrap_or(&selected.goal);
-        console.prepare_command(format!(
-            "/loops schedule {goal} {schedule}{duration} {prompt}"
-        ))
-    }
     pub(super) fn workflow(
         &mut self,
         console: &Console,
@@ -2620,10 +2575,6 @@ impl Menus {
                     if let Some(request) = permission { self.restored_plans.remove(&request); }
                     if let Some(next) = effect.next {
                         self.workflow(console, next)?;
-                    }
-                    if let Some((chat, goal)) = effect.timer {
-                        console.clear_menu(menu_id)?;
-                        self.edit_loop_timer(agent, console, chat, goal).await?;
                     }
                     return Ok(MenuOutcome {
                         permission,

@@ -611,39 +611,6 @@ impl Agent {
         }
     }
 
-    /// Brings the Chat into this instance when it does not hold it yet; a resident Chat is not
-    /// loaded again. With durable wait hosting the load rebuilds its suspended Runs, continues
-    /// the inputs a lost host was answering, queues again what was queued and arms its Triggers
-    /// again. `due_at` is the time the host's scheduler woke the Chat for, such as the
-    /// [`crate::Waits::wake_at`] it was given: across the family, each Trigger fires once for its
-    /// latest time due by then, and each Loop whose deadline came by then ends. A load also
-    /// takes what is due by this instance's clock, should it be later; a family held already
-    /// leaves that to its timers. A time already dealt with does not fire again, so a host
-    /// may wake a Chat as often as it likes.
-    pub async fn wake(
-        &self,
-        chat_id: ChatId,
-        due_at: Option<std::time::SystemTime>,
-    ) -> Result<(), AgentError> {
-        let _admission = self.inner.tasks.token();
-        self.refuse_when_closed()?;
-        let was_resident = self.inner.chats.lock().await.contains_key(&chat_id);
-        self.make_resident(chat_id).await?;
-        let due_at = due_at
-            .and_then(|due_at| due_at.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|due_at| u64::try_from(due_at.as_millis()).unwrap_or(u64::MAX));
-        // A family this instance holds already has its timers on this clock; a wake for a
-        // time from before only adds what the scheduler found due by then.
-        let until = match (due_at, was_resident) {
-            (Some(due_at), true) => due_at,
-            (due_at, _) => {
-                let now = self.inner.schedule_clock.now_ms();
-                due_at.map_or(now, |due_at| due_at.max(now))
-            }
-        };
-        self.fire_due_triggers(chat_id, until).await
-    }
-
     /// Loads a saved Chat this instance does not hold yet.
     pub(crate) async fn make_resident(&self, chat_id: ChatId) -> Result<(), AgentError> {
         if self.inner.chats.lock().await.contains_key(&chat_id) {

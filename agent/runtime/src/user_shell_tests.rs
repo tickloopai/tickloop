@@ -122,7 +122,7 @@ fn config() -> ModelConfig {
 }
 
 #[tokio::test(start_paused = true)]
-async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_again() {
+async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_events_again() {
     let directory = tempfile::tempdir().unwrap();
     let archive = directory.path().join("archive");
     let source = Agent::open_embedded(
@@ -135,14 +135,9 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
     let loop_id = uuid::Uuid::new_v4();
     let trigger = Trigger {
         id: uuid::Uuid::new_v4(),
-        prompt: "scheduled after restart".into(),
+        prompt: "check after restart".into(),
         prompt_source: TriggerPromptSource::Explicit,
-        schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
-        armed_at_ms: None,
-        last_fired_at_ms: None,
-        confirmation: None,
-        expires_at_ms: None,
-        accepts_events: false,
+        accepts_events: true,
         armed: true,
         subscriptions: Vec::new(),
     };
@@ -151,7 +146,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
         let chat = chats.get_mut(&chat_id).unwrap();
         chat.snapshot.loops.push(LoopSnapshot {
             id: loop_id,
-            goal: "persistent schedule".into(),
+            goal: "persistent trigger".into(),
             state: LoopState::WaitingTrigger,
             run_id: None,
             run_started_at: None,
@@ -161,8 +156,8 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
         });
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [
-            (tickloop_agent_protocol::Role::User, "start the schedule"),
-            (tickloop_agent_protocol::Role::Assistant, "scheduled"),
+            (tickloop_agent_protocol::Role::User, "watch for events"),
+            (tickloop_agent_protocol::Role::Assistant, "watching"),
         ] {
             chat.snapshot
                 .messages
@@ -184,7 +179,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             directed_human: None,
             denial_reference: None,
             trigger_source: Some(TriggerSource {
-                source: "timer".into(),
+                source: "manual".into(),
                 payload: serde_json::json!({"trigger_id": trigger.id}),
             }),
             armed: true,
@@ -207,7 +202,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
 
     let mut events = reopened.subscribe();
     let manual = reopened
-        .submit(chat_id, Some(loop_id), "resume this schedule".into())
+        .submit(chat_id, Some(loop_id), "resume this trigger".into())
         .await
         .unwrap();
     loop {
@@ -217,7 +212,17 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
         }
     }
     assert_eq!(model.requests.lock().unwrap().len(), 1);
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    reopened
+        .trigger(
+            chat_id,
+            loop_id,
+            TriggerSource {
+                source: "manual".into(),
+                payload: serde_json::json!({"note": "changed"}),
+            },
+        )
+        .await
+        .unwrap();
     loop {
         let event = events.recv().await.unwrap();
         if event.loop_id == loop_id && matches!(event.kind, EventKind::Completed { .. }) {

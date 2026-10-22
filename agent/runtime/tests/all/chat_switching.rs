@@ -2,7 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
-    BranchRequest, ChatId, EventKind, LoopId, Receipt, ShellTaskState, Trigger, TriggerPromptSource,
+    BranchRequest, ChatId, EventKind, LoopId, Receipt, ShellTaskState, Trigger,
+    TriggerPromptSource, TriggerSource,
 };
 use tickloop_agent_runtime::{Agent, AgentError, ShellTaskCenter};
 use tickloop_agent_test_support::{ScriptedModel, config, next_event, text, transcript_file};
@@ -102,7 +103,7 @@ async fn forking_a_saved_chat_writes_a_new_transcript_and_leaves_the_source_unch
 }
 
 #[tokio::test]
-async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_its_own_chat() {
+async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_its_own_chat() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let model = Arc::new(ScriptedModel::new(vec![
@@ -123,14 +124,9 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
             watch.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
-                prompt: "scheduled market check".into(),
+                prompt: "triggered market check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: None,
-                accepts_events: false,
+                accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),
             }),
@@ -138,17 +134,30 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         .await
         .unwrap();
     complete_turn(&agent, foreground, None, "Foreground question.").await;
-    let mut background_completions = 0;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while background_completions < 2 {
-            let event = events.recv().await.unwrap();
-            if event.chat_id == background && matches!(event.kind, EventKind::Completed { .. }) {
-                background_completions += 1;
+    for sequence in 1..=2 {
+        agent
+            .trigger(
+                background,
+                watch.loop_id,
+                TriggerSource {
+                    source: "market".into(),
+                    payload: serde_json::json!({ "sequence": sequence }),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.chat_id == background && matches!(event.kind, EventKind::Completed { .. })
+                {
+                    break;
+                }
             }
-        }
-    })
-    .await
-    .expect("the background Chat's scheduled Loop stopped firing");
+        })
+        .await
+        .expect("the background Chat's triggered Loop stopped running");
+    }
     agent
         .configure_trigger(background, watch.loop_id, None)
         .await
@@ -160,7 +169,7 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         assert!(background_text.contains(marker), "{background_text}");
         assert!(!foreground_text.contains(marker), "{foreground_text}");
     }
-    assert!(!foreground_text.contains("scheduled market check"));
+    assert!(!foreground_text.contains("triggered market check"));
     agent.shutdown().await;
     drop(agent);
 

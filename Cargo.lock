@@ -4182,25 +4182,13 @@ name = "tickloop-agent-protocol"
 version = "0.2.19"
 dependencies = [
  "async-trait",
- "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "tickloop-agent-recurrence",
  "tickloop-tick-protocol",
  "tokio",
  "unicode-width",
  "uuid",
-]
-
-[[package]]
-name = "tickloop-agent-recurrence"
-version = "0.2.19"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
 ]
 
 [[package]]

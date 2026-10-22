@@ -428,80 +428,68 @@ async fn compaction_commands_and_direct_shell_do_not_capture_points_but_later_pr
 }
 
 #[tokio::test(start_paused = true)]
-async fn explicit_events_and_timer_runs_preserve_the_single_real_user_checkpoint() {
-    for timer in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(ScriptedModel::new(vec![
-            text("Initial observation"),
-            text("Triggered observation"),
-        ]));
-        let agent = Agent::new_embedded(config(), model.clone());
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let mut events = agent.subscribe();
-        let first = agent
-            .submit(chat, None, "Observe when triggered".into())
-            .await
-            .unwrap();
-        completion(&mut events, Some(first.run_id)).await;
-        let before = checkpoints(&agent, chat).await;
-        agent
-            .configure_trigger(
-                chat,
-                first.loop_id,
-                Some(Trigger {
-                    id: Uuid::new_v4(),
-                    prompt: "Scheduled or external observation".into(),
-                    prompt_source: TriggerPromptSource::Explicit,
-                    schedule: timer
-                        .then(|| tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
-                    armed_at_ms: None,
-                    last_fired_at_ms: None,
-                    confirmation: None,
-                    expires_at_ms: None,
-                    accepts_events: !timer,
-                    armed: true,
-                    subscriptions: Vec::new(),
-                }),
-            )
-            .await
-            .unwrap();
-        let expected_run = if timer {
-            None
-        } else {
-            Some(
-                agent
-                    .trigger(
-                        chat,
-                        first.loop_id,
-                        TriggerSource {
-                            source: "fixture-event".into(),
-                            payload: json!({"changed":true}),
-                        },
-                    )
-                    .await
-                    .unwrap()
-                    .run_id,
-            )
-        };
-        let completed = completion(&mut events, expected_run).await;
-        assert_ne!(completed.run_id, first.run_id);
-        agent
-            .configure_trigger(chat, first.loop_id, None)
-            .await
-            .unwrap();
-        let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(checkpoints(&agent, chat).await, before);
-        assert_eq!(snapshot.rewind_points().len(), 1);
-        assert_eq!(snapshot.messages.len(), 4);
-        assert_eq!(support::model_script_requests(&snapshot).len(), 2);
-        assert_eq!(
-            support::model_script_requests(&snapshot)[1].run_id,
-            Some(completed.run_id)
-        );
-        assert!(snapshot.messages[2].content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Scheduled or external observation"))));
-        assert_eq!(model.requests.lock().unwrap().len(), 2);
-        agent.shutdown().await;
-    }
+async fn explicit_events_preserve_the_single_real_user_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Initial observation"),
+        text("Triggered observation"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let first = agent
+        .submit(chat, None, "Observe when triggered".into())
+        .await
+        .unwrap();
+    completion(&mut events, Some(first.run_id)).await;
+    let before = checkpoints(&agent, chat).await;
+    agent
+        .configure_trigger(
+            chat,
+            first.loop_id,
+            Some(Trigger {
+                id: Uuid::new_v4(),
+                prompt: "External observation".into(),
+                prompt_source: TriggerPromptSource::Explicit,
+                accepts_events: true,
+                armed: true,
+                subscriptions: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+    let expected_run = agent
+        .trigger(
+            chat,
+            first.loop_id,
+            TriggerSource {
+                source: "fixture-event".into(),
+                payload: json!({"changed":true}),
+            },
+        )
+        .await
+        .unwrap()
+        .run_id;
+    let completed = completion(&mut events, Some(expected_run)).await;
+    assert_ne!(completed.run_id, first.run_id);
+    agent
+        .configure_trigger(chat, first.loop_id, None)
+        .await
+        .unwrap();
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(checkpoints(&agent, chat).await, before);
+    assert_eq!(snapshot.rewind_points().len(), 1);
+    assert_eq!(snapshot.messages.len(), 4);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 2);
+    assert_eq!(
+        support::model_script_requests(&snapshot)[1].run_id,
+        Some(completed.run_id)
+    );
+    assert!(snapshot.messages[2].content.iter().any(
+        |content| matches!(content, Content::Text { text } if text.contains("External observation"))
+    ));
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    agent.shutdown().await;
 }
 
 #[tokio::test]

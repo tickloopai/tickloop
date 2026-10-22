@@ -6,8 +6,6 @@ mod durable_deliveries;
 mod durable_family;
 #[path = "all/durable_holdings.rs"]
 mod durable_holdings;
-#[path = "all/durable_triggers.rs"]
-mod durable_triggers;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
 #[path = "all/stateless_host.rs"]

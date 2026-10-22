@@ -1,11 +1,7 @@
 //! How a host assembles an Agent: the seams it reaches the outside through, and the options it
 //! imposes on every Chat.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
@@ -52,9 +48,6 @@ pub struct HarnessOptions {
     /// Task tools when no settings file is supplied; `None` defaults to off.
     /// A settings file takes precedence over this host value.
     pub task_tools: Option<bool>,
-    /// The shortest time a Trigger's schedule may leave between two runs; a schedule that runs
-    /// more often is refused.
-    pub min_schedule_interval: Duration,
     pub waits: WaitHosting,
     pub citation_style: CitationStyle,
     /// Instructions the host adds to every conversation's system prompt, as a section of their
@@ -77,7 +70,6 @@ impl HarnessOptions {
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
             task_tools: None,
-            min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Process,
             citation_style: CitationStyle::default(),
             system_prompt_addition: None,
@@ -104,10 +96,6 @@ pub enum CitationStyle {
     MarkdownLinks,
     Numbered,
 }
-
-/// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always
-/// allowed.
-pub const LOCAL_MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Who keeps a Run that waits for a person. The waits are recorded either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,7 +169,7 @@ impl ToolPolicy {
     }
 
     /// A durable Chat's: WebFetch of URLs and Artifact writes to targets with provenance,
-    /// questions, Subagents and their messages, Task tools, goals with schedules and the host's
+    /// questions, Subagents and their messages, Task tools, goals and the host's
     /// tools, with waits the Transcript keeps.
     pub const fn durable_chat() -> Self {
         Self {
@@ -314,10 +302,6 @@ pub enum Quiescence {
 pub struct Waits {
     /// The requests that wait for a person, in the order they were made.
     pub people: Vec<PersonWait>,
-    /// The earliest time a Trigger of a Loop that can take it is scheduled, or a Loop that has
-    /// not ended reaches its deadline, whatever the Loop's state. It may be past already; the
-    /// host wakes the family then with it as the due time.
-    pub wake_at: Option<SystemTime>,
     /// The artifact links whose @tickloop requests the family's Loops receive: the host
     /// delivers each with `TurnOp::Deliver`.
     pub deliveries: Vec<DeliveryBinding>,
@@ -337,8 +321,7 @@ pub struct DeliveryBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PersonWait {
     pub chat: ChatId,
-    /// The question's or permission's request id, the user shell's operation id, or the Loop id
-    /// of a schedule that waits for confirmation.
+    /// The question's or permission's request id, or the user shell's operation id.
     pub request: Uuid,
     pub kind: PersonWaitKind,
 }
@@ -346,9 +329,6 @@ pub struct PersonWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersonWaitKind {
     Question,
-    /// A schedule the model created waits for the user to confirm it; the request is its Loop's
-    /// id.
-    Schedule,
     /// Waits in this process only.
     Permission,
     /// Waits in this process only.
@@ -461,11 +441,6 @@ fn family_state(
             let family_waits = waits.get_or_insert_with(Waits::default);
             family_waits.people.extend(member_waits.people);
             family_waits.deliveries.extend(member_waits.deliveries);
-            family_waits.wake_at = family_waits
-                .wake_at
-                .into_iter()
-                .chain(member_waits.wake_at)
-                .min();
         }
     }
     found.then_some((runs, waits))
@@ -510,20 +485,16 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
         || !chat.ready_runs.is_empty()
         || chat.parked.keys().any(|run| !waits_for_person(run))
         || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
-    let wake_at = crate::triggers::wake_at(&chat.snapshot);
     let deliveries = deliveries_of(chat_id, &chat.snapshot);
     let waits = !chat.parked.is_empty()
         || !deliveries.is_empty()
         || waits_for_member
         || !chat.trigger_cancellations.is_empty()
         || !chat.event_cancellations.is_empty()
-        || wake_at.is_some()
         || user_shell_in(&[UserShellState::WaitingPermission]);
     (
         runs,
         waits.then(|| Waits {
-            wake_at: wake_at
-                .map(|milliseconds| SystemTime::UNIX_EPOCH + Duration::from_millis(milliseconds)),
             deliveries,
             ..waits_of(chat_id, &chat.snapshot)
         }),
@@ -601,28 +572,8 @@ fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> W
             request: record.id,
             kind: PersonWaitKind::UserShell,
         });
-    let schedules = snapshot
-        .loops
-        .iter()
-        .filter(|goal| {
-            !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                && goal
-                    .trigger
-                    .as_ref()
-                    .is_some_and(tickloop_agent_protocol::Trigger::awaits_confirmation)
-        })
-        .map(|goal| PersonWait {
-            chat,
-            request: goal.id,
-            kind: PersonWaitKind::Schedule,
-        });
     Waits {
-        people: questions
-            .chain(permissions)
-            .chain(user_shells)
-            .chain(schedules)
-            .collect(),
-        wake_at: None,
+        people: questions.chain(permissions).chain(user_shells).collect(),
         deliveries: Vec::new(),
     }
 }

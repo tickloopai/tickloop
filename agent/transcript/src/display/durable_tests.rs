@@ -416,14 +416,11 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
 }
 
 #[test]
-fn loop_projection_uses_latest_schedule_grid_and_hides_inactive_next_times() {
+fn loop_projection_uses_the_latest_record() {
     let id = Uuid::new_v4();
-    let mut trigger = Trigger::for_loop_goal("scheduled");
-    trigger.schedule = Some(tickloop_agent_protocol::Recurrence::parse("every 1m").unwrap());
-    trigger.arm_at(1_000);
-    trigger.note_scheduled(61_000);
+    let trigger = Trigger::for_loop_goal("watched");
     let mut record: LoopRecord = serde_json::from_value(json!({
-        "loopId": id, "goal": "scheduled", "state": "WaitingTrigger", "trigger": trigger,
+        "loopId": id, "goal": "watched", "state": "WaitingTrigger", "trigger": trigger,
         "stateSince": 2000, "runStartedAt": null,
     }))
     .unwrap();
@@ -442,30 +439,8 @@ fn loop_projection_uses_latest_schedule_grid_and_hides_inactive_next_times() {
     let projected = loops(&[snapshot, latest]);
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].goal, "updated");
-    assert_eq!(projected[0].next_scheduled_ms, Some(121_000));
-    assert_eq!(
-        projected[0]
-            .trigger
-            .as_ref()
-            .unwrap()
-            .schedule
-            .unwrap()
-            .to_string(),
-        "every 1m"
-    );
+    assert_eq!(projected[0].trigger.as_ref().unwrap().prompt, "watched");
     assert_eq!(projected[0].state_since, Some(2000));
-    for state in ["Completed", "Stopped", "Expired", "Failed"] {
-        record.state = json!(state);
-        assert_eq!(loops(&[line(&record)])[0].next_scheduled_ms, None);
-    }
-    record.state = json!("WaitingTrigger");
-    record.trigger_awaits_resume = true;
-    assert_eq!(loops(&[line(&record)])[0].next_scheduled_ms, None);
-    record.trigger_awaits_resume = false;
-    record.trigger.as_mut().unwrap()["armed"] = json!(false);
-    assert_eq!(loops(&[line(&record)])[0].next_scheduled_ms, None);
-    record.trigger = None;
-    assert_eq!(loops(&[line(&record)])[0].next_scheduled_ms, None);
 }
 
 #[test]

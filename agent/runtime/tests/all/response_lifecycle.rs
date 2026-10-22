@@ -10,8 +10,8 @@ use tickloop_agent_base::image::prepare;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, Content, DirectedSummaryRequest, Event, EventKind, HostCallContext, ImageContext,
-    ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, Receipt, RewindMode,
-    Role, SummaryDirection, Trigger, TriggerPromptSource, Usage,
+    ImageOrigin, InputContext, Message, ModelIdentity, Protocol, Receipt, RewindMode, Role,
+    SummaryDirection, Usage,
 };
 use tickloop_agent_runtime::transcript::{
     AppendBatch, BatchId, ChatPlacement, JsonlTranscriptStore, LoadRange, StorePosition,
@@ -1298,128 +1298,4 @@ async fn replaying_an_input_after_its_attachment_was_deleted_returns_its_receipt
     );
     assert_eq!(model.requests(), 1);
     agent.shutdown().await;
-}
-
-/// A queued input whose Loop expires before it starts settles as discarded, once, and stays
-/// settled across a reload and a replay.
-#[tokio::test(start_paused = true)]
-async fn an_input_queued_on_an_expiring_loop_settles_discarded_loop_ended() {
-    let fixture = fixture();
-    let store = Arc::new(InMemoryTranscriptStore::new());
-    let model = StagedModel::new(vec![
-        Step::Reply(text("watching")),
-        Step::Hang { delta: None },
-    ]);
-    let first = agent(store.clone(), model.clone());
-    let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
-    let watcher = Uuid::new_v4();
-    submit(&first, chat, watcher, None, "watch until the deadline").await;
-    first.settled_input(chat, watcher).await.unwrap();
-    let loop_id = first
-        .input_state(chat, watcher)
-        .await
-        .unwrap()
-        .unwrap()
-        .entry
-        .loop_id;
-    let lifetime = std::time::Duration::from_secs(60);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    first
-        .configure_trigger(
-            chat,
-            loop_id,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "check".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                schedule: None,
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: Some(now + lifetime.as_millis() as u64),
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-
-    let holder = Uuid::new_v4();
-    submit(&first, chat, holder, None, "hold the execution slot").await;
-    model.reached.notified().await;
-    let queued = Uuid::new_v4();
-    submit(&first, chat, queued, Some(loop_id), "too late").await;
-    let waiting = {
-        let agent = first.clone();
-        tokio::spawn(async move { agent.settled_input(chat, queued).await })
-    };
-    tokio::time::advance(lifetime).await;
-    assert_eq!(
-        waiting.await.unwrap().unwrap(),
-        SettledOutcome::Discarded {
-            reason: DiscardReason::LoopEnded
-        }
-    );
-    let snapshot = first.snapshot(chat).await.unwrap();
-    assert!(snapshot.queued_inputs().is_empty());
-    assert_eq!(
-        snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == loop_id)
-            .unwrap()
-            .state,
-        LoopState::Expired
-    );
-    first.interrupt(chat).await.unwrap();
-    first.settled_input(chat, holder).await.unwrap();
-    first.sync().await.unwrap();
-    let settled = inputs(&store.lines(chat), queued)
-        .into_iter()
-        .filter(|entry| matches!(entry.state, InputState::Settled { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(settled.len(), 1);
-    first.shutdown().await;
-    drop(first);
-
-    let next = agent(store.clone(), StagedModel::new(Vec::new()));
-    next.resume_chat(chat).await.unwrap();
-    assert_eq!(
-        next.input_state(chat, queued)
-            .await
-            .unwrap()
-            .unwrap()
-            .entry
-            .state,
-        InputState::Settled {
-            outcome: SettledOutcome::Discarded {
-                reason: DiscardReason::LoopEnded
-            }
-        }
-    );
-    submit_input(
-        &next,
-        chat,
-        queued,
-        Some(loop_id),
-        "too late".into(),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        next.snapshot(chat)
-            .await
-            .unwrap()
-            .queued_inputs()
-            .is_empty()
-    );
-    assert_eq!(model.requests(), 2);
-    next.shutdown().await;
 }

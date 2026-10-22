@@ -24,16 +24,7 @@ pub struct AgentUpgradeCheckpoint {
     trusted_directories: HashSet<PathBuf>,
     shell_descriptions: HashMap<Uuid, Option<String>>,
     task_tools_enabled: bool,
-    timers: Vec<TimerCheckpoint>,
     host_tools: Option<crate::host_tools::HostToolUpgradeCheckpoint>,
-}
-
-/// How far an armed Trigger's timer got: its schedule itself is wall-clock and on the Loop.
-#[derive(Clone, Serialize, Deserialize)]
-struct TimerCheckpoint {
-    chat: ChatId,
-    goal: LoopId,
-    tried_through_ms: u64,
 }
 
 impl AgentUpgradeCheckpoint {
@@ -175,18 +166,6 @@ impl Agent {
             .unwrap()
             .clone();
         let selected_model = self.inner.selected_model.lock().unwrap().config.clone();
-        let timers = self
-            .inner
-            .trigger_tried_through
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|((chat, goal), tried_through_ms)| TimerCheckpoint {
-                chat: *chat,
-                goal: *goal,
-                tried_through_ms: *tried_through_ms,
-            })
-            .collect();
         let checkpoint = AgentUpgradeCheckpoint {
             version: CHECKPOINT_VERSION,
             transfer_id: Uuid::new_v4(),
@@ -202,7 +181,6 @@ impl Agent {
             trusted_directories,
             shell_descriptions: self.inner.shell_descriptions.lock().await.clone(),
             task_tools_enabled: self.inner.task_tools_enabled.load(Ordering::SeqCst),
-            timers,
             host_tools,
         };
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -302,11 +280,6 @@ impl Agent {
         self.inner
             .task_tools_enabled
             .store(checkpoint.task_tools_enabled, Ordering::SeqCst);
-        *self.inner.trigger_tried_through.lock().unwrap() = checkpoint
-            .timers
-            .iter()
-            .map(|timer| ((timer.chat, timer.goal), timer.tried_through_ms))
-            .collect();
         for saved in &checkpoint.chats {
             let snapshot = saved.snapshot.clone();
             if let Some(folder) = &snapshot.folder {
@@ -462,7 +435,7 @@ impl Agent {
                 self.record_user_shell(id, command).await?;
             }
             for goal in saved.snapshot.loops {
-                if let Some(trigger) = goal.trigger.filter(|trigger| trigger.armed) {
+                if goal.trigger.is_some_and(|trigger| trigger.armed) {
                     let cancel = self.inner.shutdown.child_token();
                     self.inner
                         .chats
@@ -471,8 +444,7 @@ impl Agent {
                         .get_mut(&id)
                         .unwrap()
                         .trigger_cancellations
-                        .insert(goal.id, cancel.clone());
-                    self.trigger_task(id, goal.id, trigger, cancel);
+                        .insert(goal.id, cancel);
                 }
                 if goal
                     .event_sources

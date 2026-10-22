@@ -314,7 +314,6 @@ async fn a_foreground_child_answered_hours_later_in_another_holding_goes_on_as_i
                 request: request.id,
                 kind: PersonWaitKind::Question,
             }],
-            wake_at: None,
             deliveries: Vec::new(),
         })
     );

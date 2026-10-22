@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -1052,13 +1052,13 @@ async fn a_crash_after_every_task_was_acknowledged_is_taken_over_by_the_sweep() 
     assert!(!cloud.chats.has_open_tasks(cloud.root));
 
     let scheduler = cloud.scheduler();
-    assert!(scheduler.tick(SystemTime::now()).is_empty());
+    assert!(scheduler.tick().is_empty());
     cloud.pass(LEASE_TTL + TICK).await;
     assert_eq!(
-        scheduler.tick(SystemTime::now()),
+        scheduler.tick(),
         vec![format!("takeover:{}:{}", cloud.root, report.epoch)]
     );
-    assert!(scheduler.tick(SystemTime::now()).is_empty());
+    assert!(scheduler.tick().is_empty());
     may_finish.store(true, Ordering::SeqCst);
     let report = cloud
         .node("surviving", NodeConfig::default())
@@ -1154,7 +1154,7 @@ async fn a_crash_after_an_answer_was_acknowledged_is_taken_over_by_the_sweep() {
 
     cloud.pass(LEASE_TTL + TICK).await;
     assert_eq!(
-        cloud.scheduler().tick(SystemTime::now()),
+        cloud.scheduler().tick(),
         vec![format!("takeover:{}:{}", cloud.root, crashed.epoch)]
     );
     may_finish.store(true, Ordering::SeqCst);
@@ -1221,10 +1221,10 @@ async fn five_ceiling_handovers_neither_dead_letter_the_task_nor_fail_the_input(
 }
 
 /// A holding lasts thirty minutes while its family runs: every heartbeat extends the claim of
-/// the wake it took, so the wake is never handed out again, and it is acknowledged once when
-/// the holding ends.
+/// the takeover it took, so the takeover is never handed out again, and it is acknowledged once
+/// when the holding ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wake_claimed_for_a_thirty_minute_holding_is_not_delivered_again() {
+async fn a_takeover_claimed_for_a_thirty_minute_holding_is_not_delivered_again() {
     let may_finish = flag();
     let model = ControlledModel::new({
         let may_finish = may_finish.clone();
@@ -1236,9 +1236,9 @@ async fn a_wake_claimed_for_a_thirty_minute_holding_is_not_delivered_again() {
         ..NodeConfig::default()
     };
     let (turn_task, _) = cloud.user_turn(cloud.root, PROMPT);
-    let wake = cloud
+    let takeover = cloud
         .chats
-        .enqueue(cloud.root, "wake:test", TaskKind::Wake { due_at: None })
+        .enqueue(cloud.root, "takeover:test", TaskKind::Takeover)
         .unwrap();
     let node = cloud.node("long", config);
     let running = spawn_holding(&node, cloud.root);
@@ -1248,63 +1248,17 @@ async fn a_wake_claimed_for_a_thirty_minute_holding_is_not_delivered_again() {
         cloud.pass(TICK).await;
         passed += TICK;
         cloud.chats.reclaim_expired_tasks();
-        assert_eq!(cloud.task_state(cloud.root, wake), TaskState::Claimed);
+        assert_eq!(cloud.task_state(cloud.root, takeover), TaskState::Claimed);
     }
     assert!(passed > CLAIM_VISIBILITY * 100);
     may_finish.store(true, Ordering::SeqCst);
     let report = running.await.unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
-    for task in [wake, turn_task] {
+    for task in [takeover, turn_task] {
         let view = cloud.task(cloud.root, task);
         assert_eq!(view.state, TaskState::Acknowledged);
         assert_eq!(view.deliveries, 1);
     }
-}
-
-/// The scheduler's wake key carries the epoch of the release that wrote `wake_at`: the same
-/// time written back by a later release is queued again, while one release's time is queued
-/// once however often the scheduler polls.
-#[tokio::test]
-async fn the_same_wake_at_from_another_release_is_queued_again() {
-    let cloud = Cloud::new(ControlledModel::new(|_| Reply::Now(text(DONE))));
-    let scheduler = cloud.scheduler();
-    let wake_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-    let waiting = Waits {
-        wake_at: Some(wake_at),
-        ..Waits::default()
-    };
-    let micros = wake_at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_micros();
-    let first = cloud
-        .chats
-        .acquire_lease(cloud.root, "first", LEASE_TTL)
-        .unwrap();
-    cloud.chats.release_waiting(&first, Some(waiting.clone()));
-    assert!(scheduler.tick(wake_at - Duration::from_secs(1)).is_empty());
-    assert_eq!(
-        scheduler.tick(wake_at),
-        vec![format!("wake:{}:1:{micros}", cloud.root)]
-    );
-    assert!(scheduler.tick(wake_at).is_empty());
-
-    let second = cloud
-        .chats
-        .acquire_lease(cloud.root, "second", LEASE_TTL)
-        .unwrap();
-    cloud.chats.release_waiting(&second, Some(waiting));
-    assert_eq!(
-        scheduler.tick(wake_at),
-        vec![format!("wake:{}:2:{micros}", cloud.root)]
-    );
-    let wakes = cloud.chats.tasks(cloud.root);
-    assert_eq!(wakes.len(), 2);
-    assert!(
-        wakes
-            .iter()
-            .all(|task| matches!(task.state, TaskState::Queued))
-    );
 }
 
 /// One holding acknowledges a turn, then dies during the next one. The acknowledged turn is
@@ -1346,7 +1300,7 @@ async fn a_failed_holding_spends_no_attempt_of_the_tasks_it_finished() {
     );
     cloud.pass(LEASE_TTL + TICK).await;
     // The claim expired: the turn is delivered again, and no sweep is needed.
-    assert!(cloud.scheduler().tick(SystemTime::now()).is_empty());
+    assert!(cloud.scheduler().tick().is_empty());
     assert_eq!(cloud.task_state(cloud.root, second), TaskState::Queued);
     may_finish.store(true, Ordering::SeqCst);
     let report = cloud
@@ -1409,7 +1363,7 @@ async fn a_family_whose_load_panics_is_held_a_bounded_number_of_times_until_the_
     let mut healthy_turns = Vec::new();
     for round in 0..60 {
         cloud.pass(TICK).await;
-        scheduler.tick(SystemTime::now());
+        scheduler.tick();
         if round % 10 == 0 {
             healthy_turns.push(cloud.user_turn(healthy, "Hello.").0);
         }

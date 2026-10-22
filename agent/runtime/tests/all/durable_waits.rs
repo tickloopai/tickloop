@@ -143,7 +143,6 @@ async fn asked_and_released(
                 request: request.id,
                 kind: PersonWaitKind::Question,
             }],
-            wake_at: None,
             deliveries: Vec::new(),
         })
     );
