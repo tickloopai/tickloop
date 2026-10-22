@@ -53,6 +53,8 @@ macro_rules! test_path {
 
 pub struct ScriptedModel {
     pub requests: Mutex<Vec<ModelRequest>>,
+    /// Title requests, which never consume a scripted reply.
+    pub title_requests: Mutex<Vec<ModelRequest>>,
     replies: Mutex<VecDeque<Vec<Content>>>,
     usages: Mutex<VecDeque<Usage>>,
     rejections: Mutex<VecDeque<ModelResponseRejection>>,
@@ -66,6 +68,7 @@ impl ScriptedModel {
     pub fn with_usages(replies: Vec<Vec<Content>>, usages: Vec<Usage>) -> Self {
         Self {
             requests: Mutex::new(Vec::new()),
+            title_requests: Mutex::new(Vec::new()),
             replies: Mutex::new(replies.into()),
             usages: Mutex::new(usages.into()),
             rejections: Mutex::new(VecDeque::new()),
@@ -91,7 +94,9 @@ impl ModelClient for ScriptedModel {
         _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
     ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
-        Ok(title_output(request))
+        let output = title_output(request.clone());
+        self.title_requests.lock().unwrap().push(request);
+        Ok(output)
     }
 
     fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {

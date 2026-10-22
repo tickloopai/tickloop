@@ -300,7 +300,7 @@ pub(super) async fn serve_connection_mode(
     let session_id = session
         .as_ref()
         .map_or_else(Uuid::new_v4, |session| session.session_id);
-    let capabilities = vec![
+    let mut capabilities = vec![
         AccessCapability::Overview,
         AccessCapability::AgentDetails,
         AccessCapability::Records,
@@ -323,6 +323,13 @@ pub(super) async fn serve_connection_mode(
         AccessCapability::TrustWorkingDirectory,
         AccessCapability::ChunkedResponses,
     ];
+    capabilities.extend([
+        AccessCapability::ManagedExecutions,
+        AccessCapability::ManagedConfiguration,
+        AccessCapability::ManagedHistory,
+        AccessCapability::ManagedSessionLoad,
+        AccessCapability::ManagedSessionList,
+    ]);
     write_frame(
         &mut stream,
         &ServerMessage::Hello(ServerHello {
@@ -657,6 +664,13 @@ pub(super) async fn serve_connection_mode(
                     request_id,
                     command,
                 } => match if !forwarded_sessions
+                    && matches!(&command.command, tickloop_agent_protocol::AgentCommand::CreateManaged { session_id: claimed, .. } | tickloop_agent_protocol::AgentCommand::ManagedLoad { session_id: claimed, .. } if *claimed != session_id)
+                {
+                    Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "managed creation does not belong to this connection session",
+                    ))
+                } else if !forwarded_sessions
                     && command_origin(&command.command)
                         .is_some_and(|source| source.view.session_id != session_id)
                 {

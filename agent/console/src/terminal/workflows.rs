@@ -1490,11 +1490,29 @@ fn append_public_message(
 fn append_input_contexts(history: &mut PublicHistoryBuilder, contexts: &[InputContext]) {
     for context in contexts {
         let (kind, label, truncated) = match context {
+            InputContext::PromptText { text } => {
+                history.push_str(&safe_text(text));
+                continue;
+            }
             InputContext::File(text) => ("file", text.path.display().to_string(), text.truncated),
             InputContext::Directory(text) => {
                 ("directory", text.path.display().to_string(), text.truncated)
             }
             InputContext::Image(image) => ("image", image.origin.label(), false),
+            InputContext::Resource(resource) => {
+                let kind = if resource.content.is_some() {
+                    "resource"
+                } else {
+                    "resource reference"
+                };
+                let label = serde_json::json!({
+                    "uri": resource.uri,
+                    "mime_type": resource.mime_type,
+                    "name": resource.name,
+                })
+                .to_string();
+                (kind, label, false)
+            }
         };
         let truncated = if truncated { " · truncated" } else { "" };
         history.push_str(&format!(

@@ -56,6 +56,8 @@ mod embedded;
 mod ingress;
 mod ipc;
 mod lifecycle;
+mod managed;
+pub mod mcp_supervisor;
 mod receipts;
 #[cfg(test)]
 mod status_cost;
@@ -150,6 +152,16 @@ impl ProcessWorkerFactory {
 
 #[async_trait]
 impl WorkerFactory for ProcessWorkerFactory {
+    async fn end_managed(
+        &self,
+        launch: &LaunchSpec,
+        chat: Uuid,
+        operation: Uuid,
+    ) -> Result<(), AccessError> {
+        self.control
+            .end_managed(launch.config_root.as_deref(), chat, operation)
+            .await
+    }
     async fn request_upgrade(&self, executable: &Path) -> Result<(), AccessError> {
         self.select_upgrade(executable).await
     }
@@ -311,6 +323,33 @@ impl WorkerFactory for ProcessWorkerFactory {
             self.control.revoke(worker).await;
         }
         exited
+    }
+    async fn retire(&self, worker: &Arc<dyn AgentAccess>) {
+        self.control.revoke(worker).await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .iter()
+                .position(|managed| Arc::ptr_eq(&managed.access, worker))
+                .map(|index| workers.remove(index))
+        };
+        let Some(retired) = retired else {
+            return;
+        };
+        let process = retired.process.clone();
+        // Lifeline EOF is the Worker's ordinary shutdown; reap it off the caller's path.
+        drop(retired);
+        tokio::spawn(async move {
+            let mut process = process.lock().await;
+            if let Some(process) = process.as_mut()
+                && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        });
     }
 
     async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
@@ -659,6 +698,12 @@ pub async fn build_runtime_with_models(
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
     executable: &Path,
 ) -> Result<Agent, String> {
+    if !launch.session_mcp_servers.is_empty() {
+        if launch.profile != tickloop_agent_protocol::ExecutionProfile::Acp {
+            return Err("session MCP servers require an ACP execution".into());
+        }
+        tickloop_agent_protocol::validate_session_mcp_servers(&launch.session_mcp_servers)?;
+    }
     let model = launch_model(launch);
     let settings = launch
         .config_root
@@ -735,13 +780,20 @@ pub async fn build_runtime_with_models(
             model,
             settings,
             host: launch.host_options,
-            tools: ToolPolicy::local(),
+            tools: match launch.profile {
+                tickloop_agent_protocol::ExecutionProfile::Local => ToolPolicy::local(),
+                tickloop_agent_protocol::ExecutionProfile::OneShot => ToolPolicy::one_shot(),
+                tickloop_agent_protocol::ExecutionProfile::Acp => ToolPolicy::acp(),
+            },
             host_rules: Vec::new(),
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: tickloop_agent_runtime::WaitHosting::Process,
             citation_style: Default::default(),
-            system_prompt_addition: None,
+            system_prompt_addition: match launch.profile {
+                tickloop_agent_protocol::ExecutionProfile::Local => None,
+                _ => Some("Managed execution contract (overrides generic Tickloop and Skill lifecycle guidance): This request is invocation-scoped. Delegation, new goals, subscriptions, questions and Plan mode are unavailable. Artifacts created here are not automatically associated with this Chat for later feedback. Background Shell completion does not start another model turn. Invocation-owned Shell tasks and hosted Ticks are cleaned up when this request settles or is released; do not promise continued observation or resources persisting after the request. An ACP Chat can accept a later prompt, but each prompt must finish its own work.".into()),
+            },
             request_gates: Vec::new(),
         },
     )
@@ -757,23 +809,67 @@ pub async fn build_runtime_with_models(
         .map(|hosted| hosted as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>);
     let adapters = Arc::new(TickAdapters::builtin(agent.clone(), hosted));
     agent.install_tick_stream(adapters.clone()).await;
-    if let Some(root) = launch.config_root.as_ref()
+    use tickloop_agent_runtime::host_tools::HostToolProvider;
+    let native: Option<Arc<dyn HostToolProvider>> = if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = tickloop_agent_artifacts::ArtifactClient::new(root)
     {
+        Some(Arc::new(
+            tickloop_agent_runtime::mcp_tools::McpHostToolProvider::new(
+                artifact,
+                tick_tools.clone(),
+            ),
+        ))
+    } else {
+        tick_tools
+    };
+    let provider = if launch.session_mcp_servers.is_empty() {
+        native
+    } else {
+        Some(Arc::new(
+            tickloop_agent_runtime::session_mcp::SessionMcpProvider::new(
+                launch.session_mcp_servers.clone(),
+                native.unwrap_or_else(|| Arc::new(EmptyHostTools)),
+                Arc::new(mcp_supervisor::SupervisorMcpLauncher::new(
+                    executable.to_path_buf(),
+                )),
+            )?,
+        ) as Arc<dyn HostToolProvider>)
+    };
+    if let Some(provider) = provider {
         agent
-            .install_host_tools(Arc::new(
-                tickloop_agent_runtime::mcp_tools::McpHostToolProvider::new(
-                    artifact,
-                    tick_tools.clone(),
-                ),
-            ))
-            .map_err(|error| format!("cannot install MCP tools: {error}"))?;
-    } else if let Some(tick_tools) = tick_tools {
-        agent
-            .install_host_tools(tick_tools)
-            .map_err(|error| format!("cannot install Tick tools: {error}"))?;
+            .install_host_tools(provider)
+            .map_err(|error| format!("cannot install host tools: {error}"))?;
     }
     Ok(agent)
+}
+
+struct EmptyHostTools;
+#[async_trait::async_trait]
+impl tickloop_agent_runtime::host_tools::HostToolProvider for EmptyHostTools {
+    fn definitions(&self) -> Vec<tickloop_agent_protocol::ToolDefinition> {
+        Vec::new()
+    }
+    fn permission(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> tickloop_agent_runtime::host_tools::HostToolPermission {
+        tickloop_agent_runtime::host_tools::HostToolPermission::Confirmation
+    }
+    async fn execute(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: serde_json::Value,
+        _: CancellationToken,
+    ) -> tickloop_agent_protocol::ToolResult {
+        tickloop_agent_protocol::ToolResult {
+            content: "host tool is unavailable".into(),
+            is_error: true,
+            output_ref: None,
+        }
+    }
 }
 
 fn validate_daemon_lock_path(lock: &File, path: &Path) -> Result<(), String> {

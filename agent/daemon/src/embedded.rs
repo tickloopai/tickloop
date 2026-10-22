@@ -46,6 +46,7 @@ struct Inner {
     launches: Mutex<HashMap<ExecutionRef, LaunchSpec>>,
     account_models: tickloop_agent_model::availability::AccountModelDiscovery,
     receipts: ReceiptStore,
+    managed: super::managed::ManagedRegistry,
     answers: Mutex<HashMap<(ExecutionRef, Uuid, PendingRequestKind), AnswerState>>,
     queue: Mutex<HashMap<Uuid, QueuedAction>>,
     queue_failures: Mutex<VecDeque<QueuedCommandFailure>>,
@@ -66,6 +67,8 @@ pub(crate) struct EmbeddedCheckpoint {
     executions: Vec<(ExecutionRef, Uuid)>,
     launches: Vec<(ExecutionRef, LaunchSpec)>,
     receipts: super::receipts::ReceiptCheckpoint,
+    #[serde(default)]
+    managed: Vec<super::managed::SavedManaged>,
     queue: Vec<(Uuid, QueuedAction)>,
     queue_failures: VecDeque<QueuedCommandFailure>,
     sequence: u64,
@@ -113,6 +116,7 @@ impl EmbeddedAgentAccess {
             launches: Mutex::new(HashMap::new()),
             account_models: Default::default(),
             receipts: ReceiptStore::new(epoch),
+            managed: Default::default(),
             answers: Mutex::new(HashMap::new()),
             queue: Mutex::new(HashMap::new()),
             queue_failures: Mutex::new(VecDeque::new()),
@@ -215,6 +219,7 @@ impl EmbeddedAgentAccess {
                 .map(|(execution, launch)| (*execution, launch.clone()))
                 .collect(),
             receipts,
+            managed: self.inner.managed.checkpoint().await,
             queue: self
                 .inner
                 .queue
@@ -251,6 +256,7 @@ impl EmbeddedAgentAccess {
             .collect();
         *self.inner.executions.lock().await = checkpoint.executions.into_iter().collect();
         *self.inner.launches.lock().await = checkpoint.launches.into_iter().collect();
+        self.inner.managed.restore(checkpoint.managed).await;
         self.inner
             .receipts
             .restore(checkpoint.receipts)
@@ -555,6 +561,284 @@ impl EmbeddedAgentAccess {
 
     async fn dispatch(&self, envelope: &CommandEnvelope) -> Result<CommandResult, AccessError> {
         match envelope.command.clone() {
+            AgentCommand::CreateManaged {
+                launch,
+                initial,
+                token,
+                ..
+            } => Box::pin(async move {
+                super::managed::validate_launch(&launch)?;
+                if initial.is_some() {
+                    return Err(AccessError::invalid(
+                        "managed creation must not submit initial input",
+                    ));
+                }
+                let launch = super::managed::normalized_launch(launch);
+                self.inner
+                    .agent
+                    .validate_execution_profile(launch.profile, launch.host_options)?;
+                // Do not publish an execution reference until ACP identity is durable. A failed
+                // model/origin/commit check must not leave a generic, unguarded execution behind.
+                if launch.profile == tickloop_agent_protocol::ExecutionProfile::Acp {
+                    let root = if launch.session_persistence && self.inner.agent.saves_chats() {
+                        Some(launch.config_root.as_deref().ok_or_else(|| {
+                            AccessError::invalid("persistent ACP requires a configuration root")
+                        })?)
+                    } else {
+                        None
+                    };
+                    let chat = self.inner.agent.create_chat(launch.folder.clone()).await?;
+                    let prepared: Result<(), AccessError> = async {
+                        self.inner
+                            .agent
+                            .set_host_work_context(
+                                chat,
+                                HostCallContext {
+                                    folder: launch.folder.clone(),
+                                    workspace_id: launch
+                                        .host_work_context
+                                        .as_ref()
+                                        .and_then(|context| context.workspace.clone()),
+                                    interaction: None,
+                                },
+                            )
+                            .await?;
+                        if let Some(model) = launch.model.clone() {
+                            let model = self.builtin_config(model)?;
+                            self.inner
+                                .agent
+                                .configure_managed_session(chat, Some(model), None, None)
+                                .await?;
+                        }
+                        if let Some(root) = root {
+                            self.inner
+                                .agent
+                                .record_new_acp_session(chat, &launch.folder, root)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(mut error) = prepared {
+                        if let Err(cleanup) = self
+                            .inner
+                            .agent
+                            .discard_unpublished_managed_chat(chat)
+                            .await
+                        {
+                            error.message = format!(
+                                "{}; provisional Chat cleanup failed: {cleanup}",
+                                error.message
+                            );
+                        }
+                        return Err(error);
+                    }
+                    let execution = self.register(chat, launch.clone()).await;
+                    self.inner
+                        .managed
+                        .install(execution, chat, launch, token)
+                        .await;
+                    self.inner
+                        .receipts
+                        .set_target(envelope.command_id, execution)
+                        .await;
+                    return Ok(CommandResult::Created {
+                        execution,
+                        snapshot: Box::new(self.snapshot(execution).await?),
+                        submitted: None,
+                        shell: None,
+                    });
+                }
+                let result = Box::pin(self.dispatch(&CommandEnvelope {
+                    command: AgentCommand::Create {
+                        launch: launch.clone(),
+                        initial: None,
+                        origin: None,
+                    },
+                    ..envelope.clone()
+                }))
+                .await?;
+                if let CommandResult::Created {
+                    execution,
+                    snapshot,
+                    ..
+                } = &result
+                {
+                    self.inner
+                        .managed
+                        .install(*execution, snapshot.conversation.id, launch, token)
+                        .await;
+                }
+                Ok(result)
+            }).await,
+            AgentCommand::ManagedLoad {
+                session_uuid,
+                launch,
+                token,
+                ..
+            } => Box::pin(async move {
+                // Restore admission is large; do not add its stack frame to unrelated Console
+                // commands that reenter submission through this shared dispatcher.
+                if launch.profile != tickloop_agent_protocol::ExecutionProfile::Acp
+                    || !launch.session_persistence
+                    || launch.exact_chat.is_some()
+                {
+                    return Err(AccessError::invalid("ACP restore requires persistence"));
+                }
+                let launch = super::managed::normalized_launch(launch);
+                let root = launch.config_root.as_deref().ok_or_else(|| {
+                    AccessError::invalid("ACP restore requires a configuration root")
+                })?;
+                let old_reference = self
+                    .inner
+                    .references
+                    .lock()
+                    .await
+                    .get(&session_uuid)
+                    .copied();
+                if let Some(old) = old_reference {
+                    if !launch.session_mcp_servers.is_empty() {
+                        return Err(AccessError::invalid(
+                            "restoring session MCP descriptors requires a fresh Worker",
+                        ));
+                    }
+                    if !self.inner.managed.reacquirable(old).await {
+                        return Err(AccessError::new(
+                            AccessErrorCode::Busy,
+                            "ACP session is already active or cleanup is incomplete",
+                        ));
+                    }
+                }
+                let snapshot = self
+                    .inner
+                    .agent
+                    .resume_acp_session(session_uuid, &launch.folder, root)
+                    .await?;
+                // Keep the revoked prior reference intact until all restore validation succeeds.
+                if let Some(old) = old_reference {
+                    self.inner.references.lock().await.remove(&session_uuid);
+                    self.inner.executions.lock().await.remove(&old);
+                    self.inner.launches.lock().await.remove(&old);
+                    self.inner
+                        .answers
+                        .lock()
+                        .await
+                        .retain(|(execution, _, _), _| *execution != old);
+                }
+                let execution = self.register(snapshot.id, launch.clone()).await;
+                self.inner
+                    .managed
+                    .install(execution, snapshot.id, launch, token)
+                    .await;
+                Ok(CommandResult::Loaded {
+                    execution,
+                    snapshot: Box::new(self.snapshot(execution).await?),
+                })
+            }).await,
+            AgentCommand::ManagedConfigure {
+                execution, change, ..
+            } => Box::pin(async move {
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize_worker(&envelope.command)
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                let chat = self.chat(execution).await?;
+                let config = self.managed_configuration(execution, &entry).await?;
+                if let Some(mode) = change.mode
+                    && !config.modes.contains(&mode)
+                {
+                    return Err(AccessError::invalid(
+                        "mode is outside the session startup ceiling",
+                    ));
+                }
+                let model = if let Some(id) = change.model_id {
+                    if !config.models.iter().any(|item| item.id == id) {
+                        return Err(AccessError::invalid(
+                            "model is not in the session model directory",
+                        ));
+                    }
+                    let current = self.inner.agent.snapshot(chat).await?.model;
+                    Some(
+                        tickloop_agent_model::cards::ModelCatalog::defaults()
+                            .get(&current.provider_id, &id)
+                            .ok_or_else(|| AccessError::invalid("unknown model ID"))?,
+                    )
+                } else {
+                    None
+                };
+                self.inner
+                    .agent
+                    .configure_managed_session(chat, model, change.mode, change.reasoning_effort)
+                    .await?;
+                Ok(CommandResult::ManagedConfigured(
+                    self.managed_configuration(execution, &entry).await?,
+                ))
+            }).await,
+            AgentCommand::ManagedSubmit {
+                execution, input, ..
+            } => {
+                if !matches!(&input, UserInput::Text { .. } | UserInput::Skill { .. }) {
+                    return Err(AccessError::invalid(
+                        "managed execution does not accept user Shell input",
+                    ));
+                }
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize_worker(&envelope.command)
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                entry.begin_submit().await?;
+                self.submit(execution, None, input, None).await
+            }
+            AgentCommand::ManagedHeartbeat { .. } => Ok(CommandResult::Done),
+            AgentCommand::ManagedSettle {
+                execution, cancel, ..
+            } => {
+                let chat = self.chat(execution).await?;
+                self.inner.agent.settle_managed(chat, cancel).await?;
+                Ok(CommandResult::ManagedSettled {
+                    snapshot: Box::new(self.snapshot(execution).await?),
+                })
+            }
+            AgentCommand::ManagedRelease { execution, .. } => {
+                let chat = self.chat(execution).await?;
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize_worker(&envelope.command)
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                entry.revoke().await;
+                let result = self.inner.agent.settle_managed(chat, true).await;
+                let closed = self.inner.agent.close_session_mcp(chat).await;
+                let failure = result
+                    .as_ref()
+                    .err()
+                    .or(closed.as_ref().err())
+                    .map(ToString::to_string);
+                entry
+                    .cleanup_finished(result.is_ok() && closed.is_ok(), failure)
+                    .await;
+                entry.settle().await;
+                result?;
+                closed?;
+                Ok(CommandResult::Done)
+            }
+            AgentCommand::ManagedFinalizeRelease { execution, .. } => {
+                let chat = self.chat(execution).await?;
+                if !self.inner.managed.reacquirable(execution).await {
+                    return Err(AccessError::new(
+                        AccessErrorCode::Busy,
+                        "ACP release cleanup has not completed",
+                    ));
+                }
+                self.inner.agent.flush_acp_session(chat).await?;
+                self.inner.agent.release_acp_session_claim(chat).await;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::AddArtifactTick { execution, tick } => {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
@@ -683,7 +967,7 @@ impl EmbeddedAgentAccess {
                 launch,
                 initial,
                 origin,
-            } => {
+            } => Box::pin(async move {
                 if let Some(UserInput::Skill { name, arguments }) = &initial {
                     self.inner
                         .agent
@@ -763,12 +1047,21 @@ impl EmbeddedAgentAccess {
                     submitted,
                     shell,
                 })
-            }
+            }).await,
             AgentCommand::LoadRecord {
                 record,
                 as_new,
                 launch,
             } => {
+                if tickloop_agent_runtime::transcript::records::acp_session(&record)
+                    .await?
+                    .is_some()
+                {
+                    return Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "ACP records require scoped ManagedLoad",
+                    ));
+                }
                 let snapshot = if as_new {
                     self.inner.agent.resume_as_new_chat(record.chat_id).await?
                 } else {
@@ -893,32 +1186,43 @@ impl EmbeddedAgentAccess {
                 scope,
                 comment,
                 rule,
+            }
+            | AgentCommand::ManagedDecidePermission {
+                request,
+                allow,
+                scope,
+                comment,
+                rule,
+                ..
             } => {
-                self.claim_answer(request, PendingRequestKind::Permission, envelope.command_id)
-                    .await?;
-                let chat = self.chat(request.execution).await?;
-                let result = if let Some(rule) = rule {
-                    self.inner
-                        .agent
-                        .answer_permission_with_rule(chat, request.request_id, rule)
-                        .await
-                } else {
-                    self.inner
-                        .agent
-                        .answer_permission_with_comment(
-                            chat,
-                            request.request_id,
-                            allow,
-                            scope,
-                            comment,
-                        )
-                        .await
-                };
-                if let Err(error) = result {
-                    self.release_answer(request).await;
-                    return Err(error.into());
-                }
-                Ok(CommandResult::Done)
+                Box::pin(async {
+                    self.claim_answer(request, PendingRequestKind::Permission, envelope.command_id)
+                        .await?;
+                    let chat = self.chat(request.execution).await?;
+                    let result = if let Some(rule) = rule {
+                        self.inner
+                            .agent
+                            .answer_permission_with_rule(chat, request.request_id, rule)
+                            .await
+                    } else {
+                        self.inner
+                            .agent
+                            .answer_permission_with_comment(
+                                chat,
+                                request.request_id,
+                                allow,
+                                scope,
+                                comment,
+                            )
+                            .await
+                    };
+                    if let Err(error) = result {
+                        self.release_answer(request).await;
+                        return Err(error.into());
+                    }
+                    Ok(CommandResult::Done)
+                })
+                .await
             }
             AgentCommand::AnswerQuestion { request, answers } => {
                 self.claim_answer(request, PendingRequestKind::Question, envelope.command_id)
@@ -1437,6 +1741,85 @@ impl EmbeddedAgentAccess {
         let _ = self.inner.changes.send(update);
     }
 
+    async fn managed_configuration(
+        &self,
+        execution: ExecutionRef,
+        entry: &super::managed::ManagedEntry,
+    ) -> Result<tickloop_agent_protocol::ManagedConfiguration, AccessError> {
+        use tickloop_agent_model::ReasoningEffortExt;
+        use tickloop_agent_protocol::{
+            ExecutionMode, ManagedConfiguration, ManagedModelInfo, ReasoningEffort,
+        };
+        if entry.launch.profile != tickloop_agent_protocol::ExecutionProfile::Acp {
+            return Err(AccessError::new(
+                AccessErrorCode::AccessDenied,
+                "configuration requires ACP",
+            ));
+        }
+        let snapshot = self.inner.agent.snapshot(entry.chat).await?;
+        let current = &snapshot.model;
+        let cancel = CancellationToken::new();
+        let directory = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.inner.account_models.discover(
+                current,
+                entry.launch.config_root.as_deref(),
+                false,
+                &cancel,
+            ),
+        )
+        .await;
+        cancel.cancel();
+        let directory = match directory {
+            Ok(Ok(value)) => Some(value),
+            _ => None,
+        };
+        let models = tickloop_agent_model::cards::ModelCatalog::defaults()
+            .profiles()
+            .into_iter()
+            .filter(|config| config.provider_id == current.provider_id)
+            .filter(|config| {
+                directory
+                    .as_ref()
+                    .map_or(config.model_id == current.model_id, |directory| {
+                        directory.availability(&config.model_id).selectable()
+                    })
+            })
+            .map(|config| ManagedModelInfo {
+                id: config.model_id,
+                name: config.name,
+            })
+            .collect();
+        let ceiling =
+            if let Ok(Some(metadata)) = self.inner.agent.read_acp_session(entry.chat).await {
+                metadata.startup_permission_ceiling.mode
+            } else {
+                entry
+                    .launch
+                    .host_options
+                    .execution_mode_override
+                    .unwrap_or(ExecutionMode::Auto)
+            };
+        let modes = match ceiling {
+            ExecutionMode::AcceptEdits => vec![ExecutionMode::AcceptEdits],
+            ExecutionMode::FullAccess => vec![
+                ExecutionMode::Auto,
+                ExecutionMode::AcceptEdits,
+                ExecutionMode::FullAccess,
+            ],
+            _ => vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits],
+        };
+        let _ = execution;
+        Ok(ManagedConfiguration {
+            model_id: current.model_id.clone(),
+            mode: snapshot.policy.mode,
+            models,
+            modes,
+            reasoning_effort: snapshot.reasoning_effort,
+            efforts: ReasoningEffort::choices(current).to_vec(),
+        })
+    }
+
     fn builtin_config(
         &self,
         config: tickloop_agent_protocol::ModelConfig,
@@ -1559,6 +1942,44 @@ impl EmbeddedAgentAccess {
         detail: AgentDetailQuery,
     ) -> Result<ObservationValue, AccessError> {
         Ok(match detail {
+            AgentDetailQuery::OperationReview { run_id, call_id } => {
+                ObservationValue::OperationReview(
+                    self.inner
+                        .agent
+                        .operation_review(chat, run_id, &call_id)
+                        .await?,
+                )
+            }
+            AgentDetailQuery::ManagedConfiguration { token } => {
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize_worker(&AgentCommand::ManagedHeartbeat { execution, token })
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                ObservationValue::ManagedConfiguration(
+                    self.managed_configuration(execution, &entry).await?,
+                )
+            }
+            AgentDetailQuery::ManagedHistory { token, cursor } => {
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize_worker(&AgentCommand::ManagedHeartbeat { execution, token })
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                if entry.launch.profile != tickloop_agent_protocol::ExecutionProfile::Acp
+                    || !entry.launch.session_persistence
+                {
+                    return Err(AccessError::invalid(
+                        "history replay requires a persistent ACP session",
+                    ));
+                }
+                if cursor.is_none() {
+                    self.inner.agent.flush_acp_session(chat).await?;
+                }
+                ObservationValue::ManagedHistory(entry.history(cursor).await?)
+            }
             AgentDetailQuery::ProviderCredentials => {
                 let launches = self.inner.launches.lock().await;
                 let launch = launches.get(&execution);
@@ -1636,6 +2057,7 @@ impl EmbeddedAgentAccess {
                     None => None,
                 },
                 warnings: self.inner.agent.skill_warnings(chat).await?,
+                commands: self.inner.agent.user_skill_catalog(chat).await?,
             },
             AgentDetailQuery::Warnings => {
                 ObservationValue::Warnings(self.live_facts(execution, chat).await?.warnings)
@@ -1953,6 +2375,18 @@ impl AgentAccess for EmbeddedAgentAccess {
                 },
                 None,
             )),
+            ObservationRequest::ManagedSessions { launch, cursor } => Ok(Observation::single(
+                ObservationValue::ManagedSessions(
+                    tickloop_agent_runtime::transcript::records::managed_sessions(*launch, cursor)
+                        .await?,
+                ),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
             ObservationRequest::SavedRecords {
                 store_root,
                 folder,
@@ -2004,13 +2438,72 @@ impl AgentAccess for EmbeddedAgentAccess {
         if self.inner.upgrade_paused.load(Ordering::SeqCst) {
             return Err(AccessError::unavailable("Worker is transferring execution"));
         }
+        if matches!(&envelope.command, AgentCommand::Create { launch, .. } if launch.profile != tickloop_agent_protocol::ExecutionProfile::Local)
+            || matches!(&envelope.command, AgentCommand::LoadRecord { launch: Some(launch), .. } if launch.profile != tickloop_agent_protocol::ExecutionProfile::Local)
+        {
+            return Err(AccessError::invalid(
+                "managed profiles require CreateManaged, never history loading",
+            ));
+        }
+        match &envelope.command {
+            AgentCommand::Create { launch, .. }
+            | AgentCommand::LoadRecord {
+                launch: Some(launch),
+                ..
+            } => {
+                self.inner
+                    .agent
+                    .validate_execution_profile(launch.profile, launch.host_options)?;
+            }
+            AgentCommand::LoadRecord { launch: None, .. } => {
+                self.inner.agent.validate_execution_profile(
+                    tickloop_agent_protocol::ExecutionProfile::Local,
+                    tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
+                )?;
+            }
+            _ => {}
+        }
+        if let AgentCommand::SendFamilyInput {
+            target_execution, ..
+        } = &envelope.command
+            && self.inner.managed.contains(*target_execution).await
+        {
+            return Err(AccessError::new(
+                AccessErrorCode::AccessDenied,
+                "managed executions do not accept family input",
+            ));
+        }
+        let managed = self
+            .inner
+            .managed
+            .authorize_worker(&envelope.command)
+            .await?;
+        let _gate = if matches!(&envelope.command, AgentCommand::ManagedHeartbeat { .. }) {
+            None
+        } else if let Some(entry) = &managed {
+            Some(entry.gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        if managed.is_some() {
+            self.inner
+                .managed
+                .authorize_worker(&envelope.command)
+                .await?;
+        }
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
         let result = Box::pin(self.dispatch(&envelope)).await;
         let persistence = if let Some(error) = self.inner.agent.transcript_write_error() {
             PersistenceState::WriteFailed(error)
-        } else if matches!(envelope.command, AgentCommand::FlushTranscripts) {
+        } else if matches!(
+            &envelope.command,
+            AgentCommand::FlushTranscripts
+                | AgentCommand::ManagedConfigure { .. }
+                | AgentCommand::ManagedLoad { .. }
+        ) || matches!(&envelope.command, AgentCommand::CreateManaged { launch, .. } if launch.profile == tickloop_agent_protocol::ExecutionProfile::Acp && launch.session_persistence)
+        {
             PersistenceState::FlushObserved
         } else if self.inner.agent.saves_chats() {
             PersistenceState::BestEffortPending
@@ -2036,6 +2529,12 @@ impl AgentAccess for EmbeddedAgentAccess {
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
         if let DisplayUpdate::Displayed { execution, .. } = &update {
+            if self.inner.managed.contains(*execution).await {
+                return Err(AccessError::new(
+                    AccessErrorCode::AccessDenied,
+                    "managed executions cannot be attached to a Console",
+                ));
+            }
             self.chat(*execution).await?;
         }
         let receipt = self.inner.views.update(update).await?;

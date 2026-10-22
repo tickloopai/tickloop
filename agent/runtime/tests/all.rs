@@ -20,6 +20,8 @@ mod durable_tasks;
 mod durable_triggers;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
+#[path = "all/managed.rs"]
+mod managed;
 #[path = "all/retained_budget.rs"]
 mod retained_budget;
 #[path = "all/schedule_confirmation.rs"]

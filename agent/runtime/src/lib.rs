@@ -37,13 +37,16 @@ pub mod hosted;
 mod jev_review;
 mod lifecycle;
 pub use lifecycle::InputLedgerState;
+mod acp_claims;
 mod loop_lease;
+mod managed_configuration;
 mod mcp_http;
 mod mcp_resources;
 pub mod mcp_tools;
 mod model_request;
 mod persistence;
 mod remote_skills;
+pub mod session_mcp;
 pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tick_tools;
@@ -372,6 +375,7 @@ struct Inner {
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
+    acp_claims: Mutex<HashMap<ChatId, std::fs::File>>,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -517,7 +521,7 @@ struct Chat {
 
 enum RunAdmission {
     Idle,
-    Ready(Receipt, ModelRequest, CancellationToken),
+    Ready(Receipt, Box<ModelRequest>, CancellationToken),
     ValidateTick(Box<PendingInput>),
 }
 
@@ -871,7 +875,8 @@ fn answerable_permission_request(
         .cloned()
         .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
     let answerable = match request.execution {
-        PermissionExecution::ToolCall { run_id, .. } => {
+        PermissionExecution::ToolCall { run_id, .. }
+        | PermissionExecution::HostOperation { run_id, .. } => {
             chat.run_cancel(run_id)
                 .is_some_and(|cancel| !cancel.is_cancelled())
                 && chat.snapshot.loops.iter().any(|goal| {
@@ -1891,6 +1896,7 @@ impl Agent {
                 tasks: agent_tasks::AgentTasks::default(),
                 recorder,
                 loop_leases: loop_lease::LoopLeases::default(),
+                acp_claims: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2378,7 +2384,19 @@ impl Agent {
             ledger,
             turn,
         } = submission;
-        if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
+        if contexts.len().saturating_add(paths.len()) > input_context::MAX_CONTEXTS {
+            return Err(AgentError::Invalid(format!(
+                "a prompt can attach at most {} contexts",
+                input_context::MAX_CONTEXTS
+            )));
+        }
+        if paths.len().saturating_add(
+            contexts
+                .iter()
+                .filter(|context| context.path().is_some())
+                .count(),
+        ) > input_context::MAX_REFERENCES
+        {
             return Err(AgentError::Invalid(format!(
                 "a prompt can attach at most {} files or directories",
                 input_context::MAX_REFERENCES
@@ -2411,22 +2429,21 @@ impl Agent {
                     )));
                 }
                 drop(chats);
-                return self
-                    .submit_internal(
-                        chat_id,
-                        goal,
-                        input,
-                        SubmissionOptions {
-                            contexts,
-                            directed_human: directed_source,
-                            family_generation: target_generation,
-                            host_context,
-                            ledger,
-                            turn,
-                            ..Default::default()
-                        },
-                    )
-                    .await;
+                return Box::pin(self.submit_internal(
+                    chat_id,
+                    goal,
+                    input,
+                    SubmissionOptions {
+                        contexts,
+                        directed_human: directed_source,
+                        family_generation: target_generation,
+                        host_context,
+                        ledger,
+                        turn,
+                        ..Default::default()
+                    },
+                ))
+                .await;
             }
             let workspace = tickloop_agent_tools::Workspace {
                 folder: snapshot.folder.clone(),
@@ -2478,7 +2495,9 @@ impl Agent {
             }
             attached_file_reads = loaded.file_reads;
         }
-        self.submit_internal(
+        // Console approval can reenter submission beneath several adapter frames. Keep the
+        // large run-admission future off that stack, including the folderless path above.
+        Box::pin(self.submit_internal(
             chat_id,
             goal,
             input,
@@ -2493,7 +2512,7 @@ impl Agent {
                 turn,
                 ..Default::default()
             },
-        )
+        ))
         .await
     }
 
@@ -2558,7 +2577,7 @@ impl Agent {
                 "agent is unavailable during shutdown or planned upgrade".into(),
             ));
         }
-        if input.trim().is_empty() {
+        if input.trim().is_empty() && contexts.is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
         let mut chats = self.inner.chats.lock().await;
@@ -3967,7 +3986,7 @@ impl Agent {
             match admission {
                 RunAdmission::Idle => return Ok(None),
                 RunAdmission::Ready(receipt, request, cancel) => {
-                    return Ok(Some((receipt, request, cancel)));
+                    return Ok(Some((receipt, *request, cancel)));
                 }
                 RunAdmission::ValidateTick(pending) => {
                     let source = pending.trigger_source.as_ref().unwrap();
@@ -3993,7 +4012,7 @@ impl Agent {
                             match self.select_next_run(chat, Some(&pending))? {
                                 RunAdmission::Idle => return Ok(None),
                                 RunAdmission::Ready(receipt, request, cancel) => {
-                                    return Ok(Some((receipt, request, cancel)));
+                                    return Ok(Some((receipt, *request, cancel)));
                                 }
                                 RunAdmission::ValidateTick(_) => {}
                             }
@@ -4268,7 +4287,7 @@ impl Agent {
                 reasoning_effort: candidate.snapshot.effective_reasoning_effort(),
             };
             *chat = candidate;
-            return Ok(RunAdmission::Ready(receipt, request, cancel));
+            return Ok(RunAdmission::Ready(receipt, Box::new(request), cancel));
         }
         if preceding_model_runs.is_some()
             && command_barrier.is_none_or(|command_sequence| {
@@ -5041,6 +5060,9 @@ impl Agent {
     /// Continues the owning Loop without creating one for an unowned Shell result.
     /// An already queued input absorbs further task notifications into the same run.
     fn queue_task_continuation(&self, chat: &mut Chat, loop_id: Option<LoopId>) -> bool {
+        if self.inner.tool_policy.is_managed() {
+            return false;
+        }
         let Some(loop_id) = loop_id else {
             return false;
         };
@@ -5277,12 +5299,27 @@ fn mcp_resource_authority_allowed(
     chat: &Chat,
     authority: &tickloop_agent_protocol::HostToolAuthority,
 ) -> bool {
-    chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
-        delegation
-            .ceiling
-            .host_tools
-            .get(crate::mcp_tools::ARTIFACT_READ_TOOL)
-            .is_some_and(|authorities| authorities.contains(authority))
+    mcp_resource_authority_allowed_snapshot(&chat.snapshot, authority)
+}
+
+fn mcp_resource_authority_allowed_snapshot(
+    snapshot: &ChatSnapshot,
+    authority: &tickloop_agent_protocol::HostToolAuthority,
+) -> bool {
+    snapshot.delegation.as_ref().is_none_or(|delegation| {
+        [
+            crate::mcp_tools::ARTIFACT_READ_TOOL,
+            crate::mcp_resources::READ_MCP_RESOURCE_TOOL,
+            crate::mcp_resources::LIST_MCP_RESOURCES_TOOL,
+        ]
+        .into_iter()
+        .any(|name| {
+            delegation
+                .ceiling
+                .host_tools
+                .get(name)
+                .is_some_and(|authorities| authorities.contains(authority))
+        })
     })
 }
 

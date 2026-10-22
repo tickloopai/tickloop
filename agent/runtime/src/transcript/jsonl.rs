@@ -160,6 +160,20 @@ impl JsonlTranscriptStore {
         list_project(&project_directory(&self.files.root, folder))
     }
 
+    /// ACP listing cannot treat a missed head/tail metadata window as an ordinary Chat. A file
+    /// that cannot be scanned is listed as no ACP session rather than failing the listing.
+    pub fn project_acp_chats(&self, folder: &Path) -> io::Result<Vec<TranscriptSummary>> {
+        let mut summaries = self.project_chats(folder)?;
+        let directory = project_directory(&self.files.root, folder);
+        for summary in &mut summaries {
+            if summary.acp_session.is_none() {
+                summary.acp_session =
+                    super::listing::scan_acp_session(&transcript_path(&directory, summary.chat_id));
+            }
+        }
+        Ok(summaries)
+    }
+
     /// The saved titles in the project of a Chat this store registered or loaded.
     pub fn project_titles(&self, chat: ChatId) -> Vec<String> {
         self.chat_path(chat)
@@ -356,7 +370,8 @@ impl ChatFiles {
 }
 
 /// Loads a Transcript file the way the Harness loads a Chat: from the latest boundary, and in
-/// full when that misses the root.
+/// full when that misses the root. It only reads, so observing a saved Chat registers nothing
+/// and creates no directory.
 pub(crate) fn load_file(path: &Path) -> io::Result<Option<LoadedTranscript>> {
     let (loaded, reaches_root) = assemble(&read_file(path, LoadRange::FromLatestBoundary)?, None);
     if reaches_root && loaded.is_some() {

@@ -1404,7 +1404,9 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// 规格"会话内容的表示"中列出的 Transcript 条目类型。
-const SPECIFIED_LINE_TYPES: [&str; 17] = [
+const SPECIFIED_LINE_TYPES: [&str; 19] = [
+    "acp-session",
+    "recorded-edit",
     "user",
     "assistant",
     "system",

@@ -10,6 +10,83 @@ use tickloop_agent_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_wor
 const MONITOR_COMMAND: &str = "monitor";
 const TICK_COMMAND: &str = "tick";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientEntry {
+    Console,
+    Print,
+    Acp,
+    Internal,
+}
+
+/// Classifies only option positions, never an option's value or text after `--`.
+/// Full validation remains with the selected adapter.
+pub fn client_entry(arguments: &[OsString]) -> ClientEntry {
+    match arguments.first().and_then(|arg| arg.to_str()) {
+        Some("acp") => return ClientEntry::Acp,
+        Some("update" | "daemon" | "worker" | "monitor" | "tick") => return ClientEntry::Internal,
+        _ => {}
+    }
+    let mut arguments = arguments.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("-p" | "--print" | "--p") => return ClientEntry::Print,
+            Some("--") => break,
+            Some(
+                "--cwd"
+                | "--mode"
+                | "--view-handoff"
+                | "--chat-id"
+                | "--config"
+                | "--auto-reviewer-config"
+                | "--permission-checker-config"
+                | "--output-format"
+                | "--timeout",
+            ) => {
+                arguments.next();
+            }
+            Some("-r" | "--resume") => {
+                // Resume has an optional non-option Chat ID, read as the Console parser reads it.
+                arguments.next_if(|value| !value.as_encoded_bytes().starts_with(b"-"));
+            }
+            Some(value) if value.starts_with('-') => {}
+            _ => break,
+        }
+    }
+    ClientEntry::Console
+}
+
+pub async fn run_noninteractive(entry: ClientEntry, arguments: &[OsString]) -> Option<i32> {
+    if !matches!(entry, ClientEntry::Print | ClientEntry::Acp) {
+        return None;
+    }
+    let values = arguments
+        .iter()
+        .cloned()
+        .map(|argument| argument.into_string())
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(mut values) = values else {
+        eprintln!("Error: command arguments must be valid UTF-8");
+        return Some(2);
+    };
+    Some(match entry {
+        ClientEntry::Print => tickloop_agent_print::run(values).await,
+        ClientEntry::Acp => {
+            values.remove(0);
+            match tickloop_agent_acp::run(values).await {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!(
+                        "Error: {}",
+                        tickloop_agent_console::terminal::safe_text(&error)
+                    );
+                    1
+                }
+            }
+        }
+        _ => unreachable!(),
+    })
+}
+
 /// Names this build, from its sources, for the comparison between a View and the running daemon.
 pub fn name_this_build() {
     tickloop_agent_protocol::set_build_identity(env!("TICKLOOP_BUILD_IDENTITY"));

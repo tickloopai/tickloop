@@ -37,7 +37,37 @@ struct LegacyFixture {
 }
 
 fn main() -> ExitCode {
+    // Worker stderr is intentionally disconnected. Keep test-only panic evidence beside the
+    // isolated transport fixture so a lost command reply can be diagnosed across processes.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = std::env::var_os(TRANSPORT_FILE) {
+            let path = PathBuf::from(path).with_extension("panic.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+            {
+                let _ = writeln!(file, "{info}");
+            }
+        }
+        default_hook(info);
+    }));
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if is_product_process(&arguments)
+        && let Some(root) = std::env::var_os("TICKLOOP_CONFIG_DIR")
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(PathBuf::from(root).join("fixture-process.log"))
+    {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::dup2(file.as_raw_fd(), 2);
+        }
+    }
     if arguments.first().and_then(|argument| argument.to_str()) == Some("--content-identity") {
         println!("{}", tickhost::host::BUILD_IDENTITY);
         return ExitCode::SUCCESS;
@@ -59,6 +89,17 @@ fn main() -> ExitCode {
             .unwrap()
         );
         return ExitCode::SUCCESS;
+    }
+    if arguments.first().and_then(|argument| argument.to_str())
+        == Some(tickloop_agent_daemon::mcp_supervisor::SUPERVISOR_ARGUMENT)
+    {
+        return match tickloop_agent_daemon::mcp_supervisor::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let invoked_as_tickhost = std::env::current_exe()
         .is_ok_and(|executable| executable.file_name() == Some(TICKHOST_EXECUTABLE.as_ref()));
@@ -265,6 +306,13 @@ fn run_cli(mut arguments: Vec<OsString>) -> Result<(), String> {
         use_transport_fixture(&path);
     }
     runtime().block_on(async {
+        let entry = tickloop_agent::client_entry(&arguments);
+        if let Some(code) = tickloop_agent::run_noninteractive(entry, &arguments).await {
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         match tickloop_agent::run_internal(&arguments).await {
             Some(result) => result,
             None => {

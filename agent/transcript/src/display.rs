@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
     AgentColor, AgentMessageSource, Content, ImageContext, InputContext, LocalMessage, LoopState,
-    Protocol, Question, Role, SharedTask, SubagentRegistration, TaskBoard, Trigger,
+    Protocol, Question, ResourceContext, Role, SharedTask, SubagentRegistration, TaskBoard,
+    Trigger,
 };
 use uuid::Uuid;
 
@@ -93,11 +94,14 @@ pub enum DisplayBlock {
         text: String,
     },
     Image(ImageContext),
+    Resource(ResourceContext),
     ToolCall {
         call_id: String,
         name: String,
         input: serde_json::Value,
         result: Option<DisplayToolResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recorded_review: Option<tickloop_agent_protocol::RecordedFileChangeReview>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         member: Option<DisplayMember>,
     },
@@ -111,7 +115,12 @@ pub enum DisplayBlock {
         prompt_id: Uuid,
         input_id: Option<Uuid>,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageContext>,
+        /// Ordered attachments when resources are present; otherwise `images` carries images.
+        /// A payload is held in only one field, never duplicated.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        contexts: Vec<InputContext>,
     },
 }
 
@@ -153,6 +162,7 @@ pub struct DisplayProjector {
     /// The display node each applied chain entry is part of, or follows when it is internal.
     positions: HashMap<Uuid, Option<Uuid>>,
     responses: HashMap<Uuid, ResponseEntry>,
+    recorded_edits: HashMap<(Uuid, String), tickloop_agent_protocol::RecordedFileChangeReview>,
     waits: Vec<WaitEntry>,
     subagents: Vec<SubagentRegistration>,
     inputs: HashMap<Uuid, InputEntry>,
@@ -310,6 +320,15 @@ impl DisplayProjector {
                 .collect();
         }
         let mut changed = match line {
+            Line::RecordedEdit(edit) => {
+                self.recorded_edits
+                    .insert((edit.run_id, edit.call_id.clone()), edit.review.clone());
+                self.responses
+                    .values()
+                    .filter(|response| response.run_id == edit.run_id)
+                    .map(|response| response.response_id)
+                    .collect()
+            }
             Line::Response(response) => {
                 self.responses
                     .insert(response.response_id, response.clone());
@@ -461,11 +480,24 @@ impl DisplayProjector {
         }
         for block in &mut node.blocks {
             if let DisplayBlock::ToolCall {
+                call_id,
+                recorded_review,
+                ..
+            } = block
+                && let Some(response) = self.responses.get(&id)
+            {
+                *recorded_review = self
+                    .recorded_edits
+                    .get(&(response.run_id, call_id.clone()))
+                    .cloned();
+            }
+            if let DisplayBlock::ToolCall {
                 name,
                 input,
                 result,
                 member,
                 call_id,
+                ..
             } = block
                 && name == tickloop_agent_protocol::SUBAGENT_TOOL_NAME
             {
@@ -634,11 +666,25 @@ impl DisplayProjector {
                     .is_none_or(|run| !self.prompts_by_run.contains_key(&run)));
         let (position, changed) = match entry.response_id {
             Some(response) => {
-                let follow_up = is_prompt.then(|| DisplayBlock::FollowUp {
-                    prompt_id: entry.original_message_id.unwrap_or(entry.uuid),
-                    input_id: entry.input_id,
-                    text: message_text(&entry.message.content),
-                    images: prompt_images(entry),
+                let follow_up = is_prompt.then(|| {
+                    let contexts = prompt_contexts(entry);
+                    let has_resources = contexts.iter().any(|context| {
+                        matches!(
+                            context,
+                            InputContext::Resource(_) | InputContext::PromptText { .. }
+                        )
+                    });
+                    DisplayBlock::FollowUp {
+                        prompt_id: entry.original_message_id.unwrap_or(entry.uuid),
+                        input_id: entry.input_id,
+                        text: message_text(&entry.message.content),
+                        images: if has_resources {
+                            Vec::new()
+                        } else {
+                            prompt_images(entry)
+                        },
+                        contexts: if has_resources { contexts } else { Vec::new() },
+                    }
                 });
                 let node = self.answer(response, follows, &entry.timestamp);
                 match follow_up {
@@ -654,7 +700,14 @@ impl DisplayProjector {
                 if !text.is_empty() {
                     blocks.push(DisplayBlock::Text { text });
                 }
-                blocks.extend(prompt_images(entry).into_iter().map(DisplayBlock::Image));
+                blocks.extend(prompt_contexts(entry).into_iter().filter_map(
+                    |context| match context {
+                        InputContext::Image(image) => Some(DisplayBlock::Image(image)),
+                        InputContext::Resource(resource) => Some(DisplayBlock::Resource(resource)),
+                        InputContext::PromptText { text } => Some(DisplayBlock::Text { text }),
+                        _ => None,
+                    },
+                ));
                 if let Some(run) = entry.run_id {
                     self.prompts_by_run.insert(run, id);
                 }
@@ -729,12 +782,16 @@ fn message_text(content: &[Content]) -> String {
         .join("\n")
 }
 
-fn prompt_images(entry: &ChainEntry) -> Vec<ImageContext> {
+fn prompt_contexts(entry: &ChainEntry) -> Vec<InputContext> {
     entry
         .contexts
         .clone()
         .and_then(|contexts| serde_json::from_value::<Vec<InputContext>>(contexts).ok())
         .unwrap_or_default()
+}
+
+fn prompt_images(entry: &ChainEntry) -> Vec<ImageContext> {
+    prompt_contexts(entry)
         .into_iter()
         .filter_map(|context| match context {
             InputContext::Image(image) => Some(image),
@@ -797,6 +854,7 @@ fn add_answer_content(node: &mut DisplayNode, entry: &ChainEntry) {
                 name: name.clone(),
                 input: input.clone(),
                 result: None,
+                recorded_review: None,
                 member: None,
             }),
             Content::ToolResult {
@@ -865,6 +923,74 @@ mod tests {
             thinking: text.into(),
             signature: Some("signed".into()),
         }
+    }
+
+    #[test]
+    fn recorded_edits_bind_to_the_exact_run_and_survive_projection_rebuild() {
+        let run = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut lines = Vec::new();
+        let mut responses = Vec::new();
+        for run_id in [run, other] {
+            let response_id = Uuid::new_v4();
+            responses.push(response_id);
+            lines.push(Line::Response(ResponseEntry {
+                response_id,
+                input_id: None,
+                attempt: 1,
+                run_id,
+                loop_id: Uuid::new_v4(),
+                display_parent: None,
+                timestamp: String::new(),
+                state: ResponseState::Started,
+                without_messages: false,
+            }));
+            let mut call = entry(
+                Uuid::new_v4(),
+                None,
+                Role::Assistant,
+                vec![tool_use("same")],
+            );
+            call.run_id = Some(run_id);
+            call.response_id = Some(response_id);
+            lines.push(Line::Assistant(call));
+        }
+        let review = tickloop_agent_protocol::RecordedFileChangeReview {
+            path: "/recorded.txt".into(),
+            unified_diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+        };
+        lines.push(Line::RecordedEdit(crate::RecordedEditEntry {
+            operation_id: Uuid::new_v4(),
+            run_id: run,
+            call_id: "same".into(),
+            review: review.clone(),
+        }));
+        let nodes = project(&lines);
+        let shown = |response| {
+            nodes
+                .iter()
+                .find(|node| node.id == response)
+                .unwrap()
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    if let DisplayBlock::ToolCall {
+                        recorded_review, ..
+                    } = block
+                    {
+                        Some(recorded_review.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap()
+        };
+        assert_eq!(shown(responses[0]), Some(review));
+        assert_eq!(shown(responses[1]), None);
+        let rebuilt = project(
+            &serde_json::from_value::<Vec<Line>>(serde_json::to_value(&lines).unwrap()).unwrap(),
+        );
+        assert_eq!(nodes, rebuilt);
     }
 
     /// Thinking shows where the model wrote it, once per model call, and empty thinking (a
@@ -996,6 +1122,69 @@ mod tests {
             ]
         );
         assert!(!serde_json::to_string(&node).unwrap().contains("opaque"));
+    }
+
+    #[test]
+    fn resource_and_image_sources_survive_projection_and_record_round_trip_in_order() {
+        let reference = InputContext::Resource(ResourceContext {
+            uri: "https://never-fetched.invalid/resource".into(),
+            mime_type: None,
+            name: Some("reference".into()),
+            content: None,
+        });
+        let image = InputContext::Image(ImageContext {
+            origin: tickloop_agent_protocol::ImageOrigin::Attached {
+                id: 1,
+                uri: Some("custom://image".into()),
+            },
+            image: tickloop_agent_protocol::Image {
+                media_type: tickloop_agent_protocol::ImageMediaType::Png,
+                data: "aGVsbG8=".into(),
+                width: 1,
+                height: 1,
+            },
+        });
+        let embedded = InputContext::Resource(ResourceContext {
+            uri: "file:///not-a-read.txt".into(),
+            mime_type: Some("text/plain".into()),
+            name: None,
+            content: Some("client-provided text".into()),
+        });
+        let contexts = vec![reference, image, embedded];
+        let mut prompt = entry(
+            Uuid::new_v4(),
+            None,
+            Role::User,
+            vec![Content::Text {
+                text: "Analyze".into(),
+            }],
+        );
+        prompt.execution_mode = Some(serde_json::json!("default"));
+        prompt.contexts = Some(serde_json::to_value(&contexts).unwrap());
+        let line = Line::chain(Role::User, prompt.clone());
+        let restored: Line = serde_json::from_str(&serde_json::to_string(&line).unwrap()).unwrap();
+        let nodes = project(&[restored]);
+        assert!(matches!(&nodes[0].blocks[..], [
+            DisplayBlock::Text { text }, DisplayBlock::Resource(reference),
+            DisplayBlock::Image(image), DisplayBlock::Resource(embedded),
+        ] if text == "Analyze"
+            && reference.content.is_none()
+            && image.origin.label().contains("custom://image")
+            && embedded.uri == "file:///not-a-read.txt"
+            && embedded.content.as_deref() == Some("client-provided text")));
+
+        let response = Uuid::new_v4();
+        let mut follow_up = prompt;
+        follow_up.uuid = Uuid::new_v4();
+        follow_up.response_id = Some(response);
+        let nodes = project(&[Line::chain(Role::User, follow_up)]);
+        assert!(
+            matches!(&nodes[0].blocks[..], [DisplayBlock::FollowUp { contexts: shown, images, .. }]
+            if shown == &contexts && images.is_empty())
+        );
+        let restored: DisplayNode =
+            serde_json::from_value(serde_json::to_value(&nodes[0]).unwrap()).unwrap();
+        assert_eq!(restored, nodes[0]);
     }
 
     /// A compaction's copy of an answer entry only aliases it, while a fragment appended to the

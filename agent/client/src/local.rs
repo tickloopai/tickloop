@@ -682,13 +682,15 @@ async fn read_responses(
         };
         match response {
             ServerMessage::HandoffPrepare { transfer_id } => {
-                if handoff::prepare(&inner, transfer_id).await.is_err() {
-                    break;
+                match handoff::prepare(&inner, transfer_id).await {
+                    Ok(()) => {}
+                    Err(_) => break,
                 }
             }
             ServerMessage::HandoffAbort { transfer_id } => {
-                if handoff::abort(&inner, transfer_id).is_err() {
-                    break;
+                match handoff::abort(&inner, transfer_id) {
+                    Ok(()) => {}
+                    Err(_) => break,
                 }
             }
             ServerMessage::HandoffCommit {

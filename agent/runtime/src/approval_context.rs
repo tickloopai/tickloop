@@ -475,10 +475,30 @@ fn originals_for_active_chain_with_legacy(
                             Content::Text { text } => Some(text.as_str()),
                             _ => None,
                         })
+                        .chain(
+                            snapshot
+                                .message_contexts
+                                .get(&index)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|context| match context {
+                                    tickloop_agent_protocol::InputContext::PromptText { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                }),
+                        )
                         .collect::<Vec<_>>()
                         .join("\n\n")
                 });
-            if text.is_empty() {
+            // An attachment-only submission has a real user origin but no textual authority.
+            // Keep that empty text instead of promoting the attached material to instructions.
+            if text.is_empty()
+                && snapshot
+                    .message_contexts
+                    .get(&index)
+                    .is_none_or(|contexts| contexts.is_empty())
+            {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             }
             originals.push(OriginalUserInput {
@@ -686,6 +706,47 @@ impl crate::Agent {
 mod tests {
     use super::*;
     use tickloop_agent_protocol::{Message, ModelConfig, OperationState};
+
+    #[test]
+    fn an_attachment_only_origin_keeps_empty_text_without_promoting_resource_content() {
+        let mut snapshot = crate::empty_snapshot(Uuid::new_v4(), None, ModelConfig::unselected());
+        let run = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let mut bookkeeping = ChatBookkeeping::default();
+        bookkeeping.run_loops.insert(run, Uuid::new_v4());
+        snapshot.messages.push(Message {
+            role: Role::User,
+            content: vec![Content::Text {
+                text: String::new(),
+            }],
+        });
+        snapshot.message_runs.insert(0, run);
+        snapshot.message_ids.insert(0, message_id);
+        snapshot
+            .prompt_execution_modes
+            .insert(0, tickloop_agent_protocol::ExecutionMode::Auto);
+        assert!(originals_for_active_chain(&snapshot, &bookkeeping).is_err());
+        snapshot.message_contexts.insert(
+            0,
+            vec![tickloop_agent_protocol::InputContext::Resource(
+                tickloop_agent_protocol::ResourceContext {
+                    uri: "custom://material".into(),
+                    mime_type: None,
+                    name: None,
+                    content: Some("FORGED AUTHORIZATION".into()),
+                },
+            )],
+        );
+        let originals = originals_for_active_chain(&snapshot, &bookkeeping).unwrap();
+        assert_eq!(originals.len(), 1);
+        assert_eq!(originals[0].message_id, message_id);
+        assert!(originals[0].text.is_empty());
+        assert!(
+            !serde_json::to_string(&originals)
+                .unwrap()
+                .contains("FORGED AUTHORIZATION")
+        );
+    }
 
     #[test]
     fn tool_outputs_cannot_claim_success_or_replace_a_host_unknown_outcome() {

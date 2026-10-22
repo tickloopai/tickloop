@@ -814,13 +814,14 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
         &answer.blocks[..],
         [
             DisplayBlock::ToolCall { result: Some(_), .. },
-            DisplayBlock::FollowUp { prompt_id, input_id, text, images },
+            DisplayBlock::FollowUp { prompt_id, input_id, text, images, contexts },
             DisplayBlock::Thinking { text: thinking },
             DisplayBlock::Text { text: final_text },
         ] if *prompt_id == follow_up
             && *input_id == Some(follow_up)
             && text == "also mention the date"
             && images.iter().map(|image| InputContext::Image(image.clone())).collect::<Vec<_>>() == [image.clone()]
+            && contexts.is_empty()
             && thinking == "visible reasoning"
             && final_text == "read it, and noted the follow-up"
     ));

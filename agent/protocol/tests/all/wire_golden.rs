@@ -31,6 +31,120 @@ use tickloop_agent_protocol::{
 };
 
 #[test]
+fn managed_execution_commands_keep_their_recorded_wire_and_legacy_local_default() {
+    use tickloop_agent_protocol::{ExecutionProfile, ManagedToken};
+    let token: ManagedToken = serde_json::from_value(json!(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ))
+    .unwrap();
+    let mut legacy = serde_json::to_value(launch_spec()).unwrap();
+    legacy.as_object_mut().unwrap().remove("profile");
+    assert_eq!(
+        serde_json::from_value::<LaunchSpec>(legacy)
+            .unwrap()
+            .profile,
+        ExecutionProfile::Local
+    );
+    let mut launch = launch_spec();
+    launch.profile = ExecutionProfile::Acp;
+    launch.exact_chat = None;
+    let request = RequestRef {
+        execution: execution(),
+        request_id: id(0x61),
+        kind: PendingRequestKind::Permission,
+        version: 1,
+    };
+    launch.session_mcp_servers = vec![tickloop_agent_protocol::SessionMcpServer {
+        name: "example".into(),
+        program: "/usr/bin/example-mcp".into(),
+        args: vec!["--stdio".into()],
+        env: Default::default(),
+        cwd: "/work/project".into(),
+    }];
+    let commands = vec![
+        AgentCommand::ManagedLoad {
+            session_uuid: id(0x71),
+            launch: launch.clone(),
+            session_id: id(0x70),
+            token: token.clone(),
+        },
+        AgentCommand::ManagedConfigure {
+            execution: execution(),
+            token: token.clone(),
+            change: tickloop_agent_protocol::ManagedConfigurationChange {
+                model_id: Some("example-large".into()),
+                mode: Some(ExecutionMode::AcceptEdits),
+                reasoning_effort: None,
+            },
+        },
+        AgentCommand::ManagedFinalizeRelease {
+            execution: execution(),
+            token: token.clone(),
+        },
+        AgentCommand::CreateManaged {
+            launch,
+            initial: None,
+            session_id: id(0x70),
+            token: token.clone(),
+        },
+        AgentCommand::ManagedSubmit {
+            execution: execution(),
+            token: token.clone(),
+            input: UserInput::Text {
+                text: "inspect the project".into(),
+                contexts: vec![
+                    tickloop_agent_protocol::InputContext::Resource(
+                        tickloop_agent_protocol::ResourceContext {
+                            uri: "custom://example/notes".into(),
+                            name: Some("Notes".into()),
+                            mime_type: Some("text/plain".into()),
+                            content: Some("client-supplied material".into()),
+                        },
+                    ),
+                    tickloop_agent_protocol::InputContext::PromptText {
+                        text: "compare with the attached material".into(),
+                    },
+                ],
+                paths: vec![],
+            },
+        },
+        AgentCommand::ManagedDecidePermission {
+            request,
+            token: token.clone(),
+            allow: true,
+            scope: PermissionScope::Once,
+            comment: None,
+            rule: None,
+        },
+        AgentCommand::ManagedHeartbeat {
+            execution: execution(),
+            token: token.clone(),
+        },
+        AgentCommand::ManagedSettle {
+            execution: execution(),
+            token: token.clone(),
+            cancel: false,
+        },
+        AgentCommand::ManagedRelease {
+            execution: execution(),
+            token,
+        },
+    ];
+    for command in &commands {
+        assert!(command.is_managed());
+        assert!(!format!("{command:?}").contains("0123456789abcdef"));
+    }
+    assert_golden("managed_command", &commands);
+    let result = CommandResult::ManagedSettled {
+        snapshot: Box::new(live_chat_snapshot()),
+    };
+    let wire = serde_json::to_value(&result).unwrap();
+    assert!(serde_json::from_value::<CommandResult>(wire.clone()).is_ok());
+    assert!(!wire.to_string().contains("0123456789abcdef"));
+    assert_eq!(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION, 3);
+}
+
+#[test]
 fn worker_runtime_scope_defaults_to_unknown_for_older_daemons_and_round_trips_when_present() {
     use tickloop_agent_protocol::WorkerRuntimeVersion;
     let legacy = json!({
@@ -443,6 +557,7 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
 
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
+        profile: tickloop_agent_protocol::ExecutionProfile::Local,
         folder: "/work/project".into(),
         config_root: Some("/home/user/.tickloop".into()),
         model: Some(model_config()),
@@ -453,6 +568,7 @@ fn launch_spec() -> LaunchSpec {
             name: b"TERM".to_vec(),
             value: b"xterm-256color".to_vec(),
         }],
+        session_mcp_servers: Vec::new(),
         host_work_context: Some(HostWorkContext {
             socket: "/run/herdr.sock".into(),
             workspace: Some("w1".into()),
@@ -786,6 +902,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::Skills {
                 available: Some(true),
                 warnings: vec![],
+                commands: vec![],
             },
             ObservationValue::RewindFiles(None),
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {

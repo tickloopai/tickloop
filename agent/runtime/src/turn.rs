@@ -202,7 +202,7 @@ enum Admission {
     Known(Receipt),
     /// Its answer lost its host: another attempt continues it, under `answer_parent`.
     Continuation {
-        entry: InputEntry,
+        entry: Box<InputEntry>,
         answer_parent: Option<Uuid>,
     },
     /// It runs, replacing an acceptance lost before it started.
@@ -457,7 +457,7 @@ impl Agent {
             } => {
                 // Boxed: a submission is a large future, and hosts await `advance` on small
                 // stacks.
-                Box::pin(self.continue_input(chat_id, &ledger, entry, answer_parent, delivery))
+                Box::pin(self.continue_input(chat_id, &ledger, *entry, answer_parent, delivery))
                     .await?
             }
             Admission::Run { replaces } => {
@@ -1217,14 +1217,14 @@ fn classify(chat: &Chat, ledger: &LedgerInput) -> Result<Admission, AgentError> 
         {
             Admission::Continuation {
                 answer_parent: last.display_parent,
-                entry,
+                entry: Box::new(entry),
             }
         }
         Some(_) => Admission::Known(receipt),
         None if entry.op != InputOp::RegenerateAnswer && state.prompt_in_conversation => {
             Admission::Continuation {
                 answer_parent: Some(entry.input_id),
-                entry,
+                entry: Box::new(entry),
             }
         }
         None => Admission::Run {

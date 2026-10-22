@@ -62,6 +62,9 @@ Trigger 的定时部分：`every <N>s|m|h|d`、`daily HH:MM [±HH:MM]`、`weekly
 **Chat**：
 用户与一个 Agent 的一段持久对话，用户通过它发起、观察和控制 Loop；一个 Chat 可以关联多个 Loop，可以同时在多个 Agent 界面中打开，每个 Chat 承载独立对话，内部不设 Tab。Chat 不是 Tick：它由 Agent 持有，不由 Tickhost 运行，也不能被订阅。
 
+**托管执行（Managed Execution）**：
+由非交互 `tickloop -p`（别名 `--print`）或 `tickloop acp` 客户端新建并负责收束的 Agent 执行。`OneShot` 与 `Acp` 是执行 profile，不是新的执行模式或 Tick 类型；仍经 AgentAccess、Daemon／Worker 与同一 Harness 执行。客户端持有仅针对该执行的控制凭据和有期限租约，完成、取消或释放时清理所属资源；普通 Console 的 detach 不受影响。ACP 的 session 映射到 Chat，prompt 映射到一次 Submit；外部协议的 session 命名不替代 Transcript。持久 ACP 会话具有保留的来源标记、目录身份与启动权限上限；仅可在没有活持有者时独占装载，同一 session UUID 获取新的 execution 与控制凭据，公开历史回放本身不执行模型、工具或 MCP。普通 Console 历史及活 Chat 不可由 ACP 接管，Print 不恢复历史。会话 stdio MCP 是宿主工具来源，不是 Tick；首次 prompt 强制一次性人工批准启动，服务跨回合保留，释放／EOF／租约失效显式关闭。不开放 Plan／结构化问答、持续 Trigger 与子 Agent。
+
 **Transcript（会话记录）**：
 Chat 对话的持久记录，按发生顺序保存对话内容与 Loop 状态变化，重启后据此恢复 Chat。同一 Transcript 在多处继续时可以形成多条对话链，这些链仍属于同一个 Chat。
 _Avoid_：Session、会话存档

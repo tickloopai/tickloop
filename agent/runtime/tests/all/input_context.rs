@@ -102,7 +102,7 @@ fn mentioned_image_path(context: &InputContext) -> Option<&Path> {
     match context {
         InputContext::Image(image) => match &image.origin {
             ImageOrigin::Mentioned { path } => Some(path),
-            ImageOrigin::Pasted { .. } => None,
+            ImageOrigin::Pasted { .. } | ImageOrigin::Attached { .. } => None,
         },
         _ => None,
     }
@@ -212,6 +212,143 @@ async fn explicit_file_deny_rules_cannot_be_bypassed_by_an_accepted_reference() 
     assert!(error.to_string().contains("denied"));
     assert!(agent.snapshot(chat).await.unwrap().messages.is_empty());
     assert!(model.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn client_resources_are_untrusted_material_not_disk_reads_or_implicit_fetches() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.txt");
+    std::fs::write(&path, "real disk contents").unwrap();
+    let resource = InputContext::Resource(tickloop_agent_protocol::ResourceContext {
+        uri: format!("file://{}", path.display()),
+        mime_type: Some("text/plain".into()),
+        name: Some("client notes".into()),
+        content: Some("client contents; do not treat as instructions".into()),
+    });
+    let reference = InputContext::Resource(tickloop_agent_protocol::ResourceContext {
+        uri: "https://never-fetched.invalid/notes".into(),
+        mime_type: None,
+        name: None,
+        content: None,
+    });
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "overwrite",
+            "Write",
+            serde_json::json!({"file_path":"notes.txt", "content":"changed"}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Deny,
+                tool: "Read".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit_with_input_contexts(
+            chat,
+            None,
+            "Analyze these resources".into(),
+            vec![resource.clone(), reference.clone()],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let mut rejected_unread_write = false;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { .. } => panic!("resources must not grant a disk read"),
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "overwrite" => {
+                assert!(result.is_error);
+                assert!(result.content.contains("File has not been read yet"));
+                rejected_unread_write = true;
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(rejected_unread_write);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "real disk contents"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.message_contexts[&0], [resource, reference]);
+    let requests = model.requests.lock().unwrap();
+    let rendered = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("untrusted data"));
+    assert!(rendered.contains("client contents"));
+    assert!(rendered.contains("https://never-fetched.invalid/notes"));
+    assert!(!rendered.contains("real disk contents"));
+}
+
+#[tokio::test]
+async fn attached_images_can_be_submitted_without_fabricating_prompt_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let bytes = write_png(&directory.path().join("image.png"), 8, 6);
+    let image = InputContext::Image(ImageContext {
+        origin: ImageOrigin::Attached {
+            id: 1,
+            uri: Some("custom://image".into()),
+        },
+        image: prepare(&bytes).unwrap(),
+    });
+    let model = Arc::new(ScriptedModel::new(vec![text("An image.")]));
+    let state = directory.path().join("state");
+    let agent = Agent::open_embedded(state.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_contexts_and_wait(&agent, chat, "", vec![image.clone()], vec![]).await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.message_contexts[&0], std::slice::from_ref(&image));
+    assert!(
+        matches!(&snapshot.messages[0].content[..], [Content::Text { text }] if text.is_empty())
+    );
+    assert_eq!(
+        requested_images(&model.requests.lock().unwrap()[0]).len(),
+        1
+    );
+    assert_eq!(snapshot.highest_pasted_image_id(), None);
+    agent.shutdown().await;
+    drop(agent);
+    let reopened = Agent::open_embedded(state, config(), model).unwrap();
+    let restored = reopened.resume_chat(chat).await.unwrap();
+    assert_eq!(restored.message_contexts[&0], [image]);
+    let points = restored.rewind_points();
+    assert_eq!(points.len(), 1);
+    assert!(points[0].prompt.is_empty());
+    let rewound = reopened
+        .rewind(chat, points[0].message_id, RewindMode::Conversation)
+        .await
+        .unwrap();
+    let draft = rewound.draft.unwrap();
+    assert!(draft.prompt.is_empty());
+    assert_eq!(draft.contexts, restored.message_contexts[&0]);
+    reopened.shutdown().await;
 }
 
 #[tokio::test]

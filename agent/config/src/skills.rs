@@ -51,6 +51,10 @@ pub struct SkillExpansion {
 }
 
 impl SkillDefinition {
+    pub fn user_invocable(&self) -> bool {
+        self.user_invocable
+    }
+
     /// The Skill as its Tick package brings it: named `<package>:<skill>`, which no other Skill
     /// can be named, with the package's install directory in place of `${TICK_PACKAGE_ROOT}`.
     fn in_package(mut self, package: &InstalledPackage) -> Self {

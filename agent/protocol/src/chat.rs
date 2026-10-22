@@ -185,6 +185,17 @@ fn thinking_enabled_by_default() -> bool {
 
 impl ChatSnapshot {
     pub fn run_response_text(&self, run: RunId) -> Option<String> {
+        self.run_response_blocks(run)
+            .map(|blocks| blocks.collect::<Vec<_>>().join("\n"))
+    }
+
+    /// The run's final response text as its `Text` events streamed it: providers may split one
+    /// answer into several text blocks, so the blocks are joined without a separator.
+    pub fn run_streamed_text(&self, run: RunId) -> Option<String> {
+        self.run_response_blocks(run).map(|blocks| blocks.collect())
+    }
+
+    fn run_response_blocks(&self, run: RunId) -> Option<impl Iterator<Item = &str>> {
         self.messages
             .iter()
             .enumerate()
@@ -193,15 +204,10 @@ impl ChatSnapshot {
                 message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
             })
             .map(|(_, message)| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                message.content.iter().filter_map(|content| match content {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
             })
     }
 
@@ -432,20 +438,31 @@ pub struct ProposedToolCall {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PermissionExecution {
-    ToolCall { run_id: RunId, call_id: String },
-    UserShell { command_id: Uuid },
+    ToolCall {
+        run_id: RunId,
+        call_id: String,
+    },
+    /// Host-initiated work within a real Run, not an assistant tool call.
+    HostOperation {
+        run_id: RunId,
+        operation_id: Uuid,
+    },
+    UserShell {
+        command_id: Uuid,
+    },
 }
 
 impl PermissionExecution {
     pub fn run_id(&self) -> Option<RunId> {
         match self {
-            Self::ToolCall { run_id, .. } => Some(*run_id),
+            Self::ToolCall { run_id, .. } | Self::HostOperation { run_id, .. } => Some(*run_id),
             Self::UserShell { .. } => None,
         }
     }
     pub fn call_key(&self) -> String {
         match self {
             Self::ToolCall { call_id, .. } => call_id.clone(),
+            Self::HostOperation { operation_id, .. } => format!("host-operation:{operation_id}"),
             Self::UserShell { command_id } => format!("user-shell:{command_id}"),
         }
     }
@@ -784,12 +801,26 @@ pub fn chat_preview(conversation: &ChatSnapshot, title: &str) -> Option<String> 
                     return None;
                 }
                 Role::User if texts.iter().all(|text| text.trim().is_empty()) => {
+                    let contexts = conversation.message_contexts.get(&index);
+                    let attached_images = contexts
+                        .into_iter()
+                        .flatten()
+                        .filter(|context| matches!(context, InputContext::Image(_)))
+                        .count();
                     let images = message
                         .content
                         .iter()
                         .filter(|content| matches!(content, Content::Image { .. }))
-                        .count();
+                        .count()
+                        .max(attached_images);
                     match images {
+                        0 if contexts
+                            .into_iter()
+                            .flatten()
+                            .any(|context| matches!(context, InputContext::Resource(_))) =>
+                        {
+                            "[resource]".to_owned()
+                        }
                         0 => return None,
                         1 => "[image]".to_owned(),
                         images => format!("[{images} images]"),

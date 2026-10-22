@@ -124,6 +124,9 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     command.env("HOME", &home);
     command.env("TICKLOOP_TMPDIR", &scratch);
     command.env("TICKLOOP_AGENT_TUI", "inline");
+    for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+        command.env_remove(name);
+    }
     command.arg("--no-session-persistence");
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
@@ -376,25 +379,35 @@ fn terminal_explains_how_to_start_without_credentials() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(!text.contains("--config"));
-    assert!(!text.contains("/model FILE"));
-    assert!(text.contains("--cwd"));
-    assert!(text.contains("/loops new"));
-    assert!(
-        !text.contains("/ack-"),
-        "removed acknowledgement commands must not be documented: {text}"
-    );
     for current in [
+        "Usage:",
+        "Commands:",
+        "Options:",
+        "Session options:",
+        "Permission options:",
+        "-p, --print",
+        "--cwd",
         "--continue",
-        "--resume [CHAT]",
-        "--chat-id CHAT",
+        "--resume [<CHAT>]",
+        "--chat-id <CHAT>",
         "--fork-session",
         "--no-session-persistence",
+        "/provider",
+        "/help",
+    ] {
+        assert!(text.contains(current), "missing {current}: {text}");
+    }
+    for manual in [
+        "--config",
+        "/model FILE",
+        "/loops new",
+        "/ack-",
         "TICKLOOP_CONFIG_DIR",
         "/clear",
         "/resume CHAT",
+        "cleanupPeriodDays",
     ] {
-        assert!(text.contains(current), "missing {current}: {text}");
+        assert!(!text.contains(manual), "unexpected {manual}: {text}");
     }
 }
 
@@ -3793,7 +3806,7 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
     );
 }
 
-/// `cleanupPeriodDays` 为 0 时不保存 Chat：`-c` 说明原因，帮助文本介绍这个设置。
+/// `cleanupPeriodDays` 为 0 时不保存 Chat：`-c` 说明原因。
 #[test]
 fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     let directory = tempfile::tempdir().unwrap();
@@ -3817,10 +3830,6 @@ fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     assert!(!output.status.success());
     assert!(error.contains("cleanupPeriodDays is 0"), "{error}");
     assert!(!config_root.join("projects").exists());
-
-    let help = trusted_agent_command().arg("--help").output().unwrap();
-    let text = String::from_utf8(help.stdout).unwrap();
-    assert!(text.contains("cleanupPeriodDays"), "{text}");
 }
 
 async fn daemon_catalog(

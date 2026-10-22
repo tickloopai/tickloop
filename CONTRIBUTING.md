@@ -67,7 +67,9 @@ It runs `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targ
 
 | Path | Contents |
 | --- | --- |
-| `agent/tickloop` | The `tickloop` executable: Console, `daemon`, `worker`, `monitor` and `tick` subcommands, plus end-to-end tests |
+| `agent/tickloop` | The `tickloop` executable: Console, `-p`/`--print`, `acp`, `daemon`, `worker`, `monitor` and `tick` subcommands, plus end-to-end tests |
+| `agent/print` | Non-interactive `-p`/`--print` adapter over managed AgentAccess execution |
+| `agent/acp` | `tickloop acp` Agent Client Protocol stdio adapter over managed AgentAccess execution |
 | `agent/console` | Agent Console (terminal UI, Monitor, `/ticks`); reaches agents only through AgentAccess |
 | `agent/client` | AgentAccess client: Unix socket transport, reconnection, finding or starting the local daemon |
 | `agent/daemon` | Daemon and worker processes: AgentAccess server, embedded agent, worker supervision |
