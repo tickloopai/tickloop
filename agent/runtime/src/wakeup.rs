@@ -612,16 +612,32 @@ impl Agent {
     /// The Chat is continued: its Loop receives again, its sources deliver what they kept, and
     /// Trigger input queued while it was paused may start. A Loop already receiving only looks
     /// again at its artifact links, whose account may be back.
+    /// All of it on a task of the Agent's own, which a caller that stops waiting does not stop.
     pub(super) async fn continue_receiving(&self, chat_id: ChatId) {
-        let change = self.change_receiving(chat_id, ReceivingChange::Resumed);
-        if let Ok(Some(loop_id)) = change.await {
-            self.flush_due_tick_delivery(chat_id, loop_id);
-            // A turn that ended while the switch was off left the input waiting for it.
-            self.inner
-                .tasks
-                .spawn(self.clone().start_waiting_input(chat_id));
-        }
-        Box::pin(self.resume_feedback_sources(chat_id)).await;
+        let _ = self
+            .inner
+            .tasks
+            .spawn(self.clone().continue_receiving_whole(chat_id))
+            .await;
+    }
+
+    fn continue_receiving_whole(
+        self,
+        chat_id: ChatId,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            if let Some(loop_id) = self
+                .change_and_record_receiving(chat_id, ReceivingChange::Resumed)
+                .await
+            {
+                self.flush_due_tick_delivery(chat_id, loop_id);
+                // A turn that ended while the switch was off left the input waiting for it.
+                self.inner
+                    .tasks
+                    .spawn(self.clone().start_waiting_input(chat_id));
+            }
+            self.resume_feedback_sources(chat_id).await;
+        })
     }
 
     /// Turns the receiving switch here and records it for other processes in one operation of
@@ -792,6 +808,21 @@ impl Agent {
             },
         )
         .await
+    }
+
+    /// Whether the Chat's artifact links are being watched for @tickloop requests now.
+    #[doc(hidden)]
+    pub async fn feedback_watcher_running_for_tests(&self, chat_id: ChatId) -> bool {
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .is_some_and(|chat| {
+                chat.feedback_watcher
+                    .as_ref()
+                    .is_some_and(|cancel| !cancel.is_cancelled())
+            })
     }
 
     /// Registers, as a source does, a state that takes over the Chat's snapshot from its stored

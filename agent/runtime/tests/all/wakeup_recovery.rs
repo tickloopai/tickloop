@@ -1274,6 +1274,29 @@ async fn a_continue_dropped_midway_still_records_the_switch() {
     agent.shutdown().await;
 }
 
+/// A Continue whose caller stops waiting after the switch turned here still starts what
+/// waited through the pause, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_dropped_midway_still_starts_what_waited() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    here.stop(chat).await.unwrap();
+    let changed = here.pause_next_for_tests(chat, PausePoint::ReceivingChanged);
+    let continued = tokio::spawn({
+        let here = here.clone();
+        async move { here.continue_loop(chat).await }
+    });
+    tokio::time::timeout(WAIT, changed.entered)
+        .await
+        .expect("the switch turned here")
+        .unwrap();
+    continued.abort();
+    assert!(continued.await.unwrap_err().is_cancelled());
+    drop(changed.release);
+    setup.model.wait_seen(WaitingInput::MARKER, 1).await;
+    setup.ran_once().await;
+}
+
 /// A record of the switch waiting for another process's write holds no thread: on a runtime of
 /// one thread, time goes on meanwhile and the Agent shuts down.
 #[tokio::test]
