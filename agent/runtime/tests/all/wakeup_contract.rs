@@ -1245,3 +1245,40 @@ async fn an_unlinked_artifacts_waiting_request_is_withdrawn_with_its_reason() {
     );
     source.agent.shutdown().await;
 }
+
+/// A Continue whose caller stops waiting after the switch turned here still watches the
+/// artifact links the stop stopped watching, and their requests reach the Loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_dropped_midway_still_watches_the_links_again() {
+    let model = ContractModel::new();
+    let source = LocalFeedbackSource::new(model.clone()).await;
+    let (agent, chat) = (source.agent().clone(), source.chat());
+    assert!(agent.feedback_watcher_running_for_tests(chat).await);
+    agent.stop(chat).await.unwrap();
+    assert!(!agent.feedback_watcher_running_for_tests(chat).await);
+    let changed = agent.pause_next_for_tests(
+        chat,
+        tickloop_agent_runtime::trigger_pauses::PausePoint::ReceivingChanged,
+    );
+    let continued = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.continue_loop(chat).await }
+    });
+    tokio::time::timeout(WAIT, changed.entered)
+        .await
+        .expect("the switch turned here")
+        .unwrap();
+    continued.abort();
+    assert!(continued.await.unwrap_err().is_cancelled());
+    drop(changed.release);
+    tokio::time::timeout(WAIT, async {
+        while !agent.feedback_watcher_running_for_tests(chat).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the links are watched again");
+    source.deliver(1, "after-the-continue").await;
+    model.wait_seen("after-the-continue", 1).await;
+    agent.shutdown().await;
+}

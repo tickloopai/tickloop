@@ -181,6 +181,34 @@ impl Lifecycle {
         );
     }
 
+    /// Updates the delivery state of an accepted input without changing its stable identity.
+    pub(crate) fn set_queued_armed(&mut self, run: RunId, armed: bool) {
+        let Some(id) = self.open_inputs.get(&run).copied() else {
+            return;
+        };
+        let Some(input) = self.inputs.get(&id) else {
+            return;
+        };
+        if input.record.state != InputState::Accepted {
+            return;
+        }
+        let Some(mut queued) = input.record.queued.clone() else {
+            return;
+        };
+        if queued["armed"] == armed {
+            return;
+        }
+        queued["armed"] = armed.into();
+        let revision = self.next_revision();
+        let input = self
+            .inputs
+            .get_mut(&id)
+            .expect("accepted input remains in the ledger");
+        input.record.queued = Some(queued);
+        input.record.timestamp = now();
+        input.revision = revision;
+    }
+
     /// The Run of `run`'s open input started. An input whose prompt does not carry its id
     /// records it; for the others their prompt in the conversation shows it.
     pub(crate) fn start_input(&mut self, run: RunId) {
@@ -199,6 +227,68 @@ impl Lifecycle {
             ) {
                 input.record.state = InputState::Started;
             }
+            input.record.timestamp = now();
+            input.revision = revision;
+        }
+    }
+
+    /// Records the start of Trigger input `run` ahead of the input itself: started, with its
+    /// queued content kept, so a record of it alone shows the input never entered the
+    /// conversation. The start that follows with the input clears the content.
+    pub(crate) fn start_ahead(&mut self, run: RunId) {
+        let Some(id) = self.open_inputs.get(&run).copied() else {
+            return;
+        };
+        let revision = self.next_revision();
+        if let Some(input) = self.inputs.get_mut(&id) {
+            input.record.state = InputState::Started;
+            input.record.timestamp = now();
+            input.revision = revision;
+        }
+    }
+
+    /// Trigger input whose start was recorded ahead of it and nothing after: it never entered
+    /// the conversation, so its run never began, and it waits again as accepted. Whether any
+    /// did.
+    pub(crate) fn reopen_started_ahead(&mut self) -> bool {
+        let mut reopened = false;
+        for (id, input) in &mut self.inputs {
+            if input.record.trigger.is_some()
+                && input.record.state == InputState::Started
+                && input.record.queued.is_some()
+            {
+                self.revision += 1;
+                input.record.state = InputState::Accepted;
+                input.record.timestamp = now();
+                input.revision = self.revision;
+                self.open_inputs.insert(input.record.run_id, *id);
+                reopened = true;
+            }
+        }
+        reopened
+    }
+
+    /// Whether the input of `run` is recorded as started and open.
+    pub(crate) fn is_started(&self, run: RunId) -> bool {
+        self.open_inputs
+            .get(&run)
+            .and_then(|id| self.input(*id))
+            .is_some_and(|input| input.state == InputState::Started)
+    }
+
+    /// Takes back the start of `queued`'s input, which has not run: a newer record has it
+    /// accepted and waiting again, with its content, whatever lands of the start before it.
+    pub(crate) fn take_start_back(&mut self, queued: &PendingInput) {
+        let Some(id) = self.open_inputs.get(&queued.receipt.run_id).copied() else {
+            return;
+        };
+        let revision = self.next_revision();
+        if let Some(input) = self.inputs.get_mut(&id)
+            && input.record.state == InputState::Started
+        {
+            input.record.state = InputState::Accepted;
+            input.record.queued =
+                Some(serde_json::to_value(queued).expect("a queued input is serializable"));
             input.record.timestamp = now();
             input.revision = revision;
         }

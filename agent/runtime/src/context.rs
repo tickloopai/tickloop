@@ -507,6 +507,7 @@ impl Agent {
                             .finish(response.sequence, RequestOutcome::Accepted)?;
                         if let Some(recorder) = &self.inner.recorder {
                             recorder.compact(chat, &snapshot, &bookkeeping, &layout, &[]);
+                            self.rewrite_source_records_after_compaction(chat.snapshot.id);
                         }
                         self.save(&snapshot);
                         chat.snapshot = snapshot;

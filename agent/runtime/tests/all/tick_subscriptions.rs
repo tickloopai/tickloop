@@ -3030,6 +3030,9 @@ async fn a_watermark_that_cannot_be_written_holds_no_delivery_back() {
     };
     stream.push(shell_update(1, "started"));
     wait_for_completion(&mut events).await;
+    // The watermark follows the acceptance on its own, not the turn.
+    let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    watermark_settles_at(&root, subscription, Some(1)).await;
     let watermarks = watermark_files(&root)[0].parent().unwrap().to_path_buf();
     let kept = watermarks.with_extension("kept");
     std::fs::rename(&watermarks, &kept).unwrap();

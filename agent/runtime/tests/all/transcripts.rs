@@ -1363,7 +1363,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// 规格"会话内容的表示"中列出的 Transcript 条目类型。
-const SPECIFIED_LINE_TYPES: [&str; 17] = [
+const SPECIFIED_LINE_TYPES: [&str; 18] = [
     "user",
     "assistant",
     "system",
@@ -1372,6 +1372,7 @@ const SPECIFIED_LINE_TYPES: [&str; 17] = [
     "subagents",
     "family-completions",
     "family-inputs",
+    "family-message-hold",
     "sent-agent-messages",
     "last-prompt",
     "branch-origin",
