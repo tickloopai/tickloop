@@ -185,6 +185,17 @@ fn thinking_enabled_by_default() -> bool {
 
 impl ChatSnapshot {
     pub fn run_response_text(&self, run: RunId) -> Option<String> {
+        self.run_response_blocks(run)
+            .map(|blocks| blocks.collect::<Vec<_>>().join("\n"))
+    }
+
+    /// The run's final response text as its `Text` events streamed it: providers may split one
+    /// answer into several text blocks, so the blocks are joined without a separator.
+    pub fn run_streamed_text(&self, run: RunId) -> Option<String> {
+        self.run_response_blocks(run).map(|blocks| blocks.collect())
+    }
+
+    fn run_response_blocks(&self, run: RunId) -> Option<impl Iterator<Item = &str>> {
         self.messages
             .iter()
             .enumerate()
@@ -193,15 +204,10 @@ impl ChatSnapshot {
                 message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
             })
             .map(|(_, message)| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                message.content.iter().filter_map(|content| match content {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
             })
     }
 

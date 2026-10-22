@@ -1088,7 +1088,9 @@ impl Projection {
                     )?;
                 }
             }
-            EventKind::ToolCompleted { call_id, result } => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => {
                 self.announce_tool(connection, &call_id, "Tool", Value::Null, "pending")?;
                 let mut content = vec![
                     json!({"type":"content", "content":{"type":"text", "text":bounded_text(&result.content)}}),

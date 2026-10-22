@@ -86,6 +86,7 @@ impl WorkerFactory for Factory {
                 task_tools: Some(true),
                 min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Process,
+                citation_style: Default::default(),
                 system_prompt_addition: None,
                 request_gates: vec![],
             },

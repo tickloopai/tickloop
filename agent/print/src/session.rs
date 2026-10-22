@@ -267,7 +267,9 @@ fn consume_events<W: Write>(
                 "tool.started",
                 json!({"call_id": call_id, "name": name, "input": input}),
             ),
-            EventKind::ToolCompleted { call_id, result } => (
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } => (
                 "tool.completed",
                 json!({"call_id": call_id, "content": result.content, "is_error": result.is_error}),
             ),

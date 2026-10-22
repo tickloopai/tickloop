@@ -54,7 +54,7 @@ use crate::{
 /// 26.0 uses the service model ID as the sole ModelCard ID on the wire.
 /// 26.1 adds opt-in planned runtime upgrades and runtime version observations.
 /// 26.2 attributes each Worker's runtime version and upgrade error to its executions.
-/// 26.3 adds managed execution profiles, invocation-scoped control proofs and lease settlement.
+/// 27.0 adds managed execution profiles, invocation-scoped control proofs and lease settlement.
 /// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 27;

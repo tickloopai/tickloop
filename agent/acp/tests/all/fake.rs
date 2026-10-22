@@ -420,6 +420,7 @@ impl AgentAccess for Fake {
                                 input,
                             });
                             entry.emit(EventKind::ToolCompleted {
+                                sources: Vec::new(),
                                 call_id,
                                 result: ToolResult {
                                     content: "done".into(),
@@ -503,6 +504,7 @@ impl AgentAccess for Fake {
                             }],
                         });
                         entry.emit(EventKind::ToolCompleted {
+                            sources: Vec::new(),
                             call_id: "denied-tool".into(),
                             result: ToolResult {
                                 content: "Denied by policy".into(),
@@ -523,6 +525,7 @@ impl AgentAccess for Fake {
                             input: serde_json::json!({"file_path":"example.rs"}),
                         });
                         entry.emit(EventKind::ToolCompleted {
+                            sources: Vec::new(),
                             call_id: "read-1".into(),
                             result: ToolResult {
                                 content: "read".into(),
@@ -599,6 +602,7 @@ impl AgentAccess for Fake {
                     });
                 }
                 entry.emit(EventKind::ToolCompleted {
+                    sources: Vec::new(),
                     call_id,
                     result: ToolResult {
                         content: if allow { "edited" } else { "denied" }.into(),

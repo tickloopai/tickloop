@@ -193,6 +193,7 @@ impl AgentAccess for Fake {
                     self.send(1, ObservationChange::Event(wrong));
                     let content = if matches!(self.behavior, Behavior::DeniedTool) {
                         EventKind::ToolCompleted {
+                            sources: Vec::new(),
                             call_id: "denied".into(),
                             result: ToolResult {
                                 content: "permission denied".into(),

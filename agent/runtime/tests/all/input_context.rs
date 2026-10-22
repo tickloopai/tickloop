@@ -271,7 +271,9 @@ async fn client_resources_are_untrusted_material_not_disk_reads_or_implicit_fetc
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { .. } => panic!("resources must not grant a disk read"),
-            EventKind::ToolCompleted { call_id, result } if call_id == "overwrite" => {
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "overwrite" => {
                 assert!(result.is_error);
                 assert!(result.content.contains("File has not been read yet"));
                 rejected_unread_write = true;
