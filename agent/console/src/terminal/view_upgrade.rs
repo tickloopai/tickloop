@@ -65,10 +65,7 @@ fn load_handoff(path: &Path, process: u32) -> Result<ViewHandoff, String> {
 }
 
 /// The handoff with the JSON it was read from, which may carry fields of another View version.
-fn load_raw_handoff(
-    path: &Path,
-    process: u32,
-) -> Result<(ViewHandoff, serde_json::Value), String> {
+fn load_raw_handoff(path: &Path, process: u32) -> Result<(ViewHandoff, serde_json::Value), String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -92,8 +89,8 @@ fn load_raw_handoff(
     }
     let raw: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| format!("Invalid View handoff: {error}"))?;
-    let handoff = ViewHandoff::deserialize(&raw)
-        .map_err(|error| format!("Invalid View handoff: {error}"))?;
+    let handoff =
+        ViewHandoff::deserialize(&raw).map_err(|error| format!("Invalid View handoff: {error}"))?;
     if handoff.schema != HANDOFF_SCHEMA || handoff.process != process {
         return Err("View handoff schema or process does not match".into());
     }
@@ -226,9 +223,7 @@ fn mark_recovery_attempted(
     mut raw: serde_json::Value,
     predecessor_lease: Option<i32>,
 ) -> Result<(), String> {
-    let fields = raw
-        .as_object_mut()
-        .ok_or("View handoff is not an object")?;
+    let fields = raw.as_object_mut().ok_or("View handoff is not an object")?;
     fields.insert("recovery_attempted".into(), true.into());
     fields.insert(
         "predecessor_lease".into(),

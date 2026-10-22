@@ -1099,9 +1099,10 @@ async fn unsubscribing_ends_a_subscription_and_stopping_pauses_it() {
         1,
         "a paused Loop keeps its subscription"
     );
-    assert!(
-        stream.watched().is_empty(),
-        "a paused subscription watches again from its watermark once continued"
+    assert_eq!(
+        stream.watched().len(),
+        1,
+        "a paused subscription keeps watching for the latest update"
     );
     agent.shutdown().await;
 }
@@ -3489,7 +3490,7 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
         call("ask", "AskUserQuestion", single_question("Which close?")),
         text("saw the update after esc"),
         text("carrying on"),
-        text("saw the update after continuing"),
+        text("saw the update held across the stop"),
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     let mut events = agent.subscribe();
@@ -3520,20 +3521,99 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
 
     agent.stop(chat).await.unwrap();
     settle().await;
-    assert!(stream.watched().is_empty(), "a paused Loop watches nothing");
+    assert_eq!(
+        stream.watched(),
+        BTreeSet::from([fixture_instance(7)]),
+        "a paused Loop keeps watching for the latest update"
+    );
     assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
+    stream.push(update(7, 2, "while stopped"));
+    settle().await;
+    let requests = model.requests.lock().unwrap().len();
+    tokio::time::advance(HIGH_PERIOD * 2).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        requests,
+        "nothing is delivered while stopped"
+    );
+
+    agent.submit(chat, "carry on".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("while stopped"));
+    tokio::time::advance(HIGH_PERIOD * 2).await;
+    settle().await;
+    assert_eq!(
+        requests_mentioning(&model, "while stopped"),
+        1,
+        "the update held across the stop is delivered once"
+    );
+    agent.shutdown().await;
+}
+
+/// An update held while the turn waits for the user survives `/stop`: continuing delivers it
+/// once.
+#[tokio::test(start_paused = true)]
+async fn an_update_held_when_the_chat_stops_is_delivered_once_after_it_continues() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        call("ask", "AskUserQuestion", single_question("Which close?")),
+        text("going on"),
+        text("saw the held update"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    agent.submit(chat, "ask me first".into()).await.unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::QuestionAsked { .. }
+        ) {
+            break;
+        }
+    }
+    stream.push(update(7, 1, "held while asking"));
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    agent.stop(chat).await.unwrap();
+    settle().await;
     let requests = model.requests.lock().unwrap().len();
     tokio::time::advance(HIGH_PERIOD * 2).await;
     settle().await;
     assert_eq!(model.requests.lock().unwrap().len(), requests);
 
-    agent.submit(chat, "carry on".into()).await.unwrap();
+    agent.submit(chat, "go on".into()).await.unwrap();
     wait_for_completion(&mut events).await;
-    assert_eq!(stream.watched(), BTreeSet::from([fixture_instance(7)]));
-    stream.push(update(7, 2, "after continuing"));
-    settle().await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    assert!(last_user_text(&model).contains("after continuing"));
+    assert!(last_user_text(&model).contains("held while asking"));
+    tokio::time::advance(HIGH_PERIOD * 2).await;
+    settle().await;
+    assert_eq!(requests_mentioning(&model, "held while asking"), 1);
     agent.shutdown().await;
+}
+
+/// How many of the model's requests end with a user message mentioning `needle`.
+fn requests_mentioning(model: &ScriptedModel, needle: &str) -> usize {
+    model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request
+                .messages
+                .last()
+                .is_some_and(|message| format!("{:?}", message.content).contains(needle))
+        })
+        .count()
 }

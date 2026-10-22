@@ -1672,10 +1672,13 @@ impl Agent {
                         .filter(|_| saves_chats)
                         .map(|directory| directory.join(WATERMARK_DIRECTORY).path().to_path_buf());
                     let chat_loop = &chat.snapshot.chat_loop;
+                    // A paused Loop keeps watching, so its subscriptions keep their watches and
+                    // queued updates and only wait to be taken.
+                    let is_paused = chat.snapshot.trigger_awaits_resume;
                     chat_loop
                         .trigger
                         .iter()
-                        .filter(|trigger| trigger.armed)
+                        .filter(|trigger| trigger.armed || is_paused)
                         .flat_map(|trigger| &trigger.subscriptions)
                         .map(|subscription| {
                             (
@@ -1929,15 +1932,19 @@ impl Agent {
         // finds it held.
         let delivery = {
             let chats = self.inner.chats.lock().await;
-            let Some(chat_loop) = chats
+            let Some(chat) = chats
                 .get(&chat_id)
-                .map(|chat| &chat.snapshot.chat_loop)
-                .filter(|chat_loop| chat_loop.id == loop_id)
+                .filter(|chat| chat.snapshot.chat_loop.id == loop_id)
             else {
                 return;
             };
             let mut deliveries = self.tick_deliveries();
-            match chat_loop.state {
+            match chat.snapshot.chat_loop.state {
+                // A paused Loop holds the latest update until the Chat is continued.
+                _ if chat.snapshot.trigger_awaits_resume => {
+                    deliveries.hold(owner, Instant::now());
+                    None
+                }
                 LoopState::Idle | LoopState::Interrupted | LoopState::Failed => {
                     deliveries.take_delivery(owner)
                 }

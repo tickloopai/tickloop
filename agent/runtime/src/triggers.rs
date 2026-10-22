@@ -366,6 +366,7 @@ impl Agent {
         if let Some(loop_id) = rearmed {
             self.record_armed_trigger(chat_id, loop_id).await;
             self.sync_tick_subscriptions().await;
+            self.flush_due_tick_delivery(chat_id, loop_id);
         }
         Box::pin(self.resume_feedback_sources(chat_id)).await;
         if let Some(next) = self.next_run(chat_id).await? {

@@ -197,7 +197,11 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     }
     agent.stop(chat).await.unwrap();
     settle().await;
-    assert!(stream.watched().is_empty());
+    assert_eq!(
+        stream.watched().len(),
+        1,
+        "a paused Loop keeps watching for the latest update"
+    );
     agent.shutdown().await;
 }
 
