@@ -2,12 +2,16 @@
 //! accepted with its content, so with durable wait hosting a load queues again what was waiting,
 //! after another attempt at each input whose answer lost its host.
 
-use tickloop_agent_protocol::{ChatId, EventKind, LoopState, Receipt};
+use tickloop_agent_protocol::{ChatId, EventKind, LoopState, PendingInput, Receipt};
 use tickloop_agent_transcript::{
     InputEntry, InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
 };
 
 use super::{Agent, Chat, LoopSnapshotExt, WaitHosting, event_sources, turn};
+
+fn is_trigger_input(pending: &PendingInput) -> bool {
+    pending.trigger_source.is_some()
+}
 
 /// An input whose answer lost its host this many times in a row fails instead of continuing.
 const LOST_HOST_LIMIT: usize = 3;
@@ -32,11 +36,11 @@ impl Agent {
                     .lifecycle
                     .queued_inputs()
                     .into_iter()
-                    .filter(|pending| pending.trigger_source.is_some())
+                    .filter(is_trigger_input)
                     .map(|pending| pending.receipt.run_id)
                     .collect::<std::collections::HashSet<_>>();
                 self.forget_inputs(chat, |entry| !waiting.contains(&entry.run_id));
-                self.requeue_inputs(chat);
+                self.requeue_inputs(chat, is_trigger_input);
                 self.save(&chat.snapshot);
             }
             WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,
@@ -52,7 +56,7 @@ impl Agent {
             return;
         };
         self.continue_lost_inputs(chat);
-        self.requeue_inputs(chat);
+        self.requeue_inputs(chat, |_| true);
         self.save(&chat.snapshot);
     }
 
@@ -135,10 +139,16 @@ impl Agent {
         self.emit(chat, receipt, EventKind::Failed(LOST_HOST_ERROR.into()));
     }
 
-    /// Queues again the inputs accepted and not started, behind the continuations, in the order
-    /// they were queued, each to the Chat's Loop.
-    fn requeue_inputs(&self, chat: &mut Chat) {
-        for mut pending in chat.bookkeeping.lifecycle.queued_inputs() {
+    /// Queues again the inputs accepted and not started that `requeued` selects, behind the
+    /// continuations, in the order they were queued, each to the Chat's Loop.
+    fn requeue_inputs(&self, chat: &mut Chat, requeued: impl Fn(&PendingInput) -> bool) {
+        for mut pending in chat
+            .bookkeeping
+            .lifecycle
+            .queued_inputs()
+            .into_iter()
+            .filter(|pending| requeued(pending))
+        {
             let is_queued = chat
                 .snapshot
                 .pending_inputs
