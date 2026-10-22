@@ -83,7 +83,7 @@ fn skill_catalog_budgets_remote_and_project_descriptions_together() {
     let (_directory, mut registry) = registry_with_project_skills(4, &"Local ".repeat(80));
     registry.replace_remote(vec![
         remote("artifact-design", &"Design ".repeat(80)),
-        remote("artifact-dataviz", &"Chart ".repeat(80)),
+        remote("dataviz", &"Chart ".repeat(80)),
     ]);
     let small = registry.model_catalog_for_context(Some(8_192));
     let large = registry.model_catalog_for_context(Some(200_000));

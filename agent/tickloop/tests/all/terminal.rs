@@ -2826,18 +2826,22 @@ async fn model_control_sequences_cannot_change_terminal_state() {
     server.await.unwrap();
 }
 
+/// The tickloop guidance follows the first prompt, whose run loaded it, and stays there.
 fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[(&str, &str)]) {
     let messages = request["messages"].as_array().unwrap();
     assert_eq!(messages.len(), expected_messages.len() + 1);
-    assert_eq!(messages[0]["role"], "user");
-    let reference = messages[0]["content"].as_array().unwrap();
+    assert_eq!(messages[1]["role"], "user");
+    let reference = messages[1]["content"].as_array().unwrap();
     assert_eq!(reference.len(), 1);
     assert_eq!(reference[0]["type"], "text");
     assert!(reference[0]["text"].as_str().unwrap().starts_with(
         "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop Ticks\n"
     ));
-    let conversation = messages[1..]
+    let conversation = messages
         .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, message)| message)
         .map(|message| {
             let content = message["content"].as_array().unwrap();
             assert_eq!(content.len(), 1);

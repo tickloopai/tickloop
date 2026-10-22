@@ -1438,6 +1438,10 @@ fn chain_entry(
             .and_then(HostNote::announced_host_tools)
             .cloned(),
         plan_mode_exit: snapshot.host_notes.get(&index) == Some(&HostNote::PlanModeExit),
+        guidance: match snapshot.host_notes.get(&index) {
+            Some(HostNote::Guidance(note)) => Some(note.clone()),
+            _ => None,
+        },
         execution_mode: snapshot
             .prompt_execution_modes
             .get(&index)
@@ -1626,6 +1630,7 @@ fn record_loop(
         is_meta: false,
         host_tools: None,
         plan_mode_exit: false,
+        guidance: None,
         execution_mode: None,
         is_inherited_prompt: false,
         original_message_id: None,
@@ -1918,6 +1923,10 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::HostTools(announced.clone()));
         } else if entry.plan_mode_exit {
             restored.host_notes.insert(index, HostNote::PlanModeExit);
+        } else if let Some(note) = &entry.guidance {
+            restored
+                .host_notes
+                .insert(index, HostNote::Guidance(note.clone()));
         }
         if let Some(origin) = &entry.human_family_origin {
             restored

@@ -24,7 +24,7 @@ pub const REQUEST_CREATED_AT: &str = "2026-10-08T10:00:00.000Z";
 pub const REQUEST_CREATED_AT_MS: u64 = 1_791_453_600_000;
 pub const CREATED_ARTIFACT: &str = "created-doc";
 const PROTOCOL_VERSION: &str = "2026-07-28";
-/// The service's `tools/list`, recorded from `artifact`.
+/// The service's initialization and `tools/list`, as `artifact` publishes them.
 const RECORDED_TOOLS: &str = include_str!("../fixtures/artifact_service_tools.json");
 
 /// One image upload the service received, with the receipt it committed.
@@ -77,6 +77,8 @@ pub struct ServiceControl {
     pub release_session_response: Notify,
     pub server_name: Mutex<Option<String>>,
     pub directory_revision: AtomicUsize,
+    /// Changes the instructions discovery returns when above zero.
+    pub instructions_revision: AtomicUsize,
     pub omit_comment_tool: AtomicBool,
     /// Answers a creation with the catalog's stored format names, as deployed services do.
     pub catalog_format_names: AtomicBool,
@@ -134,8 +136,18 @@ fn query(target: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+pub fn instructions(control: &ServiceControl) -> String {
+    let recorded: Value = serde_json::from_str(RECORDED_TOOLS).unwrap();
+    let instructions = recorded["initialize"]["instructions"].as_str().unwrap();
+    match control.instructions_revision.load(Ordering::SeqCst) {
+        0 => instructions.to_owned(),
+        revision => format!("{instructions} (instructions revision {revision})"),
+    }
+}
+
 fn tools(control: &ServiceControl) -> Value {
-    let mut tools: Value = serde_json::from_str(RECORDED_TOOLS).unwrap();
+    let mut recorded: Value = serde_json::from_str(RECORDED_TOOLS).unwrap();
+    let mut tools = json!({"tools": recorded["tools"].take()});
     let listed = tools["tools"].as_array_mut().unwrap();
     for tool in listed.iter_mut() {
         if tool["name"] == "ArtifactEdit" {
@@ -292,7 +304,7 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
             if control.skills_enabled.load(Ordering::SeqCst) {
                 capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
             }
-            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":capabilities,"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
+            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":capabilities,"instructions":instructions(control),"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
         }
         "skills/list" => {
             json!({"resultType":"complete","skills":skill_entries(control.skill_revision.load(Ordering::SeqCst), control.skill_reference_bytes.load(Ordering::SeqCst)),"ttlMs":0,"cacheScope":"private"})
@@ -352,9 +364,9 @@ fn skill_reference(extra_bytes: usize) -> String {
 }
 
 fn skill_entries(revision: usize, reference_bytes: usize) -> Vec<Value> {
-    ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft", "artifact-slides"].into_iter().map(|name| {
+    ["artifact-design", "artifact-diagramming", "dataviz", "doc", "artifact-slides"].into_iter().map(|name| {
         let uri = format!("skill://tickloop-artifacts/{name}/SKILL.md");
-        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
+        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/guide.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
         json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
     }).collect()
 }

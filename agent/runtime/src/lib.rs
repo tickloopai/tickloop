@@ -2,6 +2,7 @@ mod agent_messages;
 mod agent_tasks;
 mod approval_assessment;
 pub(crate) mod approval_context;
+mod artifact_reads;
 mod auto_approval;
 #[cfg(test)]
 mod auto_benchmark_tests;
@@ -1134,7 +1135,7 @@ impl Agent {
             content: if changed {
                 format!("Launching skill: {name} [{origin}]")
             } else {
-                format!("Already loaded {name} [{origin}]")
+                format!("Already loaded {name} [{origin}]. {ALREADY_IN_CONVERSATION}")
             },
             is_error: false,
             output_ref: None,
@@ -1194,10 +1195,11 @@ impl Agent {
         let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
         Ok(tickloop_agent_protocol::ToolResult {
-            content: format!(
-                "{} {name} · Tickloop Artifacts",
-                if changed { "Loaded" } else { "Already loaded" }
-            ),
+            content: if changed {
+                format!("Loaded {name} · Tickloop Artifacts")
+            } else {
+                format!("Already loaded {name} · Tickloop Artifacts. {ALREADY_IN_CONVERSATION}")
+            },
             is_error: false,
             output_ref: None,
         })
@@ -3034,31 +3036,19 @@ impl Agent {
                     self.inner.host_tools.read().unwrap().as_deref(),
                 )
             });
+        Box::pin(
+            self.announce_guidance(
+                receipt,
+                workspace_host
+                    .as_ref()
+                    .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks),
+            ),
+        )
+        .await?;
         let family_roster = self.family_agents(receipt.chat_id).await?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            if workspace_host
-                .as_ref()
-                .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks)
-                && !chat
-                    .snapshot
-                    .invoked_skills
-                    .iter()
-                    .any(|skill| skill.name == "tickloop")
-            {
-                let invoked = chat
-                    .skills
-                    .expand(
-                        "tickloop",
-                        "",
-                        tickloop_agent_config::skills::SkillCaller::Model,
-                    )
-                    .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                record_invoked_skill(chat, invoked);
-                self.save(&chat.snapshot);
-            }
             registry.refresh(chat);
             request.tools = registry.definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
@@ -5213,6 +5203,10 @@ fn carry_user_skills_past_sign_in(chat: &mut Chat, loop_id: LoopId, run_id: RunI
         }
     }
 }
+
+/// What a repeated identical Skill call tells the model: the guidance it wrote into history stays.
+const ALREADY_IN_CONVERSATION: &str =
+    "Its guidance is already in this conversation; follow it without loading it again.";
 
 fn record_invoked_skill(chat: &mut Chat, invoked: tickloop_agent_protocol::InvokedSkill) -> bool {
     let identical = chat.snapshot.invoked_skills.iter().any(|existing| {

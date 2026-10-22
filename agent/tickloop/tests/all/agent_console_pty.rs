@@ -518,6 +518,14 @@ async fn wait_for_display_views(
     );
 }
 
+/// A user message the person typed, not guidance the host wrote into the history for the model.
+fn is_user_prompt(message: &Value) -> bool {
+    let text = message["content"]
+        .as_str()
+        .or_else(|| message["content"][0]["text"].as_str());
+    message["role"] == "user"
+        && !text.is_some_and(|text| text.starts_with("Reference guidance from "))
+}
 fn family_panel_has_viewing_row(frame: &str) -> bool {
     frame
         .lines()
@@ -2084,7 +2092,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .unwrap()
         .iter()
         .rev()
-        .find(|message| message["role"] == "user")
+        .find(|message| is_user_prompt(message))
         .unwrap();
     assert_eq!(
         follow_up_input["content"].as_str(),
@@ -2405,7 +2413,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
             .unwrap()
             .iter()
             .rev()
-            .find(|message| message["role"] == "user")
+            .find(|message| is_user_prompt(message))
             .unwrap()["content"]
             .clone()
     };
@@ -2727,7 +2735,7 @@ async fn run_stashed_folded_paste(fixture: &PrivateFixture) {
         .unwrap()
         .iter()
         .rev()
-        .find(|message| message["role"] == "user")
+        .find(|message| is_user_prompt(message))
         .unwrap();
     assert_eq!(
         user["content"].as_str().unwrap(),
@@ -2821,7 +2829,7 @@ async fn run_stashed_accepted_mention(fixture: &PrivateFixture) {
         .unwrap()
         .iter()
         .rev()
-        .find(|message| message["role"] == "user")
+        .find(|message| is_user_prompt(message))
         .unwrap();
     let content = user["content"].as_str().unwrap();
     assert!(content.contains("Read @notes.txt now"));

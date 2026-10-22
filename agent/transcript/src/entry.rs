@@ -263,6 +263,10 @@ pub struct ChainEntry {
     /// Code's `plan_mode_exit` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_mode_exit: bool,
+    /// Tickloop extension: marks a host note carrying guidance, like Claude Code's Skill messages
+    /// and `mcp_instructions_delta` attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<tickloop_agent_protocol::GuidanceNote>,
     /// The execution mode at a user checkpoint stays raw so an unknown legacy value cannot
     /// invalidate the entire Transcript entry.
     #[serde(

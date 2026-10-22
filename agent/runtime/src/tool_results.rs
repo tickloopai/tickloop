@@ -414,6 +414,11 @@ impl ContentReplacementState {
         }
     }
 
+    /// Whether the model sees the result of `tool_use_id` as a saved file's preview.
+    pub(super) fn is_replaced(&self, tool_use_id: &str) -> bool {
+        self.replacements.contains_key(tool_use_id)
+    }
+
     fn replacement_for(&self, tool_use_id: &str, content: &str) -> Option<&String> {
         self.replacements
             .get(tool_use_id)

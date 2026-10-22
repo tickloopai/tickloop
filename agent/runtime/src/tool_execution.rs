@@ -1604,7 +1604,24 @@ impl Agent {
                                 .execute_prepared(receipt.chat_id, prepared, cancel.clone())
                                 .await;
                             host_call_status = Some(host_result.status());
-                            let (result, effect) = host_result.into_parts();
+                            let (mut result, effect) = host_result.into_parts();
+                            if let Some(unchanged) = self
+                                .inner
+                                .chats
+                                .lock()
+                                .await
+                                .get(&receipt.chat_id)
+                                .and_then(|chat| {
+                                    crate::artifact_reads::unchanged_own_page(
+                                        &chat.snapshot,
+                                        &name,
+                                        &input,
+                                        &result,
+                                    )
+                                })
+                            {
+                                result = unchanged;
+                            }
                             if let Some(crate::host_tools::HostEffect::CreatedArtifact(created)) =
                                 &effect
                             {

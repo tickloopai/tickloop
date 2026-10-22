@@ -1741,7 +1741,15 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
 
 fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
+    let quickstart;
     let primary = match name {
+        "ArtifactRead" if input["action"] == "quickstart" => {
+            quickstart = format!(
+                "quickstart {}",
+                input["intent"].as_str().unwrap_or_default()
+            );
+            Some(quickstart.as_str())
+        }
         "Skill" => input["skill"].as_str(),
         "ReadMcpResourceTool" => input["uri"].as_str(),
         "ListMcpResourcesTool" => input["server"].as_str(),
@@ -2268,6 +2276,20 @@ fn compact_result_runs(
         && let Some(change) = file_change_runs(name, input, glyph, cwd, facts.review.as_ref())
     {
         return change;
+    }
+    // Like Claude Code's `Artifact(quickstart …)`, the guidance stays for the model; the row
+    // only says what was sent.
+    if !result.is_error
+        && name == "ArtifactRead"
+        && let Some(intent) = input
+            .filter(|input| input["action"] == "quickstart")
+            .and_then(|input| input["intent"].as_str())
+    {
+        rows.row([(
+            format!("Sent {} guidance", safe_text(intent)),
+            Some(Role::MutedText),
+        )]);
+        return rows.runs;
     }
     if name == BASH_TOOL_NAME {
         if tool_result_status(name, result) == BACKGROUND_RUNNING_STATUS {
@@ -4186,6 +4208,34 @@ mod tests {
             role_of(DisplayProfile::default().glyph(Glyph::ToolResult)),
             Some(Role::MutedText)
         );
+    }
+
+    #[test]
+    fn an_artifact_quickstart_names_its_intent_and_sums_up_the_guidance_it_sent() {
+        let input = json!({"action":"quickstart","intent":"page"});
+        let call = archived_tool_call(
+            "ArtifactRead",
+            &input,
+            Path::new(""),
+            DisplayProfile::default(),
+            &super::super::tick_labels::TickLabels::default(),
+        );
+        assert!(call.contains("ArtifactRead · quickstart page"), "{call}");
+        let result = joined(&archived_tool_result(
+            "ArtifactRead",
+            Some(&input),
+            &ToolResult {
+                content: "Quickstart for a page. The guidance below is the `artifact-design` Skill's own text.\n\n## Page contract - read before your first save\n\nThese are the rules.".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Path::new(""),
+            DisplayProfile::default(),
+            &CallFacts::default(),
+        ));
+        assert!(result.contains("Sent page guidance"), "{result}");
+        assert!(!result.contains("Page contract"), "{result}");
+        assert!(!result.contains("Completed"), "{result}");
     }
 
     #[test]

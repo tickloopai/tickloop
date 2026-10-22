@@ -10,6 +10,8 @@ use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{Content, EventKind, ExecutionMode, LoopState, Receipt, SkillSource};
 use tickloop_agent_runtime::Agent;
 
+use crate::support::{assert_extends, guidance_in_effect, mentions};
+
 use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
 use tickloop_agent_test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,
@@ -259,6 +261,78 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
 }
 
 #[tokio::test]
+async fn loaded_skill_guidance_follows_its_call_once_and_keeps_every_request_a_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join(".git")).unwrap();
+    write_skill(
+        &directory.path().join(".tickloop/skills"),
+        "analyze",
+        "name: analyze\ndescription: Analyze a target",
+        "Analyze $ARGUMENTS carefully.",
+    );
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"analyze","args":"first.md"}),
+        ),
+        text("Analyzed."),
+        text("Still guided."),
+    ]));
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Analyze the target".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent
+        .submit(chat, None, "Analyze the next one".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while model.requests.lock().unwrap().len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let guidance = "Analyze first.md carefully.";
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(mentions(&requests[0], guidance), 0);
+        assert_extends(&requests[0], &requests[1]);
+        assert_extends(&requests[1], &requests[2]);
+        assert_eq!(mentions(&requests[1], guidance), 1);
+        assert_eq!(mentions(&requests[2], guidance), 1);
+        let position = |predicate: &dyn Fn(&Content) -> bool| {
+            requests[1]
+                .messages
+                .iter()
+                .position(|message| message.content.iter().any(predicate))
+                .unwrap()
+        };
+        let result = position(
+            &|block| matches!(block, Content::ToolResult { tool_use_id, .. } if tool_use_id == "load"),
+        );
+        let note =
+            position(&|block| matches!(block, Content::Text { text } if text.contains(guidance)));
+        assert!(note > result, "the guidance follows the Skill call");
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.host_notes.keys().any(|index| {
+        serde_json::to_string(&snapshot.messages[*index])
+            .unwrap()
+            .contains(guidance)
+    }));
+}
+
+#[tokio::test]
 async fn model_passes_skill_arguments_through_the_args_parameter() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join(".git")).unwrap();
@@ -364,9 +438,16 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
             .contains("Use the installed host tools as the authority for targets and capabilities")
     );
     assert!(messages.contains("/tickloop show the current Workspace"));
+    let [.., prompt, guidance] = requests[0].messages.as_slice() else {
+        panic!("the request carries the prompt and the guidance it invoked");
+    };
     assert!(matches!(
-        requests[0].messages.last().unwrap().content.as_slice(),
+        prompt.content.as_slice(),
         [Content::Text { text }] if text == "/tickloop show the current Workspace"
+    ));
+    assert!(matches!(
+        guidance.content.as_slice(),
+        [Content::Text { text }] if text.starts_with("Reference guidance from tickloop")
     ));
 }
 
@@ -459,11 +540,20 @@ async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided()
     );
     let guidance = requests[3].messages.iter().find(|message| message.content.iter().any(|block| matches!(block, Content::Text { text } if text.contains("Analyze second.md carefully.")))).unwrap();
     assert_eq!(guidance.role, tickloop_agent_protocol::Role::User);
+    let recorded = snapshot
+        .messages
+        .iter()
+        .position(|message| {
+            serde_json::to_string(message)
+                .unwrap()
+                .contains("Analyze second.md carefully.")
+        })
+        .unwrap();
     assert!(
-        !serde_json::to_string(&snapshot.messages)
-            .unwrap()
-            .contains("Analyze second.md carefully.")
+        snapshot.host_notes.contains_key(&recorded),
+        "the guidance is a host note, not a user prompt"
     );
+    assert!(!snapshot.prompt_execution_modes.contains_key(&recorded));
 }
 
 #[tokio::test]
@@ -938,9 +1028,14 @@ async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() 
 const SLIDES_GUIDANCE: &str = "The user ran /slides to make a new Slides artifact.";
 
 fn carries_slides_guidance(request: &ModelRequest) -> bool {
-    serde_json::to_string(&request.messages)
-        .unwrap()
-        .contains(SLIDES_GUIDANCE)
+    let guided = guidance_in_effect(request, "slides");
+    assert!(
+        !guided
+            || serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains(SLIDES_GUIDANCE)
+    );
+    guided
 }
 
 #[tokio::test]

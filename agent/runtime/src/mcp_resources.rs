@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tickloop_agent_protocol::{
-    Receipt, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
+    Content, Receipt, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -143,6 +144,13 @@ impl Agent {
             {
                 return Err("MCP resource is outside this Run's current service authority".into());
             }
+            if let Some((definition, relative)) = &prepared.skill {
+                let resource =
+                    crate::remote_skills::resource_entry(definition, relative.as_deref())?;
+                if read_unchanged(chat, &resource.uri, &resource.digest) {
+                    return Ok(unchanged(&resource.uri));
+                }
+            }
             (
                 chat.snapshot.policy.revision,
                 crate::delegation::ancestor_revisions(&chats, receipt.chat_id)?,
@@ -183,6 +191,13 @@ impl Agent {
         {
             return Err("MCP resource source, policy or Run changed during reading".into());
         }
+        if prepared.name == READ_MCP_RESOURCE_TOOL
+            && let Some(uri) = prepared.input["uri"].as_str()
+            && let Some(text) = sole_text(&result)
+            && read_unchanged(chat, uri, &digest(text))
+        {
+            return Ok(unchanged(uri));
+        }
         if prepared.name == LIST_MCP_RESOURCES_TOOL {
             if let Some(resources) = result["resources"].as_array_mut() {
                 for resource in resources {
@@ -196,5 +211,60 @@ impl Agent {
             is_error: false,
             output_ref: None,
         })
+    }
+}
+
+/// Like Claude Code's `file_unchanged` Read, whether the model can still see this same resource,
+/// with the same text, in an earlier `ReadMcpResourceTool` result. Another resource with the same
+/// text is read in full, as another path is; a compaction or a saved-file preview hides the
+/// earlier text again.
+fn read_unchanged(chat: &crate::Chat, uri: &str, digest_of_text: &str) -> bool {
+    let messages = &chat.snapshot.messages[chat.snapshot.active_start()..];
+    let calls = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Content::ToolUse { id, name, .. } if name == READ_MCP_RESOURCE_TOOL => Some(id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| match block {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+            } if calls.contains(tool_use_id)
+                && !chat.content_replacements.is_replaced(tool_use_id) =>
+            {
+                serde_json::from_str::<Value>(&content.text()).is_ok_and(|result| {
+                    result["contents"][0]["uri"] == uri
+                        && sole_text(&result).map(digest).as_deref() == Some(digest_of_text)
+                })
+            }
+            _ => false,
+        })
+}
+
+fn sole_text(result: &Value) -> Option<&str> {
+    match result["contents"].as_array()?.as_slice() {
+        [content] => content["text"].as_str(),
+        _ => None,
+    }
+}
+
+fn digest(text: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn unchanged(uri: &str) -> ToolResult {
+    ToolResult {
+        content: format!(
+            "{uri} is unchanged since it was read earlier in this conversation; refer to that result instead of reading it again."
+        ),
+        is_error: false,
+        output_ref: None,
     }
 }

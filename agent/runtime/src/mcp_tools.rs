@@ -129,6 +129,7 @@ struct Directory {
     skills: Vec<RemoteSkillDefinition>,
     skill_error: Option<String>,
     supports_resources: bool,
+    instructions: Option<String>,
 }
 
 struct PreparedArtifactLogin;
@@ -255,6 +256,14 @@ fn bounded_identifier(value: Option<&Value>) -> Option<&str> {
 
 fn has_action(arguments: &Value, action: &str) -> bool {
     arguments.get("action").and_then(Value::as_str) == Some(action)
+}
+
+/// A failure before an Artifact call was sent, with what the model may safely do next.
+fn nothing_sent(error: &str) -> String {
+    format!(
+        "{}. Nothing was sent to Tickloop Artifacts and no artifact changed; the call can be retried with the same revision and hashes.",
+        error.trim_end_matches('.')
+    )
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Serialize)]
@@ -640,6 +649,10 @@ impl McpHostToolProvider {
             )));
         }
         let protocol_version = peer.protocol_version.clone();
+        let instructions = peer
+            .instructions
+            .clone()
+            .filter(|instructions| !instructions.trim().is_empty());
         let tools =
             match tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().list_all_tools()).await {
                 Ok(Ok(tools)) => tools,
@@ -664,6 +677,7 @@ impl McpHostToolProvider {
             .validate_directory(tools, credential, protocol_version)
             .map_err(DirectoryFailure::Rejected)?;
         directory.supports_resources = supports_resources;
+        directory.instructions = instructions;
         if supports_skills {
             match Self::mcp_request(&service, "skills/list", json!({}))
                 .await
@@ -802,6 +816,7 @@ impl McpHostToolProvider {
             skills: Vec::new(),
             skill_error: None,
             supports_resources: false,
+            instructions: None,
         })
     }
 
@@ -921,11 +936,24 @@ impl McpHostToolProvider {
         ))
     }
 
-    /// Serializes a result for the model and transcript with the bearer token redacted.
+    /// The result for the model and transcript with the bearer token redacted: like Claude Code's
+    /// `transformMCPResult`, the structured value alone when the server sent one, which already
+    /// carries what its text content repeats, and otherwise the content blocks.
     fn model_result(result: rmcp::model::CallToolResult, access_token: &str) -> ToolResult {
-        let content = serde_json::to_string(&result)
-            .unwrap_or_else(|_| "MCP result could not be displayed".into())
-            .replace(access_token, "[redacted]");
+        let content = match &result.structured_content {
+            Some(structured) => structured.to_string(),
+            None => result
+                .content
+                .iter()
+                .map(|block| match block.as_text() {
+                    Some(text) => text.text.clone(),
+                    None => serde_json::to_string(block)
+                        .unwrap_or_else(|_| "MCP content could not be displayed".into()),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+        .replace(access_token, "[redacted]");
         ToolResult {
             content,
             is_error: result.is_error == Some(true),
@@ -1283,6 +1311,289 @@ impl McpHostToolProvider {
         }
         summary
     }
+
+    async fn prepare_mcp_call(
+        &self,
+        chat_id: ChatId,
+        name: &str,
+        input: &Value,
+        (tool, fingerprint, expected_key): (DiscoveredTool, [u8; 32], [u8; 32]),
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        if cancel.is_cancelled() {
+            return Err("MCP call cancelled".into());
+        }
+        let credential = self
+            .call_credential()
+            .await
+            .map_err(|_| "Artifact credential unavailable")?
+            .ok_or("Artifact login is no longer active")?;
+        if self.credential_key(&credential) != expected_key {
+            return Err("Artifact account changed before MCP preparation".into());
+        }
+        let read_owned = if let Some(id) = artifact_read_id(name, input) {
+            Some(
+                self.artifact_read_is_owned(id, &credential, cancel.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let publication = if let Some(id) = artifact_update_id(name, input) {
+            tokio::select! {
+                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
+                result = self.artifact.read_with_credential(id, &credential) => {
+                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?.publication
+                }
+            }
+        } else {
+            None
+        };
+        let permission = if let Some(owned) = read_owned {
+            if owned {
+                HostToolPermission::ReadOnly
+            } else {
+                HostToolPermission::Confirmation
+            }
+        } else {
+            artifact_update_id(name, input)
+                .and_then(|artifact| {
+                    self.audience_permission(chat_id, &credential, artifact, publication.as_ref())
+                })
+                .unwrap_or_else(|| Self::operation_permission(&tool, input))
+        };
+        let summary = if name == ARTIFACT_EDIT_TOOL && has_action(input, "create") {
+            format!(
+                "Call {name} at {}; the created artifact joins this Chat's Monitor and is linked to the current Loop for @tickloop requests",
+                credential.origin
+            )
+        } else if read_owned == Some(false) {
+            format!(
+                "Read artifact content at {}; ownership or a trusted organization could not be confirmed",
+                credential.origin
+            )
+        } else {
+            format!("Call {name} at {}", credential.origin)
+        };
+        let approval_input = if name == ARTIFACT_EDIT_TOOL {
+            input.clone()
+        } else {
+            Self::approval_input(input)?
+        };
+        let facts = tickloop_agent_protocol::PreparedApprovalFacts {
+            artifact_publication: publication.clone(),
+            normalized_input: approval_input.clone(),
+            external_declaration: Some(
+                serde_json::to_value(&tool.definition)
+                    .map_err(|_| "Artifact tool declaration cannot be serialized")?,
+            ),
+            ..Default::default()
+        };
+        Ok(PreparedHostCall::new(
+            name.to_owned(),
+            input.clone(),
+            approval_input,
+            permission,
+            summary,
+        )
+        .with_approval_facts(facts)
+        .with_permission_input(input.clone())
+        .with_payload(PreparedMcpCall {
+            credential,
+            fingerprint,
+            arguments: input.clone(),
+            publication,
+            read_owned,
+        }))
+    }
+
+    async fn revalidate_mcp_call(
+        &self,
+        call: &PreparedHostCall,
+        prepared: &PreparedMcpCall,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("MCP call cancelled".into());
+        }
+        let current = self
+            .call_credential()
+            .await
+            .map_err(|_| "Artifact credential unavailable")?
+            .ok_or("Artifact login ended before MCP dispatch")?;
+        if !self
+            .artifact
+            .credentials_match(&prepared.credential, &current)
+        {
+            return Err("Artifact account changed before MCP dispatch".into());
+        }
+        let directory = self.load_directory(&current).await?;
+        if directory.fingerprint != prepared.fingerprint
+            || !directory
+                .tools
+                .iter()
+                .any(|tool| tool.definition.name == call.name())
+        {
+            return Err("MCP tool directory changed before dispatch".into());
+        }
+        if call.artifact_account().is_some_and(|context| {
+            context.origin != prepared.credential.origin
+                || context.account_id != prepared.credential.account_id
+        }) {
+            return Err("Feedback input belongs to another Artifact account".into());
+        }
+        if let Some(expected) = prepared.read_owned {
+            let id = artifact_read_id(call.name(), &prepared.arguments)
+                .ok_or("Artifact read identity changed")?;
+            if self
+                .artifact_read_is_owned(id, &current, cancel.clone())
+                .await?
+                != expected
+            {
+                return Err("Artifact read ownership changed before dispatch; prepare and check permission again".into());
+            }
+        }
+        if let Some(expected) = &prepared.publication {
+            let id = artifact_update_id(call.name(), &prepared.arguments)
+                .ok_or("Artifact update identity changed")?;
+            let current = tokio::select! {
+                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
+                result = self.artifact.read_with_credential(id, &current) => {
+                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?
+                }
+            };
+            if current.publication.as_ref() != Some(expected) {
+                return Err(
+                    "Artifact audience changed before dispatch; prepare and check permission again"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_mcp_call(
+        &self,
+        chat_id: ChatId,
+        name: String,
+        permission: HostToolPermission,
+        prepared: PreparedMcpCall,
+        cancel: CancellationToken,
+    ) -> HostCallResult {
+        if cancel.is_cancelled() {
+            return HostCallResult::NotDispatched("MCP call cancelled".into());
+        }
+        let current = match self.call_credential().await {
+            Ok(Some(current))
+                if self
+                    .artifact
+                    .credentials_match(&prepared.credential, &current) =>
+            {
+                current
+            }
+            _ => {
+                return HostCallResult::NotDispatched(
+                    "Artifact account changed before MCP dispatch".into(),
+                );
+            }
+        };
+        let (service, http) = match self.open_session(&current).await {
+            Ok(session) => session,
+            Err(error) => return HostCallResult::NotDispatched(error),
+        };
+        let arguments = match prepared.arguments.as_object() {
+            Some(arguments) => arguments.clone(),
+            None => return HostCallResult::NotDispatched("MCP arguments must be an object".into()),
+        };
+        let mut params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
+        let mut metadata = rmcp::model::RequestMetaObject::new();
+        if let Some(publication) = &prepared.publication {
+            metadata
+                .0
+                .0
+                .insert(PUBLICATION_META.into(), json!(publication));
+        }
+        if !metadata.0.0.is_empty() {
+            params.meta = Some(metadata);
+        }
+        if cancel.is_cancelled() {
+            return HostCallResult::NotDispatched("MCP call cancelled".into());
+        }
+        if !self.credential_is_current(&prepared.credential) {
+            return HostCallResult::NotDispatched(
+                "Artifact account changed before MCP dispatch".into(),
+            );
+        }
+        let outcome = tokio::select! {
+            () = cancel.cancelled() => return HostCallResult::OutcomeUnknown("MCP call was cancelled after dispatch; read the artifact again before deciding".into()),
+            result = tokio::time::timeout(CALL_TIMEOUT, service.peer().call_tool_once(params)) => result,
+        };
+        if http.unauthorized() {
+            self.invalidate(&current.access_token).await;
+        }
+        if !self.credential_is_current(&prepared.credential) {
+            return HostCallResult::OutcomeUnknown(
+                "Artifact account changed after MCP dispatch; read the artifact again before deciding"
+                    .into(),
+            );
+        }
+        let result = match outcome {
+            Ok(Ok(rmcp::model::CallToolResponse::Complete(result))) => result,
+            Ok(Ok(_)) => {
+                return HostCallResult::OutcomeUnknown(
+                    "MCP call did not return a final result; read the artifact again before deciding"
+                        .into(),
+                );
+            }
+            _ => {
+                return HostCallResult::OutcomeUnknown(
+                    "MCP response unavailable after dispatch; read the artifact again before deciding"
+                        .into(),
+                );
+            }
+        };
+        let effect = match name.as_str() {
+            ARTIFACT_READ_TOOL => Self::read_effect(&result, &prepared),
+            ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
+                .map(HostEffect::CreatedArtifact)
+                .or_else(|| Self::rename_effect(&result, &prepared)),
+            _ => None,
+        };
+        if result.is_error != Some(true) {
+            let admitted = match &effect {
+                Some(HostEffect::CreatedArtifact(tick))
+                    if permission == HostToolPermission::PrivateArtifactWrite =>
+                {
+                    Some((tick.artifact_id.clone(), ArtifactAudience::Private))
+                }
+                _ => prepared.publication.as_ref().and_then(|publication| {
+                    let id = artifact_update_id(&name, &prepared.arguments)?;
+                    let saved = result.structured_content.as_ref()?;
+                    (saved["artifact_id"].as_str().is_some_and(|saved| {
+                        tickloop_agent_artifacts::artifact_ids_match(id, saved)
+                    }) && saved["revision"].is_u64()
+                        && matches!(
+                            publication.audience,
+                            ArtifactAudience::Private | ArtifactAudience::Public
+                        ))
+                    .then(|| (id.to_owned(), publication.audience))
+                }),
+            };
+            if let Some((artifact, audience)) = admitted {
+                self.admit_publication(chat_id, &prepared.credential, artifact, audience);
+            }
+        }
+        let mut tool_result = Self::model_result(result, &current.access_token);
+        if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
+            tool_result.content = tool_result
+                .content
+                .replace(&latest.access_token, "[redacted]");
+        }
+        match effect {
+            Some(effect) => HostCallResult::CompletedWithEffect(tool_result, Box::new(effect)),
+            None => HostCallResult::Completed(tool_result),
+        }
+    }
 }
 
 #[async_trait]
@@ -1480,6 +1791,29 @@ impl HostToolProvider for McpHostToolProvider {
                 account_id: credential.account_id,
             },
         })
+    }
+
+    fn mcp_instructions(&self) -> Vec<crate::host_tools::McpServerInstructions> {
+        let Ok(Some(credential)) = self.artifact.credential_snapshot() else {
+            return Vec::new();
+        };
+        let directory = self.directory.read().unwrap();
+        directory
+            .as_ref()
+            .filter(|directory| directory.credential_key == self.credential_key(&credential))
+            .and_then(|directory| directory.instructions.clone())
+            .map(|text| crate::host_tools::McpServerInstructions {
+                server: crate::host_tools::McpResourceServer {
+                    name: SERVER_NAME.into(),
+                    authority: HostToolAuthority::Mcp {
+                        server_id: credential.origin,
+                        account_id: credential.account_id,
+                    },
+                },
+                text,
+            })
+            .into_iter()
+            .collect()
     }
 
     async fn list_mcp_resources(
@@ -1784,7 +2118,7 @@ impl HostToolProvider for McpHostToolProvider {
                 "{ARTIFACT_UPLOAD_TOOL} reads its file in the calling Chat's workspace"
             ));
         }
-        let Some((tool, fingerprint, expected_key)) = self.directory_tool(name) else {
+        let Some(directory_tool) = self.directory_tool(name) else {
             return self
                 .native
                 .as_ref()
@@ -1792,91 +2126,9 @@ impl HostToolProvider for McpHostToolProvider {
                 .prepare_call(chat_id, name, input, cancel)
                 .await;
         };
-        if cancel.is_cancelled() {
-            return Err("MCP call cancelled".into());
-        }
-        let credential = self
-            .call_credential()
+        self.prepare_mcp_call(chat_id, name, input, directory_tool, cancel)
             .await
-            .map_err(|_| "Artifact credential unavailable")?
-            .ok_or("Artifact login is no longer active")?;
-        if self.credential_key(&credential) != expected_key {
-            return Err("Artifact account changed before MCP preparation".into());
-        }
-        let read_owned = if let Some(id) = artifact_read_id(name, input) {
-            Some(
-                self.artifact_read_is_owned(id, &credential, cancel.clone())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let publication = if let Some(id) = artifact_update_id(name, input) {
-            tokio::select! {
-                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
-                result = self.artifact.read_with_credential(id, &credential) => {
-                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?.publication
-                }
-            }
-        } else {
-            None
-        };
-        let permission = if let Some(owned) = read_owned {
-            if owned {
-                HostToolPermission::ReadOnly
-            } else {
-                HostToolPermission::Confirmation
-            }
-        } else {
-            artifact_update_id(name, input)
-                .and_then(|artifact| {
-                    self.audience_permission(chat_id, &credential, artifact, publication.as_ref())
-                })
-                .unwrap_or_else(|| Self::operation_permission(&tool, input))
-        };
-        let summary = if name == ARTIFACT_EDIT_TOOL && has_action(input, "create") {
-            format!(
-                "Call {name} at {}; the created artifact joins this Chat's Monitor and is linked to the current Loop for @tickloop requests",
-                credential.origin
-            )
-        } else if read_owned == Some(false) {
-            format!(
-                "Read artifact content at {}; ownership or a trusted organization could not be confirmed",
-                credential.origin
-            )
-        } else {
-            format!("Call {name} at {}", credential.origin)
-        };
-        let approval_input = if name == ARTIFACT_EDIT_TOOL {
-            input.clone()
-        } else {
-            Self::approval_input(input)?
-        };
-        let facts = tickloop_agent_protocol::PreparedApprovalFacts {
-            artifact_publication: publication.clone(),
-            normalized_input: approval_input.clone(),
-            external_declaration: Some(
-                serde_json::to_value(&tool.definition)
-                    .map_err(|_| "Artifact tool declaration cannot be serialized")?,
-            ),
-            ..Default::default()
-        };
-        Ok(PreparedHostCall::new(
-            name.to_owned(),
-            input.clone(),
-            approval_input,
-            permission,
-            summary,
-        )
-        .with_approval_facts(facts)
-        .with_permission_input(input.clone())
-        .with_payload(PreparedMcpCall {
-            credential,
-            fingerprint,
-            arguments: input.clone(),
-            publication,
-            read_owned,
-        }))
+            .map_err(|error| nothing_sent(&error))
     }
 
     async fn revalidate_call(
@@ -1909,63 +2161,9 @@ impl HostToolProvider for McpHostToolProvider {
                 .revalidate_call(chat_id, call, cancel)
                 .await;
         };
-        if cancel.is_cancelled() {
-            return Err("MCP call cancelled".into());
-        }
-        let current = self
-            .call_credential()
+        self.revalidate_mcp_call(call, prepared, cancel)
             .await
-            .map_err(|_| "Artifact credential unavailable")?
-            .ok_or("Artifact login ended before MCP dispatch")?;
-        if !self
-            .artifact
-            .credentials_match(&prepared.credential, &current)
-        {
-            return Err("Artifact account changed before MCP dispatch".into());
-        }
-        let directory = self.load_directory(&current).await?;
-        if directory.fingerprint != prepared.fingerprint
-            || !directory
-                .tools
-                .iter()
-                .any(|tool| tool.definition.name == call.name())
-        {
-            return Err("MCP tool directory changed before dispatch".into());
-        }
-        if call.artifact_account().is_some_and(|context| {
-            context.origin != prepared.credential.origin
-                || context.account_id != prepared.credential.account_id
-        }) {
-            return Err("Feedback input belongs to another Artifact account".into());
-        }
-        if let Some(expected) = prepared.read_owned {
-            let id = artifact_read_id(call.name(), &prepared.arguments)
-                .ok_or("Artifact read identity changed")?;
-            if self
-                .artifact_read_is_owned(id, &current, cancel.clone())
-                .await?
-                != expected
-            {
-                return Err("Artifact read ownership changed before dispatch; prepare and check permission again".into());
-            }
-        }
-        if let Some(expected) = &prepared.publication {
-            let id = artifact_update_id(call.name(), &prepared.arguments)
-                .ok_or("Artifact update identity changed")?;
-            let current = tokio::select! {
-                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
-                result = self.artifact.read_with_credential(id, &current) => {
-                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?
-                }
-            };
-            if current.publication.as_ref() != Some(expected) {
-                return Err(
-                    "Artifact audience changed before dispatch; prepare and check permission again"
-                        .into(),
-                );
-            }
-        }
-        Ok(())
+            .map_err(|error| nothing_sent(&error))
     }
 
     async fn execute_prepared(
@@ -1995,118 +2193,14 @@ impl HostToolProvider for McpHostToolProvider {
         let Ok(prepared) = call.into_payload::<PreparedMcpCall>() else {
             unreachable!()
         };
-        if cancel.is_cancelled() {
-            return HostCallResult::NotDispatched("MCP call cancelled".into());
-        }
-        let current = match self.call_credential().await {
-            Ok(Some(current))
-                if self
-                    .artifact
-                    .credentials_match(&prepared.credential, &current) =>
-            {
-                current
+        match self
+            .dispatch_mcp_call(chat_id, name, permission, prepared, cancel)
+            .await
+        {
+            HostCallResult::NotDispatched(error) => {
+                HostCallResult::NotDispatched(nothing_sent(&error))
             }
-            _ => {
-                return HostCallResult::NotDispatched(
-                    "Artifact account changed before MCP dispatch".into(),
-                );
-            }
-        };
-        let (service, http) = match self.open_session(&current).await {
-            Ok(session) => session,
-            Err(error) => return HostCallResult::NotDispatched(error),
-        };
-        let arguments = match prepared.arguments.as_object() {
-            Some(arguments) => arguments.clone(),
-            None => return HostCallResult::NotDispatched("MCP arguments must be an object".into()),
-        };
-        let mut params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
-        let mut metadata = rmcp::model::RequestMetaObject::new();
-        if let Some(publication) = &prepared.publication {
-            metadata
-                .0
-                .0
-                .insert(PUBLICATION_META.into(), json!(publication));
-        }
-        if !metadata.0.0.is_empty() {
-            params.meta = Some(metadata);
-        }
-        if cancel.is_cancelled() {
-            return HostCallResult::NotDispatched("MCP call cancelled".into());
-        }
-        if !self.credential_is_current(&prepared.credential) {
-            return HostCallResult::NotDispatched(
-                "Artifact account changed before MCP dispatch".into(),
-            );
-        }
-        let outcome = tokio::select! {
-            () = cancel.cancelled() => return HostCallResult::OutcomeUnknown("MCP call was cancelled after dispatch; read the artifact again before deciding".into()),
-            result = tokio::time::timeout(CALL_TIMEOUT, service.peer().call_tool_once(params)) => result,
-        };
-        if http.unauthorized() {
-            self.invalidate(&current.access_token).await;
-        }
-        if !self.credential_is_current(&prepared.credential) {
-            return HostCallResult::OutcomeUnknown(
-                "Artifact account changed after MCP dispatch; read the artifact again before deciding"
-                    .into(),
-            );
-        }
-        let result = match outcome {
-            Ok(Ok(rmcp::model::CallToolResponse::Complete(result))) => result,
-            Ok(Ok(_)) => {
-                return HostCallResult::OutcomeUnknown(
-                    "MCP call did not return a final result; read the artifact again before deciding"
-                        .into(),
-                );
-            }
-            _ => {
-                return HostCallResult::OutcomeUnknown(
-                    "MCP response unavailable after dispatch; read the artifact again before deciding"
-                        .into(),
-                );
-            }
-        };
-        let effect = match name.as_str() {
-            ARTIFACT_READ_TOOL => Self::read_effect(&result, &prepared),
-            ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
-                .map(HostEffect::CreatedArtifact)
-                .or_else(|| Self::rename_effect(&result, &prepared)),
-            _ => None,
-        };
-        if result.is_error != Some(true) {
-            let admitted = match &effect {
-                Some(HostEffect::CreatedArtifact(tick))
-                    if permission == HostToolPermission::PrivateArtifactWrite =>
-                {
-                    Some((tick.artifact_id.clone(), ArtifactAudience::Private))
-                }
-                _ => prepared.publication.as_ref().and_then(|publication| {
-                    let id = artifact_update_id(&name, &prepared.arguments)?;
-                    let saved = result.structured_content.as_ref()?;
-                    (saved["artifact_id"].as_str().is_some_and(|saved| {
-                        tickloop_agent_artifacts::artifact_ids_match(id, saved)
-                    }) && saved["revision"].is_u64()
-                        && matches!(
-                            publication.audience,
-                            ArtifactAudience::Private | ArtifactAudience::Public
-                        ))
-                    .then(|| (id.to_owned(), publication.audience))
-                }),
-            };
-            if let Some((artifact, audience)) = admitted {
-                self.admit_publication(chat_id, &prepared.credential, artifact, audience);
-            }
-        }
-        let mut tool_result = Self::model_result(result, &current.access_token);
-        if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
-            tool_result.content = tool_result
-                .content
-                .replace(&latest.access_token, "[redacted]");
-        }
-        match effect {
-            Some(effect) => HostCallResult::CompletedWithEffect(tool_result, Box::new(effect)),
-            None => HostCallResult::Completed(tool_result),
+            dispatched => dispatched,
         }
     }
 

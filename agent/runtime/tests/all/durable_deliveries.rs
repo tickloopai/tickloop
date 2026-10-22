@@ -156,6 +156,25 @@ fn feedback_inputs(lines: &[Line]) -> HashSet<Uuid> {
 }
 
 #[tokio::test]
+async fn a_delivery_builds_on_artifact_content_the_chat_already_holds() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(Vec::new());
+    let (agent, chat, target) = bound_chat(store, model.clone()).await;
+    let delivered = agent
+        .advance(chat, TurnRequest::deliver(target, delivery("request-1")))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, delivered.outcome())
+        .await
+        .unwrap()
+        .unwrap();
+    let prompt = &model.requests()[0];
+    assert!(!prompt.contains("Read the artifact"), "{prompt}");
+    assert!(prompt.contains("Artifact content this Chat already read or wrote stays current"));
+    assert!(prompt.contains("on content_conflict read again and merge"));
+}
+
+#[tokio::test]
 async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());

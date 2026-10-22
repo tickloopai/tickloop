@@ -29,6 +29,8 @@ use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 pub(super) mod artifact_service;
 use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
+use crate::support::{assert_extends, guidance_in_effect, mentions};
+
 const WAIT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Default)]
@@ -311,17 +313,17 @@ async fn remote_resource_reads_do_not_activate_skills_and_repeated_reads_return_
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "repeat",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "old-resource-input",
             "Skill",
-            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/guide.md"}),
         ),
         text("done"),
     ]));
@@ -374,7 +376,12 @@ async fn remote_resource_reads_do_not_activate_skills_and_repeated_reads_return_
                 .contains("Page guidance fixture for artifact-design")
         );
         assert!(!results["reference"].1);
-        assert_eq!(results["reference"], results["repeat"]);
+        assert!(!results["repeat"].1);
+        assert!(
+            results["repeat"]
+                .0
+                .contains("is unchanged since it was read earlier in this conversation")
+        );
         assert!(
             results["reference"]
                 .0
@@ -409,12 +416,12 @@ async fn remote_resource_reads_reject_unknown_sources_paths_and_obey_denials() {
             call(
                 "wrong-server",
                 "ReadMcpResourceTool",
-                json!({"server":"other","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"other","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             call(
                 "traversal",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/../artifact-draft/SKILL.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/../doc/SKILL.md"}),
             ),
             call(
                 "unlisted",
@@ -424,7 +431,7 @@ async fn remote_resource_reads_reject_unknown_sources_paths_and_obey_denials() {
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
         ]));
@@ -488,7 +495,7 @@ async fn remote_resource_reads_discard_responses_when_account_or_policy_changes(
                 "reference",
                 tool,
                 if tool == "ReadMcpResourceTool" {
-                    json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"})
+                    json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"})
                 } else {
                     json!({"server":"tickloop-artifacts"})
                 },
@@ -550,6 +557,148 @@ async fn remote_resource_reads_discard_responses_when_account_or_policy_changes(
 }
 
 #[tokio::test]
+async fn guidance_instructions_and_an_unchanged_reference_enter_history_once() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let design_guide = "skill://tickloop-artifacts/artifact-design/references/guide.md";
+    let diagram_guide = "skill://tickloop-artifacts/artifact-diagramming/references/guide.md";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "design",
+            "Skill",
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
+        ),
+        call(
+            "design-guide",
+            "ReadMcpResourceTool",
+            json!({"server":"tickloop-artifacts","uri":design_guide}),
+        ),
+        call(
+            "diagram",
+            "Skill",
+            json!({"skill":"tickloop-artifacts:artifact-diagramming"}),
+        ),
+        call(
+            "diagram-guide",
+            "ReadMcpResourceTool",
+            json!({"server":"tickloop-artifacts","uri":diagram_guide}),
+        ),
+        call(
+            "design-guide-again",
+            "ReadMcpResourceTool",
+            json!({"server":"tickloop-artifacts","uri":design_guide}),
+        ),
+        text("Designed."),
+        call(
+            "reuse",
+            "Skill",
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
+        ),
+        text("Still designing."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make a visual page").await;
+    submit_and_wait(&agent, chat, "Add a section").await;
+    {
+        let instructions = artifact_service::instructions(&service.control);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        for (earlier, later) in requests.iter().zip(requests.iter().skip(1)) {
+            assert_extends(earlier, later);
+        }
+        for request in requests.iter() {
+            assert_eq!(mentions(request, "# MCP Server Instructions"), 1);
+            assert_eq!(
+                mentions(
+                    request,
+                    &serde_json::to_string(&instructions).unwrap()[1..40]
+                ),
+                1
+            );
+        }
+        let last = &requests[7];
+        assert_eq!(
+            mentions(last, "Page guidance fixture for artifact-design"),
+            1
+        );
+        assert_eq!(
+            mentions(last, "Page guidance fixture for artifact-diagramming"),
+            1
+        );
+        // Like Claude Code's Read, only the same resource unchanged is elided: another URI with
+        // the same text is still read in full.
+        assert_eq!(mentions(last, "Reference fixture: preserve data units"), 2);
+        let repeated = tool_result_text(last, "design-guide-again");
+        assert!(
+            repeated.contains(design_guide) && repeated.contains("unchanged since it was read"),
+            "{repeated}"
+        );
+        assert!(!repeated.contains("Reference fixture"), "{repeated}");
+        let reused = tool_result_text(last, "reuse");
+        assert!(reused.contains("Already loaded"), "{reused}");
+        assert!(reused.contains("already in this conversation"), "{reused}");
+    }
+    let reads = service
+        .control
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["body"]["method"] == "resources/read")
+        .map(|request| {
+            request["body"]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 4, "{reads:?}");
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|uri| uri.as_str() == design_guide)
+            .count(),
+        1
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn changed_or_withdrawn_server_instructions_are_appended_after_the_old_ones() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("First."),
+        text("Second."),
+        text("Third."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make a doc").await;
+    service
+        .control
+        .instructions_revision
+        .store(1, Ordering::SeqCst);
+    submit_and_wait(&agent, chat, "Make another").await;
+    service.client(directory.path()).logout().await.unwrap();
+    submit_and_wait(&agent, chat, "And another").await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_extends(&requests[0], &requests[1]);
+    assert_extends(&requests[1], &requests[2]);
+    assert_eq!(mentions(&requests[0], "# MCP Server Instructions"), 1);
+    assert_eq!(mentions(&requests[1], "# MCP Server Instructions"), 2);
+    assert_eq!(mentions(&requests[1], "(instructions revision 1)"), 1);
+    assert_eq!(mentions(&requests[2], "(instructions revision 1)"), 1);
+    assert_eq!(
+        mentions(&requests[2], "Their instructions above no longer apply"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
     let service = ArtifactService::start().await;
     service.control.skills_enabled.store(true, Ordering::SeqCst);
@@ -563,7 +712,7 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "reuse",
@@ -596,8 +745,8 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
         for name in [
             "artifact-design",
             "artifact-diagramming",
-            "artifact-dataviz",
-            "artifact-draft",
+            "dataviz",
+            "doc",
             "artifact-slides",
         ] {
             assert!(
@@ -648,7 +797,7 @@ async fn remote_skill_arguments_do_not_absorb_resource_reads_and_identical_repea
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "changed",
@@ -671,6 +820,7 @@ async fn remote_skill_arguments_do_not_absorb_resource_reads_and_identical_repea
             .messages
             .iter()
             .flat_map(|message| &message.content)
+            .rev()
             .find_map(|block| match block {
                 Content::Text { text }
                     if text.starts_with(
@@ -722,7 +872,7 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
             text("next"),
@@ -779,11 +929,13 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
         {
             let requests = model.requests.lock().unwrap();
             assert!(
-                !serde_json::to_string(&requests.last().unwrap().messages)
-                    .unwrap()
-                    .contains("Page guidance fixture for artifact-design"),
+                !guidance_in_effect(
+                    requests.last().unwrap(),
+                    "tickloop-artifacts:artifact-design"
+                ),
                 "{change}"
             );
+            assert_extends(&requests[requests.len() - 2], requests.last().unwrap());
         }
         agent.shutdown().await;
     }
@@ -797,7 +949,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let account = service.login(directory.path()).await;
-        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-artifacts:artifact-design"})), call("reference", "ReadMcpResourceTool", json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"})), text("done")]))).unwrap();
+        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-artifacts:artifact-design"})), call("reference", "ReadMcpResourceTool", json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"})), text("done")]))).unwrap();
         agent
             .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
             .unwrap();
@@ -861,9 +1013,14 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
             let requests = model.requests.lock().unwrap();
             let first = serde_json::to_string(&requests[0].messages).unwrap();
             assert_eq!(
-                first.contains("Page guidance fixture for artifact-design"),
+                guidance_in_effect(&requests[0], "tickloop-artifacts:artifact-design"),
                 change == "unchanged",
                 "{change}"
+            );
+            assert_eq!(
+                mentions(&requests[0], "Page guidance fixture for artifact-design"),
+                1,
+                "a resumed Chat keeps its announced guidance without announcing it again: {change}"
             );
             assert!(
                 first.contains("Reference fixture: preserve data units"),
@@ -986,7 +1143,7 @@ async fn remote_skill_and_resource_digest_mismatches_never_enter_context() {
         call(
             "reference-first",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "load-tampered",
@@ -1975,13 +2132,8 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
         prompt.contains("Operate artifacts with ArtifactRead, ArtifactEdit and ArtifactComment")
     );
     assert!(prompt.contains("authentication is signed_out, call ArtifactLogin"));
-    assert!(
-        prompt.contains("a doc for writing")
-            && prompt.contains("a page for visual explanations")
-            && prompt.contains("use ArtifactEdit to create the matching type")
-            && prompt.contains("Before writing any Slide, whether creating Slides or patching or replacing them, load the tickloop-artifacts:artifact-slides Skill.")
-            && prompt.contains("Honor an explicit local-file or chat-only destination")
-    );
+    assert!(prompt.contains("Tickloop Artifacts' own MCP server instructions"));
+    assert!(!prompt.contains("use ArtifactEdit to create the matching type"));
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["TickCall", "TickRead"] {
         let definition = requests[0]
@@ -2084,7 +2236,11 @@ async fn logout_after_an_approval_request_prevents_dispatch_and_hides_the_tools(
         .unwrap();
     wait_for_completion(&agent, chat).await;
     assert!(service.tool_calls().is_empty());
-    assert!(!tool_names(&model.requests.lock().unwrap()[1]).contains(&"ArtifactEdit"));
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(!tool_names(&requests[1]).contains(&"ArtifactEdit"));
+        assert!(tool_result_text(&requests[1], "replace").contains(NOTHING_SENT));
+    }
     agent.shutdown().await;
 }
 
@@ -2109,14 +2265,33 @@ async fn a_changed_directory_rejects_a_prepared_write() {
         .control
         .directory_revision
         .store(1, Ordering::SeqCst);
-    assert!(
-        provider
-            .revalidate_call(chat, &prepared, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    let rejection = provider
+        .revalidate_call(chat, &prepared, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(rejection.contains(NOTHING_SENT), "{rejection}");
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let preparation = provider
+        .prepare_call(
+            chat,
+            "ArtifactEdit",
+            &json!({"action":"replace","artifact_id":"doc","expected_revision":3,"content":"initial"}),
+            cancelled.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(preparation.contains(NOTHING_SENT), "{preparation}");
+    match provider.execute_prepared(chat, prepared, cancelled).await {
+        HostCallResult::NotDispatched(message) => {
+            assert!(message.contains(NOTHING_SENT), "{message}");
+        }
+        _ => panic!("a cancelled call must not be dispatched"),
+    }
     assert!(service.tool_calls().is_empty());
 }
+
+const NOTHING_SENT: &str = "Nothing was sent to Tickloop Artifacts and no artifact changed";
 
 #[tokio::test]
 async fn a_lost_call_response_is_unknown_and_never_replayed() {
@@ -2343,7 +2518,9 @@ async fn a_renewed_artifacts_token_keeps_the_account_directory_and_dispatches_wi
             .await
             .err()
             .unwrap(),
-        "Artifact account changed before MCP preparation"
+        format!(
+            "Artifact account changed before MCP preparation. {NOTHING_SENT}; the call can be retried with the same revision and hashes."
+        )
     );
     assert_eq!(service.tool_calls().len(), 1);
 }
@@ -2427,7 +2604,9 @@ async fn an_expired_artifacts_token_is_renewed_when_a_call_needs_it() {
             .await
             .err()
             .unwrap(),
-        "Artifact login is no longer active"
+        format!(
+            "Artifact login is no longer active. {NOTHING_SENT}; the call can be retried with the same revision and hashes."
+        )
     );
     assert!(
         service
@@ -3523,6 +3702,126 @@ async fn a_read_artifact_joins_monitor_without_linking_to_feedback() {
 }
 
 #[tokio::test]
+async fn an_artifact_result_reaches_the_model_once_and_a_page_read_stays_inline() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let section = "<section class=\"step\"><h2 title=\"step\">Step</h2><p>Sandbox \"policy\" text.</p></section>\n";
+    let source = format!(
+        "<!doctype html><html><body>{}</body></html>",
+        section.repeat(24_000 / section.len())
+    );
+    assert!(source.len() > 20_000);
+    let body = json!({"artifact_id":CREATED_ARTIFACT,"title":"Fixture","format":"page","url":"https://example.invalid/artifact/page","access_role":"owner","revision":7,"source":source});
+    *service.control.read_result.lock().unwrap() = Some(
+        json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":false}),
+    );
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "page",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read the page."),
+        call(
+            "plain",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read the plain result."),
+    ]));
+    let account = service.login(directory.path()).await;
+    let agent =
+        Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Read the page").await;
+    *service.control.read_result.lock().unwrap() = Some(json!({
+        "content":[{"type":"text","text":"first line"},{"type":"text","text":"second line"}],
+        "isError":false
+    }));
+    submit_and_wait(&agent, chat, "Read it again").await;
+
+    {
+        let requests = model.requests.lock().unwrap();
+        let page = tool_result_text(&requests[1], "page");
+        assert_eq!(serde_json::from_str::<Value>(&page).unwrap(), body);
+        assert_eq!(
+            page.matches("Sandbox").count(),
+            source.matches("Sandbox").count()
+        );
+        assert!(!page.contains("structuredContent"));
+        assert!(!page.contains("<persisted-output>"));
+        assert_eq!(
+            tool_result_text(&requests[3], "plain"),
+            "first line\nsecond line"
+        );
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn reading_back_an_unchanged_page_this_chat_wrote_returns_a_note_instead_of_its_source() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "<!doctype html><html><head><title>Fixture</title></head><body><p>Own words</p></body></html>";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "create",
+            "ArtifactEdit",
+            json!({"action":"create","title":"Fixture","format":"page","content":source}),
+        ),
+        text("Created."),
+        call(
+            "own",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read my page."),
+        call(
+            "changed",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read the edited page."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let turn = async |prompt: &str, requests: usize| {
+        agent.submit(chat, None, prompt.into()).await.unwrap();
+        eventually(async || model.requests.lock().unwrap().len() >= requests).await;
+    };
+    turn("Make a page", 2).await;
+    let page = |revision: u64, source: &str| {
+        let body = json!({"artifact_id":CREATED_ARTIFACT,"title":"Fixture","format":"page","url":"https://example.invalid/artifact/page","access_role":"owner","revision":revision,"source":source});
+        json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":false})
+    };
+    *service.control.read_result.lock().unwrap() = Some(page(0, source));
+    turn("Read it back", 4).await;
+    let edited = "<!doctype html><html><head><title>Fixture</title></head><body><p>Someone else's words</p></body></html>";
+    *service.control.read_result.lock().unwrap() = Some(page(1, edited));
+    turn("Read it again", 6).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let own = tool_result_text(&requests[3], "own");
+        assert!(!own.contains("Own words"), "{own}");
+        let own: Value = serde_json::from_str(&own).unwrap();
+        assert_eq!(own["revision"], 0);
+        assert!(
+            own["source_unchanged"]
+                .as_str()
+                .unwrap()
+                .contains("edit from it instead of reading it again"),
+            "{own}"
+        );
+        let changed = tool_result_text(&requests[5], "changed");
+        assert!(changed.contains("Someone else's words"), "{changed}");
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
@@ -3988,8 +4287,13 @@ async fn a_resumed_chat_is_told_once_which_host_tools_became_available() {
             "an unchanged tool set is not announced again"
         );
     }
-    assert_eq!(snapshot.host_notes.len(), 1);
-    let (index, announced) = snapshot.host_notes.iter().next().unwrap();
+    let tool_notes = snapshot
+        .host_notes
+        .iter()
+        .filter(|(_, note)| note.announced_host_tools().is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(tool_notes.len(), 1);
+    let (index, announced) = tool_notes[0];
     assert!(
         announced
             .announced_host_tools()
@@ -4052,7 +4356,13 @@ async fn signing_out_announces_the_removed_tools_and_offers_sign_in() {
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
     let notices = host_notices(&requests[1]);
-    assert_eq!(notices.len(), 1);
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(
+        notices[1].contains("tickloop-artifacts")
+            && notices[1].contains("Their instructions above no longer apply"),
+        "{}",
+        notices[1]
+    );
     assert!(
         notices[0].contains("Now available: ArtifactLogin.")
             && notices[0].contains(
@@ -4460,7 +4770,7 @@ async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
             text("A compact summary"),
@@ -4519,14 +4829,14 @@ async fn remote_resource_requested_after_compaction_returns_complete_content_wit
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         text("done"),
         text("A compact summary"),
         call(
             "reload",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         text("continued"),
     ]));
@@ -5888,9 +6198,9 @@ async fn slides_guidance_continues_into_the_next_run_after_sign_in_and_no_furthe
     let guided = requests
         .iter()
         .map(|request| {
-            serde_json::to_string(&request.messages)
-                .unwrap()
-                .contains(SLIDES_GUIDANCE)
+            let guided = guidance_in_effect(request, "slides");
+            assert!(!guided || mentions(request, SLIDES_GUIDANCE) == 1);
+            guided
         })
         .collect::<Vec<_>>();
     assert_eq!(

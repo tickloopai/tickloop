@@ -3,7 +3,7 @@
 use serde_json::json;
 use tickloop_agent_protocol::{
     ChatSnapshot, ChatStatus, CommandSnapshot, CommandState, Event, EventKind, ExecutionRef,
-    LiveChatSnapshot, PermissionExecution, PermissionRequest, QuestionRequest,
+    LiveChatSnapshot, PermissionExecution, PermissionRequest, QuestionRequest, chat_preview,
 };
 use uuid::Uuid;
 
@@ -180,4 +180,22 @@ fn a_live_snapshot_answers_the_status_a_status_query_would() {
     );
     assert_eq!(status.request_refs, live.request_refs);
     assert_eq!(status.warnings, ["slow"]);
+}
+
+#[test]
+fn a_preview_shows_the_latest_prompt_and_never_a_host_note() {
+    let snapshot: ChatSnapshot = serde_json::from_value(json!({
+        "id": id(0xc1),
+        "folder": "/work",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Build the page"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Reference guidance from tickloop active in this Chat"}]},
+        ],
+        "host_notes": {"1": {"guidance": {"kind": "skill", "name": "tickloop", "digest": "sha256:00"}}},
+    }))
+    .unwrap();
+    assert_eq!(
+        chat_preview(&snapshot, "Untitled").as_deref(),
+        Some("Build the page")
+    );
 }
