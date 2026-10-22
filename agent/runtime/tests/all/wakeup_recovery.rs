@@ -1106,6 +1106,25 @@ async fn trigger_input_never_recorded_as_started_runs_once_after_a_takeover() {
     processes.taken_over_ran_once().await;
 }
 
+/// Trigger input interrupted while it waits for its start to be recorded ends without asking
+/// the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_input_stopped_before_its_start_is_recorded_never_runs() {
+    let processes = FaultyProcesses::new().await;
+    processes.start_while_the_store_refuses().await;
+    processes.first.stop(processes.chat).await.unwrap();
+    wait_for_state(
+        &processes.first,
+        processes.chat,
+        tickloop_agent_protocol::LoopState::Interrupted,
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 0);
+    processes.first.shutdown().await;
+    processes.second.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
