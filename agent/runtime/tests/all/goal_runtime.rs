@@ -1683,3 +1683,123 @@ async fn a_child_stops_weighing_a_goal_the_user_cleared_or_edited_since_its_dele
         agent.shutdown().await;
     }
 }
+
+/// A continuation that delegates once, the child sending a message its Auto review weighs.
+fn delegating_replies() -> Vec<Vec<Content>> {
+    vec![
+        call("s1", "Subagent", json!({"task": "write the export"})),
+        call(
+            "m1",
+            "SendMessage",
+            json!({"to": "main", "message": CHILD_MESSAGE}),
+        ),
+        call(
+            "h1",
+            "SubagentHandback",
+            json!({"message": "Wrote the export."}),
+        ),
+        text("Reported."),
+        blocked("g1"),
+        text("Blocked."),
+    ]
+}
+
+const CHILD_MESSAGE: &str = "Starting on the export.";
+
+/// The child's review of its message, after the continuation that delegated it blocked the goal.
+async fn childs_review(agent: &Agent, chat: ChatId, checker: &ScriptedModel) -> String {
+    wait_for_goal(agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    reviewed_user_inputs(checker)
+        .into_iter()
+        .find(|review| review.contains(CHILD_MESSAGE))
+        .expect("the child's message was reviewed")
+}
+
+fn allowing_checker() -> Arc<ScriptedModel> {
+    let allow = tickloop_agent_test_support::auto_classification(false).to_string();
+    Arc::new(ScriptedModel::new(vec![text(&allow); 4]))
+}
+
+#[tokio::test]
+async fn a_child_delegated_after_an_edit_weighs_the_edited_goal() {
+    const FROM_USER: &str = "The user set this Chat's goal with /goal";
+    const EDITED: &str = "Ship the import command with tests";
+    let model = HoldingModel::new(delegating_replies(), Vec::new());
+    let checker = allowing_checker();
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), model.clone());
+    approve_everything(&agent);
+    agent.set_auto_reviewer(checker.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    agent
+        .manage_goal(
+            chat,
+            GoalAction::Edit {
+                objective: EDITED.into(),
+            },
+        )
+        .await
+        .unwrap();
+    // Leaving Plan mode continues the goal, which delegates.
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let review = childs_review(&agent, chat, &checker).await;
+    assert!(review.contains(FROM_USER) && review.contains(EDITED));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_child_delegated_after_a_restore_weighs_the_goal() {
+    const FROM_USER: &str = "The user set this Chat's goal with /goal";
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let first = Agent::open(
+        root.path().into(),
+        config(),
+        HoldingModel::new(vec![text("ready")], Vec::new()),
+    )
+    .unwrap();
+    first
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    first.submit(chat, "hello".into()).await.unwrap();
+    wait_until_idle(&first, chat).await;
+    set_goal(&first, chat, None).await;
+    first.shutdown().await;
+
+    let model = HoldingModel::new(delegating_replies(), Vec::new());
+    let checker = allowing_checker();
+    let restored = Agent::open(root.path().into(), config(), model.clone()).unwrap();
+    approve_everything(&restored);
+    restored.set_auto_reviewer(checker.clone()).await;
+    restored.resume_chat(chat).await.unwrap();
+    // Taking the Chat over pauses the goal its gone holder left; the user resumes it.
+    restored.continue_loop(chat).await.unwrap();
+    restored
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    restored
+        .manage_goal(chat, GoalAction::Resume)
+        .await
+        .unwrap();
+    let review = childs_review(&restored, chat, &checker).await;
+    assert!(review.contains(FROM_USER) && review.contains(OBJECTIVE));
+    restored.shutdown().await;
+}
