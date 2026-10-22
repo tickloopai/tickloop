@@ -1477,7 +1477,12 @@ impl Agent {
                 ..Default::default()
             },
         );
-        let input = tickloop_agent_protocol::local_messages::tick_delivery(&payload);
+        let input = match self.goal_background(chat_id).await {
+            Some(goal) => {
+                tickloop_agent_protocol::local_messages::tick_delivery_with_goal(&payload, &goal)
+            }
+            None => tickloop_agent_protocol::local_messages::tick_delivery(&payload),
+        };
         let source = TriggerSource::TickManual {
             instance,
             sequence: observation.sequence,
@@ -2204,7 +2209,12 @@ impl Agent {
                 })
                 .collect(),
         };
-        let input = tickloop_agent_protocol::local_messages::tick_delivery(&payload);
+        let input = match self.goal_background(chat_id).await {
+            Some(goal) => {
+                tickloop_agent_protocol::local_messages::tick_delivery_with_goal(&payload, &goal)
+            }
+            None => tickloop_agent_protocol::local_messages::tick_delivery(&payload),
+        };
         let outcome = self
             .deliver_trigger(
                 chat_id,

@@ -23,6 +23,7 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
     pub task_boards: Option<TaskBoardsEntry>,
+    pub goal: Option<tickloop_agent_transcript::GoalEntry>,
     pub artifact_ticks: Option<ArtifactTicksEntry>,
     pub monitor_members: Option<MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
@@ -47,6 +48,7 @@ impl CachedMetadata {
             Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
             Line::TaskBoards(entry) => self.task_boards = Some(entry.clone()),
+            Line::Goal(entry) => self.goal = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
@@ -67,6 +69,7 @@ impl CachedMetadata {
             .chain(self.ai_title.clone().map(Line::AiTitle))
             .chain(self.subagents.clone().map(Line::Subagents))
             .chain(self.task_boards.clone().map(Line::TaskBoards))
+            .chain(self.goal.clone().map(Line::Goal))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
             .chain(

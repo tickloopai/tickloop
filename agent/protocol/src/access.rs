@@ -61,8 +61,10 @@ use crate::{
 /// 28.0 puts every Trigger on one wake-up base: the Loop carries its receiving switch, with why
 /// it paused, and its Tick Subscriptions; a delivery names its source by type; the explicit
 /// Trigger commands are gone.
+/// 28.1 adds the Chat's goal: its snapshot on the Chat, `ManageGoal`, goal updates and the
+/// completion check's requests.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -374,6 +376,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         action: TaskAction,
     },
+    /// A `/goal` command for the Chat's goal.
+    ManageGoal {
+        execution: ExecutionRef,
+        action: crate::GoalAction,
+    },
     ClearCompletedTasks {
         execution: ExecutionRef,
         root_loop_id: Uuid,
@@ -410,6 +417,7 @@ impl AgentCommand {
             | Self::EditHistory { execution, .. }
             | Self::ManageLoop { execution, .. }
             | Self::ManageTask { execution, .. }
+            | Self::ManageGoal { execution, .. }
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
             | Self::LinkArtifact { execution, .. }
@@ -1217,6 +1225,7 @@ pub enum AccessCapability {
     EditHistory,
     ManageLoop,
     ManageTask,
+    ManageGoal,
     ClearCompletedTasks,
     EnqueueAfterTurn,
     RefreshConfiguration,

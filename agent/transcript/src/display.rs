@@ -12,15 +12,15 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
-    AgentColor, AgentMessageSource, Authority, Content, ImageContext, InputContext, LocalMessage,
-    LoopState, Protocol, Question, Receiving, Role, SharedTask, SubagentRegistration, TaskBoard,
-    TickSubscription, TriggerIdentity,
+    AgentColor, AgentMessageSource, Authority, Content, GoalSnapshot, ImageContext, InputContext,
+    LocalMessage, LoopState, Protocol, Question, Receiving, Role, SharedTask, SubagentRegistration,
+    TaskBoard, TickSubscription, TriggerIdentity,
 };
 use uuid::Uuid;
 
 use crate::entry::{
-    ChainEntry, InputEntry, InputOp, InputState, InterruptedBy, Line, LoopRecord, ResponseEnding,
-    ResponseEntry, ResponseState, WaitEntry, WaitKind, WaitState,
+    ChainEntry, GoalEventEntry, InputEntry, InputOp, InputState, InterruptedBy, Line, LoopRecord,
+    ResponseEnding, ResponseEntry, ResponseState, WaitEntry, WaitKind, WaitState,
 };
 
 /// The longest tool result text a tool card carries.
@@ -290,6 +290,29 @@ pub fn trigger_deliveries(lines: &[Line]) -> Vec<DisplayTriggerDelivery> {
         }
     });
     deliveries
+}
+
+/// The Chat's goal as its latest record left it; `None` when it has none or it was cleared.
+pub fn goal(lines: &[Line]) -> Option<GoalSnapshot> {
+    let mut latest = None;
+    visit_lines(lines, &mut |line| {
+        if let Line::Goal(entry) = line {
+            latest = entry.goal.clone();
+        }
+    });
+    latest
+}
+
+/// The goal changes the conversation shows as lines, in the order they happened: set, complete,
+/// blocked, budget limited, paused and cleared.
+pub fn goal_events(lines: &[Line]) -> Vec<GoalEventEntry> {
+    let mut events = Vec::new();
+    visit_lines(lines, &mut |line| {
+        if let Line::GoalEvent(entry) = line {
+            events.push(entry.clone());
+        }
+    });
+    events
 }
 
 fn visit_lines(lines: &[Line], visit: &mut impl FnMut(&Line)) {
@@ -1101,3 +1124,5 @@ mod tests {
 
 #[cfg(test)]
 mod durable_tests;
+#[cfg(test)]
+mod goal_tests;

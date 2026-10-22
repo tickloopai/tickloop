@@ -1970,6 +1970,18 @@ pub(super) fn local_message_runs(
                 push_response_block(&mut response, body, detail, display, None);
             }
         }
+        LocalMessage::GoalSteering { text } => {
+            runs.push((
+                format!(
+                    "\nGoal · {}\n",
+                    super::safe_line(text.lines().next().unwrap_or_default())
+                ),
+                Some(Role::MutedText),
+            ));
+            if matches!(detail, OutputDetail::Full) {
+                push_response_block(&mut response, text, detail, display, None);
+            }
+        }
     }
     (runs, response)
 }

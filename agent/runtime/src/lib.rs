@@ -18,10 +18,6 @@ mod family;
 mod family_load;
 mod family_tree;
 pub mod file_history;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "ticket 06 wires Goal into the Loop")
-)]
 mod goal;
 mod handback;
 mod handover;
@@ -940,6 +936,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         family_completions: Vec::new(),
         task_boards: BTreeMap::new(),
         task_board: None,
+        goal: None,
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
         generated_title: None,
@@ -1695,9 +1692,11 @@ impl Agent {
         }
     }
 
+    /// Esc: interrupts the current turn and pauses an active goal.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        self.pause_goal(chat, goal::state::GoalEvent::Interrupted);
         Ok(chat.interrupt())
     }
 
@@ -3476,6 +3475,12 @@ impl Agent {
                 Usage::default(),
             ),
         };
+        let goal_turn = match &event {
+            EventKind::Completed { .. } => goal::GoalTurnEnd::Completed,
+            EventKind::Failed(error) if !is_closed => goal::GoalTurnEnd::Failed(error.clone()),
+            _ => goal::GoalTurnEnd::Interrupted,
+        };
+        self.end_goal_turn(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
         let is_settled = !(self.inner.waits == WaitHosting::Durable
@@ -3523,6 +3528,10 @@ impl Agent {
             return None;
         }
         match self.next_run(receipt.chat_id).await {
+            Ok(None) => {
+                self.continue_goal(receipt.chat_id, receipt.run_id).await;
+                None
+            }
             Ok(next) => next,
             Err(error) => {
                 let mut chats = self.inner.chats.lock().await;

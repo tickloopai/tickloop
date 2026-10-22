@@ -25,7 +25,8 @@ impl AuxiliaryTask {
             ModelRequestKind::Conversation
             | ModelRequestKind::CompactionAutomatic
             | ModelRequestKind::CompactionManual
-            | ModelRequestKind::CompactionDirected => None,
+            | ModelRequestKind::CompactionDirected
+            | ModelRequestKind::GoalCheck => None,
         }
     }
 

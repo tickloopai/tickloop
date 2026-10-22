@@ -3,5 +3,8 @@
 
 pub(crate) mod check;
 pub(crate) mod prompts;
+mod runtime;
+
+pub(crate) use runtime::{GoalTurnEnd, charged_tokens};
 pub(crate) mod state;
 pub(crate) mod tools;

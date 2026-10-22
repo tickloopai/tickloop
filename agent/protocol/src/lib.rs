@@ -113,7 +113,7 @@ pub use file_change::{
 };
 pub use frame::{check_frame_length, decode_frame, encode_frame};
 pub use goal::{
-    GoalAction, GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+    GoalAction, GoalBlock, GoalCheck, GoalNotice, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
 };
 pub use history::{
     ActiveConversationItem, BranchCreation, BranchOrigin, BranchOutcome, BranchPublicItem,

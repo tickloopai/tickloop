@@ -24,6 +24,10 @@ pub enum Line {
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
     TaskBoards(TaskBoardsEntry),
+    /// The Chat's goal as it is now; the latest record wins.
+    Goal(GoalEntry),
+    /// A goal change the conversation shows as one line; every one is kept.
+    GoalEvent(GoalEventEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
     SentAgentMessages(SentAgentMessagesEntry),
@@ -129,6 +133,8 @@ pub enum MetadataKind {
     Provenance,
     CitationSources,
     TaskBoards,
+    Goal,
+    GoalEvent,
     FamilyCompletions,
     FileHistorySnapshot,
     ContentReplacement,
@@ -157,9 +163,12 @@ impl MetadataKind {
             | Self::Provenance
             | Self::CitationSources
             | Self::TaskBoards
+            | Self::Goal
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
-            Self::FileHistorySnapshot | Self::ContentReplacement => Retention::Accumulating,
+            Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
+                Retention::Accumulating
+            }
             Self::RetainedSnapshot => Retention::Snapshot,
             Self::Other => Retention::Unknown,
         }
@@ -217,6 +226,8 @@ impl Line {
             Self::AiTitle(_) => MetadataKind::AiTitle,
             Self::Subagents(_) => MetadataKind::Subagents,
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
+            Self::Goal(_) => MetadataKind::Goal,
+            Self::GoalEvent(_) => MetadataKind::GoalEvent,
             Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
             Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
@@ -653,6 +664,25 @@ pub struct ProvenanceEntry {
 pub struct TaskBoardsEntry {
     pub chat_id: Uuid,
     pub boards: std::collections::BTreeMap<Uuid, tickloop_agent_protocol::TaskBoard>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalEntry {
+    pub chat_id: Uuid,
+    /// `None` once the goal was cleared.
+    pub goal: Option<tickloop_agent_protocol::GoalSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalEventEntry {
+    pub chat_id: Uuid,
+    pub goal_id: Uuid,
+    /// The objective when it happened.
+    pub objective: String,
+    pub notice: tickloop_agent_protocol::GoalNotice,
+    pub timestamp: String,
 }
 
 /// One answer: one attempt of one Run. Written when it starts and again when it ends.

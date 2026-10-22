@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tickloop_agent_model::{ModelOutput, ModelRequest, StructuredOutput};
-use tickloop_agent_protocol::{Content, GoalVerdict, Message, Role};
+use tickloop_agent_protocol::{ChatSnapshot, Content, GoalVerdict, Message, Role};
 
 pub(crate) const CHECK_RESULT_NAME: &str = "goal_check_result";
 const CHECK_SYSTEM_PROMPT: &str = include_str!("templates/completion_check.md");
@@ -28,7 +28,13 @@ const MIN_CUT_STRING_BYTES: usize = 512;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum EvidenceEntry {
+    /// What the user wrote.
     User {
+        text: String,
+    },
+    /// Input the host or another Agent added: a goal continuation, a Tick or Artifact delivery,
+    /// a scheduled instruction, a notification or an Agent message. It is not the user's word.
+    HostInput {
         text: String,
     },
     Agent {
@@ -51,7 +57,7 @@ pub(crate) enum EvidenceEntry {
 impl EvidenceEntry {
     fn text_mut(&mut self) -> &mut String {
         match self {
-            Self::User { text } | Self::Agent { text } => text,
+            Self::User { text } | Self::HostInput { text } | Self::Agent { text } => text,
             Self::ToolCall { input, .. } => input,
             Self::ToolResult { output, .. } => output,
         }
@@ -90,17 +96,26 @@ enum ReplyVerdict {
     Impossible,
 }
 
-/// The conversation as check evidence: user and Agent text, tool calls and their text results.
-/// Reasoning, images and provider data are not evidence the check can weigh.
-pub(crate) fn conversation_evidence(messages: &[Message]) -> Vec<EvidenceEntry> {
+/// The Chat's conversation as check evidence: user and Agent text, tool calls and their text
+/// results. Only a prompt the user submitted counts as the user's; whatever else entered as a
+/// user message is host input. Reasoning, images and provider data are not evidence the check
+/// can weigh.
+pub(crate) fn conversation_evidence(snapshot: &ChatSnapshot) -> Vec<EvidenceEntry> {
     let mut tool_names = HashMap::<&str, &str>::new();
     let mut entries = Vec::new();
-    for message in messages {
+    for (index, message) in snapshot.messages.iter().enumerate() {
+        let is_users_prompt = snapshot
+            .message_ids
+            .get(&index)
+            .is_some_and(|id| !snapshot.agent_message_origins.contains_key(id));
         for content in &message.content {
             match content {
                 Content::Text { text } if text.trim().is_empty() => {}
                 Content::Text { text } => match message.role {
-                    Role::User => entries.push(EvidenceEntry::User { text: text.clone() }),
+                    Role::User if is_users_prompt => {
+                        entries.push(EvidenceEntry::User { text: text.clone() })
+                    }
+                    Role::User => entries.push(EvidenceEntry::HostInput { text: text.clone() }),
                     Role::Assistant => entries.push(EvidenceEntry::Agent { text: text.clone() }),
                     Role::System => {}
                 },

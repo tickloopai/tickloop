@@ -81,6 +81,18 @@ pub enum GoalBlock {
     CheckImpossible { reason: String },
 }
 
+/// A goal change the conversation shows as one line.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GoalNotice {
+    Set,
+    Completed,
+    Blocked { by: GoalBlock },
+    BudgetLimited,
+    Paused { by: GoalPause },
+    Cleared,
+}
+
 /// The completion check's latest conclusion about a reported completion.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GoalCheck {

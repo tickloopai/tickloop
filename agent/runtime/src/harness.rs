@@ -128,6 +128,8 @@ pub struct ToolPolicy {
     /// ListSubagents, SendMessage and StopSubagent.
     pub family_messages: bool,
     pub tasks: bool,
+    /// GetGoal, CreateGoal and UpdateGoal, and goal continuations, for a root Agent.
+    pub goals: bool,
     /// The host's tools, such as the Artifact and Tick tools, and its MCP resources.
     pub artifacts: bool,
     pub tick_subscriptions: bool,
@@ -157,6 +159,7 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
+            goals: true,
             artifacts: true,
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
@@ -179,6 +182,7 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
+            goals: false,
             artifacts: true,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -204,6 +208,7 @@ impl ToolPolicy {
             delegation: false,
             family_messages: false,
             tasks: false,
+            goals: false,
             artifacts: false,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,

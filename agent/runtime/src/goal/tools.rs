@@ -68,7 +68,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             name: CREATE_GOAL_TOOL_NAME.into(),
             description: format!("Set a goal for this Chat only when the user explicitly asks you to set or pursue a goal; never infer a goal from an ordinary task. The host then keeps continuing toward the objective across turns until a completion check verifies it. Fails if the Chat already has an unfinished goal; the user replaces or clears it with /goal. Set token_budget only when the user asks for a token budget; otherwise the Settings default applies. Use {UPDATE_GOAL_TOOL_NAME} only to report completion or a blocker."),
             input_schema: json!({"type":"object","properties":{
-                "objective":{"type":"string","minLength":1,"maxLength":MAX_OBJECTIVE_CHARACTERS,"description":format!("The concrete completion condition, at most {MAX_OBJECTIVE_CHARACTERS} characters. Put longer material in a file or Artifact and reference it.")},
+                "objective":{"type":"string","minLength":1,"description":format!("The concrete completion condition, at most {MAX_OBJECTIVE_CHARACTERS} characters. Put longer material in a file or Artifact and reference it.")},
                 "token_budget":{"type":"integer","minimum":1,"description":"Token budget for the goal, counted across this Chat's whole Agent family. Omit unless the user asked for one."}
             },"required":["objective"],"additionalProperties":false}),
         },

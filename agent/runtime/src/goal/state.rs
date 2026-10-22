@@ -3,7 +3,7 @@
 //! continuation conditions are judged here too, so every goal rule lives in one place.
 
 use tickloop_agent_protocol::{
-    GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+    GoalBlock, GoalCheck, GoalNotice, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
 };
 use uuid::Uuid;
 
@@ -45,6 +45,12 @@ pub(crate) enum GoalEvent {
         objective_revision: u64,
         verdict: GoalVerdict,
     },
+    /// The completion check itself failed, which counts as an execution error.
+    CheckFailed {
+        goal_id: Uuid,
+        objective_revision: u64,
+        error: String,
+    },
     /// UpdateGoal `blocked`.
     ReportedBlocked {
         reason: String,
@@ -85,16 +91,6 @@ pub(crate) enum GoalEffect {
         goal_id: Uuid,
         objective_revision: u64,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GoalNotice {
-    Set,
-    Completed,
-    Blocked(GoalBlock),
-    BudgetLimited,
-    Paused(GoalPause),
-    Cleared,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +187,11 @@ pub(crate) fn apply(
                 replace,
             } => set(None, id, &objective, token_budget, replace, now_ms),
             GoalEvent::Checked {
+                goal_id,
+                objective_revision,
+                ..
+            }
+            | GoalEvent::CheckFailed {
                 goal_id,
                 objective_revision,
                 ..
@@ -295,18 +296,29 @@ pub(crate) fn apply(
         GoalEvent::Checked {
             goal_id,
             objective_revision,
-            verdict,
-        } => {
-            if (goal_id, objective_revision) != (current.id, current.objective_revision) {
-                effects.push(GoalEffect::StaleCheckDiscarded {
-                    goal_id,
-                    objective_revision,
-                });
-                return Ok(GoalTransition {
-                    goal: Some(next),
-                    effects,
-                });
+            ..
+        }
+        | GoalEvent::CheckFailed {
+            goal_id,
+            objective_revision,
+            ..
+        } if (goal_id, objective_revision) != (current.id, current.objective_revision) => {
+            effects.push(GoalEffect::StaleCheckDiscarded {
+                goal_id,
+                objective_revision,
+            });
+        }
+        GoalEvent::CheckFailed { error, .. } => {
+            if current.status.is_finished() {
+                return Err(inapplicable("check"));
             }
+            block(
+                &mut next,
+                GoalBlock::ExecutionFailed { error },
+                &mut effects,
+            );
+        }
+        GoalEvent::Checked { verdict, .. } => {
             if current.status.is_finished() {
                 return Err(inapplicable("check"));
             }
@@ -430,7 +442,7 @@ fn pause(goal: &mut GoalSnapshot, by: GoalPause, effects: &mut Vec<GoalEffect>) 
     leave_active(
         goal,
         GoalStatus::Paused { by },
-        GoalNotice::Paused(by),
+        GoalNotice::Paused { by },
         effects,
     );
 }
@@ -439,7 +451,7 @@ fn block(goal: &mut GoalSnapshot, by: GoalBlock, effects: &mut Vec<GoalEffect>) 
     leave_active(
         goal,
         GoalStatus::Blocked { by: by.clone() },
-        GoalNotice::Blocked(by),
+        GoalNotice::Blocked { by },
         effects,
     );
 }

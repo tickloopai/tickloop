@@ -2135,6 +2135,12 @@ fn recover_transcript(
         .map(|entry| entry.completions.clone())
         .unwrap_or_default();
     if chat_id == source_chat_id {
+        snapshot.goal = loaded
+            .metadata
+            .goal
+            .as_ref()
+            .filter(|entry| entry.chat_id == chat_id)
+            .and_then(|entry| entry.goal.clone());
         snapshot.task_boards = loaded
             .metadata
             .task_boards
@@ -3145,6 +3151,7 @@ impl Agent {
         }
         super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
             .map_err(AgentError::Invalid)?;
+        self.pause_goal_after_history_load(chat_id).await;
         self.snapshot(chat_id).await
     }
 

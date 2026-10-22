@@ -6,7 +6,7 @@ use tickloop_agent_runtime::Agent;
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(180);
 
-fn live_agent() -> Agent {
+pub(super) fn live_agent() -> Agent {
     let config = ModelConfig {
         provider: tickloop_agent_protocol::ModelProvider::Api,
         auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,

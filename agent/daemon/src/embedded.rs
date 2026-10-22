@@ -957,6 +957,11 @@ impl EmbeddedAgentAccess {
             AgentCommand::ManageTask { execution, action } => {
                 self.manage_task(execution, action).await
             }
+            AgentCommand::ManageGoal { execution, action } => {
+                let chat = self.chat(execution).await?;
+                self.inner.agent.manage_goal(chat, action).await?;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::ClearCompletedTasks {
                 execution,
                 root_loop_id,

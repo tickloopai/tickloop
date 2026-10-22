@@ -126,6 +126,9 @@ pub struct ChatSnapshot {
     pub message_sources: BTreeMap<usize, PrivateHistorySource>,
     #[serde(default)]
     pub message_models: BTreeMap<usize, ModelIdentity>,
+    /// The Chat's goal; only a root Agent's Chat has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::GoalSnapshot>,
     /// The Chat's one Loop, there from the Chat's creation. 链上字段：由对话链上的 Loop 条目重放得到。
     pub chat_loop: LoopSnapshot,
     /// The fields through `pending_model` are process-local state and are not persisted with the
@@ -340,6 +343,11 @@ pub enum EventKind {
     },
     CommandUpdated {
         command: CommandSnapshot,
+    },
+    /// The Chat's goal changed; `notice` is the line the conversation shows for it, if any.
+    GoalUpdated {
+        goal: Option<crate::GoalSnapshot>,
+        notice: Option<crate::GoalNotice>,
     },
 }
 

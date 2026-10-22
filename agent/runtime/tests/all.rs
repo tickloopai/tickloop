@@ -87,6 +87,8 @@ mod file_tools;
 mod folderless_chats;
 #[path = "all/glm_models.rs"]
 mod glm_models;
+#[path = "all/goal_runtime.rs"]
+mod goal_runtime;
 #[path = "all/host_tools.rs"]
 mod host_tools;
 #[path = "all/image_limits.rs"]

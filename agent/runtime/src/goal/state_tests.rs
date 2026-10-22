@@ -299,7 +299,9 @@ fn pausing_applies_only_to_an_active_goal() {
     assert_eq!(transition.goal.unwrap().status, paused(GoalPause::User));
     assert_eq!(
         transition.effects,
-        left_active(GoalNotice::Paused(GoalPause::User))
+        left_active(GoalNotice::Paused {
+            by: GoalPause::User
+        })
     );
 
     for (status, name) in [
@@ -492,7 +494,9 @@ fn three_quiet_continuations_block_the_goal() {
     );
     assert_eq!(
         transition.effects,
-        left_active(GoalNotice::Blocked(GoalBlock::NoProgress))
+        left_active(GoalNotice::Blocked {
+            by: GoalBlock::NoProgress
+        })
     );
 }
 
@@ -532,7 +536,7 @@ fn an_execution_failure_blocks_but_a_failed_tool_call_does_not() {
             transition.goal.unwrap().status,
             GoalStatus::Blocked { by: by.clone() }
         );
-        assert_eq!(transition.effects, left_active(GoalNotice::Blocked(by)));
+        assert_eq!(transition.effects, left_active(GoalNotice::Blocked { by }));
     }
 
     let after_failed_tool = next(&goal_with(None), continuation(true, false));
@@ -608,7 +612,7 @@ fn check_verdicts_complete_keep_or_block_the_goal() {
         impossible.goal.unwrap().status,
         GoalStatus::Blocked { by: by.clone() }
     );
-    assert_eq!(impossible.effects, left_active(GoalNotice::Blocked(by)));
+    assert_eq!(impossible.effects, left_active(GoalNotice::Blocked { by }));
 }
 
 #[test]
@@ -646,7 +650,7 @@ fn the_agent_reports_a_blocker_only_while_the_goal_is_pursued() {
         );
         assert_eq!(
             transition.effects,
-            left_active(GoalNotice::Blocked(by.clone()))
+            left_active(GoalNotice::Blocked { by: by.clone() })
         );
     }
     for status in [blocked(), GoalStatus::BudgetLimited, GoalStatus::Complete] {
@@ -673,7 +677,7 @@ fn esc_stop_and_history_load_pause_only_an_active_goal() {
     ] {
         let transition = step(&goal_with(None), event.clone());
         assert_eq!(transition.goal.unwrap().status, paused(by));
-        assert_eq!(transition.effects, left_active(GoalNotice::Paused(by)));
+        assert_eq!(transition.effects, left_active(GoalNotice::Paused { by }));
 
         for status in [
             paused(GoalPause::User),
@@ -880,4 +884,39 @@ fn usage_saturates_instead_of_overflowing() {
         },
     );
     assert_eq!(edited.objective_revision, u64::MAX);
+}
+
+#[test]
+fn a_failed_check_blocks_its_goal_and_a_stale_one_is_discarded() {
+    let goal = goal_with(None);
+    let failed = |goal: &GoalSnapshot| GoalEvent::CheckFailed {
+        goal_id: goal.id,
+        objective_revision: goal.objective_revision,
+        error: "provider unavailable".into(),
+    };
+    let by = GoalBlock::ExecutionFailed {
+        error: "provider unavailable".into(),
+    };
+    let transition = step(&goal, failed(&goal));
+    assert_eq!(
+        transition.goal.unwrap().status,
+        GoalStatus::Blocked { by: by.clone() }
+    );
+    assert_eq!(transition.effects, left_active(GoalNotice::Blocked { by }));
+
+    let edited = next(
+        &goal,
+        GoalEvent::Edit {
+            objective: "Ship the import command".into(),
+        },
+    );
+    let transition = step(&edited, failed(&goal));
+    assert_eq!(transition.goal, Some(edited));
+    assert_eq!(
+        transition.effects,
+        [GoalEffect::StaleCheckDiscarded {
+            goal_id: goal.id,
+            objective_revision: goal.objective_revision,
+        }]
+    );
 }

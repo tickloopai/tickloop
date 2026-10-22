@@ -29,6 +29,8 @@ pub enum ModelRequestKind {
     WebFetch,
     /// Names a background Shell that has no description of its own.
     ShellDescription,
+    /// The completion check of a goal the Agent reported complete.
+    GoalCheck,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
