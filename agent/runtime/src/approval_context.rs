@@ -539,6 +539,31 @@ fn originals_for_active_chain_with_legacy(
     Ok(originals)
 }
 
+/// The root Chat's goal as one of the user's inputs, when the user set or edited it with /goal and
+/// it is unfinished: the user's own request for the work it continues. A goal the Agent set with
+/// CreateGoal is only the Agent's account of the request.
+pub(super) fn user_goal_input(
+    snapshot: &ChatSnapshot,
+    loop_id: Uuid,
+    run_id: Uuid,
+) -> Option<OriginalUserInput> {
+    let goal = snapshot.goal.as_ref().filter(|goal| {
+        snapshot.delegation.is_none()
+            && goal.set_by == tickloop_agent_protocol::GoalAuthor::User
+            && !goal.status.is_finished()
+    })?;
+    Some(OriginalUserInput {
+        chat_id: snapshot.id,
+        loop_id,
+        run_id,
+        message_id: goal.id,
+        text: format!(
+            "The user set this Chat's goal with /goal, for the Agent to keep working toward: {}",
+            goal.objective
+        ),
+    })
+}
+
 pub(super) fn capture(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
@@ -579,24 +604,11 @@ pub(super) fn capture(
         inherited.append(&mut original_user_inputs);
         original_user_inputs = inherited;
     }
-    // A goal the user set or edited with /goal is the user's own request for the work it
-    // continues; one the Agent set with CreateGoal is not.
-    if let Some(goal) = snapshot.goal.as_ref().filter(|goal| {
-        snapshot.delegation.is_none()
-            && goal.set_by == tickloop_agent_protocol::GoalAuthor::User
-            && !goal.status.is_finished()
-    }) {
-        original_user_inputs.push(OriginalUserInput {
-            chat_id: snapshot.id,
-            loop_id: operation.loop_id,
-            run_id: operation.run_id,
-            message_id: goal.id,
-            text: format!(
-                "The user set this Chat's goal with /goal, for the Agent to keep working toward: {}",
-                goal.objective
-            ),
-        });
-    }
+    original_user_inputs.extend(user_goal_input(
+        snapshot,
+        operation.loop_id,
+        operation.run_id,
+    ));
     if original_user_inputs.is_empty() {
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }

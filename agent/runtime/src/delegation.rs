@@ -1149,6 +1149,12 @@ impl Agent {
                             .get_or_insert_with(Vec::new)
                             .extend(inherited);
                     }
+                    // The user's /goal speaks for the user to the child too.
+                    if let Some(goal) =
+                        approval_context::user_goal_input(&snapshot, parent.loop_id, parent.run_id)
+                    {
+                        trusted_user_inputs.get_or_insert_with(Vec::new).push(goal);
+                    }
                     let history_ancestors = self.approval_history_ancestors(&snapshot, None).await;
                     let trusted_reply_history = trusted_user_inputs.as_ref().and_then(|inputs| {
                         serde_json::to_value(approval_context::capture_reply_history(

@@ -1536,3 +1536,47 @@ async fn a_goal_the_user_set_authorizes_its_work_in_auto_review_and_one_the_agen
     assert!(reviews.iter().all(|review| !review.contains(FROM_USER)));
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_child_inherits_the_users_goal_as_its_auto_review_authorization() {
+    const FROM_USER: &str = "The user set this Chat's goal with /goal";
+    const CHILD_COMMAND: &str = "touch child-export.txt";
+    let model = HoldingModel::new(
+        vec![
+            call("s1", "Subagent", json!({"task": "write the export"})),
+            call("b1", "Bash", json!({"command": CHILD_COMMAND})),
+            call(
+                "h1",
+                "SubagentHandback",
+                json!({"message": "Wrote the export."}),
+            ),
+            text("Reported."),
+            blocked("g1"),
+            text("Blocked."),
+        ],
+        Vec::new(),
+    );
+    let allow = tickloop_agent_test_support::auto_classification(false).to_string();
+    let checker = Arc::new(ScriptedModel::new(vec![text(&allow); 3]));
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), model.clone());
+    approve_everything(&agent);
+    agent.set_auto_reviewer(checker.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    let reviews = reviewed_user_inputs(&checker);
+    let child_command = reviews
+        .iter()
+        .find(|review| review.contains(CHILD_COMMAND))
+        .expect("the child's command was reviewed");
+    assert!(child_command.contains(FROM_USER) && child_command.contains(OBJECTIVE));
+    agent.shutdown().await;
+}
