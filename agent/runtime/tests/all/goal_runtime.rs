@@ -1067,55 +1067,39 @@ async fn two_processes(
 }
 
 #[tokio::test]
-#[ignore = "waits for the wake-up base's take-over hook (ticket 20)"]
-async fn a_goal_cleared_in_another_process_is_neither_continued_nor_written_back() {
-    let first_model = HoldingModel::new(vec![text("ready"), text("still here")], Vec::new());
+async fn another_process_cannot_change_a_goal_while_its_holder_runs() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
     let second_model = HoldingModel::new(Vec::new(), Vec::new());
-    let (_root, _folder, first, second, chat) =
-        two_processes(first_model.clone(), second_model).await;
-    second.manage_goal(chat, GoalAction::Clear).await.unwrap();
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
 
-    // The first process leaves Plan mode and ends another turn with the goal it last knew.
-    first
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    first.submit(chat, "anything else?".into()).await.unwrap();
-    wait_until_idle(&first, chat).await;
-    first.continue_loop(chat).await.unwrap();
-    tokio::time::sleep(SETTLE).await;
-
-    assert_eq!(
-        first_model.continuations(),
-        0,
-        "the cleared goal was continued"
-    );
-    assert_eq!(goal(&first, chat).await, None);
-    second
-        .manage_goal(chat, GoalAction::Resume)
+    let refused = second
+        .manage_goal(
+            chat,
+            GoalAction::Edit {
+                objective: "Ship the import command".into(),
+            },
+        )
         .await
         .unwrap_err();
-    assert_eq!(
-        goal(&second, chat).await,
-        None,
-        "the old goal was written back"
+    assert!(
+        refused
+            .to_string()
+            .contains("running in another Tickloop process"),
+        "{refused}"
     );
+    assert_eq!(goal(&first, chat).await.unwrap().objective, OBJECTIVE);
+    assert_eq!(goal(&second, chat).await.unwrap().objective, OBJECTIVE);
     first.shutdown().await;
     second.shutdown().await;
 }
 
 #[tokio::test]
-#[ignore = "waits for the wake-up base's take-over hook (ticket 20)"]
-async fn a_goal_edited_in_another_process_is_continued_with_the_new_objective() {
+async fn a_process_taking_over_from_a_holder_that_left_sees_its_latest_goal() {
     const EDITED: &str = "Ship the import command with tests";
-    let first_model = HoldingModel::new(
-        vec![text("ready"), blocked("b1"), text("Blocked.")],
-        Vec::new(),
-    );
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
     let second_model = HoldingModel::new(Vec::new(), Vec::new());
-    let (_root, _folder, first, second, chat) =
-        two_processes(first_model.clone(), second_model).await;
-    second
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    first
         .manage_goal(
             chat,
             GoalAction::Edit {
@@ -1124,28 +1108,48 @@ async fn a_goal_edited_in_another_process_is_continued_with_the_new_objective() 
         )
         .await
         .unwrap();
+    first.flush_transcripts().await;
+    first.shutdown().await;
 
-    first
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
+    // The second process loaded the goal before the edit; taking over, it goes on from it.
+    second.manage_goal(chat, GoalAction::Pause).await.unwrap();
+    let goal = goal(&second, chat).await.unwrap();
+    assert_eq!(goal.objective, EDITED);
+    assert_eq!(goal.objective_revision, 2);
+    assert_eq!(
+        goal.status,
+        GoalStatus::Paused {
+            by: GoalPause::User
+        }
+    );
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_goal_cleared_by_a_holder_that_left_is_gone_for_the_next() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    first.manage_goal(chat, GoalAction::Clear).await.unwrap();
+    first.flush_transcripts().await;
+    first.shutdown().await;
+
+    // Without the clear, the goal the second process loaded would refuse a new one.
+    second
+        .manage_goal(
+            chat,
+            GoalAction::Set {
+                objective: "Write the migration guide".into(),
+                token_budget: None,
+                replace: false,
+            },
+        )
         .await
         .unwrap();
-    first.submit(chat, "anything else?".into()).await.unwrap();
-    wait_until_idle(&first, chat).await;
-    // The load in the second process paused the goal; the first resumes it.
-    first.manage_goal(chat, GoalAction::Resume).await.unwrap();
-    wait_for_goal(&first, chat, |status| {
-        matches!(status, GoalStatus::Blocked { .. })
-    })
-    .await;
-
-    let continuation = first_model
-        .turn_requests()
-        .into_iter()
-        .find(|request| newest_user_text(request).contains(CONTINUATION))
-        .expect("the goal was continued");
-    assert!(newest_user_text(&continuation).contains(EDITED));
-    assert!(!newest_user_text(&continuation).contains(OBJECTIVE));
-    first.shutdown().await;
+    assert_eq!(
+        goal(&second, chat).await.unwrap().objective,
+        "Write the migration guide"
+    );
     second.shutdown().await;
 }
 

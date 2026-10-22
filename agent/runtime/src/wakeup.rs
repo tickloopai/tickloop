@@ -550,7 +550,6 @@ impl Agent {
             )
         };
         self.refresh_tick_watermarks(chat_id, delivered).await;
-        self.pause_goal_on_takeover(chat_id).await;
         if takes_waiting_input {
             self.inner
                 .tasks

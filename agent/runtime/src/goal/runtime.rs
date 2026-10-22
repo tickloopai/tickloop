@@ -135,6 +135,8 @@ pub(crate) enum GoalUpdateError {
     Goal(#[from] GoalError),
     #[error("the Chat is no longer loaded")]
     NotLoaded,
+    #[error("{0}")]
+    Elsewhere(String),
 }
 
 impl From<GoalUpdateError> for AgentError {
@@ -142,6 +144,7 @@ impl From<GoalUpdateError> for AgentError {
         match error {
             GoalUpdateError::Goal(error) => invalid(error),
             GoalUpdateError::NotLoaded => AgentError::NotFound,
+            GoalUpdateError::Elsewhere(error) => AgentError::Invalid(error),
         }
     }
 }
@@ -206,6 +209,36 @@ pub(crate) fn background_work_runs(chats: &HashMap<ChatId, Chat>, chat_id: ChatI
 }
 
 impl Agent {
+    /// A change of the goal by the user, the Agent's report or the host: made under the Chat's
+    /// lease within its Trigger boundary, so it applies to the goal the last holder left and no
+    /// other process changes it meanwhile. While another live process holds the Chat, the change
+    /// is refused with why.
+    pub(crate) async fn change_goal(
+        &self,
+        chat_id: ChatId,
+        events: Vec<GoalEvent>,
+    ) -> Result<(), GoalUpdateError> {
+        let within = self.enter_trigger_boundary(chat_id).await;
+        let release_after = self
+            .hold_lease_for_source_change(chat_id, &within)
+            .await
+            .map_err(GoalUpdateError::Elsewhere)?;
+        let changed = self.update_goal(chat_id, events, false).await;
+        if release_after {
+            self.inner.chat_leases.release(chat_id);
+        }
+        changed
+    }
+
+    /// Whether this process keeps the Chat's goal accounts: it holds the Chat's lease, or its
+    /// host has no other process to share the Chat with. The usage and time of a turn the user
+    /// ran in another process than the holder are not the goal's.
+    fn keeps_goal_accounts(&self, chat_id: ChatId) -> bool {
+        self.inner.recorder.is_none()
+            || self.inner.waits == crate::WaitHosting::Durable
+            || self.inner.chat_leases.holds(chat_id)
+    }
+
     /// Applies `events` to the Chat's goal, then carries out what they ask for. The goal first
     /// gets the running time since it was last settled, while a turn runs or as `turn_ends`.
     pub(crate) async fn update_goal(
@@ -394,7 +427,7 @@ impl Agent {
             // applies to it.
             chat.loaded_from_history = false;
         }
-        self.update_goal(chat_id, vec![event], false).await?;
+        self.change_goal(chat_id, vec![event]).await?;
         if starts_work {
             // Nothing ended a turn: the continuation is named by this command alone.
             self.continue_goal(chat_id, Uuid::new_v4()).await;
@@ -418,24 +451,8 @@ impl Agent {
             .await
             .get(&chat_id)
             .is_some_and(|chat| chat.snapshot.goal.is_some());
-        if has_goal && let Err(error) = self.update_goal(chat_id, vec![event], false).await {
+        if has_goal && let Err(error) = self.change_goal(chat_id, vec![event]).await {
             tracing::warn!(chat = %chat_id, %error, "could not pause the goal");
-        }
-    }
-
-    /// The history-load rule, when a process that loaded the Chat from its history takes its
-    /// Trigger lease over and so its execution: a goal still active, whose holder is gone, is
-    /// paused. Loading alone, while another process holds the Chat, changes nothing.
-    pub(crate) async fn pause_goal_on_takeover(&self, chat_id: ChatId) {
-        let loaded_from_history = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get_mut(&chat_id)
-            .is_some_and(|chat| std::mem::take(&mut chat.loaded_from_history));
-        if loaded_from_history {
-            self.pause_goal(chat_id, GoalEvent::HistoryLoaded).await;
         }
     }
 
@@ -460,6 +477,10 @@ impl Agent {
             }
             root
         };
+        if !self.keeps_goal_accounts(root) {
+            tracing::info!(chat = %root, tokens, "usage not charged: another process keeps the goal");
+            return;
+        }
         if let Err(error) = self
             .update_goal(root, vec![GoalEvent::TokensUsed(tokens)], false)
             .await
@@ -495,6 +516,10 @@ impl Agent {
 
     /// The goal's part in ending a turn: the time it ran, what it did, and its usage recorded.
     pub(crate) async fn end_goal_turn(&self, chat_id: ChatId, events: Vec<GoalEvent>) {
+        if !self.keeps_goal_accounts(chat_id) {
+            tracing::info!(chat = %chat_id, "turn not counted: another process keeps the goal");
+            return;
+        }
         if let Err(error) = self.update_goal(chat_id, events, true).await {
             tracing::warn!(chat = %chat_id, %error, "could not end the goal's turn");
         }
@@ -546,7 +571,10 @@ impl Agent {
                 },
                 input: prompts::continuation_prompt(&prompt_context(goal)),
                 ledger: None,
-                on_accept: None,
+                // The goal's usage so far is recorded with the acceptance, before its turn.
+                on_accept: Some(Box::new(|agent: &Agent, chat: &mut Chat, _: &Receipt| {
+                    agent.record_goal(chat, None, Vec::new());
+                })),
             }
         };
         if let Err(error) = Box::pin(self.deliver_trigger(chat_id, delivery)).await {
@@ -618,7 +646,7 @@ impl Agent {
                     replace: false,
                     set_by: GoalAuthor::Agent,
                 };
-                Ok(match self.update_goal(receipt.chat_id, vec![event], false).await {
+                Ok(match self.change_goal(receipt.chat_id, vec![event]).await {
                     Ok(()) => tool_result(
                         "Goal set. The host continues it after this turn until a completion check verifies it.".into(),
                         false,
@@ -629,7 +657,7 @@ impl Agent {
             UPDATE_GOAL_TOOL_NAME => match super::tools::parse_update_goal(&operation.input)? {
                 GoalReport::Blocked { reason } => {
                     let blocked = GoalEvent::ReportedBlocked { reason };
-                    Ok(match self.update_goal(receipt.chat_id, vec![blocked], false).await {
+                    Ok(match self.change_goal(receipt.chat_id, vec![blocked]).await {
                             Ok(()) => tool_result(
                                 "The goal is blocked. Stop working on it and tell the user what would unblock it; the user resumes it with /goal resume.".into(),
                                 false,
@@ -743,7 +771,7 @@ impl Agent {
                 error: format!("the goal completion check failed: {error}"),
             },
         };
-        if let Err(error) = self.update_goal(receipt.chat_id, vec![event], false).await {
+        if let Err(error) = self.change_goal(receipt.chat_id, vec![event]).await {
             return Ok(tool_result(error.to_string(), true));
         }
         let chats = self.inner.chats.lock().await;
@@ -780,6 +808,62 @@ impl Agent {
                 true,
             ),
         })
+    }
+}
+
+/// The goal as a Trigger source's own state: a process that takes the Chat's lease over
+/// rebuilds it from the Transcript, so it goes on from what the last holder recorded.
+pub(crate) struct GoalSourceState;
+
+impl crate::wakeup::TriggerSourceState for GoalSourceState {
+    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+        if chat.snapshot.delegation.is_some() {
+            return;
+        }
+        let mut goal = tickloop_agent_transcript::display::goal(stored);
+        // What this process counted for the same goal and has not recorded yet still counts.
+        if let (Some(goal), Some(held)) = (goal.as_mut(), chat.snapshot.goal.as_ref())
+            && goal.id == held.id
+        {
+            goal.tokens_used = goal.tokens_used.max(held.tokens_used);
+            goal.time_used_ms = goal.time_used_ms.max(held.time_used_ms);
+        }
+        let changed = goal != chat.snapshot.goal;
+        chat.goal_recorded_tokens = goal.as_ref().map_or(0, |goal| goal.tokens_used);
+        chat.snapshot.goal = goal;
+        agent.withdraw_ended_inputs(chat);
+        // The history-load rule: the holder that left an active goal is gone, and this process
+        // took the Chat over from its history.
+        if std::mem::take(&mut chat.loaded_from_history)
+            && chat
+                .snapshot
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == GoalStatus::Active)
+        {
+            match apply_events(
+                chat.snapshot.goal.as_ref(),
+                vec![GoalEvent::HistoryLoaded],
+                unix_time_milliseconds(),
+            ) {
+                Ok((goal, effects)) => agent.adopt_goal(chat, goal, effects, false),
+                Err(error) => {
+                    tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal")
+                }
+            }
+        } else if changed {
+            let receipt = Receipt {
+                chat_id: chat.snapshot.id,
+                loop_id: chat.snapshot.chat_loop.id,
+                run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
+            };
+            let goal = chat.snapshot.goal.clone();
+            agent.publish_event(
+                chat,
+                &receipt,
+                EventKind::GoalUpdated { goal, notice: None },
+            );
+        }
     }
 }
 

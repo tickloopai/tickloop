@@ -59,6 +59,8 @@ const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
 const RECEIVING_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
+/// Why a change of a source's own state, such as a `/goal` command, is refused here.
+pub(super) const SOURCE_CHANGE_ELSEWHERE: &str = "this Chat is running in another Tickloop process; change its goal there, or once that process leaves it";
 const HELD_ELSEWHERE_MESSAGE: &str =
     "another Tickloop process holds this Chat's Trigger; the event was not delivered";
 
@@ -367,6 +369,11 @@ impl ChatLeases {
 
     pub(super) fn clear_notice(&self, chat_id: ChatId) {
         self.notices.lock().unwrap().remove(&chat_id);
+    }
+
+    /// Whether this process holds the Chat's lease now, taken over or not.
+    pub(super) fn holds(&self, chat_id: ChatId) -> bool {
+        self.held.lock().unwrap().contains_key(&chat_id)
     }
 
     pub(super) fn release(&self, chat_id: ChatId) {
@@ -726,6 +733,74 @@ impl Agent {
                 TriggerPermit::Fire(LeaseHolding(Some(epoch)))
             }
         }
+    }
+
+    /// Holds the Chat's lease to change a source's own state, such as the Chat's goal, within
+    /// the Chat's Trigger boundary and whether or not the Loop receives: a newly held lease takes
+    /// the Chat's Trigger state over from the store first, so the change applies to what the
+    /// last holder left. While a live process holds the lease, the change is refused with why.
+    /// Returns whether the lease goes back once the change is made, as a Loop that does not
+    /// receive holds none.
+    pub(super) async fn hold_lease_for_source_change(
+        &self,
+        chat_id: ChatId,
+        _within: &TriggerBoundary,
+    ) -> Result<bool, String> {
+        if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
+            return Ok(false);
+        }
+        let directory = self
+            .lease_directory(chat_id)
+            .await
+            .ok_or("the Chat is no longer loaded")?;
+        let leases = &self.inner.chat_leases;
+        // A pause recorded elsewhere is taken on first; the lease is then taken again.
+        for _ in 0..2 {
+            match leases
+                .check(&directory, chat_id)
+                .map_err(|error| format!("could not take this Chat's Trigger lease: {error}"))?
+            {
+                LeaseCheck::HeldElsewhere => return Err(SOURCE_CHANGE_ELSEWHERE.into()),
+                LeaseCheck::ForeignHost(host) => {
+                    return Err(format!(
+                        "this Chat's Trigger lock was written on host {host}, which may still                          run it; the change was not made"
+                    ));
+                }
+                LeaseCheck::Closing => return Err("this Agent is shutting down".into()),
+                LeaseCheck::PausedElsewhere(generation) => {
+                    leases.remember_generation(chat_id, generation);
+                    self.pause_receiving_paused_elsewhere(chat_id).await;
+                }
+                LeaseCheck::Held { epoch, synced } => {
+                    if !synced {
+                        self.reload_trigger_state(chat_id).await.map_err(|error| {
+                            format!(
+                                "could not take over this Chat's state from its Transcript:                                  {error}; the change was not made"
+                            )
+                        })?;
+                        leases.mark_synced(chat_id, epoch);
+                    }
+                    let receiving = self
+                        .inner
+                        .chats
+                        .lock()
+                        .await
+                        .get(&chat_id)
+                        .map(|chat| chat.snapshot.chat_loop.receiving);
+                    return Ok(match receiving {
+                        Some(Receiving::Receiving)
+                        | Some(Receiving::Paused {
+                            reason: PauseReason::TranscriptUnavailable,
+                        }) => false,
+                        Some(Receiving::Paused {
+                            reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
+                        })
+                        | None => true,
+                    });
+                }
+            }
+        }
+        Err("receiving keeps pausing in another Tickloop process; the change was not made".into())
     }
 
     /// A permit for the Chat's waiting Trigger input failed: it is tried again after a delay

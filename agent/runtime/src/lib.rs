@@ -1992,6 +1992,7 @@ impl Agent {
             }),
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
+        agent.register_trigger_source_state(Arc::new(goal::GoalSourceState));
         agent
     }
 

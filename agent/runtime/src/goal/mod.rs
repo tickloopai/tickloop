@@ -5,6 +5,8 @@ pub(crate) mod check;
 pub(crate) mod prompts;
 mod runtime;
 
-pub(crate) use runtime::{GoalTurnEnd, background_work_runs, charged_tokens, current_continuation};
+pub(crate) use runtime::{
+    GoalSourceState, GoalTurnEnd, background_work_runs, charged_tokens, current_continuation,
+};
 pub(crate) mod state;
 pub(crate) mod tools;
