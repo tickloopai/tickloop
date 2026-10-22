@@ -11,7 +11,7 @@ use tickloop_agent_test_support::config;
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 
-use super::wakeup_support::{ContractModel, SETTLE, complete_turn, hold_a_turn};
+use super::wakeup_support::{ContractModel, SETTLE, WAIT, complete_turn, hold_a_turn};
 
 fn at(hour: u32, minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 23, hour, minute, 0).unwrap()
@@ -58,10 +58,11 @@ async fn tasks(agent: &Agent, chat: ChatId) -> Vec<ScheduledTask> {
     agent.snapshot(chat).await.unwrap().scheduled_tasks
 }
 
-/// The store fails while a wake-up hands a run over: the wake-up reports it and the task keeps
-/// its time; the next wake-up stores the same run, which runs once.
+/// The store fails while a wake-up hands a run over: the run is accepted and the task moves on
+/// with it, and the run's turn waits for its records; once the store takes them the wake-up
+/// returns the run, which runs once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_storage_failure_keeps_the_task_due_and_the_retry_runs_it_once() {
+async fn a_storage_failure_holds_the_run_until_it_and_its_task_are_stored() {
     let faults = Arc::new(FaultyTranscriptStore::new(Arc::new(
         InMemoryTranscriptStore::new(),
     )));
@@ -69,30 +70,37 @@ async fn a_storage_failure_keeps_the_task_due_and_the_retry_runs_it_once() {
     let agent = stateless_host(faults.clone(), model.clone());
     let (chat, task) = chat_with_a_task(&agent).await;
     let due_at = task.next_fire_at_ms.unwrap();
-    // The run waits behind a held turn, so only the ledger stands between it and a second run.
-    hold_a_turn(&agent, chat, &model).await;
 
     faults.fail_appends();
-    assert!(agent.wake_scheduled_tasks(chat, due_at).await.is_err());
-    assert_eq!(tasks(&agent, chat).await, std::slice::from_ref(&task));
+    let waking = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.wake_scheduled_tasks(chat, due_at).await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while tasks(&agent, chat).await == std::slice::from_ref(&task) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the task moves on as its run is accepted");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("check the build"), 0, "{:?}", model.prompts());
 
     faults.heal();
-    let handed = agent.wake_scheduled_tasks(chat, due_at).await.unwrap();
+    let handed = waking.await.unwrap().unwrap();
     assert_eq!(handed.len(), 1);
-    assert_ne!(tasks(&agent, chat).await, [task]);
-    model.release_held_turn();
     model.wait_seen("check the build", 1).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("check the build"), 1, "{:?}", model.prompts());
     agent.shutdown().await;
 }
 
-/// The host goes down after a wake-up stored the ledger of its runs and before it stored the
-/// task's next time: the next host loads the run waiting and the task due, and waking it for
-/// the same time is answered by the ledger. Both where the run queued behind a busy turn and
+/// The host goes down right after a wake-up handed its run over: the next host loads the run
+/// waiting and the task already moved on with it, so waking it for the same time hands nothing
+/// over again and the run runs once. Both where the run queued behind a busy turn and
 /// where it merged into a run waiting already.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_crash_between_the_ledger_and_the_next_time_runs_nothing_twice() {
+async fn a_crash_after_a_wake_up_finds_the_task_moved_on_with_its_run() {
     for merges in [false, true] {
         let store = Arc::new(InMemoryTranscriptStore::new());
         let model = ContractModel::new();
@@ -104,9 +112,9 @@ async fn a_crash_between_the_ledger_and_the_next_time_runs_nothing_twice() {
             agent.wake_scheduled_tasks(chat, due_at).await.unwrap();
             due_at = tasks(&agent, chat).await[0].next_fire_at_ms.unwrap();
         }
-        agent.stop_scheduled_wakeups_before_recording_for_tests();
         let handed = agent.wake_scheduled_tasks(chat, due_at).await.unwrap();
         assert_eq!(handed.len(), 1);
+        let moved_on = tasks(&agent, chat).await;
         // The host is gone: the next one loads what the store holds now.
         let image = Arc::new(InMemoryTranscriptStore::new());
         image.seed(chat, store.lines(chat), store.position(chat).unwrap());
@@ -117,18 +125,9 @@ async fn a_crash_between_the_ledger_and_the_next_time_runs_nothing_twice() {
         next_model.release_held_turn();
         let next = stateless_host(image, next_model.clone());
         next.resume_chat(chat).await.unwrap();
+        assert_eq!(tasks(&next, chat).await, moved_on, "merges: {merges}");
         let again = next.wake_scheduled_tasks(chat, due_at).await.unwrap();
-        assert_eq!(
-            again
-                .iter()
-                .map(|receipt| receipt.run_id)
-                .collect::<Vec<_>>(),
-            handed
-                .iter()
-                .map(|receipt| receipt.run_id)
-                .collect::<Vec<_>>(),
-            "merges: {merges}"
-        );
+        assert!(again.is_empty(), "merges: {merges}: {again:?}");
         next_model.wait_seen("check the build", 1).await;
         tokio::time::sleep(SETTLE).await;
         assert_eq!(

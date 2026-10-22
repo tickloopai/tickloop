@@ -39,10 +39,6 @@ pub(crate) struct ScheduleClock {
     zone: Zone,
     #[cfg(any(test, feature = "test-support"))]
     fixed_now: std::sync::Mutex<Option<DateTime<Utc>>>,
-    /// Stops a wake-up after the ledger of its runs is stored and before the tasks' next times
-    /// are, as a host that goes down there.
-    #[cfg(any(test, feature = "test-support"))]
-    stop_before_recording: std::sync::atomic::AtomicBool,
 }
 
 impl ScheduleClock {
@@ -51,8 +47,6 @@ impl ScheduleClock {
             zone,
             #[cfg(any(test, feature = "test-support"))]
             fixed_now: std::sync::Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            stop_before_recording: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -191,8 +185,6 @@ fn started_by_scheduled_run(chat: &Chat, run: tickloop_agent_protocol::RunId) ->
 struct DueRun {
     before: ScheduledTask,
     fired: FiredTask,
-    /// A run of the task already waits, so this one merges into it.
-    merges: bool,
 }
 
 /// The scheduled task that started the run `run`: the latest run of the self-paced task is
@@ -302,17 +294,6 @@ impl Agent {
                 skipped: 0,
             });
         }
-    }
-
-    /// Stops each later wake-up after the ledger of its runs is stored and before the tasks'
-    /// next times are, as a host that goes down there.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn stop_scheduled_wakeups_before_recording_for_tests(&self) {
-        self.inner
-            .schedule_clock
-            .stop_before_recording
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Records the Chat's scheduled tasks after a change, announces it, and has the timer look
@@ -691,8 +672,8 @@ impl Agent {
     }
 
     /// Hands the Loop each task due by `now`, at most once each, while it receives. A task moves
-    /// on to its next time only once the base took its run: a run the base refuses leaves the
-    /// task as it was, due again.
+    /// on to its next time as the base accepts its run, before the run's turn can start: a run
+    /// the base refuses leaves the task as it was, due again.
     pub(crate) async fn run_due_scheduled_tasks(
         &self,
         chat_id: ChatId,
@@ -726,104 +707,79 @@ impl Agent {
                         .iter()
                         .find(|task| task.id == fired.task.id)?
                         .clone();
-                    // A run of the task already waits: this one merges into it, so its time is
-                    // passed over like one the Loop was too busy for.
-                    let merges = chat.snapshot.pending_inputs.iter().any(|pending| {
-                        matches!(
-                            &pending.trigger_source,
-                            Some(TriggerSource::ScheduledTask { task_id, .. }) if *task_id == before.id
-                        )
-                    });
-                    let mut input =
-                        run_input(chat, &fired.task, self.inner.config_root.as_deref());
-                    if fired.is_last && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
+                    let mut input = run_input(chat, &fired.task, self.inner.config_root.as_deref());
+                    if fired.is_last
+                        && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
                     {
                         input.push_str(&format!("\n\n{FINAL_RUN_NOTE}"));
                     }
-                    let delivery = TriggerDelivery {
-                        source: TriggerSource::ScheduledTask {
-                            task_id: before.id.clone(),
-                            scheduled_for_ms: fired.scheduled_for_ms,
-                        },
+                    let source = TriggerSource::ScheduledTask {
+                        task_id: before.id.clone(),
+                        scheduled_for_ms: fired.scheduled_for_ms,
+                    };
+                    let run = DueRun { before, fired };
+                    Some(TriggerDelivery {
+                        source,
                         input,
                         ledger: None,
-                        on_accept: None,
-                    };
-                    Some((
-                        DueRun {
-                            before,
-                            fired,
-                            merges,
-                        },
-                        delivery,
-                    ))
+                        on_accept: Some(Box::new(move |agent, chat, receipt| {
+                            agent.commit_scheduled_run(chat, &run, receipt);
+                        })),
+                    })
                 })
                 .collect::<Vec<_>>()
         };
-        let mut taken = Vec::new();
+        let mut receipts = Vec::new();
         let mut refusal = None;
-        for (run, delivery) in runs {
+        for delivery in runs {
             match self.deliver_trigger(chat_id, delivery).await {
-                Ok(receipt) => taken.push((run, receipt)),
+                Ok(receipt) => receipts.push(receipt),
                 Err(error) => {
                     tracing::debug!(%chat_id, %error, "a scheduled run was not taken");
                     refusal.get_or_insert(error);
                 }
             }
         }
-        if !taken.is_empty() {
-            let mut chats = self.inner.chats.lock().await;
-            if let Some(chat) = chats.get_mut(&chat_id) {
-                // The runs' ledger is stored before the tasks' next times: a host that goes down
-                // in between finds the same runs due again, and their records answer them.
-                self.checkpoint_ledger(&chat.snapshot, &chat.bookkeeping)
-                    .await
-                    .map_err(AgentError::Storage)?;
-                #[cfg(any(test, feature = "test-support"))]
-                if self
-                    .inner
-                    .schedule_clock
-                    .stop_before_recording
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Ok(taken.into_iter().map(|(_, receipt)| receipt).collect());
-                }
-                self.commit_taken_runs(chat, &taken);
-            }
-        }
         match refusal {
             Some(error) => Err(error),
-            None => Ok(taken.into_iter().map(|(_, receipt)| receipt).collect()),
+            None => Ok(receipts),
         }
     }
 
-    /// Moves each task whose run the base took on to its next time, unless the task changed
-    /// meanwhile, such as by a reschedule or a deletion that withdrew the run.
-    fn commit_taken_runs(&self, chat: &mut Chat, taken: &[(DueRun, Receipt)]) {
-        let mut notices = Vec::new();
-        for (run, _) in taken {
-            let Some(index) = chat
-                .snapshot
-                .scheduled_tasks
-                .iter()
-                .position(|task| *task == run.before)
-            else {
-                continue;
-            };
-            if run.fired.is_last {
-                chat.snapshot.scheduled_tasks.remove(index);
-            } else {
-                let mut after = run.fired.task.clone();
-                after.skipped += u64::from(run.merges);
-                chat.snapshot.scheduled_tasks[index] = after;
-            }
-            notices.push(ScheduledTaskNotice::Fired {
-                task_id: run.before.id.clone(),
+    /// The base accepted a task's run under `receipt`: the task moves on to its next time, or
+    /// ends with its last run, unless it changed since the run was prepared, such as by a
+    /// reschedule. A run merged into one of the task's that already waits is passed over like
+    /// one the Loop was too busy for.
+    fn commit_scheduled_run(&self, chat: &mut Chat, run: &DueRun, receipt: &Receipt) {
+        let Some(index) = chat
+            .snapshot
+            .scheduled_tasks
+            .iter()
+            .position(|task| *task == run.before)
+        else {
+            return;
+        };
+        if run.fired.is_last {
+            chat.snapshot.scheduled_tasks.remove(index);
+        } else {
+            let queued_itself = chat.snapshot.pending_inputs.iter().any(|pending| {
+                pending.receipt.run_id == receipt.run_id
+                    && matches!(
+                        &pending.trigger_source,
+                        Some(TriggerSource::ScheduledTask { scheduled_for_ms, .. })
+                            if *scheduled_for_ms == run.fired.scheduled_for_ms
+                    )
             });
+            let mut after = run.fired.task.clone();
+            after.skipped += u64::from(!queued_itself);
+            chat.snapshot.scheduled_tasks[index] = after;
         }
-        if !notices.is_empty() {
-            self.persist_scheduled_tasks(chat, notices);
-        }
+        self.persist_scheduled_tasks(
+            chat,
+            vec![ScheduledTaskNotice::Fired {
+                task_id: run.before.id.clone(),
+            }],
+        );
     }
 
     /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it

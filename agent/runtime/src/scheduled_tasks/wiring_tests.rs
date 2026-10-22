@@ -38,6 +38,10 @@ fn ms(time: DateTime<Utc>) -> u64 {
 struct HoldingModel {
     scripted: ScriptedModel,
     release: Notify,
+    /// The state root and Chat whose stored scheduled tasks each turn reads as the model is
+    /// called for it.
+    watched: std::sync::OnceLock<(std::path::PathBuf, ChatId)>,
+    stored_tasks_seen: std::sync::Mutex<Vec<Vec<ScheduledTask>>>,
 }
 
 impl HoldingModel {
@@ -45,7 +49,13 @@ impl HoldingModel {
         Arc::new(Self {
             scripted: ScriptedModel::new(replies),
             release: Notify::new(),
+            watched: std::sync::OnceLock::new(),
+            stored_tasks_seen: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    fn watch_stored_tasks(&self, root: &std::path::Path, chat: ChatId) {
+        let _ = self.watched.set((root.to_owned(), chat));
     }
 
     fn prompts(&self) -> Vec<String> {
@@ -110,6 +120,22 @@ impl ModelClient for HoldingModel {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
+        if !request.tools.is_empty()
+            && let Some((root, chat)) = self.watched.get()
+        {
+            let stored =
+                std::fs::read_to_string(tickloop_agent_test_support::transcript_file(root, *chat))
+                    .unwrap();
+            let tasks = stored
+                .lines()
+                .filter_map(|line| match serde_json::from_str(line) {
+                    Ok(Line::ScheduledTasks(entry)) => Some(entry.tasks),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap_or_default();
+            self.stored_tasks_seen.lock().unwrap().push(tasks);
+        }
         let holds = !request.tools.is_empty()
             && request
                 .messages
@@ -281,6 +307,42 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
         EventKind::ScheduledTasksChanged { notice: None }
     ));
     assert!(agent.delete_scheduled_task(chat, &task.id).await.is_err());
+}
+
+/// The turn a scheduled run starts finds its task already moved on: the task's next time is
+/// stored as the base accepts the run, before the model is called for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runs_turn_starts_with_its_task_already_moved_on() {
+    let model = HoldingModel::new(vec![
+        create("create", "*/10 * * * *", "check the build"),
+        text("Scheduled."),
+        text("Checked."),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    turn(&agent, chat, "schedule it").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    agent.flush_transcripts().await;
+    model.watch_stored_tasks(&root, chat);
+
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 15, 0))
+        .await
+        .unwrap();
+    wait_seen(&model, "check the build", 1).await;
+    let seen = model.stored_tasks_seen.lock().unwrap().clone();
+    let at_the_model = &seen[0];
+    assert_eq!(at_the_model.len(), 1, "{seen:?}");
+    assert_ne!(at_the_model[0], task);
+    assert_eq!(
+        at_the_model[0].last_scheduled_for_ms,
+        Some(ms(at(10, 10, 0)))
+    );
+    assert_eq!(at_the_model[0].scheduled_for_ms, Some(ms(at(10, 20, 0))));
+    agent.shutdown().await;
 }
 
 #[tokio::test]
