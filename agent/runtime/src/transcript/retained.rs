@@ -94,6 +94,8 @@ pub(crate) struct RetainedFold {
     /// The latest record of each answer, input and wait.
     by_id: HashMap<(MetadataKind, Uuid), Kept>,
     content_replacements: Vec<Kept>,
+    /// Every goal event, which the conversation shows as its goal lines.
+    goal_events: Vec<Kept>,
     /// The latest file history snapshot of each message.
     file_history: HashMap<Uuid, Kept>,
     unknown: HashMap<String, VecDeque<Kept>>,
@@ -158,6 +160,9 @@ impl RetainedFold {
             }
             (Retention::Accumulating, Line::ContentReplacement(_)) => {
                 self.content_replacements.push(kept);
+            }
+            (Retention::Accumulating, Line::GoalEvent(_)) => {
+                self.goal_events.push(kept);
             }
             (Retention::Accumulating, Line::FileHistorySnapshot(entry)) => {
                 self.file_history.insert(entry.message_id, kept);
@@ -240,6 +245,7 @@ impl RetainedFold {
             .chain(self.content_replacements.iter().filter(|kept| {
                 matches!(&kept.line, Line::ContentReplacement(entry) if entry.replacements.iter().any(|replacement| self.chain.keeps_tool_result(replacement.tool_use_id())))
             }))
+            .chain(&self.goal_events)
             .chain(
                 self.file_history
                     .iter()
