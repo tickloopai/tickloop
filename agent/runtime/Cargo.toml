@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 fastrand = "2"
 futures-util = "0.3"
 http = "1"
@@ -29,6 +30,7 @@ thiserror = "2"
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-config = { path = "../config" }
+tickloop-agent-cron = { path = "../cron" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
@@ -45,6 +47,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 base64 = "0.22"
+chrono-tz = "0.10"
 percent-encoding = "2"
 serde_yaml_ng = "0.10"
 tempfile = "3"

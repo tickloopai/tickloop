@@ -35,6 +35,7 @@ mod plan;
 pub mod projection;
 mod provider_connection;
 mod provider_failure;
+mod scheduled_tasks;
 mod shell_tasks;
 mod skill;
 mod tick_subscriptions;
@@ -163,6 +164,10 @@ pub use plan::{Plan, Progress, TodoItem, TodoStatus};
 pub use projection::{HistoryCall, InvalidConversation};
 pub use provider_connection::{ConnectionRegion, ModelDiscovery, ProductKind, ProviderConnection};
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
+pub use scheduled_tasks::{
+    MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
+    ScheduledTaskDecision, ScheduledTaskKind,
+};
 pub use shell_tasks::{
     FINISHED_SHELL_DISPLAY_MS, SHELL_TASK_OUTPUT_MAX_BYTES, SHELL_TASK_PROMPT_QUIET_PERIOD,
     ShellTask, ShellTaskAction, ShellTaskCapabilities, ShellTaskCenterError, ShellTaskDelta,
