@@ -1469,6 +1469,100 @@ async fn a_source_change_made_with_an_acceptance_lands_before_its_turn() {
     agent.shutdown().await;
 }
 
+/// A delivery's acceptance and its source's change reach the store whole: a write already in
+/// the store as the source makes its change goes on to whatever is queued, and stores neither
+/// the acceptance without the change, which a crash then would leave behind, nor the reverse.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acceptance_is_never_stored_without_its_source_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let store = Arc::new(FaultyTranscriptStore::new(Arc::new(
+        tickloop_agent_runtime::transcript::JsonlTranscriptStore::open(root.clone()).unwrap(),
+    )));
+    let model = ContractModel::new();
+    let agent = process_on(&root, store.clone(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    // The lease is taken first, so the delivery under test reads nothing from the store.
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("lease", 1), "takes-the-lease")
+        .await
+        .unwrap();
+    agent.flush_transcripts().await;
+    agent.submit(chat, "queued behind".into()).await.unwrap();
+    store.hold_appends();
+    let in_flight = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.flush_transcripts().await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while store.waiting_appends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a write waits in the store");
+
+    let (entered, entered_here) = std::sync::mpsc::channel();
+    let (go_on, going_on) = std::sync::mpsc::channel::<()>();
+    let source = scheduled("task", 1);
+    let delivered = tokio::spawn({
+        let agent = agent.clone();
+        let source = source.clone();
+        async move {
+            agent
+                .deliver_trigger_with_commit_for_tests(chat, source, "accepted-whole", {
+                    move |snapshot, _| {
+                        entered.send(()).unwrap();
+                        let _ = going_on.recv();
+                        vec![source_record(snapshot.id, "advanced with the acceptance")]
+                    }
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(WAIT, async {
+        while entered_here.try_recv().is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the source makes its change");
+    store.release_appends();
+    tokio::time::timeout(WAIT, async {
+        while store.waiting_appends() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the write goes on");
+    tokio::time::sleep(SETTLE).await;
+    let accepted = tickloop_agent_transcript::input_ids::trigger(chat, &source.identity());
+    let acceptance_stored = |lines: &[tickloop_agent_transcript::Line]| {
+        lines.iter().any(|line| {
+            matches!(line, tickloop_agent_transcript::Line::Input(entry)
+                if entry.input_id == accepted)
+        })
+    };
+    let crash_image = stored_lines(&root, chat);
+    assert_eq!(
+        acceptance_stored(&crash_image),
+        records_of(&crash_image, "advanced with the acceptance") == 1,
+        "the acceptance and the source's change are stored together or not at all"
+    );
+
+    go_on.send(()).unwrap();
+    delivered.await.unwrap().unwrap();
+    in_flight.await.unwrap();
+    agent.flush_transcripts().await;
+    let stored = stored_lines(&root, chat);
+    assert!(acceptance_stored(&stored));
+    assert_eq!(records_of(&stored, "advanced with the acceptance"), 1);
+    model.release_held_turn();
+    agent.shutdown().await;
+}
+
 /// A custom title Line, the record the example sources of these tests keep their state in.
 fn source_record(chat: Uuid, record: &str) -> tickloop_agent_transcript::Line {
     tickloop_agent_transcript::Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {

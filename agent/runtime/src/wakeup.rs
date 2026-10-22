@@ -32,10 +32,11 @@ pub(super) struct TriggerDelivery {
 /// A source's own change for a delivery, such as a scheduled task's next time or the run it
 /// started: called once as the delivery is accepted, queued or merged, with the receipt it is
 /// accepted under; not for a replay, a hold or a refusal, which leave the delivery with its
-/// source. It is called within the Chat's boundary and under the Chats lock, after the
-/// acceptance's ledger record is queued for the Transcript, so what it changes in the Chat or
-/// records with `record_chat_metadata` lands after that record, in the checkpoint that follows
-/// the acceptance, and no later than the start record the delivery's turn waits for.
+/// source. It is called within the Chat's boundary and under the Chats lock, and the
+/// acceptance's ledger record, what it changes in the Chat and what it records through the
+/// [`SourceChange`] are queued for the Transcript as one group after it: the store takes them
+/// whole, in the checkpoint that follows the acceptance and no later than the start record the
+/// delivery's turn waits for.
 pub(super) type SourceCommit = Box<dyn FnOnce(&SourceChange, &mut Chat, &Receipt) + Send>;
 
 /// A Trigger source's own state kept in the Chat's Transcript beside the ledger, such as a Goal
@@ -60,13 +61,27 @@ pub(super) trait TriggerSourceState: Send + Sync {
 }
 
 /// Proof that its holder is within the Chat's boundary under its lease, which a source's change
-/// of its own state takes; only the base makes one.
+/// of its own state takes; only the base makes one. What the source records through it is
+/// queued for the Transcript as one group with the change of the Chat it is made with.
 pub(super) struct SourceChange<'a> {
     agent: &'a Agent,
-    chat_id: ChatId,
+    records: std::sync::Mutex<SourceRecords>,
 }
 
-impl SourceChange<'_> {
+#[derive(Default)]
+struct SourceRecords {
+    metadata: Vec<Line>,
+    source_states: Vec<Line>,
+}
+
+impl<'a> SourceChange<'a> {
+    fn new(agent: &'a Agent) -> Self {
+        Self {
+            agent,
+            records: Default::default(),
+        }
+    }
+
     // The Goal and the scheduled tasks use it as they are wired to the base.
     #[allow(dead_code)]
     pub(super) fn agent(&self) -> &Agent {
@@ -76,7 +91,22 @@ impl SourceChange<'_> {
     /// Records a Line of the source's state: never cached to be written again as metadata, nor
     /// folded into a retained snapshot.
     pub(super) fn record_source_state(&self, line: Line) {
-        self.agent.queue_source_state(self.chat_id, line);
+        self.records.lock().unwrap().source_states.push(line);
+    }
+
+    /// Records a Line of the Chat's metadata, kept to be written again as the Chat's metadata
+    /// is.
+    // The scheduled tasks record their revocations through it as they are wired to the base.
+    #[allow(dead_code)]
+    pub(super) fn record_chat_metadata(&self, line: Line) {
+        self.records.lock().unwrap().metadata.push(line);
+    }
+
+    /// Queues the Chat's change and what the source recorded with it, as one group.
+    fn queue_with(self, chat: &Chat) {
+        let records = self.records.into_inner().unwrap();
+        self.agent
+            .queue_with_source_states(chat, records.metadata, records.source_states);
     }
 }
 
@@ -656,20 +686,17 @@ impl Agent {
         }
     }
 
-    /// Applies a source's change for a delivery just accepted, after the acceptance is queued
-    /// for the Transcript.
+    /// Applies a source's change for a delivery just accepted, queuing it for the Transcript in
+    /// one group with the acceptance.
     pub(super) fn commit_trigger_source(
         &self,
         chat: &mut Chat,
         commit: SourceCommit,
         receipt: &Receipt,
     ) {
-        self.queue_for_transcript(chat);
-        let change = SourceChange {
-            agent: self,
-            chat_id: chat.snapshot.id,
-        };
+        let change = SourceChange::new(self);
         commit(&change, chat, receipt);
+        change.queue_with(chat);
     }
 
     /// Runs `change` of a source's own state within the Chat's boundary, on a task of the
@@ -718,11 +745,9 @@ impl Agent {
             let chat = chats
                 .get_mut(&chat_id)
                 .ok_or(SourceChangeError::NotLoaded)?;
-            let source_change = SourceChange {
-                agent: self,
-                chat_id,
-            };
+            let source_change = SourceChange::new(self);
             let result = change(&source_change, chat);
+            source_change.queue_with(chat);
             self.save(&chat.snapshot);
             result
         };
@@ -758,13 +783,11 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
-        let change = SourceChange {
-            agent: self,
-            chat_id,
-        };
+        let change = SourceChange::new(self);
         for state in &states {
             state.on_stop(&change, chat);
         }
+        change.queue_with(chat);
         self.save(&chat.snapshot);
         if let Err(error) = self
             .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
