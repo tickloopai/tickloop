@@ -41,6 +41,9 @@ pub(super) enum Hold {
     PlanMode,
     /// The artifact link's account signed out or lost access.
     LinkUnavailable,
+    /// The delivery carries an update the Chat already took, as another process holding its
+    /// lease delivered it; the source sorts it out and delivers the rest.
+    Delivered,
 }
 
 impl Hold {
@@ -53,6 +56,7 @@ impl Hold {
             Self::PlanReview => "this Chat's Loop waits for its plan to be reviewed",
             Self::PlanMode => "Plan mode holds it back",
             Self::LinkUnavailable => "the artifact link's account is unavailable",
+            Self::Delivered => "this Chat already took an update the delivery carries",
         }
     }
 }
@@ -245,6 +249,18 @@ impl Agent {
             Eligibility::Eligible => {}
             Eligibility::Hold(hold) => return Admission::Hold(hold),
             Eligibility::Ended(reason) => return Admission::Refuse(reason),
+        }
+        let carries_delivered = match source {
+            TriggerSource::TickUpdate { items } => {
+                self.tick_deliveries().holds_delivered_items(items)
+            }
+            TriggerSource::TickManual { .. }
+            | TriggerSource::ArtifactFeedback { .. }
+            | TriggerSource::GoalContinuation { .. }
+            | TriggerSource::ScheduledTask { .. } => false,
+        };
+        if carries_delivered {
+            return Admission::Hold(Hold::Delivered);
         }
         let waiting = chat.snapshot.pending_inputs.iter().find(|pending| {
             pending

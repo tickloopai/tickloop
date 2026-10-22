@@ -416,3 +416,21 @@ pub(crate) fn stored_trigger_deliveries(
             .collect();
     tickloop_agent_transcript::display::trigger_deliveries(&lines)
 }
+
+/// The receipts' runs of the Tick deliveries among `deliveries` that carry update `sequence`.
+pub(crate) fn runs_delivering_tick_update(
+    deliveries: &[tickloop_agent_transcript::display::DisplayTriggerDelivery],
+    sequence: u64,
+) -> Vec<Uuid> {
+    deliveries
+        .iter()
+        .filter(|delivery| {
+            matches!(
+                &delivery.identity,
+                tickloop_agent_protocol::TriggerIdentity::TickUpdate { updates }
+                    if updates.iter().any(|update| update.sequence == sequence)
+            )
+        })
+        .map(|delivery| delivery.run_id)
+        .collect()
+}

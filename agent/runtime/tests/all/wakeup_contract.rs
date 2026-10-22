@@ -512,6 +512,8 @@ struct TickSource {
     process: ProcessChat,
     shell: ShellTick,
     task: Uuid,
+    /// What the ledger recorded before the crash this process reopened from.
+    before_crash: Vec<tickloop_agent_transcript::display::DisplayTriggerDelivery>,
 }
 
 impl TickSource {
@@ -528,6 +530,7 @@ impl TickSource {
             process,
             shell,
             task: self.task,
+            before_crash: Vec::new(),
         }
     }
 }
@@ -551,6 +554,7 @@ impl Source for TickSource {
             },
             shell,
             task,
+            before_crash: Vec::new(),
         }
     }
 
@@ -574,19 +578,30 @@ impl Source for TickSource {
             .unwrap();
     }
 
-    /// This process's subscription, which started without any delivery, got the base's answer
-    /// for the update.
-    async fn replayed(&self, _n: u64) -> bool {
-        tokio::time::timeout(WAIT, async {
+    /// The update the stream gave again reached this process's subscription, which let it go as
+    /// delivered, and left the ledger as it was: one delivery carries it, under the receipt it
+    /// got before the crash.
+    async fn replayed(&self, n: u64) -> bool {
+        let reached = tokio::time::timeout(WAIT, async {
             while self.agent().tick_subscriptions(self.chat()).await.unwrap()[0]
-                .last_delivery_ms
+                .updated_at_ms
                 .is_none()
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .is_ok()
+        .is_ok();
+        tokio::time::sleep(SETTLE).await;
+        let status = &self.agent().tick_subscriptions(self.chat()).await.unwrap()[0];
+        let source_let_it_go = status.accumulated == 0 && status.pending_since_ms.is_none();
+        self.agent().flush_transcripts().await;
+        let first = runs_delivering_tick_update(&self.before_crash, n);
+        let now = runs_delivering_tick_update(
+            &stored_trigger_deliveries(&self.process.root, self.chat()),
+            n,
+        );
+        reached && source_let_it_go && first.len() == 1 && now == first
     }
 
     /// The crash came after the delivery's acceptance was durable and before its watermark was
@@ -596,7 +611,11 @@ impl Source for TickSource {
         for watermark in files_under(&image, "tick-watermarks") {
             std::fs::remove_file(watermark).unwrap();
         }
-        self.resumed(image, model).await
+        let before_crash = stored_trigger_deliveries(&image, self.chat());
+        Self {
+            before_crash,
+            ..self.resumed(image, model).await
+        }
     }
 
     /// Another process holding the same Chat at the same time; only the lease holder delivers.

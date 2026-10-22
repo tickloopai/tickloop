@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, Instant};
 
+use super::loop_lease::TriggerPermit;
 use super::tick_content::{
     DeliveredWatermark, TickContentCache, WATERMARK_DIRECTORY, read_watermark, remove_watermark,
     write_watermark,
@@ -629,6 +630,17 @@ impl TickDeliveries {
             .collect()
     }
 
+    /// Whether an item of a new delivery was delivered already: a delivery prepared before the
+    /// lease told what another process delivered does not reach the Loop.
+    pub(super) fn holds_delivered_items(&self, items: &[TickDeliveryItem]) -> bool {
+        items.iter().any(|item| {
+            self.subscriptions
+                .get(&item.subscription)
+                .and_then(|runtime| runtime.delivered)
+                .is_some_and(|delivered| item.sequence <= delivered.sequence)
+        })
+    }
+
     /// The Tick Update source's own condition.
     pub(super) fn items_eligibility(
         &self,
@@ -954,6 +966,20 @@ impl TickDeliveries {
             }
         }
         self.hold(owner, Instant::now());
+    }
+
+    /// The updates `items` carry no longer wait in their subscriptions: they were delivered.
+    fn let_go(&mut self, items: &[DeliveryItem]) {
+        for item in items {
+            if let Some(runtime) = self.subscriptions.get_mut(&item.subscription) {
+                runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
+                if let Some(first) = &runtime.first {
+                    runtime.pending_since = Some(first.received_at);
+                } else if runtime.accumulated == 0 && !runtime.has_pending_change {
+                    runtime.pending_since = None;
+                }
+            }
+        }
     }
 
     /// Keeps `owner`'s pending delivery until its Loop can take it. It flushes when the Loop's
@@ -2044,15 +2070,27 @@ impl Agent {
             }
             items.push(item);
         }
+        // What was delivered is known only under the lease, once what another process holding it
+        // delivered is taken over: the items are sorted out and batched after that.
+        match self.acquire_trigger_permit(chat_id).await {
+            TriggerPermit::Fire => {}
+            TriggerPermit::Wait(_) | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
+                self.tick_deliveries().restore(owner, items);
+                self.inner.tick_wake.notify_one();
+                return;
+            }
+        }
         {
-            let deliveries = self.tick_deliveries();
-            items.retain(|item| {
+            let mut deliveries = self.tick_deliveries();
+            let (fresh, delivered): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
                 deliveries
                     .subscriptions
                     .get(&item.subscription)
                     .and_then(|runtime| runtime.delivered)
                     .is_none_or(|delivered| item.sequence > delivered.sequence)
             });
+            deliveries.let_go(&delivered);
+            items = fresh;
         }
         if items.is_empty() {
             return;
@@ -2151,18 +2189,17 @@ impl Agent {
         let mut deliveries = self.tick_deliveries();
         let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
         for (subscription, _, mark) in marks {
-            if let Some(runtime) = deliveries.subscriptions.get_mut(subscription) {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
                 runtime.delivered = Some(*mark);
             }
         }
+        deliveries.let_go(items);
         for item in items {
             if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
-                runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
-                if let Some(first) = &runtime.first {
-                    runtime.pending_since = Some(first.received_at);
-                } else if runtime.accumulated == 0 && !runtime.has_pending_change {
-                    runtime.pending_since = None;
-                }
                 runtime.last_delivery_ms = Some(delivered_at);
                 runtime.last_delivery = Some(summary.to_owned());
             }
@@ -2193,7 +2230,7 @@ impl Agent {
             return;
         }
         // A watermark that cannot be written only lets the update be delivered again, which
-        // the ledger answers with its first receipt.
+        // the ledger holds already.
         let written = tokio::task::spawn_blocking(move || {
             marks
                 .into_iter()

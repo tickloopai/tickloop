@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tickloop_agent_protocol::LoopTriggerNoticeKind;
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::config;
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::transcripts::FaultyTranscriptStore;
 use uuid::Uuid;
 
@@ -74,8 +75,8 @@ async fn an_update_the_lease_kept_out_is_not_marked_delivered() {
 }
 
 /// A process that takes the lease over learns what the previous holder delivered: the same
-/// update, held while the other process ran it, is replayed from the ledger instead of running
-/// a second time.
+/// update, held while the other process ran it, is known as delivered instead of running a
+/// second time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_process_taking_the_lease_over_does_not_run_what_the_holder_ran() {
     const SECOND: &str = "\"seq\":\"2\"";
@@ -96,17 +97,18 @@ async fn a_process_taking_the_lease_over_does_not_run_what_the_holder_ran() {
     holder_model.wait_seen(SECOND, 1).await;
     holder.shutdown().await;
 
-    // The held delivery is retried once the lease is free, and answered by the ledger.
+    // The held delivery is retried once the lease is free, and sorted out as delivered.
     tokio::time::timeout(WAIT, async {
-        while other.tick_subscriptions(chat).await.unwrap()[0]
-            .last_delivery_ms
-            .is_none()
+        while other
+            .loop_trigger_notices()
+            .iter()
+            .any(|notice| notice.chat_id == chat)
         {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the other process retries the held update");
+    .expect("the other process takes the lease over");
     tokio::time::sleep(SETTLE).await;
     assert_eq!(other_model.seen(SECOND), 0, "{:?}", other_model.prompts());
     other.shutdown().await;
@@ -297,6 +299,81 @@ fn take_the_lease_away(root: &std::path::Path) {
     {
         std::fs::remove_file(lease).unwrap();
     }
+}
+
+/// Two Shell Ticks of one Chat on one stream, both subscribed or watched.
+struct TwoTicks {
+    first: ShellTick,
+    second: ShellTick,
+}
+
+impl TwoTicks {
+    async fn installed(agent: &Agent, first: Uuid, second: Uuid) -> Self {
+        let stream = tickloop_agent_runtime::tick_stream::InMemoryTickStream::new();
+        let ticks = Self {
+            first: ShellTick::on(stream.clone(), first),
+            second: ShellTick::on(stream, second),
+        };
+        ticks.first.install(agent).await;
+        ticks
+    }
+}
+
+/// A process taking the lease over sorts out every update the holder delivered, whatever
+/// batch it comes in: a batch of its own that repeats one of them in part delivers only the
+/// rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_delivers_only_what_a_partly_repeated_batch_adds() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let (first_task, second_task) = (Uuid::new_v4(), Uuid::new_v4());
+    let holder_model = ContractModel::new();
+    let holder = Agent::open_embedded(root.clone(), config(), holder_model.clone()).unwrap();
+    let holder_ticks = TwoTicks::installed(&holder, first_task, second_task).await;
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&holder, chat, "watch both").await;
+    holder_ticks.first.subscribe(&holder, chat).await;
+    holder_ticks.second.subscribe(&holder, chat).await;
+    holder.flush_transcripts().await;
+
+    let other_model = ContractModel::new();
+    let other = Agent::open_embedded(root.clone(), config(), other_model.clone()).unwrap();
+    let other_ticks = TwoTicks::installed(&other, first_task, second_task).await;
+    other.resume_chat(chat).await.unwrap();
+    complete_turn(&other, chat, "resume here").await;
+    other_ticks.first.wait_until_live(&other, chat).await;
+    other_ticks.second.wait_until_live(&other, chat).await;
+
+    // The holder takes both updates in one batch.
+    hold_a_turn(&holder, chat, &holder_model).await;
+    holder_ticks.first.update(2, "first-two");
+    holder_ticks.second.update(3, "second-three");
+    tokio::time::sleep(SETTLE).await;
+    holder_model.release_held_turn();
+    holder_model.wait_seen("second-three", 1).await;
+    assert_eq!(
+        holder_model.first_turn_with("first-two"),
+        holder_model.first_turn_with("second-three"),
+        "one batch: {:?}",
+        holder_model.prompts()
+    );
+
+    other_ticks.first.update(2, "first-two");
+    other_ticks.second.update(4, "second-four");
+    wait_for_notice(&other, chat, LoopTriggerNoticeKind::HeldByAnotherProcess).await;
+    holder.shutdown().await;
+
+    // Held updates may come without their data, which the stream no longer has; their sequence
+    // names them.
+    other_model.wait_seen("\"seq\":\"4\"", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        other_model.seen("\"seq\":\"2\""),
+        0,
+        "{:?}",
+        other_model.prompts()
+    );
+    other.shutdown().await;
 }
 
 /// A local Agent on `root` whose Transcript store is `store`, as `Agent::open_embedded` would
