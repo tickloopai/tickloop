@@ -14,7 +14,6 @@ struct TerminalFixture {
     writer: Box<dyn std::io::Write + Send>,
     output: std::sync::Arc<std::sync::Mutex<String>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
-    runtime: std::path::PathBuf,
     root: std::path::PathBuf,
 }
 
@@ -22,7 +21,7 @@ impl TerminalFixture {
     fn start(root: &std::path::Path) -> Self {
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("tmp")).unwrap();
-        let runtime = support::cli_runtime::directory();
+        support::cli_runtime::adopt(&root.join("state"));
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 35,
@@ -32,7 +31,6 @@ impl TerminalFixture {
             })
             .unwrap();
         let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(root);
@@ -64,7 +62,6 @@ impl TerminalFixture {
             writer,
             output,
             _master: pty.master,
-            runtime,
             root: root.into(),
         }
     }
@@ -152,7 +149,6 @@ impl Drop for TerminalFixture {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.root.join("home"))
             .env("TICKLOOP_CONFIG_DIR", self.root.join("state"))
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .output();
     }
 }
@@ -270,11 +266,8 @@ async fn piped_commands_wait_for_logout_before_provider_navigation_and_exit() {
         .unwrap();
     lock.lock().unwrap();
 
+    support::cli_runtime::adopt(&state_dir);
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .args(["--working-directory-is-trusted", "--mode", "acceptEdits"])
         .arg("--cwd")
         .arg(&root)

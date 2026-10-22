@@ -7,12 +7,16 @@ use std::{
     fmt,
     fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, PackageAuth, PackageError, validate_package_name,
@@ -31,6 +35,9 @@ pub const OAUTH_TOKEN_FILE_VARIABLE: &str = "TICKLOOP_OAUTH_TOKEN_FILE";
 /// Moves the config root away from `~/.tickloop` when set and not empty.
 const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
 const DEFAULT_CONFIG_ROOT: &str = ".tickloop";
+/// Bytes of the config root digest that name its runtime directories, short enough for the Unix
+/// socket paths beneath them.
+const RUNTIME_KEY_BYTES: usize = 8;
 /// The `client_id` registered with each issuer, reused by the next login.
 const OAUTH_CLIENTS_FILE_NAME: &str = "oauth2-clients.json";
 /// Files are replaced through a temporary file with this prefix beside them.
@@ -408,6 +415,47 @@ pub fn default_config_root() -> Option<PathBuf> {
                 .filter(|home| !home.as_os_str().is_empty())
                 .map(|home| home.join(DEFAULT_CONFIG_ROOT))
         })
+}
+
+/// What sets the runtime of `config_root` apart from the user's others: `None` for
+/// `~/.tickloop`, whose daemon and Tickhost keep the per-user runtime directories, and for any
+/// other root the start of the SHA-256 of its canonical path. Every runtime directory derives
+/// from it, so one config root has exactly one daemon and one Tickhost.
+pub fn config_root_runtime_key(config_root: &Path) -> Option<String> {
+    let root = resolved_path(config_root);
+    let home_root = std::env::home_dir()
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(|home| resolved_path(&home.join(DEFAULT_CONFIG_ROOT)));
+    if home_root.as_ref() == Some(&root) {
+        return None;
+    }
+    let digest = Sha256::digest(root.as_os_str().as_bytes());
+    Some(
+        digest[..RUNTIME_KEY_BYTES]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// `path` with every symbolic link resolved, also before it exists: its deepest existing ancestor
+/// is resolved and the rest appended, so a config root names the same runtime before and after
+/// it is created.
+fn resolved_path(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .find_map(|ancestor| {
+            let canonical = ancestor.canonicalize().ok()?;
+            let rest = absolute.strip_prefix(ancestor).ok()?;
+            // Joining an empty rest would add a trailing separator.
+            Some(if rest.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(rest)
+            })
+        })
+        .unwrap_or(absolute)
 }
 
 pub(crate) fn now_seconds() -> u64 {

@@ -28,9 +28,8 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         "/subs",
         "/quit",
     ];
-    let runtime_directory = support::cli_runtime::directory();
+    let runtime_directory = support::cli_runtime::adopt(&directory.path().join("state"));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .current_dir(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
@@ -133,9 +132,8 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     let commands = format!(
         "/loops {goal}\n/events keep explicit events\n/loops schedule {goal} 86400 --for 604800 scheduled review\n/loops trigger {goal}\n/loops schedule {other_goal} 86400 wrong chat\n/loops {other_goal}\n/loops schedule {goal} 0 invalid\n/loops trigger\n/loops new\n/loops\n/exit\n"
     );
-    let runtime_directory = support::cli_runtime::directory();
+    let runtime_directory = support::cli_runtime::adopt(&archive);
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--chat-id",

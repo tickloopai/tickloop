@@ -355,11 +355,9 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         .unwrap();
     let controller = HostController::new(
         directory.path(),
-        tickhost::paths::HostPaths {
-            runtime: directory.path().join("h"),
-        },
+        tickhost::paths::HostPaths::of_config_root(Some(directory.path())),
         Uuid::new_v4(),
-        support::fixture_cli::tickhost(),
+        support::hosted::executable_in(directory.path()),
         support::hosted::IDLE_TIMEOUT,
     );
     let owner = tickhost::host::TickOwner {

@@ -1,8 +1,11 @@
+use crate::support;
+
 use std::process::Command;
 
 #[test]
 fn update_help_and_version_do_not_start_a_daemon() {
     let root = tempfile::tempdir().unwrap();
+    let daemon = support::cli_runtime::adopt(&root.path().join("config"));
     for arguments in [
         vec!["update", "--help"],
         vec!["--version"],
@@ -10,7 +13,6 @@ fn update_help_and_version_do_not_start_a_daemon() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
             .args(arguments)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", root.path().join("daemon"))
             .env("TICKLOOP_CONFIG_DIR", root.path().join("config"))
             .output()
             .unwrap();
@@ -21,13 +23,14 @@ fn update_help_and_version_do_not_start_a_daemon() {
         );
         assert!(!output.stdout.is_empty());
     }
-    assert!(!root.path().join("daemon").exists());
+    assert!(!daemon.exists());
     assert!(!root.path().join("config").exists());
 }
 
 #[test]
 fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
     let root = tempfile::tempdir().unwrap();
+    let daemon = support::cli_runtime::adopt(&root.path().join("config"));
     for arguments in [
         vec!["update", "--unknown"],
         vec!["update", "--check"],
@@ -36,7 +39,6 @@ fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
             .args(&arguments)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", root.path().join("daemon"))
             .env("TICKLOOP_CONFIG_DIR", root.path().join("config"))
             .output()
             .unwrap();
@@ -51,7 +53,7 @@ fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
             "{stderr}"
         );
     }
-    assert!(!root.path().join("daemon").exists());
+    assert!(!daemon.exists());
     assert!(!root.path().join("config").exists());
 }
 
@@ -59,6 +61,7 @@ fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
 fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
+    let daemon = support::cli_runtime::adopt(&root.path().join("config"));
     let source = root.path().join("downloaded");
     let cargo_root = root.path().join("Cargo install root");
     std::fs::create_dir(&source).unwrap();
@@ -85,7 +88,6 @@ fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries()
         .args(["update", "--install-cargo"])
         .arg(&launcher)
         .env("TICKLOOP_CONFIG_DIR", root.path().join("config"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", root.path().join("daemon"))
         .output()
         .unwrap();
     assert!(
@@ -118,5 +120,5 @@ fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries()
         );
     }
     assert!(!root.path().join("config").exists());
-    assert!(!root.path().join("daemon").exists());
+    assert!(!daemon.exists());
 }

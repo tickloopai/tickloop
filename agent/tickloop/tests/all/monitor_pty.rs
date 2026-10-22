@@ -70,10 +70,7 @@ impl Session {
         command.cwd(directory);
         command.args(arguments);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("state"));
-        command.env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        );
+        support::cli_runtime::adopt(&directory.join("state"));
         command.env("HERDR_ENV", "0");
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         if let Some(origin) = origin {

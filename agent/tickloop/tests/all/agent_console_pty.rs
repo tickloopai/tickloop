@@ -68,7 +68,7 @@ impl PrivateFixture {
     fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;
         let directory = support::runtime_dir();
-        for name in ["config", "home", "runtime", "work", "scratch"] {
+        for name in ["config", "home", "work", "scratch"] {
             std::fs::create_dir(directory.path().join(name)).unwrap();
             std::fs::set_permissions(
                 directory.path().join(name),
@@ -83,11 +83,34 @@ impl PrivateFixture {
             serde_json::to_vec(&model).unwrap(),
         )
         .unwrap();
+        let runtime = support::cli_runtime::adopt(&directory.path().join("config"));
+        tickloop_agent_client::daemon_endpoint::validate_directory(&runtime).unwrap();
         Self { directory }
     }
 
     fn path(&self, name: &str) -> std::path::PathBuf {
-        self.directory.path().join(name)
+        let path = std::path::Path::new(name);
+        let (directory, suffix) = if let Ok(suffix) = path.strip_prefix("runtime") {
+            (
+                support::cli_runtime::daemon_directory_of(&self.directory.path().join("config")),
+                suffix,
+            )
+        } else if let Ok(suffix) = path.strip_prefix("tickhost") {
+            (
+                tickhost::paths::HostPaths::of_config_root(Some(
+                    &self.directory.path().join("config"),
+                ))
+                .runtime,
+                suffix,
+            )
+        } else {
+            return self.directory.path().join(path);
+        };
+        if suffix.as_os_str().is_empty() {
+            directory
+        } else {
+            directory.join(suffix)
+        }
     }
 
     fn set_model(&self, model: &tickloop_agent_protocol::ModelConfig) {
@@ -212,8 +235,6 @@ impl PtyView {
         command.env("PATH", "/usr/bin:/bin");
         command.env("HOME", fixture.path("home"));
         command.env("TICKLOOP_CONFIG_DIR", fixture.path("config"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"));
-        command.env("TICKLOOP_TICKHOST_RUNTIME_DIR", fixture.path("tickhost"));
         command.env("TICKLOOP_TMPDIR", fixture.path("scratch"));
         command.env("TMPDIR", fixture.path("scratch"));
         command.env("TICKLOOP_FIXTURE_API_KEY", "fixture-key");
@@ -3678,14 +3699,16 @@ async fn relay_legacy(
     }
 }
 
-/// A private runtime directory whose daemon endpoint relays to `fixture`'s daemon, rewriting the
+/// A private config root whose daemon endpoint relays to `fixture`'s daemon, rewriting the
 /// `legacy` executions' summaries into the older schema. Only this fixture's own daemon is reached.
 fn legacy_daemon_endpoint(
     fixture: &PrivateFixture,
     legacy: Vec<ExecutionRef>,
 ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let directory = fixture.path("legacy");
+    let config_root = fixture.path("legacy");
+    std::fs::create_dir(&config_root).unwrap();
+    let directory = support::cli_runtime::adopt(&config_root);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)
@@ -3701,7 +3724,7 @@ fn legacy_daemon_endpoint(
             tokio::spawn(relay_legacy(downstream, upstream, legacy.clone()));
         }
     });
-    (directory, relay)
+    (config_root, relay)
 }
 
 /// Overview rows named `New Agent`; the dispatch line below the list (`New Agent · cwd …`) names
@@ -3786,7 +3809,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
     // their explicit work facts as known-worked controls.
     let (legacy, relay) = legacy_daemon_endpoint(fixture, unreported.clone());
     let mut view =
-        PtyView::start_with_environment(fixture, &[], &[("TICKLOOP_DAEMON_RUNTIME_DIR", &legacy)]);
+        PtyView::start_with_environment(fixture, &[], &[("TICKLOOP_CONFIG_DIR", &legacy)]);
     view.wait_for("legacy View ready", new_input_is_visible)
         .await;
     view.send(b"\x1b[D");

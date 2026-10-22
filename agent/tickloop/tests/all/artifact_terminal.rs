@@ -84,11 +84,8 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("state"));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .args(["--working-directory-is-trusted", "--cwd"])
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
@@ -150,11 +147,8 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
     });
     let origin = server.issuer().strip_suffix("/account").unwrap().to_owned();
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("state"));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .args(["--working-directory-is-trusted", "--cwd"])
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))

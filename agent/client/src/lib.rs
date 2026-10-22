@@ -314,35 +314,20 @@ fn incompatible_daemon_guidance(
         runtime.display(),
         executable.display(),
     );
-    let (Some(runtime), Some(executable)) = (runtime.to_str(), executable.to_str()) else {
+    let Some(executable) = executable.to_str() else {
         return format!(
             "{details}\n\nRun this build with daemon stop, then relaunch.\nThis stops running Agents. Saved history is kept."
         );
     };
-    let default_directory = PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
-        libc::geteuid()
-    }));
-    let default_directory = default_directory
-        .canonicalize()
-        .unwrap_or(default_directory);
-    let prefix = if Path::new(runtime) == default_directory {
-        String::new()
-    } else {
-        format!(
-            "TICKLOOP_DAEMON_RUNTIME_DIR={} ",
-            shell_words::quote(runtime)
-        )
+    let prefix = match std::env::var_os("TICKLOOP_CONFIG_DIR")
+        .filter(|config| !config.is_empty())
+        .and_then(|config| config.into_string().ok())
+    {
+        Some(config) => format!("TICKLOOP_CONFIG_DIR={} ", shell_words::quote(&config)),
+        None => String::new(),
     };
     let stop = format!("{prefix}{}", shell_words::quote(executable));
     let mut launch = prefix;
-    if let Some(config) = std::env::var_os("TICKLOOP_CONFIG_DIR")
-        && let Some(config) = config.to_str()
-    {
-        launch.push_str(&format!(
-            "TICKLOOP_CONFIG_DIR={} ",
-            shell_words::quote(config)
-        ));
-    }
     launch.push_str(&shell_words::quote(executable));
     let startup_note = if own_startup {
         "\nUse a pinned executable for CLI, daemon, and workers before relaunching."

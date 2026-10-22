@@ -32,7 +32,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = support::runtime_dir();
-        for name in ["home", "config", "runtime", "scratch", "work"] {
+        for name in ["home", "config", "scratch", "work"] {
             let directory = root.path().join(name);
             fs::create_dir(&directory).unwrap();
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -42,10 +42,15 @@ impl Fixture {
             "untrusted invalid configuration",
         )
         .unwrap();
+        let runtime = support::cli_runtime::adopt(&root.path().join("config"));
+        tickloop_agent_client::daemon_endpoint::validate_directory(&runtime).unwrap();
         Self { root }
     }
 
     fn path(&self, name: &str) -> PathBuf {
+        if name == "runtime" {
+            return support::cli_runtime::daemon_directory_of(&self.root.path().join("config"));
+        }
         self.root.path().join(name)
     }
 
@@ -53,7 +58,6 @@ impl Fixture {
         vec![
             ("HOME", self.path("home")),
             ("TICKLOOP_CONFIG_DIR", self.path("config")),
-            ("TICKLOOP_DAEMON_RUNTIME_DIR", self.path("runtime")),
             ("TICKLOOP_TMPDIR", self.path("scratch")),
         ]
     }

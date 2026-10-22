@@ -20,11 +20,10 @@ use serde_json::json;
 fn incompatible_daemon_output(terminal: bool) -> String {
     let fixture = support::runtime_dir();
     let root = fixture.path().canonicalize().unwrap();
-    let runtime = root.join("runtime");
-    std::fs::create_dir(&runtime).unwrap();
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = root.join("config with ' and $(literal)");
     std::fs::create_dir(&config).unwrap();
+    let runtime = support::cli_runtime::adopt(&config);
+    tickloop_agent_client::daemon_endpoint::validate_directory(&runtime).unwrap();
     let socket = runtime.join("daemon.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -143,7 +142,7 @@ fn incompatible_daemon_output(terminal: bool) -> String {
         command.env("HOME", &root);
         command.env("TERM", "xterm-256color");
         command.env("TICKLOOP_CONFIG_DIR", &config);
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
+
         command.env("TICKLOOP_FIXTURE_API_KEY", "private-fixture-key");
         let mut child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
@@ -186,7 +185,6 @@ fn incompatible_daemon_output(terminal: bool) -> String {
             .env("TERM", "xterm-256color")
             .env("NO_COLOR", "1")
             .env("TICKLOOP_CONFIG_DIR", &config)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime)
             .env("TICKLOOP_FIXTURE_API_KEY", "private-fixture-key")
             .stdin(Stdio::null())
             .output()
@@ -204,7 +202,7 @@ fn incompatible_daemon_output(terminal: bool) -> String {
     if terminal {
         assert!(output.contains("Stop the running daemon and continue?"));
         assert!(output.contains("Saved history is kept"));
-        assert!(!output.contains("TICKLOOP_DAEMON_RUNTIME_DIR="));
+        assert!(!output.contains("TICKLOOP_CONFIG_DIR="));
         return output;
     }
     assert!(!output.contains("incompatible AgentAccess protocol major"));
@@ -244,7 +242,10 @@ fn incompatible_daemon_output(terminal: bool) -> String {
         "{command}"
     );
     assert!(commands[1].ends_with(quoted_executable.as_ref()));
-    assert!(output.contains(&format!("Runtime: {}", runtime.display())));
+    assert!(output.contains(&format!(
+        "Runtime: {}",
+        runtime.canonicalize().unwrap().display()
+    )));
     assert!(output.contains(&format!("Executable: {resolved_executable}")));
     assert!(output.contains(&format!(
         "client {}.{}",
@@ -252,11 +253,15 @@ fn incompatible_daemon_output(terminal: bool) -> String {
         tickloop_agent_protocol::PROTOCOL_MINOR
     )));
     assert!(output.contains("peer protocol 1.1"));
-    let runtime_argument = format!(
-        "TICKLOOP_DAEMON_RUNTIME_DIR={}",
-        shell_words::quote(runtime.to_str().unwrap())
+    let config_argument = format!(
+        "TICKLOOP_CONFIG_DIR={}",
+        shell_words::quote(config.to_str().unwrap())
     );
-    assert!(commands.iter().all(|line| line.contains(&runtime_argument)));
+    assert!(
+        commands
+            .iter()
+            .all(|line| line.starts_with(&config_argument))
+    );
     assert!(!command.contains("--working-directory-is-trusted"));
     assert!(!command.contains("--config"));
     output

@@ -325,3 +325,34 @@ fn a_key_is_one_printable_line_and_never_shown() {
         "ApiKey(..)"
     );
 }
+
+#[test]
+fn a_config_root_names_one_runtime_before_and_after_it_exists_and_through_any_alias() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("config root");
+    let before = tick_packages::config_root_runtime_key(&root).unwrap();
+    fs::create_dir(&root).unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    assert_eq!(
+        tick_packages::config_root_runtime_key(&root).unwrap(),
+        before
+    );
+    assert_eq!(
+        tick_packages::config_root_runtime_key(&alias).unwrap(),
+        before
+    );
+    assert_eq!(before.len(), 16);
+    assert!(before.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let other = tick_packages::config_root_runtime_key(&directory.path().join("other")).unwrap();
+    assert_ne!(other, before);
+}
+
+#[test]
+fn the_home_config_root_keeps_the_per_user_runtime() {
+    let home = std::env::home_dir().unwrap();
+    assert_eq!(
+        tick_packages::config_root_runtime_key(&home.join(".tickloop")),
+        None
+    );
+}

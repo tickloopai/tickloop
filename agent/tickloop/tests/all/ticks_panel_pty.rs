@@ -35,7 +35,6 @@ struct Terminal {
     _master: Box<dyn portable_pty::MasterPty + Send>,
     fixture_home: std::path::PathBuf,
     config_root: std::path::PathBuf,
-    runtime: std::path::PathBuf,
 }
 
 impl Terminal {
@@ -61,7 +60,6 @@ impl Terminal {
         command.env("HOME", root.join("home"));
         command.env("TICKLOOP_TMPDIR", root.join("tmp"));
         command.env("TICKLOOP_CONFIG_DIR", root.join("config"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &fixture.runtime);
         command.env("TICKLOOP_TICK_MARKETPLACE", marketplace);
         command.env("TICKLOOP_AGENT_TUI", "inline");
         command.env("TERM", "xterm-256color");
@@ -89,7 +87,6 @@ impl Terminal {
             _master: pty.master,
             fixture_home: root.join("home"),
             config_root: root.join("config"),
-            runtime: fixture.runtime.clone(),
         }
     }
 
@@ -167,7 +164,6 @@ impl Drop for Terminal {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.fixture_home)
             .env("TICKLOOP_CONFIG_DIR", &self.config_root)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .output();
     }
 }

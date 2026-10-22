@@ -146,7 +146,6 @@ async fn creation_adds_an_artifact_in_mode(flags: &[&str]) {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", fixture.path("home"))
         .env("TICKLOOP_CONFIG_DIR", fixture.path("config"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"))
         .output()
         .unwrap();
     fixture.shutdown().await;

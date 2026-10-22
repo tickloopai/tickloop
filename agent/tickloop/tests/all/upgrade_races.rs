@@ -60,23 +60,15 @@ struct Scenario {
 
 impl Scenario {
     async fn new(model_url: &str, workdir: tempfile::TempDir) -> Self {
-        let runtime = PrivateRuntime(
-            tempfile::Builder::new()
-                .prefix("gu")
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir_in("/tmp")
-                .unwrap(),
-        );
-        tickhost::paths::HostPaths {
-            runtime: runtime.0.path().canonicalize().unwrap().join("tickhost"),
-        }
-        .check_session_directories()
-        .expect("the private test runtime must leave room for every Tick Session socket");
+        let runtime = PrivateRuntime::new();
+        tickhost::paths::HostPaths::of_config_root(Some(runtime.config_root()))
+            .check_session_directories()
+            .expect("the private test runtime must leave room for every Tick Session socket");
         let bundles = tempfile::tempdir().unwrap();
         let source = support::fixture_cli::executable();
         let old_executable = copy_bundle(&source, &bundles.path().join("old"));
         let new_executable = copy_bundle(&source, &bundles.path().join("new"));
-        let config_root = workdir.path().canonicalize().unwrap().join("state");
+        let config_root = runtime.config_root().to_path_buf();
         tickloop_agent_config::UserSettings::in_root(&config_root)
             .trust_working_directory(workdir.path())
             .unwrap();
@@ -107,9 +99,12 @@ impl Scenario {
             name: b"TICKLOOP_TRANSPORT_FIXTURE".to_vec(),
             value: transport_path.as_os_str().as_encoded_bytes().to_vec(),
         });
-        let client = connect_or_start_at(runtime.0.path().to_path_buf(), old_executable)
-            .await
-            .unwrap();
+        let client = connect_or_start_at(
+            runtime.path().to_path_buf(),
+            runtime.executable(&old_executable),
+        )
+        .await
+        .unwrap();
         let created = client
             .execute(command(
                 client.daemon_epoch(),
@@ -158,7 +153,7 @@ impl Scenario {
     }
 
     fn worker_endpoint(&self) -> PathBuf {
-        std::fs::read_dir(self.runtime.0.path())
+        std::fs::read_dir(self.runtime.path())
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -190,7 +185,7 @@ impl Scenario {
         tokio::time::timeout(WAIT, async {
             loop {
                 if let Ok(client) =
-                    LocalAgentClient::connect(self.runtime.0.path().join("daemon.sock")).await
+                    LocalAgentClient::connect(self.runtime.path().join("daemon.sock")).await
                 {
                     let state = version(&client).await;
                     if state.executable == self.new_executable
@@ -462,11 +457,11 @@ async fn live_worker_retries_an_unstarted_tool_request_while_its_daemon_changes(
     let wrapper = scenario.new_executable.with_file_name("gated-tickloop");
     std::fs::write(&wrapper, format!("#!/bin/sh\nif [ \"$1\" = daemon ] && [ \"$2\" = run ]; then\n  : > '{}'\n  while [ ! -f '{}' ]; do /bin/sleep 0.01; done\nfi\nexec '{}' \"$@\"\n", ready.display(), release.display(), scenario.new_executable.display())).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let published = scenario.runtime.0.path().join("worker-control.sock");
+    let published = scenario.runtime.path().join("worker-control.sock");
     let (listener, original) = replace_socket(&published);
     let forwarding = original.clone();
     let restored_control = published.clone();
-    let daemon_endpoint = scenario.runtime.0.path().join("daemon.sock");
+    let daemon_endpoint = scenario.runtime.path().join("daemon.sock");
     let old_daemon = scenario.client.server_process_id();
     let (refused, refusal) = oneshot::channel();
     let (retry_captured, retry_capture) = oneshot::channel();

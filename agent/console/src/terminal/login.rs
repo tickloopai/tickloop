@@ -851,8 +851,9 @@ mod tests {
             "--nocapture",
         ]);
         command.cwd(&root);
+        let _runtime_directories =
+            crate::terminal::test_runtime::RuntimeDirectories::of_config_root(&root.join("state"));
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", root.join("runtime"));
         let rejected_login = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         command.env(
             "TICKLOOP_TEST_CODEX_OAUTH",
@@ -1220,8 +1221,9 @@ mod tests {
             "--nocapture",
         ]);
         command.cwd(&root);
+        let _runtime_directories =
+            crate::terminal::test_runtime::RuntimeDirectories::of_config_root(&root.join("state"));
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", root.join("runtime"));
         command.env("TICKLOOP_TEST_CODEX_OAUTH", &origin);
         command.env(
             "TICKLOOP_TEST_CODEX_RESPONSES",

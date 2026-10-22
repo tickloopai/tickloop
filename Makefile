@@ -26,13 +26,11 @@ PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
 .PHONY: dev build install package test test-workspace check check-workspace release release-publish
 
-## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation,
-## against Tickloop Cloud ENV=prod (default), ENV=pre or ENV=dev. Example: make dev ENV=pre ARGS="-c"
+## Start this checkout's build in the current directory, with the same config root, daemon and Tickhost
+## as an installed tickloop, against Tickloop Cloud ENV=prod (default), ENV=pre or ENV=dev.
+## Example: make dev ENV=pre ARGS="-c"
 # ENV=dev needs TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin> in .env. Every ENV replaces any
 # TICKLOOP_ARTIFACT_ORIGIN from .env or the environment.
-# Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
-# TICKLOOP_TICKHOST_RUNTIME_DIR independently overrides Tickhost. Explicit overrides may share services.
-# An explicit CARGO_TARGET_DIR gets a worktree+branch subdirectory to keep build artifacts isolated.
 dev: override TICKLOOP_ARTIFACT_ORIGIN := $(DEV_CLOUD_ORIGIN_$(ENV))
 dev:
 	$(if $(DEV_ENV_IS_KNOWN),,$(error Unknown ENV '$(ENV)'; use ENV=prod (the default), ENV=pre or ENV=dev))

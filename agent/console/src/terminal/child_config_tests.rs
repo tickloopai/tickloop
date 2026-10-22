@@ -284,6 +284,7 @@ async fn run_child_config_fixture() {
 }
 
 struct ChildPty {
+    _runtime_directories: crate::terminal::test_runtime::RuntimeDirectories,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -301,6 +302,9 @@ fn completed_frames(output: &str) -> &str {
 
 impl ChildPty {
     fn start(directory: &Path, route: &str) -> Self {
+        let runtime_directories = crate::terminal::test_runtime::RuntimeDirectories::of_config_root(
+            &directory.join("config-root"),
+        );
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: HEIGHT as u16,
@@ -326,7 +330,6 @@ impl ChildPty {
         command.env("TERM", "xterm-256color");
         command.env("HOME", directory);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", directory.join("runtime"));
         command.env("TICKLOOP_TMPDIR", directory);
         for model in tickloop_agent_model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
@@ -356,6 +359,7 @@ impl ChildPty {
             }
         });
         Self {
+            _runtime_directories: runtime_directories,
             child,
             writer,
             output,

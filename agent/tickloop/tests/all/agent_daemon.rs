@@ -1062,12 +1062,22 @@ async fn start_daemon_with_agent(
     runtime: &Path,
     workdir: &Path,
 ) -> (LocalAgentClient, ExecutionRef, [u32; 2]) {
-    let client = tickloop_agent_client::connect_or_start_at(
-        runtime.to_path_buf(),
+    start_daemon_with_agent_executable(
+        runtime,
+        workdir,
         PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
     )
     .await
-    .unwrap();
+}
+
+async fn start_daemon_with_agent_executable(
+    runtime: &Path,
+    workdir: &Path,
+    executable: PathBuf,
+) -> (LocalAgentClient, ExecutionRef, [u32; 2]) {
+    let client = tickloop_agent_client::connect_or_start_at(runtime.to_path_buf(), executable)
+        .await
+        .unwrap();
     let mut launch = LaunchSpec::embedded(workdir.to_path_buf());
     launch.session_persistence = false;
     let mut model = tickloop_agent_test_support::config();
@@ -1177,13 +1187,17 @@ async fn assert_group_ends(group: u32) {
 #[tokio::test]
 async fn daemon_stop_ends_the_background_shells_of_its_workers() {
     let workdir = tempfile::tempdir().unwrap();
-    let runtime = support::runtime_dir();
-    let (client, target, processes) = start_daemon_with_agent(runtime.path(), workdir.path()).await;
+    let config_root = support::cli_runtime::config_root();
+    let runtime = support::cli_runtime::daemon_directory_of(&config_root);
+    let executable =
+        support::cli_runtime::executable_in(&config_root, &support::fixture_cli::executable());
+    let (client, target, processes) =
+        start_daemon_with_agent_executable(&runtime, workdir.path(), executable).await;
     let group = start_background_shell(&client, target).await;
     assert!(tickhost::shell::process_group_exists(group));
     let stopped = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .args(["daemon", "stop"])
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", runtime.path())
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
         .output()
         .await
         .unwrap();
@@ -1199,9 +1213,12 @@ async fn daemon_stop_ends_the_background_shells_of_its_workers() {
 #[tokio::test]
 async fn a_crashed_workers_background_shells_end_with_it() {
     let workdir = tempfile::tempdir().unwrap();
-    let runtime = support::runtime_dir();
+    let config_root = support::cli_runtime::config_root();
+    let runtime = support::cli_runtime::daemon_directory_of(&config_root);
+    let executable =
+        support::cli_runtime::executable_in(&config_root, &support::fixture_cli::executable());
     let (client, target, [_, worker]) =
-        start_daemon_with_agent(runtime.path(), workdir.path()).await;
+        start_daemon_with_agent_executable(&runtime, workdir.path(), executable).await;
     let group = start_background_shell(&client, target).await;
     assert!(tickhost::shell::process_group_exists(group));
     unsafe { libc::kill(worker as libc::pid_t, libc::SIGKILL) };

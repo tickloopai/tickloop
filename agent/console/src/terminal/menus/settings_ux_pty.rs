@@ -236,6 +236,7 @@ impl AgentAccess for FixtureAccess {
 }
 
 struct Fixture {
+    _runtime_directories: crate::terminal::test_runtime::RuntimeDirectories,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -256,6 +257,9 @@ impl Fixture {
 
     fn start_at(mode: &str, height: u16) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let runtime_directories = crate::terminal::test_runtime::RuntimeDirectories::of_config_root(
+            &directory.path().join("config"),
+        );
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: height,
@@ -276,10 +280,6 @@ impl Fixture {
         command.env("TICKLOOP_SETTINGS_UX_MODE", mode);
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
-        command.env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            directory.path().join("runtime"),
-        );
         command.env("TICKLOOP_TMPDIR", directory.path());
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         command.env("TERM", "xterm-256color");
@@ -300,6 +300,7 @@ impl Fixture {
             }
         });
         let fixture = Self {
+            _runtime_directories: runtime_directories,
             child,
             writer,
             output,

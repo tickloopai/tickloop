@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 
 const launcher = resolve('scripts/dev-agent.sh');
 const makefile = resolve('Makefile');
@@ -57,7 +56,7 @@ function fixture(t) {
     fs.chmodSync(bin, 0o500); fs.chmodSync(path.dirname(bin), 0o500);
     console.log(JSON.stringify({ cwd: fs.realpathSync('.'), executable: fs.realpathSync(process.argv[1]), args,
       developmentRoot, compiledFor: __COMPILED_CHECKOUT__, buildTarget: __BUILD_TARGET__,
-      daemon: process.env.TICKLOOP_DAEMON_RUNTIME_DIR, tickhost: process.env.TICKLOOP_TICKHOST_RUNTIME_DIR,
+      environment: Object.fromEntries(Object.entries(process.env).filter(([name]) => name.endsWith('_RUNTIME_DIR'))),
       config: process.env.TICKLOOP_CONFIG_DIR, home: process.env.HOME,
       artifactOrigin: process.env.TICKLOOP_ARTIFACT_ORIGIN, devArtifactOrigin: process.env.TICKLOOP_DEV_ARTIFACT_ORIGIN,
       shellStartupFile: process.env.ENV }));
@@ -75,8 +74,6 @@ function fixture(t) {
       .replace('__BUILD_TARGET__', JSON.stringify(fs.realpathSync(target)));
     for (const name of ['tickloop', 'tickhost'])
       fs.writeFileSync(path.join(directory, name), program, { mode: 0o755 });
-    const switchedBranch = path.join(process.cwd(), 'switch-branch-during-build');
-    if (fs.existsSync(switchedBranch)) fs.copyFileSync(switchedBranch, path.join(process.cwd(), 'branch'));
   `);
 
   function checkout(name, { branch = 'main', revision, archive = false } = {}) {
@@ -94,8 +91,7 @@ function fixture(t) {
     const env = { ...process.env, PATH: `${commands}:/usr/bin:/bin`,
       TICKLOOP_CONFIG_DIR: join(root, 'global configuration') };
     // An enclosing `make test` passes its own variables and command line down to every sub-make.
-    for (const name of ['TICKLOOP_DAEMON_RUNTIME_DIR', 'TICKLOOP_TICKHOST_RUNTIME_DIR', 'CARGO_TARGET_DIR',
-      'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
+    for (const name of ['CARGO_TARGET_DIR', 'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
       delete env[name];
     return Object.assign(env, overrides);
   }
@@ -119,23 +115,14 @@ function fixture(t) {
   return { root, caller, checkout, run, runMake };
 }
 
-test('actual launcher reuses branch services but publishes a fresh immutable program bundle', t => {
+test('actual launcher publishes a fresh immutable program bundle for the shared daemon', t => {
   const f = fixture(t);
   const checkout = f.checkout('worktree with spaces', { branch: 'feature/升级' });
   const first = f.run(checkout, {}, ['-c', '--cwd', f.caller]);
   const second = f.run(checkout);
   assert.equal(first.status, 0, first.stderr);
   assert.equal(second.status, 0, second.stderr);
-  assert.equal(first.reported.daemon, second.reported.daemon);
-  assert.equal(first.reported.tickhost, second.reported.tickhost);
   assert.notEqual(first.reported.executable, second.reported.executable);
-  assert.match(first.reported.daemon, new RegExp(`^/tmp/tickloop-dev-${process.getuid()}-[a-f0-9]{16}$`));
-  assert.match(first.reported.tickhost, /^\/tmp\/tlh-[a-f0-9]{16}$/);
-  assert.equal(first.reported.tickhost, `/tmp/tlh-${first.reported.daemon.slice(-16)}`);
-  const expectedNamespace = createHash('sha256')
-    .update([String(process.getuid()), realpathSync(checkout), 'branch:refs/heads/feature/升级', ''].join('\0'))
-    .digest('hex').slice(0, 16);
-  assert.equal(first.reported.tickhost, `/tmp/tlh-${expectedNamespace}`);
   assert.equal(first.reported.cwd, realpathSync(f.caller));
   assert.equal(first.reported.developmentRoot, realpathSync(checkout));
   assert.equal(first.reported.compiledFor, realpathSync(checkout));
@@ -148,121 +135,29 @@ test('actual launcher reuses branch services but publishes a fresh immutable pro
   assert.equal(lstatSync(first.reported.executable).mode & 0o777, 0o500);
   assert.equal(lstatSync(dirname(first.reported.executable)).mode & 0o777, 0o500);
   assert.ok(existsSync(first.reported.executable));
-  const workerSocket = 'w-00000000-0000-0000-0000-000000000000.upgrade';
-  const maxSessionDirectoryBytes = 55;
-  const longestTickSession = join('s', 'ffffffffffffffff');
-  for (const prefix of ['', '/private']) {
-    assert.ok(Buffer.byteLength(join(prefix, first.reported.daemon, workerSocket)) < 104);
-    assert.ok(Buffer.byteLength(join(prefix, first.reported.tickhost, 'host.sock')) < 104);
-    assert.ok(Buffer.byteLength(join(prefix, first.reported.tickhost, longestTickSession)) <= maxSessionDirectoryBytes);
-  }
+  assert.ok(!existsSync(join(checkout, 'git-calls')));
 });
 
-test('different branches and worktrees cannot select each other by default', t => {
+test('every checkout and branch selects the daemon of the config root, as an installed tickloop does', t => {
   const f = fixture(t);
   const first = f.checkout('first', { branch: 'feature/a' });
-  const second = f.checkout('second', { branch: 'feature/a' });
-  const a = f.run(first).reported;
-  const otherWorktree = f.run(second).reported;
-  writeFileSync(join(first, 'branch'), 'feature/b');
-  const b = f.run(first).reported;
-  writeFileSync(join(first, 'branch'), 'feature/a');
-  const returned = f.run(first).reported;
-  assert.notEqual(a.daemon, otherWorktree.daemon);
-  assert.notEqual(a.tickhost, otherWorktree.tickhost);
-  assert.notEqual(a.daemon, b.daemon);
-  assert.notEqual(a.tickhost, b.tickhost);
-  assert.equal(a.daemon, returned.daemon);
-  assert.equal(a.tickhost, returned.tickhost);
-});
-
-test('canonical checkout paths and detached commits produce stable identities', t => {
-  const f = fixture(t);
-  const checkout = f.checkout('detached', { branch: null, revision: 'a'.repeat(40) });
-  const alias = join(f.root, 'checkout alias');
-  symlinkSync(checkout, alias);
-  const first = f.run(checkout).reported;
-  assert.equal(first.daemon, f.run(alias).reported.daemon);
-  assert.equal(first.tickhost, f.run(checkout).reported.tickhost);
-  writeFileSync(join(checkout, 'revision'), 'b'.repeat(40));
-  assert.notEqual(first.daemon, f.run(checkout).reported.daemon);
-});
-
-test('source archives remain isolated without consulting an ancestor Git repository', t => {
-  const f = fixture(t);
-  const first = f.checkout('archive one', { archive: true });
-  const second = f.checkout('archive two', { archive: true });
-  const a = f.run(first).reported;
-  assert.equal(a.daemon, f.run(first).reported.daemon);
-  assert.notEqual(a.daemon, f.run(second).reported.daemon);
-  assert.ok(!existsSync(join(first, 'git-calls')));
-});
-
-test('explicit existing service overrides are honored independently without changing global config', t => {
-  const f = fixture(t);
-  const checkout = f.checkout('overrides');
-  const baseline = f.run(checkout).reported;
-  const daemon = '/tmp/chosen-daemon';
-  const tickhost = '/tmp/chosen-tickhost';
-  const daemonOnly = f.run(checkout, { TICKLOOP_DAEMON_RUNTIME_DIR: daemon }).reported;
-  assert.equal(daemonOnly.daemon, daemon);
-  assert.equal(daemonOnly.tickhost, join(daemon, 'tickhost'));
-  const hostOnly = f.run(checkout, { TICKLOOP_TICKHOST_RUNTIME_DIR: tickhost }).reported;
-  assert.equal(hostOnly.daemon, baseline.daemon);
-  assert.equal(hostOnly.tickhost, tickhost);
-  const both = f.run(checkout, { TICKLOOP_DAEMON_RUNTIME_DIR: daemon,
-    TICKLOOP_TICKHOST_RUNTIME_DIR: tickhost, CARGO_TARGET_DIR: join(f.root, 'custom target') }).reported;
-  assert.equal(both.daemon, daemon);
-  assert.equal(both.tickhost, tickhost);
-  assert.equal(both.config, baseline.config);
-  assert.equal(both.home, baseline.home);
-});
-
-test('unreadable checkout identity fails before building or selecting services', t => {
-  const f = fixture(t);
-  const checkout = f.checkout('broken metadata', { branch: null });
-  const result = f.run(checkout);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Cannot identify the development checkout/);
-  assert.ok(!existsSync(join(checkout, 'cargo-calls')));
-});
-
-test('shared Cargo overrides isolate build artifacts by worktree and branch', t => {
-  const f = fixture(t);
-  const first = f.checkout('shared target first');
-  const second = f.checkout('shared target second');
-  const shared = join(f.root, 'shared build target');
-  const overrides = { CARGO_TARGET_DIR: shared };
-  const a = f.run(first, overrides);
-  const b = f.run(second, overrides);
-  assert.equal(a.status, 0, a.stderr);
-  assert.equal(b.status, 0, b.stderr);
-  assert.equal(a.reported.compiledFor, realpathSync(first));
-  assert.equal(b.reported.compiledFor, realpathSync(second));
-  assert.notEqual(a.reported.buildTarget, b.reported.buildTarget);
-  for (const result of [a, b]) {
-    assert.equal(dirname(result.reported.buildTarget), realpathSync(shared));
-    assert.ok(existsSync(join(result.reported.buildTarget, 'debug/tickloop')));
-    assert.match(result.reported.buildTarget, /\/tickloop-dev-[a-f0-9]{16}$/);
+  const second = f.checkout('second', { branch: 'feature/b' });
+  for (const checkout of [first, second]) {
+    const result = f.run(checkout);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(Object.keys(result.reported.environment), []);
+    assert.equal(result.reported.config, join(f.root, 'global configuration'));
   }
-  assert.equal(f.run(first, overrides).reported.buildTarget, a.reported.buildTarget);
-  writeFileSync(join(first, 'branch'), 'another-branch');
-  const switched = f.run(first, overrides).reported;
-  assert.notEqual(switched.buildTarget, a.reported.buildTarget);
-  assert.notEqual(switched.buildTarget, b.reported.buildTarget);
-  assert.equal(switched.compiledFor, realpathSync(first));
-  assert.ok(!existsSync(join(shared, 'debug')));
 });
 
-test('switching branches during a build cannot publish into the previous branch namespace', t => {
+test('an explicit CARGO_TARGET_DIR is the build target', t => {
   const f = fixture(t);
-  const checkout = f.checkout('changing branch', { branch: 'before' });
-  writeFileSync(join(checkout, 'switch-branch-during-build'), 'after');
-  const result = f.run(checkout);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /changed branches during the build/);
-  assert.equal(result.stdout, '');
-  assert.deepEqual(readdirSync(join(checkout, 'target/dev-runs')), []);
+  const checkout = f.checkout('shared target');
+  const shared = join(f.root, 'shared build target');
+  const result = f.run(checkout, { CARGO_TARGET_DIR: shared });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.reported.buildTarget, realpathSync(shared));
+  assert.equal(result.reported.compiledFor, realpathSync(checkout));
 });
 
 test('make dev talks to production Tickloop Cloud by default, over any configured origin', t => {
