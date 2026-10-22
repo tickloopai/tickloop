@@ -2338,7 +2338,9 @@ async fn a_chat_cleared_away_keeps_running_without_writing_into_the_foreground()
     });
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let mut child = trusted_async_agent_command()
+    let mut command = trusted_async_agent_command();
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
@@ -2399,6 +2401,10 @@ async fn a_chat_cleared_away_keeps_running_without_writing_into_the_foreground()
         "the cleared Chat's reply must not appear in the foreground: {transcript:?}"
     );
 
+    // EOF closes the View; wait for its daemon's queued Transcript writes before another daemon resumes.
+    support::cli_runtime::flush_transcripts(&runtime_directory)
+        .await
+        .unwrap();
     let resumed = run_with_config(directory.path(), &["--resume", chats[0]], "").await;
     assert!(
         resumed.status.success(),
