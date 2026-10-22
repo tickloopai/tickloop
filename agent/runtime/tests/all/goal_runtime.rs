@@ -1154,6 +1154,29 @@ async fn a_goal_cleared_by_a_holder_that_left_is_gone_for_the_next() {
 }
 
 #[tokio::test]
+async fn a_process_that_only_loaded_a_goal_leaves_without_restoring_it() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    first.manage_goal(chat, GoalAction::Clear).await.unwrap();
+    first.flush_transcripts().await;
+    first.shutdown().await;
+    // The second process still holds the goal it loaded, and leaves without touching it.
+    assert!(goal(&second, chat).await.is_some());
+    second.shutdown().await;
+
+    let third = Agent::open(
+        root.path().into(),
+        config(),
+        HoldingModel::new(Vec::new(), Vec::new()),
+    )
+    .unwrap();
+    third.resume_chat(chat).await.unwrap();
+    assert_eq!(goal(&third, chat).await, None);
+    third.shutdown().await;
+}
+
+#[tokio::test]
 async fn usage_charged_mid_turn_survives_a_crash() {
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
