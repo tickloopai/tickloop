@@ -602,7 +602,7 @@ async fn late_report_review_cannot_bypass_cancellation_rules_or_a_stopped_caller
                 agent.interrupt(child).await.unwrap();
             }
             "stop_caller" => {
-                agent.interrupt(chat).await.unwrap();
+                agent.stop(chat).await.unwrap();
             }
             _ => agent
                 .set_permission_rules(

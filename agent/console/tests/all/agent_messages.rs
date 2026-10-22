@@ -1,5 +1,9 @@
 use std::sync::{Arc, Mutex};
 
+use tickloop_agent_test_support::subagents::{
+    SubagentTimingModel, completed, task_notifications, wait_for_snapshot,
+};
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
@@ -41,6 +45,9 @@ impl ModelClient for PausedParentModel {
         if state(&request)["delegation"].is_null()
             && has_tool_result(&request, "delegate")
             && !has_text(&request, "Explicitly continue the parent.")
+            && !has_text(&request, "Try to resume the ended parent.")
+            && !has_text(&request, "Accepted context survives")
+            && !has_text(&request, "<task-notification>")
         {
             self.entered.notify_one();
             cancel.cancelled().await;
@@ -171,22 +178,6 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
         child
     );
     core.shutdown().await;
-}
-
-async fn completed(
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
-    receipt: &tickloop_agent_protocol::Receipt,
-) {
-    loop {
-        let event = tickloop_agent_test_support::next_event(events).await;
-        if event.run_id == receipt.run_id {
-            match event.kind {
-                EventKind::Completed { .. } => return,
-                EventKind::Failed(error) => panic!("execution failed: {error}"),
-                _ => {}
-            }
-        }
-    }
 }
 
 fn has_text(request: &ModelRequest, text: &str) -> bool {
@@ -892,7 +883,7 @@ async fn same_family_siblings_route_by_the_parent_handle_registry() {
     agent.shutdown().await;
 }
 
-async fn ended_parent_does_not_resume_from_child_messages(stopped: bool) {
+async fn ended_parent_resumes_from_child_messages(stopped: bool) {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(PausedParentModel {
         entered: tokio::sync::Notify::new(),
@@ -961,25 +952,25 @@ async fn ended_parent_does_not_resume_from_child_messages(stopped: bool) {
         .await
         .unwrap();
     completed(&mut events, &child_receipt).await;
-    let after = agent.snapshot(parent).await.unwrap();
-    assert_eq!(
-        after.chat_loop.state,
-        tickloop_agent_protocol::LoopState::Interrupted
-    );
-    assert_eq!(after.messages.len(), before.messages.len());
-    assert_eq!(after.chat_loop.run_id, before.chat_loop.run_id);
-    assert!(agent.snapshot(child.id).await.unwrap().events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted { call_id, result, .. } if call_id=="later" && result.is_error)));
+    let after = wait_for_snapshot(&agent, parent, "the new child message", |snapshot| {
+        agent_body_count(snapshot, "Try to resume the ended parent.") == 1
+            && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+    })
+    .await;
+    assert!(after.messages.len() > before.messages.len());
+    assert_ne!(after.chat_loop.run_id, before.chat_loop.run_id);
+    assert!(agent.snapshot(child.id).await.unwrap().events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted { call_id, result, .. } if call_id=="later" && !result.is_error)));
     agent.shutdown().await;
 }
 
 #[tokio::test]
-async fn interrupted_parent_does_not_resume_from_child_messages_or_eventual_results() {
-    ended_parent_does_not_resume_from_child_messages(false).await;
+async fn interrupted_parent_resumes_from_child_messages_and_eventual_results() {
+    ended_parent_resumes_from_child_messages(false).await;
 }
 
 #[tokio::test]
-async fn stopped_parent_does_not_resume_from_child_messages_or_eventual_results() {
-    ended_parent_does_not_resume_from_child_messages(true).await;
+async fn stopped_parent_resumes_from_new_child_messages() {
+    ended_parent_resumes_from_child_messages(true).await;
 }
 
 #[tokio::test]
@@ -1343,7 +1334,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
 }
 
 #[tokio::test]
-async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_human_continuation() {
+async fn interrupt_preserves_an_already_accepted_agent_message_and_automatically_runs_it() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(PausedParentModel {
         entered: tokio::sync::Notify::new(),
@@ -1423,41 +1414,21 @@ async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_huma
             break;
         }
     }
-    let interrupted = agent.snapshot(parent).await.unwrap();
-    assert_eq!(
-        interrupted.chat_loop.state,
-        tickloop_agent_protocol::LoopState::Interrupted
-    );
-    assert!(
-        interrupted
-            .pending_inputs
-            .iter()
-            .any(|pending| pending.agent_message.is_some()
-                && !pending.armed
-                && pending.input.contains("Accepted context survives"))
-    );
-    assert_eq!(
-        agent_body_count(&interrupted, "Accepted context survives"),
-        0
-    );
-    assert!(
-        agent
-            .take_queued_inputs(parent, true)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let resumed = agent
-        .submit(parent, "Explicitly continue the parent.".into())
-        .await
-        .unwrap();
-    completed(&mut events, &resumed).await;
-    let after = agent.snapshot(parent).await.unwrap();
-    assert_eq!(agent_body_count(&after, "Accepted context survives"), 1);
+    let after = wait_for_snapshot(
+        &agent,
+        parent,
+        "the accepted message after interruption",
+        |snapshot| {
+            agent_body_count(snapshot, "Accepted context survives") == 1
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+        },
+    )
+    .await;
+    assert!(after.pending_inputs.is_empty());
     assert!(model.routed.requests.lock().unwrap().iter().any(|request| {
         state(request)["delegation"].is_null()
             && has_text(request, "Accepted context survives")
-            && has_text(request, "Explicitly continue the parent.")
+            && !has_text(request, "Explicitly continue the parent.")
     }));
     agent.shutdown().await;
 }
@@ -2438,7 +2409,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
 }
 
 #[tokio::test]
-async fn family_stop_cancels_owned_background_commands_and_keeps_other_families() {
+async fn family_stop_preserves_owned_background_commands_and_keeps_other_families() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
@@ -2485,7 +2456,7 @@ async fn family_stop_cancels_owned_background_commands_and_keeps_other_families(
     let registration = core.subagents(root).await.unwrap();
     let child = core.snapshot(registration[0].child_chat_id).await.unwrap();
     assert!(!child.commands.is_empty());
-    assert!(child.commands.iter().all(|command| !matches!(
+    assert!(child.commands.iter().all(|command| matches!(
         command.state,
         tickloop_agent_protocol::CommandState::Running
             | tickloop_agent_protocol::CommandState::Background
@@ -3112,91 +3083,6 @@ async fn the_model_has_exactly_four_subagent_tools_and_no_pull_contract() {
     );
 }
 
-struct SubagentTimingModel {
-    routed: RoutedModel,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-    entered_count: std::sync::atomic::AtomicUsize,
-}
-
-impl SubagentTimingModel {
-    fn new(background: bool) -> Self {
-        Self::with_boundary(background, None)
-    }
-
-    fn with_boundary(background: bool, boundary: Option<String>) -> Self {
-        Self {
-            routed: RoutedModel::new(move |request| {
-                if !state(request)["delegation"].is_null() {
-                    tickloop_agent_test_support::text("CHILD-FINAL-REPORT")
-                } else if !has_tool_result(request, "launch") {
-                    tickloop_agent_test_support::call(
-                        "launch",
-                        "Subagent",
-                        json!({"task":"Inspect bounded evidence","name":"audit","run_in_background":background}),
-                    )
-                } else if let Some(command) = boundary
-                    .as_ref()
-                    .filter(|_| !has_tool_result(request, "busy-boundary"))
-                {
-                    tickloop_agent_test_support::call(
-                        "busy-boundary",
-                        "Bash",
-                        json!({"command":command,"description":"Hold the controlled parent tool boundary"}),
-                    )
-                } else {
-                    tickloop_agent_test_support::text("Parent finished its turn")
-                }
-            }),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-            entered_count: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl ModelClient for SubagentTimingModel {
-    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
-        self.routed.identity()
-    }
-    async fn generate_title(
-        &self,
-        request: ModelRequest,
-        _: UnboundedSender<ModelDelta>,
-        _: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_agent_test_support::title_output(request))
-    }
-    async fn complete(
-        &self,
-        request: ModelRequest,
-        events: UnboundedSender<ModelDelta>,
-        cancel: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        let is_child = !state(&request)["delegation"].is_null();
-        if is_child {
-            self.entered_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.entered.notify_one();
-            tokio::select! {
-                () = self.release.notified() => {},
-                () = cancel.cancelled() => return Err(ModelError::Cancelled),
-            }
-        }
-        let mut output = self.routed.complete(request, events, cancel).await?;
-        if is_child {
-            output.usage = tickloop_agent_protocol::Usage {
-                input_tokens: Some(11),
-                output_tokens: Some(7),
-                cache_read_input_tokens: Some(3),
-                cache_write_input_tokens: None,
-            };
-        }
-        Ok(output)
-    }
-}
-
 #[tokio::test]
 async fn a_background_subagent_returns_before_the_child_finishes() {
     let model = Arc::new(SubagentTimingModel::new(true));
@@ -3519,11 +3405,18 @@ async fn background_completion_cannot_spawn_an_unbounded_subagent_chain() {
 async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_notification() {
     let model = Arc::new(RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
-            tickloop_agent_test_support::call(
+            let mut output = tickloop_agent_test_support::call(
                 "question",
                 "AskUserQuestion",
                 tickloop_agent_test_support::single_question("Which bounded report?"),
-            )
+            );
+            output.insert(
+                0,
+                Content::Text {
+                    text: "CHILD-PARTIAL-REPORT".into(),
+                },
+            );
+            output
         } else if !has_tool_result(request, "launch") {
             tickloop_agent_test_support::call(
                 "launch",
@@ -3578,6 +3471,11 @@ async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_n
     core.shutdown().await;
     let snapshot = notification.expect("a stopped parked background run must report completion");
     assert_eq!(snapshot.family_completions.len(), 1);
+    assert!(
+        task_notifications(&snapshot)[0]
+            .1
+            .contains("CHILD-PARTIAL-REPORT")
+    );
 }
 
 #[tokio::test]
@@ -3910,73 +3808,6 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
     assert!(resumed_model.requests.lock().unwrap().iter().all(|request| request.messages.iter().flat_map(|message| &message.content).filter(|content| matches!(content, Content::Text {text} if text.starts_with("<task-notification>"))).count() == 1));
 }
 
-async fn wait_for_snapshot(
-    core: &Agent,
-    chat: Uuid,
-    awaited: &str,
-    ready: impl Fn(&tickloop_agent_protocol::ChatSnapshot) -> bool,
-) -> tickloop_agent_protocol::ChatSnapshot {
-    let mut latest = String::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let snapshot = core.snapshot(chat).await.unwrap();
-            if ready(&snapshot) {
-                break snapshot;
-            }
-            latest = format!(
-                "completions {:?}; loop {:?}; latest events {:?}",
-                snapshot
-                    .family_completions
-                    .iter()
-                    .map(|completion| &completion.notification)
-                    .collect::<Vec<_>>(),
-                snapshot.chat_loop,
-                snapshot.events.iter().rev().take(6).collect::<Vec<_>>()
-            );
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {awaited}: {latest}"))
-}
-
-fn task_notifications(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Vec<(usize, &str)> {
-    snapshot
-        .messages
-        .iter()
-        .enumerate()
-        .flat_map(|(index, message)| {
-            message
-                .content
-                .iter()
-                .filter_map(move |content| match content {
-                    Content::Text { text } if text.starts_with("<task-notification>") => {
-                        Some((index, text.as_str()))
-                    }
-                    _ => None,
-                })
-        })
-        .collect()
-}
-
-/// Whether nothing settles `chat`'s only completion record within a bounded wait.
-async fn completion_stays_pending(core: &Agent, chat: Uuid) -> bool {
-    tokio::time::timeout(std::time::Duration::from_millis(300), async {
-        loop {
-            let snapshot = core.snapshot(chat).await.unwrap();
-            if !matches!(
-                snapshot.family_completions[0].notification,
-                tickloop_agent_protocol::SubagentNotificationDelivery::Pending
-            ) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .is_err()
-}
-
 const CHILD_VIEW_CONTINUE: &str = "HUMAN-CONTINUE-TYPED-IN-THE-CHILD-VIEW";
 
 /// Fails every child request with a provider error until a human continues the child in its
@@ -4157,10 +3988,8 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
     assert_eq!(tick.executions.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-const ROOT_CONTINUE: &str = "Continue the root after its provider failure";
-
 /// Holds each child request until released, and fails the root's turn once it launched its
-/// child until a human continues the root.
+/// child, then allows its completion notification to start a new turn.
 struct FailingRootModel {
     timing: SubagentTimingModel,
 }
@@ -4186,7 +4015,7 @@ impl ModelClient for FailingRootModel {
     ) -> Result<ModelOutput, ModelError> {
         if state(&request)["delegation"].is_null()
             && has_tool_result(&request, "launch")
-            && !has_text(&request, ROOT_CONTINUE)
+            && !has_text(&request, "<task-notification>")
         {
             return Err(ModelError::InvalidResponse(
                 "Controlled root provider failure".into(),
@@ -4196,16 +4025,8 @@ impl ModelClient for FailingRootModel {
     }
 }
 
-struct HeldCompletion {
-    core: Agent,
-    root: Uuid,
-    events: tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
-    _directory: tempfile::TempDir,
-}
-
-/// A root whose run failed after launching a background child, holding that child's later
-/// completion pending without starting the ended root.
-async fn failed_root_holding_a_child_completion() -> HeldCompletion {
+#[tokio::test]
+async fn a_completion_wakes_a_failed_root_without_human_continue() {
     let model = Arc::new(FailingRootModel {
         timing: SubagentTimingModel::new(true),
     });
@@ -4229,64 +4050,25 @@ async fn failed_root_holding_a_child_completion() -> HeldCompletion {
             break;
         }
     }
-    let failed = core.snapshot(root).await.unwrap();
     model.timing.release.notify_one();
-    wait_for_snapshot(&core, root, "the child's completion record", |snapshot| {
-        snapshot.family_completions.len() == 1
-    })
-    .await;
-    assert!(
-        completion_stays_pending(&core, root).await,
-        "a failed root keeps the completion pending: {:?}",
-        core.snapshot(root).await.unwrap().family_completions[0].notification
-    );
-    let waiting = core.snapshot(root).await.unwrap();
-    assert_eq!(
-        waiting.chat_loop.state,
-        tickloop_agent_protocol::LoopState::Failed
-    );
-    assert_eq!(waiting.chat_loop.run_id, failed.chat_loop.run_id);
-    assert_eq!(waiting.messages.len(), failed.messages.len());
-    assert!(
-        waiting.pending_inputs.is_empty(),
-        "the ended root is not started"
-    );
-    HeldCompletion {
-        core,
+    let delivered = wait_for_snapshot(
+        &core,
         root,
-        events,
-        _directory: directory,
-    }
-}
-
-#[tokio::test]
-async fn a_completion_for_a_failed_root_waits_for_its_explicit_continue() {
-    use tickloop_agent_protocol::{LoopState, SubagentNotificationDelivery};
-    let HeldCompletion {
-        core,
-        root,
-        mut events,
-        _directory,
-        ..
-    } = failed_root_holding_a_child_completion().await;
-    let continued = core.submit(root, ROOT_CONTINUE.into()).await.unwrap();
-    completed(&mut events, &continued).await;
-    wait_for_snapshot(&core, root, "the deferred notice", |snapshot| {
-        matches!(
-            snapshot.family_completions[0].notification,
-            SubagentNotificationDelivery::Queued
-        ) && snapshot.pending_inputs.is_empty()
-            && snapshot.chat_loop.state == LoopState::Idle
-            && task_notifications(snapshot).len() == 1
-    })
+        "automatic notification after failure",
+        |snapshot| {
+            task_notifications(snapshot).len() == 1
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+        },
+    )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let delivered = core.snapshot(root).await.unwrap();
-    core.shutdown().await;
-    let notifications = task_notifications(&delivered);
-    assert_eq!(notifications.len(), 1, "delivered exactly once");
-    assert!(notifications[0].1.contains("CHILD-FINAL-REPORT"));
+    assert_ne!(delivered.chat_loop.run_id, Some(receipt.run_id));
     assert_eq!(delivered.family_completions.len(), 1);
+    assert!(
+        task_notifications(&delivered)[0]
+            .1
+            .contains("CHILD-FINAL-REPORT")
+    );
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -4312,33 +4094,17 @@ async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_chil
         }
     }
     model.release.notify_one();
-    let recorded = wait_for_snapshot(&core, root, "the child's completion record", |snapshot| {
-        snapshot.family_completions.len() == 1
-    })
-    .await;
-    assert!(
-        matches!(
-            recorded.family_completions[0].notification,
-            SubagentNotificationDelivery::Pending
-        ),
-        "no foreground call returns this run: {:?}",
-        recorded.family_completions[0].notification
-    );
-    assert_eq!(recorded.chat_loop.state, LoopState::Interrupted);
-    assert_eq!(
-        tool_result(&recorded.messages, "launch").unwrap()["status"],
-        "interrupted"
-    );
-    let continued = core
-        .submit(root, "Continue after the interruption".into())
-        .await
-        .unwrap();
-    completed(&mut events, &continued).await;
     let delivered = wait_for_snapshot(&core, root, "the child's notice", |snapshot| {
-        matches!(
-            snapshot.family_completions[0].notification,
-            SubagentNotificationDelivery::Queued
-        ) && snapshot.pending_inputs.is_empty()
+        snapshot
+            .family_completions
+            .first()
+            .is_some_and(|completion| {
+                matches!(
+                    completion.notification,
+                    SubagentNotificationDelivery::Queued
+                )
+            })
+            && snapshot.pending_inputs.is_empty()
             && snapshot.chat_loop.state == LoopState::Idle
             && task_notifications(snapshot).len() == 1
     })

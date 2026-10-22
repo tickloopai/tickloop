@@ -1,8 +1,8 @@
 //! The queue a Chat's input ledger carries from one host to the next: every queued input is
 //! accepted with its content, so a load under durable wait hosting continues the answers a lost
 //! host left, ahead of the inputs it queues again, and fails an input whose host was lost three
-//! times in a row. Under process wait hosting the inputs the Agent queued for itself are lost, as
-//! before.
+//! times in a row. Process wait hosting also preserves unconsumed family messages and their
+//! delivery state, while other inputs the Agent queued for itself are lost.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

@@ -372,7 +372,7 @@ fn chat_snapshot() -> ChatSnapshot {
             },
         },
         "family_completions": [{
-            "notification": {"rejected": {"code": "stale_target", "message": "The receiving parent is stopped"}},
+            "notification": {"rejected": {"code": "stale_target", "message": "The receiving parent is unavailable"}},
             "usage": {"input_tokens": 11, "output_tokens": 7},
             "child_chat_id": id(0xc2),
             "child_loop_id": id(0x11),

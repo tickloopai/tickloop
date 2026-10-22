@@ -712,13 +712,13 @@ mod tests {
         refused.started_at = None;
         refused.notification = SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
             code: FamilyMessageRejectionCode::StaleTarget,
-            message: "The receiving parent is stopped".into(),
+            message: "The receiving parent is unavailable".into(),
         });
         let (heading, body) = block(&refused, &snapshot, OutputDetail::Preview);
         assert_eq!(joined(&heading), "\n⏺ Teammate @audit finished\n");
         assert_eq!(
             joined(&body),
-            "  Plain reply text\n  Notification not delivered: The receiving parent is stopped\n"
+            "  Plain reply text\n  Notification not delivered: The receiving parent is unavailable\n"
         );
     }
 
