@@ -2821,21 +2821,32 @@ async fn subscribe_loop(agent: &Agent, chat: Uuid, instances: &[InstanceRef]) ->
         .collect()
 }
 
-/// Waits until `root` holds `expected` watermark files, which are written and removed off the
-/// runtime: real time bounds the wait, since paused time would run out before the disk does.
-async fn watermark_files_settle_at(
-    root: &std::path::Path,
-    expected: usize,
-) -> Vec<std::path::PathBuf> {
+/// Waits until the subscription's watermark records the sequence `expected`, or is gone for
+/// `None`. Watermarks are written and removed off the runtime: real time bounds the wait, since
+/// paused time would run out before the disk does. A watermark is replaced atomically, so the
+/// file under its own name is always whole.
+async fn watermark_settles_at(root: &std::path::Path, subscription: Uuid, expected: Option<u64>) {
+    let name = format!("{subscription}.json");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let files = watermark_files(root);
-        if files.len() == expected {
-            return files;
+        let recorded = watermark_files(root)
+            .into_iter()
+            .find(|path| path.file_name().is_some_and(|file| file == name.as_str()))
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["sequence"].as_u64()
+            });
+        let settled = match (expected, recorded) {
+            (None, None) => true,
+            (Some(sequence), Some(recorded)) => recorded == Some(sequence),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if settled {
+            return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{expected} watermark file(s) expected: {files:?}"
+            "the watermark of {subscription} records {expected:?}: {recorded:?}"
         );
         tokio::task::yield_now().await;
     }
@@ -2890,11 +2901,10 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("three"));
     // The watermark follows the acceptance on its own, not the turn.
-    let files = watermark_files_settle_at(&root, 1).await;
-    let recorded: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
-    assert_eq!(recorded["sequence"], 3);
+    watermark_settles_at(&root, subscription, Some(3)).await;
 
+    // The repeat is dropped as the stream hands it on, which nothing shows; this runtime runs
+    // on the test's own thread, so yielding lets the stream's tasks take it, whatever the load.
     stream.push(update(5, 3, "three again"));
     settle().await;
     accumulated(&agent, chat, 0).await;
@@ -2912,12 +2922,15 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("four"));
 
+    // Cancelled while the delivery of "four" may still be writing its watermark.
     agent
         .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
         .await
         .unwrap();
-    watermark_files_settle_at(&root, 0).await;
+    watermark_settles_at(&root, subscription, None).await;
+    // Once nothing of the Agent runs any more, no watermark came back.
     agent.shutdown().await;
+    assert_eq!(watermark_files(&root), Vec::<std::path::PathBuf>::new());
 }
 
 /// The watermark follows a delivery's acceptance: one that cannot be written holds nothing back,
