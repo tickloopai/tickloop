@@ -7,16 +7,15 @@
 //! 3. Seqs start above both the committed `last_seq` and the stream's top.
 //! 4. A takeover writes a resync marker unless the previous holder, if any, released the lease
 //!    and published everything it committed. Every marker first raises `last_seq` to its seq.
-//! 5. `with_seams → advance → outcome → quiesce → shutdown → sync`, or for a scheduler's wake
-//!    `with_seams → wake(due_at) → quiesce → shutdown → sync`.
+//! 5. `with_seams → advance → outcome → quiesce → shutdown → sync`.
 //! 6. Events go out as an ordered prefix: a Harness event that is not transient waits for the
 //!    commit that reflects it, and everything after it waits too. Nothing is published or
 //!    appended once the local deadline has passed.
 //! 7. A publish that fails, or events the Harness broadcast dropped, owe a resync marker.
 //! 8. The task is acknowledged only after `sync` succeeded, every event is published and no
 //!    marker is owed; a fence or a stale epoch stops the holder without acknowledging. What the
-//!    Chat waits on once quiet is written with the acknowledgement, so the host knows when to
-//!    come back: its scheduler wakes the family at `wake_at`, giving that time as `due_at`.
+//!    Chat waits on once quiet is written with the acknowledgement, so the host knows what it
+//!    waits for.
 //!
 //! A Harness whose waits are durable leaves a Run that waits for a person suspended in the
 //! Transcript; the holding that delivers the reply rebuilds it from there.
@@ -31,17 +30,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use tickloop_agent_protocol::{ChatId, Event, LoopId};
+use tickloop_agent_protocol::{ChatId, Event};
 use tickloop_agent_runtime::transcript::{
     AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
     TranscriptError, TranscriptStore,
 };
-use tickloop_agent_runtime::{
-    Agent, AgentError, Quiescence, ScheduleDecision, TurnOutcome, TurnRequest, Waits,
-};
+use tickloop_agent_runtime::{Agent, AgentError, Quiescence, TurnOutcome, TurnRequest, Waits};
 use tickloop_agent_transcript::Line;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -140,8 +137,6 @@ struct ChatRow {
     consecutive_unclean: u32,
     /// The epoch whose unclean end `consecutive_unclean` counted last.
     counted_unclean: Option<u64>,
-    /// The epoch of the last released lease: the scheduler's wake keys carry it.
-    released_epoch: u64,
     /// The sweep gave up on the family after three unclean holdings in a row; a user's action
     /// clears it.
     needs_attention: bool,
@@ -182,9 +177,6 @@ pub enum TaskKind {
         member: Option<ChatId>,
         request: Box<TurnRequest>,
     },
-    /// The scheduler's wake for the time the family asked to be woken at; acknowledged when the
-    /// holding ends.
-    Wake { due_at: Option<SystemTime> },
     /// The sweep's load of a family whose holder went away; acknowledged when the holding ends.
     Takeover,
     /// The load of a family a holder handed over; acknowledged when the holding ends.
@@ -300,7 +292,6 @@ impl DurableChats {
             if let Some(held) = &mut row.lease {
                 held.released = true;
             }
-            row.released_epoch = lease.epoch;
             row.consecutive_unclean = 0;
             row.needs_attention = false;
             Ok(())
@@ -682,9 +673,8 @@ fn count_unclean_ending(row: &mut ChatRow, now: Duration) {
     }
 }
 
-/// The scheduler of the reference host: it wakes each released family at the time it asked
-/// for, delivers claims nobody extended again, and takes over each family whose holder went
-/// away with nothing left to load it again.
+/// The scheduler of the reference host: it delivers claims nobody extended again, and takes
+/// over each family whose holder went away with nothing left to load it again.
 pub struct ReferenceScheduler {
     chats: Arc<DurableChats>,
 }
@@ -694,35 +684,16 @@ impl ReferenceScheduler {
         Self { chats }
     }
 
-    /// One poll at the wall time `now`; the keys of the tasks it queued.
-    ///
-    /// - A family whose `wake_at` is due gets `wake:{root}:{released_epoch}:{wake_at µs}`,
-    ///   with `due_at = wake_at`: a later release that writes the same time back gets a new
-    ///   key.
-    /// - A family whose lease expired unreleased, with no queued or claimed task and fewer
-    ///   than three unclean holdings in a row, gets `takeover:{root}:{epoch}`, tried once.
-    pub fn tick(&self, now: SystemTime) -> Vec<String> {
+    /// One poll; the keys of the tasks it queued. A family whose lease expired unreleased, with
+    /// no queued or claimed task and fewer than three unclean holdings in a row, gets
+    /// `takeover:{root}:{epoch}`, tried once.
+    pub fn tick(&self) -> Vec<String> {
         self.chats.reclaim_expired_tasks();
         let clock = self.chats.clock.now();
         let mut due = Vec::new();
         {
             let mut rows = self.chats.rows.lock().unwrap();
             for (root, row) in rows.iter_mut() {
-                if let Some(wake_at) = row.waiting.as_ref().and_then(|waits| waits.wake_at)
-                    && wake_at <= now
-                {
-                    let micros = wake_at
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |since| since.as_micros());
-                    due.push((
-                        *root,
-                        format!("wake:{root}:{}:{micros}", row.released_epoch),
-                        TaskKind::Wake {
-                            due_at: Some(wake_at),
-                        },
-                        TASK_MAX_ATTEMPTS,
-                    ));
-                }
                 count_unclean_ending(row, clock);
                 let is_abandoned = row
                     .lease
@@ -804,29 +775,17 @@ pub enum CrashPoint {
     BeforeAck,
 }
 
-/// What a holding was given to do.
-enum Task {
-    /// A turn of the family member `member`, or of the root Chat.
-    Turn {
-        member: Option<ChatId>,
-        request: Box<TurnRequest>,
-    },
-    /// The scheduler's wake of the family for the time it was asked to come back at.
-    Wake { due_at: Option<SystemTime> },
-    /// The user's answer to a schedule the model created in a Loop of the family member
-    /// `member`, or of the root Chat.
-    DecideSchedule {
-        member: Option<ChatId>,
-        loop_id: LoopId,
-        decision: ScheduleDecision,
-    },
+/// What a holding was given to do: a turn of the family member `member`, or of the root Chat.
+struct Task {
+    member: Option<ChatId>,
+    request: Box<TurnRequest>,
 }
 
 /// What one holding of the lease did with its task.
 #[derive(Clone, Debug)]
 pub struct TurnReport {
     pub epoch: u64,
-    /// The outcome `advance` reached, if the holder got that far; a wake has none.
+    /// The outcome `advance` reached, if the holder got that far.
     pub outcome: Option<TurnOutcome>,
     pub halt: Option<Halt>,
     pub acknowledged: bool,
@@ -991,35 +950,9 @@ impl Holding {
         let input = request.input_id;
         self.hold(
             input,
-            Task::Turn {
+            Task {
                 member,
                 request: Box::new(request),
-            },
-        )
-        .await
-    }
-
-    /// Steps 2 to 8 for the scheduler's task `task`, which wakes the Chat's family for the time
-    /// `due_at` its last acknowledgement asked to be woken at, or for a takeover without one.
-    pub async fn wake(&self, task: Uuid, due_at: Option<SystemTime>) -> TurnReport {
-        self.hold(task, Task::Wake { due_at }).await
-    }
-
-    /// Steps 2 to 8 for the user's task `task` that confirms or rejects the schedule the model
-    /// created for the Loop `loop_id` of the family member `member`, or of the root Chat.
-    pub async fn decide_schedule(
-        &self,
-        task: Uuid,
-        member: Option<ChatId>,
-        loop_id: LoopId,
-        decision: ScheduleDecision,
-    ) -> TurnReport {
-        self.hold(
-            task,
-            Task::DecideSchedule {
-                member,
-                loop_id,
-                decision,
             },
         )
         .await
@@ -1048,7 +981,7 @@ impl Holding {
         agent.shutdown().await;
         let synced = match reached {
             Ok(outcome) => {
-                report.outcome = outcome;
+                report.outcome = Some(outcome);
                 match self.until_halted(agent.sync()).await {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(error)) => Err(self.agent_failure(error)),
@@ -1120,7 +1053,7 @@ impl Holding {
         stop: &CancellationToken,
         pump: &mut Option<JoinHandle<()>>,
         report: &mut TurnReport,
-    ) -> Result<Option<TurnOutcome>, Halt> {
+    ) -> Result<TurnOutcome, Halt> {
         let chat = match self.shared.chats.harness_chat(self.shared.lease.chat) {
             Some(chat) => chat,
             None => self
@@ -1140,40 +1073,19 @@ impl Holding {
             stop.clone(),
             self.config.retry_delay,
         )));
-        let (target, outcome) = match task {
-            Task::Turn { member, request } => {
-                let target = member.unwrap_or(chat);
-                let turn = self
-                    .until_halted(agent.advance(target, *request))
-                    .await?
-                    .map_err(|error| self.agent_failure(error))?;
-                let outcome = self
-                    .until_halted(turn.outcome())
-                    .await?
-                    .map_err(|error| self.agent_failure(error))?;
-                if matches!(outcome, TurnOutcome::Fenced) {
-                    return Err(self.shared.halt_or(Halt::Fenced));
-                }
-                (target, Some(outcome))
-            }
-            Task::Wake { due_at } => {
-                self.until_halted(agent.wake(chat, due_at))
-                    .await?
-                    .map_err(|error| self.agent_failure(error))?;
-                (chat, None)
-            }
-            Task::DecideSchedule {
-                member,
-                loop_id,
-                decision,
-            } => {
-                let target = member.unwrap_or(chat);
-                self.until_halted(agent.decide_schedule(target, loop_id, decision))
-                    .await?
-                    .map_err(|error| self.agent_failure(error))?;
-                (target, None)
-            }
-        };
+        let Task { member, request } = task;
+        let target = member.unwrap_or(chat);
+        let turn = self
+            .until_halted(agent.advance(target, *request))
+            .await?
+            .map_err(|error| self.agent_failure(error))?;
+        let outcome = self
+            .until_halted(turn.outcome())
+            .await?
+            .map_err(|error| self.agent_failure(error))?;
+        if matches!(outcome, TurnOutcome::Fenced) {
+            return Err(self.shared.halt_or(Halt::Fenced));
+        }
         if let Quiescence::Waiting(waits) = self.until_halted(agent.quiesce(target)).await? {
             report.waiting = Some(waits);
         }

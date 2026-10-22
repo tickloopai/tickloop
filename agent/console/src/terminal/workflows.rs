@@ -124,7 +124,6 @@ pub(super) struct WorkflowEffect {
     pub(super) selection: Option<(Uuid, Option<Uuid>)>,
     pub(super) receipt: Option<Receipt>,
     pub(super) restored: Option<ChatSnapshot>,
-    pub(super) timer: Option<(Uuid, Uuid)>,
 }
 
 impl Workflow {
@@ -194,7 +193,7 @@ impl Workflow {
         let context = if snapshot.loops.is_empty() {
             "Choose New goal to start another goal with your next input, keeping this Chat's history."
         } else {
-            "Choose a goal to view its trigger, configure a timer or select it for your next message."
+            "Choose a goal to view its trigger or select it for your next message."
         };
         Ok((
             menu("Loops", vec![context.into()], options),
@@ -228,11 +227,7 @@ impl Workflow {
             menu(
                 "Loop details",
                 context,
-                vec![
-                    "Use this goal".into(),
-                    "Configure timer · edit command".into(),
-                    "Back to Loops".into(),
-                ],
+                vec!["Use this goal".into(), "Back to Loops".into()],
             ),
             Self::Goal { chat, goal },
         ))
@@ -475,10 +470,6 @@ impl Workflow {
             Self::Goal { chat, goal } => {
                 match index {
                     1 => {
-                        effect.timer = Some((chat, goal));
-                        return Ok(effect);
-                    }
-                    2 => {
                         effect.next = Some(Self::goals(agent, chat).await?);
                         return Ok(effect);
                     }

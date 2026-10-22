@@ -1407,7 +1407,6 @@ mod feedback_admission_tests {
                 tools: crate::ToolPolicy::web_fetch_only(),
                 host_rules: Vec::new(),
                 task_tools: None,
-                min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: WaitHosting::Durable,
                 citation_style: Default::default(),
                 system_prompt_addition: None,

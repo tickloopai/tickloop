@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
     EventKind, LoopSnapshot, LoopState, OperationState, PendingInput, Question, QuestionAnswer,
-    QuestionRequest, Receipt, ToolDefinition, ToolResult, Trigger,
+    QuestionRequest, Receipt, ToolDefinition, ToolResult,
 };
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
@@ -273,54 +273,24 @@ Usage notes:
 pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
     vec![ask_user_question_definition(is_delegated), ToolDefinition {
         name: START_GOAL_TOOL_NAME.into(),
-        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run. Give a schedule only when the user asked for the goal to run at certain times: the goal then runs at each scheduled time, starting with the next one, instead of now.".into(),
+        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run.".into(),
         input_schema: json!({"type":"object","properties":{
-            "goal":{"type":"string"},
-            "schedule":{"type":"string","description":"When the goal runs: `every <N>s|m|h|d` (counted from now), `daily HH:MM [±HH:MM]`, `weekly <day>[,<day>…] HH:MM [±HH:MM]` with days mon..sun, or `at <RFC 3339 time>` for once. Times without an offset are UTC. Runs missed while nothing could run are skipped, not caught up."}
+            "goal":{"type":"string"}
         },"required":["goal"],"additionalProperties":false}),
     }]
 }
 
-/// Whether the call is a StartGoal that creates a schedule.
-pub(crate) fn creates_schedule(name: &str, input: &Value) -> bool {
-    name == START_GOAL_TOOL_NAME
-        && input
-            .get("schedule")
-            .is_some_and(|schedule| !schedule.is_null())
-}
-
-/// What a StartGoal call that registered `goal` returns: the input queued for it, or for a
-/// scheduled goal its schedule, next scheduled time and expiry, or that it awaits the user's
-/// confirmation.
+/// What a StartGoal call that registered `goal` returns: the input queued for it.
 pub(crate) fn started_goal_result(
     chat_id: ChatId,
     goal: &LoopSnapshot,
     queued_run: Option<RunId>,
 ) -> ToolResult {
-    let schedule = goal.trigger.as_ref().and_then(|trigger| trigger.schedule);
-    let content = match (schedule, queued_run) {
-        (Some(schedule), _) => {
-            let trigger = goal.trigger.as_ref();
-            let next_run_at = trigger
-                .filter(|trigger| trigger.armed)
-                .and_then(Trigger::next_scheduled_ms)
-                .map(tickloop_agent_base::timestamp::format_timestamp);
-            let expires_at = trigger
-                .and_then(|trigger| trigger.expires_at_ms)
-                .map(tickloop_agent_base::timestamp::format_timestamp);
-            let state = if trigger.is_some_and(Trigger::awaits_confirmation) {
-                "awaiting_user_confirmation"
-            } else {
-                "scheduled"
-            };
-            json!({"chat_id":chat_id,"loop_id":goal.id,"state":state,
-                "schedule":schedule.to_string(),"next_run_at":next_run_at,"expires_at":expires_at})
-        }
-        (None, Some(run_id)) => {
+    let content = match queued_run {
+        Some(run_id) => {
             json!({"chat_id":chat_id,"loop_id":goal.id,"run_id":run_id,"state":"queued"})
         }
-        // A goal whose schedule was removed since.
-        (None, None) => json!({"chat_id":chat_id,"loop_id":goal.id,"state":"registered"}),
+        None => json!({"chat_id":chat_id,"loop_id":goal.id,"state":"registered"}),
     };
     ToolResult {
         content: content.to_string(),
@@ -461,51 +431,35 @@ impl Agent {
         call_id: &str,
         name: &str,
         input: &Value,
-        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Option<Result<ToolResult, String>> {
         match name {
             ASK_USER_QUESTION_TOOL_NAME => {
                 Some(self.ask_question(receipt, call_id, input, cancel).await)
             }
-            START_GOAL_TOOL_NAME => Some(
-                self.start_goal(receipt, call_id, input, was_approved_by_human, cancel)
-                    .await,
-            ),
+            START_GOAL_TOOL_NAME => Some(self.start_goal(receipt, call_id, input, cancel).await),
             _ => None,
         }
     }
 
-    /// Registers the goal. A schedule it gives expires after the model's schedule lifetime and
-    /// runs only once the user confirms it: the call's approval when a person approved it,
-    /// otherwise a later `decide_schedule`.
+    /// Registers the goal and queues it.
     async fn start_goal(
         &self,
         receipt: &Receipt,
         call_id: &str,
         input: &Value,
-        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Input {
             goal: String,
-            #[serde(default)]
-            schedule: Option<String>,
         }
-        let parsed: Input = serde_json::from_value(input.clone()).map_err(|_| {
-            format!("{START_GOAL_TOOL_NAME} requires a goal string and an optional schedule string")
-        })?;
+        let parsed: Input = serde_json::from_value(input.clone())
+            .map_err(|_| format!("{START_GOAL_TOOL_NAME} requires a goal string"))?;
         if parsed.goal.trim().is_empty() || parsed.goal.len() > MAX_ANSWER_BYTES {
             return Err("goal must contain 1 to 65536 bytes".into());
         }
-        let schedule = parsed
-            .schedule
-            .as_deref()
-            .map(tickloop_agent_protocol::Recurrence::parse)
-            .transpose()
-            .map_err(|error| format!("invalid schedule: {error}"))?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
             .get_mut(&receipt.chat_id)
@@ -552,93 +506,50 @@ impl Agent {
             run_id: Uuid::new_v4(),
         };
         let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
-        let trigger = match schedule {
-            Some(schedule) => {
-                if triggers::active_schedules(&chat.snapshot) >= triggers::MAX_ACTIVE_SCHEDULES {
-                    return Err(triggers::too_many_schedules());
-                }
-                let mut trigger = Trigger {
-                    id: Uuid::new_v4(),
-                    prompt: parsed.goal.clone(),
-                    prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                    schedule: Some(schedule),
-                    expires_at_ms: Some(now.saturating_add(triggers::MODEL_SCHEDULE_LIFETIME_MS)),
-                    accepts_events: false,
-                    armed: was_approved_by_human,
-                    armed_at_ms: None,
-                    last_fired_at_ms: None,
-                    confirmation: Some(if was_approved_by_human {
-                        tickloop_agent_protocol::ScheduleConfirmation::Confirmed { at_ms: now }
-                    } else {
-                        tickloop_agent_protocol::ScheduleConfirmation::Pending
-                    }),
-                    subscriptions: Vec::new(),
-                };
-                let armed_at = self.inner.schedule_clock.now_ms();
-                if let Some(reason) =
-                    triggers::invalid_trigger(&trigger, self.inner.min_schedule_interval, armed_at)
-                {
-                    return Err(reason);
-                }
-                if trigger.armed {
-                    trigger.arm_at(armed_at);
-                }
-                Some(trigger)
-            }
-            None => None,
-        };
         chat.bookkeeping.add_loop(
             &mut snapshot,
             LoopSnapshot {
                 id: new_receipt.loop_id,
                 goal: parsed.goal.clone(),
-                state: match trigger {
-                    Some(_) => LoopState::WaitingTrigger,
-                    None => LoopState::Queued,
-                },
+                state: LoopState::Queued,
                 run_id: None,
                 run_started_at: None,
-                trigger: trigger.clone(),
+                trigger: None,
                 event_sources: Vec::new(),
                 state_since: Some(now),
             },
         );
-        let queued_run = match trigger {
-            Some(_) => None,
-            None => {
-                let index = snapshot
-                    .pending_inputs
-                    .iter()
-                    .position(|pending| pending.trigger_source.is_some())
-                    .unwrap_or(snapshot.pending_inputs.len());
-                snapshot.last_queue_sequence += 1;
-                let queued_sequence = snapshot.last_queue_sequence;
-                let queued = PendingInput {
-                    receipt: new_receipt.clone(),
-                    input: parsed.goal,
-                    contexts: Vec::new(),
-                    agent_message: None,
-                    directed_human: None,
-                    denial_reference: None,
-                    trigger_source: None,
-                    armed: true,
-                    queued_sequence,
-                    task_continuation: false,
-                    is_skill_invocation: false,
-                    attached_file_reads: Vec::new(),
-                };
-                chat.bookkeeping.lifecycle.accept(
-                    &lifecycle::LedgerInput::new(
-                        tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
-                        tickloop_agent_transcript::InputOp::Goal,
-                        &queued.input,
-                    ),
-                    &queued,
-                );
-                snapshot.pending_inputs.insert(index, queued);
-                Some(new_receipt.run_id)
-            }
+        let index = snapshot
+            .pending_inputs
+            .iter()
+            .position(|pending| pending.trigger_source.is_some())
+            .unwrap_or(snapshot.pending_inputs.len());
+        snapshot.last_queue_sequence += 1;
+        let queued_sequence = snapshot.last_queue_sequence;
+        let queued = PendingInput {
+            receipt: new_receipt.clone(),
+            input: parsed.goal,
+            contexts: Vec::new(),
+            agent_message: None,
+            directed_human: None,
+            denial_reference: None,
+            trigger_source: None,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation: false,
+            attached_file_reads: Vec::new(),
         };
+        chat.bookkeeping.lifecycle.accept(
+            &lifecycle::LedgerInput::new(
+                tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
+                tickloop_agent_transcript::InputOp::Goal,
+                &queued.input,
+            ),
+            &queued,
+        );
+        snapshot.pending_inputs.insert(index, queued);
+        let queued_run = Some(new_receipt.run_id);
         let goal = snapshot
             .loops
             .iter()
@@ -655,21 +566,6 @@ impl Agent {
         }
         self.save(&snapshot);
         chat.snapshot = snapshot;
-        let timer = trigger.map(|trigger| {
-            let cancel = CancellationToken::new();
-            chat.trigger_cancellations.insert(loop_id, cancel.clone());
-            (trigger, cancel)
-        });
-        drop(chats);
-        match timer {
-            Some((trigger, cancel)) if trigger.armed => {
-                self.start_armed_trigger(receipt.chat_id, loop_id, trigger, cancel)
-                    .await;
-            }
-            // A schedule awaiting confirmation keeps only its deadline.
-            Some((trigger, cancel)) => self.trigger_task(receipt.chat_id, loop_id, trigger, cancel),
-            None => {}
-        }
         Ok(result)
     }
 

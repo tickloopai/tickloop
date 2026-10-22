@@ -329,8 +329,6 @@
               "id": "00000000-0000-0000-0000-000000000030",
               "prompt": "Report changes",
               "prompt_source": "LoopGoal",
-              "schedule": "every 1m",
-              "expires_at_ms": null,
               "accepts_events": true,
               "armed": true,
               "subscriptions": []
@@ -935,8 +933,6 @@
               "id": "00000000-0000-0000-0000-000000000030",
               "prompt": "Report changes",
               "prompt_source": "LoopGoal",
-              "schedule": "every 1m",
-              "expires_at_ms": null,
               "accepts_events": true,
               "armed": true,
               "subscriptions": []

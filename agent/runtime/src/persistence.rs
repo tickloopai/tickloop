@@ -1631,17 +1631,6 @@ fn plan_entry_content(
     Some((record, run_id))
 }
 
-/// A recorded Trigger as configured: without the latest scheduled time its Loop dealt with,
-/// which each fire moves on without reconfiguring anything.
-fn configured_trigger(trigger: &Option<serde_json::Value>) -> Option<serde_json::Value> {
-    trigger.clone().map(|mut trigger| {
-        if let Some(fields) = trigger.as_object_mut() {
-            fields.remove("last_fired_at_ms");
-        }
-        trigger
-    })
-}
-
 /// 把 Loop 状态写成接在 `parent` 之后的 system 条目，并记为链上的最新状态。
 fn record_loop(
     log: &mut ChatLog,
@@ -1664,7 +1653,7 @@ fn record_loop(
         .recorded_loops
         .get(&loop_id)
         .is_some_and(|(previous, _)| {
-            configured_trigger(&previous.trigger) != configured_trigger(&record.trigger)
+            previous.trigger != record.trigger
                 || previous.trigger_awaits_resume != record.trigger_awaits_resume
         })
     {
@@ -1899,24 +1888,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         if let (Some(run_id), Some(loop_id)) = (entry.run_id, entry_loop) {
             restored.run_loops.insert(run_id, loop_id);
         }
-        if let Some(mut record) = entry.loop_record.clone().filter(|_| entry.is_loop_record()) {
-            if let Some(trigger) = record.trigger.as_mut()
-                && trigger
-                    .get("interval_seconds")
-                    .is_some_and(serde_json::Value::is_u64)
-                && trigger
-                    .get("schedule")
-                    .is_none_or(serde_json::Value::is_null)
-                && trigger.get("armed").and_then(serde_json::Value::as_bool) == Some(true)
-                && trigger
-                    .get("armed_at_ms")
-                    .is_none_or(serde_json::Value::is_null)
-                && let Some(armed_at) =
-                    tickloop_agent_base::timestamp::parse_timestamp_ms(&entry.timestamp)
-                        .and_then(|value| u64::try_from(value).ok())
-            {
-                trigger["armed_at_ms"] = serde_json::json!(armed_at);
-            }
+        if let Some(record) = entry.loop_record.clone().filter(|_| entry.is_loop_record()) {
             restored
                 .loop_records
                 .push((restored.messages.len(), (record, entry.run_id)));

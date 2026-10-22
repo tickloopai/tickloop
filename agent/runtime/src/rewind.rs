@@ -927,28 +927,23 @@ mod tests {
             first_tracked,
             ..
         } = two_chats_with_tracked_files().await;
-        run_prompt(&agent, &mut events, first, "write scheduled agent").await;
+        run_prompt(&agent, &mut events, first, "write watching agent").await;
         let snapshot = agent.snapshot(first).await.unwrap();
-        let scheduled = snapshot.loops.last().unwrap().id;
+        let watching = snapshot.loops.last().unwrap().id;
         let point = snapshot
             .rewind_points()
             .into_iter()
-            .find(|point| point.prompt == "write scheduled agent")
+            .find(|point| point.prompt == "write watching agent")
             .unwrap();
         agent
             .configure_trigger(
                 first,
-                scheduled,
+                watching,
                 Some(tickloop_agent_protocol::Trigger {
                     id: Uuid::new_v4(),
-                    prompt: "scheduled check".into(),
+                    prompt: "event check".into(),
                     prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                    schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
-                    armed_at_ms: None,
-                    last_fired_at_ms: None,
-                    confirmation: None,
-                    expires_at_ms: None,
-                    accepts_events: false,
+                    accepts_events: true,
                     armed: true,
                     subscriptions: Vec::new(),
                 }),
@@ -966,26 +961,33 @@ mod tests {
             }
         });
         wait_until_paused(&pause);
-        // 占用期间：新建 Loop 的输入排队，被移除 Loop 的定时输入也排队。
+        // 占用期间：新建 Loop 的输入排队，被移除 Loop 的事件输入也排队。
         let created = agent
             .submit(first, None, "talk during rewind".into())
             .await
             .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while !agent
-            .snapshot(first)
+        agent
+            .trigger(
+                first,
+                watching,
+                tickloop_agent_protocol::TriggerSource {
+                    source: "manual".into(),
+                    payload: serde_json::json!({"note": "changed"}),
+                },
+            )
             .await
-            .unwrap()
-            .pending_inputs
-            .iter()
-            .any(|pending| pending.receipt.loop_id == scheduled && pending.trigger_source.is_some())
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the scheduled trigger did not queue during the rewind"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            .unwrap();
+        assert!(
+            agent
+                .snapshot(first)
+                .await
+                .unwrap()
+                .pending_inputs
+                .iter()
+                .any(|pending| pending.receipt.loop_id == watching
+                    && pending.trigger_source.is_some()),
+            "the event did not queue during the rewind"
+        );
         drop(pause);
         let outcome = tokio::time::timeout(STEP_TIMEOUT, rewinding)
             .await
@@ -997,7 +999,7 @@ mod tests {
                 .snapshot
                 .loops
                 .iter()
-                .any(|goal| goal.id == scheduled)
+                .any(|goal| goal.id == watching)
         );
         assert!(
             outcome
@@ -1011,7 +1013,7 @@ mod tests {
                 .snapshot
                 .pending_inputs
                 .iter()
-                .all(|pending| pending.receipt.loop_id != scheduled)
+                .all(|pending| pending.receipt.loop_id != watching)
         );
         tokio::time::timeout(
             STEP_TIMEOUT,

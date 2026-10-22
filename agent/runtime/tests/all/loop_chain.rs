@@ -1,5 +1,6 @@
-//! Loop 随对话链记录（rewind、Branch、压缩与重启后是否存在）与 Trigger 的跨进程租约。
-//! 同一测试进程中的多个 Agent 实例模拟多个进程；锁文件接管、停止状态与子进程持锁见 `loop_trigger_safety.rs`。
+//! Loop 随对话链记录（rewind、Branch、压缩与重启后是否存在）。
+//! 同一测试进程中的多个 Agent 实例模拟多个进程；Trigger 租约、锁文件接管、停止状态与子进程持锁见
+//! `loop_trigger_safety.rs`。
 
 use std::{
     path::PathBuf,
@@ -12,15 +13,13 @@ use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, Mod
 use tickloop_agent_protocol::{
     BranchRequest, ChatId, ChatSnapshot, Content, DirectedSummaryRequest, EventKind, LoopId,
     LoopState, Message, ModelIdentity, Protocol, Receipt, RewindMode, Role, SummaryDirection,
-    Trigger, TriggerPromptSource, Usage,
+    Trigger, TriggerPromptSource, TriggerSource, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{config, next_event};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 每个请求都回复一段文字；不带工具的摘要请求回复摘要。
 struct EchoModel {
@@ -116,18 +115,11 @@ fn message_text(message: &Message) -> String {
         .join("\n")
 }
 
-fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
+fn watching(prompt: &str) -> Trigger {
     Trigger {
         id: Uuid::new_v4(),
         prompt: prompt.into(),
         prompt_source: TriggerPromptSource::Explicit,
-        schedule: interval_seconds.map(|seconds| {
-            tickloop_agent_protocol::Recurrence::parse(&format!("every {seconds}s")).unwrap()
-        }),
-        expires_at_ms: None,
-        armed_at_ms: None,
-        last_fired_at_ms: None,
-        confirmation: None,
         accepts_events: true,
         armed: true,
         subscriptions: Vec::new(),
@@ -259,54 +251,32 @@ async fn recovery_conversions_leave_their_state_time_unknown() {
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let kept = complete_turn(&agent, chat, None, "kept goal").await;
-    let scheduled = complete_turn(&agent, chat, None, "scheduled goal").await;
+    let watched = complete_turn(&agent, chat, None, "watched goal").await;
     agent
-        .configure_trigger(
-            chat,
-            scheduled.loop_id,
-            Some(periodic("scheduled check", Some(60))),
-        )
-        .await
-        .unwrap();
-    let deadline = complete_turn(&agent, chat, None, "deadline goal").await;
-    agent
-        .configure_trigger(
-            chat,
-            deadline.loop_id,
-            Some(Trigger {
-                expires_at_ms: Some(now_ms() + 1_000),
-                ..periodic("deadline check", None)
-            }),
-        )
+        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
         .await
         .unwrap();
     let before = agent.snapshot(chat).await.unwrap();
     let kept_at = find_loop(&before, kept.loop_id).state_since;
     assert_eq!(find_loop(&before, kept.loop_id).state, LoopState::Completed);
     assert!(kept_at.is_some());
-    for converted in [scheduled.loop_id, deadline.loop_id] {
-        let goal = find_loop(&before, converted);
-        assert_eq!(goal.state, LoopState::WaitingTrigger);
-        assert!(
-            goal.state_since.is_some(),
-            "the waiting state has a known time"
-        );
-    }
+    let waiting = find_loop(&before, watched.loop_id);
+    assert_eq!(waiting.state, LoopState::WaitingTrigger);
+    assert!(
+        waiting.state_since.is_some(),
+        "the waiting state has a known time"
+    );
     agent.shutdown().await;
     drop(agent);
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
 
     let restarted = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    let interrupted = find_loop(&restored, scheduled.loop_id);
+    let interrupted = find_loop(&restored, watched.loop_id);
     assert_eq!(interrupted.state, LoopState::Interrupted);
     assert_eq!(
         interrupted.state_since, None,
         "a recovery conversion does not reuse the waiting state's time"
     );
-    let expired = find_loop(&restored, deadline.loop_id);
-    assert_eq!(expired.state, LoopState::Expired);
-    assert_eq!(expired.state_since, None);
     let unchanged = find_loop(&restored, kept.loop_id);
     assert_eq!(unchanged.state, LoopState::Completed);
     assert_eq!(
@@ -326,11 +296,7 @@ async fn rewinding_before_a_loop_start_removes_it_and_earlier_loops_stay_after_r
     let first = complete_turn(&agent, chat, None, "first goal").await;
     let second = complete_turn(&agent, chat, None, "second goal").await;
     agent
-        .configure_trigger(
-            chat,
-            second.loop_id,
-            Some(periodic("second check", Some(1))),
-        )
+        .configure_trigger(chat, second.loop_id, Some(watching("second check")))
         .await
         .unwrap();
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[1].clone();
@@ -341,7 +307,19 @@ async fn rewinding_before_a_loop_start_removes_it_and_earlier_loops_stay_after_r
     let draft = outcome.draft.unwrap().loop_id;
     assert_eq!(loop_ids(&outcome.snapshot), vec![first.loop_id, draft]);
     // 被移除的 Loop 的 Trigger 随截断停止。
-    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    assert!(
+        agent
+            .trigger(
+                chat,
+                second.loop_id,
+                TriggerSource {
+                    source: "manual".into(),
+                    payload: serde_json::json!({"note": "changed"}),
+                },
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(model.prompts_containing("second check"), 0);
     let third = complete_turn(&agent, chat, None, "third goal").await;
     agent.shutdown().await;
@@ -397,11 +375,7 @@ async fn branch_copies_loops_started_before_it_with_disarmed_triggers() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let watched = complete_turn(&agent, chat, None, "watch goal").await;
     agent
-        .configure_trigger(
-            chat,
-            watched.loop_id,
-            Some(periodic("watch check", Some(3_600))),
-        )
+        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
         .await
         .unwrap();
     complete_turn(&agent, chat, None, "abandoned goal").await;
@@ -474,7 +448,7 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
         let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let watched = complete_turn(&agent, chat, None, "watch goal").await;
-        let trigger = periodic("watch check", Some(3_600));
+        let trigger = watching("watch check");
         agent
             .configure_trigger(chat, watched.loop_id, Some(trigger.clone()))
             .await
@@ -520,13 +494,6 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
         let restored_trigger = restored_watch.trigger.as_ref().unwrap();
         assert_eq!(restored_trigger.id, trigger.id, "{label}");
         assert_eq!(restored_trigger.prompt, trigger.prompt, "{label}");
-        assert_eq!(
-            restored_trigger
-                .schedule
-                .map(|schedule| schedule.to_string()),
-            Some("every 1h".into()),
-            "{label}"
-        );
         assert!(restored_trigger.accepts_events, "{label}");
         assert!(!restored_trigger.armed, "{label}");
         assert_eq!(restored_watch.state, LoopState::Interrupted, "{label}");
@@ -574,189 +541,52 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
 }
 
 #[tokio::test]
-async fn restarted_triggers_are_interrupted_or_expired_and_manual_resume_fires_on_schedule() {
+async fn restarted_triggers_are_interrupted_and_manual_resume_takes_events_again() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let scheduled = complete_turn(&agent, chat, None, "scheduled goal").await;
+    let watched = complete_turn(&agent, chat, None, "watched goal").await;
     agent
-        .configure_trigger(
-            chat,
-            scheduled.loop_id,
-            Some(periodic("scheduled check", Some(1))),
-        )
-        .await
-        .unwrap();
-    let deadline = complete_turn(&agent, chat, None, "deadline goal").await;
-    agent
-        .configure_trigger(
-            chat,
-            deadline.loop_id,
-            Some(Trigger {
-                expires_at_ms: Some(now_ms() + 1_000),
-                ..periodic("deadline check", None)
-            }),
-        )
+        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
         .await
         .unwrap();
     agent.shutdown().await;
     drop(agent);
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
 
     let model = EchoModel::new();
     let restarted = Agent::open_embedded(root, config(), model.clone()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    let scheduled_loop = find_loop(&restored, scheduled.loop_id);
-    assert_eq!(scheduled_loop.state, LoopState::Interrupted);
-    assert!(!scheduled_loop.trigger.as_ref().unwrap().armed);
-    assert_eq!(
-        find_loop(&restored, deadline.loop_id).state,
-        LoopState::Expired
-    );
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let watched_loop = find_loop(&restored, watched.loop_id);
+    assert_eq!(watched_loop.state, LoopState::Interrupted);
+    assert!(!watched_loop.trigger.as_ref().unwrap().armed);
     assert!(model.requests.lock().unwrap().is_empty());
 
-    complete_turn(
-        &restarted,
-        chat,
-        Some(scheduled.loop_id),
-        "resume the schedule",
-    )
-    .await;
+    complete_turn(&restarted, chat, Some(watched.loop_id), "resume watching").await;
     let resumed = restarted.snapshot(chat).await.unwrap();
     assert!(
-        find_loop(&resumed, scheduled.loop_id)
+        find_loop(&resumed, watched.loop_id)
             .trigger
             .as_ref()
             .unwrap()
             .armed
     );
-    wait_until(
-        "the resumed schedule to fire",
-        Duration::from_secs(3),
-        || model.prompts_containing("scheduled check") >= 1,
-    )
-    .await;
-    assert!(
-        restarted
-            .submit(chat, Some(deadline.loop_id), "resume the deadline".into())
-            .await
-            .is_err()
-    );
-    restarted.shutdown().await;
-}
-
-#[derive(Clone, Copy, Debug)]
-enum HolderExit {
-    Shutdown,
-    Drop,
-}
-
-/// 在独立的 tokio 运行时中恢复 Chat、重新武装 Loop，第一次触发后通知 `ready`，收到 `release`
-/// 后按 `exit` 退出；`Drop` 时直接释放 Agent 与运行时，模拟实例退出而未调用 shutdown。
-fn spawn_lease_holder(
-    root: PathBuf,
-    chat: ChatId,
-    loop_id: LoopId,
-    model: Arc<EchoModel>,
-    exit: HolderExit,
-    ready: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let agent = Agent::open_embedded(root, config(), model.clone()).unwrap();
-            agent.resume_chat(chat).await.unwrap();
-            complete_turn(&agent, chat, Some(loop_id), "resume in the holder").await;
-            wait_until("the holder to fire", WAIT_TIMEOUT, || {
-                model.prompts_containing("shared check") >= 1
-            })
-            .await;
-            ready.send(()).unwrap();
-            release.await.unwrap();
-            match exit {
-                HolderExit::Shutdown => agent.shutdown().await,
-                HolderExit::Drop => drop(agent),
-            }
-        });
-        drop(runtime);
-    })
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn two_instances_fire_a_shared_loop_once_and_the_other_takes_over_after_the_holder_exits() {
-    for exit in [HolderExit::Shutdown, HolderExit::Drop] {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("root");
-        let creator = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
-        let chat = creator.create_chat(directory.path().into()).await.unwrap();
-        let watched = complete_turn(&creator, chat, None, "shared goal").await;
-        creator
-            .configure_trigger(
-                chat,
-                watched.loop_id,
-                Some(periodic("shared check", Some(1))),
-            )
-            .await
-            .unwrap();
-        creator.shutdown().await;
-        drop(creator);
-
-        let holder_model = EchoModel::new();
-        let (ready_sender, ready) = tokio::sync::oneshot::channel();
-        let (release, release_receiver) = tokio::sync::oneshot::channel();
-        let holder = spawn_lease_holder(
-            root.clone(),
+    restarted
+        .trigger(
             chat,
             watched.loop_id,
-            holder_model.clone(),
-            exit,
-            ready_sender,
-            release_receiver,
-        );
-        tokio::time::timeout(WAIT_TIMEOUT, ready)
-            .await
-            .expect("holder did not fire")
-            .unwrap();
-
-        let other_model = EchoModel::new();
-        let other = Agent::open_embedded(root, config(), other_model.clone()).unwrap();
-        other.resume_chat(chat).await.unwrap();
-        complete_turn(&other, chat, Some(watched.loop_id), "resume in the other").await;
-        let holder_fires = holder_model.prompts_containing("shared check");
-        tokio::time::sleep(Duration::from_millis(3_200)).await;
-        assert!(
-            holder_model.prompts_containing("shared check") >= holder_fires + 2,
-            "{exit:?}"
-        );
-        assert_eq!(
-            other_model.prompts_containing("shared check"),
-            0,
-            "{exit:?}"
-        );
-
-        release.send(()).unwrap();
-        let exited_at = Instant::now();
-        tokio::task::spawn_blocking(move || holder.join().unwrap())
-            .await
-            .unwrap();
-        wait_until(
-            "the other instance to take over",
-            Duration::from_secs(8),
-            || other_model.prompts_containing("shared check") >= 1,
+            TriggerSource {
+                source: "manual".into(),
+                payload: serde_json::json!({"note": "changed"}),
+            },
         )
-        .await;
-        // 拿不到租约时每 5 秒重试一次；接手后在下一个 1 秒间隔触发。
-        assert!(
-            exited_at.elapsed() < Duration::from_millis(6_500),
-            "{exit:?}: took over after {:?}",
-            exited_at.elapsed()
-        );
-        other.shutdown().await;
-    }
+        .await
+        .unwrap();
+    wait_until(
+        "the resumed trigger to deliver",
+        Duration::from_secs(3),
+        || model.prompts_containing("watch check") >= 1,
+    )
+    .await;
+    restarted.shutdown().await;
 }

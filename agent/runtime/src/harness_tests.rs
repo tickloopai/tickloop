@@ -307,7 +307,6 @@ fn durable_chat_options() -> HarnessOptions {
         tools: ToolPolicy::durable_chat(),
         host_rules: durable_chat_host_rules(),
         task_tools: Some(true),
-        min_schedule_interval: Duration::from_secs(60),
         waits: WaitHosting::Durable,
         ..HarnessOptions::local(config())
     }

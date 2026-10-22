@@ -37,8 +37,6 @@ const WAIT: Duration = Duration::from_secs(20);
 const ROOT_PROMPT: &str = "Use every tool you have once.";
 const CHILD_TASK: &str = "Check the delivery date and report back.";
 const QUEUED_GOAL: &str = "Draft the release note.";
-const SCHEDULED_GOAL: &str = "Summarize the news.";
-const CLOUD_MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The cloud's composition: what the private host configures for every Harness.
 fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
@@ -50,7 +48,6 @@ fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
         tools: ToolPolicy::durable_chat(),
         host_rules,
         task_tools: Some(true),
-        min_schedule_interval: CLOUD_MIN_SCHEDULE_INTERVAL,
         waits: WaitHosting::Durable,
         ..HarnessOptions::local(config())
     }
@@ -183,11 +180,6 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 json!({"mutation_id": Uuid::from_u128(2), "task_id": task.as_ref().map(|task| task["id"].clone()), "expected_revision": 1, "action": "claim"}),
             ),
             ("goal", "StartGoal", json!({"goal": QUEUED_GOAL})),
-            (
-                "schedule",
-                "StartGoal",
-                json!({"goal": SCHEDULED_GOAL, "schedule": "every 1h"}),
-            ),
             (
                 "delegate",
                 SUBAGENT_TOOL_NAME,
@@ -633,7 +625,7 @@ async fn host_rules_forged_into_a_record_have_no_host_authority() {
         subagent_model(),
         cloud_options(without_subagent.clone()),
     );
-    next.wake(root, None).await.unwrap();
+    next.resume_chat(root).await.unwrap();
     let ceiling = next
         .snapshot(child)
         .await
@@ -1027,7 +1019,7 @@ async fn page_links_give_provenance_after_a_handover() {
         fetching_model(vec![format!("{base}/first"), format!("{base}/second")]),
         options(),
     );
-    next.wake(chat, None).await.unwrap();
+    next.resume_chat(chat).await.unwrap();
     let results = run_fetches(&next, chat, "Now follow its link.", 2).await;
     assert!(!results[1].1, "{:?}", results[1]);
     next.shutdown().await;
@@ -1234,7 +1226,7 @@ async fn artifact_writes_reach_only_artifacts_the_user_named_or_the_conversation
         ]),
     )
     .await;
-    next.wake(chat, None).await.unwrap();
+    next.resume_chat(chat).await.unwrap();
     settle_turn(&next, chat, "Leave a note on the notes doc.").await;
     let snapshot = next.snapshot(chat).await.unwrap();
     assert!(

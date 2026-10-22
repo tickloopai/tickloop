@@ -68,11 +68,7 @@ pub(super) fn can_take_manual_update(goal: &LoopSnapshot) -> bool {
             | LoopState::Failed
             | LoopState::Interrupted
             | LoopState::WaitingPlan
-    ) && goal
-        .trigger
-        .as_ref()
-        .and_then(|trigger| trigger.expires_at_ms)
-        .is_none_or(|deadline| deadline > crate::monitor_members::now_ms())
+    )
 }
 
 pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
@@ -588,13 +584,7 @@ impl TickDeliveries {
                 goal.id == loop_id && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
             })
             .and_then(|goal| goal.trigger.as_ref())
-            .filter(|trigger| {
-                trigger.armed
-                    && trigger.accepts_events
-                    && trigger.expires_at_ms.is_none_or(|deadline| {
-                        deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
-                    })
-            })
+            .filter(|trigger| trigger.armed && trigger.accepts_events)
             .ok_or_else(|| {
                 AgentError::Invalid("Tick delivery has no active subscription configuration".into())
             })?;
@@ -2751,14 +2741,6 @@ mod manual_admission_tests {
         assert!(
             !can_take_manual_update(&goal),
             "data must not approve a plan"
-        );
-        goal.state = LoopState::WaitingTrigger;
-        let mut trigger = Trigger::for_loop_goal(&goal.goal);
-        trigger.expires_at_ms = Some(0);
-        goal.trigger = Some(trigger);
-        assert!(
-            !can_take_manual_update(&goal),
-            "the wall-clock deadline holds even before expiry dispatch"
         );
     }
 }

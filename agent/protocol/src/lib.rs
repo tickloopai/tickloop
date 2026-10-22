@@ -136,8 +136,8 @@ pub use local_messages::{
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
-    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind,
-    ScheduleConfirmation, Trigger, TriggerPromptSource, TriggerSource,
+    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
+    TriggerPromptSource, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
@@ -172,7 +172,6 @@ pub use tick_subscriptions::{
     TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
     TickSubscriptionFrequency, TickSubscriptionStatus,
 };
-pub use tickloop_agent_recurrence::{ParseError as RecurrenceError, Recurrence};
 pub use tool::ToolDefinition;
 pub use tools::{
     CitationSource, CommandSnapshot, CommandState, FileReadRecord, SearchConfig,

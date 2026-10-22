@@ -405,7 +405,6 @@ async fn asked_and_released(
                 request: request.id,
                 kind: PersonWaitKind::Question,
             }],
-            wake_at: None,
             deliveries: Vec::new(),
         })
     );
@@ -832,7 +831,7 @@ async fn a_pending_completion_of_a_foreground_call_is_returned_not_notified() {
     seeded.seed(root, root_lines, StorePosition(1));
     seeded.seed(child, child_lines, StorePosition(1));
     let loading = harness(seeded.clone(), model.clone(), WaitHosting::Durable);
-    loading.wake(root, None).await.unwrap();
+    loading.resume_chat(root).await.unwrap();
     assert!(matches!(
         settled(&loading, root, turn.input_id()).await,
         SettledOutcome::Completed { .. }
@@ -868,7 +867,7 @@ async fn a_child_that_lost_its_host_once_reports_to_its_foreground_parent_once()
     assert!(last_completions(&store.lines(root)).is_empty());
 
     let second = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    second.wake(root, None).await.unwrap();
+    second.resume_chat(root).await.unwrap();
     assert!(matches!(
         settled(&second, root, turn.input_id()).await,
         SettledOutcome::Completed { .. }
@@ -914,13 +913,13 @@ async fn a_child_failed_by_three_lost_hosts_at_load_resolves_its_foreground_pare
     // Two more holdings lose the child's continued attempt the same way.
     for _ in 0..2 {
         let holder = harness(store.clone(), model.clone(), WaitHosting::Durable);
-        holder.wake(root, None).await.unwrap();
+        holder.resume_chat(root).await.unwrap();
         model.holding.notified().await;
         holder.shutdown().await;
         holder.sync().await.unwrap();
     }
     let last = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    last.wake(root, None).await.unwrap();
+    last.resume_chat(root).await.unwrap();
     assert!(matches!(
         settled(&last, root, turn.input_id()).await,
         SettledOutcome::Completed { .. }
@@ -948,7 +947,7 @@ async fn a_member_registered_without_a_transcript_does_not_fail_the_load() {
     let lost = Arc::new(InMemoryTranscriptStore::new());
     lost.seed(root, store.lines(root), StorePosition(1));
     let loading = harness(lost.clone(), model.clone(), WaitHosting::Durable);
-    loading.wake(root, None).await.unwrap();
+    loading.resume_chat(root).await.unwrap();
     let outcome = settled(&loading, root, turn.input_id()).await;
     assert!(
         matches!(outcome, SettledOutcome::Completed { .. }),
@@ -1023,7 +1022,7 @@ async fn pruned_family_lists_deliver_nothing_again_after_a_load() {
     let requests = model.requests.lock().unwrap().len();
 
     let loading = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    loading.wake(root, None).await.unwrap();
+    loading.resume_chat(root).await.unwrap();
     assert_eq!(loading.quiesce(root).await, Quiescence::Idle);
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -1050,7 +1049,7 @@ async fn a_family_messaging_over_many_holdings_leaves_bounded_loads() {
     agent.sync().await.unwrap();
     for holding in 0..HOLDINGS {
         let agent = harness(store.clone(), model.clone(), WaitHosting::Durable);
-        agent.wake(root, None).await.unwrap();
+        agent.resume_chat(root).await.unwrap();
         message_rounds(
             &agent,
             root,
@@ -1374,7 +1373,7 @@ async fn host_rules_reach_a_child_live_and_are_never_recorded_with_its_delegatio
 
     let second_rule = host_rule("WebFetch");
     let loading = harness_with_rules(store.clone(), model, vec![second_rule.clone()]);
-    loading.wake(root, None).await.unwrap();
+    loading.resume_chat(root).await.unwrap();
     let snapshot = loading.snapshot(child).await.unwrap();
     // The member's own policy and the ceiling its delegation checks both hold the current
     // rules, and only those.

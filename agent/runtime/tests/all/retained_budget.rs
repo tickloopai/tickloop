@@ -124,7 +124,7 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
         assert_bounded_load(&store, chat).await;
         let started = Instant::now();
         let agent = harness(store.clone());
-        agent.wake(chat, None).await.unwrap();
+        agent.resume_chat(chat).await.unwrap();
         assert!(
             started.elapsed() < LOAD_TIME_LIMIT,
             "loading took {:?}",
@@ -186,11 +186,6 @@ async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId, loop_id: Uuid
                 id: Uuid::new_v4(),
                 prompt: "Check the feed".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                schedule: None,
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),

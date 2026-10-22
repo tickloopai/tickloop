@@ -154,7 +154,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
 }
 
 #[tokio::test]
-async fn planned_restore_preserves_armed_timer_and_session_permissions_without_model_calls() {
+async fn planned_restore_preserves_an_armed_trigger_and_session_permissions_without_model_calls() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("ready")]));
     let original = Agent::new_embedded(config(), model);
@@ -168,12 +168,7 @@ async fn planned_restore_preserves_armed_timer_and_session_permissions_without_m
                 id: Uuid::new_v4(),
                 prompt: "check later".into(),
                 prompt_source: Default::default(),
-                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 3600s").unwrap()),
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                accepts_events: false,
-                expires_at_ms: None,
+                accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),
             }),
@@ -546,71 +541,6 @@ async fn parent_answer_does_not_allow_replacement_while_a_child_still_waits_for_
     );
     original.cancel_upgrade().await;
     original.shutdown().await;
-}
-
-#[tokio::test]
-async fn timer_due_while_prepared_waits_for_successor_and_input_cannot_dispatch_on_old_owner() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![text("ready")]));
-    let original = Agent::new_embedded(config(), model.clone());
-    let chat = original.create_chat(directory.path().into()).await.unwrap();
-    let receipt = complete(&original, chat, "check periodically").await;
-    original
-        .configure_trigger(
-            chat,
-            receipt.loop_id,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "scheduled check".into(),
-                prompt_source: Default::default(),
-                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
-                armed_at_ms: None,
-                last_fired_at_ms: None,
-                confirmation: None,
-                expires_at_ms: None,
-                accepts_events: false,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    let checkpoint = prepare(&original).await;
-    let wire = serde_json::to_vec(&checkpoint).unwrap();
-    assert!(
-        original
-            .submit(chat, None, "queued during transfer".into())
-            .await
-            .is_err()
-    );
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(model.requests.lock().unwrap().len(), 1);
-    let successor_model = Arc::new(ScriptedModel::new(vec![text("checked"), text("received")]));
-    let successor = Agent::new_embedded(config(), successor_model.clone());
-    successor
-        .restore_upgrade(serde_json::from_slice(&wire).unwrap())
-        .await
-        .unwrap();
-    successor.activate_upgrade().await.unwrap();
-    original.shutdown_for_upgrade().await;
-    let mut events = successor.subscribe();
-    successor.release_upgrade().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !matches!(
-            events.recv().await.unwrap().kind,
-            EventKind::Completed { .. }
-        ) {}
-    })
-    .await
-    .unwrap();
-    successor
-        .configure_trigger(chat, receipt.loop_id, None)
-        .await
-        .unwrap();
-    assert_eq!(successor_model.requests.lock().unwrap().len(), 1);
-    complete(&successor, chat, "queued during transfer").await;
-    assert_eq!(successor_model.requests.lock().unwrap().len(), 2);
-    successor.shutdown().await;
 }
 
 #[derive(Clone)]

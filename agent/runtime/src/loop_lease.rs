@@ -32,7 +32,6 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,8 +42,6 @@ use tickloop_agent_base::private_fs::{
 };
 use tickloop_agent_protocol::{ChatId, LoopId, LoopTriggerNotice, LoopTriggerNoticeKind};
 
-/// 照 Claude Code `LOCK_PROBE_INTERVAL_MS`：拿不到租约的进程重试获取的间隔。
-pub(super) const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const LEASE_DIRECTORY: &str = "loops";
 const STATE_WRITE_LOCK_FILE: &str = ".state.lock";
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。

@@ -131,7 +131,7 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     let goal = goals[0];
     let other_goal = goals[1];
     let commands = format!(
-        "/loops {goal}\n/events keep explicit events\n/loops schedule {goal} 86400 --for 604800 scheduled review\n/loops trigger {goal}\n/loops schedule {other_goal} 86400 wrong chat\n/loops {other_goal}\n/loops schedule {goal} 0 invalid\n/loops trigger\n/loops new\n/loops\n/exit\n"
+        "/loops {goal}\n/events keep explicit events\n/loops trigger {goal}\n/loops trigger {other_goal}\n/loops {other_goal}\n/loops schedule {goal} 60 retired\n/loops trigger\n/loops new\n/loops\n/exit\n"
     );
     let runtime_directory = support::cli_runtime::directory();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
@@ -163,7 +163,6 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("explicit events true"), "{stdout}");
-    assert!(stdout.contains("Interval: 86400 seconds"), "{stdout}");
     assert_eq!(
         stdout
             .matches("Goal does not belong to the current Chat")
@@ -172,7 +171,7 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("interval must be a positive number"),
+        stdout.contains("use /loops [GOAL_ID|new|trigger [GOAL_ID]]"),
         "{stdout}"
     );
     assert!(
@@ -193,13 +192,8 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     assert_eq!(after.messages.len(), before.messages.len());
     assert_eq!(after.loops.len(), 1);
     let trigger = after.loops[0].trigger.as_ref().unwrap();
-    assert_eq!(
-        trigger.schedule.and_then(|schedule| schedule.interval()),
-        Some(std::time::Duration::from_secs(86400))
-    );
-    assert!(trigger.expires_at_ms.is_some());
     assert!(trigger.accepts_events);
-    assert_eq!(trigger.prompt, "scheduled review");
+    assert_eq!(trigger.prompt, "keep explicit events");
     assert!(
         agent.resume_chat(other_chat).await.unwrap().loops[0]
             .trigger

@@ -5,7 +5,6 @@
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const TRIGGER: &str = "tickloop.input.trigger";
 const FEEDBACK: &str = "tickloop.input.feedback";
 const FAMILY_MESSAGE: &str = "tickloop.input.family-message";
 const GOAL: &str = "tickloop.input.goal";
@@ -23,14 +22,6 @@ fn named(namespace: &str, parts: &[&[u8]]) -> Uuid {
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&hasher.finalize()[..16]);
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
-}
-
-/// A Trigger's fire at its scheduled time.
-pub fn trigger(loop_id: Uuid, scheduled_for_ms: u64) -> Uuid {
-    named(
-        TRIGGER,
-        &[loop_id.as_bytes(), &scheduled_for_ms.to_be_bytes()],
-    )
 }
 
 /// An @tickloop request, by the delivery that brought it.
@@ -80,7 +71,6 @@ mod tests {
         let loop_id = Uuid::new_v4();
         assert_eq!(goal(loop_id), goal(loop_id));
         assert_ne!(goal(loop_id), goal(Uuid::new_v4()));
-        assert_ne!(trigger(loop_id, 1), trigger(loop_id, 2));
         assert_ne!(
             family_message(loop_id, loop_id, "a"),
             family_message(loop_id, loop_id, "b")

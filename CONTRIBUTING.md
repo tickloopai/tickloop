@@ -70,7 +70,6 @@ It runs `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targ
 | `agent/artifacts` | Client of the Tickloop Artifacts service: sign-in, credentials, catalog |
 | `agent/packages` | Tick marketplace download, install, update, uninstall, login and logout |
 | `agent/updater` | Versioned installation, update checks and pinned executable bundles |
-| `agent/recurrence` | Wall-clock recurrence rules for Loop triggers |
 | `agent/base` | Shared low-level utilities: private files, HTTP policy, images, output styles |
 | `agent/test-support` | Test helpers shared by agent crates: scripted model, transcript stores, PTY screens, fake HTTP servers |
 | `tickhost/host` | The `tickhost` executable: runs protocol, Terminal and Shell Ticks with multiple attached views |

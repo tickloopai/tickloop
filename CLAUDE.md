@@ -51,7 +51,6 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 | `agent/config/` | 用户设置与 Skill registry（含内置 Skill 正文；用户、项目与已安装 Tick 包的 Skill），依赖 model、tools、protocol、base 与 tick/packages |
 | `agent/artifacts/` | Artifact Service 客户端（登录、凭据、目录），依赖 protocol、base |
 | `agent/updater/` | 按版本目录安装、更新检查与固定运行副本，依赖 base 与 tickhost/connect |
-| `agent/recurrence/` | Loop Trigger 的墙钟重复规则：解析、规范文本与下次运行时间，不依赖其他 crate |
 | `agent/test-support/` | Agent 各 crate 测试共用的代码：ScriptedModel、内存与注入故障的 Transcript Store、无状态宿主的参考发布者与内存 Event Stream（含契约测试）、PTY 屏幕、传输限额与假 HTTP 服务；依赖 model、protocol、runtime 与 transcript |
 | `tickhost/host/` | 可执行文件 `tickhost`：daemon 拉起的宿主服务 `tickhost run`（协议、终端与 Shell 适配器，多视图附着）、宿主内部的隐藏 launcher `tickhost launch` 与 `tickhost stop` |
 | `tickhost/connect/` | Tickhost 业务通道与客户端、每实例 TickSession、launch 契约、打开时的程序解析（已安装 Tick 包、PATH）、Herdr socket 与视图 Pane 布局；不依赖 Agent 或旧工作台 |
