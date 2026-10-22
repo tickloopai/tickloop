@@ -230,15 +230,17 @@ impl ToolPolicy {
 /// The tools whose calls a durable Chat's host admits by its own rule instead of Auto review.
 /// WebFetch fetches only URLs with provenance there, so it carries no data the model composed;
 /// Artifact writes are admitted by their target's provenance instead of a rule.
-/// CronCreate needs no review there because a task the Agent creates waits for the user's
-/// confirmation; deleting or rescheduling a task has no such check and stays reviewed.
-const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 6] = [
+/// CronCreate and ScheduleWakeup need no review there: a task the Agent creates waits for the
+/// user's confirmation, and rescheduling keeps the instruction the task was confirmed with.
+/// Deleting a task has no such check and stays reviewed.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 7] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
     tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
     crate::mcp_tools::ARTIFACT_READ_TOOL,
     crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME,
+    crate::scheduled_tasks::tools::SCHEDULE_WAKEUP_TOOL_NAME,
 ];
 
 /// The host rules of a durable Chat, beside [`ToolPolicy::durable_chat`]: each allows one of

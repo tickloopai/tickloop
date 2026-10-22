@@ -874,41 +874,12 @@ async fn the_users_self_paced_loop_starts_with_its_turn_and_falls_back_when_not_
 }
 
 #[tokio::test]
-async fn a_new_self_paced_task_on_a_stateless_host_waits_for_confirmation() {
+async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_reschedules() {
     let model = HoldingModel::new(vec![
         wakeup("wake", 600, "watch the build"),
         text("Waiting."),
     ]);
-    let agent = Agent::with_seams(
-        HarnessSeams {
-            transcripts: None,
-            environment: None,
-            models: ChosenModels::new(model),
-        },
-        HarnessOptions {
-            host: AgentHostOptions {
-                prompt_policy: PromptPolicy::DenyOnPrompt,
-                ..AgentHostOptions::product_defaults()
-            },
-            tools: ToolPolicy {
-                scheduled_tasks: true,
-                ..ToolPolicy::web_fetch_only()
-            },
-            waits: WaitHosting::Durable,
-            // This host lets ScheduleWakeup through, so the call is not refused by review.
-            host_rules: vec![tickloop_agent_protocol::PermissionRule {
-                id: uuid::Uuid::new_v4(),
-                decision: tickloop_agent_protocol::Decision::Allow,
-                tool: tools::SCHEDULE_WAKEUP_TOOL_NAME.into(),
-                specifier: None,
-                input: None,
-                loop_id: None,
-                persistent: false,
-            }],
-            ..HarnessOptions::local(config())
-        },
-    )
-    .unwrap();
+    let agent = stateless_agent(model.clone());
     agent.set_scheduled_now(at(10, 0, 0));
     let chat = agent.create_chat_without_folder().await.unwrap();
     advance(&agent, chat, "pace yourself").await;
@@ -916,4 +887,25 @@ async fn a_new_self_paced_task_on_a_stateless_host_waits_for_confirmation() {
     assert_eq!(task.creator, ScheduledTaskCreator::Agent);
     assert_eq!(task.confirmation, Some(ScheduledTaskConfirmation::Pending));
     assert_eq!(task.next_fire_at_ms, None);
+
+    agent
+        .decide_scheduled_task(chat, &task.id, ScheduledTaskDecision::Confirm)
+        .await
+        .unwrap();
+    agent.set_scheduled_now(at(10, 5, 0));
+    model
+        .scripted
+        .enqueue(wakeup("again", 1200, "do something else"));
+    model.scripted.enqueue(text("Later."));
+    advance(&agent, chat, "keep going").await;
+    let (result, is_error) = tool_result(&agent, chat, "again").await;
+    assert!(!is_error, "{result}");
+    let rescheduled = tasks(&agent, chat).await.remove(0);
+    assert_eq!(rescheduled.id, task.id);
+    assert_eq!(rescheduled.prompt, "watch the build");
+    assert_eq!(
+        rescheduled.confirmation,
+        Some(ScheduledTaskConfirmation::Confirmed)
+    );
+    assert_eq!(rescheduled.next_fire_at_ms, Some(ms(at(10, 25, 0))));
 }

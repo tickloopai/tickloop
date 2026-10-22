@@ -220,6 +220,11 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 json!({"cron": "7 9 * * *", "prompt": "Check the delivery page."}),
             ),
             ("schedules", "CronList", json!({})),
+            (
+                "wakeup",
+                "ScheduleWakeup",
+                json!({"delaySeconds": 1200, "reason": "waiting for the delivery", "prompt": "Check the delivery page."}),
+            ),
             ("ask", "AskUserQuestion", single_question("Which format?")),
         ];
         for (id, name, input) in steps {
@@ -231,9 +236,9 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
     }))
 }
 
-/// The scheduled task tools a cloud Chat offers but reviews: nothing else checks a deletion or a
-/// reschedule, while a task the Agent creates waits for the user's confirmation.
-const REVIEWED_SCHEDULED_TASK_TOOLS: [&str; 2] = ["CronDelete", "ScheduleWakeup"];
+/// The scheduled task tool a cloud Chat offers but reviews: nothing else checks a deletion,
+/// while a task the Agent creates waits for the user's confirmation.
+const REVIEWED_SCHEDULED_TASK_TOOLS: [&str; 1] = ["CronDelete"];
 
 /// Records whether any call was reviewed or put to a person.
 fn watch_admissions(agent: &Agent) -> Arc<Mutex<Vec<String>>> {
@@ -279,8 +284,8 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
 
 /// Every tool a cloud Chat offers its model is admitted without review or a prompt: WebFetch of
 /// a URL the user gave and the Subagent call by the host's rules, and the writes to an Artifact
-/// the user shared with the Chat by that Artifact's provenance. Nothing is denied. Deleting or
-/// rescheduling a scheduled task is the exception: it is reviewed, see
+/// the user shared with the Chat by that Artifact's provenance. Nothing is denied. Deleting a
+/// scheduled task is the exception: it is reviewed, see
 /// `deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition`.
 #[tokio::test]
 async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
