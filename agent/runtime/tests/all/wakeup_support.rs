@@ -38,7 +38,26 @@ pub(crate) struct ContractModel {
     requests: Mutex<Vec<ModelRequest>>,
     entered: Mutex<Vec<String>>,
     changed: Notify,
-    released: Mutex<Vec<String>>,
+    releases: Mutex<Releases>,
+}
+
+/// Releases not yet taken by a held turn, and held turns that ended unreleased, cancelled with
+/// their run; releasing one of those releases nothing, so no later turn under its key runs
+/// through on a stale release.
+#[derive(Default)]
+struct Releases {
+    pending: Vec<String>,
+    ended: Vec<String>,
+}
+
+fn take(keys: &mut Vec<String>, key: &str) -> bool {
+    match keys.iter().position(|taken| taken == key) {
+        Some(index) => {
+            keys.remove(index);
+            true
+        }
+        None => false,
+    }
 }
 
 fn hold_key(text: &str) -> Option<String> {
@@ -140,7 +159,11 @@ impl ContractModel {
     }
 
     pub(crate) fn release(&self, key: &str) {
-        self.released.lock().unwrap().push(key.into());
+        let mut releases = self.releases.lock().unwrap();
+        if !take(&mut releases.ended, key) {
+            releases.pending.push(key.into());
+        }
+        drop(releases);
         self.changed.notify_waiters();
     }
 
@@ -149,13 +172,13 @@ impl ContractModel {
     }
 
     fn take_release(&self, key: &str) -> bool {
-        let mut released = self.released.lock().unwrap();
-        match released.iter().position(|released| released == key) {
-            Some(index) => {
-                released.remove(index);
-                true
-            }
-            None => false,
+        take(&mut self.releases.lock().unwrap().pending, key)
+    }
+
+    fn end_unreleased(&self, key: &str) {
+        let mut releases = self.releases.lock().unwrap();
+        if !take(&mut releases.pending, key) {
+            releases.ended.push(key.into());
         }
     }
 }
@@ -226,7 +249,10 @@ impl ModelClient for ContractModel {
                 }
                 tokio::select! {
                     _ = changed => {}
-                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    _ = cancel.cancelled() => {
+                        self.end_unreleased(&key);
+                        return Err(ModelError::Cancelled);
+                    }
                 }
             }
         }
