@@ -2904,10 +2904,10 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     agent.shutdown().await;
 }
 
-/// An immediate subscription has no period to retry a held delivery with: one whose watermark
-/// could not be written is still delivered, shortly after writing works again.
+/// The watermark follows a delivery's acceptance: one that cannot be written holds nothing back,
+/// since a repeat of the update finds its ledger record.
 #[tokio::test]
-async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands() {
+async fn a_watermark_that_cannot_be_written_holds_no_delivery_back() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let workdir = directory.path().join("work");
@@ -2947,32 +2947,21 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
     std::fs::write(&watermarks, "a file where the watermark directory belongs").unwrap();
 
     stream.push(shell_update(2, "exit 0"));
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        model.requests.lock().unwrap().len(),
-        2,
-        "a delivery whose watermark cannot be written is held"
-    );
-    std::fs::remove_file(&watermarks).unwrap();
-    std::fs::rename(&kept, &watermarks).unwrap();
-
     while !matches!(
         next_event_within(&mut events, Duration::from_secs(15))
             .await
             .kind,
         EventKind::Completed { .. }
     ) {}
-    assert_eq!(
-        model.requests.lock().unwrap().len(),
-        3,
-        "the held delivery is retried without another update"
-    );
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
     assert!(last_user_text(&model).contains("exit 0"));
+    std::fs::remove_file(&watermarks).unwrap();
+    std::fs::rename(&kept, &watermarks).unwrap();
     agent.shutdown().await;
 }
 
 /// A periodic delivery that came due but was held is looked at again shortly, not one period
-/// later: here its watermark could not be written, and it lands soon after writing works again.
+/// later: here another host's lock kept the Chat's lease, and it lands soon after the lock goes.
 #[tokio::test(start_paused = true)]
 async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
     let directory = tempfile::tempdir().unwrap();
@@ -2996,10 +2985,20 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
     accumulated(&agent, chat, 1).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    let watermarks = watermark_files(&root)[0].parent().unwrap().to_path_buf();
-    let kept = watermarks.with_extension("kept");
-    std::fs::rename(&watermarks, &kept).unwrap();
-    std::fs::write(&watermarks, "a file where the watermark directory belongs").unwrap();
+    let lease = watermark_files(&root)[0]
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("trigger")
+        .join("lease.lock");
+    std::fs::remove_file(&lease).unwrap();
+    std::fs::write(
+        &lease,
+        json!({"chatId": chat, "pid": 1, "nonce": Uuid::new_v4(), "startedAt": 1, "host": "another-host.invalid"})
+            .to_string(),
+    )
+    .unwrap();
 
     stream.push(update(5, 2, "second"));
     accumulated(&agent, chat, 1).await;
@@ -3008,10 +3007,9 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
     assert_eq!(
         model.requests.lock().unwrap().len(),
         2,
-        "a delivery whose watermark cannot be written is held"
+        "a delivery another host's lock keeps out is held"
     );
-    std::fs::remove_file(&watermarks).unwrap();
-    std::fs::rename(&kept, &watermarks).unwrap();
+    std::fs::remove_file(&lease).unwrap();
 
     let held_at = tokio::time::Instant::now();
     while !matches!(

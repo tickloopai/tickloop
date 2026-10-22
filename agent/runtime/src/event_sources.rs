@@ -1,7 +1,7 @@
 //! Artifact feedback for the Chat's Loop: linking and unlinking an account's artifacts and the
 //! watcher that claims their @tickloop requests through the service's HTTP lifecycle.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -21,7 +21,7 @@ use tickloop_agent_protocol::{
     ArtifactFeedbackHistory, ArtifactTick, ChatId, EventSourceBinding, InputId, LoopId,
     LoopSnapshot, Receipt, TriggerSource,
 };
-use tickloop_agent_transcript::{DiscardReason, InputOp, InputState};
+use tickloop_agent_transcript::{DiscardReason, InputState};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_PENDING_PAGES_PER_POLL: usize = 8;
@@ -82,35 +82,6 @@ pub(super) fn feedback_eligibility(
         Some(source) if source.resume_required => Eligibility::Hold(Hold::LinkUnavailable),
         Some(_) => Eligibility::Eligible,
     }
-}
-
-/// The ledger inputs of the @tickloop requests a load leaves open under process wait hosting:
-/// accepted and not yet in the conversation, for the Chat's Loop, and still pending in the local
-/// inbox, which delivers them again.
-pub(super) fn requests_the_inbox_delivers_again(chat: &super::Chat) -> HashSet<InputId> {
-    let pending = feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat.snapshot.id)
-        .pending()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|input| input.identity.input_id())
-        .collect::<HashSet<_>>();
-    chat.bookkeeping
-        .lifecycle
-        .open_entries()
-        .into_iter()
-        .filter(|entry| {
-            entry.op == InputOp::Feedback
-                && entry.state == InputState::Accepted
-                && pending.contains(&entry.input_id)
-                && !chat
-                    .snapshot
-                    .message_runs
-                    .values()
-                    .any(|run| *run == entry.run_id)
-                && chat.snapshot.chat_loop.id == entry.loop_id
-        })
-        .map(|entry| entry.input_id)
-        .collect()
 }
 
 /// An @tickloop request the Artifacts service delivered to one receiver, the Loop of a Chat:

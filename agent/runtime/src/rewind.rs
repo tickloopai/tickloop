@@ -743,7 +743,14 @@ mod tests {
             .await
             .unwrap();
         let triggered = agent
-            .deliver_test_trigger(first, "rewind", 1, "event check")
+            .deliver_trigger_for_tests(
+                first,
+                tickloop_agent_protocol::TriggerSource::ScheduledTask {
+                    task_id: "rewind".into(),
+                    scheduled_for_ms: 1,
+                },
+                "event check",
+            )
             .await
             .unwrap();
         assert!(

@@ -2084,10 +2084,10 @@ impl Agent {
             // Held, they flush as soon as the run this delivery starts ends.
             self.tick_deliveries().restore(owner, deferred);
         }
-        let (marks, previous_marks) = {
+        let marks = {
             let deliveries = self.tick_deliveries();
             let delivery = Uuid::new_v4();
-            let marks = items
+            items
                 .iter()
                 .map(|item| {
                     let watermarks = deliveries
@@ -2103,50 +2103,8 @@ impl Agent {
                         },
                     )
                 })
-                .collect::<Vec<_>>();
-            let previous_marks = items
-                .iter()
-                .map(|item| {
-                    (
-                        item.subscription,
-                        deliveries
-                            .subscriptions
-                            .get(&item.subscription)
-                            .and_then(|runtime| runtime.delivered),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (marks, previous_marks)
+                .collect::<Vec<_>>()
         };
-        // The watermark is durable before the delivery is handed on, so a repeat of this update
-        // is never delivered again, even by a later process.
-        let durable = marks.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            durable
-                .iter()
-                .filter_map(|(subscription, directory, mark)| {
-                    directory
-                        .as_ref()
-                        .map(|directory| (directory, subscription, mark))
-                })
-                .try_for_each(|(directory, subscription, mark)| {
-                    write_watermark(directory, *subscription, *mark)
-                })
-        })
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            self.tick_deliveries().restore(owner, items);
-            self.inner.tick_wake.notify_one();
-            return;
-        }
-        {
-            let mut deliveries = self.tick_deliveries();
-            for (subscription, _, mark) in marks {
-                if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
-                    runtime.delivered = Some(mark);
-                }
-            }
-        }
         let source = TriggerSource::TickUpdate {
             items: items
                 .iter()
@@ -2170,36 +2128,80 @@ impl Agent {
                 },
             )
             .await;
-        let mut deliveries = self.tick_deliveries();
         match outcome {
             Ok(_) => {
-                let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
-                for item in &items {
-                    if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
-                        runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
-                        if let Some(first) = &runtime.first {
-                            runtime.pending_since = Some(first.received_at);
-                        } else if runtime.accumulated == 0 && !runtime.has_pending_change {
-                            runtime.pending_since = None;
-                        }
-                        runtime.last_delivery_ms = Some(delivered_at);
-                        runtime.last_delivery = Some(summary.clone());
-                    }
-                }
+                self.record_delivery(&marks, &items, &summary);
+                self.record_delivered_watermarks(chat_id, marks).await;
             }
             Err(_) => {
-                // Not delivered, so not delivered again: the in-memory watermark goes back for
-                // the restored items. A durable watermark written ahead may skip them after a
-                // restart, as a crash right after writing it would.
-                for (subscription, previous) in previous_marks {
-                    if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
-                        runtime.delivered = previous;
-                    }
-                }
-                deliveries.restore(owner, items);
+                self.tick_deliveries().restore(owner, items);
                 self.inner.tick_wake.notify_one();
             }
         }
+    }
+
+    /// What an accepted delivery leaves in its subscriptions: the updates it carried are
+    /// delivered and no longer wait.
+    fn record_delivery(
+        &self,
+        marks: &[(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)],
+        items: &[DeliveryItem],
+        summary: &str,
+    ) {
+        let mut deliveries = self.tick_deliveries();
+        let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        for (subscription, _, mark) in marks {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(subscription) {
+                runtime.delivered = Some(*mark);
+            }
+        }
+        for item in items {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
+                runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
+                if let Some(first) = &runtime.first {
+                    runtime.pending_since = Some(first.received_at);
+                } else if runtime.accumulated == 0 && !runtime.has_pending_change {
+                    runtime.pending_since = None;
+                }
+                runtime.last_delivery_ms = Some(delivered_at);
+                runtime.last_delivery = Some(summary.to_owned());
+            }
+        }
+    }
+
+    /// Writes the watermarks of an accepted delivery once its acceptance is durable, so no
+    /// later process skips an update the ledger does not hold: a crash before this leaves the
+    /// update to be delivered again, where the ledger finds it; a crash after it finds the
+    /// accepted input queued again when the Chat loads.
+    async fn record_delivered_watermarks(
+        &self,
+        chat_id: ChatId,
+        marks: Vec<(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)>,
+    ) {
+        if marks.iter().all(|(_, directory, _)| directory.is_none()) {
+            return;
+        }
+        let accepted = {
+            let chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get(&chat_id) else {
+                return;
+            };
+            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await
+        };
+        if accepted.is_err() {
+            return;
+        }
+        // A watermark that cannot be written only lets the update be delivered again, which
+        // the ledger answers with its first receipt.
+        let _ = tokio::task::spawn_blocking(move || {
+            for (subscription, directory, mark) in marks {
+                if let Some(directory) = directory {
+                    let _ = write_watermark(&directory, subscription, mark);
+                }
+            }
+        })
+        .await;
     }
 
     /// Proves the delivered items' watches again with their Tickhost; one that fails is no longer

@@ -17,9 +17,9 @@ impl Agent {
     /// After a load. With durable wait hosting: another attempt continues each input whose
     /// answer lost its host, unless it lost its host three times in a row; the inputs that were
     /// queued are queued again after them; suspended Runs are rebuilt. With process wait
-    /// hosting, the inputs the Agent queued for itself are lost with the process, as they always
-    /// were, and an @tickloop request that had not started waits for the local inbox, which
-    /// delivers it again.
+    /// hosting, Trigger input that had not started is queued again, to wait for the Chat to be
+    /// continued, since its source already moved past it; the rest the Agent queued for itself
+    /// is lost with the process, as it always was.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -27,8 +27,16 @@ impl Agent {
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     return;
                 };
-                let redelivered = event_sources::requests_the_inbox_delivers_again(chat);
-                self.forget_inputs(chat, |entry| !redelivered.contains(&entry.input_id));
+                let waiting = chat
+                    .bookkeeping
+                    .lifecycle
+                    .queued_inputs()
+                    .into_iter()
+                    .filter(|pending| pending.trigger_source.is_some())
+                    .map(|pending| pending.receipt.run_id)
+                    .collect::<std::collections::HashSet<_>>();
+                self.forget_inputs(chat, |entry| !waiting.contains(&entry.run_id));
+                self.requeue_inputs(chat);
                 self.save(&chat.snapshot);
             }
             WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,

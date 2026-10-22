@@ -86,7 +86,14 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
         .await
         .unwrap();
     agent
-        .deliver_test_trigger(chat, "evidence", 1, "Check fresh evidence")
+        .deliver_trigger_for_tests(
+            chat,
+            tickloop_agent_protocol::TriggerSource::ScheduledTask {
+                task_id: "evidence".into(),
+                scheduled_for_ms: 1,
+            },
+            "Check fresh evidence",
+        )
         .await
         .unwrap();
     loop {
