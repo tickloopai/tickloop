@@ -575,6 +575,85 @@ async fn a_background_child_holds_the_continuation_until_its_report_arrives() {
 }
 
 #[tokio::test]
+async fn a_background_shell_holds_the_continuation_until_it_ends() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("release");
+    let model = HoldingModel::new(
+        vec![
+            call(
+                "sh1",
+                "Bash",
+                json!({
+                    "command": format!("while [ ! -e '{}' ]; do sleep 0.05; done", gate.display()),
+                    "run_in_background": true,
+                    "description": "Wait for the release gate"
+                }),
+            ),
+            text("Waiting for the shell."),
+            text("The shell finished."),
+            blocked("b1"),
+            text("Blocked on credentials."),
+        ],
+        Vec::new(),
+    );
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
+    approve_everything(&agent);
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    tokio::time::timeout(WAIT, async {
+        while model.turn_requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the continuation started the shell");
+    wait_until_idle(&agent, chat).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        model.continuations(),
+        1,
+        "no continuation while the background shell runs"
+    );
+    assert_eq!(goal(&agent, chat).await.unwrap().status, GoalStatus::Active);
+
+    std::fs::write(&gate, b"release").unwrap();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    assert_eq!(
+        model.continuations(),
+        2,
+        "the continuation followed the shell's completion"
+    );
+    let last = model.turn_requests().pop().unwrap();
+    let notification = last
+        .messages
+        .iter()
+        .position(|message| mentions_text(message, "<task-notification>"))
+        .expect("the shell's completion reached the model");
+    let second_continuation = last
+        .messages
+        .iter()
+        .rposition(|message| mentions_text(message, CONTINUATION))
+        .unwrap();
+    assert!(notification < second_continuation);
+    agent.shutdown().await;
+}
+
+fn mentions_text(message: &tickloop_agent_protocol::Message, needle: &str) -> bool {
+    message
+        .content
+        .iter()
+        .any(|content| matches!(content, Content::Text { text } if text.contains(needle)))
+}
+
+#[tokio::test]
 async fn a_childs_usage_counts_toward_its_roots_goal_and_children_have_no_goal_tools() {
     let model = HoldingModel::new(
         vec![
