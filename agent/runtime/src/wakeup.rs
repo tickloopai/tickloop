@@ -932,8 +932,10 @@ pub mod trigger_pauses {
         TriggerChecked,
         /// Queued Trigger input started, and its start is not recorded durably yet.
         TriggerStarted,
-        /// A shutdown abandons Trigger input whose start is not recorded, before it drops
-        /// what the Transcript did not take.
+        /// Trigger input whose start could not be recorded is about to wait before trying again.
+        TriggerStartRetrying,
+        /// A shutdown abandons Trigger input whose start is not recorded, before it takes the
+        /// start back.
         TriggerStartAbandoned,
     }
 

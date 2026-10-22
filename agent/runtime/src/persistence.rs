@@ -2592,14 +2592,6 @@ impl Agent {
         }
     }
 
-    /// What the Chat queued for its Transcript and could not commit is dropped, and nothing more
-    /// of it is written by this process.
-    pub(super) fn withhold_transcript(&self, chat_id: ChatId, reason: &str) {
-        if let Some(recorder) = &self.inner.recorder {
-            recorder.outbox.withhold(chat_id, reason);
-        }
-    }
-
     /// Whether the store holds anything of the Chat yet: a process host records nothing ahead of
     /// its conversation.
     pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {

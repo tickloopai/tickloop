@@ -1036,6 +1036,7 @@ async fn a_caller_dropped_as_its_input_starts_leaves_it_running_once() {
 /// durably by the first, waiting behind a turn.
 struct FaultyProcesses {
     _directory: tempfile::TempDir,
+    root: std::path::PathBuf,
     chat: Uuid,
     first: Agent,
     first_store: Arc<FaultyTranscriptStore>,
@@ -1073,6 +1074,7 @@ impl FaultyProcesses {
         first.flush_transcripts().await;
         Self {
             _directory: directory,
+            root,
             chat,
             first,
             first_store,
@@ -1143,12 +1145,14 @@ async fn trigger_input_never_recorded_as_started_runs_once_after_a_takeover() {
     processes.taken_over_ran_once().await;
 }
 
-/// A shutdown abandons Trigger input whose start was not recorded, and the store taking writes
-/// again before the shutdown's last flush records nothing of it: the process taking the lease
-/// over runs it once.
+/// A shutdown abandons Trigger input whose start was not recorded and the store takes writes
+/// again before the shutdown's last flush: the start is taken back after it, and the previous
+/// turn's answer, queued with the start and not yet stored, is stored all the same. The process
+/// taking the lease over runs the input once.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_abandoned_start_stays_unrecorded_when_the_store_recovers_at_shutdown() {
+async fn an_abandoned_start_keeps_the_chats_other_records_when_the_store_recovers() {
     let processes = FaultyProcesses::new().await;
+    // The held turn ends with its answer while the store refuses writes.
     processes.start_while_the_store_refuses().await;
     let abandoned = processes
         .first
@@ -1163,6 +1167,82 @@ async fn an_abandoned_start_stays_unrecorded_when_the_store_recovers_at_shutdown
         .unwrap();
     processes.first_store.heal();
     drop(abandoned.release);
+    shutdown.await.unwrap();
+    let stored: Vec<tickloop_agent_transcript::Line> = std::fs::read_to_string(
+        tickloop_agent_test_support::transcript_file(&processes.root, processes.chat),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str(line).ok())
+    .collect();
+    let held_prompt = stored
+        .iter()
+        .find_map(|line| match line {
+            tickloop_agent_transcript::Line::User(entry)
+                if serde_json::to_string(&entry.message)
+                    .unwrap()
+                    .contains("HOLD:turn this turn") =>
+            {
+                Some(entry.uuid)
+            }
+            _ => None,
+        })
+        .expect("the held turn's prompt is stored");
+    assert!(
+        stored.iter().any(|line| matches!(
+            line,
+            tickloop_agent_transcript::Line::Response(entry)
+                if entry.input_id == Some(held_prompt)
+                    && entry.state
+                        == tickloop_agent_transcript::ResponseState::Ended {
+                            ending: tickloop_agent_transcript::ResponseEnding::Completed,
+                        }
+        )),
+        "the held turn's answer is stored as completed"
+    );
+    processes.taken_over_ran_once().await;
+}
+
+/// A write of the start already in the store, waiting there, as the shutdown abandons the
+/// start: it lands, and the start taken back after it lands too, so the process taking the
+/// lease over runs the input once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_start_already_being_written_is_taken_back_after_it() {
+    let processes = FaultyProcesses::new().await;
+    let (first, chat) = (processes.first.clone(), processes.chat);
+    let retrying = first.pause_next_for_tests(chat, PausePoint::TriggerStartRetrying);
+    processes.start_while_the_store_refuses().await;
+    tokio::time::timeout(WAIT, retrying.entered)
+        .await
+        .expect("the start waits to try again")
+        .unwrap();
+    // Another write of the same batch reaches the store, which takes writes again, and waits.
+    processes.first_store.hold_appends();
+    processes.first_store.heal();
+    let in_flight = tokio::spawn({
+        let first = first.clone();
+        async move { first.flush_transcripts().await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while processes.first_store.waiting_appends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the write waits in the store");
+    let abandoned = first.pause_next_for_tests(chat, PausePoint::TriggerStartAbandoned);
+    let shutdown = tokio::spawn({
+        let first = first.clone();
+        async move { first.shutdown().await }
+    });
+    drop(retrying.release);
+    tokio::time::timeout(WAIT, abandoned.entered)
+        .await
+        .expect("the shutdown abandons the start")
+        .unwrap();
+    drop(abandoned.release);
+    processes.first_store.release_appends();
+    in_flight.await.unwrap();
     shutdown.await.unwrap();
     processes.taken_over_ran_once().await;
 }
@@ -1211,21 +1291,23 @@ async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease
     processes.second.shutdown().await;
 }
 
-/// Trigger input interrupted while it waits for its start to be recorded ends without asking
-/// the model.
+/// Trigger input stopped while it waits for its start to be recorded never starts: its start
+/// is taken back, and it runs once the Chat is continued.
 #[tokio::test(flavor = "multi_thread")]
-async fn trigger_input_stopped_before_its_start_is_recorded_never_runs() {
+async fn trigger_input_stopped_before_its_start_is_recorded_waits_for_the_continue() {
     let processes = FaultyProcesses::new().await;
     processes.start_while_the_store_refuses().await;
     processes.first.stop(processes.chat).await.unwrap();
-    wait_for_state(
-        &processes.first,
-        processes.chat,
-        tickloop_agent_protocol::LoopState::Interrupted,
-    )
-    .await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 0);
+    processes.first_store.heal();
+    processes.first.continue_loop(processes.chat).await.unwrap();
+    processes
+        .first_model
+        .wait_seen(FaultyProcesses::MARKER, 1)
+        .await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 1);
     processes.first.shutdown().await;
     processes.second.shutdown().await;
 }

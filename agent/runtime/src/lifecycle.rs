@@ -204,6 +204,32 @@ impl Lifecycle {
         }
     }
 
+    /// Whether the input of `run` is recorded as started and open.
+    pub(crate) fn is_started(&self, run: RunId) -> bool {
+        self.open_inputs
+            .get(&run)
+            .and_then(|id| self.input(*id))
+            .is_some_and(|input| input.state == InputState::Started)
+    }
+
+    /// Takes back the start of `queued`'s input, which has not run: a newer record has it
+    /// accepted and waiting again, with its content, whatever lands of the start before it.
+    pub(crate) fn take_start_back(&mut self, queued: &PendingInput) {
+        let Some(id) = self.open_inputs.get(&queued.receipt.run_id).copied() else {
+            return;
+        };
+        let revision = self.next_revision();
+        if let Some(input) = self.inputs.get_mut(&id)
+            && input.record.state == InputState::Started
+        {
+            input.record.state = InputState::Accepted;
+            input.record.queued =
+                Some(serde_json::to_value(queued).expect("a queued input is serializable"));
+            input.record.timestamp = now();
+            input.revision = revision;
+        }
+    }
+
     /// The inputs accepted and not yet started, in the order they were queued: what a load
     /// queues again.
     pub(crate) fn queued_inputs(&self) -> Vec<PendingInput> {
