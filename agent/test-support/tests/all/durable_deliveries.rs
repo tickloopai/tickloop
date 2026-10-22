@@ -105,7 +105,6 @@ fn prompt(text: &str) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -198,7 +197,7 @@ async fn a_delivery_whose_holder_died_before_acknowledging_enters_the_conversati
         ];
         transcripts.seed(chat, lines, stored.position);
 
-        let request = TurnRequest::deliver(target, delivery());
+        let request = TurnRequest::deliver(delivery());
         let holding = cloud.host("crashing").acquire(cloud.chat).unwrap();
         holding.crash_at(crash);
         let crashed = holding.run(request.clone()).await;

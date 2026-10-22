@@ -115,9 +115,8 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     let chat = agent.create_chat_without_folder().await.unwrap();
     let mut events = agent.subscribe();
     let turn = agent.advance(chat, check_feed()).await.unwrap();
-    let loop_id = turn.receipt().loop_id;
     until_completed(&mut events, turn.receipt().run_id).await;
-    arm(&agent, chat, loop_id).await;
+    arm(&agent, chat).await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
     for holding in 0..fires / fires_per_holding {
@@ -136,7 +135,6 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
             let receipt = agent
                 .trigger(
                     chat,
-                    loop_id,
                     TriggerSource {
                         source: "feed".into(),
                         payload: serde_json::json!({ "fire": fire }),
@@ -166,7 +164,6 @@ fn check_feed() -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: "Check the feed whenever it changes.".into(),
                 ..Default::default()
@@ -177,11 +174,10 @@ fn check_feed() -> TurnRequest {
     }
 }
 
-async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId, loop_id: Uuid) {
+async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId) {
     agent
         .configure_trigger(
             chat,
-            loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the feed".into(),

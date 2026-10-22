@@ -108,7 +108,7 @@ impl ModelClient for UsageModel {
 
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -327,7 +327,6 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: Some("large work".into()),
         })
         .await
@@ -618,7 +617,6 @@ async fn branch_and_fork_after_a_directed_summary_keep_the_summary_and_restart_u
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -692,8 +690,8 @@ fn assert_restored_like(restored: &ChatSnapshot, in_process: &ChatSnapshot, labe
     };
     assert_eq!(markers(restored), markers(in_process), "{label}");
     assert_eq!(
-        serde_json::to_value(&restored.loops).unwrap(),
-        serde_json::to_value(&in_process.loops).unwrap(),
+        serde_json::to_value(&restored.chat_loop).unwrap(),
+        serde_json::to_value(&in_process.chat_loop).unwrap(),
         "{label}"
     );
 }
@@ -949,7 +947,7 @@ async fn code_rewind_to_a_preserved_prompt_uses_its_file_history_in_process_and_
 
 async fn complete_turn_approving(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {

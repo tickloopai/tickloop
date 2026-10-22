@@ -243,7 +243,7 @@ async fn run_background_request_fixture() {
     wait_for_background_stage("start").await;
     answerer.display_chat(Some(background)).await.unwrap();
     answerer
-        .submit(background, None, BACKGROUND_TASK.into())
+        .submit(background, BACKGROUND_TASK.into())
         .await
         .unwrap();
     let request_id = loop {
@@ -259,16 +259,13 @@ async fn run_background_request_fixture() {
     background_phase("requested", serde_json::json!({"request":request_id}));
     if std::env::var(BACKGROUND_PENDING_SHORT_VARIABLE).as_deref() == Ok("1") {
         answerer.display_chat(Some(visible)).await.unwrap();
-        let started = answerer
-            .submit(visible, None, "Visible initial input".into())
+        answerer
+            .submit(visible, "Visible initial input".into())
             .await
             .unwrap();
         model.entered.acquire().await.unwrap().forget();
         for _ in 0..2 {
-            answerer
-                .submit(visible, Some(started.loop_id), "Hello".into())
-                .await
-                .unwrap();
+            answerer.submit(visible, "Hello".into()).await.unwrap();
         }
         let snapshot = core.snapshot(visible).await.unwrap();
         assert_eq!(snapshot.queued_inputs().len(), 2);
@@ -333,13 +330,13 @@ async fn run_background_request_fixture() {
     assert!(snapshot.permissions.is_empty());
     assert!(snapshot.questions.is_empty());
     assert_eq!(
-        snapshot.loops[0].state,
+        snapshot.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
     background_phase(
         "answered",
         serde_json::json!({
-            "permissions":snapshot.permissions.len(),"questions":snapshot.questions.len(),"state":snapshot.loops[0].state,
+            "permissions":snapshot.permissions.len(),"questions":snapshot.questions.len(),"state":snapshot.chat_loop.state,
             "monitor":monitor_view,"answerer":answerer_view,
         }),
     );
@@ -387,12 +384,12 @@ async fn run_background_request_fixture() {
         let snapshot = core.snapshot(background).await.unwrap();
         assert!(snapshot.permissions.is_empty());
         assert_eq!(
-            snapshot.loops[0].state,
+            snapshot.chat_loop.state,
             tickloop_agent_protocol::LoopState::Running
         );
         background_phase(
             "answered-next",
-            serde_json::json!({"permissions":0,"state":snapshot.loops[0].state}),
+            serde_json::json!({"permissions":0,"state":snapshot.chat_loop.state}),
         );
     }
     wait_for_background_stage("finish").await;

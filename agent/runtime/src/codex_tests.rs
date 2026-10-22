@@ -86,13 +86,10 @@ async fn agent_websocket_reuses_chat_connection_for_tools_and_continuation() {
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Read both files".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Read both files".into()).await.unwrap();
     completed_agent_turn(&mut events).await;
     agent
-        .submit(chat, Some(first.loop_id), "Repeat their markers".into())
+        .submit(chat, "Repeat their markers".into())
         .await
         .unwrap();
     completed_agent_turn(&mut events).await;
@@ -185,11 +182,11 @@ async fn concurrent_agent_chats_keep_websocket_tools_and_results_separate() {
     });
     let mut events = agent.subscribe();
     agent
-        .submit(first_chat, None, "Read parallel-a.txt".into())
+        .submit(first_chat, "Read parallel-a.txt".into())
         .await
         .unwrap();
     agent
-        .submit(second_chat, None, "Read parallel-b.txt".into())
+        .submit(second_chat, "Read parallel-b.txt".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), ready_rx)
@@ -315,7 +312,7 @@ async fn agent_falls_back_to_sse_only_before_websocket_output() {
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     completed_agent_turn(&mut events).await;
     let (ws, headers, sse) = captured_rx.await.unwrap();
     assert_eq!(ws["type"], "response.create");
@@ -357,7 +354,7 @@ async fn agent_never_replays_after_websocket_output_begins() {
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     let mut saw_partial = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -396,7 +393,7 @@ async fn agent_conversation_uses_codex_credentials_and_streams_text_and_reasonin
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Say hello".into()).await.unwrap();
+    agent.submit(chat, "Say hello".into()).await.unwrap();
     let mut text = String::new();
     let mut thinking = String::new();
     loop {
@@ -474,7 +471,7 @@ async fn agent_uses_replaced_account_on_its_next_real_model_request() {
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -493,10 +490,7 @@ async fn agent_uses_replaced_account_on_its_next_real_model_request() {
         "local-test-account-2",
         3_600_000,
     );
-    agent
-        .submit(chat, Some(first.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -589,7 +583,7 @@ async fn agent_sends_refreshed_token_and_account_to_the_model_service() {
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -642,8 +636,8 @@ async fn agent_reads_two_real_files_and_continues_with_paired_codex_tool_history
     let agent = Agent::new_embedded(config, client.into_fixture_client());
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Read both files and tell me their dates".into())
+    agent
+        .submit(chat, "Read both files and tell me their dates".into())
         .await
         .unwrap();
     let mut tool_completions = 0;
@@ -665,7 +659,7 @@ async fn agent_reads_two_real_files_and_continues_with_paired_codex_tool_history
     }
     assert_eq!(tool_completions, 2);
     agent
-        .submit(chat, Some(first.loop_id), "What were the dates?".into())
+        .submit(chat, "What were the dates?".into())
         .await
         .unwrap();
     loop {
@@ -780,7 +774,6 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
         agent
             .submit(
                 chat,
-                None,
                 "Create the checked link in this temporary directory".into(),
             )
             .await
@@ -901,7 +894,6 @@ async fn explicit_codex_reviewer_uses_its_own_model_and_usage_identity() {
     agent
         .submit(
             chat,
-            None,
             "Create the approved link in this temporary directory".into(),
         )
         .await
@@ -985,11 +977,7 @@ async fn blocked_auto_review_case(
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Inspect the directory without making changes".into(),
-        )
+        .submit(chat, "Inspect the directory without making changes".into())
         .await
         .unwrap();
     let mut reason = None;
@@ -1189,7 +1177,7 @@ async fn orphan_tool_event_requires_manual_review(malformed_result: bool) {
                 .unwrap();
             let mut events = agent.subscribe();
             agent
-                .submit(chat, None, "Create the blocked link".into())
+                .submit(chat, "Create the blocked link".into())
                 .await
                 .unwrap();
             let mut manual = false;

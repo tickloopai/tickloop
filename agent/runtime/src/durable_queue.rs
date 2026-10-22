@@ -2,7 +2,7 @@
 //! accepted with its content, so with durable wait hosting a load queues again what was waiting,
 //! after another attempt at each input whose answer lost its host.
 
-use tickloop_agent_protocol::{ChatId, EventKind, LoopSnapshot, LoopState, Receipt};
+use tickloop_agent_protocol::{ChatId, EventKind, LoopState, Receipt};
 use tickloop_agent_transcript::{
     InputEntry, InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
 };
@@ -123,65 +123,29 @@ impl Agent {
                 error: LOST_HOST_ERROR.into(),
             },
         );
-        if let Some(goal) = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == receipt.loop_id)
-            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-        {
-            goal.set_state(LoopState::Failed);
-        }
+        chat.snapshot.chat_loop.set_state(LoopState::Failed);
         self.emit(chat, receipt, EventKind::Failed(LOST_HOST_ERROR.into()));
     }
 
     /// Queues again the inputs accepted and not started, behind the continuations, in the order
-    /// they were queued: each goes where it went when it was queued.
+    /// they were queued, each to the Chat's Loop.
     fn requeue_inputs(&self, chat: &mut Chat) {
-        for pending in chat.bookkeeping.lifecycle.queued_inputs() {
+        for mut pending in chat.bookkeeping.lifecycle.queued_inputs() {
             let is_queued = chat
                 .snapshot
                 .pending_inputs
                 .iter()
                 .any(|queued| queued.receipt.run_id == pending.receipt.run_id);
-            // A Loop is recorded once its first Run starts: an input that was to start one
-            // brings it back.
-            if !chat
-                .snapshot
-                .loops
-                .iter()
-                .any(|goal| goal.id == pending.receipt.loop_id)
-            {
-                chat.bookkeeping.add_loop(
-                    &mut chat.snapshot,
-                    LoopSnapshot {
-                        id: pending.receipt.loop_id,
-                        goal: pending.input.clone(),
-                        state: LoopState::Idle,
-                        run_id: None,
-                        run_started_at: None,
-                        trigger: None,
-                        event_sources: Vec::new(),
-                        state_since: None,
-                    },
-                );
-            }
-            let Some(goal) = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == pending.receipt.loop_id)
-            else {
-                continue;
-            };
-            if is_queued || matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            if is_queued {
                 continue;
             }
+            pending.receipt.loop_id = chat.snapshot.chat_loop.id;
+            let chat_loop = &mut chat.snapshot.chat_loop;
             if !matches!(
-                goal.state,
+                chat_loop.state,
                 LoopState::Running | LoopState::WaitingQuestion | LoopState::WaitingPermission
             ) {
-                goal.set_state(LoopState::Queued);
+                chat_loop.set_state(LoopState::Queued);
             }
             chat.snapshot.last_queue_sequence = chat
                 .snapshot

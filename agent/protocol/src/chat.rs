@@ -126,13 +126,13 @@ pub struct ChatSnapshot {
     pub message_sources: BTreeMap<usize, PrivateHistorySource>,
     #[serde(default)]
     pub message_models: BTreeMap<usize, ModelIdentity>,
-    /// 链上字段：由对话链上的 Loop 条目重放得到。
-    #[serde(default)]
-    pub loops: Vec<LoopSnapshot>,
-    /// Trigger 已解除武装、等待用户向该 Loop 提交输入时重新武装的 Loop（重启恢复或 Branch
-    /// 复制后）。随 Loop 条目记录在对话链上。
+    /// The Chat's one Loop, there from the Chat's creation. 链上字段：由对话链上的 Loop 条目重放得到。
+    pub chat_loop: LoopSnapshot,
+    /// Receiving is paused until the Chat is continued (after `/stop`, or a history load or Branch
+    /// copy of an armed Trigger); the Loop's Trigger stays disarmed meanwhile. Recorded with the
+    /// Loop on the conversation chain.
     #[serde(skip)]
-    pub resume_triggers: Vec<LoopId>,
+    pub trigger_awaits_resume: bool,
     /// The fields through `pending_model` are process-local state and are not persisted with the
     /// Chat. Recovery starts them from defaults; persistent rules and context limits come from
     /// user settings.
@@ -203,10 +203,6 @@ impl ChatSnapshot {
                     .collect::<Vec<_>>()
                     .join("\n")
             })
-    }
-
-    pub fn default_input_loop(&self) -> Option<LoopId> {
-        (self.loops.len() == 1).then(|| self.loops[0].id)
     }
 
     /// Whether the model that answers the next user input accepts images; a pending model
@@ -313,10 +309,6 @@ pub enum EventKind {
     },
     QuestionAsked {
         request: QuestionRequest,
-    },
-    GoalEnded {
-        reason: String,
-        operations: Vec<OperationRecord>,
     },
     ToolStarted {
         call_id: String,
@@ -702,11 +694,14 @@ pub fn short_chat_title(text: &str) -> String {
 
 const NEW_AGENT_TITLE: &str = "New Agent";
 
-/// Provides a bounded task or Shell label until a generated or explicit Chat title exists.
-pub(crate) fn fallback_title(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> String {
-    loops
-        .first()
-        .map(|goal| short_chat_title(&goal.goal))
+/// Provides a bounded label from the first user prompt or Shell until a generated or explicit
+/// Chat title exists.
+pub(crate) fn fallback_title(
+    first_prompt: Option<&str>,
+    user_shells: &[UserShellRecord],
+) -> String {
+    first_prompt
+        .map(short_chat_title)
         .or_else(|| {
             user_shells
                 .first()
@@ -721,7 +716,40 @@ pub fn chat_display_title(snapshot: &ChatSnapshot, user_shells: &[UserShellRecor
         .as_ref()
         .map(|origin| origin.name.clone())
         .or_else(|| snapshot.generated_title.clone())
-        .unwrap_or_else(|| fallback_title(&snapshot.loops, user_shells))
+        .unwrap_or_else(|| {
+            fallback_title(
+                first_prompt(snapshot, &snapshot.pending_inputs).as_deref(),
+                user_shells,
+            )
+        })
+}
+
+/// What the conversation was first asked: a delegated Chat's task, or else the first prompt the
+/// user gave it, or the first one still queued.
+pub(crate) fn first_prompt(
+    conversation: &ChatSnapshot,
+    pending_inputs: &[PendingInput],
+) -> Option<String> {
+    if let Some(delegation) = &conversation.delegation {
+        return Some(delegation.task.clone());
+    }
+    conversation
+        .prompt_execution_modes
+        .keys()
+        .find_map(|index| conversation.rewind_point_at(*index))
+        .map(|point| point.prompt)
+        .or_else(|| {
+            pending_inputs
+                .iter()
+                .find(|pending| is_queued_user_message(pending))
+                .map(|pending| pending.input.clone())
+        })
+}
+
+fn is_queued_user_message(pending: &PendingInput) -> bool {
+    pending.trigger_source.is_none()
+        && !pending.task_continuation
+        && pending.agent_message.is_none()
 }
 
 /// Whether an execution ever received work. Configuration changes alone leave it empty.
@@ -730,10 +758,7 @@ pub fn chat_has_work(
     user_shells: &[UserShellRecord],
     queued: usize,
 ) -> bool {
-    !conversation.loops.is_empty()
-        || !conversation.messages.is_empty()
-        || !user_shells.is_empty()
-        || queued > 0
+    !conversation.messages.is_empty() || !user_shells.is_empty() || queued > 0
 }
 
 const PREVIEW_MAX_CHARACTERS: usize = 160;
@@ -832,11 +857,7 @@ pub(crate) fn queued_inputs(
 ) -> Vec<QueuedInput> {
     let mut entries = pending_inputs
         .iter()
-        .filter(|pending| {
-            pending.trigger_source.is_none()
-                && !pending.task_continuation
-                && pending.agent_message.is_none()
-        })
+        .filter(|pending| is_queued_user_message(pending))
         .map(|pending| QueuedInput {
             id: pending.receipt.run_id,
             chat_id: pending.receipt.chat_id,

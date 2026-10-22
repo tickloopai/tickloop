@@ -209,9 +209,9 @@ impl Agent {
                     .any(|id| names_it(id))
                     || chat
                         .snapshot
-                        .loops
+                        .chat_loop
+                        .event_sources
                         .iter()
-                        .flat_map(|goal| &goal.event_sources)
                         .any(|source| names_it(&source.artifact_id))
             });
             let is_named_by_the_user = user_texts.iter().any(|text| {

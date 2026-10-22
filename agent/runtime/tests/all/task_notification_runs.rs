@@ -116,7 +116,7 @@ async fn background_agent_command_completion_continues_its_goal() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     let started = agent.snapshot(chat).await.unwrap();
@@ -187,7 +187,7 @@ async fn a_foreground_command_past_its_timeout_moves_to_the_background_and_notif
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "run it".into()).await.unwrap();
+    agent.submit(chat, "run it".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     let moved = agent.snapshot(chat).await.unwrap();
     let command = &moved.commands[0];
@@ -244,7 +244,7 @@ async fn a_foreground_command_the_user_backgrounds_returns_at_once_and_notifies_
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "run it".into()).await.unwrap();
+    agent.submit(chat, "run it".into()).await.unwrap();
     let running = loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => {
@@ -325,22 +325,21 @@ async fn background_user_shell_completion_continues_the_goal_that_started_it() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "hello".into()).await.unwrap();
+    agent.submit(chat, "hello".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
 
     agent
-        .submit_user_shell_for_goal(chat, Some(receipt.loop_id), gated_command(&gate), true)
+        .submit_user_shell(chat, gated_command(&gate), true)
         .await
         .unwrap();
     std::fs::write(&gate, b"release").unwrap();
 
-    let snapshot = wait_for_snapshot(&agent, chat, |snapshot| {
+    wait_for_snapshot(&agent, chat, |snapshot| {
         conversation_texts(snapshot)
             .last()
             .is_some_and(|text| text == "the shell command finished")
     })
     .await;
-    assert_eq!(snapshot.loops.len(), 1);
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(
@@ -370,7 +369,7 @@ async fn background_completion_does_not_resume_an_interrupted_loop() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
 
     loop {
         match next_event(&mut events).await.kind {
@@ -396,7 +395,7 @@ async fn background_completion_does_not_resume_an_interrupted_loop() {
         }
     }
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::Interrupted
     );
 
@@ -407,7 +406,7 @@ async fn background_completion_does_not_resume_an_interrupted_loop() {
             .any(|text| text.starts_with("<task-notification>"))
     })
     .await;
-    assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
     assert_eq!(model.requests.lock().unwrap().len(), 2);
 }
 
@@ -424,7 +423,7 @@ async fn background_completion_does_not_resume_a_failed_loop() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
 
     loop {
         match next_event(&mut events).await.kind {
@@ -439,7 +438,7 @@ async fn background_completion_does_not_resume_a_failed_loop() {
         }
     }
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::Failed
     );
 
@@ -450,13 +449,13 @@ async fn background_completion_does_not_resume_a_failed_loop() {
             .any(|text| text.starts_with("<task-notification>"))
     })
     .await;
-    assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
     assert_eq!(model.requests.lock().unwrap().len(), 2);
 }
 
-/// An unowned `!` command does not create a Loop or start an Agent run.
+/// A `!` command before the Loop's first turn only records its completion.
 #[tokio::test]
-async fn background_completion_without_a_goal_only_records_the_notification() {
+async fn a_background_user_shell_completion_before_any_turn_only_records_the_notification() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -464,7 +463,7 @@ async fn background_completion_without_a_goal_only_records_the_notification() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .submit_user_shell_for_goal(chat, None, "printf done".into(), true)
+        .submit_user_shell(chat, "printf done".into(), true)
         .await
         .unwrap();
 
@@ -474,7 +473,7 @@ async fn background_completion_without_a_goal_only_records_the_notification() {
             .any(|text| text.starts_with("<task-notification>"))
     })
     .await;
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(model.requests.lock().unwrap().is_empty());
     assert!(
@@ -513,7 +512,7 @@ async fn background_completions_during_a_run_continue_the_goal_once() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start both".into()).await.unwrap();
+    agent.submit(chat, "start both".into()).await.unwrap();
     let approvals = tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -594,7 +593,7 @@ async fn a_completion_inside_a_running_tool_loop_does_not_add_a_run() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
     let approvals = tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -662,14 +661,14 @@ async fn background_completion_does_not_continue_another_chat() {
     let first = agent.create_chat(directory.path().into()).await.unwrap();
     let second = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(first, None, "hello".into()).await.unwrap();
+    agent.submit(first, "hello".into()).await.unwrap();
     finish_run(&agent, first, &mut events).await;
-    agent.submit(second, None, "hello".into()).await.unwrap();
+    agent.submit(second, "hello".into()).await.unwrap();
     finish_run(&agent, second, &mut events).await;
     let untouched = conversation_texts(&agent.snapshot(second).await.unwrap());
 
     agent
-        .submit_user_shell_for_goal(first, Some(receipt.loop_id), gated_command(&gate), true)
+        .submit_user_shell(first, gated_command(&gate), true)
         .await
         .unwrap();
     std::fs::write(&gate, b"release").unwrap();

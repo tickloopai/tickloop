@@ -183,7 +183,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     };
     let old_worker_pid = version(&old).await.workers[0].process_id;
     let shell = old.execute(command(epoch, AgentCommand::Submit {
-        execution, target_loop: None,
+        execution,
         input: UserInput::Shell { command: "printf before-upgrade; while [ ! -f release ]; do sleep 0.05; done; printf after-upgrade".into(), background: true },
         origin: None,
     })).await.unwrap().into_result().unwrap();
@@ -222,7 +222,6 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
         epoch,
         AgentCommand::Submit {
             execution,
-            target_loop: None,
             input: UserInput::Text {
                 text: "first turn".into(),
                 contexts: Vec::new(),
@@ -319,7 +318,6 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
         epoch,
         AgentCommand::Submit {
             execution,
-            target_loop: None,
             input: UserInput::Text {
                 text: "second turn".into(),
                 contexts: Vec::new(),
@@ -369,7 +367,6 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
             epoch,
             AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Shell {
                     command: "printf next-input".into(),
                     background: false,

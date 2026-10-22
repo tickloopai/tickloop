@@ -79,12 +79,7 @@ impl LateReceiptDaemon {
             let ObservationValue::Agent(snapshot) = observation.initial else {
                 panic!("the daemon's Agent snapshot");
             };
-            if !snapshot
-                .conversation
-                .loops
-                .iter()
-                .any(|goal| goal.state == LoopState::Running)
-            {
+            if snapshot.conversation.chat_loop.state != LoopState::Running {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -160,16 +155,19 @@ impl AgentAccess for LateReceiptDaemon {
             let ObservationValue::Agent(snapshot) = observation.initial else {
                 panic!("the daemon's configured Agent snapshot");
             };
-            self.record("configured-state.json", serde_json::json!({
-                "execution": snapshot.execution,
-                "command_id": receipt.command_id,
-                "change": change,
-                "mode": snapshot.policy.mode,
-                "messages": snapshot.conversation.messages.len(),
-                "running": snapshot.conversation.loops.iter().any(|goal| goal.state == LoopState::Running),
-                "pending_inputs": snapshot.pending_inputs.len(),
-                "pending_commands": snapshot.pending_commands.len(),
-            }));
+            self.record(
+                "configured-state.json",
+                serde_json::json!({
+                    "execution": snapshot.execution,
+                    "command_id": receipt.command_id,
+                    "change": change,
+                    "mode": snapshot.policy.mode,
+                    "messages": snapshot.conversation.messages.len(),
+                    "running": snapshot.conversation.chat_loop.state == LoopState::Running,
+                    "pending_inputs": snapshot.pending_inputs.len(),
+                    "pending_commands": snapshot.pending_commands.len(),
+                }),
+            );
         }
         if loses_reply {
             return Err(AccessError::new(
@@ -335,9 +333,7 @@ async fn answer_daemon_probes(daemon: Arc<LateReceiptDaemon>, execution: Executi
             let state = serde_json::json!({
                 "running": snapshot
                     .conversation
-                    .loops
-                    .iter()
-                    .any(|goal| goal.state == LoopState::Running),
+                    .chat_loop.state == LoopState::Running,
                 "pending_inputs": snapshot.pending_inputs.len(),
                 "pending_commands": snapshot.pending_commands.len(),
             });

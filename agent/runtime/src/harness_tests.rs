@@ -53,7 +53,6 @@ fn prompt_request(input: Uuid, after: ParentSelection, delivery: Delivery) -> Tu
         input_id: input,
         op: TurnOp::Continue {
             after,
-            target_loop: None,
             message: UserMessage {
                 text: "prompt".into(),
                 ..Default::default()

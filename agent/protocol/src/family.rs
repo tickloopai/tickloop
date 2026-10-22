@@ -175,9 +175,7 @@ impl FamilyCompletion {
     /// How the run ended, from the Loop state a completion recorded without one.
     pub fn status(&self) -> ChildRunStatus {
         self.run_status.unwrap_or(match self.state {
-            LoopState::Completed | LoopState::WaitingTrigger | LoopState::Idle => {
-                ChildRunStatus::Completed
-            }
+            LoopState::Idle => ChildRunStatus::Completed,
             LoopState::Failed => ChildRunStatus::Failed,
             _ => ChildRunStatus::Interrupted,
         })

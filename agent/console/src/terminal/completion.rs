@@ -178,12 +178,6 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
-        command: "/loops",
-        arguments: "[ACTION|GOAL_ID]",
-        description: "Manage goals and their triggers in this Chat.",
-        menu_group: Some(CommandGroup::Conversation),
-    },
-    CommandSpec {
         command: "/rewind",
         arguments: "",
         description: "Opens the Rewind checkpoint selector.",
@@ -257,8 +251,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "/plan",
-        arguments: "[GOAL_ID]",
-        description: "Enter Plan mode and review the selected plan; with an ID, view its saved plan.",
+        arguments: "",
+        description: "Enter Plan mode, or review this Chat's saved plan.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
@@ -270,13 +264,13 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/interrupt",
         arguments: "",
-        description: "Interrupts the current run.",
+        description: "Interrupts the current turn, like esc.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/stop",
-        arguments: "[GOAL]",
-        description: "Stops a goal.",
+        arguments: "",
+        description: "Interrupts the turn and pauses Triggers until your next message.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
@@ -288,7 +282,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/mode",
         arguments: "[auto|ask|fullAccess|plan]",
-        description: "Changes execution mode; use /plan to plan a goal.",
+        description: "Changes execution mode; use /plan to plan first.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
@@ -348,19 +342,19 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/events",
         arguments: "PROMPT",
-        description: "Enables explicit events for the selected goal.",
+        description: "Enables explicit events for this Chat's Loop.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/trigger",
         arguments: "SOURCE [JSON]",
-        description: "Delivers an event to the selected goal.",
+        description: "Delivers an event to this Chat's Loop.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/clear-trigger",
         arguments: "",
-        description: "Removes the selected goal's trigger.",
+        description: "Removes this Chat's Trigger.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
@@ -619,8 +613,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 25);
-        assert_eq!(builtin_commands().len(), 44);
+        assert_eq!(completion.candidates().len(), 24);
+        assert_eq!(builtin_commands().len(), 43);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -658,6 +652,7 @@ mod tests {
         for command in [
             "/new",
             "/goal",
+            "/loops",
             "/theme",
             "/logout",
             "/triggers",

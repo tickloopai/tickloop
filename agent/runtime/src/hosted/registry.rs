@@ -1,7 +1,7 @@
 //! The daemon's durable record of hosted Tick ownership. Each config root keeps its own
-//! private `tickhost/` directory: a lease lock held for the daemon's life, and per Chat its owner
-//! state and one file per launch record. Only the daemon writes it; the files outlive host
-//! and daemon restarts so ownership, recovery and end events never depend on a live process.
+//! private `tickhost/` directory: a lease lock held for the daemon's life, and per Chat one file
+//! per launch record. Only the daemon writes it; the files outlive host and daemon restarts so
+//! ownership, recovery and end events never depend on a live process.
 
 use std::{
     collections::HashMap,
@@ -30,7 +30,6 @@ use tickloop_agent_base::private_fs::{
 const REGISTRY_DIRECTORY: &str = "tickhost";
 const LEASE_FILE: &str = "registry.lock";
 const CHATS_DIRECTORY: &str = "chats";
-const OWNER_FILE: &str = "owner.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LAUNCH_PREFIX: &str = "launch-";
 const RECORD_EXTENSION: &str = ".json";
@@ -40,18 +39,6 @@ pub const TARGET_GONE: &str = "TargetGone";
 /// Records are kept per Chat and per launch, so this never caps how many there are.
 pub const SHARD_BYTES: usize = 1024 * 1024;
 const RECORD_TOO_LARGE: &str = "RecordTooLarge";
-
-/// Whether a Chat may own hosted Ticks. Only an explicit StopSubagent ends it.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum OwnerState {
-    #[default]
-    Active,
-    /// StopSubagent stopped this child Chat; its host cleanup is not yet confirmed.
-    Stopping { operation: Uuid },
-    /// Only an explicit Continue lets this Chat own Ticks again.
-    Stopped { operation: Uuid },
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -360,21 +347,6 @@ impl RegistryFiles {
         Ok(revision)
     }
 
-    fn owner_state(&self, chat: Uuid) -> Result<OwnerState, HostError> {
-        let Some(directory) = self.existing_chat_directory(chat)? else {
-            return Ok(OwnerState::Active);
-        };
-        match read_unlinked(&directory.join(OWNER_FILE))? {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| failed(&error)),
-            None => Ok(OwnerState::Active),
-        }
-    }
-
-    fn set_owner_state(&self, chat: Uuid, state: &OwnerState) -> Result<(), HostError> {
-        let _written = self.written();
-        self.write(&self.chat_directory(chat).join(OWNER_FILE), state)
-    }
-
     fn record_launch(&self, mut record: LaunchRecord) -> Result<(), HostError> {
         let _written = self.written();
         record.updated_ms = unix_time_milliseconds();
@@ -542,7 +514,7 @@ impl RootRegistry {
             .map_err(|error| failed(&error))?
     }
 
-    /// The root's registry revision: it advances with every owner end and snapshot, so the host
+    /// The root's registry revision: it advances with every owner snapshot, so the host
     /// can tell a later decision from an earlier one.
     pub async fn revision(&self) -> Result<u64, HostError> {
         self.on_files(RegistryFiles::revision).await
@@ -551,16 +523,6 @@ impl RootRegistry {
     /// Advances and durably records the revision, returning the new one.
     pub async fn next_revision(&self) -> Result<u64, HostError> {
         self.on_files(RegistryFiles::next_revision).await
-    }
-
-    pub async fn owner_state(&self, chat: Uuid) -> Result<OwnerState, HostError> {
-        self.on_files(move |files| files.owner_state(chat)).await
-    }
-
-    pub async fn set_owner_state(&self, chat: Uuid, state: &OwnerState) -> Result<(), HostError> {
-        let state = state.clone();
-        self.on_files(move |files| files.set_owner_state(chat, &state))
-            .await
     }
 
     pub async fn record_launch(&self, record: &LaunchRecord) -> Result<(), HostError> {
@@ -595,9 +557,8 @@ impl RootRegistry {
         self.on_files(RegistryFiles::chats).await
     }
 
-    /// Reconciles this root with the host: records are settled against what the host runs,
-    /// decided ends are carried out, and the host gets a complete snapshot of the Chats that
-    /// still own Ticks, so it can reap any other. Runs before anything else is served for the
+    /// Reconciles this root with the host: records are settled against what the host runs, and
+    /// the host gets a complete snapshot of the Chats that own Ticks, so it can reap any other. Runs before anything else is served for the
     /// root.
     pub async fn reconcile_with_host(
         &self,
@@ -612,13 +573,8 @@ impl RootRegistry {
                 chat,
             };
             // A Chat whose records cannot be read keeps its Ticks and never holds up the others.
-            if self
-                .reconcile_chat(controller, &owner)
-                .await
-                .unwrap_or(true)
-            {
-                owners.push(chat);
-            }
+            let _ = self.reconcile_chat(controller, &owner).await;
+            owners.push(chat);
         }
         if host_epoch.is_none() {
             return Ok(());
@@ -628,25 +584,17 @@ impl RootRegistry {
         Ok(())
     }
 
-    /// Settles one Chat's records and decided end; returns whether it still owns Ticks.
+    /// Settles one Chat's records against what the host runs.
     async fn reconcile_chat(
         &self,
         controller: &HostController,
         owner: &TickOwner,
-    ) -> Result<bool, HostError> {
-        let chat = owner.chat;
-        if !self.launches(chat).await?.is_empty() {
+    ) -> Result<(), HostError> {
+        if !self.launches(owner.chat).await?.is_empty() {
             let listing = controller.owner_listing(owner).await?;
             self.settle_launches(controller, owner, &listing).await?;
         }
-        match self.owner_state(chat).await? {
-            OwnerState::Active => Ok(true),
-            OwnerState::Stopping { operation } => {
-                self.end_stopped(controller, owner, operation).await?;
-                Ok(false)
-            }
-            OwnerState::Stopped { .. } => Ok(false),
-        }
+        Ok(())
     }
 
     /// Settles `owner`'s records against the host. A live instance its host still runs stays;
@@ -723,38 +671,6 @@ impl RootRegistry {
             .await?;
         }
         Ok(())
-    }
-
-    /// Ends the Ticks of a child Chat StopSubagent stopped. The decision is durable before the host
-    /// is asked, so a lost answer is carried out by the next reconcile. Idempotent.
-    pub async fn end_stopped(
-        &self,
-        controller: &HostController,
-        owner: &TickOwner,
-        operation: Uuid,
-    ) -> Result<(), HostError> {
-        let _lifecycle = self.lifecycle(owner.chat).await;
-        self.finish_stop(controller, owner, operation).await
-    }
-
-    /// Ends the Ticks of `owner`, stopped by `operation`, and forgets their records. The caller
-    /// holds the Chat's lifecycle lock.
-    pub async fn finish_stop(
-        &self,
-        controller: &HostController,
-        owner: &TickOwner,
-        operation: Uuid,
-    ) -> Result<(), HostError> {
-        self.set_owner_state(owner.chat, &OwnerState::Stopping { operation })
-            .await?;
-        controller
-            .end_owner(owner, self.revision().await?, operation)
-            .await?;
-        for record in self.launches(owner.chat).await? {
-            self.remove_launch(owner.chat, record.operation).await?;
-        }
-        self.set_owner_state(owner.chat, &OwnerState::Stopped { operation })
-            .await
     }
 }
 
@@ -885,9 +801,6 @@ mod tests {
             let registry = Registry::default();
             let root = registry.root(directory.path()).await.unwrap();
             root.record_launch(&opened).await.unwrap();
-            root.set_owner_state(chat, &OwnerState::Active)
-                .await
-                .unwrap();
             let second = Registry::default().root(directory.path()).await;
             assert_eq!(
                 second.err().unwrap().code,
@@ -1087,27 +1000,5 @@ mod tests {
         assert!(gave_up.is_err());
         drop(held);
         assert_eq!(locked(&root), 0, "a waiter that gave up leaves nothing");
-    }
-
-    #[tokio::test]
-    async fn a_stopped_owner_state_is_durable() {
-        let directory = tempfile::tempdir().unwrap();
-        let chat = Uuid::new_v4();
-        let stopped = OwnerState::Stopped {
-            operation: Uuid::new_v4(),
-        };
-        Registry::default()
-            .root(directory.path())
-            .await
-            .unwrap()
-            .set_owner_state(chat, &stopped)
-            .await
-            .unwrap();
-        let root = Registry::default().root(directory.path()).await.unwrap();
-        assert_eq!(root.owner_state(chat).await.unwrap(), stopped);
-        assert_eq!(
-            root.owner_state(Uuid::new_v4()).await.unwrap(),
-            OwnerState::Active
-        );
     }
 }

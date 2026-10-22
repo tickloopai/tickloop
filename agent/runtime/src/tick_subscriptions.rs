@@ -37,8 +37,8 @@ use tickloop_agent_protocol::{
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ALREADY_SUBSCRIBED: &str =
-    "a Loop of this Chat already subscribes to this Tick; s cycles its subscription";
-const NO_SUBSCRIBING_LOOP: &str = "no Loop of this Chat can take its Tick Updates";
+    "this Chat already subscribes to this Tick; s cycles its subscription";
+const NO_SUBSCRIBING_LOOP: &str = "this Chat's Loop cannot take its Tick Updates now";
 
 use crate::tick_tools::TICK_MANAGE;
 const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::High;
@@ -58,17 +58,33 @@ const MAX_HEADER_TEXT_BYTES: usize = 128;
 const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (an extension Tick's query tool through TickCall, a Shell's output file through Read) or TickRead.";
 const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; TickRead returns its current screen, and output that scrolled past between periods cannot be recovered.";
 const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
-const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with a goal is its subscription and brings each @tickloop feedback request to that goal. An artifact a goal creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
+const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with the Chat is its subscription and brings each @tickloop feedback request to the Chat's Loop. An artifact the Chat creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
 
-pub(super) fn can_take_manual_update(goal: &LoopSnapshot) -> bool {
-    !matches!(
-        goal.state,
-        LoopState::Stopped
-            | LoopState::Expired
-            | LoopState::Failed
-            | LoopState::Interrupted
-            | LoopState::WaitingPlan
-    )
+/// Whether the Loop takes a Tick's current content the user sends it: not while a plan waits
+/// for review.
+pub(super) fn can_take_manual_update(chat_loop: &LoopSnapshot) -> bool {
+    match chat_loop.state {
+        LoopState::WaitingPlan => false,
+        LoopState::Idle
+        | LoopState::Queued
+        | LoopState::Running
+        | LoopState::WaitingPermission
+        | LoopState::WaitingQuestion
+        | LoopState::Failed
+        | LoopState::Interrupted => true,
+    }
+}
+
+/// The Loop's Trigger that a Tick delivery to `loop_id` comes through: armed, or disarmed only
+/// until the Chat is continued.
+fn delivering_trigger(
+    chat_loop: &LoopSnapshot,
+    awaits_resume: bool,
+    loop_id: LoopId,
+) -> Option<&Trigger> {
+    chat_loop.trigger.as_ref().filter(|trigger| {
+        chat_loop.id == loop_id && trigger.accepts_events && (trigger.armed || awaits_resume)
+    })
 }
 
 pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
@@ -576,18 +592,11 @@ impl TickDeliveries {
         chat_id: ChatId,
         loop_id: LoopId,
         payload: &Value,
-        loops: &[LoopSnapshot],
+        (chat_loop, awaits_resume): (&LoopSnapshot, bool),
     ) -> Result<Vec<WatchBinding>, AgentError> {
-        let trigger = loops
-            .iter()
-            .find(|goal| {
-                goal.id == loop_id && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-            })
-            .and_then(|goal| goal.trigger.as_ref())
-            .filter(|trigger| trigger.armed && trigger.accepts_events)
-            .ok_or_else(|| {
-                AgentError::Invalid("Tick delivery has no active subscription configuration".into())
-            })?;
+        let trigger = delivering_trigger(chat_loop, awaits_resume, loop_id).ok_or_else(|| {
+            AgentError::Invalid("Tick delivery has no active subscription configuration".into())
+        })?;
         let items = payload["items"]
             .as_array()
             .filter(|items| !items.is_empty())
@@ -987,17 +996,12 @@ impl Agent {
     ) -> Result<Vec<TickSubscriptionStatus>, AgentError> {
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-        let configured: Vec<_> = chat
-            .snapshot
-            .loops
+        let chat_loop = &chat.snapshot.chat_loop;
+        let configured: Vec<_> = chat_loop
+            .trigger
             .iter()
-            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-            .flat_map(|goal| {
-                goal.trigger
-                    .iter()
-                    .flat_map(|trigger| &trigger.subscriptions)
-                    .map(|subscription| (goal.id, goal.state.clone(), subscription.clone()))
-            })
+            .flat_map(|trigger| &trigger.subscriptions)
+            .map(|subscription| (chat_loop.id, chat_loop.state.clone(), subscription.clone()))
             .collect();
         drop(chats);
         let deliveries = self.tick_deliveries();
@@ -1047,8 +1051,8 @@ impl Agent {
     }
 
     /// Changes one subscription's frequency or cancels it, from Monitor or a model tool. The
-    /// change is written through the owning Loop's Trigger, which refuses a frequency the Tick
-    /// type does not allow.
+    /// change is written through the Loop's Trigger, which refuses a frequency the Tick type does
+    /// not allow.
     pub async fn update_tick_subscription(
         &self,
         chat_id: ChatId,
@@ -1057,17 +1061,16 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-        let (loop_id, mut trigger) = chat
+        let mut trigger = chat
             .snapshot
-            .loops
-            .iter()
-            .find_map(|goal| {
-                let trigger = goal.trigger.as_ref()?;
+            .chat_loop
+            .trigger
+            .clone()
+            .filter(|trigger| {
                 trigger
                     .subscriptions
                     .iter()
                     .any(|subscription| subscription.id == subscription_id)
-                    .then(|| (goal.id, trigger.clone()))
             })
             .ok_or(AgentError::NotFound)?;
         drop(chats);
@@ -1083,49 +1086,38 @@ impl Agent {
                 }
             }
         }
-        self.configure_trigger(chat_id, loop_id, Some(trigger))
-            .await
+        self.configure_trigger(chat_id, Some(trigger)).await
     }
 
-    /// Subscribes the Chat to `instance` at the default frequency because its user asked to on
-    /// the instance's Monitor row. The Chat's newest Loop that has not ended receives it; an
-    /// instance one of its Loops already subscribes to, or a Chat without such a Loop, is refused
+    /// Subscribes the Chat's Loop to `instance` at the default frequency because its user asked
+    /// to on the instance's Monitor row; an instance the Loop already subscribes to is refused
     /// with what to do instead.
     pub async fn tick_subscribe_for_user(
         &self,
         chat_id: ChatId,
         instance: InstanceRef,
     ) -> Result<(), AgentError> {
-        let loop_id = {
+        {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let open_loops = chat
+            let is_subscribed = chat
                 .snapshot
-                .loops
+                .chat_loop
+                .trigger
                 .iter()
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                .collect::<Vec<_>>();
-            let is_subscribed = open_loops.iter().any(|goal| {
-                goal.trigger
-                    .iter()
-                    .flat_map(|trigger| &trigger.subscriptions)
-                    .any(|subscription| subscription.instance == instance)
-            });
+                .flat_map(|trigger| &trigger.subscriptions)
+                .any(|subscription| subscription.instance == instance);
             if is_subscribed {
                 return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
             }
-            open_loops
-                .last()
-                .map(|goal| goal.id)
-                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?
-        };
-        self.subscribe_loop_for_user(chat_id, loop_id, instance, DEFAULT_FREQUENCY)
+        }
+        self.subscribe_loop_for_user(chat_id, instance, DEFAULT_FREQUENCY)
             .await
     }
 
     /// Ends this Chat's subscriptions to `lost` once `reopened` took its place, and with
-    /// `restore` subscribes each of their Loops to `reopened` again at the frequency it had,
-    /// admitted as the user's own subscription. The error tells which could not be restored.
+    /// `restore` subscribes the Loop to `reopened` again at the frequency it had, admitted as the
+    /// user's own subscription. The error tells which could not be restored.
     pub async fn replace_tick_subscriptions(
         &self,
         chat_id: ChatId,
@@ -1137,25 +1129,21 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.snapshot
-                .loops
+                .chat_loop
+                .trigger
                 .iter()
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                .flat_map(|goal| {
-                    goal.trigger
-                        .iter()
-                        .flat_map(|trigger| &trigger.subscriptions)
-                        .filter(|subscription| subscription.instance == *lost)
-                        .map(|subscription| (goal.id, subscription.id, subscription.frequency))
-                })
+                .flat_map(|trigger| &trigger.subscriptions)
+                .filter(|subscription| subscription.instance == *lost)
+                .map(|subscription| (subscription.id, subscription.frequency))
                 .collect::<Vec<_>>()
         };
         let mut refusals = Vec::new();
-        for (loop_id, subscription, frequency) in subscriptions {
+        for (subscription, frequency) in subscriptions {
             self.update_tick_subscription(chat_id, subscription, TickSubscriptionChange::Cancel)
                 .await?;
             if restore
                 && let Err(error) = self
-                    .subscribe_loop_for_user(chat_id, loop_id, reopened.clone(), frequency)
+                    .subscribe_loop_for_user(chat_id, reopened.clone(), frequency)
                     .await
             {
                 refusals.push(error.to_string());
@@ -1221,13 +1209,9 @@ impl Agent {
                     "Send Update requires a Tick owned by this Chat".into(),
                 ));
             }
-            let goal = chat
-                .snapshot
-                .loops
-                .iter()
-                .find(|goal| goal.id == loop_id)
-                .ok_or(AgentError::NotFound)?;
-            if !can_take_manual_update(goal) {
+            if chat.snapshot.chat_loop.id != loop_id
+                || !can_take_manual_update(&chat.snapshot.chat_loop)
+            {
                 return Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()));
             }
             let operation = SessionPermissionOperation::from_normalized(
@@ -1276,31 +1260,23 @@ impl Agent {
         chat_id: ChatId,
         instance: InstanceRef,
     ) -> Result<Receipt, AgentError> {
-        let (loop_id, goal, title) = {
+        let (loop_id, title) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            if chat
-                .snapshot
-                .loops
+            let chat_loop = &chat.snapshot.chat_loop;
+            if chat_loop
+                .trigger
                 .iter()
-                .flat_map(|goal| {
-                    goal.trigger
-                        .iter()
-                        .flat_map(|trigger| &trigger.subscriptions)
-                })
+                .flat_map(|trigger| &trigger.subscriptions)
                 .any(|subscription| subscription.instance == instance)
             {
                 return Err(AgentError::Invalid(
                     "Send Update is available for unsubscribed Ticks".into(),
                 ));
             }
-            let goal = chat
-                .snapshot
-                .loops
-                .iter()
-                .rev()
-                .find(|goal| can_take_manual_update(goal))
-                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
+            if !can_take_manual_update(chat_loop) {
+                return Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()));
+            }
             let title = chat
                 .snapshot
                 .monitor
@@ -1308,7 +1284,7 @@ impl Agent {
                 .iter()
                 .find(|member| member.instance == instance)
                 .and_then(|member| member.title.clone());
-            (goal.id, goal.goal.clone(), title)
+            (chat_loop.id, title)
         };
         let authority = self.admit_manual_tick(chat_id, loop_id, &instance).await?;
         let port = self
@@ -1396,7 +1372,7 @@ impl Agent {
         );
         let input = tickloop_agent_protocol::local_messages::tick_delivery(
             &payload,
-            &Trigger::for_loop_goal(&goal),
+            &Trigger::for_subscriptions(),
         );
         let source = TriggerSource {
             source: TICK_MANUAL_SOURCE.into(),
@@ -1404,7 +1380,6 @@ impl Agent {
         };
         self.submit_internal(
             chat_id,
-            Some(loop_id),
             input,
             SubmissionOptions {
                 trigger_source: Some(source),
@@ -1434,13 +1409,12 @@ impl Agent {
         Ok(())
     }
 
-    /// Subscribes `loop_id` to `instance` at `frequency` on its user's word, as an approved
+    /// Subscribes the Loop to `instance` at `frequency` on its user's word, as an approved
     /// TickManage would without asking: the watch is admitted under the Chat's current
     /// authority, and a Deny rule for it still refuses it.
     async fn subscribe_loop_for_user(
         &self,
         chat_id: ChatId,
-        loop_id: LoopId,
         instance: InstanceRef,
         frequency: TickSubscriptionFrequency,
     ) -> Result<(), AgentError> {
@@ -1475,6 +1449,7 @@ impl Agent {
         let mut trigger = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            let loop_id = chat.snapshot.chat_loop.id;
             let session_operation = SessionPermissionOperation::from_normalized(
                 policy_name.to_owned(),
                 permission_input.clone(),
@@ -1501,16 +1476,11 @@ impl Agent {
                     "a Deny rule for {policy_name} refuses subscribing to {instance}"
                 )));
             }
-            let goal = chat
-                .snapshot
-                .loops
-                .iter()
-                .find(|goal| goal.id == loop_id)
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
-            goal.trigger
+            chat.snapshot
+                .chat_loop
+                .trigger
                 .clone()
-                .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal))
+                .unwrap_or_else(Trigger::for_subscriptions)
         };
         if trigger
             .subscriptions
@@ -1526,8 +1496,7 @@ impl Agent {
             frequency,
             authority,
         });
-        self.configure_trigger(chat_id, loop_id, Some(trigger))
-            .await
+        self.configure_trigger(chat_id, Some(trigger)).await
     }
 
     pub(super) async fn tick_subscription_tool(
@@ -1569,20 +1538,16 @@ impl Agent {
         let chat = chats
             .get(&receipt.chat_id)
             .ok_or_else(|| "chat is unavailable".to_string())?;
-        let goal = chat
-            .snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .ok_or_else(|| "goal is unavailable".to_string())?;
         let run_cancel = chat
             .run_cancel(receipt.run_id)
             .cloned()
             .ok_or_else(|| "run is unavailable".to_string())?;
-        let mut trigger = goal
+        let mut trigger = chat
+            .snapshot
+            .chat_loop
             .trigger
             .clone()
-            .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal));
+            .unwrap_or_else(Trigger::for_subscriptions);
         drop(chats);
         if let Some(existing) = trigger
             .subscriptions
@@ -1590,7 +1555,7 @@ impl Agent {
             .find(|subscription| subscription.instance == instance)
         {
             return Err(format!(
-                "this goal already subscribes to Tick Instance {} as {}; cancel it with {TICK_MANAGE} before subscribing at another frequency",
+                "this Chat already subscribes to Tick Instance {} as {}; cancel it with {TICK_MANAGE} before subscribing at another frequency",
                 existing.instance, existing.id
             ));
         }
@@ -1604,7 +1569,7 @@ impl Agent {
             authority,
         };
         trigger.subscriptions.push(subscription.clone());
-        self.configure_trigger(receipt.chat_id, receipt.loop_id, Some(trigger))
+        self.configure_trigger(receipt.chat_id, Some(trigger))
             .await
             .map_err(|error| error.to_string())?;
         let (ready, link) = if armed {
@@ -1622,7 +1587,7 @@ impl Agent {
         });
         if !armed {
             answer["note"] = json!(
-                "this goal's Trigger is disarmed, so the subscription is configured but delivers nothing until it is armed again"
+                "this Chat's Trigger is disarmed, so the subscription is configured but delivers nothing until it is armed again"
             );
         } else if !ready {
             answer["link"] = json!(format!("{link:?}"));
@@ -1706,30 +1671,28 @@ impl Agent {
                         .chat_directory()
                         .filter(|_| saves_chats)
                         .map(|directory| directory.join(WATERMARK_DIRECTORY).path().to_path_buf());
-                    chat.snapshot
-                        .loops
+                    let chat_loop = &chat.snapshot.chat_loop;
+                    chat_loop
+                        .trigger
                         .iter()
-                        .filter(|goal| {
-                            goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                                && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                        })
-                        .flat_map(|goal| {
-                            goal.trigger
-                                .iter()
-                                .flat_map(|trigger| &trigger.subscriptions)
-                                .map(|subscription| {
-                                    (*chat_id, goal.id, subscription.clone(), watermarks.clone())
-                                })
+                        .filter(|trigger| trigger.armed)
+                        .flat_map(|trigger| &trigger.subscriptions)
+                        .map(|subscription| {
+                            (
+                                *chat_id,
+                                chat_loop.id,
+                                subscription.clone(),
+                                watermarks.clone(),
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            // A disarmed or stopped Loop keeps its subscriptions' delivered watermarks; only a
+            // A disarmed or paused Loop keeps its subscriptions' delivered watermarks; only a
             // subscription no Loop configures any more is cancelled.
             let existing: BTreeSet<Uuid> = chats
                 .values()
-                .flat_map(|chat| &chat.snapshot.loops)
-                .filter_map(|goal| goal.trigger.as_ref())
+                .filter_map(|chat| chat.snapshot.chat_loop.trigger.as_ref())
                 .flat_map(|trigger| &trigger.subscriptions)
                 .map(|subscription| subscription.id)
                 .collect();
@@ -1966,16 +1929,23 @@ impl Agent {
         // finds it held.
         let delivery = {
             let chats = self.inner.chats.lock().await;
-            let Some(goal) = chats
+            let Some(chat_loop) = chats
                 .get(&chat_id)
-                .and_then(|chat| chat.snapshot.loops.iter().find(|goal| goal.id == loop_id))
+                .map(|chat| &chat.snapshot.chat_loop)
+                .filter(|chat_loop| chat_loop.id == loop_id)
             else {
                 return;
             };
             let mut deliveries = self.tick_deliveries();
-            match goal.state {
-                LoopState::WaitingTrigger | LoopState::Completed => deliveries.take_delivery(owner),
-                _ => {
+            match chat_loop.state {
+                LoopState::Idle | LoopState::Interrupted | LoopState::Failed => {
+                    deliveries.take_delivery(owner)
+                }
+                LoopState::Queued
+                | LoopState::Running
+                | LoopState::WaitingPermission
+                | LoopState::WaitingQuestion
+                | LoopState::WaitingPlan => {
                     deliveries.hold(owner, Instant::now());
                     None
                 }
@@ -2148,7 +2118,7 @@ impl Agent {
             source: TICK_SUBSCRIPTION_SOURCE.into(),
             payload,
         };
-        let outcome = self.trigger(chat_id, loop_id, source).await;
+        let outcome = self.trigger(chat_id, source).await;
         let mut deliveries = self.tick_deliveries();
         match outcome {
             Ok(_) => {
@@ -2178,10 +2148,15 @@ impl Agent {
         chat_id: ChatId,
         loop_id: LoopId,
         payload: &Value,
-        loops: &[LoopSnapshot],
+        snapshot: &ChatSnapshot,
     ) -> Result<(), AgentError> {
         self.tick_deliveries()
-            .source_bindings(chat_id, loop_id, payload, loops)
+            .source_bindings(
+                chat_id,
+                loop_id,
+                payload,
+                (&snapshot.chat_loop, snapshot.trigger_awaits_resume),
+            )
             .map(|_| ())
     }
 
@@ -2191,14 +2166,18 @@ impl Agent {
         loop_id: LoopId,
         payload: &Value,
     ) -> Result<(), AgentError> {
-        let (bindings, loops) = {
+        let (bindings, chat_loop, awaits_resume) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let loops = chat.snapshot.loops.clone();
-            let bindings = self
-                .tick_deliveries()
-                .source_bindings(chat_id, loop_id, payload, &loops)?;
-            (bindings, loops)
+            let chat_loop = chat.snapshot.chat_loop.clone();
+            let awaits_resume = chat.snapshot.trigger_awaits_resume;
+            let bindings = self.tick_deliveries().source_bindings(
+                chat_id,
+                loop_id,
+                payload,
+                (&chat_loop, awaits_resume),
+            )?;
+            (bindings, chat_loop, awaits_resume)
         };
         let port = self
             .tick_deliveries()
@@ -2218,15 +2197,22 @@ impl Agent {
                 return Err(AgentError::Invalid(error));
             }
         }
-        self.tick_deliveries()
-            .source_bindings(chat_id, loop_id, payload, &loops)?;
+        self.tick_deliveries().source_bindings(
+            chat_id,
+            loop_id,
+            payload,
+            (&chat_loop, awaits_resume),
+        )?;
         Ok(())
     }
 
     pub(super) fn discard_invalid_tick_inputs(&self, chat: &mut Chat) -> bool {
         let deliveries = self.tick_deliveries();
         let mut discarded = Vec::new();
-        let loops = &chat.snapshot.loops;
+        let delivering = (
+            &chat.snapshot.chat_loop,
+            chat.snapshot.trigger_awaits_resume,
+        );
         chat.snapshot.pending_inputs.retain(|pending| {
             let valid = pending.trigger_source.as_ref().is_none_or(|source| {
                 source.source != TICK_SUBSCRIPTION_SOURCE
@@ -2235,7 +2221,7 @@ impl Agent {
                             pending.receipt.chat_id,
                             pending.receipt.loop_id,
                             &source.payload,
-                            loops,
+                            delivering,
                         )
                         .is_ok()
             });
@@ -2258,7 +2244,7 @@ impl Agent {
             chat,
             receipt.run_id,
             SettledOutcome::Discarded {
-                reason: tickloop_agent_transcript::DiscardReason::LoopEnded,
+                reason: tickloop_agent_transcript::DiscardReason::SourceEnded,
             },
         );
         self.inner
@@ -2267,29 +2253,10 @@ impl Agent {
             .unwrap()
             .runs
             .remove(&receipt.run_id);
-        if !chat
-            .snapshot
-            .pending_inputs
-            .iter()
-            .any(|pending| pending.receipt.loop_id == receipt.loop_id)
-            && let Some(goal) = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == receipt.loop_id && goal.state == LoopState::Queued)
+        if chat.snapshot.pending_inputs.is_empty()
+            && chat.snapshot.chat_loop.state == LoopState::Queued
         {
-            goal.set_state(
-                if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                    || goal
-                        .event_sources
-                        .iter()
-                        .any(|source| !source.resume_required)
-                {
-                    LoopState::WaitingTrigger
-                } else {
-                    LoopState::Completed
-                },
-            );
+            chat.snapshot.chat_loop.set_state(LoopState::Idle);
         }
     }
 
@@ -2725,21 +2692,24 @@ mod manual_admission_tests {
     use super::*;
 
     #[test]
-    fn manual_updates_respect_plan_approval_and_expiry_before_the_timer_changes_state() {
-        let mut goal: LoopSnapshot = serde_json::from_value(json!({
-            "id": Uuid::new_v4(), "goal": "observe", "state": "Completed",
-            "run_id": null, "run_started_at": null,
-        }))
-        .unwrap();
-        assert!(can_take_manual_update(&goal));
-        goal.state = LoopState::WaitingPermission;
+    fn manual_updates_wait_only_for_plan_approval() {
+        let mut chat_loop = LoopSnapshot::new(Uuid::new_v4());
+        assert!(can_take_manual_update(&chat_loop));
+        for state in [LoopState::Interrupted, LoopState::Failed] {
+            chat_loop.state = state;
+            assert!(
+                can_take_manual_update(&chat_loop),
+                "how the last turn ended never holds data back"
+            );
+        }
+        chat_loop.state = LoopState::WaitingPermission;
         assert!(
-            can_take_manual_update(&goal),
+            can_take_manual_update(&chat_loop),
             "permission waits may queue data"
         );
-        goal.state = LoopState::WaitingPlan;
+        chat_loop.state = LoopState::WaitingPlan;
         assert!(
-            !can_take_manual_update(&goal),
+            !can_take_manual_update(&chat_loop),
             "data must not approve a plan"
         );
     }

@@ -148,7 +148,6 @@ fn prompt(text: &str) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -967,21 +966,14 @@ async fn task_assignment_is_delivered_once_when_the_receiver_commits_before_the_
     else {
         panic!("one member");
     };
-    let loop_id = *task_boards(&cloud.root_lines()).keys().next().unwrap();
-    let mut task = prompt("Assign the report");
-    if let TurnOp::Continue { target_loop, .. } = &mut task.op {
-        *target_loop = Some(loop_id);
-    }
+    let task = prompt("Assign the report");
     let holding = cloud.host("crashing").acquire(cloud.chat).unwrap();
     holding.crash_at(CrashPoint::AfterCommit(accepts_the_assignment));
     let crashed = holding.run(task.clone()).await;
     assert_eq!(crashed.halt, Some(Halt::Crashed), "{crashed:?}");
     cloud.clock.advance(LEASE_TTL + Duration::from_secs(1));
     acknowledged(&cloud.host("b").deliver(cloud.chat, task).await.unwrap());
-    let mut retry = prompt("Assign the report again");
-    if let TurnOp::Continue { target_loop, .. } = &mut retry.op {
-        *target_loop = Some(loop_id);
-    }
+    let retry = prompt("Assign the report again");
     acknowledged(&cloud.host("c").deliver(cloud.chat, retry).await.unwrap());
     let inputs = cloud
         .chats

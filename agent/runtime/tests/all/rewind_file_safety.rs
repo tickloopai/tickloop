@@ -20,7 +20,7 @@ async fn run_prompt(
     prompt: &str,
 ) {
     let receipt = agent
-        .submit(chat, None, prompt.into())
+        .submit(chat, prompt.into())
         .await
         .expect("prompt accepted");
     loop {

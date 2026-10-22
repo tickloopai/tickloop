@@ -504,7 +504,7 @@ impl DaemonServer {
                         chat_id: snapshot.conversation.id,
                     });
                 let state = tickloop_agent_runtime::summary_state(
-                    &snapshot.conversation.loops,
+                    &snapshot.conversation.chat_loop,
                     &snapshot.user_shells,
                 );
                 let parent = snapshot
@@ -527,9 +527,12 @@ impl DaemonServer {
                     execution,
                     chat_id: snapshot.conversation.id,
                     folder: snapshot.conversation.folder.clone(),
-                    run_id: super::summary::summary_run_id(&snapshot.conversation.loops, &state),
+                    run_id: super::summary::summary_run_id(
+                        &snapshot.conversation.chat_loop,
+                        &state,
+                    ),
                     run_started_at: super::summary::run_started_at(
-                        &snapshot.conversation.loops,
+                        &snapshot.conversation.chat_loop,
                         &state,
                     ),
                     state,
@@ -542,7 +545,7 @@ impl DaemonServer {
                         snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
                     )),
                     updated_at: super::summary::updated_at(
-                        &snapshot.conversation.loops,
+                        &snapshot.conversation.chat_loop,
                         &snapshot.user_shells,
                     ),
                     waiting_permissions: snapshot.permissions.len(),

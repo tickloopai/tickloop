@@ -39,7 +39,7 @@ async fn each_new_subagent_gets_a_color_no_family_member_uses() {
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Delegate two background tasks".into())
+        .submit(chat, "Delegate two background tasks".into())
         .await
         .unwrap();
     loop {
@@ -101,7 +101,7 @@ async fn auto_plain_final_text_is_not_forwarded_without_handback() {
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Delegate a bounded report".into())
+        .submit(chat, "Delegate a bounded report".into())
         .await
         .unwrap();
     loop {
@@ -197,11 +197,7 @@ async fn reports_are_delivered_with_audit_warnings_and_finish_after_the_current_
                 .unwrap();
             let mut events = agent.subscribe();
             let receipt = agent
-                .submit(
-                    chat,
-                    None,
-                    "Delegate the bounded report and file marker".into(),
-                )
+                .submit(chat, "Delegate the bounded report and file marker".into())
                 .await
                 .unwrap();
             loop {
@@ -352,7 +348,7 @@ async fn report_requirements_and_deliveries_survive_restore_without_replaying_pl
             .unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(chat, None, "Delegate the bounded report".into())
+            .submit(chat, "Delegate the bounded report".into())
             .await
             .unwrap();
         loop {
@@ -468,7 +464,7 @@ async fn handback_availability_and_explicit_rules_preserve_mode_boundaries() {
             }
             let mut events = agent.subscribe();
             let receipt = agent
-                .submit(chat, None, "Delegate the report".into())
+                .submit(chat, "Delegate the report".into())
                 .await
                 .unwrap();
             let mut prompts = 0;
@@ -591,7 +587,7 @@ async fn late_report_review_cannot_bypass_cancellation_rules_or_a_stopped_caller
             .await
             .unwrap();
         agent
-            .submit(chat, None, "Delegate the bounded report".into())
+            .submit(chat, "Delegate the bounded report".into())
             .await
             .unwrap();
         tokio::time::timeout(
@@ -628,16 +624,10 @@ async fn late_report_review_cannot_bypass_cancellation_rules_or_a_stopped_caller
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let snapshot = agent.snapshot(child).await.unwrap();
-                if snapshot.loops.iter().all(|goal| {
-                    matches!(
-                        goal.state,
-                        LoopState::Completed
-                            | LoopState::Interrupted
-                            | LoopState::Stopped
-                            | LoopState::Failed
-                            | LoopState::Expired
-                    )
-                }) {
+                if matches!(
+                    snapshot.chat_loop.state,
+                    LoopState::Idle | LoopState::Interrupted | LoopState::Failed
+                ) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -700,7 +690,7 @@ async fn malformed_report_checkpoint_cannot_restore_as_unreviewed_plain_output()
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Delegate the report".into())
+        .submit(chat, "Delegate the report".into())
         .await
         .unwrap();
     loop {
@@ -783,11 +773,7 @@ async fn background_report_is_delivered_once_without_turning_its_claims_into_use
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Delegate a bounded background report only.".into(),
-        )
+        .submit(chat, "Delegate a bounded background report only.".into())
         .await
         .unwrap();
     loop {

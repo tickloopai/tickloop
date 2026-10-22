@@ -41,7 +41,7 @@ async fn verify_deepseek_file_round_trip(protocol: Protocol) {
     let agent = Agent::new_embedded(config, client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt=agent.submit(chat,None,"Use Read to read probe.txt in the current working directory. Reply with exactly the validation_marker value found inside. Use no other tool.".into()).await.unwrap();
+    let _receipt=agent.submit(chat,"Use Read to read probe.txt in the current working directory. Reply with exactly the validation_marker value found inside. Use no other tool.".into()).await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(300), async {
         let mut observed_read = false;
         loop {
@@ -89,7 +89,6 @@ async fn verify_deepseek_file_round_trip(protocol: Protocol) {
         agent
             .submit(
                 chat,
-                Some(receipt.loop_id),
                 "Repeat the exact validation_marker from our previous turn. Do not call any tools."
                     .into(),
             )
@@ -176,7 +175,7 @@ async fn live_deepseek_messages_reads_images_in_tool_results() {
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Use the Read tool to read swatch.png in the current working directory, then reply with the single English name of its colour. Use no other tool.".into()).await.unwrap();
+    agent.submit(chat, "Use the Read tool to read swatch.png in the current working directory, then reply with the single English name of its colour. Use no other tool.".into()).await.unwrap();
     let answer = tokio::time::timeout(Duration::from_secs(300), async {
         let mut answer = String::new();
         let mut read_image = false;
@@ -281,7 +280,7 @@ async fn live_deepseek_switches_protocols_after_public_compaction() {
             "Repeat the exact validation marker from the previous conversation. Use no tools."
                 .into()
         };
-        goal = Some(agent.submit(chat, goal, input).await.unwrap().loop_id);
+        goal = Some(agent.submit(chat, input).await.unwrap().loop_id);
         let answer = tokio::time::timeout(Duration::from_secs(180), async {
             let mut answer = String::new();
             loop {
@@ -300,7 +299,6 @@ async fn live_deepseek_switches_protocols_after_public_compaction() {
         .expect("live switch timed out");
         assert!(answer.contains(&marker));
     }
-    assert_eq!(agent.snapshot(chat).await.unwrap().loops.len(), 1);
     agent.shutdown().await;
 }
 
@@ -341,7 +339,7 @@ async fn live_deepseek_searches_and_reads_official_documentation() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Search the web for 'rust documentation' using WebSearch, then use WebFetch to read https://doc.rust-lang.org/stable/. Summarize one official documentation resource and cite its source URL. Both real tools are required; do not use Shell or files.".into()).await.unwrap();
+    agent.submit(chat, "Search the web for 'rust documentation' using WebSearch, then use WebFetch to read https://doc.rust-lang.org/stable/. Summarize one official documentation resource and cite its source URL. Both real tools are required; do not use Shell or files.".into()).await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(180), async {
         let mut completed = std::collections::HashMap::new();
         let mut names = std::collections::HashMap::new();

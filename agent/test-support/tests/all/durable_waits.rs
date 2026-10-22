@@ -132,7 +132,6 @@ fn prompt() -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::Root,
-            target_loop: None,
             message: UserMessage {
                 text: PROMPT.into(),
                 ..Default::default()

@@ -3,8 +3,8 @@ use super::{
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, CommandState, LoopId, Message, PermissionExecution, Receipt,
-    TaskNotification, ToolResult, UserShellReceipt, UserShellRecord, UserShellState,
+    ChatId, ChatSnapshot, CommandState, Message, PermissionExecution, Receipt, TaskNotification,
+    ToolResult, UserShellReceipt, UserShellRecord, UserShellState,
 };
 use tickloop_agent_tools::{CANCELLED_COMMAND_REASON, Tools, UserCommandSnapshot};
 use tokio::sync::broadcast;
@@ -70,10 +70,9 @@ impl Agent {
         self.inner.user_shell_events.subscribe()
     }
 
-    pub async fn submit_user_shell_for_goal(
+    pub async fn submit_user_shell(
         &self,
         chat_id: ChatId,
-        loop_id: Option<LoopId>,
         command: String,
         background: bool,
     ) -> Result<UserShellReceipt, AgentError> {
@@ -105,16 +104,12 @@ impl Agent {
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             let folder = super::require_folder(&chat.snapshot)?.to_path_buf();
-            if loop_id
-                .is_some_and(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == loop_id))
-            {
-                return Err(AgentError::NotFound);
-            }
-            let loop_id = if chat.snapshot.delegation.is_some() {
-                loop_id.or_else(|| chat.snapshot.loops.first().map(|goal| goal.id))
-            } else {
-                loop_id
-            };
+            // A `!` command belongs to the Loop once it has worked, or always in a delegated
+            // Chat, so its background completion goes on with that work; before the first turn
+            // it only records its completion.
+            let chat_loop = &chat.snapshot.chat_loop;
+            let loop_id = (chat.snapshot.delegation.is_some() || chat_loop.run_id.is_some())
+                .then_some(chat_loop.id);
             let mut snapshot = chat.snapshot.clone();
             snapshot.last_queue_sequence += 1;
             let record = UserShellRecord {

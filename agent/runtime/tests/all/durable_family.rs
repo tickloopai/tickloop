@@ -213,7 +213,6 @@ fn prompt(text: &str) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -762,11 +761,7 @@ async fn a_worker_restarted_during_a_foreground_subagent_ends_it_as_a_lost_host_
     crashed.seed(child, store.lines(child), StorePosition(1));
     let restarted = harness(crashed.clone(), asking_family(), WaitHosting::Process);
     let snapshot = restarted.resume_chat(root).await.unwrap();
-    let goal = snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id == turn.receipt().loop_id)
-        .unwrap();
+    let goal = snapshot.chat_loop;
     assert_eq!(goal.state, LoopState::Interrupted);
     // The batch had no result yet, so the load drops it, as it always has, and the child is not
     // loaded with its parent.
@@ -816,7 +811,7 @@ async fn a_pending_completion_of_a_foreground_call_is_returned_not_notified() {
             child_loop_id: child_receipt.0,
             child_run_id: child_receipt.1,
             handle: "writer".into(),
-            state: LoopState::Completed,
+            state: LoopState::Idle,
             result: CHILD_REPORT.into(),
             error: None,
             started_at: None,

@@ -915,7 +915,7 @@ mod tests {
             target_run_id: Uuid::new_v4(),
             submitted_at: 1000,
             response: Some("Verified reply".into()),
-            state: Some(tickloop_agent_protocol::LoopState::Completed),
+            state: Some(tickloop_agent_protocol::LoopState::Idle),
         };
         write(
             &path,

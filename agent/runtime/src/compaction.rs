@@ -250,34 +250,7 @@ impl CompactionLayout {
             }
         }
         compacted.announced_host_tools = compacted.visible_announced_host_tools();
-        if rewrites_existing {
-            for start in compacted_bookkeeping.loop_starts.values_mut() {
-                *start = self.moved_loop_start(*start, snapshot.messages.len());
-            }
-        }
         (compacted, compacted_bookkeeping)
-    }
-
-    /// 定向摘要后 Loop 的创建位置：压缩后对话中第一条代表创建之后消息的条目之前。保留的消息
-    /// 代表它自己，摘要代表被摘要的消息；rewind 到这个位置或更早的保留提示时 Loop 仍随截断移除。
-    fn moved_loop_start(&self, start: usize, message_count: usize) -> usize {
-        let kept = self
-            .sources
-            .iter()
-            .filter_map(|source| match source {
-                MessageSource::Existing(original) => Some(*original),
-                _ => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let summarizes_later_messages = (start..message_count).any(|index| !kept.contains(&index));
-        self.sources
-            .iter()
-            .position(|source| match source {
-                MessageSource::Existing(original) => *original >= start,
-                MessageSource::Summary => summarizes_later_messages,
-                MessageSource::Boundary => false,
-            })
-            .unwrap_or(self.sources.len())
     }
 
     /// `apply` 前后同一条保留消息的 id 变化（旧 id → 新 id）；全量压缩时为空。

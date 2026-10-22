@@ -205,7 +205,6 @@ async fn assert_merged_host_source(headless: bool) {
     let first = agent
         .submit_with_input_contexts_in_host_context(
             chat,
-            None,
             "Read the original host source.".into(),
             Vec::new(),
             Vec::new(),
@@ -219,7 +218,6 @@ async fn assert_merged_host_source(headless: bool) {
     let follow_up = agent
         .submit_with_input_contexts_in_host_context(
             chat,
-            Some(first.loop_id),
             QUEUED_SOURCE_INPUT.into(),
             Vec::new(),
             Vec::new(),
@@ -421,7 +419,7 @@ async fn workspace_host_request_probe() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     for input in ["Check host", "Check host again"] {
-        let receipt = agent.submit(chat, None, input.into()).await.unwrap();
+        let receipt = agent.submit(chat, input.into()).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let event = events.recv().await.unwrap();

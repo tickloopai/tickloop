@@ -142,7 +142,6 @@ impl Scenario {
                 self.client.daemon_epoch(),
                 AgentCommand::Submit {
                     execution: self.execution,
-                    target_loop: None,
                     origin: None,
                     input: UserInput::Text {
                         text: text.into(),

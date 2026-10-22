@@ -168,7 +168,8 @@ async fn actual_cli_questions_show_only_their_answers_or_decline_in_every_view()
 }
 
 /// Ctrl+C in a permission dialog rejects the call as Esc does, as Claude Code's
-/// `PermissionRequest`; outside the dialog it still asks for a second press to exit.
+/// `PermissionRequest`; outside the dialog, on the idle Agent's empty input, it leaves the View
+/// at once as Codex does.
 async fn control_c_rejects_a_permission(fixture: &PrivateFixture) {
     const CALL: &str = "PERMISSION-CTRL-C-PROBE";
     let marker = fixture.path("permission-marker");
@@ -216,22 +217,21 @@ async fn control_c_rejects_a_permission(fixture: &PrivateFixture) {
     assert!(!marker.exists());
 
     view.send(b"\x03");
-    view.wait_for(
-        "Ctrl+C outside the dialog asks again before exiting",
-        |frame| frame.contains(EXIT_HINT),
-    )
-    .await;
-    assert!(view.child.try_wait().unwrap().is_none());
-    view.send(b"x");
-    view.wait_for("another key cancels the exit", |frame| {
-        !frame.contains(EXIT_HINT)
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            if let Some(status) = view.child.try_wait().unwrap() {
+                assert!(status.success(), "{}", view.frame());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
-    .await;
-    view.close().await;
+    .await
+    .unwrap_or_else(|_| panic!("Ctrl+C on an idle Agent leaves the View: {}", view.frame()));
 }
 
 #[tokio::test]
-async fn actual_cli_ctrl_c_rejects_a_permission_and_keeps_its_exit_meaning_outside() {
+async fn actual_cli_ctrl_c_rejects_a_permission_and_leaves_an_idle_view_outside() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(control_c_rejects_a_permission(&fixture))
         .catch_unwind()

@@ -197,7 +197,7 @@ async fn failed_catalog_and_cached_snapshot_keep_retained_background_requests() 
         next_fact(&mut facts, |fact| matches!(fact, RecoveryFact::Forwarded { chat, sequence: received } if *chat == visible && *received == sequence)).await;
     }
     let receipt = core
-        .submit(background, None, "Ask a controlled question".into())
+        .submit(background, "Ask a controlled question".into())
         .await
         .unwrap();
     let snapshot = tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -332,7 +332,7 @@ async fn a_delayed_reset_cannot_roll_back_the_snapshot_covered_by_recovery() {
     let ObservationValue::Agent(older) = initial.initial else {
         panic!("expected initial snapshot");
     };
-    core.submit(chat, None, "Ask a controlled question".into())
+    core.submit(chat, "Ask a controlled question".into())
         .await
         .unwrap();
     let current = tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -414,7 +414,7 @@ async fn delayed_changed_and_resync_queries_cannot_roll_back_recovered_requests(
             .await
             .unwrap()
             .unwrap();
-        core.submit(chat, None, "Ask a controlled question".into())
+        core.submit(chat, "Ask a controlled question".into())
             .await
             .unwrap();
         let current = tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -517,7 +517,7 @@ async fn replaced_execution_recovery(cover_before_reset: bool) {
         recovery.cover(observed.execution, &observed.snapshot);
     }
     let receipt = core
-        .submit(chat, None, "Ask after execution replacement".into())
+        .submit(chat, "Ask after execution replacement".into())
         .await
         .unwrap();
     let snapshot = tokio::time::timeout(RECOVERY_TIMEOUT, async {

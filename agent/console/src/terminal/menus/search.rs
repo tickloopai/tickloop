@@ -838,7 +838,6 @@ mod tests {
                     },
                     workflows::Workflow::Plan {
                         chat,
-                        goal: request,
                         version: 1,
                         request: None,
                     },

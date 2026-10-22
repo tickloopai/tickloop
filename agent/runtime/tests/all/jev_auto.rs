@@ -194,7 +194,7 @@ async fn selected_jev_configuration_failure_falls_back_to_the_conversation_model
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create a symlink named reviewed".into())
+        .submit(chat, "Create a symlink named reviewed".into())
         .await
         .unwrap();
     let mut checked = false;
@@ -233,7 +233,7 @@ async fn typed_allow_executes_and_records_separate_judgment_usage() {
         let (root, agent, reviewer, chat) = fixture(outcome, PromptPolicy::Interactive).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create a symlink named reviewed".into())
+            .submit(chat, "Create a symlink named reviewed".into())
             .await
             .unwrap();
         loop {
@@ -278,7 +278,7 @@ async fn overall_allow_is_not_overridden_by_an_extra_confidence_gate() {
         let (root, agent, reviewer, chat) = fixture(Outcome::LowConfidence, prompt_policy).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create a symlink named reviewed".into())
+            .submit(chat, "Create a symlink named reviewed".into())
             .await
             .unwrap();
         loop {
@@ -301,7 +301,7 @@ async fn invalid_answers_and_auth_failures_fall_back_to_the_chat_model() {
         let (root, agent, reviewer, chat) = fixture(outcome, PromptPolicy::Interactive).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create a symlink named reviewed".into())
+            .submit(chat, "Create a symlink named reviewed".into())
             .await
             .unwrap();
         loop {
@@ -345,7 +345,7 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create a symlink named reviewed".into())
+        .submit(chat, "Create a symlink named reviewed".into())
         .await
         .unwrap();
     loop {
@@ -362,7 +362,7 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
 
     let (root, agent, reviewer, chat) = fixture(Outcome::Wait, PromptPolicy::Interactive).await;
     agent
-        .submit(chat, None, "Create a symlink named reviewed".into())
+        .submit(chat, "Create a symlink named reviewed".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

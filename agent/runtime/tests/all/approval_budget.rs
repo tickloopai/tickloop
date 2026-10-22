@@ -83,7 +83,7 @@ async fn classifier_disables_api_thinking_only_when_supported_in_both_stages() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create a local symlink.".into())
+            .submit(chat, "Create a local symlink.".into())
             .await
             .unwrap();
         loop {
@@ -183,7 +183,7 @@ async fn llm_stages_format_retries_and_transport_retries_share_one_deadline() {
             .unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(chat, None, "Create a local symlink.".into())
+            .submit(chat, "Create a local symlink.".into())
             .await
             .unwrap();
         let mut assessment = None;

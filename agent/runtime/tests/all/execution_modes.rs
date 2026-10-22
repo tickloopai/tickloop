@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use tickloop_agent_protocol::{
-    AgentHostOptions, BranchRequest, ChatId, Decision, EventKind, ExecutionMode, LoopId,
-    PermissionRule, Receipt, ToolResult,
+    AgentHostOptions, BranchRequest, ChatId, Decision, EventKind, ExecutionMode, PermissionRule,
+    Receipt, ToolResult,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text, transcript_file};
@@ -13,12 +13,11 @@ use uuid::Uuid;
 async fn run_answering_permissions(
     agent: &Agent,
     chat: ChatId,
-    goal: Option<LoopId>,
     prompt: &str,
     allow: bool,
 ) -> (Receipt, Vec<String>, Vec<(String, ToolResult)>) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut requested = Vec::new();
     let mut results = Vec::new();
     loop {
@@ -66,7 +65,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
 
     // Auto mode still asks; a bare refusal ends the run and keeps the mode.
     let (receipt, requested, results) =
-        run_answering_permissions(&agent, chat, None, "Add caching", false).await;
+        run_answering_permissions(&agent, chat, "Add caching", false).await;
     let goal = receipt.loop_id;
     assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
     let (_, declined) = &results[0];
@@ -81,8 +80,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    let (_, requested, _) =
-        run_answering_permissions(&agent, chat, Some(goal), "Plan it anyway", false).await;
+    let (_, requested, _) = run_answering_permissions(&agent, chat, "Plan it anyway", false).await;
     assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
@@ -90,7 +88,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
     );
 
     let (_, requested, results) =
-        run_answering_permissions(&agent, chat, Some(goal), "Plan it first", true).await;
+        run_answering_permissions(&agent, chat, "Plan it first", true).await;
     assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
     let (_, accepted) = &results[0];
     assert!(!accepted.is_error, "{}", accepted.content);
@@ -120,7 +118,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
     );
 
     let (_, requested, results) =
-        run_answering_permissions(&agent, chat, Some(goal), "Keep planning", true).await;
+        run_answering_permissions(&agent, chat, "Keep planning", true).await;
     assert!(requested.is_empty(), "{requested:?}");
     let (_, again) = &results[0];
     assert!(!again.is_error);
@@ -156,7 +154,7 @@ async fn entering_plan_mode_is_refused_when_prompts_are_unavailable_or_denied_by
     let initial_mode = headless.snapshot(chat).await.unwrap().policy.mode;
     assert_ne!(initial_mode, ExecutionMode::Plan);
     let (_, requested, results) =
-        run_answering_permissions(&headless, chat, None, "Add caching", true).await;
+        run_answering_permissions(&headless, chat, "Add caching", true).await;
     assert!(requested.is_empty());
     assert!(results[0].1.is_error);
     assert_eq!(
@@ -189,7 +187,7 @@ async fn entering_plan_mode_is_refused_when_prompts_are_unavailable_or_denied_by
         .await
         .unwrap();
     let (_, requested, results) =
-        run_answering_permissions(&agent, chat, None, "Add caching", true).await;
+        run_answering_permissions(&agent, chat, "Add caching", true).await;
     assert!(requested.is_empty());
     assert!(results[0].1.is_error);
     assert_eq!(
@@ -356,7 +354,7 @@ async fn revoked_directory_trust_blocks_final_side_effect_admission() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create blocked.txt".into())
+        .submit(chat, "Create blocked.txt".into())
         .await
         .unwrap();
     let request = loop {
@@ -426,8 +424,8 @@ async fn resume_branch_and_process_override_use_current_defaults_not_temporary_c
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(source, None, "Record this conversation".into())
+    agent
+        .submit(source, "Record this conversation".into())
         .await
         .unwrap();
     loop {
@@ -458,7 +456,6 @@ async fn resume_branch_and_process_override_use_current_defaults_not_temporary_c
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: Some(receipt.loop_id),
             name: Some("default mode branch".into()),
         })
         .await
@@ -554,10 +551,7 @@ async fn legacy_transcript_modes_are_mapped_conservatively() {
             .await
             .unwrap();
         let mut events = first.subscribe();
-        let receipt = first
-            .submit(chat, None, "Remember this".into())
-            .await
-            .unwrap();
+        let receipt = first.submit(chat, "Remember this".into()).await.unwrap();
         loop {
             let event = next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {

@@ -555,28 +555,6 @@ impl HostController {
         self.paths.was_emptied(epoch)
     }
 
-    /// Ends every Tick of `owner` and fences its later opens. Without a running host none runs.
-    pub async fn end_owner(
-        &self,
-        owner: &TickOwner,
-        revision: u64,
-        operation: Uuid,
-    ) -> Result<(), HostError> {
-        match self
-            .request(
-                "end_owner",
-                json!({"owner":owner,"revision":revision,"operation":operation}),
-                CONTROL_TIMEOUT,
-                Start::Never,
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
     pub async fn list(
         &self,
         owner: &TickOwner,

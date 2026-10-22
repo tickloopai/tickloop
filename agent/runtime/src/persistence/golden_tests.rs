@@ -50,17 +50,13 @@ fn run_scenario(recording: &dyn Recording, chat: Uuid, folder: &Path) {
     snapshot.messages.push(message(Role::User, "first prompt"));
     snapshot.message_ids.insert(0, Uuid::from_u128(0x1));
     snapshot.message_runs.insert(0, run);
-    snapshot.loops.push(LoopSnapshot {
-        id: loop_id,
-        goal: "first prompt".into(),
+    snapshot.chat_loop = LoopSnapshot {
         state: LoopState::Running,
         run_id: Some(run),
         run_started_at: Some(1),
-        trigger: None,
         state_since: Some(2),
-        event_sources: Vec::new(),
-    });
-    bookkeeping.loop_starts.insert(loop_id, 0);
+        ..LoopSnapshot::new(loop_id)
+    };
     bookkeeping.run_loops.insert(run, loop_id);
     recording.sync(&snapshot, &bookkeeping);
     recording.flush();
@@ -98,8 +94,8 @@ fn run_scenario(recording: &dyn Recording, chat: Uuid, folder: &Path) {
     snapshot.messages.push(message(Role::Assistant, "done"));
     snapshot.message_ids.insert(3, Uuid::from_u128(0x4));
     snapshot.message_runs.insert(3, run);
-    snapshot.loops[0].state = LoopState::Completed;
-    snapshot.loops[0].state_since = Some(3);
+    snapshot.chat_loop.state = LoopState::Idle;
+    snapshot.chat_loop.state_since = Some(3);
     recording.sync(&snapshot, &bookkeeping);
     recording.ai_title(chat, "A golden Chat");
     recording.replacements(

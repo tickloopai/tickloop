@@ -380,7 +380,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::Authentication).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let first = completed(&mut events, run.run_id).await;
@@ -404,7 +404,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
     ));
 
     let run = agent
-        .submit(chat, None, "Create another requested symlink".into())
+        .submit(chat, "Create another requested symlink".into())
         .await
         .unwrap();
     let second = completed(&mut events, run.run_id).await;
@@ -417,7 +417,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
 
     tokio::time::advance(Duration::from_secs(60)).await;
     let run = agent
-        .submit(chat, None, "Create one more requested symlink".into())
+        .submit(chat, "Create one more requested symlink".into())
         .await
         .unwrap();
     let _ = completed(&mut events, run.run_id).await;
@@ -432,7 +432,7 @@ async fn valid_jev_refusal_does_not_seek_llm_approval() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::Block).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -451,7 +451,7 @@ async fn jev_wait_uses_one_shared_twenty_second_budget_before_llm_fallback() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     tokio::time::advance(Duration::from_secs(20)).await;
@@ -472,7 +472,7 @@ async fn transient_jev_failure_retries_once_within_budget_and_keeps_valid_refusa
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::TransientThenBlock).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     tokio::time::advance(Duration::from_millis(500)).await;
@@ -490,7 +490,7 @@ async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Invalid).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -506,7 +506,7 @@ async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Block).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = loop {
@@ -532,7 +532,7 @@ async fn cancellation_during_jev_wait_does_not_fallback_or_change_health() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     while jev.calls.load(Ordering::SeqCst) == 0 {
@@ -565,7 +565,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     let (_root, agent, model, old, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     while old.calls.load(Ordering::SeqCst) == 0 {
@@ -585,7 +585,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     );
 
     let run = agent
-        .submit(chat, None, "Create another requested symlink".into())
+        .submit(chat, "Create another requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -642,7 +642,7 @@ async fn jev_capacity_routes_complete_policy_without_overriding_valid_denials() 
 
         let mut events = agent.subscribe();
         let run = agent
-            .submit(chat, None, "Create the requested symlink".into())
+            .submit(chat, "Create the requested symlink".into())
             .await
             .unwrap();
         let assessment = completed(&mut events, run.run_id).await;
@@ -700,7 +700,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
         fixture_choosing_models(JevBehavior::AuthThenWait).await;
     let mut events = agent.subscribe();
     let first_run = agent
-        .submit(first_chat, None, "Create the requested symlink".into())
+        .submit(first_chat, "Create the requested symlink".into())
         .await
         .unwrap();
     completed(&mut events, first_run.run_id).await;
@@ -723,7 +723,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     tokio::time::advance(Duration::from_secs(60)).await;
     let mut probe_events = agent.subscribe();
     let probe = agent
-        .submit(first_chat, None, "Create another requested symlink".into())
+        .submit(first_chat, "Create another requested symlink".into())
         .await
         .unwrap();
     while jev.calls.load(Ordering::SeqCst) < 2 {
@@ -735,11 +735,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     );
 
     let concurrent = agent
-        .submit(
-            other_chat,
-            None,
-            "Create a symlink in the other Chat".into(),
-        )
+        .submit(other_chat, "Create a symlink in the other Chat".into())
         .await
         .unwrap();
     assert_eq!(probe.chat_id, first_chat);
@@ -779,7 +775,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::AuthThenBlock).await;
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let first_assessment = completed(&mut events, first.run_id).await;
@@ -790,7 +786,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     tokio::time::advance(Duration::from_secs(60)).await;
 
     let second = agent
-        .submit(chat, None, "Create another requested symlink".into())
+        .submit(chat, "Create another requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, second.run_id).await;
@@ -802,7 +798,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     );
 
     let third = agent
-        .submit(chat, None, "Create one more requested symlink".into())
+        .submit(chat, "Create one more requested symlink".into())
         .await
         .unwrap();
     let _ = completed(&mut events, third.run_id).await;
@@ -852,7 +848,7 @@ async fn both_reviewers_at_capacity_ask_a_human_or_stop_headless() {
             limited_fallback_fixture(FallbackBehavior::ContextLimit, prompt_policy).await;
         let mut events = agent.subscribe();
         let run = agent
-            .submit(chat, None, "Create the requested symlink".into())
+            .submit(chat, "Create the requested symlink".into())
             .await
             .unwrap();
         let mut assessment = None;
@@ -912,7 +908,7 @@ async fn cancelling_waiting_llm_fallback_leaves_no_denial_or_execution() {
         limited_fallback_fixture(FallbackBehavior::WaitForCancel, PromptPolicy::DenyOnPrompt).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     while model.review_requests.load(Ordering::SeqCst) == 0 {
@@ -967,7 +963,7 @@ async fn headless_auto_counts_valid_refusals_but_not_failed_reviews() {
             .unwrap();
         let mut events = agent.subscribe();
         let run = agent
-            .submit(chat, None, "Create the requested symlinks".into())
+            .submit(chat, "Create the requested symlinks".into())
             .await
             .unwrap();
         let mut assessments = Vec::new();
@@ -1030,7 +1026,7 @@ async fn authorization_stage_failure_falls_back_without_treating_screening_as_re
     let (root, agent, model, jev, chat) = fixture(JevBehavior::BlockThenAuthentication).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -1065,7 +1061,7 @@ async fn jev_stages_share_one_twenty_second_budget() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(12)).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -1094,7 +1090,7 @@ async fn jev_can_complete_two_six_second_stages_without_premature_fallback() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(6)).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;
@@ -1121,7 +1117,7 @@ async fn both_jev_stages_share_one_retry_allowance() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::TransientInBothStages).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
+        .submit(chat, "Create the requested symlink".into())
         .await
         .unwrap();
     let assessment = completed(&mut events, run.run_id).await;

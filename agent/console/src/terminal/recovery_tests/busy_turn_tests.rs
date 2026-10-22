@@ -253,7 +253,7 @@ fn busy_turn_pty_fixture() {
                     .unwrap();
                 let mut events = core.subscribe();
                 for turn in 0..HISTORY_TURNS {
-                    core.submit(chat, None, format!("history turn {turn}"))
+                    core.submit(chat, format!("history turn {turn}"))
                         .await
                         .unwrap();
                     loop {

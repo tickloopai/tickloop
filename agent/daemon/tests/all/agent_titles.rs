@@ -79,7 +79,6 @@ async fn generated_title_is_background_work_and_survives_restart() {
     let receipt = core
         .submit(
             chat,
-            None,
             format!(
                 "{}Investigate why artifact recovery no longer works after restarting the app",
                 "Earlier context. ".repeat(100)

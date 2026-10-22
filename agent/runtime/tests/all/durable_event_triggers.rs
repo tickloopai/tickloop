@@ -24,12 +24,7 @@ async fn a_durable_load_keeps_an_armed_event_trigger_waiting_for_its_next_event(
     );
     let chat = first.create_chat_without_folder().await.unwrap();
     let request = prompt("watch the feed", ParentSelection::CurrentLeaf);
-    let loop_id = first
-        .advance(chat, request.clone())
-        .await
-        .unwrap()
-        .receipt()
-        .loop_id;
+    first.advance(chat, request.clone()).await.unwrap();
     assert!(matches!(
         settled(&first, chat, request.input_id).await,
         SettledOutcome::Completed { .. }
@@ -37,7 +32,6 @@ async fn a_durable_load_keeps_an_armed_event_trigger_waiting_for_its_next_event(
     first
         .configure_trigger(
             chat,
-            loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: EVENT_PROMPT.into(),
@@ -57,13 +51,12 @@ async fn a_durable_load_keeps_an_armed_event_trigger_waiting_for_its_next_event(
     next.resume_chat(chat).await.unwrap();
     assert!(model.requests().is_empty());
     assert!(matches!(next.quiesce(chat).await, Quiescence::Waiting(_)));
-    let goal = next.snapshot(chat).await.unwrap().loops[0].clone();
-    assert_eq!(goal.state, LoopState::WaitingTrigger);
+    let goal = next.snapshot(chat).await.unwrap().chat_loop.clone();
+    assert_eq!(goal.state, LoopState::Idle);
     assert!(goal.trigger.unwrap().armed);
 
     next.trigger(
         chat,
-        loop_id,
         TriggerSource {
             source: "feed".into(),
             payload: serde_json::json!({"entry": 1}),

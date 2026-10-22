@@ -170,15 +170,13 @@ impl LongChat {
             panic!("Create returns the execution: {created:?}");
         };
         let chat = snapshot.conversation.id;
-        let mut goal = None;
         for turn in 0..=turns {
-            let submitted = access
+            access
                 .execute(CommandEnvelope {
                     daemon_epoch: access.daemon_epoch(),
                     command_id: Uuid::new_v4(),
                     command: AgentCommand::Submit {
                         execution,
-                        target_loop: goal,
                         input: UserInput::Text {
                             text: format!("turn {turn}"),
                             contexts: Vec::new(),
@@ -189,9 +187,6 @@ impl LongChat {
                 })
                 .await
                 .unwrap();
-            if let Some(CommandResult::Submitted(receipt)) = submitted.result {
-                goal = Some(receipt.loop_id);
-            }
             if turn == turns {
                 break;
             }
@@ -295,7 +290,7 @@ async fn a_status_query_answers_what_a_snapshot_of_the_same_moment_holds() {
         serde_json::to_value(&*status).unwrap(),
         serde_json::to_value(snapshot.status()).unwrap()
     );
-    assert_eq!(status.chat.loops.len(), snapshot.conversation.loops.len());
+    assert_eq!(status.chat.chat_loop.id, snapshot.conversation.chat_loop.id);
     assert!(status.chat.last_sequence > 0);
     let ObservationValue::Events(events) = long
         .observe(AgentDetailQuery::Events {

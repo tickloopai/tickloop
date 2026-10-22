@@ -190,7 +190,7 @@ impl Agent {
             let mut scanner = SetupScanner {
                 workspace: Workspace { folder: Some(workdir.clone()), additional_directories: snapshot.additional_directories.clone() },
                 policy: snapshot.policy,
-                loop_id: snapshot.loops.last().map_or(Uuid::nil(), |goal| goal.id),
+                loop_id: snapshot.chat_loop.id,
                 gaps: Vec::new(),
             };
             let batch = Uuid::new_v4();

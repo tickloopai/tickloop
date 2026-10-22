@@ -1,4 +1,4 @@
-//! Loop 随对话链记录（rewind、Branch、压缩与重启后是否存在）。
+//! Chat 的 Loop 随对话链记录：rewind、Branch、压缩与重启后保持同一个 Loop 与它的 Trigger。
 //! 同一测试进程中的多个 Agent 实例模拟多个进程；Trigger 租约、锁文件接管、停止状态与子进程持锁见
 //! `loop_trigger_safety.rs`。
 
@@ -11,9 +11,9 @@ use std::{
 use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    BranchRequest, ChatId, ChatSnapshot, Content, DirectedSummaryRequest, EventKind, LoopId,
-    LoopState, Message, ModelIdentity, Protocol, Receipt, RewindMode, Role, SummaryDirection,
-    Trigger, TriggerPromptSource, TriggerSource, Usage,
+    BranchRequest, ChatId, Content, DirectedSummaryRequest, EventKind, LoopState, Message,
+    ModelIdentity, Protocol, Receipt, RewindMode, Role, SummaryDirection, Trigger,
+    TriggerPromptSource, TriggerSource, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{config, next_event};
@@ -126,9 +126,9 @@ fn watching(prompt: &str) -> Trigger {
     }
 }
 
-async fn complete_turn(agent: &Agent, chat: ChatId, goal: Option<LoopId>, prompt: &str) -> Receipt {
+async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -148,18 +148,6 @@ async fn wait_until(what: &str, timeout: Duration, condition: impl Fn() -> bool)
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-fn loop_ids(snapshot: &ChatSnapshot) -> Vec<LoopId> {
-    snapshot.loops.iter().map(|goal| goal.id).collect()
-}
-
-fn find_loop(snapshot: &ChatSnapshot, loop_id: LoopId) -> &tickloop_agent_protocol::LoopSnapshot {
-    snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id == loop_id)
-        .unwrap_or_else(|| panic!("Loop {loop_id} is missing"))
 }
 
 fn now_ms() -> u64 {
@@ -195,10 +183,11 @@ async fn loop_state_times_survive_restart_and_legacy_records_stay_unknown() {
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let started = now_ms();
-    let finished = complete_turn(&agent, chat, None, "finish once").await;
+    let finished = complete_turn(&agent, chat, "finish once").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let goal = find_loop(&snapshot, finished.loop_id);
-    assert_eq!(goal.state, LoopState::Completed);
+    let goal = &snapshot.chat_loop;
+    assert_eq!(goal.id, finished.loop_id);
+    assert_eq!(goal.state, LoopState::Idle);
     let finished_at = goal.state_since.expect("a finish records its time");
     assert!(finished_at >= started && finished_at <= now_ms());
     agent.shutdown().await;
@@ -214,10 +203,10 @@ async fn loop_state_times_survive_restart_and_legacy_records_stay_unknown() {
     tokio::time::sleep(Duration::from_millis(5)).await;
     let restarted = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    let goal = find_loop(&restored, finished.loop_id);
-    assert_eq!(goal.state, LoopState::Completed);
+    assert_eq!(restored.chat_loop.id, finished.loop_id);
+    assert_eq!(restored.chat_loop.state, LoopState::Idle);
     assert_eq!(
-        goal.state_since,
+        restored.chat_loop.state_since,
         Some(finished_at),
         "restart keeps the original time"
     );
@@ -232,71 +221,54 @@ async fn loop_state_times_survive_restart_and_legacy_records_stay_unknown() {
     }
     let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = reopened.resume_chat(chat).await.unwrap();
-    let goal = find_loop(&restored, finished.loop_id);
-    assert_eq!(goal.state, LoopState::Completed);
+    assert_eq!(restored.chat_loop.state, LoopState::Idle);
     assert_eq!(
-        goal.state_since, None,
+        restored.chat_loop.state_since, None,
         "a legacy record leaves the time unknown"
     );
     reopened.shutdown().await;
 }
 
-/// Restoring converts a Loop that was waiting or running before the restart into Interrupted or
-/// Expired. Nobody knows when that happened, so the converted Loop's time becomes unknown; a Loop
-/// whose persisted state survives unchanged keeps its recorded time.
+/// A restart pauses an idle Loop's receiving without converting its state, so the Loop keeps
+/// its recorded state time.
 #[tokio::test]
-async fn recovery_conversions_leave_their_state_time_unknown() {
+async fn a_restart_pauses_an_idle_loop_and_keeps_its_state_time() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let kept = complete_turn(&agent, chat, None, "kept goal").await;
-    let watched = complete_turn(&agent, chat, None, "watched goal").await;
+    complete_turn(&agent, chat, "watched goal").await;
     agent
-        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
+        .configure_trigger(chat, Some(watching("watch check")))
         .await
         .unwrap();
     let before = agent.snapshot(chat).await.unwrap();
-    let kept_at = find_loop(&before, kept.loop_id).state_since;
-    assert_eq!(find_loop(&before, kept.loop_id).state, LoopState::Completed);
-    assert!(kept_at.is_some());
-    let waiting = find_loop(&before, watched.loop_id);
-    assert_eq!(waiting.state, LoopState::WaitingTrigger);
-    assert!(
-        waiting.state_since.is_some(),
-        "the waiting state has a known time"
-    );
+    assert_eq!(before.chat_loop.state, LoopState::Idle);
+    let idle_at = before.chat_loop.state_since;
+    assert!(idle_at.is_some());
     agent.shutdown().await;
     drop(agent);
 
     let restarted = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    let interrupted = find_loop(&restored, watched.loop_id);
-    assert_eq!(interrupted.state, LoopState::Interrupted);
-    assert_eq!(
-        interrupted.state_since, None,
-        "a recovery conversion does not reuse the waiting state's time"
-    );
-    let unchanged = find_loop(&restored, kept.loop_id);
-    assert_eq!(unchanged.state, LoopState::Completed);
-    assert_eq!(
-        unchanged.state_since, kept_at,
-        "an unchanged persisted state keeps its recorded time"
-    );
+    assert_eq!(restored.chat_loop.state, LoopState::Idle);
+    assert_eq!(restored.chat_loop.state_since, idle_at);
+    assert!(!restored.chat_loop.trigger.as_ref().unwrap().armed);
+    assert!(restored.trigger_awaits_resume);
     restarted.shutdown().await;
 }
 
 #[tokio::test]
-async fn rewinding_before_a_loop_start_removes_it_and_earlier_loops_stay_after_restart() {
+async fn rewind_keeps_the_loop_and_its_trigger_across_restarts() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let model = EchoModel::new();
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = complete_turn(&agent, chat, None, "first goal").await;
-    let second = complete_turn(&agent, chat, None, "second goal").await;
+    let first = complete_turn(&agent, chat, "first goal").await;
+    complete_turn(&agent, chat, "second goal").await;
     agent
-        .configure_trigger(chat, second.loop_id, Some(watching("second check")))
+        .configure_trigger(chat, Some(watching("second check")))
         .await
         .unwrap();
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[1].clone();
@@ -304,157 +276,127 @@ async fn rewinding_before_a_loop_start_removes_it_and_earlier_loops_stay_after_r
         .rewind(chat, point.message_id, RewindMode::Conversation)
         .await
         .unwrap();
-    let draft = outcome.draft.unwrap().loop_id;
-    assert_eq!(loop_ids(&outcome.snapshot), vec![first.loop_id, draft]);
-    // 被移除的 Loop 的 Trigger 随截断停止。
-    assert!(
-        agent
-            .trigger(
-                chat,
-                second.loop_id,
-                TriggerSource {
-                    source: "manual".into(),
-                    payload: serde_json::json!({"note": "changed"}),
-                },
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(model.prompts_containing("second check"), 0);
-    let third = complete_turn(&agent, chat, None, "third goal").await;
+    assert_eq!(outcome.draft.unwrap().prompt, "second goal");
+    assert_eq!(outcome.snapshot.chat_loop.id, first.loop_id);
+    assert!(outcome.snapshot.chat_loop.trigger.as_ref().unwrap().armed);
+    agent
+        .trigger(
+            chat,
+            TriggerSource {
+                source: "manual".into(),
+                payload: serde_json::json!({"note": "changed"}),
+            },
+        )
+        .await
+        .unwrap();
+    wait_until(
+        "the Trigger to deliver after the rewind",
+        Duration::from_secs(3),
+        || model.prompts_containing("second check") >= 1,
+    )
+    .await;
+    let third = complete_turn(&agent, chat, "third goal").await;
+    assert_eq!(third.loop_id, first.loop_id);
     agent.shutdown().await;
     drop(agent);
 
     let restarted_model = EchoModel::new();
     let restarted = Agent::open_embedded(root.clone(), config(), restarted_model.clone()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    assert_eq!(
-        loop_ids(&restored),
-        vec![first.loop_id, draft, third.loop_id]
-    );
-    // 重启后 rewind 到第三个目标的提示：之后创建的 Loop 移除，更早的 Loop 保留。
-    let third_point = restored.rewind_points()[1].clone();
-    assert_eq!(third_point.prompt, "third goal");
+    assert_eq!(restored.chat_loop.id, first.loop_id);
+    let third_point = restored
+        .rewind_points()
+        .into_iter()
+        .find(|point| point.prompt == "third goal")
+        .unwrap();
     let outcome = restarted
         .rewind(chat, third_point.message_id, RewindMode::Conversation)
         .await
         .unwrap();
-    let second_draft = outcome.draft.unwrap().loop_id;
-    assert_eq!(
-        loop_ids(&outcome.snapshot),
-        vec![first.loop_id, second_draft]
-    );
-    let fourth = complete_turn(&restarted, chat, None, "fourth goal").await;
+    assert_eq!(outcome.snapshot.chat_loop.id, first.loop_id);
+    complete_turn(&restarted, chat, "fourth goal").await;
     let request = restarted_model.last_conversation_request();
-    assert_eq!(
-        request
-            .messages
-            .iter()
-            .filter(|message| message.role != Role::System)
-            .map(message_text)
-            .collect::<Vec<_>>(),
-        vec!["first goal", "answered 2", "fourth goal"]
-    );
+    let sent = request
+        .messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .map(message_text)
+        .collect::<Vec<_>>();
+    assert_eq!(sent.first().map(String::as_str), Some("first goal"));
+    assert_eq!(sent.last().map(String::as_str), Some("fourth goal"));
+    assert!(!sent.iter().any(|text| text == "third goal"));
     restarted.shutdown().await;
     drop(restarted);
 
     let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = reopened.resume_chat(chat).await.unwrap();
-    assert_eq!(
-        loop_ids(&restored),
-        vec![first.loop_id, second_draft, fourth.loop_id]
-    );
+    assert_eq!(restored.chat_loop.id, first.loop_id);
+    assert!(restored.chat_loop.trigger.is_some());
     reopened.shutdown().await;
 }
 
 #[tokio::test]
-async fn branch_copies_loops_started_before_it_with_disarmed_triggers() {
+async fn branch_copies_the_loop_with_its_trigger_disarmed_until_continued() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let watched = complete_turn(&agent, chat, None, "watch goal").await;
+    let watched = complete_turn(&agent, chat, "watch goal").await;
     agent
-        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
+        .configure_trigger(chat, Some(watching("watch check")))
         .await
         .unwrap();
-    complete_turn(&agent, chat, None, "abandoned goal").await;
-    let point = agent.snapshot(chat).await.unwrap().rewind_points()[1].clone();
-    let draft = agent
-        .rewind(chat, point.message_id, RewindMode::Conversation)
-        .await
-        .unwrap()
-        .draft
-        .unwrap()
-        .loop_id;
 
     let outcome = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: None,
         })
         .await
         .unwrap();
     let child = outcome.snapshot;
-    assert_eq!(loop_ids(&child), vec![watched.loop_id, draft]);
-    assert!(
-        child
-            .loops
-            .iter()
-            .all(|goal| { goal.trigger.as_ref().is_none_or(|trigger| !trigger.armed) })
-    );
-    assert_eq!(
-        find_loop(&child, watched.loop_id).state,
-        LoopState::Interrupted
-    );
-    assert!(child.resume_triggers.contains(&watched.loop_id));
+    assert_eq!(child.chat_loop.id, watched.loop_id);
+    assert!(!child.chat_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(child.chat_loop.state, LoopState::Idle);
+    assert!(child.trigger_awaits_resume);
     let source = agent.snapshot(chat).await.unwrap();
-    assert!(
-        find_loop(&source, watched.loop_id)
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
-    );
+    assert!(source.chat_loop.trigger.as_ref().unwrap().armed);
 
     complete_turn(
         &agent,
         outcome.child_chat_id,
-        Some(watched.loop_id),
         "resume watching in the branch",
     )
     .await;
     let resumed = agent.snapshot(outcome.child_chat_id).await.unwrap();
-    let resumed_loop = find_loop(&resumed, watched.loop_id);
-    assert!(resumed_loop.trigger.as_ref().unwrap().armed);
-    assert_eq!(resumed_loop.state, LoopState::WaitingTrigger);
+    assert!(resumed.chat_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(resumed.chat_loop.state, LoopState::Idle);
     agent.shutdown().await;
     drop(agent);
 
     let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = reopened.resume_chat(outcome.child_chat_id).await.unwrap();
-    assert_eq!(loop_ids(&restored), vec![watched.loop_id, draft]);
-    assert!(restored.resume_triggers.contains(&watched.loop_id));
+    assert_eq!(restored.chat_loop.id, watched.loop_id);
+    assert!(restored.trigger_awaits_resume);
     reopened.shutdown().await;
 }
 
 #[tokio::test]
-async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction() {
+async fn trigger_settings_survive_restart_after_compaction() {
     for directed in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
         let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let watched = complete_turn(&agent, chat, None, "watch goal").await;
+        let watched = complete_turn(&agent, chat, "watch goal").await;
         let trigger = watching("watch check");
         agent
-            .configure_trigger(chat, watched.loop_id, Some(trigger.clone()))
+            .configure_trigger(chat, Some(trigger.clone()))
             .await
             .unwrap();
-        let other = complete_turn(&agent, chat, None, "other goal").await;
-        let third = complete_turn(&agent, chat, None, "third goal").await;
+        complete_turn(&agent, chat, "other goal").await;
+        complete_turn(&agent, chat, "third goal").await;
         if directed {
             let point = agent.snapshot(chat).await.unwrap().rewind_points()[2].clone();
             agent
@@ -485,29 +427,16 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
         let restarted = Agent::open_embedded(root, config(), model.clone()).unwrap();
         let restored = restarted.resume_chat(chat).await.unwrap();
         let label = if directed { "directed" } else { "full" };
-        assert_eq!(
-            loop_ids(&restored),
-            vec![watched.loop_id, other.loop_id, third.loop_id],
-            "{label}"
-        );
-        let restored_watch = find_loop(&restored, watched.loop_id);
-        let restored_trigger = restored_watch.trigger.as_ref().unwrap();
+        assert_eq!(restored.chat_loop.id, watched.loop_id, "{label}");
+        let restored_trigger = restored.chat_loop.trigger.as_ref().unwrap();
         assert_eq!(restored_trigger.id, trigger.id, "{label}");
         assert_eq!(restored_trigger.prompt, trigger.prompt, "{label}");
         assert!(restored_trigger.accepts_events, "{label}");
         assert!(!restored_trigger.armed, "{label}");
-        assert_eq!(restored_watch.state, LoopState::Interrupted, "{label}");
-        assert!(
-            restored.resume_triggers.contains(&watched.loop_id),
-            "{label}"
-        );
-        assert_eq!(
-            find_loop(&restored, other.loop_id).state,
-            LoopState::Completed,
-            "{label}"
-        );
+        assert_eq!(restored.chat_loop.state, LoopState::Idle, "{label}");
+        assert!(restored.trigger_awaits_resume, "{label}");
 
-        complete_turn(&restarted, chat, Some(watched.loop_id), "resume watching").await;
+        complete_turn(&restarted, chat, "resume watching").await;
         // Loop 条目不进入发给模型的对话：重启后的请求只多出恢复哨兵与新的提示。
         let sent = model
             .last_conversation_request()
@@ -529,7 +458,11 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
             "{label}: {extra:?}"
         );
         assert!(
-            find_loop(&restarted.snapshot(chat).await.unwrap(), watched.loop_id)
+            restarted
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .chat_loop
                 .trigger
                 .as_ref()
                 .unwrap()
@@ -541,14 +474,14 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
 }
 
 #[tokio::test]
-async fn restarted_triggers_are_interrupted_and_manual_resume_takes_events_again() {
+async fn restarted_triggers_are_paused_and_a_new_input_resumes_them() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let watched = complete_turn(&agent, chat, None, "watched goal").await;
+    complete_turn(&agent, chat, "watched goal").await;
     agent
-        .configure_trigger(chat, watched.loop_id, Some(watching("watch check")))
+        .configure_trigger(chat, Some(watching("watch check")))
         .await
         .unwrap();
     agent.shutdown().await;
@@ -557,24 +490,16 @@ async fn restarted_triggers_are_interrupted_and_manual_resume_takes_events_again
     let model = EchoModel::new();
     let restarted = Agent::open_embedded(root, config(), model.clone()).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
-    let watched_loop = find_loop(&restored, watched.loop_id);
-    assert_eq!(watched_loop.state, LoopState::Interrupted);
-    assert!(!watched_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(restored.chat_loop.state, LoopState::Idle);
+    assert!(!restored.chat_loop.trigger.as_ref().unwrap().armed);
     assert!(model.requests.lock().unwrap().is_empty());
 
-    complete_turn(&restarted, chat, Some(watched.loop_id), "resume watching").await;
+    complete_turn(&restarted, chat, "resume watching").await;
     let resumed = restarted.snapshot(chat).await.unwrap();
-    assert!(
-        find_loop(&resumed, watched.loop_id)
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
-    );
+    assert!(resumed.chat_loop.trigger.as_ref().unwrap().armed);
     restarted
         .trigger(
             chat,
-            watched.loop_id,
             TriggerSource {
                 source: "manual".into(),
                 payload: serde_json::json!({"note": "changed"}),
@@ -589,4 +514,140 @@ async fn restarted_triggers_are_interrupted_and_manual_resume_takes_events_again
     )
     .await;
     restarted.shutdown().await;
+}
+
+/// A Chat is created with its one Loop: idle, with nothing to receive. Every turn runs in it and
+/// a restart restores the same Loop.
+#[tokio::test]
+async fn a_new_chat_has_one_loop_that_every_turn_and_restart_keep() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let created = agent.snapshot(chat).await.unwrap().chat_loop;
+    assert_eq!(created.state, LoopState::Idle);
+    assert!(created.run_id.is_none());
+    assert!(created.trigger.is_none());
+    assert!(created.event_sources.is_empty());
+    let first = complete_turn(&agent, chat, "first task").await;
+    let second = complete_turn(&agent, chat, "an unrelated task").await;
+    assert_eq!(first.loop_id, created.id);
+    assert_eq!(second.loop_id, created.id);
+    agent.shutdown().await;
+    drop(agent);
+
+    let restarted = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
+    let restored = restarted.resume_chat(chat).await.unwrap();
+    assert_eq!(restored.chat_loop.id, created.id);
+    let third = complete_turn(&restarted, chat, "after the restart").await;
+    assert_eq!(third.loop_id, created.id);
+    restarted.shutdown().await;
+}
+
+/// An interrupted or failed turn is only how that turn ended: the next input continues the same
+/// Loop.
+#[tokio::test]
+async fn interrupted_and_failed_turns_continue_with_the_next_input() {
+    use tickloop_agent_test_support::{ScriptedModel, call, single_question, text};
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![call(
+        "ask",
+        "AskUserQuestion",
+        single_question("Which file?"),
+    )]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let asked = agent.submit(chat, "ask me".into()).await.unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::QuestionAsked { .. }
+        ) {
+            break;
+        }
+    }
+    agent.interrupt(chat).await.unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id == asked.run_id && matches!(event.kind, EventKind::Interrupted) {
+            break;
+        }
+    }
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Interrupted
+    );
+
+    // The script is empty now, so this turn fails.
+    let failed = agent.submit(chat, "try again".into()).await.unwrap();
+    assert_eq!(failed.loop_id, asked.loop_id);
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id == failed.run_id && matches!(event.kind, EventKind::Failed(_)) {
+            break;
+        }
+    }
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Failed
+    );
+
+    model.enqueue(text("done at last"));
+    let continued = complete_turn(&agent, chat, "go on").await;
+    assert_eq!(continued.loop_id, asked.loop_id);
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Idle
+    );
+    agent.shutdown().await;
+}
+
+/// Loop records written before a Chat had one Loop are dropped on load; the conversation they
+/// sat in stays visible and the Chat goes on with a Loop of its own.
+#[tokio::test]
+async fn old_format_loop_records_are_dropped_and_the_history_stays_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let before = complete_turn(&agent, chat, "OLD-FORMAT-PROMPT").await;
+    agent
+        .configure_trigger(chat, Some(watching("watch check")))
+        .await
+        .unwrap();
+    agent.shutdown().await;
+    drop(agent);
+    for path in transcript_files(&root) {
+        let old = std::fs::read_to_string(&path).unwrap().replace(
+            "\"subtype\":\"chat_loop\",\"loop\":{",
+            "\"subtype\":\"loop_state\",\"loop\":{\"goal\":\"OLD-FORMAT-PROMPT\",",
+        );
+        std::fs::write(&path, old).unwrap();
+    }
+
+    let model = EchoModel::new();
+    let reopened = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    let restored = reopened.resume_chat(chat).await.unwrap();
+    assert!(
+        restored
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("OLD-FORMAT-PROMPT")),
+        "the history stays visible"
+    );
+    assert_ne!(restored.chat_loop.id, before.loop_id);
+    assert_eq!(restored.chat_loop.state, LoopState::Idle);
+    assert!(restored.chat_loop.trigger.is_none());
+    let continued = complete_turn(&reopened, chat, "go on").await;
+    assert_eq!(continued.loop_id, restored.chat_loop.id);
+    assert!(
+        model
+            .last_conversation_request()
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("OLD-FORMAT-PROMPT")),
+        "the continued turn still sees the earlier conversation"
+    );
+    reopened.shutdown().await;
 }

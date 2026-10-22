@@ -413,7 +413,7 @@ fn view_from_snapshot(
         auto_settings_revision,
         jev_key_status,
         auto_reviewer_health,
-        selected_loop_id: snapshot.loops.last().map(|loop_snapshot| loop_snapshot.id),
+        selected_loop_id: Some(snapshot.chat_loop.id),
         rules,
         working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),
@@ -434,11 +434,9 @@ fn validate_editable_rule(
     {
         return Err(PermissionChangeError::Invalid("rule is read-only".into()));
     }
-    if let Some(loop_id) = rule.loop_id
-        && !snapshot
-            .loops
-            .iter()
-            .any(|loop_snapshot| loop_snapshot.id == loop_id)
+    if rule
+        .loop_id
+        .is_some_and(|loop_id| loop_id != snapshot.chat_loop.id)
     {
         return Err(PermissionChangeError::Invalid(
             "Loop does not exist in this Chat".into(),

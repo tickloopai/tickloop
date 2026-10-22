@@ -40,7 +40,7 @@ fn text_only_config() -> ModelConfig {
 /// Submits a prompt and returns the tool results reported while the run completes.
 async fn run_to_completion(agent: &Agent, chat: ChatId, prompt: &str) -> Vec<ToolResult> {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut results = Vec::new();
     loop {
         let event = next_event(&mut events).await;

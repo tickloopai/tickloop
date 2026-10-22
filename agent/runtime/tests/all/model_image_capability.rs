@@ -294,7 +294,7 @@ fn write_png(path: &Path) -> Vec<u8> {
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str, paths: Vec<std::path::PathBuf>) {
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit_with_file_references(chat, None, prompt.into(), paths)
+        .submit_with_file_references(chat, prompt.into(), paths)
         .await
         .unwrap();
     loop {

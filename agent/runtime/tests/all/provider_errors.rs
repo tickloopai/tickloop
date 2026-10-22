@@ -296,10 +296,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "First attempt".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "First attempt".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -350,7 +347,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
             .contains_key("fixture-api")
     );
     agent
-        .submit(chat, None, "Second explicit attempt".into())
+        .submit(chat, "Second explicit attempt".into())
         .await
         .unwrap();
     loop {
@@ -382,7 +379,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     ));
     agent.set_model(chat, config.clone()).await.unwrap();
     agent
-        .submit(chat, None, "Third explicit attempt".into())
+        .submit(chat, "Third explicit attempt".into())
         .await
         .unwrap();
     loop {
@@ -431,7 +428,7 @@ async fn persisted_transcript_retains_provider_explanation_after_reload() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Transcript error probe".into())
+        .submit(chat, "Transcript error probe".into())
         .await
         .unwrap();
     loop {

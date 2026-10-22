@@ -5,10 +5,7 @@ use tickloop_agent_test_support::{ScriptedModel, config, text};
 
 async fn finish(core: &Agent, chat: ChatId) -> Receipt {
     let mut events = core.subscribe();
-    let receipt = core
-        .submit(chat, None, "authorized work".into())
-        .await
-        .unwrap();
+    let receipt = core.submit(chat, "authorized work".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -419,7 +416,7 @@ async fn explicit_setting_reads_refresh_only_the_target_configuration_without_ru
         Err(AgentError::NotFound)
     ));
     let snapshot = target.snapshot(target_chat).await.unwrap();
-    assert!(snapshot.loops.is_empty());
+    assert_eq!(snapshot.chat_loop.run_id, None);
     assert!(snapshot.messages.is_empty());
     assert!(snapshot.task_boards.is_empty());
     assert!(model.requests.lock().unwrap().is_empty());

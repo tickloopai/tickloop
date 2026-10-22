@@ -68,14 +68,6 @@ pub(super) enum Workflow {
         choices: Vec<Uuid>,
         as_new_chat: bool,
     },
-    Goals {
-        chat: Uuid,
-        choices: Vec<Uuid>,
-    },
-    Goal {
-        chat: Uuid,
-        goal: Uuid,
-    },
     Commands {
         chat: Uuid,
         choices: Vec<CommandChoice>,
@@ -87,7 +79,6 @@ pub(super) enum Workflow {
     },
     Plan {
         chat: Uuid,
-        goal: Uuid,
         version: u64,
         request: Option<Uuid>,
     },
@@ -121,7 +112,7 @@ pub(super) enum CommandAction {
 #[derive(Default)]
 pub(super) struct WorkflowEffect {
     pub(super) next: Option<(Menu, Workflow)>,
-    pub(super) selection: Option<(Uuid, Option<Uuid>)>,
+    pub(super) selection: Option<Uuid>,
     pub(super) receipt: Option<Receipt>,
     pub(super) restored: Option<ChatSnapshot>,
 }
@@ -130,9 +121,7 @@ impl Workflow {
     pub(super) fn chat(&self) -> Option<Uuid> {
         match self {
             Self::Chats { .. } => None,
-            Self::Goals { chat, .. }
-            | Self::Goal { chat, .. }
-            | Self::Commands { chat, .. }
+            Self::Commands { chat, .. }
             | Self::Command { chat, .. }
             | Self::Plan { chat, .. }
             | Self::PlanView { chat } => Some(*chat),
@@ -175,61 +164,6 @@ impl Workflow {
                 choices: chats.into_iter().map(|chat| chat.id).collect(),
                 as_new_chat,
             },
-        ))
-    }
-
-    pub(super) async fn goals(agent: &Agent, chat: Uuid) -> Result<(Menu, Self), String> {
-        let snapshot = agent
-            .snapshot(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let options = snapshot
-            .loops
-            .iter()
-            .map(|goal| format!("{} · {:?}", single_line(&goal.goal), goal.state))
-            .chain(std::iter::once("New goal".into()))
-            .chain(std::iter::once("Cancel".into()))
-            .collect();
-        let context = if snapshot.loops.is_empty() {
-            "Choose New goal to start another goal with your next input, keeping this Chat's history."
-        } else {
-            "Choose a goal to view its trigger or select it for your next message."
-        };
-        Ok((
-            menu("Loops", vec![context.into()], options),
-            Self::Goals {
-                chat,
-                choices: snapshot.loops.iter().map(|goal| goal.id).collect(),
-            },
-        ))
-    }
-
-    pub(super) async fn goal(
-        agent: &Agent,
-        chat: Uuid,
-        goal: Uuid,
-    ) -> Result<(Menu, Self), String> {
-        let snapshot = agent
-            .snapshot(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let selected = snapshot
-            .loops
-            .iter()
-            .find(|item| item.id == goal)
-            .ok_or("The selected goal no longer exists.")?;
-        let mut context = vec![
-            format!("{} · {:?}", single_line(&selected.goal), selected.state),
-            format!("Goal: {goal}"),
-        ];
-        context.extend(super::loops::trigger_lines(selected.trigger.as_ref()));
-        Ok((
-            menu(
-                "Loop details",
-                context,
-                vec!["Use this goal".into(), "Back to Loops".into()],
-            ),
-            Self::Goal { chat, goal },
         ))
     }
 
@@ -310,29 +244,18 @@ impl Workflow {
         ))
     }
 
-    pub(super) async fn plan(
-        agent: &Agent,
-        chat: Uuid,
-        goal: Uuid,
-    ) -> Result<(Menu, Self), String> {
+    pub(super) async fn plan(agent: &Agent, chat: Uuid) -> Result<(Menu, Self), String> {
         let status = agent
             .status(chat)
             .await
             .map_err(|error| error.to_string())?;
-        let selected_goal = status
-            .loops
-            .iter()
-            .find(|entry| entry.id == goal)
-            .ok_or("The selected goal no longer exists.")?;
+        let chat_loop = status.chat_loop.id;
         let plan = status
             .plans
             .iter()
-            .find(|plan| plan.loop_id == goal)
-            .ok_or("This goal has no plan yet. Ask the Agent to create one in Plan mode.")?;
-        let mut context = vec![
-            format!("Goal: {}", safe_text(&selected_goal.goal)),
-            format!("Plan version: {}", plan.version),
-        ];
+            .find(|plan| plan.loop_id == chat_loop)
+            .ok_or("This Chat has no plan yet. Ask the Agent to create one in Plan mode.")?;
+        let mut context = vec![format!("Plan version: {}", plan.version)];
         if let Some(mode) = plan.approved_execution_mode {
             context.push(format!("Already approved with mode: {mode}"));
         }
@@ -348,7 +271,7 @@ impl Workflow {
             .iter()
             .find(|request| {
                 request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
-                    && request.loop_id == goal
+                    && request.loop_id == chat_loop
             })
             .map(|request| request.id);
         let mut menu = menu(
@@ -364,7 +287,6 @@ impl Workflow {
             menu,
             Self::Plan {
                 chat,
-                goal,
                 version: plan.version,
                 request,
             },
@@ -389,23 +311,13 @@ impl Workflow {
         feedback: Option<String>,
     ) -> Result<WorkflowEffect, String> {
         let Some(index) = index else {
-            let mut effect = WorkflowEffect::default();
-            if let Self::Plan {
-                chat,
-                goal,
-                version,
-                ..
-            } = self
-            {
+            if let Self::Plan { chat, version, .. } = self {
                 agent
-                    .decline_plan(chat, goal, version, None)
+                    .decline_plan(chat, version, None)
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            if let Self::Goal { chat, .. } = self {
-                effect.next = Some(Self::goals(agent, chat).await?);
-            }
-            return Ok(effect);
+            return Ok(WorkflowEffect::default());
         };
         let mut effect = WorkflowEffect::default();
         match self {
@@ -444,62 +356,8 @@ impl Workflow {
                 super::show_settings_warnings(console, agent.user_settings_warnings(chat))?;
                 console.write("History only; selecting this Chat starts no work.\n")?;
                 write_public_history(console, &snapshot)?;
-                let goal = if snapshot.loops.len() == 1 {
-                    Some(snapshot.loops[0].id)
-                } else {
-                    None
-                };
-                effect.selection = Some((chat, goal));
-                if snapshot.loops.len() > 1 {
-                    effect.next = Some(Self::goals(agent, chat).await?);
-                }
+                effect.selection = Some(chat);
                 effect.restored = Some(snapshot);
-            }
-            Self::Goals { chat, choices } => {
-                if index == choices.len() {
-                    console.write("\nThe next input will start a new goal in this Chat.\n")?;
-                    effect.selection = Some((chat, None));
-                    return Ok(effect);
-                }
-                if index == choices.len() + 1 {
-                    return Ok(effect);
-                }
-                let goal = *choices.get(index).ok_or("Invalid goal selection.")?;
-                effect.next = Some(Self::goal(agent, chat, goal).await?);
-            }
-            Self::Goal { chat, goal } => {
-                match index {
-                    1 => {
-                        effect.next = Some(Self::goals(agent, chat).await?);
-                        return Ok(effect);
-                    }
-                    0 => {}
-                    _ => return Err("Invalid goal action.".into()),
-                }
-                let snapshot = agent
-                    .snapshot(chat)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let selected = snapshot
-                    .loops
-                    .iter()
-                    .find(|entry| entry.id == goal)
-                    .ok_or("The selected goal no longer exists.")?;
-                let next_step = match selected.state {
-                    LoopState::Stopped | LoopState::Expired => {
-                        "This goal has ended. Use /loops new to start another goal."
-                    }
-                    LoopState::WaitingPermission => {
-                        "This goal is waiting for your approval in the permission menu."
-                    }
-                    _ => "Enter a message when you want this goal to continue.",
-                };
-                console.write(&format!(
-                    "\nSelected goal: {} · {:?}\n{next_step}\n",
-                    safe_text(&selected.goal),
-                    selected.state,
-                ))?;
-                effect.selection = Some((chat, Some(goal)));
             }
             Self::Commands { chat, choices } => {
                 if index == choices.len() {
@@ -637,33 +495,30 @@ impl Workflow {
                     }
                 }
             }
-            Self::Plan {
-                chat,
-                goal,
-                version,
-                ..
-            } => {
+            Self::Plan { chat, version, .. } => {
                 let choice = PLAN_APPROVAL_CHOICES
                     .get(index)
                     .ok_or("Invalid plan selection.")?;
                 let Some(mode) = choice.mode() else {
                     effect.receipt = agent
-                        .decline_plan(chat, goal, version, feedback)
+                        .decline_plan(chat, version, feedback)
                         .await
                         .map_err(|error| error.to_string())?;
                     return Ok(effect);
                 };
                 let approval = agent
-                    .approve_plan(chat, goal, version, mode)
+                    .approve_plan(chat, version, mode)
                     .await
                     .map_err(|error| error.to_string())?;
                 if let Some(approval) = approval {
-                    let receipt=agent.submit(chat,Some(goal),approval).await
+                    let receipt=agent.submit(chat,approval).await
                         .map_err(|error|format!("Plan version {version} was approved, but execution could not start: {error}"))?;
                     effect.receipt = Some(receipt);
                 }
-                console.write(&format!("\nPlan version {version} approved. Starting this goal with {mode} permissions.\n"))?;
-                effect.selection = Some((chat, Some(goal)));
+                console.write(&format!(
+                    "\nPlan version {version} approved. Starting it with {mode} permissions.\n"
+                ))?;
+                effect.selection = Some(chat);
             }
         }
         Ok(effect)
@@ -794,10 +649,10 @@ pub(super) fn chat_title(chat: &ChatSnapshot) -> String {
     if let Some(name) = chat.branch_name() {
         return single_line(name);
     }
-    chat.loops
-        .first()
-        .map(|goal| single_line(&goal.goal))
-        .unwrap_or_else(|| "New conversation".into())
+    single_line(&tickloop_agent_protocol::chat_display_title(
+        chat,
+        &chat.user_shells,
+    ))
 }
 
 /// Picker title: the Branch name or custom title, otherwise the first prompt.
@@ -882,10 +737,8 @@ pub(super) fn pending_reply(snapshot: &ChatSnapshot) -> String {
     else {
         return String::new();
     };
-    let is_running = snapshot
-        .loops
-        .iter()
-        .any(|goal| goal.run_id == Some(streaming_run) && goal.state == LoopState::Running);
+    let is_running = snapshot.chat_loop.run_id == Some(streaming_run)
+        && snapshot.chat_loop.state == LoopState::Running;
     let last_message_index = snapshot.messages.len().checked_sub(1);
     let is_committed = last_message_index.is_some_and(|index| {
         snapshot.messages[index].role == Role::Assistant
@@ -1501,9 +1354,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
     use std::sync::Arc;
-    use tickloop_agent_protocol::{
-        BranchRequest, CompactionMarker, Event, LoopSnapshot, SummaryDirection,
-    };
+    use tickloop_agent_protocol::{BranchRequest, CompactionMarker, Event, SummaryDirection};
     use tickloop_agent_protocol::{Decision, PermissionRule};
     use tickloop_agent_protocol::{InputModality, Message, ModelConfig, Protocol};
 
@@ -1546,13 +1397,13 @@ mod tests {
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let first = agent
-            .submit(chat, None, "Read the first report.".into())
+        agent
+            .submit(chat, "Read the first report.".into())
             .await
             .unwrap();
         completed(&mut events).await;
         agent
-            .submit(chat, Some(first.loop_id), "Read another report.".into())
+            .submit(chat, "Read another report.".into())
             .await
             .unwrap();
         completed(&mut events).await;
@@ -1755,7 +1606,7 @@ mod tests {
                 input_modalities: vec![InputModality::Text],
             },
             "messages": messages,
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
             "last_sequence": 20,
             "last_queue_sequence": 1,
         }))
@@ -1808,13 +1659,13 @@ mod tests {
             "id": Uuid::from_u128(701),
             "folder": "/workspace",
             "messages": [
-                user_text(&tickloop_agent_protocol::local_messages::tick_delivery(&payload, &tickloop_agent_protocol::Trigger::for_loop_goal("watch 700.HK"))),
+                user_text(&tickloop_agent_protocol::local_messages::tick_delivery(&payload, &tickloop_agent_protocol::Trigger::for_subscriptions())),
                 Message {
                     role: Role::Assistant,
                     content: vec![Content::Text { text: reply.into() }],
                 },
             ],
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
         }))
         .unwrap()
     }
@@ -1920,7 +1771,7 @@ mod tests {
                     content: vec![Content::Text { text: "[Image #1] is wider".into() }],
                 },
             ],
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
         }))
         .unwrap();
         let linked_runs = || {
@@ -1991,7 +1842,7 @@ mod tests {
                     }],
                 },
             ],
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
         }))
         .unwrap();
 
@@ -2031,7 +1882,7 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Describe chart.png".into())
+            .submit(chat, "Describe chart.png".into())
             .await
             .unwrap();
         let mut compact = super::presentation::ToolPresentation::new(false);
@@ -2191,7 +2042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn choosing_history_and_goals_does_not_resume_work() {
+    async fn choosing_history_does_not_resume_work() {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![vec![
             Content::Thinking {
@@ -2210,10 +2061,7 @@ mod tests {
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "read the notes".into())
-            .await
-            .unwrap();
+        let receipt = agent.submit(chat, "read the notes".into()).await.unwrap();
         completed(&mut events).await;
         let before = agent.snapshot(chat).await.unwrap();
         let history = public_history(&before, DisplayProfile::default());
@@ -2254,16 +2102,8 @@ mod tests {
         let mut streaming = before.clone();
         let streaming_run = Uuid::new_v4();
         let unfinished = "an unfinished reply\u{1b}[31m";
-        streaming.loops.push(LoopSnapshot {
-            id: Uuid::new_v4(),
-            goal: "streaming".into(),
-            state: LoopState::Running,
-            run_id: Some(streaming_run),
-            run_started_at: None,
-            trigger: None,
-            event_sources: Vec::new(),
-            state_since: None,
-        });
+        streaming.chat_loop.state = LoopState::Running;
+        streaming.chat_loop.run_id = Some(streaming_run);
         for kind in [EventKind::Started, EventKind::Text(unfinished.into())] {
             streaming.last_sequence += 1;
             streaming.events.push(Event {
@@ -2297,9 +2137,9 @@ mod tests {
         );
         streaming.messages.pop();
         streaming.message_runs.remove(&committed_index);
-        streaming.loops.last_mut().unwrap().state = LoopState::Interrupted;
+        streaming.chat_loop.state = LoopState::Interrupted;
         assert!(pending_reply(&streaming).is_empty());
-        streaming.loops.last_mut().unwrap().state = LoopState::Running;
+        streaming.chat_loop.state = LoopState::Running;
         assert_eq!(pending_reply(&streaming), unfinished);
         streaming.last_sequence += 1;
         streaming.events.push(Event {
@@ -2317,20 +2157,13 @@ mod tests {
             .await
             .unwrap();
         let selected = picker.choose(&agent, &console, Some(0)).await.unwrap();
-        assert_eq!(selected.selection, Some((chat, Some(receipt.loop_id))));
+        assert_eq!(selected.selection, Some(chat));
         assert!(selected.receipt.is_none());
         assert_eq!(selected.restored.as_ref().unwrap().id, chat);
         assert_eq!(
             selected.restored.unwrap().last_sequence,
             before.last_sequence
         );
-        let (_, picker) = Workflow::goals(&agent, chat).await.unwrap();
-        let details = picker.choose(&agent, &console, Some(0)).await.unwrap();
-        assert!(details.selection.is_none());
-        let (_, detail) = details.next.unwrap();
-        let selected = detail.choose(&agent, &console, Some(0)).await.unwrap();
-        assert_eq!(selected.selection, Some((chat, Some(receipt.loop_id))));
-        assert!(selected.restored.is_none());
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         assert_eq!(
             agent.snapshot(chat).await.unwrap().last_sequence,
@@ -2373,7 +2206,7 @@ mod tests {
             .unwrap();
         let mut agent_events = agent.subscribe();
         agent
-            .submit(chat, None, "Start an Agent Shell task.".into())
+            .submit(chat, "Start an Agent Shell task.".into())
             .await
             .unwrap();
         loop {
@@ -2393,7 +2226,7 @@ mod tests {
 
         let mut user_events = agent.subscribe_user_shells();
         let user = agent
-            .submit_user_shell_for_goal(chat, None, "sleep 30".into(), false)
+            .submit_user_shell(chat, "sleep 30".into(), false)
             .await
             .unwrap();
         user_shell_reaches(&mut user_events, user.command_id, UserShellState::Running).await;
@@ -2552,10 +2385,7 @@ mod tests {
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        let run = agent
-            .submit(chat, None, "Prepare a plan.".into())
-            .await
-            .unwrap();
+        let run = agent.submit(chat, "Prepare a plan.".into()).await.unwrap();
         async fn approval(
             events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
         ) {
@@ -2572,7 +2402,7 @@ mod tests {
             }
         }
         approval(&mut events).await;
-        let (stale_menu, stale) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        let (stale_menu, stale) = Workflow::plan(&agent, chat).await.unwrap();
         assert_eq!(
             stale_menu.options,
             [
@@ -2583,7 +2413,7 @@ mod tests {
             ]
         );
         let (console, _) = Console::start(false).unwrap();
-        let (_, review) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        let (_, review) = Workflow::plan(&agent, chat).await.unwrap();
         assert!(
             review
                 .choose_with_feedback(&agent, &console, Some(3), Some("Add the summary.".into()))
@@ -2602,7 +2432,7 @@ mod tests {
                 .contains("revised")
         );
         assert_eq!(model.requests.lock().unwrap().len(), 2);
-        let (_, current) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        let (_, current) = Workflow::plan(&agent, chat).await.unwrap();
         let effect = current.choose(&agent, &console, Some(0)).await.unwrap();
         assert!(effect.receipt.is_none());
         completed(&mut events).await;
@@ -2612,11 +2442,11 @@ mod tests {
             snapshot.plans[0].approved_execution_mode,
             Some(ExecutionMode::Auto)
         );
-        assert_eq!(snapshot.loops[0].run_id, Some(run.run_id));
+        assert_eq!(snapshot.chat_loop.run_id, Some(run.run_id));
         let requests = model.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 3);
         assert!(requests[2].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult {tool_use_id, content, is_error:false} if tool_use_id == "p2" && content.text().contains("User has approved your plan.") && content.text().ends_with("Read notes and summarize."))));
-        let (saved, _) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        let (saved, _) = Workflow::plan(&agent, chat).await.unwrap();
         assert_eq!(saved.options, ["Close"]);
         agent.shutdown().await;
     }
@@ -2633,16 +2463,12 @@ mod tests {
                 .unwrap();
         let source = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        agent
-            .submit(source, None, "source prompt".into())
-            .await
-            .unwrap();
+        agent.submit(source, "source prompt".into()).await.unwrap();
         completed(&mut events).await;
         let child = agent
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id: source,
-                source_loop_id: None,
                 name: Some("child".into()),
             })
             .await

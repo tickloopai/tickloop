@@ -85,7 +85,6 @@ fn command(hello: &ServerHello, text: &str) -> CommandEnvelope {
                 agent_id: Uuid::new_v4(),
                 generation: 3,
             },
-            target_loop: None,
             input: UserInput::Text {
                 text: text.into(),
                 contexts: vec![],

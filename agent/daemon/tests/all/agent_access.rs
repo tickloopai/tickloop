@@ -290,7 +290,6 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
             command_id: Uuid::new_v4(),
             command: AgentCommand::EnqueueAfterTurn {
                 execution,
-                target_loop: None,
                 action: AfterTurnAction::Submit {
                     input: UserInput::Skill {
                         name: "fixture-missing-skill".into(),
@@ -335,7 +334,6 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
             command_id: Uuid::new_v4(),
             command: AgentCommand::EnqueueAfterTurn {
                 execution,
-                target_loop: None,
                 action: AfterTurnAction::Submit {
                     input: UserInput::Text {
                         text: "Continue with the next action".into(),
@@ -501,7 +499,6 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Return the complete result".into(),
                     contexts: vec![],
@@ -786,7 +783,7 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
         matches!(removed.result, Some(CommandResult::ArtifactTicks(ticks)) if ticks.is_empty())
     );
     let snapshot = runtime.snapshot(snapshot.conversation.id).await.unwrap();
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     runtime.shutdown().await;
 }
 

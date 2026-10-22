@@ -1169,7 +1169,7 @@ fn sticky_prompt_loaded_history_tracks_the_original_message_row() {
         ],
         "message_ids": {"1": agent_message},
         "agent_message_origins": {(agent_message.to_string()): {}},
-        "loops": []
+        "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
     })).unwrap();
     super::super::workflows::write_public_history(&console, &snapshot).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1806,10 +1806,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Plan the task".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Plan the task".into()).await.unwrap();
     let request = loop {
         if let EventKind::PermissionRequested { request } =
             tickloop_agent_test_support::next_event(&mut events)
@@ -1940,7 +1937,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         ExecutionMode::AcceptEdits
     );
     assert_eq!(model.requests.lock().unwrap().len(), 2);
-    let saved = super::super::workflows::Workflow::plan(&agent, chat, request.loop_id)
+    let saved = super::super::workflows::Workflow::plan(&agent, chat)
         .await
         .unwrap();
     menus.workflow(&console, saved).unwrap();
@@ -1978,7 +1975,7 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
             tickloop_agent_test_support::next_event(&mut events)
@@ -2109,7 +2106,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(source, None, "Plan".into()).await.unwrap();
+    let receipt = agent.submit(source, "Plan".into()).await.unwrap();
     loop {
         if matches!(
             tickloop_agent_test_support::next_event(&mut events)
@@ -2120,10 +2117,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
             break;
         }
     }
-    agent
-        .decline_plan(source, receipt.loop_id, 1, None)
-        .await
-        .unwrap();
+    agent.decline_plan(source, 1, None).await.unwrap();
     loop {
         if matches!(
             tickloop_agent_test_support::next_event(&mut events)
@@ -2138,7 +2132,6 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -2223,7 +2216,7 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
         .await
         .unwrap();
     let mut events = original.subscribe();
-    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    original.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
             tickloop_agent_test_support::next_event(&mut events)
@@ -2295,12 +2288,7 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
         .choose(&agent, &second, stale_id, None, None)
         .await
         .unwrap();
-    assert!(
-        agent
-            .decline_plan(chat, run.loop_id, 1, None)
-            .await
-            .is_err()
-    );
+    assert!(agent.decline_plan(chat, 1, None).await.is_err());
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(!snapshot.plans[0].approval_pending);
     assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
@@ -2356,7 +2344,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
         .unwrap();
     let mut events = core.subscribe();
     agent
-        .submit(parent, None, "Delegate a plan".into())
+        .submit(parent, "Delegate a plan".into())
         .await
         .unwrap();
     let mut child = None;
@@ -2373,12 +2361,11 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
         }
     }
     let child = child.expect("the child completed before its parent");
-    let goal = agent.snapshot(child).await.unwrap().loops[0].id;
     let console = tests::console_with_state(State::new(true, 80, 24));
     console.select_chat(Some(child)).unwrap();
     console.set_visible_delegation(true).unwrap();
     let mut menus = Menus::default();
-    let refusal = open_current_plan(&agent, &console, &mut menus, Some(child), Some(goal))
+    let refusal = open_current_plan(&agent, &console, &mut menus, Some(child))
         .await
         .unwrap_err();
     assert!(
@@ -2413,7 +2400,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
         .await
         .unwrap();
     let mut events = original.subscribe();
-    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    original.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
             tickloop_agent_test_support::next_event(&mut events)
@@ -2450,7 +2437,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     let old_id = console.dialog_menu_id().unwrap().unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, Some(run.loop_id), "Revise in another View".into())
+        .submit(chat, "Revise in another View".into())
         .await
         .unwrap();
     let revised = loop {
@@ -2491,12 +2478,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
         .choose(&agent, &console, old_id, None, None)
         .await
         .unwrap();
-    assert!(
-        agent
-            .decline_plan(chat, run.loop_id, 1, None)
-            .await
-            .is_err()
-    );
+    assert!(agent.decline_plan(chat, 1, None).await.is_err());
     assert!(agent.snapshot(chat).await.unwrap().plans[0].approval_pending);
     menus
         .choose(&agent, &console, new_id, Some(1), None)

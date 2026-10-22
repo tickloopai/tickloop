@@ -513,7 +513,7 @@ pub(super) fn persistent_rule_changes(
         .any(|rule| rule.persistent && rule.loop_id.is_some())
     {
         return Err(AgentError::Invalid(
-            "persistent rules apply to every goal in the project and cannot name a goal".into(),
+            "persistent rules apply to every Chat in the project and cannot name a Loop".into(),
         ));
     }
     let previous = snapshot

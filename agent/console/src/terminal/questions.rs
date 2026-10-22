@@ -83,7 +83,8 @@ impl QuestionDraft {
 
 pub(super) struct QuestionFlow {
     request: QuestionRequest,
-    goal: String,
+    /// Who asks, as a background notice names the Agent; empty for the Agent this View shows.
+    requester: String,
     drafts: Vec<QuestionDraft>,
     step: usize,
     focus: usize,
@@ -91,11 +92,11 @@ pub(super) struct QuestionFlow {
 }
 
 impl QuestionFlow {
-    pub(super) fn new(request: QuestionRequest, goal: String) -> Self {
+    pub(super) fn new(request: QuestionRequest, requester: String) -> Self {
         let drafts = vec![QuestionDraft::default(); request.questions.len()];
         Self {
             request,
-            goal,
+            requester,
             drafts,
             step: 0,
             focus: 0,
@@ -234,8 +235,8 @@ impl QuestionFlow {
 
     pub(super) fn menu(&self, display: DisplayProfile) -> (Menu, QuestionMenu) {
         let mut context = vec![self.tabs(display)];
-        if !self.goal.is_empty() {
-            context.push(safe_text(&format!("Goal: {}", self.goal)));
+        if !self.requester.is_empty() {
+            context.push(safe_text(&self.requester));
         }
         if let Some(notice) = self.notice {
             context.push(format!("{} {notice}", display.glyph(Glyph::Warning)));
@@ -562,7 +563,7 @@ mod tests {
         let mut dialog = flow(vec![report()]);
         let (menu, keys) = dialog.menu(DisplayProfile::default());
         assert_eq!(menu.title, "Which report?");
-        assert_eq!(menu.context, ["☐ Report", "Goal: Shorten the report"]);
+        assert_eq!(menu.context, ["☐ Report", "Shorten the report"]);
         assert_eq!(
             menu.options,
             [

@@ -376,7 +376,7 @@ fn plan_approval_pty_fixture() {
         console.set_prompt_enabled(true).unwrap();
         console.state.lock().unwrap().insert("Unsent PTY draft");
         let mut events = agent.subscribe();
-        agent.submit(chat, None, "Plan the controlled file".into()).await.unwrap();
+        agent.submit(chat, "Plan the controlled file".into()).await.unwrap();
         let mut menus = Menus::default();
         let mut pending = HashMap::new();
         let mut poll = tokio::time::interval(Duration::from_millis(20));

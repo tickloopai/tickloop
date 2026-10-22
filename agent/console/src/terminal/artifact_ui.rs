@@ -483,7 +483,7 @@ mod tests {
         );
         assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         let snapshot = agent.snapshot(chat).await.unwrap();
-        let binding = &snapshot.loops[0].event_sources[0];
+        let binding = &snapshot.chat_loop.event_sources[0];
         assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
         server.abort();
         core.shutdown().await;
@@ -649,7 +649,15 @@ mod tests {
             result.is_err_and(|error| error.contains("Tickloop Artifacts is unavailable")),
             "linking needs Tickloop Artifacts"
         );
-        assert!(agent.snapshot(chat).await.unwrap().loops.is_empty());
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .chat_loop
+                .event_sources
+                .is_empty()
+        );
         core.shutdown().await;
     }
 
@@ -758,7 +766,7 @@ mod tests {
         );
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(
-            snapshot.loops[0].event_sources.len(),
+            snapshot.chat_loop.event_sources.len(),
             1,
             "asking unlinks nothing"
         );
@@ -768,7 +776,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = agent.snapshot(chat).await.unwrap();
-        assert!(snapshot.loops[0].event_sources.is_empty());
+        assert!(snapshot.chat_loop.event_sources.is_empty());
         assert!(snapshot.artifact_ticks.is_empty());
         assert!(!console.monitor_has_entries().unwrap());
         refresh(&agent, &console, Some(&root), chat).await.unwrap();

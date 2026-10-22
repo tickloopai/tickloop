@@ -341,7 +341,6 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
     for (op, source, text) in [
         (InputOp::Continue, None, "user"),
         (InputOp::Trigger, None, "scheduled prompt"),
-        (InputOp::Goal, None, "goal"),
         (
             InputOp::Feedback,
             None,
@@ -357,7 +356,7 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
         let mut response = response(ResponseState::Started);
         let mut prompt = entry(Role::User, vec![Content::Text { text: text.into() }]);
         prompt.run_id = Some(response.run_id);
-        if matches!(op, InputOp::Continue | InputOp::Goal) {
+        if op == InputOp::Continue {
             prompt.execution_mode = Some(json!("default"));
         }
         if let Some((call_id, is_result)) = source {
@@ -369,12 +368,7 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
             }));
         }
         let expected = match op {
-            InputOp::Trigger => PromptOrigin::Trigger {
-                r#loop: response.loop_id,
-            },
-            InputOp::Goal => PromptOrigin::Goal {
-                r#loop: response.loop_id,
-            },
+            InputOp::Trigger => PromptOrigin::Trigger,
             InputOp::Feedback => PromptOrigin::Feedback {
                 artifact: "doc".into(),
             },
@@ -416,31 +410,41 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
 }
 
 #[test]
-fn loop_projection_uses_the_latest_record() {
+fn loop_projection_uses_the_latest_current_record_and_skips_the_old_format() {
     let id = Uuid::new_v4();
-    let trigger = Trigger::for_loop_goal("watched");
+    let trigger = Trigger::for_subscriptions();
     let mut record: LoopRecord = serde_json::from_value(json!({
-        "loopId": id, "goal": "watched", "state": "WaitingTrigger", "trigger": trigger,
+        "loopId": id, "state": "Running", "trigger": trigger,
         "stateSince": 2000, "runStartedAt": null,
     }))
     .unwrap();
-    let line = |record: &LoopRecord| {
+    let line = |record: &LoopRecord, subtype: &str| {
         let mut entry = entry(Role::System, vec![]);
+        entry.subtype = Some(subtype.into());
         entry.loop_record = Some(record.clone());
         Line::System(entry)
     };
-    let first = line(&record);
-    record.goal = "updated".into();
-    let latest = line(&record);
+    let first = line(&record, crate::LOOP_SUBTYPE);
+    record.state = json!("Idle");
+    let latest = line(&record, crate::LOOP_SUBTYPE);
+    let old_format = line(
+        &LoopRecord {
+            loop_id: Uuid::new_v4(),
+            state: json!("Interrupted"),
+            ..record.clone()
+        },
+        "loop_state",
+    );
     let snapshot = Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
         chat_id: Uuid::nil(),
         lines: vec![first],
     });
-    let projected = loops(&[snapshot, latest]);
-    assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].goal, "updated");
-    assert_eq!(projected[0].trigger.as_ref().unwrap().prompt, "watched");
-    assert_eq!(projected[0].state_since, Some(2000));
+    let projected = chat_loop(&[snapshot, latest, old_format]).unwrap();
+    assert_eq!(projected.id, id);
+    assert_eq!(projected.state, tickloop_agent_protocol::LoopState::Idle);
+    assert!(projected.trigger.is_some());
+    assert_eq!(projected.state_since, Some(2000));
+    assert!(chat_loop(&[line(&record, "loop_created")]).is_none());
 }
 
 #[test]

@@ -14,14 +14,13 @@ async fn a_continuous_goal_waits_for_explicit_events_and_stopped_goals_reject_wa
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Check the notes when requested".into())
+    agent
+        .submit(chat, "Check the notes when requested".into())
         .await
         .unwrap();
     agent
         .configure_trigger(
             chat,
-            receipt.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the notes".into(),
@@ -42,13 +41,12 @@ async fn a_continuous_goal_waits_for_explicit_events_and_stopped_goals_reject_wa
         }
     }
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
-        LoopState::WaitingTrigger
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Idle
     );
     agent
         .trigger(
             chat,
-            receipt.loop_id,
             TriggerSource {
                 source: "manual-test".into(),
                 payload: serde_json::json!({"note":"changed"}),
@@ -65,12 +63,11 @@ async fn a_continuous_goal_waits_for_explicit_events_and_stopped_goals_reject_wa
         }
     }
     assert_eq!(model.requests.lock().unwrap().len(), 2);
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     assert!(
         agent
             .trigger(
                 chat,
-                receipt.loop_id,
                 TriggerSource {
                     source: "late".into(),
                     payload: serde_json::Value::Null
@@ -137,14 +134,10 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "ongoing goal".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "ongoing goal".into()).await.unwrap();
     agent
         .configure_trigger(
             chat,
-            receipt.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "event check".into(),
@@ -161,7 +154,6 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
         let triggered = agent
             .trigger(
                 chat,
-                receipt.loop_id,
                 TriggerSource {
                     source: "file-observation".into(),
                     payload: serde_json::Value::Null,
@@ -176,11 +168,7 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
         }
     }
     agent
-        .submit(
-            chat,
-            Some(receipt.loop_id),
-            "Please prioritize this user input".into(),
-        )
+        .submit(chat, "Please prioritize this user input".into())
         .await
         .unwrap();
     assert_eq!(agent.snapshot(chat).await.unwrap().pending_inputs.len(), 2);
@@ -200,24 +188,18 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn manually_resuming_a_restored_goal_rearms_only_its_trigger() {
+async fn a_restored_chat_pauses_its_trigger_until_a_new_input_continues_it() {
     let directory = tempfile::tempdir().unwrap();
     let archive = directory.path().join("archive");
     let agent = Agent::open_embedded(
         archive.clone(),
         config(),
-        Arc::new(ScriptedModel::new(vec![
-            text("first ready"),
-            text("second ready"),
-        ])),
+        Arc::new(ScriptedModel::new(vec![text("ready")])),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "first watched goal".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "watch the notes".into()).await.unwrap();
     loop {
         if matches!(
             next_event(&mut events).await.kind,
@@ -226,103 +208,56 @@ async fn manually_resuming_a_restored_goal_rearms_only_its_trigger() {
             break;
         }
     }
-    let second = agent
-        .submit(chat, None, "second watched goal".into())
+    agent
+        .configure_trigger(
+            chat,
+            Some(Trigger {
+                id: Uuid::new_v4(),
+                prompt: "event check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
+                accepts_events: true,
+                armed: true,
+                subscriptions: Vec::new(),
+            }),
+        )
         .await
         .unwrap();
-    loop {
-        if matches!(
-            next_event(&mut events).await.kind,
-            EventKind::Completed { .. }
-        ) {
-            break;
-        }
-    }
-    for receipt in [&first, &second] {
-        agent
-            .configure_trigger(
-                chat,
-                receipt.loop_id,
-                Some(Trigger {
-                    id: Uuid::new_v4(),
-                    prompt: "event check".into(),
-                    prompt_source: TriggerPromptSource::Explicit,
-                    accepts_events: true,
-                    armed: true,
-                    subscriptions: Vec::new(),
-                }),
-            )
-            .await
-            .unwrap();
-    }
     agent.shutdown().await;
     drop(agent);
     let model = Arc::new(ScriptedModel::new(vec![
-        text("first resumed"),
-        text("first event check"),
+        text("resumed"),
+        text("event checked"),
     ]));
-    let restored = Agent::open_embedded(archive.clone(), config(), model.clone()).unwrap();
+    let restored = Agent::open_embedded(archive, config(), model.clone()).unwrap();
     restored.resume_chat(chat).await.unwrap();
-    assert!(
-        restored
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .all(|goal| !goal.trigger.as_ref().unwrap().armed)
-    );
-    assert!(model.requests.lock().unwrap().is_empty());
-    let mut events = restored.subscribe();
-    restored
-        .submit(chat, Some(first.loop_id), "Resume the first goal".into())
-        .await
-        .unwrap();
-    loop {
-        if matches!(
-            next_event(&mut events).await.kind,
-            EventKind::Completed { .. }
-        ) {
-            break;
-        }
-    }
-    let snapshot = restored.snapshot(chat).await.unwrap();
-    assert!(
-        snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == first.loop_id)
-            .unwrap()
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
-    );
-    assert!(
-        !snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == second.loop_id)
-            .unwrap()
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
-    );
+    let trigger_armed = |snapshot: &tickloop_agent_protocol::ChatSnapshot| {
+        snapshot.chat_loop.trigger.as_ref().unwrap().armed
+    };
+    assert!(!trigger_armed(&restored.snapshot(chat).await.unwrap()));
     let event = || TriggerSource {
         source: "manual".into(),
         payload: serde_json::json!({"note": "changed"}),
     };
     assert!(
-        restored
-            .trigger(chat, second.loop_id, event())
-            .await
-            .is_err()
+        restored.trigger(chat, event()).await.is_err(),
+        "a loaded Chat receives nothing until it is continued"
     );
+    assert!(model.requests.lock().unwrap().is_empty());
+    let mut events = restored.subscribe();
     restored
-        .trigger(chat, first.loop_id, event())
+        .submit(chat, "Go on watching".into())
         .await
         .unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert!(trigger_armed(&restored.snapshot(chat).await.unwrap()));
+    restored.trigger(chat, event()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if matches!(event.kind, EventKind::Completed { .. }) {
@@ -332,40 +267,127 @@ async fn manually_resuming_a_restored_goal_rearms_only_its_trigger() {
     }
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     restored.shutdown().await;
-    drop(restored);
-    let reopened = Agent::open_embedded(
-        archive,
-        config(),
-        Arc::new(ScriptedModel::new(vec![text("second resumed")])),
-    )
-    .unwrap();
-    reopened.resume_chat(chat).await.unwrap();
-    let mut events = reopened.subscribe();
-    reopened
-        .submit(chat, Some(second.loop_id), "Resume the second goal".into())
+}
+
+/// Holds its first request until released, so the Loop stays running meanwhile.
+struct HeldFirstTurn {
+    script: ScriptedModel,
+    entered: tokio::sync::Notify,
+    release: tokio_util::sync::CancellationToken,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_model::ModelClient for HeldFirstTurn {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(title_output(request))
+    }
+
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        self.script.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: tickloop_agent_model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            tokio::select! {
+                _ = self.release.cancelled() => {}
+                _ = cancel.cancelled() => return Err(tickloop_agent_model::ModelError::Cancelled),
+            }
+        }
+        self.script.complete(request, events, cancel).await
+    }
+}
+
+/// `/stop` keeps a Trigger input queued before it but takes none of it, and a configuration
+/// change does not continue the Chat; the next user input does, and the queued input follows it.
+#[tokio::test]
+async fn stop_holds_queued_trigger_input_until_a_new_input_continues_the_chat() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(HeldFirstTurn {
+        script: ScriptedModel::new(vec![text("going on"), text("event checked")]),
+        entered: tokio::sync::Notify::new(),
+        release: tokio_util::sync::CancellationToken::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .configure_trigger(
+            chat,
+            Some(Trigger {
+                id: Uuid::new_v4(),
+                prompt: "Check the notes".into(),
+                prompt_source: TriggerPromptSource::Explicit,
+                accepts_events: true,
+                armed: true,
+                subscriptions: Vec::new(),
+            }),
+        )
         .await
         .unwrap();
-    loop {
-        if matches!(
-            next_event(&mut events).await.kind,
-            EventKind::Completed { .. }
-        ) {
-            break;
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Work on it".into()).await.unwrap();
+    model.entered.notified().await;
+    let queued = agent
+        .trigger(
+            chat,
+            TriggerSource {
+                source: "manual".into(),
+                payload: serde_json::json!({"note": "changed"}),
+            },
+        )
+        .await
+        .unwrap();
+    agent.stop(chat).await.unwrap();
+    let paused = |snapshot: &tickloop_agent_protocol::ChatSnapshot| {
+        snapshot.trigger_awaits_resume
+            && !snapshot.chat_loop.trigger.as_ref().unwrap().armed
+            && snapshot.pending_inputs.len() == 1
+            && snapshot.pending_inputs[0].receipt.run_id == queued.run_id
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let stopped = agent.snapshot(chat).await.unwrap();
+    assert_eq!(stopped.chat_loop.state, LoopState::Interrupted);
+    assert!(paused(&stopped), "{:?}", stopped.pending_inputs);
+    agent
+        .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        paused(&agent.snapshot(chat).await.unwrap()),
+        "a configuration change is not a continue"
+    );
+    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let resumed = agent.submit(chat, "Go on".into()).await.unwrap();
+    let mut finished = Vec::new();
+    while finished.len() < 2 {
+        let event = next_event(&mut events).await;
+        if matches!(event.kind, EventKind::Completed { .. }) {
+            finished.push(event.run_id);
         }
     }
-    assert!(
-        reopened
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .find(|goal| goal.id == second.loop_id)
-            .unwrap()
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
-    );
-    reopened.shutdown().await;
+    assert_eq!(finished, [resumed.run_id, queued.run_id]);
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(!snapshot.trigger_awaits_resume);
+    assert!(snapshot.chat_loop.trigger.as_ref().unwrap().armed);
+    let delivered = {
+        let requests = model.script.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        format!("{:?}", requests[1].messages.last())
+    };
+    assert!(delivered.contains("Check the notes"));
+    agent.shutdown().await;
 }

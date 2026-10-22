@@ -23,10 +23,7 @@ async fn command_output_is_readable_only_in_the_process_that_ran_it() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Run the command".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the command".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => agent

@@ -88,10 +88,7 @@ async fn a_read_is_recorded_only_for_the_chat_that_made_it() {
     let reader = agent.create_chat(directory.path().into()).await.unwrap();
     let bystander = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(reader, None, "Read the notes".into())
-        .await
-        .unwrap();
+    agent.submit(reader, "Read the notes".into()).await.unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await

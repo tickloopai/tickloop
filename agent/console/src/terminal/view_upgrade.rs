@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -39,9 +38,7 @@ struct RawModeState {
 pub(super) struct ViewSelection {
     pub navigation: crate::agent_console::UpgradeNavigation,
     pub chat: Option<Uuid>,
-    pub goal: Option<Uuid>,
     pub overview: bool,
-    pub selected_loops: HashMap<Uuid, Option<Uuid>>,
     pub configuration: serde_json::Value,
 }
 
@@ -342,9 +339,7 @@ mod tests {
                     filter: tickloop_agent_protocol::AgentFilter::default(),
                 },
                 chat: Some(chat),
-                goal: None,
                 overview: false,
-                selected_loops: HashMap::new(),
                 configuration: serde_json::to_value(
                     super::super::new_agent_draft::NewAgentDraft::default(),
                 )

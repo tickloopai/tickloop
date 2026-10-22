@@ -56,7 +56,7 @@ impl JudgmentClient for ReviewingJudgment {
 
 async fn finish(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> usize {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut prompts = 0;
     loop {
         let event = next_event(&mut events).await;
@@ -329,7 +329,7 @@ async fn classifier_allow_cannot_create_or_message_after_cancellation_or_policy_
             agent.set_auto_reviewer(reviewer.clone()).await;
             let mut events = agent.subscribe();
             let receipt = agent
-                .submit(chat, None, "Perform the bounded family operation".into())
+                .submit(chat, "Perform the bounded family operation".into())
                 .await
                 .unwrap();
             tokio::time::timeout(

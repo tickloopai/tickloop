@@ -115,7 +115,7 @@ impl MonitorRows for CalendarRows {
 
 async fn run_turn(agent: &Agent, chat: ChatId, text: &str) {
     let mut events = agent.subscribe();
-    agent.submit(chat, None, text.into()).await.unwrap();
+    agent.submit(chat, text.into()).await.unwrap();
     loop {
         match tickloop_agent_test_support::next_event(&mut events)
             .await
@@ -195,7 +195,6 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
         .branch_chat(tickloop_agent_protocol::BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("Branch".into()),
         })
         .await
@@ -499,7 +498,7 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
         sampled_at_ms: 1,
     };
     let only_subscribed: tickloop_agent_protocol::TickSubscriptionStatus = serde_json::from_value(
-        serde_json::json!({"id":uuid::Uuid::new_v4(),"loop_id":uuid::Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":foreign,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"title":"Shared","link":"Live"}),
+        serde_json::json!({"id":uuid::Uuid::new_v4(),"loop_id":uuid::Uuid::new_v4(),"loop_state":"Idle","instance":foreign,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"title":"Shared","link":"Live"}),
     )
     .unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {

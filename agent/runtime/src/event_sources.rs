@@ -1,4 +1,4 @@
-//! Artifact feedback for a Loop: linking and unlinking an account's artifacts and the per-Loop
+//! Artifact feedback for the Chat's Loop: linking and unlinking an account's artifacts and the
 //! watcher that claims their @tickloop requests through the service's HTTP lifecycle.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
@@ -9,8 +9,8 @@ use uuid::Uuid;
 use serde::Serialize;
 
 use super::{
-    Agent, AgentError, LoopSnapshotExt, SubmissionOptions, WaitHosting, feedback_inbox,
-    lifecycle::LedgerInput, loop_lease::RunStateChange,
+    Agent, AgentError, SubmissionOptions, WaitHosting, feedback_inbox, lifecycle::LedgerInput,
+    loop_lease::RunStateChange,
 };
 use tickloop_agent_artifacts::{
     AgentLink, AgentLinkRequest, ArtifactClient, ArtifactError, ClaimedFeedback,
@@ -18,7 +18,7 @@ use tickloop_agent_artifacts::{
 };
 use tickloop_agent_protocol::{
     ArtifactFeedbackHistory, ArtifactTick, ChatId, EventSourceBinding, InputId, LoopId,
-    LoopSnapshot, LoopState, PendingInput, Receipt, TriggerSource,
+    LoopSnapshot, PendingInput, Receipt, TriggerSource,
 };
 use tickloop_agent_transcript::{InputOp, InputState};
 
@@ -66,8 +66,8 @@ pub(super) fn queued_feedback_identity(
 }
 
 /// The ledger inputs of the @tickloop requests a load leaves open under process wait hosting:
-/// accepted and not yet in the conversation, for a Loop that has not ended, and still pending in
-/// the local inbox, which delivers them again.
+/// accepted and not yet in the conversation, for the Chat's Loop, and still pending in the local
+/// inbox, which delivers them again.
 pub(super) fn requests_the_inbox_delivers_again(chat: &super::Chat) -> HashSet<InputId> {
     let pending = feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat.snapshot.id)
         .pending()
@@ -88,17 +88,14 @@ pub(super) fn requests_the_inbox_delivers_again(chat: &super::Chat) -> HashSet<I
                     .message_runs
                     .values()
                     .any(|run| *run == entry.run_id)
-                && chat.snapshot.loops.iter().any(|goal| {
-                    goal.id == entry.loop_id
-                        && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                })
+                && chat.snapshot.chat_loop.id == entry.loop_id
         })
         .map(|entry| entry.input_id)
         .collect()
 }
 
-/// An @tickloop request the Artifacts service delivered to one receiver, a Loop of a Chat: what
-/// [`crate::TurnOp::Deliver`] takes into that Loop. A delivery names its input on every host, so
+/// An @tickloop request the Artifacts service delivered to one receiver, the Loop of a Chat:
+/// what [`crate::TurnOp::Deliver`] takes into that Loop. A delivery names its input on every host, so
 /// delivering it again runs nothing again.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,64 +273,50 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             chats
                 .iter()
-                .flat_map(|(chat_id, chat)| {
-                    chat.snapshot
-                        .loops
-                        .iter()
-                        .filter(|goal| !goal.event_sources.is_empty())
-                        .map(move |goal| (*chat_id, goal.id))
-                })
+                .filter(|(_, chat)| !chat.snapshot.chat_loop.event_sources.is_empty())
+                .map(|(chat_id, _)| *chat_id)
                 .collect::<Vec<_>>()
         };
-        for (chat_id, loop_id) in targets {
-            self.disable_event_sources_for_loop(chat_id, loop_id).await;
+        for chat_id in targets {
+            self.disable_event_sources_for_chat(chat_id).await;
         }
     }
 
-    pub async fn disable_event_sources_for_loop(&self, chat_id: ChatId, loop_id: LoopId) {
-        let disarm_lease = {
+    /// Stops the Loop's artifact links from receiving until the Chat is continued.
+    pub async fn disable_event_sources_for_chat(&self, chat_id: ChatId) {
+        let (loop_id, disarm_lease) = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return;
             };
-            let Some(goal) = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == loop_id)
-            else {
-                return;
-            };
-            for source in &mut goal.event_sources {
+            let chat_loop = &mut chat.snapshot.chat_loop;
+            for source in &mut chat_loop.event_sources {
                 source.resume_required = true;
             }
-            let disarm_lease = Self::settle_without_listening(goal, LoopState::Interrupted);
+            let loop_id = chat_loop.id;
+            let disarm_lease = !Self::listens(chat_loop);
             if let Some(cancel) = chat.event_cancellations.remove(&loop_id) {
                 cancel.cancel();
             }
             self.save(&chat.snapshot);
-            disarm_lease
+            (loop_id, disarm_lease)
         };
         if disarm_lease {
             self.disarm_feedback_lease(chat_id, loop_id).await;
         }
     }
 
-    /// A Loop that no longer listens for a Trigger or any feedback stops waiting in `state`.
-    /// Returns whether its run lease should be disarmed.
-    pub(super) fn settle_without_listening(goal: &mut LoopSnapshot, state: LoopState) -> bool {
-        if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-            || goal
+    /// Whether the Loop still listens for its Trigger or any feedback; one that does not
+    /// releases its run lease.
+    pub(super) fn listens(chat_loop: &LoopSnapshot) -> bool {
+        chat_loop
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.armed)
+            || chat_loop
                 .event_sources
                 .iter()
                 .any(|source| !source.resume_required)
-        {
-            return false;
-        }
-        if goal.state == LoopState::WaitingTrigger {
-            goal.set_state(state);
-        }
-        true
     }
 
     pub(super) async fn disarm_feedback_lease(&self, chat_id: ChatId, loop_id: LoopId) {
@@ -344,10 +327,10 @@ impl Agent {
         self.inner.loop_leases.release(chat_id, loop_id);
     }
 
-    /// Links the artifact to this Chat for the signed-in account's @tickloop requests and
-    /// starts listening with an explicit choice of whether to include earlier feedback. The Loop that
-    /// holds the artifact keeps it, whichever account linked it before; otherwise the Chat's
-    /// newest Loop that has not ended receives it, or a new Loop when there is none.
+    /// Links the artifact to this Chat's Loop for the signed-in account's @tickloop requests and
+    /// starts listening with an explicit choice of whether to include earlier feedback; a link of
+    /// the artifact by another account is replaced. A Loop takes feedback for one account: one
+    /// that holds another account's links to other artifacts refuses it.
     pub async fn link_artifact(
         &self,
         chat_id: ChatId,
@@ -364,59 +347,29 @@ impl Agent {
                 "the artifact belongs to another Tickloop Artifacts origin".into(),
             ));
         }
-        let (loop_id, creates_loop) = {
+        let loop_id = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             let identities = super::feedback_inbox::FeedbackInbox::identities_for(chat)
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
-            let open_loops = chat
-                .snapshot
-                .loops
-                .iter()
-                .filter(|goal| {
-                    !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                        && goal.event_sources.iter().all(|source| {
-                            source.origin == credential.origin
-                                && source.account_id == credential.account_id
-                        })
-                        && identities
-                            .iter()
-                            .filter(|identity| identity.loop_id == goal.id)
-                            .all(|identity| {
-                                identity.origin == credential.origin
-                                    && identity.account_id == credential.account_id
-                            })
-                })
-                .collect::<Vec<_>>();
-            let holder = open_loops.iter().find(|goal| {
-                goal.event_sources
-                    .iter()
-                    .any(|source| source.is_for(&credential.origin, &tick.artifact_id))
-            });
-            match holder.or(open_loops.last()) {
-                Some(goal) => (goal.id, false),
-                None => (Uuid::new_v4(), true),
-            }
-        };
-        {
-            let chats = self.inner.chats.lock().await;
-            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let identities = super::feedback_inbox::FeedbackInbox::identities_for(chat)
-                .map_err(|error| AgentError::Storage(error.to_string()))?;
-            if identities.iter().any(|identity| {
-                identity.loop_id == loop_id
+            let chat_loop = &chat.snapshot.chat_loop;
+            // A link of the same artifact by another account is replaced below.
+            let other_account = chat_loop.event_sources.iter().any(|source| {
+                !source.is_for(&credential.origin, &tick.artifact_id)
+                    && (source.origin != credential.origin
+                        || source.account_id != credential.account_id)
+            }) || identities.iter().any(|identity| {
+                identity.loop_id == chat_loop.id
                     && (identity.origin != credential.origin
                         || identity.account_id != credential.account_id)
-            }) {
+            });
+            if other_account {
                 return Err(AgentError::Invalid("This Loop already contains feedback for another Artifact account; use a new Chat for this account".into()));
             }
-        }
-        self.unlink_feedback_receivers(
-            chat_id,
-            None,
-            Some((&credential.origin, &tick.artifact_id)),
-        )
-        .await?;
+            chat_loop.id
+        };
+        self.unlink_feedback_receivers(chat_id, Some((&credential.origin, &tick.artifact_id)))
+            .await?;
         let binding = self
             .request_link(
                 &client,
@@ -426,56 +379,15 @@ impl Agent {
                 history,
             )
             .await?;
-        let released_loops = {
+        {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            if creates_loop {
-                chat.bookkeeping.add_loop(
-                    &mut chat.snapshot,
-                    LoopSnapshot {
-                        id: loop_id,
-                        goal: format!("Handle @tickloop requests on {}", tick.title),
-                        state: LoopState::Idle,
-                        run_id: None,
-                        run_started_at: None,
-                        trigger: None,
-                        event_sources: Vec::new(),
-                        state_since: None,
-                    },
-                );
-            }
-            let mut released_loops = Vec::new();
-            for goal in &mut chat.snapshot.loops {
-                let linked = goal.event_sources.len();
-                goal.event_sources
-                    .retain(|source| !source.is_for(&binding.origin, &binding.artifact_id));
-                if goal.id != loop_id
-                    && goal.event_sources.len() != linked
-                    && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                    && Self::settle_without_listening(goal, LoopState::Completed)
-                {
-                    released_loops.push(goal.id);
-                }
-            }
-            let goal = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == loop_id)
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                .ok_or_else(|| AgentError::Invalid("the Loop ended while linking".into()))?;
-            goal.event_sources.push(binding);
-            if matches!(
-                goal.state,
-                LoopState::Idle | LoopState::Completed | LoopState::Interrupted | LoopState::Failed
-            ) {
-                goal.set_state(LoopState::WaitingTrigger);
-            }
+            let chat_loop = &mut chat.snapshot.chat_loop;
+            chat_loop
+                .event_sources
+                .retain(|source| !source.is_for(&binding.origin, &binding.artifact_id));
+            chat_loop.event_sources.push(binding);
             self.save(&chat.snapshot);
-            released_loops
-        };
-        for released in released_loops {
-            self.disarm_feedback_lease(chat_id, released).await;
         }
         self.start_event_source_watcher(chat_id, loop_id).await;
         Ok(())
@@ -511,14 +423,7 @@ impl Agent {
             let chat = chats
                 .get_mut(&receipt.chat_id)
                 .ok_or(AgentError::NotFound)?;
-            let goal = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == receipt.loop_id)
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                .ok_or_else(|| AgentError::Invalid("the Loop ended while linking".into()))?;
-            goal.event_sources.push(binding);
+            chat.snapshot.chat_loop.event_sources.push(binding);
             self.save(&chat.snapshot);
         }
         self.start_event_source_watcher(receipt.chat_id, receipt.loop_id)
@@ -526,45 +431,36 @@ impl Agent {
         Ok(())
     }
 
-    /// Ends the Chat's association with the artifact, whichever account linked it: its Loops stop
-    /// listening for the artifact's @tickloop requests, and one left with nothing to wait for
-    /// completes. Already received input stays in the conversation. The caller queues cloud
-    /// receiver removal before removing local associations. Returns the Loops whose lease to disarm.
+    /// Ends the Chat's association with the artifact, whichever account linked it: the Loop stops
+    /// listening for the artifact's @tickloop requests. Already received input stays in the
+    /// conversation. The caller queues cloud receiver removal before removing local associations.
+    /// Returns the Loop when its lease is to be disarmed, as nothing is left to listen for.
     pub(super) fn unlink_artifact(
         &self,
         chat: &mut super::Chat,
         origin: &str,
         artifact_id: &str,
-    ) -> Vec<LoopId> {
-        let mut is_unlinked = false;
-        let mut released_loops = Vec::new();
-        for goal in &mut chat.snapshot.loops {
-            let linked = goal.event_sources.len();
-            goal.event_sources
-                .retain(|source| !source.is_for(origin, artifact_id));
-            if goal.event_sources.len() == linked {
-                continue;
-            }
-            is_unlinked = true;
-            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                continue;
-            }
-            if goal
-                .event_sources
-                .iter()
-                .all(|source| source.resume_required)
-                && let Some(cancel) = chat.event_cancellations.remove(&goal.id)
-            {
-                cancel.cancel();
-            }
-            if Self::settle_without_listening(goal, LoopState::Completed) {
-                released_loops.push(goal.id);
-            }
+    ) -> Option<LoopId> {
+        let chat_loop = &mut chat.snapshot.chat_loop;
+        let linked = chat_loop.event_sources.len();
+        chat_loop
+            .event_sources
+            .retain(|source| !source.is_for(origin, artifact_id));
+        if chat_loop.event_sources.len() == linked {
+            return None;
         }
-        if is_unlinked {
-            self.save(&chat.snapshot);
+        let loop_id = chat_loop.id;
+        if chat_loop
+            .event_sources
+            .iter()
+            .all(|source| source.resume_required)
+            && let Some(cancel) = chat.event_cancellations.remove(&loop_id)
+        {
+            cancel.cancel();
         }
-        released_loops
+        let releases = !Self::listens(&chat.snapshot.chat_loop);
+        self.save(&chat.snapshot);
+        releases.then_some(loop_id)
     }
 
     /// One link request with fresh identities; the service replaces any earlier link of this
@@ -603,8 +499,16 @@ impl Agent {
     }
 
     pub(super) async fn resume_feedback_sources(&self, chat_id: ChatId) {
-        // A durable host pushes each request with `TurnOp::Deliver`; nothing here listens.
+        // A durable host pushes each request with `TurnOp::Deliver`; nothing here listens, so
+        // continuing only lets its deliveries in again.
         if self.inner.waits == WaitHosting::Durable {
+            let mut chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get_mut(&chat_id) {
+                for source in &mut chat.snapshot.chat_loop.event_sources {
+                    source.resume_required = false;
+                }
+                self.save(&chat.snapshot);
+            }
             return;
         }
         let Ok(client) = artifact_client(self) else {
@@ -613,45 +517,28 @@ impl Agent {
         let Ok(Some(credential)) = client.credential_snapshot() else {
             return;
         };
-        let loops = {
+        let (loop_id, receives) = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return;
             };
-            let mut loops = Vec::new();
-            for goal in &mut chat.snapshot.loops {
-                if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                    continue;
-                }
-                let mut receives = false;
-                for source in &mut goal.event_sources {
-                    if source.account_id == credential.account_id
-                        && source.origin == credential.origin
-                    {
-                        source.resume_required = false;
-                        receives = true;
-                    }
-                }
-                if receives {
-                    if matches!(
-                        goal.state,
-                        LoopState::Idle
-                            | LoopState::Completed
-                            | LoopState::Interrupted
-                            | LoopState::Failed
-                    ) {
-                        goal.set_state(LoopState::WaitingTrigger);
-                    }
-                    loops.push(goal.id);
+            let chat_loop = &mut chat.snapshot.chat_loop;
+            let mut receives = false;
+            for source in &mut chat_loop.event_sources {
+                if source.account_id == credential.account_id && source.origin == credential.origin
+                {
+                    source.resume_required = false;
+                    receives = true;
                 }
             }
+            let loop_id = chat_loop.id;
             self.save(&chat.snapshot);
-            loops
+            (loop_id, receives)
         };
-        for loop_id in loops {
+        if receives {
             self.start_event_source_watcher(chat_id, loop_id).await;
         }
-        let saved_loops = {
+        let has_saved_requests = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
                 return;
@@ -660,26 +547,19 @@ impl Agent {
                 .pending()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|input| {
+                .any(|input| {
                     input.identity.origin == credential.origin
                         && input.identity.account_id == credential.account_id
+                        && input.identity.loop_id == loop_id
                 })
-                .filter(|input| {
-                    chat.snapshot.loops.iter().any(|goal| {
-                        goal.id == input.identity.loop_id
-                            && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                    })
-                })
-                .map(|input| input.identity.loop_id)
-                .collect::<std::collections::HashSet<_>>()
         };
-        for loop_id in saved_loops {
-            if matches!(
+        if has_saved_requests
+            && matches!(
                 Box::pin(self.acquire_feedback_replay_permit(chat_id, loop_id)).await,
                 super::loop_lease::TriggerPermit::Fire
-            ) {
-                Box::pin(self.drain_feedback_inbox(chat_id, loop_id, &client)).await;
-            }
+            )
+        {
+            Box::pin(self.drain_feedback_inbox(chat_id, loop_id, &client)).await;
         }
     }
 
@@ -692,14 +572,13 @@ impl Agent {
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return;
             };
-            if !chat.snapshot.loops.iter().any(|goal| {
-                goal.id == loop_id
-                    && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                    && goal
-                        .event_sources
-                        .iter()
-                        .any(|source| !source.resume_required)
-            }) {
+            let chat_loop = &chat.snapshot.chat_loop;
+            if chat_loop.id != loop_id
+                || !chat_loop
+                    .event_sources
+                    .iter()
+                    .any(|source| !source.resume_required)
+            {
                 return;
             }
             if chat
@@ -782,16 +661,15 @@ impl Agent {
             let Some(chat) = chats.get(&chat_id) else {
                 return EventPollOutcome::Stop;
             };
-            let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
-                return EventPollOutcome::Stop;
-            };
-            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            let chat_loop = &chat.snapshot.chat_loop;
+            if chat_loop.id != loop_id {
                 return EventPollOutcome::Stop;
             }
             if chat.snapshot.policy.mode == super::ExecutionMode::Plan {
                 return EventPollOutcome::Skipped;
             }
-            goal.event_sources
+            chat_loop
+                .event_sources
                 .iter()
                 .filter(|source| !source.resume_required)
                 .cloned()
@@ -904,15 +782,13 @@ impl Agent {
                             chat.tools.chat_directory(),
                             chat_id,
                         );
-                        let remains_linked = chat.snapshot.loops.iter().any(|goal| {
-                            goal.id == loop_id
-                                && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                                && goal.event_sources.iter().any(|current| {
-                                    current.binding_id == source.binding_id
-                                        && current.epoch == source.epoch
-                                        && !current.resume_required
-                                })
-                        });
+                        let chat_loop = &chat.snapshot.chat_loop;
+                        let remains_linked = chat_loop.id == loop_id
+                            && chat_loop.event_sources.iter().any(|current| {
+                                current.binding_id == source.binding_id
+                                    && current.epoch == source.epoch
+                                    && !current.resume_required
+                            });
                         let compatible = inbox.identities().and_then(|identities| {
                             if identities.iter().any(|input| {
                                 input.loop_id == loop_id
@@ -1033,10 +909,7 @@ impl Agent {
             }
             // Already received inputs remain valid after unlinking; the inbox owns their admission.
             let delivery = ExternalDelivery::received(&input.identity, input.prompt);
-            if let Err(error) = self
-                .advance_received_delivery(chat_id, loop_id, delivery)
-                .await
-            {
+            if let Err(error) = self.advance_received_delivery(chat_id, delivery).await {
                 self.warn_feedback_delivery(
                     chat_id,
                     loop_id,
@@ -1047,29 +920,37 @@ impl Agent {
         }
     }
 
-    /// Takes the delivered request into the Loop `target_loop` under its ledger input `ledger`,
-    /// queued behind the Loop's work as a Trigger's fire is. A Loop that has ended discards it;
-    /// one that is interrupted, failed or completed goes on with it.
+    /// Takes the delivered request into the Chat's Loop under its ledger input `ledger`, queued
+    /// behind the Loop's work as a Trigger's fire is; a Loop whose turn was interrupted or failed
+    /// goes on with it.
     pub(super) async fn take_delivery(
         &self,
         chat_id: ChatId,
-        target_loop: LoopId,
         delivery: ExternalDelivery,
         ledger: LedgerInput,
     ) -> Result<Receipt, AgentError> {
-        self.take_received_delivery(chat_id, target_loop, delivery, ledger, true)
+        self.take_received_delivery(chat_id, delivery, ledger, true)
             .await
     }
 
     pub(super) async fn take_received_delivery(
         &self,
         chat_id: ChatId,
-        target_loop: LoopId,
         delivery: ExternalDelivery,
         ledger: LedgerInput,
         requires_binding: bool,
     ) -> Result<Receipt, AgentError> {
-        let identity = delivery.identity(chat_id, target_loop);
+        let loop_id = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .chat_loop
+            .id;
+        let identity = delivery.identity(chat_id, loop_id);
         let source = TriggerSource {
             source: ARTIFACT_FEEDBACK_SOURCE.into(),
             payload: serde_json::json!({
@@ -1082,7 +963,6 @@ impl Agent {
         };
         Box::pin(self.submit_internal(
             chat_id,
-            Some(target_loop),
             delivery.prompt,
             SubmissionOptions {
                 trigger_source: Some(source),
@@ -1147,7 +1027,6 @@ impl Agent {
     pub(super) async fn unlink_feedback_receivers(
         &self,
         chat_id: ChatId,
-        loop_id: Option<LoopId>,
         instance: Option<(&str, &str)>,
     ) -> Result<(), AgentError> {
         {
@@ -1155,28 +1034,22 @@ impl Agent {
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             let inbox =
                 super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id);
-            for goal in chat
-                .snapshot
-                .loops
+            let chat_loop = &chat.snapshot.chat_loop;
+            for source in chat_loop
+                .event_sources
                 .iter()
-                .filter(|goal| loop_id.is_none_or(|id| goal.id == id))
+                .filter(|source| instance.is_none_or(|(origin, id)| source.is_for(origin, id)))
             {
-                for source in goal
-                    .event_sources
-                    .iter()
-                    .filter(|source| instance.is_none_or(|(origin, id)| source.is_for(origin, id)))
-                {
-                    if let Err(error) = inbox.queue_unlink(&super::feedback_inbox::FeedbackUnlink {
-                        loop_id: goal.id,
-                        source: source.clone(),
-                    }) {
-                        self.warn_feedback_delivery(
-                            chat_id,
-                            goal.id,
-                            "Cloud unlink could not be saved; local stop will continue",
-                            &error,
-                        );
-                    }
+                if let Err(error) = inbox.queue_unlink(&super::feedback_inbox::FeedbackUnlink {
+                    loop_id: chat_loop.id,
+                    source: source.clone(),
+                }) {
+                    self.warn_feedback_delivery(
+                        chat_id,
+                        chat_loop.id,
+                        "Cloud unlink could not be saved; local stop will continue",
+                        &error,
+                    );
                 }
             }
         }
@@ -1302,16 +1175,13 @@ impl Agent {
     async fn disconnect_feedback_source(&self, chat_id: ChatId, loop_id: LoopId, binding_id: Uuid) {
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id)
+            && chat.snapshot.chat_loop.id == loop_id
             && let Some(source) = chat
                 .snapshot
-                .loops
+                .chat_loop
+                .event_sources
                 .iter_mut()
-                .find(|goal| goal.id == loop_id)
-                .and_then(|goal| {
-                    goal.event_sources
-                        .iter_mut()
-                        .find(|source| source.binding_id == binding_id)
-                })
+                .find(|source| source.binding_id == binding_id)
         {
             source.resume_required = true;
             self.save(&chat.snapshot);
@@ -1327,16 +1197,13 @@ impl Agent {
     ) {
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id)
+            && chat.snapshot.chat_loop.id == loop_id
             && let Some(source) = chat
                 .snapshot
-                .loops
+                .chat_loop
+                .event_sources
                 .iter_mut()
-                .find(|goal| goal.id == loop_id)
-                .and_then(|goal| {
-                    goal.event_sources
-                        .iter_mut()
-                        .find(|source| source.binding_id == binding_id)
-                })
+                .find(|source| source.binding_id == binding_id)
         {
             source.last_request_at_ms = Some(
                 source
@@ -1365,6 +1232,7 @@ impl Agent {
 #[cfg(test)]
 mod feedback_admission_tests {
     use super::*;
+    use tickloop_agent_protocol::LoopState;
     use tickloop_agent_test_support::{ScriptedModel, config, text};
 
     #[test]
@@ -1415,8 +1283,8 @@ mod feedback_admission_tests {
         )
         .unwrap();
         let chat = agent.create_chat_without_folder().await.unwrap();
-        let receipt = agent.submit(chat, None, "prepare".into()).await.unwrap();
-        while agent.snapshot(chat).await.unwrap().loops[0].state != LoopState::Completed {
+        let receipt = agent.submit(chat, "prepare".into()).await.unwrap();
+        while agent.snapshot(chat).await.unwrap().chat_loop.state != LoopState::Idle {
             tokio::task::yield_now().await;
         }
         (agent, receipt)
@@ -1435,7 +1303,7 @@ mod feedback_admission_tests {
     }
 
     #[tokio::test]
-    async fn delivery_requires_the_target_loops_active_artifact_binding() {
+    async fn delivery_requires_an_active_artifact_binding_of_the_loop() {
         let (agent, receipt) = folderless_loop().await;
         let identity = feedback_identity(&receipt);
         let binding = EventSourceBinding {
@@ -1465,19 +1333,17 @@ mod feedback_admission_tests {
                 .get_mut(&receipt.chat_id)
                 .unwrap()
                 .snapshot
-                .loops[0]
+                .chat_loop
                 .event_sources = if mismatch == "missing" {
                 vec![]
             } else {
                 vec![source]
             };
             let delivery = ExternalDelivery::received(&identity, "saved feedback".into());
-            let ledger = crate::turn::delivery_ledger(receipt.loop_id, delivery.clone());
+            let ledger = crate::turn::delivery_ledger(delivery.clone());
             assert!(
                 matches!(
-                    agent
-                        .take_delivery(receipt.chat_id, receipt.loop_id, delivery, ledger)
-                        .await,
+                    agent.take_delivery(receipt.chat_id, delivery, ledger).await,
                     Err(AgentError::Invalid(_))
                 ),
                 "{mismatch}"
@@ -1518,10 +1384,9 @@ mod feedback_admission_tests {
                     "queue" => chat.snapshot.pending_inputs.push(pending.clone()),
                     _ => {
                         let delivery = ExternalDelivery::received(&identity, pending.input.clone());
-                        chat.bookkeeping.lifecycle.accept(
-                            &crate::turn::delivery_ledger(receipt.loop_id, delivery),
-                            &pending,
-                        );
+                        chat.bookkeeping
+                            .lifecycle
+                            .accept(&crate::turn::delivery_ledger(delivery), &pending);
                         if provenance == "unknown" {
                             chat.bookkeeping.lifecycle.start_input(receipt.run_id);
                         }
@@ -1542,9 +1407,9 @@ mod feedback_admission_tests {
         let model = Arc::new(ScriptedModel::new(vec![text("Ready."), text("Received.")]));
         let agent = Agent::new_embedded(config(), model.clone());
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
-        let first = agent.submit(chat_id, None, "Prepare".into()).await.unwrap();
+        let first = agent.submit(chat_id, "Prepare".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while agent.snapshot(chat_id).await.unwrap().loops[0].state != LoopState::Completed {
+            while agent.snapshot(chat_id).await.unwrap().chat_loop.state != LoopState::Idle {
                 tokio::task::yield_now().await;
             }
         })
@@ -1568,29 +1433,19 @@ mod feedback_admission_tests {
             ..Default::default()
         };
         let (left, right) = tokio::join!(
-            agent.submit_internal(
-                chat_id,
-                Some(first.loop_id),
-                "Saved feedback".into(),
-                options()
-            ),
-            agent.submit_internal(
-                chat_id,
-                Some(first.loop_id),
-                "Saved feedback".into(),
-                options()
-            ),
+            agent.submit_internal(chat_id, "Saved feedback".into(), options()),
+            agent.submit_internal(chat_id, "Saved feedback".into(), options()),
         );
         assert_eq!(left.unwrap().run_id, right.unwrap().run_id);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while agent.snapshot(chat_id).await.unwrap().loops[0].state != LoopState::Completed {
+            while agent.snapshot(chat_id).await.unwrap().chat_loop.state != LoopState::Idle {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         let snapshot = agent.snapshot(chat_id).await.unwrap();
-        assert!(snapshot.loops[0].event_sources.is_empty());
+        assert!(snapshot.chat_loop.event_sources.is_empty());
         assert_eq!(snapshot.messages.iter().flat_map(|message| &message.content).filter(|content|
             matches!(content, crate::Content::Text { text } if text == "Saved feedback")).count(), 1);
         assert_eq!(model.requests.lock().unwrap().len(), 2);
@@ -1607,9 +1462,9 @@ mod feedback_admission_tests {
         )
         .unwrap();
         let chat_id = first.create_chat(directory.path().into()).await.unwrap();
-        let receipt = first.submit(chat_id, None, "Prepare".into()).await.unwrap();
+        let receipt = first.submit(chat_id, "Prepare".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while first.snapshot(chat_id).await.unwrap().loops[0].state != LoopState::Completed {
+            while first.snapshot(chat_id).await.unwrap().chat_loop.state != LoopState::Idle {
                 tokio::task::yield_now().await;
             }
         })

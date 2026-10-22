@@ -104,7 +104,7 @@ async fn invoke_bash() -> ToolResult {
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Print the fixture marker".into())
+        .submit(chat, "Print the fixture marker".into())
         .await
         .unwrap();
     let result = loop {

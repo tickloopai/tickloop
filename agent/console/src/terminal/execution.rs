@@ -844,7 +844,7 @@ impl ConsoleExecution {
     pub(super) fn cached_pending_plan_approvals(
         &self,
         chat: Uuid,
-    ) -> Option<(ExecutionRef, Vec<(Uuid, u64)>)> {
+    ) -> Option<(ExecutionRef, Vec<u64>)> {
         let statuses = self.inner.statuses.read().unwrap();
         let status = statuses.get(&chat)?;
         Some((
@@ -855,34 +855,31 @@ impl ConsoleExecution {
                 .iter()
                 .filter(|plan| {
                     plan.approval_pending
-                        && status.chat.loops.iter().any(|goal| {
-                            goal.id == plan.loop_id
-                                && matches!(
-                                    goal.state,
-                                    LoopState::WaitingPlan | LoopState::Interrupted
-                                )
-                        })
+                        && status.chat.chat_loop.id == plan.loop_id
+                        && matches!(
+                            status.chat.chat_loop.state,
+                            LoopState::WaitingPlan | LoopState::Interrupted
+                        )
                         && !status.chat.permissions.iter().any(|request| {
                             request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
                                 && request.loop_id == plan.loop_id
                         })
                 })
-                .map(|plan| (plan.loop_id, plan.version))
+                .map(|plan| plan.version)
                 .collect(),
         ))
     }
 
-    pub(super) fn cached_plan_is_pending(
-        &self,
-        chat: Uuid,
-        loop_id: Uuid,
-        version: u64,
-    ) -> Option<bool> {
+    pub(super) fn cached_plan_is_pending(&self, chat: Uuid, version: u64) -> Option<bool> {
         let statuses = self.inner.statuses.read().unwrap();
         let status = statuses.get(&chat)?;
-        Some(status.chat.plans.iter().any(|plan| {
-            plan.loop_id == loop_id && plan.version == version && plan.approval_pending
-        }))
+        Some(
+            status
+                .chat
+                .plans
+                .iter()
+                .any(|plan| plan.version == version && plan.approval_pending),
+        )
     }
 
     pub(super) fn cached_reference(&self, chat: Uuid) -> Option<ExecutionRef> {
@@ -2378,7 +2375,7 @@ impl ConsoleExecution {
             PermissionChange::UpsertRule { rule } if rule.persistent => {
                 if rule.loop_id.is_some() {
                     return Err(invalid(
-                        "persistent rules apply to every goal in the project and cannot name a goal",
+                        "persistent rules apply to every Chat in the project and cannot name a Loop",
                     ));
                 }
                 validate_rule(&rule).map_err(invalid)?;
@@ -2645,19 +2642,13 @@ impl ConsoleExecution {
         launch.exact_chat = Some(chat);
         self.create(launch, None).await.map(|_| ())
     }
-    pub(super) async fn submit(
-        &self,
-        chat: Uuid,
-        goal: Option<Uuid>,
-        text: String,
-    ) -> Result<Receipt, AccessError> {
-        self.submit_with_input_contexts(chat, goal, text, Vec::new(), Vec::new())
+    pub(super) async fn submit(&self, chat: Uuid, text: String) -> Result<Receipt, AccessError> {
+        self.submit_with_input_contexts(chat, text, Vec::new(), Vec::new())
             .await
     }
     pub(super) async fn submit_with_input_contexts(
         &self,
         chat: Uuid,
-        goal: Option<Uuid>,
         text: String,
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
@@ -2667,7 +2658,6 @@ impl ConsoleExecution {
             .command(
                 AgentCommand::Submit {
                     execution,
-                    target_loop: goal,
                     input: UserInput::Text {
                         text,
                         contexts,
@@ -2702,7 +2692,6 @@ impl ConsoleExecution {
                 AgentCommand::SendFamilyInput {
                     source_execution,
                     target_execution: target,
-                    target_loop: None,
                     origin,
                     input: UserInput::Text {
                         text,
@@ -2726,7 +2715,6 @@ impl ConsoleExecution {
     pub(super) async fn invoke_skill(
         &self,
         chat: Uuid,
-        goal: Option<Uuid>,
         name: &str,
         arguments: &str,
     ) -> Result<Receipt, AccessError> {
@@ -2735,7 +2723,6 @@ impl ConsoleExecution {
             .command(
                 AgentCommand::Submit {
                     execution,
-                    target_loop: goal,
                     input: UserInput::Skill {
                         name: name.into(),
                         arguments: arguments.into(),
@@ -3071,15 +3058,8 @@ impl ConsoleExecution {
         self.command(AgentCommand::ManageLoop { execution, action }, None)
             .await
     }
-    pub(super) async fn stop(
-        &self,
-        chat: Uuid,
-        loop_id: Uuid,
-    ) -> Result<Vec<OperationRecord>, AccessError> {
-        match self
-            .loop_command(chat, LoopAction::Stop { loop_id })
-            .await?
-        {
+    pub(super) async fn stop(&self, chat: Uuid) -> Result<Vec<OperationRecord>, AccessError> {
+        match self.loop_command(chat, LoopAction::Stop).await? {
             CommandResult::Operations(value) => Ok(value),
             _ => Err(unexpected()),
         }
@@ -3111,14 +3091,15 @@ impl ConsoleExecution {
             {
                 continue;
             }
-            for goal in self.status(row.chat_id).await?.loops {
-                if !goal.event_sources.is_empty() {
-                    self.loop_command(
-                        row.chat_id,
-                        LoopAction::DisableEventSources { loop_id: goal.id },
-                    )
+            if !self
+                .status(row.chat_id)
+                .await?
+                .chat_loop
+                .event_sources
+                .is_empty()
+            {
+                self.loop_command(row.chat_id, LoopAction::DisableEventSources)
                     .await?;
-                }
             }
         }
         Ok(())
@@ -3127,21 +3108,19 @@ impl ConsoleExecution {
     pub(super) async fn configure_trigger(
         &self,
         chat: Uuid,
-        loop_id: Uuid,
         trigger: Option<Trigger>,
     ) -> Result<(), AccessError> {
-        self.loop_command(chat, LoopAction::ConfigureTrigger { loop_id, trigger })
+        self.loop_command(chat, LoopAction::ConfigureTrigger { trigger })
             .await
             .map(|_| ())
     }
     pub(super) async fn trigger(
         &self,
         chat: Uuid,
-        loop_id: Uuid,
         source: TriggerSource,
     ) -> Result<Receipt, AccessError> {
         match self
-            .loop_command(chat, LoopAction::EmitTrigger { loop_id, source })
+            .loop_command(chat, LoopAction::EmitTrigger { source })
             .await?
         {
             CommandResult::Submitted(receipt) => Ok(receipt),
@@ -3151,19 +3130,11 @@ impl ConsoleExecution {
     pub(super) async fn approve_plan(
         &self,
         chat: Uuid,
-        loop_id: Uuid,
         version: u64,
         mode: ExecutionMode,
     ) -> Result<Option<String>, AccessError> {
         match self
-            .loop_command(
-                chat,
-                LoopAction::ApprovePlan {
-                    loop_id,
-                    version,
-                    mode,
-                },
-            )
+            .loop_command(chat, LoopAction::ApprovePlan { version, mode })
             .await?
         {
             CommandResult::Text(value) => Ok(Some(value)),
@@ -3174,19 +3145,11 @@ impl ConsoleExecution {
     pub(super) async fn decline_plan(
         &self,
         chat: Uuid,
-        loop_id: Uuid,
         version: u64,
         feedback: Option<String>,
     ) -> Result<Option<Receipt>, AccessError> {
         match self
-            .loop_command(
-                chat,
-                LoopAction::DeclinePlan {
-                    loop_id,
-                    version,
-                    feedback,
-                },
-            )
+            .loop_command(chat, LoopAction::DeclinePlan { version, feedback })
             .await?
         {
             CommandResult::Submitted(receipt) => Ok(Some(receipt)),
@@ -3537,10 +3500,7 @@ impl ConsoleExecution {
         match self
             .history(
                 request.source_chat_id,
-                HistoryAction::Branch {
-                    target_loop: request.source_loop_id,
-                    name: request.name,
-                },
+                HistoryAction::Branch { name: request.name },
                 Some(request.request_id),
             )
             .await?
@@ -3761,10 +3721,9 @@ impl ConsoleExecution {
         self.command(AgentCommand::ManageTask { execution, action }, None)
             .await
     }
-    pub(super) async fn submit_user_shell_for_goal(
+    pub(super) async fn submit_user_shell(
         &self,
         chat: Uuid,
-        target_loop: Option<Uuid>,
         command: String,
         background: bool,
     ) -> Result<UserShellReceipt, AccessError> {
@@ -3772,7 +3731,6 @@ impl ConsoleExecution {
             .task(
                 chat,
                 TaskAction::SubmitShell {
-                    target_loop,
                     command,
                     background,
                 },
@@ -3980,23 +3938,15 @@ impl ConsoleExecution {
     pub(super) async fn queue_command(
         &self,
         chat: Uuid,
-        target_loop: Option<Uuid>,
         text: String,
     ) -> Result<Uuid, AccessError> {
-        let mut action = super::parse_after_turn(self, chat, target_loop, &text).await?;
+        let mut action = super::parse_after_turn(self, chat, &text).await?;
         if let AfterTurnAction::Submit { origin, .. } = &mut action {
             *origin = self.origin();
         }
         let execution = self.reference(chat).await?;
         match self
-            .command(
-                AgentCommand::EnqueueAfterTurn {
-                    execution,
-                    target_loop,
-                    action,
-                },
-                None,
-            )
+            .command(AgentCommand::EnqueueAfterTurn { execution, action }, None)
             .await?
         {
             CommandResult::Queued { command_id } => Ok(command_id),
@@ -4159,7 +4109,6 @@ mod tests {
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: "Expired input must not execute.".into(),
                         contexts: Vec::new(),
@@ -4175,11 +4124,11 @@ mod tests {
             AccessErrorCode::VersionConflict
         );
         assert!(model.requests.lock().unwrap().is_empty());
-        assert!(runtime.snapshot(chat).await.unwrap().loops.is_empty());
+        assert!(runtime.snapshot(chat).await.unwrap().messages.is_empty());
 
         let mut events = runtime.subscribe();
         let accepted = terminal
-            .submit(chat, None, "Renew and accept this input once.".into())
+            .submit(chat, "Renew and accept this input once.".into())
             .await
             .unwrap();
         loop {
@@ -4206,8 +4155,7 @@ mod tests {
         assert_eq!(accepted.chat_id, chat);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         let snapshot = runtime.snapshot(chat).await.unwrap();
-        assert_eq!(snapshot.loops.len(), 1);
-        assert_eq!(snapshot.loops[0].id, accepted.loop_id);
+        assert_eq!(snapshot.chat_loop.id, accepted.loop_id);
         assert_eq!(
             snapshot
                 .events
@@ -4366,7 +4314,7 @@ mod tests {
         }
         let mut events = runtime.subscribe();
         terminal
-            .submit(chat, None, "Read this input's host source.".into())
+            .submit(chat, "Read this input's host source.".into())
             .await
             .unwrap();
         let result = loop {
@@ -4439,17 +4387,17 @@ mod tests {
         );
         let chat = terminal.create_chat(directory.path().into()).await.unwrap();
         let error = terminal
-            .submit(chat, None, "x".repeat(TRANSPORT_LIMITS.frame_bytes()))
+            .submit(chat, "x".repeat(TRANSPORT_LIMITS.frame_bytes()))
             .await
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("frame"), "{message}");
         assert!(!message.contains("unknown acceptance"), "{message}");
-        assert!(runtime.snapshot(chat).await.unwrap().loops.is_empty());
+        assert!(runtime.snapshot(chat).await.unwrap().messages.is_empty());
         assert!(model.requests.lock().unwrap().is_empty());
         let mut events = runtime.subscribe();
         terminal
-            .submit(chat, None, "Explicitly correct the oversized input.".into())
+            .submit(chat, "Explicitly correct the oversized input.".into())
             .await
             .unwrap();
         loop {
@@ -4463,7 +4411,6 @@ mod tests {
             }
         }
         assert_eq!(model.requests.lock().unwrap().len(), 1);
-        assert_eq!(runtime.snapshot(chat).await.unwrap().loops.len(), 1);
         terminal.leave_view().await.unwrap();
         runtime.shutdown().await;
         server.abort();
@@ -4947,9 +4894,9 @@ mod tests {
             .unwrap_or_else(|_| panic!("created"));
         set(&access.lose_replies, true);
         set(&access.hide_receipts, true);
-        assert!(terminal.submit(chat, None, "once".into()).await.is_err());
+        assert!(terminal.submit(chat, "once".into()).await.is_err());
         set(&access.lose_replies, false);
-        assert!(terminal.submit(chat, None, "once".into()).await.is_err());
+        assert!(terminal.submit(chat, "once".into()).await.is_err());
         let submits = || {
             count(&access, |command| {
                 matches!(command, AgentCommand::Submit { .. })
@@ -4957,7 +4904,7 @@ mod tests {
         };
         assert_eq!(submits(), 1, "an unknown input is never sent again");
         set(&access.hide_receipts, false);
-        assert!(terminal.submit(chat, None, "next".into()).await.is_ok());
+        assert!(terminal.submit(chat, "next".into()).await.is_ok());
         assert_eq!(submits(), 2);
         runtime.shutdown().await;
     }
@@ -5087,10 +5034,7 @@ mod tests {
         let snapshot = runtime.snapshot(chat).await.unwrap();
         assert_ne!(snapshot.policy.mode, ExecutionMode::Plan);
         assert!(
-            terminal
-                .submit(chat, None, "too early".into())
-                .await
-                .is_err(),
+            terminal.submit(chat, "too early".into()).await.is_err(),
             "no ordinary input reaches a partially configured Agent"
         );
         assert!(
@@ -5115,7 +5059,7 @@ mod tests {
             terminal.acknowledge_first_create(command_id),
             Some(CreateAcknowledgement::ChoicesCancelled)
         ));
-        assert!(terminal.submit(chat, None, "now".into()).await.is_ok());
+        assert!(terminal.submit(chat, "now".into()).await.is_ok());
         assert_eq!(submits(&access), 1);
         assert_eq!(creates(&access), 1);
         runtime.shutdown().await;
@@ -5157,10 +5101,7 @@ mod tests {
         };
         set(&access.lose_configure_replies, false);
         assert!(
-            terminal
-                .submit(chat, None, "too early".into())
-                .await
-                .is_err(),
+            terminal.submit(chat, "too early".into()).await.is_err(),
             "the first input waits until every staged choice is proven"
         );
         assert!(matches!(
@@ -5177,12 +5118,7 @@ mod tests {
             panic!("the late accepted receipt lets the remaining choices go out");
         };
         assert_eq!(created, chat);
-        assert!(
-            terminal
-                .submit(chat, None, "first input".into())
-                .await
-                .is_ok()
-        );
+        assert!(terminal.submit(chat, "first input".into()).await.is_ok());
         let mode_changes = count(&access, |command| {
             matches!(
                 command,
@@ -5335,7 +5271,7 @@ mod tests {
             InputResolution::Unknown
         ));
         assert!(
-            terminal.submit(chat, None, "edited".into()).await.is_err(),
+            terminal.submit(chat, "edited".into()).await.is_err(),
             "{kind}: new input waits while the earlier acceptance is unknown"
         );
         let sent_count = || count(&access, &sent);
@@ -5348,7 +5284,7 @@ mod tests {
         assert_eq!(sent_count(), 1, "{kind}: adopting sends nothing");
         assert!(terminal.unknown_input(chat).is_none());
         assert!(
-            terminal.submit(chat, None, "edited".into()).await.is_ok(),
+            terminal.submit(chat, "edited".into()).await.is_ok(),
             "{kind}: an edited input is sent as a new intent after proof"
         );
         runtime.shutdown().await;
@@ -5358,7 +5294,7 @@ mod tests {
     async fn a_late_accepted_message_is_adopted_instead_of_sent_again() {
         assert_late_accepted_input_is_adopted(
             "message",
-            async |terminal, chat| terminal.submit(chat, None, "once".into()).await.map(|_| ()),
+            async |terminal, chat| terminal.submit(chat, "once".into()).await.map(|_| ()),
             |command| {
                 matches!(
                     command,
@@ -5379,7 +5315,7 @@ mod tests {
             "skill",
             async |terminal, chat| {
                 terminal
-                    .invoke_skill(chat, None, "tickloop", "")
+                    .invoke_skill(chat, "tickloop", "")
                     .await
                     .map(|_| ())
             },
@@ -5403,7 +5339,7 @@ mod tests {
             "queued",
             async |terminal, chat| {
                 terminal
-                    .queue_command(chat, None, "/tickloop".into())
+                    .queue_command(chat, "/tickloop".into())
                     .await
                     .map(|_| ())
             },
@@ -5419,7 +5355,7 @@ mod tests {
             "shell",
             async |terminal, chat| {
                 terminal
-                    .submit_user_shell_for_goal(chat, None, "true".into(), false)
+                    .submit_user_shell(chat, "true".into(), false)
                     .await
                     .map(|_| ())
             },
@@ -5693,7 +5629,7 @@ mod tests {
         let after = runtime.snapshot(chat).await.unwrap();
         assert_eq!(after.model, before.model);
         assert_eq!(after.pending_model, before.pending_model);
-        assert!(after.loops.is_empty());
+        assert!(after.chat_loop.run_id.is_none());
         assert_eq!(runtime.list_chats().await.len(), 1);
         assert!(client.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;

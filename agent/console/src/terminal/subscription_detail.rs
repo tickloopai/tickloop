@@ -1,10 +1,10 @@
 //! The Tick Subscriptions on one Monitor row, shown inside the Monitor column.
 //!
-//! Each Loop's subscription shows its frequency, pending updates, last delivery and link state.
+//! Each subscription shows its frequency, pending updates, last delivery and link state.
 //! `s` cycles a periodic subscription through its frequencies and off; `u` cancels immediately.
 //! Immediate subscriptions keep the frequency their Tick type decides.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tick_protocol::InstanceRef;
@@ -20,7 +20,7 @@ use super::{
 };
 use crate::monitor_rows::{SUBSCRIBE_KEY, SubscriptionOperation, UNSUBSCRIBE_KEY};
 use tickloop_agent_protocol::{
-    LoopId, LoopState, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
+    LoopState, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
     TickSubscriptionStatus,
 };
 
@@ -51,7 +51,6 @@ pub(super) struct SubscriptionDetail {
     instance: InstanceRef,
     title: String,
     rows: Vec<TickSubscriptionStatus>,
-    goals: HashMap<LoopId, String>,
     selected: Option<Uuid>,
     top: usize,
     /// A refusal or explanation the hint shows until the next key.
@@ -69,7 +68,6 @@ impl SubscriptionDetail {
         instance: InstanceRef,
         title: String,
         rows: Vec<TickSubscriptionStatus>,
-        goals: HashMap<LoopId, String>,
         operation: SubscriptionOperation,
         display: DisplayProfile,
     ) -> Self {
@@ -80,7 +78,6 @@ impl SubscriptionDetail {
             title,
             selected: rows.first().map(|row| row.id),
             rows,
-            goals,
             top: 0,
             notice: None,
             opened_to_cancel: operation == SubscriptionOperation::Cancel,
@@ -95,14 +92,8 @@ impl SubscriptionDetail {
 
     /// Takes the row's current subscriptions without disturbing the cursor. A subscription that
     /// disappeared hands the cursor to its neighbour.
-    pub(super) fn update(
-        &mut self,
-        title: String,
-        rows: Vec<TickSubscriptionStatus>,
-        goals: HashMap<LoopId, String>,
-    ) {
+    pub(super) fn update(&mut self, title: String, rows: Vec<TickSubscriptionStatus>) {
         self.title = title;
-        self.goals = goals;
         if self.rows == rows {
             return;
         }
@@ -188,14 +179,6 @@ impl SubscriptionDetail {
         self.selected_index().map(|index| &self.rows[index])
     }
 
-    fn goal(&self, row: &TickSubscriptionStatus) -> String {
-        self.goals
-            .get(&row.loop_id)
-            .map(|goal| super::safe_line(goal))
-            .filter(|goal| !goal.is_empty())
-            .unwrap_or_else(|| format!("Loop {}", &row.loop_id.simple().to_string()[..8]))
-    }
-
     fn subscription_lines(&self, row: &TickSubscriptionStatus, selected: bool) -> [RoleLine; 3] {
         let role = if selected {
             Role::Text
@@ -216,7 +199,7 @@ impl SubscriptionDetail {
                 format!(
                     "{DETAIL_INDENT}{} {}",
                     self.display.glyph(loop_state_glyph(&row.loop_state)),
-                    self.goal(row)
+                    loop_state_label(&row.loop_state)
                 ),
                 Role::MutedText,
             ),
@@ -348,14 +331,24 @@ fn clock_time(milliseconds: u64) -> String {
 fn loop_state_glyph(state: &LoopState) -> Glyph {
     match state {
         LoopState::Running | LoopState::Queued => Glyph::ToolCall,
-        LoopState::WaitingTrigger | LoopState::Idle => Glyph::TickDelivery,
+        LoopState::Idle => Glyph::TickDelivery,
         LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan => {
             Glyph::Warning
         }
-        LoopState::Completed => Glyph::Success,
-        LoopState::Failed | LoopState::Interrupted | LoopState::Stopped | LoopState::Expired => {
-            Glyph::Failure
-        }
+        LoopState::Failed | LoopState::Interrupted => Glyph::Failure,
+    }
+}
+
+fn loop_state_label(state: &LoopState) -> &'static str {
+    match state {
+        LoopState::Idle => "Loop idle",
+        LoopState::Queued => "Loop queued",
+        LoopState::Running => "Loop running",
+        LoopState::WaitingPermission => "Loop needs approval",
+        LoopState::WaitingQuestion => "Loop needs an answer",
+        LoopState::WaitingPlan => "Loop waits for plan review",
+        LoopState::Failed => "Loop turn failed",
+        LoopState::Interrupted => "Loop turn interrupted",
     }
 }
 
@@ -384,7 +377,7 @@ mod tests {
             kind: None,
             id: Uuid::from_u128(id),
             loop_id: Uuid::from_u128(900 + id),
-            loop_state: LoopState::WaitingTrigger,
+            loop_state: LoopState::Idle,
             instance: instance(),
             frequency,
             accumulated: 0,
@@ -403,16 +396,11 @@ mod tests {
         rows: Vec<TickSubscriptionStatus>,
         operation: SubscriptionOperation,
     ) -> SubscriptionDetail {
-        let goals = rows
-            .iter()
-            .map(|row| (row.loop_id, format!("Watch run {}", row.id.as_u128())))
-            .collect();
         SubscriptionDetail::open(
             Uuid::from_u128(1),
             instance(),
             "Fixture run".into(),
             rows,
-            goals,
             operation,
             DisplayProfile::default(),
         )
@@ -453,7 +441,7 @@ mod tests {
         assert_eq!(lines[0], "Fixture run");
         assert_eq!(lines[1], "Tick Subscriptions 2");
         assert_eq!(lines[2], "› ↻ high · every 1 min · 4 new");
-        assert_eq!(lines[3], "    ◉ Watch run 3");
+        assert_eq!(lines[3], "    ◉ Loop idle");
         assert_eq!(lines[4], "    10:00:45 3 #12 · dropped 2 · live");
         assert_eq!(lines[5], "  ↻ medium · every 10 min");
         assert_eq!(lines[7], "    no delivery yet · live");
@@ -562,7 +550,6 @@ mod tests {
         detail.update(
             "Fixture run".into(),
             vec![row(3, TickSubscriptionFrequency::High)],
-            HashMap::new(),
         );
 
         assert_eq!(text(&mut detail)[2], "› ↻ high · every 1 min");
@@ -570,7 +557,7 @@ mod tests {
             !detail.is_done(),
             "a detail opened to view stays while one is left"
         );
-        detail.update("Fixture run".into(), Vec::new(), HashMap::new());
+        detail.update("Fixture run".into(), Vec::new());
         assert!(
             detail.is_done(),
             "with none left Monitor goes back to its list"
@@ -596,7 +583,6 @@ mod tests {
                 row(3, TickSubscriptionFrequency::High),
                 row(4, TickSubscriptionFrequency::Low),
             ],
-            HashMap::new(),
         );
         assert!(!detail.is_done(), "a refused cancel stays on the detail");
         assert_eq!(
@@ -608,7 +594,6 @@ mod tests {
         detail.update(
             "Fixture run".into(),
             vec![row(4, TickSubscriptionFrequency::Low)],
-            HashMap::new(),
         );
         assert!(detail.is_done(), "the cancelled subscription is gone");
     }

@@ -156,7 +156,6 @@
       "agent_id": "00000000-0000-0000-0000-0000000000a1",
       "generation": 3
     },
-    "target_loop": "00000000-0000-0000-0000-000000000010",
     "input": {
       "kind": "skill",
       "name": "tickloop",
@@ -276,7 +275,6 @@
     },
     "action": {
       "kind": "configure_trigger",
-      "loop_id": "00000000-0000-0000-0000-000000000010",
       "trigger": {
         "id": "00000000-0000-0000-0000-000000000030",
         "prompt": "Report changes",

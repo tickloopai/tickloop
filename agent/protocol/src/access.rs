@@ -54,10 +54,12 @@ use crate::{
 /// 26.0 uses the service model ID as the sole ModelCard ID on the wire.
 /// 26.1 adds opt-in planned runtime upgrades and runtime version observations.
 /// 26.2 attributes each Worker's runtime version and upgrade error to its executions.
-/// Older business majors
-/// are refused before dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 26;
-pub const PROTOCOL_MINOR: u16 = 2;
+/// 27.0 gives each Chat exactly one Loop: commands no longer select a Loop, `Stop` pauses
+/// receiving instead of ending a Loop, `ContinueLoop` resumes it, and the ended Loop states are
+/// gone. Older business majors are refused before dispatch; the frozen daemon management
+/// protocol remains independent.
+pub const PROTOCOL_MAJOR: u16 = 27;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -259,7 +261,7 @@ pub enum AgentCommand {
         tick: ArtifactTick,
     },
     /// Unlinks the artifact from the Chat: it leaves Monitor and its association with the
-    /// Chat's Loops ends.
+    /// Chat's Loop ends.
     RemoveArtifactTick {
         execution: ExecutionRef,
         instance_id: String,
@@ -294,8 +296,8 @@ pub enum AgentCommand {
     },
     /// Starts a new instance in place of a hosted Tick that no longer runs, at the user's
     /// request. It takes the old row's place in Monitor; the old instance's Tick Subscriptions in
-    /// this Chat end, and with `restore_subscriptions` their Loops subscribe to the new instance
-    /// at the frequencies they had.
+    /// this Chat end, and with `restore_subscriptions` the Loop subscribes to the new instance at
+    /// the frequencies they had.
     ReopenHostedTick {
         execution: ExecutionRef,
         instance: InstanceRef,
@@ -321,20 +323,17 @@ pub enum AgentCommand {
     SendFamilyInput {
         source_execution: ExecutionRef,
         target_execution: ExecutionRef,
-        target_loop: Option<Uuid>,
         origin: InteractionSource,
         input: UserInput,
     },
     Submit {
         execution: ExecutionRef,
-        target_loop: Option<Uuid>,
         input: UserInput,
         origin: Option<InteractionSource>,
     },
+    /// The user continues the Chat without a new input: its Loop receives Triggers again.
     ContinueLoop {
         execution: ExecutionRef,
-        loop_id: Uuid,
-        input: UserInput,
         origin: Option<InteractionSource>,
     },
     DecidePermission {
@@ -379,7 +378,6 @@ pub enum AgentCommand {
     },
     EnqueueAfterTurn {
         execution: ExecutionRef,
-        target_loop: Option<Uuid>,
         action: AfterTurnAction,
     },
     RefreshConfiguration {
@@ -482,7 +480,6 @@ pub enum ConfigurationChange {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HistoryAction {
     Branch {
-        target_loop: Option<Uuid>,
         name: Option<String>,
     },
     Compact {
@@ -505,33 +502,26 @@ pub enum HistoryAction {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LoopAction {
-    Stop {
-        loop_id: Uuid,
-    },
+    /// Interrupts the current turn and pauses receiving until the Chat is continued.
+    Stop,
     Interrupt,
     /// Interrupts the current work so the queued user message `run_id` starts now; does nothing
     /// once the message has joined a run or when no work runs ahead of it.
     SendNow {
         run_id: Uuid,
     },
-    DisableEventSources {
-        loop_id: Uuid,
-    },
+    DisableEventSources,
     ConfigureTrigger {
-        loop_id: Uuid,
         trigger: Option<Trigger>,
     },
     EmitTrigger {
-        loop_id: Uuid,
         source: TriggerSource,
     },
     ApprovePlan {
-        loop_id: Uuid,
         version: u64,
         mode: ExecutionMode,
     },
     DeclinePlan {
-        loop_id: Uuid,
         version: u64,
         feedback: Option<String>,
     },
@@ -539,12 +529,12 @@ pub enum LoopAction {
         subscription_id: Uuid,
         change: TickSubscriptionChange,
     },
-    /// Sends one snapshot of an unsubscribed Tick to an eligible Loop without subscribing.
+    /// Sends one snapshot of an unsubscribed Tick to the Loop without subscribing.
     TickUpdate {
         instance: tick_protocol::InstanceRef,
     },
-    /// Subscribes the Chat's newest Loop that has not ended to `instance` at the default
-    /// frequency, at the user's request from Monitor.
+    /// Subscribes the Chat's Loop to `instance` at the default frequency, at the user's request
+    /// from Monitor.
     TickManage {
         instance: InstanceRef,
     },
@@ -556,20 +546,10 @@ pub enum LoopAction {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskAction {
-    SubmitShell {
-        target_loop: Option<Uuid>,
-        command: String,
-        background: bool,
-    },
-    Background {
-        task: TaskRef,
-    },
-    Stop {
-        task: TaskRef,
-    },
-    TakeBackQueued {
-        draft_empty: bool,
-    },
+    SubmitShell { command: String, background: bool },
+    Background { task: TaskRef },
+    Stop { task: TaskRef },
+    TakeBackQueued { draft_empty: bool },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -750,12 +730,12 @@ pub struct AgentSummary {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentRegistration>,
-    /// Whether this execution ever received work: a Loop, a message, a user Shell or queued input.
+    /// Whether this execution ever received work: a message, a user Shell or queued input.
     /// Configuration alone does not count. `None` means the producer did not report the fact (an
     /// older daemon or worker); it is neither worked nor empty and stays absent when re-sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_work: Option<bool>,
-    /// Unix milliseconds when a Loop or user Shell of this execution last entered its current
+    /// Unix milliseconds when the Loop or a user Shell of this execution last entered its current
     /// state; for finished work, when it finished. `None` when no producer recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
@@ -808,7 +788,7 @@ pub struct LiveChatSnapshot {
     pub last_model_run: Option<Uuid>,
     pub warnings: Vec<String>,
     pub request_refs: Vec<RequestRef>,
-    pub resume_triggers: Vec<Uuid>,
+    pub trigger_awaits_resume: bool,
     pub last_queue_sequence: u64,
     pub transcript_write_error: Option<String>,
     pub loop_trigger_notices: Vec<LoopTriggerNotice>,
@@ -824,7 +804,7 @@ impl LiveChatSnapshot {
         Self {
             execution,
             subagent: None,
-            resume_triggers: snapshot.resume_triggers.clone(),
+            trigger_awaits_resume: snapshot.trigger_awaits_resume,
             last_queue_sequence: snapshot.last_queue_sequence,
             transcript_write_error: None,
             loop_trigger_notices: Vec::new(),
@@ -894,7 +874,7 @@ impl LiveChatSnapshot {
 
     pub fn into_snapshot(self) -> ChatSnapshot {
         let mut snapshot = self.conversation;
-        snapshot.resume_triggers = self.resume_triggers;
+        snapshot.trigger_awaits_resume = self.trigger_awaits_resume;
         snapshot.last_queue_sequence = self.last_queue_sequence;
         snapshot.model = self.model;
         snapshot.reasoning_effort = self.reasoning_effort;

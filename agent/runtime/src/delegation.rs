@@ -54,7 +54,7 @@ mod ancestry_authority_tests {
             .await
             .unwrap();
         let mut events = core.subscribe();
-        let run = core.submit(root, None, "delegate".into()).await.unwrap();
+        let run = core.submit(root, "delegate".into()).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.unwrap();
@@ -74,7 +74,7 @@ mod ancestry_authority_tests {
             let sessions = core.inner.session_permissions.lock().await;
             let receipt = Receipt {
                 chat_id: child,
-                loop_id: chats[&child].snapshot.loops[0].id,
+                loop_id: chats[&child].snapshot.chat_loop.id,
                 run_id: Uuid::new_v4(),
             };
             let input = json!({"task":"delegate again"});
@@ -1179,9 +1179,9 @@ impl Agent {
                             host_context: host_context.clone(),
                             host_tools,
                             tick_instances: snapshot
-                                .loops
+                                .chat_loop
+                                .trigger
                                 .iter()
-                                .filter_map(|goal| goal.trigger.as_ref())
                                 .flat_map(|trigger| {
                                     trigger
                                         .subscriptions
@@ -1248,12 +1248,10 @@ impl Agent {
                     let receipt = self
                         .submit_internal(
                             child_id,
-                            None,
                             local_messages::agent_message(&source, &task),
                             SubmissionOptions {
                                 task_delegation: Some(parent.clone()),
                                 agent_message: Some(source),
-                                goal_title: Some(task),
                                 ..Default::default()
                             },
                         )

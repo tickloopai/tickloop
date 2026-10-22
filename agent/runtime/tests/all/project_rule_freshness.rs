@@ -172,7 +172,7 @@ async fn cross_process_project_deny_invalidates_a_held_auto_allow() {
         .unwrap();
     let mut events = first.subscribe();
     let run = first
-        .submit(first_chat, None, "Write blocked.txt".into())
+        .submit(first_chat, "Write blocked.txt".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), model.entered.notified())
@@ -243,7 +243,7 @@ async fn cross_process_project_ask_requires_human_on_next_operation() {
         .unwrap();
     let mut events = first.subscribe();
     let run = first
-        .submit(first_chat, None, "Write ask.txt".into())
+        .submit(first_chat, "Write ask.txt".into())
         .await
         .unwrap();
     let request = loop {
@@ -311,7 +311,7 @@ async fn cross_process_project_ask_applies_to_host_tools() {
         .unwrap();
     let mut events = first.subscribe();
     let run = first
-        .submit(first_chat, None, "Change the panel".into())
+        .submit(first_chat, "Change the panel".into())
         .await
         .unwrap();
     let request = loop {
@@ -367,7 +367,7 @@ async fn cross_process_project_deny_invalidates_held_host_admission() {
         .unwrap();
     let mut events = first.subscribe();
     let run = first
-        .submit(first_chat, None, "Change the panel".into())
+        .submit(first_chat, "Change the panel".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
@@ -420,7 +420,7 @@ async fn unreadable_project_rules_fail_closed_before_execution() {
     std::fs::write(root.join("settings.json"), b"{invalid JSON").unwrap();
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Write not-written.txt".into())
+        .submit(chat, "Write not-written.txt".into())
         .await
         .unwrap();
     loop {
@@ -465,10 +465,7 @@ async fn unreadable_project_rules_during_local_approval_record_final_refusal() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let run = agent
-        .submit(chat, None, "Write held.txt".into())
-        .await
-        .unwrap();
+    let run = agent.submit(chat, "Write held.txt".into()).await.unwrap();
     let request = loop {
         let event = next_event(&mut events).await;
         if event.run_id != run.run_id {
@@ -529,10 +526,7 @@ async fn unreadable_project_rules_during_host_admission_record_final_refusal() {
     agent.install_host_tools(host.clone()).unwrap();
     let chat = agent.create_chat(workdir).await.unwrap();
     let mut events = agent.subscribe();
-    let run = agent
-        .submit(chat, None, "Change the panel".into())
-        .await
-        .unwrap();
+    let run = agent.submit(chat, "Change the panel".into()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
         .await
         .expect("Host Tool admission did not start");

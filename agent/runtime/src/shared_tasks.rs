@@ -156,12 +156,7 @@ fn scope(chats: &HashMap<ChatId, Chat>, receipt: &Receipt) -> Result<(ChatId, Lo
             (parent.chat_id, parent.loop_id)
         });
     let root_chat = chats.get(&root).ok_or("root Agent is unavailable")?;
-    if !root_chat
-        .snapshot
-        .loops
-        .iter()
-        .any(|goal| goal.id == loop_id)
-    {
+    if root_chat.snapshot.chat_loop.id != loop_id {
         return Err("the task board's root Loop no longer exists".into());
     }
     Ok((root, loop_id))
@@ -172,12 +167,7 @@ pub(super) fn view(chats: &HashMap<ChatId, Chat>, chat_id: ChatId) -> Option<Tas
     let (root, loop_id) = if let Some(delegation) = &snapshot.delegation {
         (delegation.root_chat_id(), delegation.root_loop_id())
     } else {
-        let goal = snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.run_id == chats[&chat_id].active_run && goal.run_id.is_some())
-            .or_else(|| snapshot.loops.last())?;
-        (chat_id, goal.id)
+        (chat_id, snapshot.chat_loop.id)
     };
     let mut board = chats
         .get(&root)?
@@ -693,12 +683,7 @@ impl Agent {
             chat_id
         };
         let root = chats.get_mut(&root_id).ok_or(AgentError::NotFound)?;
-        if !root
-            .snapshot
-            .loops
-            .iter()
-            .any(|goal| goal.id == root_loop_id)
-        {
+        if root.snapshot.chat_loop.id != root_loop_id {
             return Err(AgentError::Invalid(
                 "the task board's root Loop no longer exists".into(),
             ));
@@ -891,19 +876,14 @@ impl Agent {
             if !belongs {
                 continue;
             }
-            let Some(goal) = chat
-                .snapshot
-                .loops
-                .iter()
-                .rev()
-                .find(|goal| chat.snapshot.id != root || goal.id == loop_id)
-            else {
+            let chat_loop = &chat.snapshot.chat_loop;
+            if chat.snapshot.id == root && chat_loop.id != loop_id {
                 continue;
-            };
+            }
             let receipt = Receipt {
                 chat_id: chat.snapshot.id,
-                loop_id: goal.id,
-                run_id: goal.run_id.unwrap_or_default(),
+                loop_id: chat_loop.id,
+                run_id: chat_loop.run_id.unwrap_or_default(),
             };
             self.publish_event(
                 chat,

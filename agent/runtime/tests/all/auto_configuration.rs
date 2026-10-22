@@ -165,7 +165,6 @@ async fn default_llm_uses_the_chat_model_even_when_a_legacy_jev_key_exists() {
     let receipt = agent
         .submit(
             chat,
-            None,
             "Create the requested symlink in this directory".into(),
         )
         .await
@@ -226,7 +225,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(first, None, "Create a symlink".into())
+        .submit(first, "Create a symlink".into())
         .await
         .unwrap();
     let assessment = finish(&mut events, receipt.run_id).await;
@@ -248,7 +247,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .await
         .unwrap();
     let receipt = agent
-        .submit(first, None, "Create another symlink".into())
+        .submit(first, "Create another symlink".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
@@ -267,7 +266,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
     );
     assert_eq!(pending_model.review_count(), 0);
     let receipt = agent
-        .submit(first, None, "Create the next symlink".into())
+        .submit(first, "Create the next symlink".into())
         .await
         .unwrap();
     let assessment = finish(&mut events, receipt.run_id).await;
@@ -520,7 +519,7 @@ async fn jev_retry_keeps_its_connection_while_later_chats_and_generic_judgments_
     });
     let mut first_events = first.subscribe();
     let receipt = first
-        .submit(a, None, "Create the first symlink".into())
+        .submit(a, "Create the first symlink".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
@@ -536,7 +535,7 @@ async fn jev_retry_keeps_its_connection_while_later_chats_and_generic_judgments_
     assert_eq!(assessment.reviewer.unwrap().requested_model, "jev-one");
     let mut next_events = next.subscribe();
     let receipt = next
-        .submit(b, None, "Create the next symlink".into())
+        .submit(b, "Create the next symlink".into())
         .await
         .unwrap();
     let assessment = finish(&mut next_events, receipt.run_id).await;
@@ -610,10 +609,7 @@ async fn invalid_global_auto_policy_requires_a_human_without_calling_a_reviewer(
     .unwrap();
     assert!(agent.permissions_view(chat).await.is_err());
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Create a symlink".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Create a symlink".into()).await.unwrap();
     let mut asked = false;
     loop {
         let event = next_event(&mut events).await;

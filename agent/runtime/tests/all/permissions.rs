@@ -172,7 +172,7 @@ async fn verified_malformed_or_truncated_reviews_retry_but_unverified_operations
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create the blocked link".into())
+            .submit(chat, "Create the blocked link".into())
             .await
             .unwrap();
         let mut saw_manual = false;
@@ -222,7 +222,7 @@ async fn invalid_auto_review_request_is_concise_and_not_retried() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Link the file only if it is safe".into())
+        .submit(chat, "Link the file only if it is safe".into())
         .await
         .unwrap();
     let mut reason = None;
@@ -289,7 +289,7 @@ async fn an_unavailable_auto_classifier_requests_a_human_with_retry_guidance() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Link the file only if it is safe".into())
+        .submit(chat, "Link the file only if it is safe".into())
         .await
         .unwrap();
     let mut retry_attempts = Vec::new();
@@ -338,7 +338,7 @@ async fn a_cancelled_auto_review_does_not_record_a_denial_assessment() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Link the file only if it is safe".into())
+        .submit(chat, "Link the file only if it is safe".into())
         .await
         .unwrap();
     loop {
@@ -386,7 +386,7 @@ async fn auto_review_reports_terminal_account_errors_without_retrying() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Link the file only if it is safe".into())
+            .submit(chat, "Link the file only if it is safe".into())
             .await
             .unwrap();
         let mut checked_reason = None;
@@ -439,7 +439,7 @@ async fn an_overlong_auto_review_context_asks_the_user_once() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the reviewed link".into())
+        .submit(chat, "Create the reviewed link".into())
         .await
         .unwrap();
 
@@ -506,7 +506,7 @@ async fn an_overlong_auto_review_context_stops_a_headless_run() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Only inspect the workspace".into())
+        .submit(chat, "Only inspect the workspace".into())
         .await
         .unwrap();
 
@@ -550,7 +550,7 @@ async fn invalid_classifications_request_a_human_after_both_stages_fail() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "link it".into()).await.unwrap();
+    agent.submit(chat, "link it".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionChecked { decision, reason } => {
@@ -612,7 +612,7 @@ async fn automatic_check_retries_invalid_structured_output_once() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the checked link".into())
+        .submit(chat, "Create the checked link".into())
         .await
         .unwrap();
     loop {
@@ -663,7 +663,7 @@ async fn automatic_allow_and_block_classifications_control_real_side_effects() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create the requested link".into())
+            .submit(chat, "Create the requested link".into())
             .await
             .unwrap();
         let mut saw_check = false;
@@ -722,11 +722,7 @@ async fn explicit_legacy_reviewer_can_share_the_active_model_with_isolated_reque
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Read notes.txt, then create the reviewed link".into(),
-        )
+        .submit(chat, "Read notes.txt, then create the reviewed link".into())
         .await
         .unwrap();
     loop {
@@ -792,11 +788,7 @@ async fn an_auto_reviewer_denial_is_a_recoverable_tool_result() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Inspect the workspace without changing it".into(),
-        )
+        .submit(chat, "Inspect the workspace without changing it".into())
         .await
         .unwrap();
     loop {
@@ -835,7 +827,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Only inspect the workspace".into())
+        .submit(chat, "Only inspect the workspace".into())
         .await
         .unwrap();
     let request = loop {
@@ -858,7 +850,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
         )
     );
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::WaitingPermission
     );
     agent
@@ -902,7 +894,7 @@ async fn human_approval_resets_consecutive_auto_denials() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Inspect the workspace.".into())
+        .submit(chat, "Inspect the workspace.".into())
         .await
         .unwrap();
     let mut prompts = 0;
@@ -981,7 +973,7 @@ async fn headless_invalid_classification_and_service_failure_do_not_trigger_the_
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Inspect the workspace.".into())
+            .submit(chat, "Inspect the workspace.".into())
             .await
             .unwrap();
         loop {
@@ -1041,7 +1033,7 @@ async fn repeated_headless_context_limits_remain_capacity_errors() {
     let mut events = agent.subscribe();
     for _ in 0..3 {
         agent
-            .submit(chat, None, "Inspect the workspace.".into())
+            .submit(chat, "Inspect the workspace.".into())
             .await
             .unwrap();
         loop {
@@ -1086,7 +1078,7 @@ async fn headless_auto_mode_stops_the_run_after_repeated_classifier_denials() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Only inspect the workspace".into())
+        .submit(chat, "Only inspect the workspace".into())
         .await
         .unwrap();
     let error = loop {
@@ -1134,7 +1126,7 @@ async fn twenty_total_auto_denials_require_user_intervention_even_when_successes
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read safe.txt without changing files".into())
+        .submit(chat, "Read safe.txt without changing files".into())
         .await
         .unwrap();
     let request = loop {
@@ -1194,7 +1186,7 @@ async fn human_escalation_preserves_total_until_twenty_and_then_restarts_countin
     let mut prompted_steps = Vec::new();
     for index in 1..=23 {
         agent
-            .submit(chat, None, format!("Inspect step {index}."))
+            .submit(chat, format!("Inspect step {index}."))
             .await
             .unwrap();
         loop {
@@ -1276,7 +1268,7 @@ async fn auto_requires_human_approval_for_an_explicit_ask_before_a_workspace_edi
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Write the report and read the notes".into())
+        .submit(chat, "Write the report and read the notes".into())
         .await
         .unwrap();
     let request = loop {
@@ -1336,7 +1328,7 @@ async fn full_access_runs_an_ordinary_shell_without_review_and_switching_to_ask_
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the first link".into())
+        .submit(chat, "Create the first link".into())
         .await
         .unwrap();
     let mut started = false;
@@ -1366,7 +1358,7 @@ async fn full_access_runs_an_ordinary_shell_without_review_and_switching_to_ask_
         .await
         .unwrap();
     agent
-        .submit(chat, None, "Create the second link".into())
+        .submit(chat, "Create the second link".into())
         .await
         .unwrap();
     let request = loop {
@@ -1434,7 +1426,7 @@ async fn full_access_keeps_explicit_ask_and_deny_rules() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Ask for the first edit".into())
+        .submit(chat, "Ask for the first edit".into())
         .await
         .unwrap();
     let request = loop {
@@ -1482,7 +1474,7 @@ async fn full_access_keeps_explicit_ask_and_deny_rules() {
         .await
         .unwrap();
     agent
-        .submit(chat, None, "Attempt the denied edit".into())
+        .submit(chat, "Attempt the denied edit".into())
         .await
         .unwrap();
     loop {
@@ -1515,10 +1507,7 @@ async fn resumed_chat_uses_configured_default_instead_of_temporary_full_access()
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Save this chat".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Save this chat".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -1558,10 +1547,7 @@ async fn startup_unrestricted_host_policy_does_not_relabel_auto_as_full_access()
         ExecutionMode::Auto
     );
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Create the link".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Create the link".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -1617,10 +1603,7 @@ async fn headless_auto_denies_an_explicit_ask_without_reviewing_or_writing() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     require_workspace_write_approval(&agent, chat).await;
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Write the report".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write the report".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -1660,7 +1643,7 @@ async fn auto_sends_sensitive_workspace_writes_to_the_classifier_and_accept_edit
         agent.set_execution_mode(chat, mode).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Tidy the repository".into())
+            .submit(chat, "Tidy the repository".into())
             .await
             .unwrap();
         loop {
@@ -1714,10 +1697,7 @@ async fn headless_prompts_are_denied_with_claude_code_guidance() {
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Link the file".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Link the file".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -1759,7 +1739,7 @@ async fn hostile_tool_output_neither_forces_approval_nor_reaches_the_classifier(
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read source.txt and link a summary".into())
+        .submit(chat, "Read source.txt and link a summary".into())
         .await
         .unwrap();
     loop {
@@ -1794,10 +1774,7 @@ async fn exact_external_read_requires_a_current_approval_and_stopped_requests_ex
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "read external".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "read external".into()).await.unwrap();
     let permission = loop {
         if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
             break request;
@@ -1808,11 +1785,11 @@ async fn exact_external_read_requires_a_current_approval_and_stopped_requests_ex
         json!(path.canonicalize().unwrap())
     );
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::WaitingPermission
     );
     assert_eq!(model.requests.lock().unwrap().len(), 1);
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     assert!(
         agent
             .answer_permission(chat, permission.id, true)
@@ -1864,10 +1841,7 @@ async fn deny_rules_win_over_allow_and_ask() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "read secret".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "read secret".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -1922,7 +1896,7 @@ async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_fil
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat,None,format!("Create a new file at this exact explicitly authorized external path {} with the exact text 'permission checker live verification'. This temporary directory belongs to this test; the user explicitly requests this bounded file creation.",output_path.display())).await.unwrap();
+    agent.submit(chat,format!("Create a new file at this exact explicitly authorized external path {} with the exact text 'permission checker live verification'. This temporary directory belongs to this test; the user explicitly requests this bounded file creation.",output_path.display())).await.unwrap();
     let mut checked = false;
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(90), events.recv())
@@ -1982,10 +1956,7 @@ async fn an_explicit_ask_rule_also_protects_host_plan_operations() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Plan the work".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Plan the work".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => {
@@ -2004,7 +1975,7 @@ async fn an_explicit_ask_rule_also_protects_host_plan_operations() {
                         .is_err()
                 );
                 agent
-                    .approve_plan(chat, request.loop_id, 1, ExecutionMode::AcceptEdits)
+                    .approve_plan(chat, 1, ExecutionMode::AcceptEdits)
                     .await
                     .unwrap();
                 break;
@@ -2066,7 +2037,7 @@ async fn project_and_managed_policy_can_tighten_but_not_expand_user_authority() 
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create blocked.txt".into())
+        .submit(chat, "Create blocked.txt".into())
         .await
         .unwrap();
     loop {
@@ -2120,7 +2091,7 @@ async fn an_explicit_ask_only_accepts_approval_for_its_current_request() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the requested file".into())
+        .submit(chat, "Create the requested file".into())
         .await
         .unwrap();
     let request = loop {
@@ -2186,8 +2157,8 @@ async fn a_new_explicit_ask_overrides_an_existing_session_allow_for_the_same_ope
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Read the external source".into())
+    agent
+        .submit(chat, "Read the external source".into())
         .await
         .unwrap();
     let first_request = loop {
@@ -2223,11 +2194,7 @@ async fn a_new_explicit_ask_overrides_an_existing_session_allow_for_the_same_ope
         .await
         .unwrap();
     agent
-        .submit(
-            chat,
-            Some(receipt.loop_id),
-            "Read the same source again".into(),
-        )
+        .submit(chat, "Read the same source again".into())
         .await
         .unwrap();
     let second_request = loop {
@@ -2265,7 +2232,7 @@ async fn an_allow_comment_reaches_the_model_after_the_tool_result_without_adding
     require_workspace_write_approval(&agent, chat).await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the requested file".into())
+        .submit(chat, "Create the requested file".into())
         .await
         .unwrap();
     let request = loop {
@@ -2345,7 +2312,7 @@ async fn interrupting_a_pending_permission_preserves_its_unadmitted_recovery_fac
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     require_workspace_write_approval(&agent, chat).await;
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Create it".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Create it".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { .. } => break,
@@ -2388,7 +2355,7 @@ async fn an_allow_comment_still_reaches_the_model_after_a_failed_tool_result() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Run it".into()).await.unwrap();
+    agent.submit(chat, "Run it".into()).await.unwrap();
     let request = loop {
         if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
             break request;
@@ -2464,7 +2431,7 @@ async fn a_deny_comment_explains_the_rejection_and_continues_but_empty_denial_st
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         require_workspace_write_approval(&agent, chat).await;
         let mut events = agent.subscribe();
-        agent.submit(chat, None, "Create it".into()).await.unwrap();
+        agent.submit(chat, "Create it".into()).await.unwrap();
         let request = loop {
             if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
                 break request;
@@ -2493,7 +2460,7 @@ async fn a_deny_comment_explains_the_rejection_and_continues_but_empty_denial_st
         assert_eq!(snapshot.policy.rules[0].decision, Decision::Ask);
         assert!(snapshot.tool_call_recoveries.is_empty());
         if !continues {
-            assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+            assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
             assert!(
                 format!("{:?}", snapshot.messages.last().unwrap())
                     .contains("[Request interrupted by user for tool use]")
@@ -2526,7 +2493,7 @@ async fn permission_comments_cannot_create_session_or_persistent_authority() {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         require_workspace_write_approval(&agent, chat).await;
         let mut events = agent.subscribe();
-        agent.submit(chat, None, "Create it".into()).await.unwrap();
+        agent.submit(chat, "Create it".into()).await.unwrap();
         let request = loop {
             if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
                 break request;
@@ -2565,10 +2532,10 @@ async fn permission_comments_cannot_create_session_or_persistent_authority() {
     }
 }
 
-/// 会话授权只对原目标生效、重启后消失；照 Claude Code"不再询问"，持久授权写入用户设置中当前
-/// 工作目录的分区，对该目录的其他目标和重启后的新 Chat 同样生效。
+/// 会话授权只在本 Chat 的 Loop 内生效、重启后消失；照 Claude Code"不再询问"，持久授权写入用户
+/// 设置中当前工作目录的分区，对重启后的新 Chat 同样生效。
 #[tokio::test]
-async fn persistent_grants_cover_the_project_after_restart_but_session_grants_stay_with_their_goal()
+async fn persistent_grants_cover_the_project_after_restart_but_session_grants_stay_with_their_chat()
 {
     for scope in [PermissionScope::Session, PermissionScope::Persistent] {
         let is_persistent = scope == PermissionScope::Persistent;
@@ -2578,16 +2545,12 @@ async fn persistent_grants_cover_the_project_after_restart_but_session_grants_st
         std::fs::write(&source, "scoped information").unwrap();
         let request = || call("read", "Read", json!({"file_path":source}));
         let state = directory.path().join("state");
-        let mut replies = vec![
+        let replies = vec![
             request(),
             text("first read"),
             request(),
-            text("same goal read"),
-            request(),
+            text("same Chat read"),
         ];
-        if is_persistent {
-            replies.push(text("another goal read"));
-        }
         let agent = Agent::open_embedded(
             state.clone(),
             config(),
@@ -2596,8 +2559,8 @@ async fn persistent_grants_cover_the_project_after_restart_but_session_grants_st
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "Read the external source".into())
+        agent
+            .submit(chat, "Read the external source".into())
             .await
             .unwrap();
         loop {
@@ -2611,39 +2574,17 @@ async fn persistent_grants_cover_the_project_after_restart_but_session_grants_st
                 _ => {}
             }
         }
-        agent
-            .submit(chat, Some(receipt.loop_id), "Read it again".into())
-            .await
-            .unwrap();
+        agent.submit(chat, "Read it again".into()).await.unwrap();
         loop {
             match next_event(&mut events).await.kind {
                 EventKind::Completed { .. } => break,
                 EventKind::PermissionRequested { .. } => {
-                    panic!("the exact same goal operation lost its scoped grant")
+                    panic!("the exact same operation in the Chat lost its scoped grant")
                 }
                 EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
             }
         }
-        agent
-            .submit(chat, None, "A separate goal wants the same source".into())
-            .await
-            .unwrap();
-        let mut another_goal_asked = false;
-        loop {
-            match next_event(&mut events).await.kind {
-                EventKind::PermissionRequested { request } => {
-                    another_goal_asked = true;
-                    agent
-                        .answer_permission(chat, request.id, false)
-                        .await
-                        .unwrap();
-                }
-                EventKind::Interrupted | EventKind::Completed { .. } => break,
-                _ => {}
-            }
-        }
-        assert_eq!(another_goal_asked, !is_persistent);
         agent.shutdown().await;
         drop(agent);
 
@@ -2660,7 +2601,7 @@ async fn persistent_grants_cover_the_project_after_restart_but_session_grants_st
         );
         let mut events = restored.subscribe();
         restored
-            .submit(fresh, None, "Read again in a new Chat after restart".into())
+            .submit(fresh, "Read again in a new Chat after restart".into())
             .await
             .unwrap();
         let mut asked_after_restart = false;
@@ -2720,7 +2661,7 @@ async fn plan_rejects_writes_without_prompting_even_when_an_allow_rule_matches()
         }
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Write the file only if permitted".into())
+            .submit(chat, "Write the file only if permitted".into())
             .await
             .unwrap();
         loop {

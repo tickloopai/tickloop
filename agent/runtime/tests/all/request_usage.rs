@@ -265,7 +265,7 @@ async fn auto_setup_records_chat_owned_usage_and_terminal_outcomes_without_a_loo
             "{result:?}"
         );
         let snapshot = agent.snapshot(chat).await.unwrap();
-        assert!(snapshot.loops.is_empty());
+        assert!(snapshot.chat_loop.run_id.is_none());
         assert!(snapshot.messages.is_empty());
         let entries = snapshot.request_usage.entries();
         assert_eq!(entries.len(), 1);
@@ -305,7 +305,7 @@ async fn auto_setup_timeout_retains_observed_usage_and_closes_the_request() {
         .unwrap_err();
     assert!(error.to_string().contains("timed out"), "{error}");
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     assert_eq!(snapshot.request_usage.entries().len(), 1);
     let record = &snapshot.request_usage.entries()[0];
     assert_eq!(record.kind, ModelRequestKind::AutoSetup);
@@ -346,7 +346,7 @@ async fn auto_setup_shutdown_cancels_the_request_and_retains_usage() {
     agent.shutdown().await;
     assert!(task.await.unwrap().is_err());
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     assert_eq!(snapshot.request_usage.entries().len(), 1);
     let record = &snapshot.request_usage.entries()[0];
     assert_eq!(record.kind, ModelRequestKind::AutoSetup);
@@ -375,7 +375,7 @@ async fn one_reply_observations_and_final_usage_are_recorded_once() {
         Agent::open_embedded(archive.clone(), config(&main_identity()), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Reply".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Reply".into()).await.unwrap();
     assert_eq!(completed_usage(&mut events, receipt.run_id).await, expected);
     let snapshot = agent.snapshot(chat).await.unwrap();
     let entries = support::model_script_requests(&snapshot);
@@ -417,10 +417,7 @@ async fn tool_rounds_and_multiple_calls_share_one_entry_per_model_request() {
     let agent = Agent::new_embedded(config(&main_identity()), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Read sources".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Read sources".into()).await.unwrap();
     assert_eq!(
         completed_usage(&mut events, receipt.run_id).await,
         counters(60, 6, 9, 1)
@@ -461,10 +458,7 @@ async fn overflowing_run_usage_fails_without_losing_accepted_request_counters() 
     let agent = Agent::new_embedded(config(&main_identity()), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Read source".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Read source".into()).await.unwrap();
     let terminal = terminal_event(&mut events, receipt.run_id).await;
     match terminal.kind {
         EventKind::Failed(error) => assert!(error.contains("Input usage exceeds")),
@@ -482,7 +476,7 @@ async fn overflowing_run_usage_fails_without_losing_accepted_request_counters() 
     }
     assert_eq!(entries[0].usage, first_usage);
     assert_eq!(entries[1].usage, second_usage);
-    assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
     assert!(!snapshot.events.iter().any(|event| {
         event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. })
     }));
@@ -521,7 +515,7 @@ async fn a_failed_tool_result_returns_to_the_model_with_each_accepted_request_re
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Read the missing file".into())
+        .submit(chat, "Read the missing file".into())
         .await
         .unwrap();
     assert!(matches!(
@@ -549,7 +543,7 @@ async fn a_failed_tool_result_returns_to_the_model_with_each_accepted_request_re
             .iter()
             .all(|entry| entry.outcome == RequestOutcome::Accepted)
     );
-    assert_eq!(snapshot.loops[0].state, LoopState::Completed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     assert!(snapshot.events.iter().any(|event| {
         matches!(&event.kind, EventKind::ToolCompleted { call_id, result, .. }
             if call_id == "missing" && result.is_error)
@@ -571,7 +565,7 @@ async fn manual_compaction_acceptance_and_rejection_have_no_borrowed_run_identit
     let agent = Agent::new_embedded(config(&main_identity()), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Start".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Start".into()).await.unwrap();
     assert_eq!(
         completed_usage(&mut events, receipt.run_id).await,
         counters(10, 2, 0, 0)
@@ -585,7 +579,6 @@ async fn manual_compaction_acceptance_and_rejection_have_no_borrowed_run_identit
         accepted.latest_compact_summary()
     );
     assert_eq!(snapshot.messages, accepted.messages);
-    assert_eq!(snapshot.loops.len(), 1);
     assert_eq!(model.request_count(), 3);
     let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 3);
@@ -627,23 +620,14 @@ async fn automatic_compaction_is_owned_by_its_run_but_excluded_from_reply_usage(
     let agent = Agent::new_embedded(config(&main_identity()), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Keep constraints".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "Keep constraints".into()).await.unwrap();
     completed_usage(&mut events, first.run_id).await;
     for prompt in ["Second step", "Third step"] {
-        let receipt = agent
-            .submit(chat, Some(first.loop_id), prompt.into())
-            .await
-            .unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         completed_usage(&mut events, receipt.run_id).await;
     }
     agent.set_context_window(chat, 20_000).await.unwrap();
-    let receipt = agent
-        .submit(chat, Some(first.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Continue".into()).await.unwrap();
     assert_eq!(
         completed_usage(&mut events, receipt.run_id).await,
         counters(20, 4, 2, 0)
@@ -707,10 +691,7 @@ async fn checker_uses_its_actual_identity_and_is_excluded_from_conversation_tota
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "Write result.txt".into())
-            .await
-            .unwrap();
+        let receipt = agent.submit(chat, "Write result.txt".into()).await.unwrap();
         assert_eq!(
             completed_usage(&mut events, receipt.run_id).await,
             counters(30, 3, 0, 0)
@@ -779,7 +760,7 @@ async fn invalid_checker_verdict_retains_usage_and_blocks_the_call() {
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Write if approved".into())
+        .submit(chat, "Write if approved".into())
         .await
         .unwrap();
     assert!(matches!(
@@ -823,10 +804,7 @@ async fn operations_not_needing_review_create_no_auto_review_request_record() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Read source.txt".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Read source.txt".into()).await.unwrap();
     completed_usage(&mut events, receipt.run_id).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(
@@ -853,10 +831,7 @@ async fn switching_models_never_relabels_old_requests() {
     let agent = embedded_agent(config(&main_identity()), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "First request".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "First request".into()).await.unwrap();
     completed_usage(&mut events, first.run_id).await;
     let next_identity = identity("same-provider-responses", Protocol::Responses, "next-model");
     let next_model = Arc::new(UsageModel::new(
@@ -868,10 +843,7 @@ async fn switching_models_never_relabels_old_requests() {
         agent.set_model(chat, config(&next_identity)).await.unwrap(),
         ModelChange::Applied
     );
-    let second = agent
-        .submit(chat, Some(first.loop_id), "Next request".into())
-        .await
-        .unwrap();
+    let second = agent.submit(chat, "Next request".into()).await.unwrap();
     completed_usage(&mut events, second.run_id).await;
     let before = agent.snapshot(chat).await.unwrap();
     assert_eq!(
@@ -904,10 +876,7 @@ async fn cancelling_after_usage_was_queued_drains_and_terminalizes_the_same_requ
     let agent = Agent::new_embedded(config(&main_identity()), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Start a request".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Start a request".into()).await.unwrap();
     tokio::time::timeout(EVENT_TIMEOUT, entered.notified())
         .await
         .unwrap();
@@ -958,7 +927,7 @@ async fn host_rejection_and_usage_regression_retain_observed_facts_without_compl
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     for prompt in ["Invalid tool response", "Regressed usage"] {
-        let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         assert!(matches!(
             terminal_event(&mut events, receipt.run_id).await.kind,
             EventKind::Failed(_)
@@ -1017,7 +986,7 @@ async fn failed_requests_keep_reported_usage_and_leave_missing_counters_unknown(
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     for prompt in ["HTTP failure", "Provider failure"] {
-        let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         assert!(matches!(
             terminal_event(&mut events, receipt.run_id).await.kind,
             EventKind::Failed(_)
@@ -1061,13 +1030,10 @@ async fn evicting_old_completed_events_preserves_all_request_records_and_totals(
         Agent::open_embedded(archive.clone(), config(&main_identity()), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(chat, None, "First".into()).await.unwrap();
+    let first = agent.submit(chat, "First".into()).await.unwrap();
     let first_completed = terminal_event(&mut events, first.run_id).await;
     assert!(matches!(first_completed.kind, EventKind::Completed { .. }));
-    let second = agent
-        .submit(chat, Some(first.loop_id), "Noisy reply".into())
-        .await
-        .unwrap();
+    let second = agent.submit(chat, "Noisy reply".into()).await.unwrap();
     completed_usage(&mut events, second.run_id).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.events.len(), 1_024);

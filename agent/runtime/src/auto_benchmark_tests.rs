@@ -286,12 +286,9 @@ async fn review_case(
         || vec![case.user],
         |dialogue| vec![dialogue.initial.as_str(), dialogue.reply.as_str()],
     );
-    let mut loop_id = None;
     let mut receipt = None;
     for prompt in prompts {
-        let submitted = agent.submit(chat_id, loop_id, prompt.into()).await.unwrap();
-        loop_id = Some(submitted.loop_id);
-        receipt = Some(submitted);
+        receipt = Some(agent.submit(chat_id, prompt.into()).await.unwrap());
         loop {
             match next_event(&mut events).await.kind {
                 EventKind::Completed { .. } => break,

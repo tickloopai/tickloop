@@ -7,7 +7,7 @@
 //! Recovery assigns a fresh, unapproved version when the file disagrees with its checkpoint.
 //! TodoWrite replaces the Loop's progress, rebuilt from the last successful call or checkpoint.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,9 +23,8 @@ use tickloop_agent_base::private_fs::{
 };
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
-    ChatSnapshot, EventKind, FileReadRecord, LoopId, LoopState, OperationRecord,
-    PermissionApprovalSource, Plan, Progress, PromptPolicy, Receipt, TodoItem, ToolDefinition,
-    ToolResult,
+    ChatSnapshot, EventKind, FileReadRecord, LoopId, OperationRecord, PermissionApprovalSource,
+    Plan, Progress, PromptPolicy, Receipt, TodoItem, ToolDefinition, ToolResult,
 };
 use tickloop_agent_tools::{
     ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, FileReadRecordExt, TODO_WRITE_TOOL_NAME,
@@ -206,7 +205,6 @@ struct PlanFile {
 /// 链上 Loop 条目携带的计划版本与进度。`position` 是条目之前的消息数。
 pub(super) struct PlanCheckpoint {
     pub position: usize,
-    pub loop_id: LoopId,
     pub plan_version: Option<u64>,
     pub approval_pending: bool,
     pub progress: Option<Vec<TodoItem>>,
@@ -443,12 +441,12 @@ pub(super) fn copy_plans_to_new_slug(
     bookkeeping.plan_slug = Some(slug);
 }
 
-/// 该 Loop 已使用过的最高计划版本，包括内容不可用的计划。
+/// Loop 已使用过的最高计划版本，包括内容不可用的计划。
 pub(super) fn highest_plan_version(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
-    loop_id: LoopId,
 ) -> Option<u64> {
+    let loop_id = snapshot.chat_loop.id;
     let current = snapshot
         .plans
         .iter()
@@ -457,8 +455,8 @@ pub(super) fn highest_plan_version(
     current.max(bookkeeping.unavailable_plan_versions.get(&loop_id).copied())
 }
 
-/// 沿对话链重建计划版本与进度：Loop 条目携带的检查点与之后成功的计划、进度工具调用按链上
-/// 顺序生效。版本取检查点与调用结果中较大的值；进度取最后一次生效的内容。返回恢复时发现的
+/// 沿对话链重建 Loop 的计划版本与进度：Loop 条目携带的检查点与之后成功的计划、进度工具调用
+/// 按链上顺序生效。版本取检查点与调用结果中较大的值；进度取最后一次生效的内容。返回恢复时发现的
 /// 问题，供加载警告显示。
 ///
 /// 计划内容从计划文件读取，并与链上记录核对：文件版本行记录的版本等于重建的版本、且摘要与内容
@@ -476,26 +474,24 @@ pub(super) fn rebuild_plans_and_progress(
         Progress(Vec<TodoItem>),
     }
     // 排序键：位置为 p 的检查点在第 p 条消息之前（2p），结果位于第 r 条消息的调用紧随其后（2r+1）。
+    let loop_id = snapshot.chat_loop.id;
     let mut changes = Vec::new();
     for checkpoint in checkpoints {
         let order = checkpoint.position * 2;
         if let Some(version) = checkpoint.plan_version {
-            changes.push((order, checkpoint.loop_id, Change::Version(version)));
+            changes.push((order, Change::Version(version)));
         }
         if let Some(todos) = &checkpoint.progress {
-            changes.push((order, checkpoint.loop_id, Change::Progress(todos.clone())));
+            changes.push((order, Change::Progress(todos.clone())));
         }
     }
     for call in projection::history_calls(snapshot)? {
         let Some((result_message, result_content)) = call.result else {
             continue;
         };
-        let Some(loop_id) = call
-            .run_id
-            .and_then(|run| bookkeeping.run_loops.get(&run).copied())
-        else {
+        if call.run_id.is_none() {
             continue;
-        };
+        }
         let (Content::ToolUse { name, input, .. }, Content::ToolResult { is_error, .. }) = (
             &snapshot.messages[call.message_index].content[call.content_index],
             &snapshot.messages[result_message].content[result_content],
@@ -509,32 +505,25 @@ pub(super) fn rebuild_plans_and_progress(
         if name == TODO_WRITE_TOOL_NAME
             && let Ok(todos) = TodoWriteInput::parse(input)
         {
-            changes.push((position, loop_id, Change::Progress(todos)));
+            changes.push((position, Change::Progress(todos)));
         }
     }
-    changes.sort_by_key(|(position, _, _)| *position);
-    let mut versions = HashMap::<LoopId, u64>::new();
-    let mut progress = HashMap::<LoopId, Vec<TodoItem>>::new();
-    for (_, loop_id, change) in changes {
+    changes.sort_by_key(|(position, _)| *position);
+    let mut recorded_version = None::<u64>;
+    let mut progress = None;
+    for (_, change) in changes {
         match change {
             Change::Version(version) => {
-                let current = versions.entry(loop_id).or_default();
-                *current = (*current).max(version);
+                recorded_version = Some(recorded_version.unwrap_or_default().max(version));
             }
-            Change::Progress(todos) => {
-                progress.insert(loop_id, todos);
-            }
+            Change::Progress(todos) => progress = Some(todos),
         }
     }
     let mut warnings = Vec::new();
     let pending = checkpoints
         .iter()
-        .filter_map(|checkpoint| {
-            checkpoint
-                .plan_version
-                .map(|_| (checkpoint.loop_id, checkpoint.approval_pending))
-        })
-        .collect::<HashMap<_, _>>();
+        .rev()
+        .find_map(|checkpoint| checkpoint.plan_version.map(|_| checkpoint.approval_pending));
     // 与 `--fork-session` 相同，换用新的 slug；旧 slug 无法安全定位计划文件，已记录版本的计划按缺失处理。
     let mut location = directory.zip(bookkeeping.plan_slug.clone());
     if let Some(slug) = bookkeeping
@@ -547,18 +536,13 @@ pub(super) fn rebuild_plans_and_progress(
         bookkeeping.plan_slug = Some(generate_plan_slug(directory));
         location = None;
     }
-    let loop_ids = snapshot
-        .loops
-        .iter()
-        .map(|goal| goal.id)
-        .collect::<Vec<_>>();
     let mut plans = Vec::new();
     let mut unavailable = BTreeMap::new();
-    for loop_id in &loop_ids {
-        let recorded = versions.remove(loop_id).filter(|version| *version > 0);
+    'restore: {
+        let recorded = recorded_version.filter(|version| *version > 0);
         let file = location
             .as_ref()
-            .map(|(directory, slug)| read_plan_file(directory, slug, *loop_id));
+            .map(|(directory, slug)| read_plan_file(directory, slug, loop_id));
         match (recorded, file) {
             (Some(version), Some(Ok(file))) => {
                 let restored_version = if file.is_submitted && file.version == Some(version) {
@@ -566,27 +550,28 @@ pub(super) fn rebuild_plans_and_progress(
                 } else {
                     let fresh = file.version.unwrap_or(0).max(version).saturating_add(1);
                     warnings.push(format!(
-                        "the plan file of goal {loop_id} does not match plan version {version} recorded in the conversation; it is restored as unapproved version {fresh}"
+                        "the plan file does not match plan version {version} recorded in the conversation; it is restored as unapproved version {fresh}"
                     ));
                     fresh
                 };
                 if restored_version != version {
                     let (directory, slug) = location.as_ref().expect("readable plan location");
                     if let Err(error) =
-                        write_plan_file(directory, slug, *loop_id, restored_version, &file.markdown)
+                        write_plan_file(directory, slug, loop_id, restored_version, &file.markdown)
                     {
-                        warnings.push(format!("cannot save recovered plan version {restored_version} of goal {loop_id}: {error}"));
-                        unavailable.insert(*loop_id, restored_version);
-                        continue;
+                        warnings.push(format!(
+                            "cannot save recovered plan version {restored_version}: {error}"
+                        ));
+                        unavailable.insert(loop_id, restored_version);
+                        break 'restore;
                     }
                 }
                 plans.push(Plan {
-                    loop_id: *loop_id,
+                    loop_id,
                     version: restored_version,
                     markdown: file.markdown,
                     approved_execution_mode: None,
-                    approval_pending: restored_version != version
-                        || pending.get(loop_id).copied().unwrap_or(true),
+                    approval_pending: restored_version != version || pending.unwrap_or(true),
                 });
             }
             (
@@ -599,18 +584,18 @@ pub(super) fn rebuild_plans_and_progress(
             ) => {
                 let fresh = file_version.saturating_add(1);
                 warnings.push(format!(
-                    "the plan file of goal {loop_id} was not recorded in the conversation; it is restored as unapproved version {fresh}"
+                    "the plan file was not recorded in the conversation; it is restored as unapproved version {fresh}"
                 ));
                 let (directory, slug) = location.as_ref().expect("readable plan location");
-                if let Err(error) = write_plan_file(directory, slug, *loop_id, fresh, &markdown) {
+                if let Err(error) = write_plan_file(directory, slug, loop_id, fresh, &markdown) {
                     warnings.push(format!(
-                        "cannot save recovered plan version {fresh} of goal {loop_id}: {error}"
+                        "cannot save recovered plan version {fresh}: {error}"
                     ));
-                    unavailable.insert(*loop_id, fresh);
-                    continue;
+                    unavailable.insert(loop_id, fresh);
+                    break 'restore;
                 }
                 plans.push(Plan {
-                    loop_id: *loop_id,
+                    loop_id,
                     version: fresh,
                     markdown,
                     approved_execution_mode: None,
@@ -623,24 +608,19 @@ pub(super) fn rebuild_plans_and_progress(
                     _ => "the plan file cannot be located".into(),
                 };
                 warnings.push(format!(
-                    "cannot restore plan version {version} of goal {loop_id}: {reason}; the next plan will be version {}",
+                    "cannot restore plan version {version}: {reason}; the next plan will be version {}",
                     version.saturating_add(1)
                 ));
-                unavailable.insert(*loop_id, version);
+                unavailable.insert(loop_id, version);
             }
             (None, _) => {}
         }
     }
     snapshot.plans = plans;
     bookkeeping.unavailable_plan_versions = unavailable;
-    snapshot.progress = loop_ids
-        .iter()
-        .filter_map(|loop_id| {
-            Some(Progress {
-                loop_id: *loop_id,
-                todos: progress.remove(loop_id)?,
-            })
-        })
+    snapshot.progress = progress
+        .map(|todos| Progress { loop_id, todos })
+        .into_iter()
         .collect();
     Ok(warnings)
 }
@@ -653,7 +633,6 @@ impl Agent {
     pub async fn decline_plan(
         &self,
         chat_id: ChatId,
-        loop_id: LoopId,
         version: u64,
         feedback: Option<String>,
     ) -> Result<Option<Receipt>, AgentError> {
@@ -662,6 +641,7 @@ impl Agent {
             .filter(|text| !text.is_empty());
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let loop_id = chat.snapshot.chat_loop.id;
         let plan = chat
             .snapshot
             .plans
@@ -707,13 +687,9 @@ impl Agent {
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         drop(chats);
-        self.submit(
-            chat_id,
-            Some(loop_id),
-            prompts::declined_plan(Some(&feedback)),
-        )
-        .await
-        .map(Some)
+        self.submit(chat_id, prompts::declined_plan(Some(&feedback)))
+            .await
+            .map(Some)
     }
 
     /// Approves the reviewed version and resumes its waiting tool. If that Run already ended,
@@ -721,7 +697,6 @@ impl Agent {
     pub async fn approve_plan(
         &self,
         chat_id: ChatId,
-        loop_id: LoopId,
         version: u64,
         mode: ExecutionMode,
     ) -> Result<Option<String>, AgentError> {
@@ -732,6 +707,7 @@ impl Agent {
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let loop_id = chat.snapshot.chat_loop.id;
         // Subagents never reach plan approval, but an approval request can name any Chat, so the
         // delegated ceiling is enforced here rather than trusted to the tools a child lacks.
         if chat
@@ -765,19 +741,11 @@ impl Agent {
         }
         let mut snapshot = chat.snapshot.clone();
         let plans_directory = self.plans_directory(super::require_folder(&snapshot)?);
-        let goal = snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == loop_id)
-            .ok_or(AgentError::NotFound)?;
-        if goal.state == LoopState::Stopped {
-            return Err(AgentError::Invalid("goal is stopped".into()));
-        }
         let plan = snapshot
             .plans
             .iter_mut()
             .find(|plan| plan.loop_id == loop_id)
-            .ok_or_else(|| AgentError::Invalid("goal has no plan".into()))?;
+            .ok_or_else(|| AgentError::Invalid("the Loop has no plan".into()))?;
         if plan.version != version {
             return Err(AgentError::Invalid(
                 "plan was revised; review the current version".into(),
@@ -1087,7 +1055,7 @@ impl Agent {
         if markdown.trim().is_empty() {
             return Err(prompts::empty_plan_file(&path));
         }
-        let version = highest_plan_version(snapshot, bookkeeping, loop_id).unwrap_or(0) + 1;
+        let version = highest_plan_version(snapshot, bookkeeping).unwrap_or(0) + 1;
         let contents = write_plan_file(directory, &slug, loop_id, version, &markdown)
             .map_err(|error| format!("cannot save the plan: {error}"))?;
         let file_reads = chat.tools.file_reads();

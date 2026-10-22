@@ -293,11 +293,7 @@ impl StatusArea {
                 row.parent_id.is_some()
                     && matches!(
                         row.state,
-                        LoopState::Completed
-                            | LoopState::Failed
-                            | LoopState::Stopped
-                            | LoopState::Interrupted
-                            | LoopState::Expired
+                        LoopState::Idle | LoopState::Failed | LoopState::Interrupted
                     )
             })
             .map(|row| row.agent_id)
@@ -1262,22 +1258,6 @@ mod tests {
             Some(162_000),
             "only the run time ticks"
         );
-        rows[1].group = AttentionGroup::Waiting;
-        rows[1].state = tickloop_agent_protocol::LoopState::WaitingTrigger;
-        rows[1].glyph = Glyph::AgentWaiting;
-        rows[1].status = "Waiting · trigger".into();
-        area.update_agents(rows.clone(), Some(child));
-        let display = DisplayProfile::default();
-        assert_ne!(
-            display.glyph(Glyph::AgentWaiting),
-            display.glyph(Glyph::AgentIdle)
-        );
-        let waiting = &area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1];
-        assert!(
-            waiting.text().ends_with("Waiting · trigger"),
-            "a waiting member shows its state: {waiting:?}"
-        );
-        assert_eq!(waiting.spans[1].role, Some(Role::AgentCyan));
         rows[1].group = AttentionGroup::Idle;
         rows[1].state = tickloop_agent_protocol::LoopState::Idle;
         rows[1].status = "Idle".into();
@@ -1472,7 +1452,7 @@ mod tests {
         use crate::agent_console::AttentionGroup;
         use tickloop_agent_protocol::{AgentColor, SubagentRegistration};
         let root = Uuid::from_u128(1);
-        let row = |id: u128, state: LoopState, group: AttentionGroup, completed: bool| AgentRow {
+        let row = |id: u128, state: LoopState, group: AttentionGroup| AgentRow {
             agent_id: Uuid::from_u128(id),
             parent_id: (id != 1).then_some(root),
             title: format!("member-{id}"),
@@ -1483,7 +1463,7 @@ mod tests {
             approvals: 0,
             questions: 0,
             group,
-            glyph: super::super::console::status_glyph(group, completed),
+            glyph: super::super::console::status_glyph(group, false),
             preview: None,
             updated_at: Some(64_000),
             run_started_at: None,
@@ -1499,11 +1479,10 @@ mod tests {
         area.update("Auto".into(), "model".into(), None, None);
         area.update_agents(
             vec![
-                row(1, LoopState::Idle, AttentionGroup::Idle, false),
-                row(2, LoopState::Completed, AttentionGroup::Done, true),
-                row(3, LoopState::Failed, AttentionGroup::Errors, false),
-                row(4, LoopState::Stopped, AttentionGroup::Done, false),
-                row(5, LoopState::Interrupted, AttentionGroup::Done, false),
+                row(1, LoopState::Idle, AttentionGroup::Idle),
+                row(2, LoopState::Idle, AttentionGroup::Idle),
+                row(3, LoopState::Failed, AttentionGroup::Errors),
+                row(4, LoopState::Interrupted, AttentionGroup::Done),
             ],
             Some(root),
         );
@@ -1520,7 +1499,7 @@ mod tests {
             "main's dot keeps the viewed row's colour: {:?}",
             lines[0]
         );
-        for (index, line) in lines.iter().enumerate().take(5).skip(1) {
+        for (index, line) in lines.iter().enumerate().take(4).skip(1) {
             assert_eq!(line.spans[1].text, "○");
             assert_eq!(
                 line.spans[1].role,
@@ -1534,10 +1513,9 @@ mod tests {
                     .all(|span| span.role == Some(Role::MutedText)),
                 "{line:?}"
             );
-            let expected = ["idle", "Failed", "Stopped", "Interrupted"][index - 1];
+            let expected = ["idle", "Failed", "Interrupted"][index - 1];
             assert!(line.text().ends_with(expected), "{line:?}");
-            let expected_role =
-                [Role::MutedText, Role::Error, Role::Warning, Role::Warning][index - 1];
+            let expected_role = [Role::MutedText, Role::Error, Role::Warning][index - 1];
             assert_eq!(line.spans.last().unwrap().role, Some(expected_role));
             for word in ["done", "failed", "stopped", "✔", "✖"] {
                 assert!(!line.text().contains(word), "{line:?}");
@@ -1662,14 +1640,14 @@ mod shared_task_tests {
                 agent_id: Uuid::from_u128(9001),
                 parent_id: Some(Uuid::from_u128(9002)),
                 title: "Read notes".into(),
-                status: "Completed".into(),
-                state: LoopState::Completed,
+                status: "Idle".into(),
+                state: LoopState::Idle,
                 project: String::new(),
                 workspace: None,
                 approvals: 0,
                 questions: 0,
-                group: crate::agent_console::AttentionGroup::Done,
-                glyph: Glyph::AgentCompleted,
+                group: crate::agent_console::AttentionGroup::Idle,
+                glyph: Glyph::AgentIdle,
                 preview: None,
                 updated_at: None,
                 run_started_at: None,

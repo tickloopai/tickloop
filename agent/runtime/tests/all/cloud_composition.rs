@@ -36,7 +36,6 @@ use super::mcp_tools::artifact_service::{ArtifactService, CREATED_ARTIFACT};
 const WAIT: Duration = Duration::from_secs(20);
 const ROOT_PROMPT: &str = "Use every tool you have once.";
 const CHILD_TASK: &str = "Check the delivery date and report back.";
-const QUEUED_GOAL: &str = "Draft the release note.";
 
 /// The cloud's composition: what the private host configures for every Harness.
 fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
@@ -74,7 +73,6 @@ fn prompt(text: &str) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -148,12 +146,7 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 )
             };
         }
-        if !starts_with_prompt(request, ROOT_PROMPT)
-            || request
-                .messages
-                .last()
-                .is_some_and(|message| format!("{:?}", message.content).contains(QUEUED_GOAL))
-        {
+        if !starts_with_prompt(request, ROOT_PROMPT) {
             return text("Done.");
         }
         let task = tool_result(&request.messages, "create").map(|result| result["task"].clone());
@@ -179,7 +172,6 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 "TaskUpdate",
                 json!({"mutation_id": Uuid::from_u128(2), "task_id": task.as_ref().map(|task| task["id"].clone()), "expected_revision": 1, "action": "claim"}),
             ),
-            ("goal", "StartGoal", json!({"goal": QUEUED_GOAL})),
             (
                 "delegate",
                 SUBAGENT_TOOL_NAME,

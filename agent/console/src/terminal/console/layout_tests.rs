@@ -2993,14 +2993,15 @@ const OLD_SHELL_AGENT: Uuid = Uuid::from_u128(0x937b_0000_0000_0000_0000_0000_00
 const NEW_SHELL_AGENT: Uuid = Uuid::from_u128(0x2c7e_0000_0000_0000_0000_0000_0000_0002);
 const BRAVO_AGENT: Uuid = Uuid::from_u128(0x77b4_0000_0000_0000_0000_0000_0000_0003);
 
-/// A finished root Agent; Done stays expanded, so these rows are listed without unfolding.
+/// A root Agent whose turn was interrupted; Done stays expanded, so these rows are listed
+/// without unfolding.
 fn finished_row(id: Uuid, title: &str, project: &str) -> AgentRow {
     let mut row = agent_row(id, None, title);
-    row.status = "Completed".into();
-    row.state = LoopState::Completed;
+    row.status = "Interrupted".into();
+    row.state = LoopState::Interrupted;
     row.approvals = 0;
     row.group = AttentionGroup::Done;
-    row.glyph = status_glyph(AttentionGroup::Done, true);
+    row.glyph = status_glyph(AttentionGroup::Done, false);
     row.project = project.into();
     row
 }
@@ -3119,7 +3120,7 @@ fn agent_layout_reading_numbers_cover_identical_and_cut_titles() {
             ])))
             .unwrap();
         let frame = frame_lines(&console);
-        let rows = listed_rows(&frame, "Investigate quarte");
+        let rows = listed_rows(&frame, "Investigate quar");
         assert_eq!(rows.len(), 2, "{frame:#?}");
         assert_eq!(
             rows.iter().all(|line| line.contains(") ·")),
@@ -3277,11 +3278,11 @@ fn agent_layout_creation_cue_names_a_filter_hidden_agent_without_moving_monitor_
     }
     let frame = frame_lines(&console);
     assert!(
-        line_with(&frame, "Created !pwd (2) · Completed").is_some(),
+        line_with(&frame, "Created !pwd (2) · Interrupted").is_some(),
         "{frame:#?}"
     );
-    assert!(line_with(&frame, "!pwd (2) · Completed · project-a").is_some());
-    assert!(line_with(&frame, "!pwd (1) · Completed · project-a").is_some());
+    assert!(line_with(&frame, "!pwd (2) · Interrupted · project-a").is_some());
+    assert!(line_with(&frame, "!pwd (1) · Interrupted · project-a").is_some());
 }
 
 #[test]
@@ -3719,7 +3720,7 @@ fn agent_layout_real_pty_accepted_dispatch_cue_keeps_the_monitored_filter_and_se
             frame.contains("Project: all")
                 && frame
                     .lines()
-                    .any(|line| line.ends_with("Created !pwd (2) · Completed"))
+                    .any(|line| line.ends_with("Created !pwd (2) · Interrupted"))
         });
         eprintln!("Console PTY {label}: filter cleared, created row identified\n{frame}");
         let tree = frame
@@ -3786,7 +3787,7 @@ fn fleet_row(
     (state, status): (LoopState, &str),
     group: AttentionGroup,
 ) -> AgentRow {
-    let glyph = status_glyph(group, state == LoopState::Completed);
+    let glyph = status_glyph(group, false);
     AgentRow {
         agent_id: id,
         parent_id: parent,
@@ -3859,8 +3860,8 @@ fn fleet_overview() -> AgentOverview {
             Uuid::from_u128(0x5500),
             None,
             "Watch earnings",
-            (LoopState::WaitingTrigger, "Waiting · trigger"),
-            AttentionGroup::Waiting,
+            (LoopState::Queued, "Queued"),
+            AttentionGroup::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5600),
@@ -3875,7 +3876,7 @@ fn fleet_overview() -> AgentOverview {
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         )
     }));
@@ -3940,8 +3941,7 @@ fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
         [
             "Needs input · 2",
             "Errors · 1",
-            "Working · 1",
-            "Waiting · 1",
+            "Working · 2",
             "Idle · 1",
             "Done · 16",
             "Empty · 14 · never used",
@@ -4040,7 +4040,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
             line_with(&frame, "Needs input").is_none(),
             "the selection is in a scrolled list: {frame:#?}"
         );
-        screen_row(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")).unwrap()
+        screen_row(&frame, &format!("{SELECTED_MARK} ✖ Done task 09")).unwrap()
     };
     let mut arrived = fleet_overview();
     let mut asking = fleet_row(
@@ -4060,7 +4060,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert_eq!(
-        screen_row(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")),
+        screen_row(&frame, &format!("{SELECTED_MARK} ✖ Done task 09")),
         Some(before),
         "{frame:#?}"
     );
@@ -4074,7 +4074,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert!(
-        line_with(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")).is_some(),
+        line_with(&frame, &format!("{SELECTED_MARK} ✖ Done task 09")).is_some(),
         "resize keeps the selection in view: {frame:#?}"
     );
     assert!(
@@ -4101,10 +4101,10 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
         .filter(|row| [INTERRUPTED_FAMILY, RUNNING_CHILD].contains(&row.agent_id))
         .cloned()
         .map(|mut row| {
-            row.status = "Completed".into();
-            row.state = LoopState::Completed;
+            row.status = "Interrupted".into();
+            row.state = LoopState::Interrupted;
             row.group = AttentionGroup::Done;
-            row.glyph = status_glyph(AttentionGroup::Done, true);
+            row.glyph = status_glyph(AttentionGroup::Done, false);
             row
         })
         .collect::<Vec<_>>();
@@ -4116,7 +4116,7 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
     let mut state = console.state.lock().unwrap();
     let frame = drawn(&mut state);
     assert!(
-        line_with(&frame, &format!("{SELECTED_MARK} ✔ Long scan")).is_some(),
+        line_with(&frame, &format!("{SELECTED_MARK} ✖ Long scan")).is_some(),
         "{frame:#?}"
     );
     state.key(key(KeyCode::Char('k')));
@@ -4153,7 +4153,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         )
     }));
@@ -4205,7 +4205,7 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         )
     }));
@@ -4531,10 +4531,7 @@ fn agent_layout_overview_rows_carry_state_in_words_and_semantic_roles() {
         role_of(row("Plan the hedge"), "Plan review"),
         Some(Role::Warning)
     );
-    assert_eq!(
-        role_of(row("Watch earnings"), "Waiting · trigger"),
-        Some(Role::MutedText)
-    );
+    assert_eq!(role_of(row("Watch earnings"), "Queued"), Some(Role::Accent));
     assert_eq!(role_of(row("Long scan"), "Running"), Some(Role::Accent));
 }
 
@@ -4756,9 +4753,9 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
         fleet_row(
             Uuid::from_u128(0x5500),
             None,
-            "Keep this goal",
-            (LoopState::WaitingTrigger, "Waiting · trigger"),
-            AttentionGroup::Waiting,
+            "Keep this task",
+            (LoopState::Queued, "Queued"),
+            AttentionGroup::Working,
         ),
     ];
     rows.extend((0..17).map(|index| {
@@ -4775,7 +4772,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             screenshot_done(index),
             None,
             SCREENSHOT_TITLE,
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         )
     }));
@@ -4783,7 +4780,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
         SCREENSHOT_SOURCE,
         None,
         "Tick 的标准化设计",
-        (LoopState::Completed, "Completed"),
+        (LoopState::Interrupted, "Interrupted"),
         AttentionGroup::Done,
     ));
     AgentOverview {
@@ -4942,7 +4939,7 @@ fn repeated_done(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
         id,
         parent,
         title,
-        (LoopState::Completed, "Completed"),
+        (LoopState::Interrupted, "Interrupted"),
         AttentionGroup::Done,
     )
 }
@@ -5238,7 +5235,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             finished,
             None,
             "Alpha",
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         );
         done.updated_at = Some(six_minutes_ago);
@@ -5256,7 +5253,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             Uuid::from_u128(0xa300),
             None,
             "Charlie",
-            (LoopState::Completed, "Completed"),
+            (LoopState::Interrupted, "Interrupted"),
             AttentionGroup::Done,
         );
         let mut state = State::new(true, width, height);
@@ -5291,7 +5288,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
                 .unwrap_or_else(|| panic!("{width} columns: {title} is listed: {screen:#?}"))
         };
         let content_columns = usize::from(width) - 1;
-        for (title, glyph, role) in [("Alpha", '✔', Role::Success), ("Bravo", '◆', Role::Warning)]
+        for (title, glyph, role) in [("Alpha", '✖', Role::Warning), ("Bravo", '◆', Role::Warning)]
         {
             let text = screen_row(title);
             let line = lines

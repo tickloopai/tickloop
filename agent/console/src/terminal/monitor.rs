@@ -414,7 +414,6 @@ impl Monitor {
         {
             detail.entry = entry.clone();
         }
-        let goals = self.loop_goals();
         if let Some(detail) = self
             .detail
             .as_mut()
@@ -424,7 +423,6 @@ impl Monitor {
             detail.update(
                 title_of(&self.entries, &instance),
                 crate::monitor_rows::subscriptions_on(&shown_subscriptions, &instance),
-                goals,
             );
             if detail.is_done() {
                 self.close_detail();
@@ -585,14 +583,6 @@ impl Monitor {
     /// The row's title, or the instance itself when no row shows it.
     pub(super) fn title_of(&self, instance: &InstanceRef) -> String {
         title_of(&self.entries, instance)
-    }
-    /// What each of the Chat's Loops is for, by Loop.
-    pub(super) fn loop_goals(&self) -> HashMap<uuid::Uuid, String> {
-        self.chat_status
-            .iter()
-            .flat_map(|chat| &chat.loops)
-            .map(|goal| (goal.id, goal.goal.clone()))
-            .collect()
     }
     #[cfg(test)]
     pub(super) fn replace(&mut self, group: TickGroup, rows: Vec<MonitorEntry>) {
@@ -1219,7 +1209,7 @@ mod signal_tests {
                 "id": uuid::Uuid::from_u128(1),
                 "folder": "/fixture",
                 "messages": [],
-                "loops": []
+                "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
             }))
             .unwrap(),
         )
@@ -1722,7 +1712,7 @@ mod signal_tests {
         TickSubscriptionStatus {
             id: uuid::Uuid::from_u128(frequency as u128 + 2),
             loop_id: uuid::Uuid::from_u128(9),
-            loop_state: LoopState::WaitingTrigger,
+            loop_state: LoopState::Idle,
             instance: quotes(),
             frequency,
             accumulated: 0,
@@ -2202,7 +2192,7 @@ mod rebuild_benchmarks {
             "id": uuid::Uuid::from_u128(1),
             "folder": "/fixture",
             "messages": messages,
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
         }))
         .unwrap()
     }

@@ -251,7 +251,7 @@ async fn unexpected_tool_response_requires_manual(mut reviewer_config: ModelConf
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create the blocked link".into())
+            .submit(chat, "Create the blocked link".into())
             .await
             .unwrap();
         let mut saw_manual = false;
@@ -436,7 +436,7 @@ async fn unnormalized_model_tools_never_repair_into_allowing_findings() {
                 .unwrap();
             let mut events = agent.subscribe();
             agent
-                .submit(chat, None, "Create the blocked link".into())
+                .submit(chat, "Create the blocked link".into())
                 .await
                 .unwrap();
             let mut saw_manual = false;
@@ -533,7 +533,7 @@ async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create the checked link".into())
+            .submit(chat, "Create the checked link".into())
             .await
             .unwrap();
         let mut checked = false;
@@ -648,7 +648,6 @@ async fn default_llm_review_uses_the_provider_auxiliary_model_and_records_its_id
     agent
         .submit(
             chat,
-            None,
             "Create the auxiliary-link symlink to missing-target".into(),
         )
         .await

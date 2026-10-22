@@ -94,7 +94,7 @@ async fn foreground_subagents_in_the_same_batch_can_work_at_the_same_time() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Run two independent children".into())
+        .submit(chat, "Run two independent children".into())
         .await
         .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -179,7 +179,7 @@ async fn denying_a_parallel_read_interrupts_the_run_and_dispatches_no_peers() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read both before writing".into())
+        .submit(chat, "Read both before writing".into())
         .await
         .unwrap();
     let mut denied = false;
@@ -277,7 +277,7 @@ async fn cancellation_and_panics_settle_in_flight_reads_without_starting_the_nex
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Read both before writing".into())
+            .submit(chat, "Read both before writing".into())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -405,11 +405,7 @@ async fn consecutive_searches_overlap_and_writes_separate_the_batches() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Search, write the marker, then search again".into(),
-        )
+        .submit(chat, "Search, write the marker, then search again".into())
         .await
         .unwrap();
     let completed = tokio::time::timeout(Duration::from_secs(5), async {

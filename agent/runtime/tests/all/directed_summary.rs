@@ -25,31 +25,7 @@ async fn run_prompt(
     chat: uuid::Uuid,
     prompt: &str,
 ) {
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
-    loop {
-        let event = next_event(events).await;
-        if event.run_id != receipt.run_id {
-            continue;
-        }
-        match event.kind {
-            EventKind::Completed { .. } => return,
-            EventKind::Failed(error) => panic!("prompt failed: {error}"),
-            _ => {}
-        }
-    }
-}
-
-async fn run_prompt_in_loop(
-    agent: &Agent,
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
-    chat: uuid::Uuid,
-    loop_id: uuid::Uuid,
-    prompt: &str,
-) {
-    let receipt = agent
-        .submit(chat, Some(loop_id), prompt.into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(events).await;
         if event.run_id != receipt.run_id {
@@ -143,7 +119,7 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[1].clone();
     let raw_messages = before.messages.clone();
-    let loops = serde_json::to_value(&before.loops).unwrap();
+    let loops = serde_json::to_value(&before.chat_loop).unwrap();
     let prior_usage = before.request_usage.entries().to_vec();
 
     let outcome = agent
@@ -203,7 +179,7 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
     );
     assert_eq!(outcome.snapshot.last_sequence, before.last_sequence);
     assert_eq!(
-        serde_json::to_value(&outcome.snapshot.loops).unwrap(),
+        serde_json::to_value(&outcome.snapshot.chat_loop).unwrap(),
         loops
     );
     let draft = outcome.draft.unwrap();
@@ -545,7 +521,6 @@ async fn from_here_summarizes_attached_context_and_restores_the_typed_draft() {
     let receipt = agent
         .submit_with_file_references(
             chat,
-            None,
             "review the attached research".into(),
             vec![attachment_path],
         )
@@ -745,7 +720,7 @@ async fn a_prompt_abandoned_by_conversation_rewind_cannot_summarize_the_new_bran
     run_prompt(&agent, &mut events, chat, "second prompt").await;
     let before_rewind = agent.snapshot(chat).await.unwrap();
     let abandoned_checkpoint = before_rewind.rewind_points()[1].clone();
-    agent.stop(chat, before_rewind.loops[1].id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     let rewind = agent
         .rewind(
             chat,
@@ -754,15 +729,8 @@ async fn a_prompt_abandoned_by_conversation_rewind_cannot_summarize_the_new_bran
         )
         .await
         .unwrap();
-    let resumed_loop = rewind.draft.unwrap().loop_id;
-    run_prompt_in_loop(
-        &agent,
-        &mut events,
-        chat,
-        resumed_loop,
-        "replacement branch prompt",
-    )
-    .await;
+    assert!(rewind.draft.is_some());
+    run_prompt(&agent, &mut events, chat, "replacement branch prompt").await;
     let branched = agent.snapshot(chat).await.unwrap();
     let usage_before = branched.request_usage.entries().to_vec();
     let compactions_before = branched.message_compactions.clone();
@@ -800,6 +768,7 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
     let model = Arc::new(ScriptedModel::new(vec![
         text("first answer"),
         text("second answer"),
+        text("noted the shell"),
         text("suffix summary"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -810,9 +779,8 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
 
     let release = directory.path().join("release-background-shell");
     let shell = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             chat,
-            None,
             format!(
                 "while [ ! -e '{}' ]; do sleep 0.01; done; printf shell-finished",
                 release.display()
@@ -847,7 +815,10 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
-            if message_text(&snapshot.messages).contains("<task-notification>") {
+            // The notification continues the Chat's Loop, which answers it.
+            if message_text(&snapshot.messages).contains("noted the shell")
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -870,7 +841,7 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
         .await
         .unwrap();
     assert_eq!(outcome.direction, SummaryDirection::FromHere);
-    let summary_source = message_text(&model.requests.lock().unwrap()[2].messages);
+    let summary_source = message_text(&model.requests.lock().unwrap()[3].messages);
     assert!(summary_source.contains("second prompt"));
     assert!(summary_source.contains(&format!("<task-id>{}</task-id>", shell.command_id)));
     assert!(!summary_source.contains("<bash-input>"));
@@ -1358,7 +1329,7 @@ async fn summary_keeps_a_visible_tool_pair_and_excludes_a_rewound_pair() {
 
     let before_rewind = agent.snapshot(chat).await.unwrap();
     let abandoned_checkpoint = before_rewind.rewind_points()[1].clone();
-    agent.stop(chat, before_rewind.loops[1].id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     let rewind = agent
         .rewind(
             chat,
@@ -1367,14 +1338,8 @@ async fn summary_keeps_a_visible_tool_pair_and_excludes_a_rewound_pair() {
         )
         .await
         .unwrap();
-    run_prompt_in_loop(
-        &agent,
-        &mut events,
-        chat,
-        rewind.draft.unwrap().loop_id,
-        "replacement branch prompt",
-    )
-    .await;
+    assert!(rewind.draft.is_some());
+    run_prompt(&agent, &mut events, chat, "replacement branch prompt").await;
     let before_summary = agent.snapshot(chat).await.unwrap();
     let replacement_checkpoint = before_summary.rewind_points().last().unwrap().clone();
 
@@ -1427,15 +1392,14 @@ async fn summary_keeps_a_visible_tool_pair_and_excludes_a_rewound_pair() {
 }
 
 #[tokio::test]
-async fn summary_resumes_existing_loop_continuations_in_fifo_order() {
+async fn summary_resumes_the_input_queued_while_it_ran() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(PausedSuccessfulSummaryModel {
         requests: Mutex::new(Vec::new()),
         ordinary_replies: Mutex::new(VecDeque::from([
             text("first answer"),
             text("second answer"),
-            text("first continuation answer"),
-            text("second continuation answer"),
+            text("continuation answer"),
         ])),
         summary_started: Notify::new(),
         release_summary: Notify::new(),
@@ -1443,15 +1407,11 @@ async fn summary_resumes_existing_loop_continuations_in_fifo_order() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first loop prompt").await;
-    run_prompt(&agent, &mut events, chat, "second loop prompt").await;
+    run_prompt(&agent, &mut events, chat, "first prompt").await;
+    run_prompt(&agent, &mut events, chat, "second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
-    let checkpoints = before.rewind_points();
-    let first_loop = before.loops[0].id;
-    let second_loop = before.loops[1].id;
-    assert_ne!(first_loop, second_loop);
-    assert_eq!(before.loops.len(), 2);
-    let checkpoint_id = checkpoints[1].message_id;
+    let loop_id = before.chat_loop.id;
+    let checkpoint_id = before.rewind_points()[1].message_id;
 
     let summary = {
         let agent = agent.clone();
@@ -1469,16 +1429,11 @@ async fn summary_resumes_existing_loop_continuations_in_fifo_order() {
         })
     };
     model.summary_started.notified().await;
-    let first_continuation = agent
-        .submit(chat, Some(first_loop), "continue first loop".into())
+    let continuation = agent
+        .submit(chat, "continue the work".into())
         .await
         .unwrap();
-    let second_continuation = agent
-        .submit(chat, Some(second_loop), "continue second loop".into())
-        .await
-        .unwrap();
-    assert_eq!(first_continuation.loop_id, first_loop);
-    assert_eq!(second_continuation.loop_id, second_loop);
+    assert_eq!(continuation.loop_id, loop_id);
     assert_eq!(model.requests.lock().unwrap().len(), 3);
 
     model.release_summary.notify_one();
@@ -1488,47 +1443,26 @@ async fn summary_resumes_existing_loop_continuations_in_fifo_order() {
     assert!(summary_usage.loop_id.is_none());
     assert!(summary_usage.run_id.is_none());
 
-    let mut completed_runs = Vec::new();
-    while completed_runs.len() < 2 {
+    loop {
         let event = next_event(&mut events).await;
-        if matches!(event.kind, EventKind::Completed { .. })
-            && [first_continuation.run_id, second_continuation.run_id].contains(&event.run_id)
+        if matches!(event.kind, EventKind::Completed { .. }) && event.run_id == continuation.run_id
         {
-            completed_runs.push(event.run_id);
+            break;
         }
     }
-    assert_eq!(
-        completed_runs,
-        vec![first_continuation.run_id, second_continuation.run_id]
-    );
-
     let after = agent.snapshot(chat).await.unwrap();
-    assert_eq!(
-        after.loops.iter().map(|goal| goal.id).collect::<Vec<_>>(),
-        vec![first_loop, second_loop]
-    );
-    let first_usage = after
+    assert_eq!(after.chat_loop.id, loop_id);
+    let usage = after
         .request_usage
         .entries()
         .iter()
-        .find(|usage| usage.run_id == Some(first_continuation.run_id))
+        .find(|usage| usage.run_id == Some(continuation.run_id))
         .unwrap();
-    let second_usage = after
-        .request_usage
-        .entries()
-        .iter()
-        .find(|usage| usage.run_id == Some(second_continuation.run_id))
-        .unwrap();
-    assert_eq!(first_usage.loop_id, Some(first_loop));
-    assert_eq!(second_usage.loop_id, Some(second_loop));
+    assert_eq!(usage.loop_id, Some(loop_id));
     {
         let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        let first_request_text = message_text(&requests[3].messages);
-        let second_request_text = message_text(&requests[4].messages);
-        assert!(first_request_text.contains("continue first loop"));
-        assert!(!first_request_text.contains("continue second loop"));
-        assert!(second_request_text.contains("continue second loop"));
+        assert_eq!(requests.len(), 4);
+        assert!(message_text(&requests[3].messages).contains("continue the work"));
     }
     agent.shutdown().await;
 }

@@ -11,7 +11,7 @@ use crate::{
     EventKind, LoopSnapshot, ModelConfig, MonitorMembership, PendingCommand, PendingInput,
     PermissionPolicy, PermissionRequest, Plan, Progress, ProviderHttpFailure, QuestionRequest,
     QueuedInput, ReasoningEffort, RequestUsageLedger, RunId, UserShellRecord,
-    chat::{fallback_title, highest_pasted_image_id, queued_inputs},
+    chat::{fallback_title, first_prompt, highest_pasted_image_id, queued_inputs},
 };
 
 /// What a Chat is doing now, without its history: the state a View's status row, Monitor,
@@ -43,7 +43,10 @@ pub struct ChatStatus {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_enabled: bool,
     pub policy: PermissionPolicy,
-    pub loops: Vec<LoopSnapshot>,
+    pub chat_loop: LoopSnapshot,
+    /// What the conversation was first asked, which titles the Chat until it has a title of its
+    /// own.
+    pub first_prompt: Option<String>,
     pub plans: Vec<Plan>,
     pub progress: Vec<Progress>,
     pub permissions: Vec<PermissionRequest>,
@@ -170,7 +173,8 @@ impl ChatStatus {
             reasoning_effort: process.reasoning_effort,
             thinking_enabled: process.thinking_enabled,
             policy: process.policy.clone(),
-            loops: conversation.loops.clone(),
+            chat_loop: conversation.chat_loop.clone(),
+            first_prompt: first_prompt(conversation, process.pending_inputs),
             plans: conversation.plans.clone(),
             progress: conversation.progress.clone(),
             permissions: process.permissions.to_vec(),
@@ -221,6 +225,6 @@ impl ChatStatus {
             .as_ref()
             .map(|origin| origin.name.clone())
             .or_else(|| self.generated_title.clone())
-            .unwrap_or_else(|| fallback_title(&self.loops, &self.user_shells))
+            .unwrap_or_else(|| fallback_title(self.first_prompt.as_deref(), &self.user_shells))
     }
 }

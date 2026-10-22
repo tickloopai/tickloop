@@ -27,6 +27,8 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         "/bashes",
         "/subs",
         "/quit",
+        "/loops",
+        "/loops new",
     ];
     let runtime_directory = support::cli_runtime::directory();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
@@ -58,7 +60,7 @@ fn retired_commands_do_not_execute_or_become_prompts() {
     // No retired command created an Agent or queued input: the New Agent screen still has none.
     assert!(stdout.contains("No Chat is selected."), "{stdout}");
     assert!(!stdout.contains("Chat: "), "{stdout}");
-    assert!(!stdout.contains("Accepted: Goal"));
+    assert!(!stdout.contains("Accepted:"));
     assert!(!stdout.contains("Codex login removed"));
     use tickloop_agent_client::LocalAgentClient;
     use tickloop_agent_protocol::{AgentAccess as _, ObservationRequest, ObservationValue, Page};
@@ -90,7 +92,7 @@ fn retired_commands_do_not_execute_or_become_prompts() {
 }
 
 #[tokio::test]
-async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
+async fn pipe_trigger_controls_preserve_history_and_stay_in_their_chat() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let archive = root.join("state");
@@ -107,13 +109,8 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     let chat = agent.create_chat(root.clone()).await.unwrap();
     let other_chat = agent.create_chat(root.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let mut goals = Vec::new();
     for chat in [chat, other_chat] {
-        let receipt = agent
-            .submit(chat, None, "Keep this goal".into())
-            .await
-            .unwrap();
-        goals.push(receipt.loop_id);
+        agent.submit(chat, "Keep this task".into()).await.unwrap();
         loop {
             match tickloop_agent_test_support::next_event(&mut events)
                 .await
@@ -128,11 +125,7 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     let before = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
     drop(agent);
-    let goal = goals[0];
-    let other_goal = goals[1];
-    let commands = format!(
-        "/loops {goal}\n/events keep explicit events\n/loops trigger {goal}\n/loops trigger {other_goal}\n/loops {other_goal}\n/loops schedule {goal} 60 retired\n/loops trigger\n/loops new\n/loops\n/exit\n"
-    );
+    let commands = "/events keep explicit events\n/exit\n";
     let runtime_directory = support::cli_runtime::directory();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
@@ -163,22 +156,7 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("explicit events true"), "{stdout}");
-    assert_eq!(
-        stdout
-            .matches("Goal does not belong to the current Chat")
-            .count(),
-        2,
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("use /loops [GOAL_ID|new|trigger [GOAL_ID]]"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("next input will start a new goal in this Chat"),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("Accepted: Goal"), "{stdout}");
+    assert!(!stdout.contains("Accepted:"), "{stdout}");
     support::cli_runtime::flush_transcripts(&runtime_directory)
         .await
         .unwrap();
@@ -190,12 +168,15 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     .unwrap();
     let after = agent.resume_chat(chat).await.unwrap();
     assert_eq!(after.messages.len(), before.messages.len());
-    assert_eq!(after.loops.len(), 1);
-    let trigger = after.loops[0].trigger.as_ref().unwrap();
+    let trigger = after.chat_loop.trigger.as_ref().unwrap();
     assert!(trigger.accepts_events);
     assert_eq!(trigger.prompt, "keep explicit events");
     assert!(
-        agent.resume_chat(other_chat).await.unwrap().loops[0]
+        agent
+            .resume_chat(other_chat)
+            .await
+            .unwrap()
+            .chat_loop
             .trigger
             .is_none()
     );

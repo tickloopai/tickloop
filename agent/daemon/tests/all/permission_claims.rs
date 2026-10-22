@@ -180,7 +180,6 @@ impl Fixture {
                 self.execution.daemon_epoch,
                 AgentCommand::Submit {
                     execution: self.execution,
-                    target_loop: Some(self.loop_id),
                     input: UserInput::Text {
                         text: "Read the exact same source in the original Loop".into(),
                         contexts: vec![],
@@ -735,9 +734,8 @@ async fn an_authorized_persistent_write_survives_run_interrupt_with_a_queryable_
             loop {
                 let current = snapshot(&*fixture.second, fixture.execution).await;
                 if current.permissions.is_empty()
-                    && current.conversation.loops.iter().any(|goal| {
-                        goal.id == fixture.loop_id && goal.state == LoopState::Interrupted
-                    })
+                    && current.conversation.chat_loop.id == fixture.loop_id
+                    && current.conversation.chat_loop.state == LoopState::Interrupted
                 {
                     break current;
                 }

@@ -112,7 +112,6 @@ async fn complete_input(
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Text {
                     text: text.into(),
                     contexts: vec![],
@@ -130,10 +129,10 @@ async fn complete_input(
     tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
             let snapshot = core.snapshot(chat).await.unwrap();
-            if snapshot.loops.iter().any(|goal| {
-                goal.id == receipt.loop_id
-                    && goal.state == tickloop_agent_protocol::LoopState::Completed
-            }) {
+            if snapshot.chat_loop.id == receipt.loop_id
+                && snapshot.chat_loop.run_id == Some(receipt.run_id)
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+            {
                 break;
             }
             tokio::task::yield_now().await;

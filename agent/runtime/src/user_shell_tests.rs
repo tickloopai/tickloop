@@ -6,9 +6,8 @@ use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{
-    ChatSnapshot, CommandState, Content, EventKind, InputModality, LoopSnapshot, LoopState,
-    ModelConfig, PendingInput, Protocol, Receipt, Trigger, TriggerPromptSource, TriggerSource,
-    Usage, UserShellState,
+    ChatSnapshot, CommandState, Content, EventKind, InputModality, ModelConfig, PendingInput,
+    Protocol, Receipt, Trigger, TriggerPromptSource, TriggerSource, Usage, UserShellState,
 };
 use tickloop_agent_tools::UserCommandSnapshot;
 
@@ -132,7 +131,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     )
     .unwrap();
     let chat_id = source.create_chat(directory.path().into()).await.unwrap();
-    let loop_id = uuid::Uuid::new_v4();
+    let loop_id;
     let trigger = Trigger {
         id: uuid::Uuid::new_v4(),
         prompt: "check after restart".into(),
@@ -144,16 +143,8 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     {
         let mut chats = source.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).unwrap();
-        chat.snapshot.loops.push(LoopSnapshot {
-            id: loop_id,
-            goal: "persistent trigger".into(),
-            state: LoopState::WaitingTrigger,
-            run_id: None,
-            run_started_at: None,
-            trigger: Some(trigger.clone()),
-            event_sources: Vec::new(),
-            state_since: None,
-        });
+        loop_id = chat.snapshot.chat_loop.id;
+        chat.snapshot.chat_loop.trigger = Some(trigger.clone());
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [
             (tickloop_agent_protocol::Role::User, "watch for events"),
@@ -197,12 +188,12 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     let reopened = Agent::open_embedded(archive, config(), model.clone()).unwrap();
     let recovered = reopened.resume_chat(chat_id).await.unwrap();
     assert!(recovered.pending_inputs.is_empty());
-    assert!(recovered.resume_triggers.contains(&loop_id));
-    assert!(!recovered.loops[0].trigger.as_ref().unwrap().armed);
+    assert!(recovered.trigger_awaits_resume);
+    assert!(!recovered.chat_loop.trigger.as_ref().unwrap().armed);
 
     let mut events = reopened.subscribe();
     let manual = reopened
-        .submit(chat_id, Some(loop_id), "resume this trigger".into())
+        .submit(chat_id, "resume this trigger".into())
         .await
         .unwrap();
     loop {
@@ -215,7 +206,6 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     reopened
         .trigger(
             chat_id,
-            loop_id,
             TriggerSource {
                 source: "manual".into(),
                 payload: serde_json::json!({"note": "changed"}),
@@ -243,9 +233,8 @@ async fn direct_user_shell_joins_the_conversation_without_agent_permissions_or_o
     let mut shell_events = agent.subscribe_user_shells();
 
     let receipt = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             chat,
-            None,
             "printf 'direct output'; printf 'created' > direct.txt".into(),
             false,
         )
@@ -292,7 +281,7 @@ async fn direct_user_shell_joins_the_conversation_without_agent_permissions_or_o
 
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Explain the command result".into())
+        .submit(chat, "Explain the command result".into())
         .await
         .unwrap();
     loop {
@@ -334,7 +323,7 @@ async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, "printf final".into(), false)
+        .submit_user_shell(chat, "printf final".into(), false)
         .await
         .unwrap();
     let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -410,12 +399,7 @@ async fn a_user_shell_can_be_backgrounded_and_stopped_without_a_loop_identity() 
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     let receipt = agent
-        .submit_user_shell_for_goal(
-            chat,
-            None,
-            "while :; do printf x; sleep 0.02; done".into(),
-            false,
-        )
+        .submit_user_shell(chat, "while :; do printf x; sleep 0.02; done".into(), false)
         .await
         .unwrap();
 
@@ -478,7 +462,7 @@ async fn a_user_shell_can_be_backgrounded_and_stopped_without_a_loop_identity() 
             ),
         ]
     );
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     agent.shutdown().await;
 }
 
@@ -491,7 +475,7 @@ async fn a_user_shell_moved_by_its_timeout_is_announced_as_running_in_the_backgr
     let mut shell_events = agent.subscribe_user_shells();
     let command = "while [ ! -e never ]; do sleep 0.05; done";
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, command.into(), false)
+        .submit_user_shell(chat, command.into(), false)
         .await
         .unwrap();
     let (running, output_ref) = loop {
@@ -552,19 +536,11 @@ async fn a_background_notification_follows_messages_that_finished_before_it() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     agent
-        .submit_user_shell_for_goal(
-            chat,
-            None,
-            "sleep 0.1; printf 'late shell output'".into(),
-            true,
-        )
+        .submit_user_shell(chat, "sleep 0.1; printf 'late shell output'".into(), true)
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "first prompt".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "first prompt".into()).await.unwrap();
     loop {
         let event = events.recv().await.unwrap();
         if event.run_id == first.run_id && matches!(event.kind, EventKind::Completed { .. }) {
@@ -577,10 +553,7 @@ async fn a_background_notification_follows_messages_that_finished_before_it() {
             break;
         }
     }
-    let second = agent
-        .submit(chat, Some(first.loop_id), "second prompt".into())
-        .await
-        .unwrap();
+    let second = agent.submit(chat, "second prompt".into()).await.unwrap();
     loop {
         let event = events.recv().await.unwrap();
         if event.run_id == second.run_id && matches!(event.kind, EventKind::Completed { .. }) {
@@ -623,7 +596,7 @@ async fn shells_submitted_while_agent_is_busy_are_persisted_and_run_in_order() {
     let mut shell_events = agent.subscribe_user_shells();
 
     agent
-        .submit(chat, None, "hold the execution slot".into())
+        .submit(chat, "hold the execution slot".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), model.started.notified())
@@ -631,11 +604,11 @@ async fn shells_submitted_while_agent_is_busy_are_persisted_and_run_in_order() {
         .unwrap();
 
     let first = agent
-        .submit_user_shell_for_goal(chat, None, "printf 1 >> order.txt".into(), false)
+        .submit_user_shell(chat, "printf 1 >> order.txt".into(), false)
         .await
         .unwrap();
     let second = agent
-        .submit_user_shell_for_goal(chat, None, "printf 2 >> order.txt".into(), false)
+        .submit_user_shell(chat, "printf 2 >> order.txt".into(), false)
         .await
         .unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -680,29 +653,20 @@ async fn shell_and_model_inputs_keep_their_typed_submission_order() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
 
-    agent
-        .submit(chat, None, "prompt-before".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "prompt-before".into()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), model.started.notified())
         .await
         .unwrap();
     let shell_1 = agent
-        .submit_user_shell_for_goal(chat, None, "printf 1 >> typed-order.txt".into(), false)
+        .submit_user_shell(chat, "printf 1 >> typed-order.txt".into(), false)
         .await
         .unwrap();
-    let prompt_between = agent
-        .submit(chat, None, "prompt-between".into())
-        .await
-        .unwrap();
+    let prompt_between = agent.submit(chat, "prompt-between".into()).await.unwrap();
     let shell_2 = agent
-        .submit_user_shell_for_goal(chat, None, "printf 2 >> typed-order.txt".into(), false)
+        .submit_user_shell(chat, "printf 2 >> typed-order.txt".into(), false)
         .await
         .unwrap();
-    let prompt_after = agent
-        .submit(chat, None, "prompt-after".into())
-        .await
-        .unwrap();
+    let prompt_after = agent.submit(chat, "prompt-after".into()).await.unwrap();
 
     let snapshot = agent.snapshot(chat).await.unwrap();
     let first = snapshot
@@ -776,14 +740,14 @@ async fn restart_forgets_queued_shell_state_and_does_not_leave_chat_busy() {
     source.install_own_tickhost();
     let chat = source.create_chat(directory.path().into()).await.unwrap();
     source
-        .submit(chat, None, "hold the execution slot".into())
+        .submit(chat, "hold the execution slot".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), model.started.notified())
         .await
         .unwrap();
     source
-        .submit_user_shell_for_goal(chat, None, "printf stale > stale.txt".into(), false)
+        .submit_user_shell(chat, "printf stale > stale.txt".into(), false)
         .await
         .unwrap();
     assert_eq!(
@@ -809,7 +773,7 @@ async fn restart_forgets_queued_shell_state_and_does_not_leave_chat_busy() {
     );
     let mut shell_events = recovered.subscribe_user_shells();
     let fresh = recovered
-        .submit_user_shell_for_goal(chat, None, "printf fresh > fresh.txt".into(), false)
+        .submit_user_shell(chat, "printf fresh > fresh.txt".into(), false)
         .await
         .unwrap();
     loop {

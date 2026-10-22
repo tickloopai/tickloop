@@ -138,7 +138,7 @@ async fn identical_host_calls_keep_distinct_resolved_targets_through_approval() 
     let first_chat = first.create_chat(directory.path().into()).await.unwrap();
     let mut first_events = first.subscribe();
     first
-        .submit(first_chat, None, "Change current".into())
+        .submit(first_chat, "Change current".into())
         .await
         .unwrap();
     let first_request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -166,7 +166,7 @@ async fn identical_host_calls_keep_distinct_resolved_targets_through_approval() 
     let second_chat = second.create_chat(directory.path().into()).await.unwrap();
     let mut second_events = second.subscribe();
     second
-        .submit(second_chat, None, "Change current".into())
+        .submit(second_chat, "Change current".into())
         .await
         .unwrap();
     let second_request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -222,10 +222,7 @@ async fn dispatched_host_call_with_lost_response_keeps_unknown_outcome() {
     agent.install_host_tools(provider.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Change current".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Change current".into()).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let EventKind::PermissionRequested { request } = events.recv().await.unwrap().kind {
@@ -274,10 +271,7 @@ async fn a_host_panic_preserves_admission_and_does_not_repeat_the_operation() {
         agent.install_host_tools(provider.clone()).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        agent
-            .submit(chat, None, "Change current".into())
-            .await
-            .unwrap();
+        agent.submit(chat, "Change current".into()).await.unwrap();
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match events.recv().await.unwrap().kind {
@@ -297,7 +291,7 @@ async fn a_host_panic_preserves_admission_and_does_not_repeat_the_operation() {
         .expect("host panic left the run Running");
         assert!(error.contains("internal"), "{error}");
         let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+        assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
         if before_admission {
             assert!(snapshot.operations.is_empty());
         } else {
@@ -479,14 +473,7 @@ impl HostToolProvider for WorkspaceTools {
 async fn wait_for_completion(agent: &Agent, chat: ChatId) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if agent
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .loops
-                .last()
-                .is_some_and(|loop_| loop_.state == LoopState::Completed)
-            {
+            if agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle {
                 return;
             }
             tokio::task::yield_now().await;
@@ -508,10 +495,7 @@ async fn invalid_host_input_never_reaches_permission_or_execution() {
     agent.install_host_tools(provider.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
-    agent
-        .submit(chat, None, "Run the tool".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the tool".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
 
     assert_eq!(provider.permission_checks.load(Ordering::SeqCst), 0);
@@ -530,10 +514,7 @@ async fn host_prepare_rejects_semantically_invalid_input_before_authorization() 
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_host_tools(provider.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "Run the tool".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the tool".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
 
     assert_eq!(provider.permission_checks.load(Ordering::SeqCst), 0);
@@ -567,10 +548,7 @@ async fn a_deny_rule_blocks_a_registered_host_tool() {
         )
         .await
         .unwrap();
-    agent
-        .submit(chat, None, "Run the tool".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the tool".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
 
     assert_eq!(provider.executions.load(Ordering::SeqCst), 0);
@@ -610,10 +588,7 @@ async fn an_explicit_ask_requires_human_approval_before_an_automatic_host_tool_r
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Run the tool".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the tool".into()).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await.unwrap().kind {
@@ -676,10 +651,7 @@ async fn headless_auto_denies_an_explicit_ask_for_an_automatic_host_tool() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Run the tool".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run the tool".into()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await.unwrap().kind {
@@ -711,7 +683,7 @@ async fn host_permission_change_during_approval_blocks_execution() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
 
-    agent.submit(chat, None, "Change it".into()).await.unwrap();
+    agent.submit(chat, "Change it".into()).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let EventKind::PermissionRequested { request } = events.recv().await.unwrap().kind {
@@ -759,7 +731,7 @@ async fn cancelling_a_host_permission_request_prevents_execution() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Close it".into()).await.unwrap();
+    agent.submit(chat, "Close it".into()).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let EventKind::PermissionRequested { request } = events.recv().await.unwrap().kind {
@@ -801,10 +773,7 @@ async fn registered_host_tool_runs_sequentially_across_model_turns() {
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_host_tools(provider.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "Run both steps".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Run both steps".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
 
     assert_eq!(provider.executions.load(Ordering::SeqCst), 2);
@@ -831,7 +800,7 @@ async fn model_can_call_a_read_only_host_tool_and_receive_its_result() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .submit(chat, None, "What is in this Space?".into())
+        .submit(chat, "What is in this Space?".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -892,7 +861,7 @@ async fn confirmation_host_tools_prompt_even_with_unrestricted_host_and_generic_
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Close it".into()).await.unwrap();
+    agent.submit(chat, "Close it".into()).await.unwrap();
 
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -928,7 +897,7 @@ async fn full_access_still_requires_host_confirmation() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Close it".into()).await.unwrap();
+    agent.submit(chat, "Close it".into()).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await.unwrap().kind {
@@ -971,7 +940,7 @@ async fn plan_mode_denies_mutating_host_tools_without_prompting() {
         .unwrap();
 
     agent
-        .submit(chat, None, "Rearrange the panels".into())
+        .submit(chat, "Rearrange the panels".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;

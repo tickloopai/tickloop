@@ -79,7 +79,7 @@ async fn root_plan_mode_blocks_an_existing_grandchilds_host_mutation() {
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "delegate".into()).await.unwrap();
+    core.submit(root, "delegate".into()).await.unwrap();
     let (leaf, question) = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -115,8 +115,6 @@ async fn root_plan_mode_blocks_an_existing_grandchilds_host_mutation() {
     core.shutdown().await;
 }
 
-struct FailingStopHook;
-
 fn copy_test_store(source: &std::path::Path, destination: &std::path::Path) {
     std::fs::create_dir_all(destination).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
@@ -139,7 +137,7 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
         Agent::open_embedded(store.path().into(), config(), background_family_model()).unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "start".into()).await.unwrap();
+    core.submit(root, "start".into()).await.unwrap();
     let leaf = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -167,12 +165,8 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
     ]));
     let restored = Agent::open_embedded(copied.path().into(), config(), model).unwrap();
     restored.resume_chat(leaf).await.unwrap();
-    let parent_loop = restored.snapshot(parent).await.unwrap().loops[0].id;
     let mut events = restored.subscribe();
-    let attempt = restored
-        .submit(parent, Some(parent_loop), "Continue".into())
-        .await
-        .unwrap();
+    let attempt = restored.submit(parent, "Continue".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -192,8 +186,7 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
     })
     .await
     .unwrap();
-    let leaf_loop = restored.snapshot(leaf).await.unwrap().loops[0].id;
-    restored.stop(leaf, leaf_loop).await.unwrap();
+    restored.stop(leaf).await.unwrap();
     assert!(
         restored
             .snapshot(parent)
@@ -202,14 +195,10 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
             .family_completions
             .iter()
             .any(|completion| completion.child_chat_id == leaf
-                && completion.state == tickloop_agent_protocol::LoopState::Stopped)
+                && completion.state == tickloop_agent_protocol::LoopState::Interrupted)
     );
     let continued = restored
-        .submit(
-            parent,
-            Some(parent_loop),
-            "Continue after stopping the child".into(),
-        )
+        .submit(parent, "Continue after stopping the child".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -227,38 +216,6 @@ async fn unfinished_restored_child_requires_resolution_and_explicit_stop_resolve
     .await
     .unwrap();
     restored.shutdown().await;
-}
-
-#[async_trait::async_trait]
-impl tickloop_agent_runtime::StoppedChildHook for FailingStopHook {
-    async fn child_stopped(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<(), String> {
-        Err("fixture host stop failed".into())
-    }
-}
-
-#[tokio::test]
-async fn subtree_stop_does_not_report_success_when_host_cleanup_fails() {
-    let directory = tempfile::tempdir().unwrap();
-    let core = Agent::new_embedded(config(), background_family_model());
-    core.install_stopped_child_hook(Arc::new(FailingStopHook));
-    let root = core.create_chat(directory.path().into()).await.unwrap();
-    let mut events = core.subscribe();
-    core.submit(root, None, "start".into()).await.unwrap();
-    let leaf = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let event = events.recv().await.unwrap();
-            if matches!(event.kind, EventKind::QuestionAsked { .. }) {
-                break event.chat_id;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let loop_id = core.snapshot(leaf).await.unwrap().loops[0].id;
-    let error = core.stop(leaf, loop_id).await.unwrap_err().to_string();
-    assert!(error.contains("fixture host stop failed"), "{error}");
-    assert!(error.contains(&leaf.to_string()));
-    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -295,7 +252,7 @@ async fn grandparent_denial_wins_over_a_pending_grandchild_approval() {
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "delegate with an approval".into())
+    core.submit(root, "delegate with an approval".into())
         .await
         .unwrap();
     let (leaf, permission) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -401,7 +358,7 @@ async fn delegated_parent_waits_for_its_background_child_without_model_polling()
     let core = Agent::new_embedded(config(), model.clone());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "start".into()).await.unwrap();
+    core.submit(root, "start".into()).await.unwrap();
     let (leaf, question) = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -462,7 +419,7 @@ async fn stopping_a_member_cancels_its_waiting_descendants() {
     let core = Agent::new_embedded(config(), background_family_model());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "start".into()).await.unwrap();
+    core.submit(root, "start".into()).await.unwrap();
     let leaf = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -480,12 +437,23 @@ async fn stopping_a_member_cancels_its_waiting_descendants() {
         .delegation
         .unwrap()
         .parent_chat_id;
-    let parent_loop = core.snapshot(parent).await.unwrap().loops[0].id;
-    core.stop(parent, parent_loop).await.unwrap();
+    core.stop(parent).await.unwrap();
     for member in [parent, leaf] {
-        let snapshot = core.snapshot(member).await.unwrap();
-        assert_eq!(snapshot.loops[0].state, LoopState::Stopped);
-        assert!(snapshot.questions.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(
+                core.snapshot(member).await.unwrap().chat_loop.state,
+                LoopState::Running
+                    | LoopState::Queued
+                    | LoopState::WaitingPermission
+                    | LoopState::WaitingQuestion
+                    | LoopState::WaitingPlan
+            ) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stopped member's turn ends");
+        assert!(core.snapshot(member).await.unwrap().questions.is_empty());
     }
     core.shutdown().await;
 }
@@ -506,7 +474,7 @@ async fn three_levels_keep_direct_parents_and_one_flat_family() {
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let run = core
-        .submit(root, None, "Delegate three levels".into())
+        .submit(root, "Delegate three levels".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -583,7 +551,7 @@ async fn restoring_only_a_grandchild_loads_all_ancestors_without_running_models(
     let core = Agent::open_embedded(store.path().into(), config(), model).unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    let run = core.submit(root, None, "delegate".into()).await.unwrap();
+    let run = core.submit(root, "delegate".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -627,7 +595,7 @@ async fn family_handles_remain_unique_across_delegating_parents() {
     let core = Agent::new_embedded(config(), model);
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    let run = core.submit(root, None, "Delegate".into()).await.unwrap();
+    let run = core.submit(root, "Delegate".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();

@@ -95,7 +95,6 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
     let source_receipt = agent
         .submit_with_file_references(
             source_chat_id,
-            None,
             "source prompt".into(),
             vec![attachment_path.clone()],
         )
@@ -114,7 +113,6 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
     let request = BranchRequest {
         request_id: Uuid::new_v4(),
         source_chat_id,
-        source_loop_id: Some(source_receipt.loop_id),
         name: Some("研究分支".into()),
     };
 
@@ -129,7 +127,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
     assert_eq!(origin.source_chat_id, source_chat_id);
     assert_eq!(origin.name, "研究分支 (Branch)");
     let origin = origin.creation.as_ref().unwrap();
-    assert_eq!(origin.source_loop_id, Some(source_receipt.loop_id));
+    assert_eq!(origin.source_loop_id, source_receipt.loop_id);
     assert_eq!(origin.request_id, request.request_id);
     assert_eq!(origin.requested_name.as_deref(), Some("研究分支"));
     assert_eq!(origin.source_raw_boundary, source_before.messages.len());
@@ -153,16 +151,8 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         outcome.snapshot.public_conversation_items().unwrap(),
         source_before.public_conversation_items().unwrap()
     );
-    // 分出点之前创建的 Loop 随当前对话链复制到子 Chat。
-    assert_eq!(
-        outcome
-            .snapshot
-            .loops
-            .iter()
-            .map(|goal| goal.id)
-            .collect::<Vec<_>>(),
-        vec![source_receipt.loop_id]
-    );
+    // 源 Chat 的 Loop 复制到子 Chat。
+    assert_eq!(outcome.snapshot.chat_loop.id, source_receipt.loop_id);
     assert!(outcome.snapshot.request_usage.entries().is_empty());
     assert_eq!(
         outcome.snapshot.rewind_points(),
@@ -197,15 +187,23 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
     ));
 
     let child_receipt = agent
-        .submit(outcome.child_chat_id, None, "continue in child".into())
+        .submit(outcome.child_chat_id, "continue in child".into())
         .await
         .unwrap();
-    assert_ne!(child_receipt.loop_id, source_receipt.loop_id);
+    assert_eq!(child_receipt.loop_id, source_receipt.loop_id);
     assert_ne!(child_receipt.run_id, source_receipt.run_id);
     wait_for_run(&mut events, child_receipt.run_id).await;
-    assert_eq!(agent.snapshot(source_chat_id).await.unwrap().loops.len(), 1);
     let child = agent.snapshot(outcome.child_chat_id).await.unwrap();
-    assert_eq!(child.loops.len(), 2);
+    assert_eq!(child.chat_loop.run_id, Some(child_receipt.run_id));
+    assert_eq!(
+        agent
+            .snapshot(source_chat_id)
+            .await
+            .unwrap()
+            .chat_loop
+            .run_id,
+        Some(source_receipt.run_id)
+    );
     assert_eq!(child.request_usage.entries().len(), 1);
     assert_eq!(child.rewind_points().len(), 2);
     {
@@ -230,7 +228,6 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: outcome.child_chat_id,
-            source_loop_id: Some(child_receipt.loop_id),
             name: Some("nested branch".into()),
         })
         .await
@@ -260,7 +257,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         .collect::<std::collections::HashSet<_>>();
     assert!(provenance.contains(&source_chat_id));
     assert!(provenance.contains(&outcome.child_chat_id));
-    assert_eq!(grandchild.snapshot.loops.len(), 2);
+    assert_eq!(grandchild.snapshot.chat_loop.id, source_receipt.loop_id);
     agent.shutdown().await;
     drop(agent);
 
@@ -284,7 +281,7 @@ async fn concurrent_branch_requests_are_serialized_by_request_identity() {
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source_receipt = agent
-        .submit(source_chat_id, None, "source prompt".into())
+        .submit(source_chat_id, "source prompt".into())
         .await
         .unwrap();
     wait_for_run(&mut events, source_receipt.run_id).await;
@@ -293,7 +290,6 @@ async fn concurrent_branch_requests_are_serialized_by_request_identity() {
     let idempotent_request = BranchRequest {
         request_id: Uuid::new_v4(),
         source_chat_id,
-        source_loop_id: Some(source_receipt.loop_id),
         name: Some("same request".into()),
     };
 
@@ -313,13 +309,11 @@ async fn concurrent_branch_requests_are_serialized_by_request_identity() {
     let first_request = BranchRequest {
         request_id: Uuid::new_v4(),
         source_chat_id,
-        source_loop_id: Some(source_receipt.loop_id),
         name: Some("parallel one".into()),
     };
     let second_request = BranchRequest {
         request_id: Uuid::new_v4(),
         source_chat_id,
-        source_loop_id: Some(source_receipt.loop_id),
         name: Some("parallel two".into()),
     };
     let (first_child, second_child) = tokio::join!(
@@ -365,7 +359,7 @@ async fn branch_model_seed_and_first_child_request_exclude_private_model_content
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source_receipt = agent
-        .submit(source_chat_id, None, "source prompt".into())
+        .submit(source_chat_id, "source prompt".into())
         .await
         .unwrap();
     wait_for_run(&mut events, source_receipt.run_id).await;
@@ -391,7 +385,6 @@ async fn branch_model_seed_and_first_child_request_exclude_private_model_content
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source_receipt.loop_id),
             name: Some("public child".into()),
         })
         .await
@@ -413,7 +406,7 @@ async fn branch_model_seed_and_first_child_request_exclude_private_model_content
     );
 
     let child_receipt = agent
-        .submit(branch.child_chat_id, None, "continue in child".into())
+        .submit(branch.child_chat_id, "continue in child".into())
         .await
         .unwrap();
     wait_for_run(&mut events, child_receipt.run_id).await;
@@ -462,12 +455,12 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(source_chat_id, None, "first source prompt".into())
+        .submit(source_chat_id, "first source prompt".into())
         .await
         .unwrap();
     wait_for_run(&mut events, first.run_id).await;
     let second = agent
-        .submit(source_chat_id, None, "second source prompt".into())
+        .submit(source_chat_id, "second source prompt".into())
         .await
         .unwrap();
     wait_for_run(&mut events, second.run_id).await;
@@ -479,7 +472,6 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(second.loop_id),
             name: Some("duplicate call branch".into()),
         })
         .await
@@ -535,7 +527,7 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
     );
 
     let child = agent
-        .submit(branch.child_chat_id, None, "continue in child".into())
+        .submit(branch.child_chat_id, "continue in child".into())
         .await
         .unwrap();
     wait_for_run(&mut events, child.run_id).await;
@@ -590,19 +582,14 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(source_chat_id, None, "inspect the fact".into())
+        .submit(source_chat_id, "inspect the fact".into())
         .await
         .unwrap();
     wait_for_run(&mut events, first.run_id).await;
 
     let mut shell_events = agent.subscribe_user_shells();
     let shell = agent
-        .submit_user_shell_for_goal(
-            source_chat_id,
-            Some(first.loop_id),
-            "printf shell-fact".into(),
-            false,
-        )
+        .submit_user_shell(source_chat_id, "printf shell-fact".into(), false)
         .await
         .unwrap();
     loop {
@@ -622,7 +609,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
     }
 
     let second = agent
-        .submit(source_chat_id, None, "second prompt".into())
+        .submit(source_chat_id, "second prompt".into())
         .await
         .unwrap();
     wait_for_run(&mut events, second.run_id).await;
@@ -664,7 +651,6 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(second.loop_id),
             name: None,
         })
         .await
@@ -685,11 +671,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
     assert!(outcome.snapshot.message_runs.is_empty());
 
     let child_run = agent
-        .submit(
-            outcome.child_chat_id,
-            None,
-            "continue after the branch".into(),
-        )
+        .submit(outcome.child_chat_id, "continue after the branch".into())
         .await
         .unwrap();
     wait_for_run(&mut events, child_run.run_id).await;
@@ -799,7 +781,7 @@ async fn failed_partial_reply_is_not_inherited_by_a_branch() {
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let failed = agent
-        .submit(source_chat_id, None, "produce a partial".into())
+        .submit(source_chat_id, "produce a partial".into())
         .await
         .unwrap();
     wait_for_failed_run(&mut events, failed.run_id).await;
@@ -813,7 +795,6 @@ async fn failed_partial_reply_is_not_inherited_by_a_branch() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(failed.loop_id),
             name: None,
         })
         .await
@@ -831,7 +812,7 @@ async fn failed_partial_reply_is_not_inherited_by_a_branch() {
     );
 
     let continued = agent
-        .submit(outcome.child_chat_id, None, "continue".into())
+        .submit(outcome.child_chat_id, "continue".into())
         .await
         .unwrap();
     wait_for_run(&mut events, continued.run_id).await;
@@ -893,7 +874,6 @@ async fn invalid_empty_and_busy_sources_have_no_branch_side_effects() {
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id: empty,
-                source_loop_id: None,
                 name: None,
             })
             .await,
@@ -902,10 +882,7 @@ async fn invalid_empty_and_busy_sources_have_no_branch_side_effects() {
     assert_eq!(agent.list_chats().await.len(), empty_count);
 
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(empty, None, "running prompt".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(empty, "running prompt".into()).await.unwrap();
     blocking.entered.notified().await;
     let source_before = serde_json::to_value(agent.snapshot(empty).await.unwrap()).unwrap();
     assert!(matches!(
@@ -913,7 +890,6 @@ async fn invalid_empty_and_busy_sources_have_no_branch_side_effects() {
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id: empty,
-                source_loop_id: Some(receipt.loop_id),
                 name: None,
             })
             .await,
@@ -926,17 +902,6 @@ async fn invalid_empty_and_busy_sources_have_no_branch_side_effects() {
     );
     agent.interrupt(empty).await.unwrap();
     wait_for_failed_run(&mut events, receipt.run_id).await;
-    assert!(matches!(
-        agent
-            .branch_chat(BranchRequest {
-                request_id: Uuid::new_v4(),
-                source_chat_id: empty,
-                source_loop_id: Some(Uuid::new_v4()),
-                name: None,
-            })
-            .await,
-        Err(AgentError::Invalid(message)) if message.contains("does not belong")
-    ));
     agent.shutdown().await;
 }
 
@@ -948,7 +913,7 @@ async fn automatic_names_are_unique_and_explicit_names_are_validated() {
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(source_chat_id, None, "  first   prompt  ".into())
+        .submit(source_chat_id, "  first   prompt  ".into())
         .await
         .unwrap();
     wait_for_run(&mut events, receipt.run_id).await;
@@ -956,7 +921,6 @@ async fn automatic_names_are_unique_and_explicit_names_are_validated() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(receipt.loop_id),
             name: None,
         })
         .await
@@ -965,7 +929,6 @@ async fn automatic_names_are_unique_and_explicit_names_are_validated() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(receipt.loop_id),
             name: None,
         })
         .await
@@ -977,7 +940,6 @@ async fn automatic_names_are_unique_and_explicit_names_are_validated() {
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id,
-                source_loop_id: Some(receipt.loop_id),
                 name: Some("bad\nname".into()),
             })
             .await,
@@ -1049,7 +1011,7 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
     agent.install_own_tickhost();
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let shell = agent
-        .submit_user_shell_for_goal(source_chat_id, None, gated_shell_command(&gate), true)
+        .submit_user_shell(source_chat_id, gated_shell_command(&gate), true)
         .await
         .unwrap();
     wait_for_snapshot(&agent, source_chat_id, |snapshot| {
@@ -1063,13 +1025,12 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: None,
             name: Some("background branch".into()),
         })
         .await
         .unwrap();
     assert!(outcome.snapshot.user_shells.is_empty());
-    assert!(outcome.snapshot.loops.is_empty());
+    assert_eq!(outcome.snapshot.chat_loop.run_id, None);
     assert!(outcome.snapshot.operations.is_empty());
     let child_items_at_branch = outcome.snapshot.public_conversation_items().unwrap();
     let child_messages_at_branch = outcome.snapshot.conversation_messages().unwrap();
@@ -1168,7 +1129,7 @@ async fn background_agent_shell_output_after_branch_stays_in_the_source_chat() {
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "start the background task".into())
+        .submit(source_chat_id, "start the background task".into())
         .await
         .unwrap();
     loop {
@@ -1199,15 +1160,13 @@ async fn background_agent_shell_output_after_branch_stays_in_the_source_chat() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("agent shell branch".into()),
         })
         .await
         .unwrap();
     assert!(outcome.snapshot.commands.is_empty());
     assert!(outcome.snapshot.operations.is_empty());
-    assert_eq!(outcome.snapshot.loops.len(), 1);
-    assert_eq!(outcome.snapshot.loops[0].id, source.loop_id);
+    assert_eq!(outcome.snapshot.chat_loop.id, source.loop_id);
     let child_items_at_branch = outcome.snapshot.public_conversation_items().unwrap();
     let child_messages_at_branch = outcome.snapshot.conversation_messages().unwrap();
 

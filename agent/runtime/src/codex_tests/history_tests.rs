@@ -75,8 +75,8 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
     let agent = Agent::open_embedded(state.clone(), config(), client(&state, &endpoint)).unwrap();
     let chat = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Observe when new evidence arrives".into())
+    agent
+        .submit(chat, "Observe when new evidence arrives".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -88,7 +88,6 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
     agent
         .configure_trigger(
             chat,
-            receipt.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check fresh evidence".into(),
@@ -104,10 +103,7 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
         source: "test-tick".into(),
         payload: json!({"sequence": 1}),
     };
-    agent
-        .trigger(chat, receipt.loop_id, source())
-        .await
-        .unwrap();
+    agent.trigger(chat, source()).await.unwrap();
     loop {
         if let EventKind::Failed(error) =
             tokio::time::timeout(Duration::from_secs(8), events.recv())
@@ -121,35 +117,14 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
         }
     }
     assert_eq!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .unwrap()
-            .state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::Failed
     );
     std::fs::write(state.join("auth/openai-codex-credentials.json"), saved).unwrap();
-    assert!(
-        agent
-            .trigger(chat, receipt.loop_id, source())
-            .await
-            .is_err()
-    );
+    // Signing in again retries nothing; only a later input or Trigger starts a new turn.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .unwrap()
-            .state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::Failed
     );
     assert_eq!(observed.await.unwrap().len(), 1);
@@ -174,12 +149,12 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
     let chat = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Preserve source files".into())
+        .submit(chat, "Preserve source files".into())
         .await
         .unwrap();
     completed(&mut events).await;
     agent
-        .submit(chat, None, "Second checkpoint".into())
+        .submit(chat, "Second checkpoint".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -215,7 +190,7 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
     models.choose(client(&state, &endpoint));
     agent.set_model(chat, config()).await.unwrap();
     agent
-        .submit(chat, None, "Continue after rewind".into())
+        .submit(chat, "Continue after rewind".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -250,8 +225,8 @@ async fn branch_copies_public_context_and_keeps_source_private_history_unchanged
     let agent = Agent::open_embedded(state.clone(), config(), client(&state, &endpoint)).unwrap();
     let source = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(source, None, "Research source".into())
+    agent
+        .submit(source, "Research source".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -260,14 +235,13 @@ async fn branch_copies_public_context_and_keeps_source_private_history_unchanged
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: Some(receipt.loop_id),
             name: Some("Independent research".into()),
         })
         .await
         .unwrap();
     assert_ne!(source, branch.child_chat_id);
     agent
-        .submit(branch.child_chat_id, None, "Continue separately".into())
+        .submit(branch.child_chat_id, "Continue separately".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -310,12 +284,12 @@ async fn automatic_compaction_uses_the_subscription_and_can_continue_a_real_file
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Initial observation".into())
+        .submit(chat, "Initial observation".into())
         .await
         .unwrap();
     completed(&mut events).await;
     agent
-        .submit(chat, None, "Read evidence.txt".into())
+        .submit(chat, "Read evidence.txt".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -355,7 +329,7 @@ fn recovery_child() {
         let restored = agent.resume_chat(chat).await.unwrap();
         assert!(restored.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Text { text } if text.contains("Hello from Codex"))));
         let mut events = agent.subscribe();
-        agent.submit(chat, None, "Read restart-marker.txt after process restart".into()).await.unwrap();
+        agent.submit(chat, "Read restart-marker.txt after process restart".into()).await.unwrap();
         completed(&mut events).await;
         agent.shutdown().await;
     });
@@ -383,7 +357,7 @@ async fn new_process_restores_transcript_with_full_history_and_no_previous_conne
     let chat = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Remember the initial observation".into())
+        .submit(chat, "Remember the initial observation".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -437,7 +411,7 @@ async fn failed_subscription_compaction_preserves_the_last_valid_history() {
     let chat = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Keep this progress".into())
+        .submit(chat, "Keep this progress".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -537,13 +511,13 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         .unwrap();
     let mut events = agent.subscribe();
     let mut completed_tools = 0;
-    let first = agent
-        .submit(source, None, "Remember this observation".into())
+    agent
+        .submit(source, "Remember this observation".into())
         .await
         .unwrap();
     completed(&mut events).await;
     agent
-        .submit(source, Some(first.loop_id), "Read ws-history.txt".into())
+        .submit(source, "Read ws-history.txt".into())
         .await
         .unwrap();
     loop {
@@ -560,7 +534,7 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         }
     }
     agent
-        .submit(source, None, "Checkpoint before compact".into())
+        .submit(source, "Checkpoint before compact".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -574,8 +548,8 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         .unwrap();
     let compacted = agent.compact(source).await.unwrap();
     assert!(compacted.summary.contains("WS_HISTORY_MARKER"));
-    let continued = agent
-        .submit(source, None, "Continue after compact".into())
+    agent
+        .submit(source, "Continue after compact".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -583,14 +557,13 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: Some(continued.loop_id),
             name: Some("WS branch".into()),
         })
         .await
         .unwrap();
     assert_ne!(branch.child_chat_id, source);
     agent
-        .submit(branch.child_chat_id, None, "Continue branch".into())
+        .submit(branch.child_chat_id, "Continue branch".into())
         .await
         .unwrap();
     completed(&mut events).await;
@@ -599,7 +572,7 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         .await
         .unwrap();
     agent
-        .submit(source, None, "Continue after rewind".into())
+        .submit(source, "Continue after rewind".into())
         .await
         .unwrap();
     completed(&mut events).await;

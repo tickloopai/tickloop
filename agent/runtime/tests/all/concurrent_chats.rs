@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tickloop_agent_model::*;
 use tickloop_agent_protocol::{Content, EventKind, LoopState, Role, Usage};
@@ -15,6 +15,7 @@ struct ConcurrentModel {
     alpha_started: Notify,
     release_alpha: CancellationToken,
     requests: Mutex<Vec<ModelRequest>>,
+    calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -67,7 +68,8 @@ impl ModelClient for ConcurrentModel {
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                 }
             }
-            call("read", "Read", serde_json::json!({"file_path":"value.txt"}))
+            let id = format!("read-{}", self.calls.fetch_add(1, Ordering::SeqCst));
+            call(&id, "Read", serde_json::json!({"file_path":"value.txt"}))
         };
         Ok(ModelOutput {
             private_source: None,
@@ -79,7 +81,7 @@ impl ModelClient for ConcurrentModel {
 }
 
 #[tokio::test]
-async fn two_chats_progress_independently_while_two_goals_share_only_their_own_chat_history() {
+async fn two_chats_progress_independently_and_share_only_their_own_history() {
     let alpha_directory = tempfile::tempdir().unwrap();
     let beta_directory = tempfile::tempdir().unwrap();
     let moved_beta_directory = tempfile::tempdir().unwrap();
@@ -99,6 +101,7 @@ async fn two_chats_progress_independently_while_two_goals_share_only_their_own_c
         alpha_started: Notify::new(),
         release_alpha: CancellationToken::new(),
         requests: Mutex::new(Vec::new()),
+        calls: AtomicUsize::new(0),
     });
     let agent = Agent::new_embedded(config(), model.clone());
     let alpha = agent
@@ -110,25 +113,19 @@ async fn two_chats_progress_independently_while_two_goals_share_only_their_own_c
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(alpha, None, "alpha-first".into())
-        .await
-        .unwrap();
+    let first = agent.submit(alpha, "alpha-first".into()).await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(3),
         model.alpha_started.notified(),
     )
     .await
     .unwrap();
-    let second = agent
-        .submit(alpha, None, "alpha-second".into())
-        .await
-        .unwrap();
+    let second = agent.submit(alpha, "alpha-second".into()).await.unwrap();
     agent
         .set_directories(beta, moved_beta_directory.path().into(), Vec::new())
         .await
         .unwrap();
-    let beta_receipt = agent.submit(beta, None, "beta-only".into()).await.unwrap();
+    let beta_receipt = agent.submit(beta, "beta-only".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         match event.kind {
@@ -138,8 +135,8 @@ async fn two_chats_progress_independently_while_two_goals_share_only_their_own_c
         }
     }
     let snapshot = agent.snapshot(alpha).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::Running);
-    assert_eq!(snapshot.loops[1].state, LoopState::Queued);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Running);
+    assert_eq!(snapshot.pending_inputs[0].receipt.run_id, second.run_id);
     assert_eq!(
         snapshot.folder,
         Some(alpha_directory.path().canonicalize().unwrap())
@@ -149,16 +146,26 @@ async fn two_chats_progress_independently_while_two_goals_share_only_their_own_c
     assert!(beta_history.contains("beta-private-file"));
     assert!(!beta_history.contains("alpha"));
     model.release_alpha.cancel();
-    let mut completed = Vec::new();
-    while completed.len() < 2 {
+    let mut merged = false;
+    loop {
         let event = next_event(&mut events).await;
         match event.kind {
-            EventKind::Completed { .. } if event.chat_id == alpha => completed.push(event.run_id),
+            EventKind::InputMerged { into_run_id } if event.run_id == second.run_id => {
+                assert_eq!(into_run_id, first.run_id);
+                merged = true;
+            }
+            EventKind::Completed { .. } if event.chat_id == alpha => {
+                assert_eq!(event.run_id, first.run_id);
+                break;
+            }
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
-    assert_eq!(completed, vec![first.run_id, second.run_id]);
+    assert!(
+        merged,
+        "the second alpha input joins the running turn of its Chat's Loop"
+    );
     let history = serde_json::to_string(&agent.snapshot(alpha).await.unwrap().messages).unwrap();
     assert!(history.contains("alpha-private-file"));
     assert!(!history.contains("beta"));

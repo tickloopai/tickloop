@@ -120,13 +120,10 @@ async fn failed_reply_text_stays_out_of_the_conversation_across_restart() {
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let failed = agent
-        .submit(chat, None, "Please answer".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Please answer".into()).await.unwrap();
     wait_for(&mut events, |kind| matches!(kind, EventKind::Failed(_))).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
     assert!(
         snapshot
             .messages
@@ -153,7 +150,7 @@ async fn failed_reply_text_stays_out_of_the_conversation_across_restart() {
     );
     let mut events = restored.subscribe();
     restored
-        .submit(chat, Some(failed.loop_id), "Continue after restart".into())
+        .submit(chat, "Continue after restart".into())
         .await
         .unwrap();
     wait_for(&mut events, |kind| {
@@ -240,7 +237,7 @@ async fn verify_rejected_tool_reply(repeat_prior_call: bool) {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read notes before proceeding".into())
+        .submit(chat, "Read notes before proceeding".into())
         .await
         .unwrap();
     wait_for(
@@ -297,10 +294,7 @@ async fn an_empty_failed_reply_does_not_persist_private_thinking() {
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Please answer".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Please answer".into()).await.unwrap();
     wait_for(&mut events, |kind| matches!(kind, EventKind::Failed(_))).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(
@@ -360,10 +354,7 @@ async fn disabling_task_tools_returns_an_unavailable_result_for_a_stale_task_cal
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent.set_task_tools_enabled(chat, true).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Record a task".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Record a task".into()).await.unwrap();
     wait_for(&mut events, |kind| {
         matches!(kind, EventKind::Completed { .. })
     })
@@ -371,7 +362,7 @@ async fn disabling_task_tools_returns_an_unavailable_result_for_a_stale_task_cal
     let before = agent.snapshot(chat).await.unwrap().task_boards;
     agent.set_task_tools_enabled(chat, false).await.unwrap();
     agent
-        .submit(chat, Some(receipt.loop_id), "Continue without tasks".into())
+        .submit(chat, "Continue without tasks".into())
         .await
         .unwrap();
     wait_for(&mut events, |kind| {
@@ -446,7 +437,7 @@ async fn disabled_task_calls_still_reject_duplicate_ids_and_malformed_or_unknown
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Continue without task tools".into())
+            .submit(chat, "Continue without task tools".into())
             .await
             .unwrap();
         wait_for(&mut events, |kind| matches!(kind, EventKind::Failed(error) if error.contains("invalid or repeated tool call"))).await;
@@ -494,10 +485,7 @@ async fn disabling_task_tools_during_a_model_request_does_not_execute_its_task_c
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent.set_task_tools_enabled(chat, true).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Record a task".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Record a task".into()).await.unwrap();
     wait_for(
         &mut events,
         |kind| matches!(kind, EventKind::Text(text) if text == "request-in-flight"),

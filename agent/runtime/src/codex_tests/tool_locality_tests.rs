@@ -71,7 +71,7 @@ async fn run_agent_round_trip(agent: Agent, workdir: &std::path::Path) {
     let chat = agent.create_chat(workdir.to_path_buf()).await.unwrap();
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Read the research test Space".into())
+        .submit(chat, "Read the research test Space".into())
         .await
         .unwrap();
     let mut requested_permission = false;

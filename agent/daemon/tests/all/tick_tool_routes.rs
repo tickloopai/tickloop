@@ -449,7 +449,7 @@ async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Inspect the artifact".into())
+        .submit(chat, "Inspect the artifact".into())
         .await
         .unwrap();
     let result = loop {

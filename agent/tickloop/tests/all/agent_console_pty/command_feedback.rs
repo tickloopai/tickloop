@@ -129,7 +129,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
         rows[0].execution,
         "first model run completes before navigation",
         |snapshot| {
-            snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         },
     )
     .await;
@@ -278,10 +278,9 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
             let ObservationValue::Status(status) = observed.initial else {
                 panic!("expected background Agent status");
             };
-            if status.chat.loops.iter().any(|goal| {
-                goal.id == before.conversation.loops[0].id
-                    && goal.state == tickloop_agent_protocol::LoopState::Completed
-            }) {
+            if status.chat.chat_loop.run_id != before.conversation.chat_loop.run_id
+                && status.chat.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

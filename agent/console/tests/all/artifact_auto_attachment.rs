@@ -59,7 +59,7 @@ fn artifact(title: &str) -> ArtifactTick {
 
 async fn run_artifact_tool(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
-    agent.submit(chat, None, prompt.into()).await.unwrap();
+    agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         match tickloop_agent_test_support::next_event(&mut events)
             .await
@@ -160,7 +160,6 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
         .branch_chat(tickloop_agent_protocol::BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("Removed artifact branch".into()),
         })
         .await
@@ -271,9 +270,9 @@ async fn repeated_confirmed_effects_refresh_metadata_but_failure_and_unknown_do_
             .snapshot(chat)
             .await
             .unwrap()
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
+            .chat_loop
+            .event_sources
+            .is_empty()
     );
     agent.shutdown().await;
 }
@@ -350,9 +349,9 @@ async fn repeated_body_reads_show_one_monitor_row_without_feedback_or_subscripti
             .snapshot(chat)
             .await
             .unwrap()
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
+            .chat_loop
+            .event_sources
+            .is_empty()
     );
     agent.shutdown().await;
 }

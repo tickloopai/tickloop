@@ -307,7 +307,6 @@ fn display_operation_summary<'a>(tool: &str, summary: &'a str) -> &'a str {
         "WebSearch",
         "TaskStop",
         "AskUserQuestion",
-        "StartGoal",
         "TodoWrite",
         "EnterPlanMode",
         "ExitPlanMode",

@@ -134,8 +134,7 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
                 .human_family_origins
                 .values()
                 .any(|source| source.original_submission.contains("@audit DIRECT-HELLO"))
-                && current.conversation.loops[0].state
-                    == tickloop_agent_protocol::LoopState::Completed
+                && current.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         },
     )
     .await;
@@ -183,13 +182,15 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
         frame.contains("Child stop confirmed")
     })
     .await;
-    assert_eq!(
-        snapshot(&client, audit).await.conversation.loops[0].state,
-        tickloop_agent_protocol::LoopState::Stopped
+    assert!(
+        snapshot(&client, audit).await.trigger_awaits_resume,
+        "the stopped member waits to be continued"
     );
+    let echo_snapshot = snapshot(&client, echo).await;
+    assert!(!echo_snapshot.trigger_awaits_resume);
     assert_eq!(
-        snapshot(&client, echo).await.conversation.loops[0].state,
-        tickloop_agent_protocol::LoopState::Completed
+        echo_snapshot.conversation.chat_loop.state,
+        tickloop_agent_protocol::LoopState::Idle
     );
     pty.close().await;
 }
@@ -526,7 +527,7 @@ async fn run_continued_child_notice(fixture: &PrivateFixture) {
         .unwrap()
         .execution;
     wait_snapshot(&client, child, "the child failed", |current| {
-        current.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Failed
+        current.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Failed
     })
     .await;
     open_family_row(&mut pty, CHILD_TASK, |frame| {

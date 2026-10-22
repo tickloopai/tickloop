@@ -378,7 +378,7 @@ fn chat_snapshot() -> ChatSnapshot {
             "child_loop_id": id(0x11),
             "child_run_id": id(0x21),
             "handle": "audit",
-            "state": "Completed",
+            "state": "Idle",
             "result": "Actual child report",
             "error": null,
             "started_at": 1,
@@ -391,21 +391,20 @@ fn chat_snapshot() -> ChatSnapshot {
         "inherited_prompts": [1],
         "message_usage": {"2": {"input_tokens": 120, "output_tokens": 30, "cache_read_input_tokens": 100}},
         "message_models": {"2": {"profile": "example-plan", "protocol": "messages", "requested_model": "example-large"}},
-        "loops": [{
+        "chat_loop": {
             "id": id(0x10),
-            "goal": "Watch the counter",
-            "state": "WaitingTrigger",
+            "state": "Idle",
             "run_id": id(0x20),
             "run_started_at": 1_000,
             "state_since": 2_000,
             "trigger": {
                 "id": id(0x30),
-                "prompt": "Report changes",
-                "prompt_source": "LoopGoal",
+                "prompt": "",
+                "prompt_source": "Subscriptions",
                 "accepts_events": true,
                 "armed": true,
             },
-        }],
+        },
     }))
     .unwrap();
     snapshot.monitor = MonitorMembership {
@@ -549,7 +548,6 @@ fn agent_commands_keep_their_recorded_wire() {
             AgentCommand::Configure { execution: execution(), change: ConfigurationChange::TaskToolsEnabled { enabled: true }, provider: None },
             AgentCommand::Submit {
                 execution: execution(),
-                target_loop: Some(id(0x10)),
                 input: UserInput::Skill {
                     name: "tickloop".into(),
                     arguments: "status".into(),
@@ -581,7 +579,6 @@ fn agent_commands_keep_their_recorded_wire() {
             AgentCommand::ManageLoop {
                 execution: execution(),
                 action: LoopAction::ConfigureTrigger {
-                    loop_id: id(0x10),
                     trigger: Some(
                         serde_json::from_value(json!({
                             "id": id(0x30),
@@ -787,7 +784,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
                 id: id(0x31),
                 loop_id: id(0x10),
-                loop_state: tickloop_agent_protocol::LoopState::WaitingTrigger,
+                loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: hosted_instance(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 2,
@@ -965,7 +962,6 @@ fn command_results_keep_their_recorded_wire() {
             CommandResult::PromptTakenBack {
                 snapshot: Box::new(live_chat_snapshot()),
                 draft: TakenBackPrompt {
-                    loop_id: Some(id(0x10)),
                     prompt: "Compare [Image #1]".into(),
                     contexts: serde_json::from_value(json!([
                         {"kind": "image", "origin": {"type": "pasted", "id": 1}, "image": {"media_type": "image/png", "data": "iVBORw0KGgo=", "width": 1, "height": 1}},

@@ -43,7 +43,7 @@ impl StepModel {
         })
     }
 
-    /// Every text the last model request carried, the host state with its Loop goals included.
+    /// Every text the last model request carried, the host state with its Loop included.
     fn last_request_text(&self) -> String {
         let requests = self.requests.lock().unwrap();
         message_text(&requests.last().expect("a model request").messages)
@@ -141,10 +141,9 @@ async fn complete_prompt(
     agent: &Agent,
     events: &mut Receiver<Event>,
     chat: ChatId,
-    goal: Option<Uuid>,
     prompt: &str,
 ) -> Receipt {
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     assert!(matches!(
         wait_for_run_end(events, receipt.run_id).await,
         EventKind::Completed { .. }
@@ -158,12 +157,11 @@ async fn interrupt_before_reply(
     model: &StepModel,
     events: &mut Receiver<Event>,
     chat: ChatId,
-    goal: Option<Uuid>,
     prompt: &str,
     contexts: Vec<InputContext>,
 ) -> Receipt {
     let receipt = agent
-        .submit_with_input_contexts(chat, goal, prompt.into(), contexts, Vec::new())
+        .submit_with_input_contexts(chat, prompt.into(), contexts, Vec::new())
         .await
         .unwrap();
     model.entered.notified().await;
@@ -187,7 +185,7 @@ async fn a_follow_up_interrupted_before_any_reply_leaves_the_history_and_keeps_i
     let agent = Agent::open_embedded(state.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let kept = complete_prompt(&agent, &mut events, chat, None, "kept prompt").await;
+    let kept = complete_prompt(&agent, &mut events, chat, "kept prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let image = pasted_image(1);
     let interrupted = interrupt_before_reply(
@@ -195,7 +193,6 @@ async fn a_follow_up_interrupted_before_any_reply_leaves_the_history_and_keeps_i
         &model,
         &mut events,
         chat,
-        Some(kept.loop_id),
         "taken back [Image #1]",
         vec![image.clone()],
     )
@@ -210,18 +207,10 @@ async fn a_follow_up_interrupted_before_any_reply_leaves_the_history_and_keeps_i
         .expect("a turn without a reply gives its prompt back");
     assert_eq!(draft.prompt, "taken back [Image #1]");
     assert_eq!(draft.contexts, vec![image]);
-    assert_eq!(draft.loop_id, Some(kept.loop_id));
     let taken_back = agent.snapshot(chat).await.unwrap();
     assert_eq!(taken_back.messages, before.messages);
     assert_eq!(taken_back.rewind_points(), before.rewind_points());
-    assert_eq!(
-        taken_back
-            .loops
-            .iter()
-            .map(|goal| goal.id)
-            .collect::<Vec<_>>(),
-        [kept.loop_id]
-    );
+    assert_eq!(taken_back.chat_loop.id, kept.loop_id);
     assert!(
         taken_back
             .events
@@ -245,14 +234,7 @@ async fn a_follow_up_interrupted_before_any_reply_leaves_the_history_and_keeps_i
         "the prompt is taken back once"
     );
 
-    complete_prompt(
-        &agent,
-        &mut events,
-        chat,
-        draft.loop_id,
-        "replacement prompt",
-    )
-    .await;
+    complete_prompt(&agent, &mut events, chat, "replacement prompt").await;
     let request = model.last_request_text();
     assert!(request.contains("kept answer"), "{request}");
     assert!(!request.contains("taken back"), "{request}");
@@ -270,37 +252,24 @@ async fn a_follow_up_interrupted_before_any_reply_leaves_the_history_and_keeps_i
 }
 
 #[tokio::test]
-async fn a_taken_back_first_prompt_leaves_neither_its_message_nor_its_loop() {
+async fn a_taken_back_first_prompt_leaves_no_message() {
     let directory = tempfile::tempdir().unwrap();
     let model = StepModel::new(vec![Step::Block, Step::Reply(text("fresh answer"))]);
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let interrupted = interrupt_before_reply(
-        &agent,
-        &model,
-        &mut events,
-        chat,
-        None,
-        "first words",
-        Vec::new(),
-    )
-    .await;
+    let interrupted =
+        interrupt_before_reply(&agent, &model, &mut events, chat, "first words", Vec::new()).await;
     let draft = agent
         .take_back_interrupted_prompt(chat, interrupted.run_id)
         .await
         .unwrap()
         .expect("the first prompt comes back");
     assert_eq!(draft.prompt, "first words");
-    assert_eq!(
-        draft.loop_id, None,
-        "the prompt's own Loop is gone, so sending again starts a new one"
-    );
     let taken_back = agent.snapshot(chat).await.unwrap();
     assert!(taken_back.messages.is_empty());
-    assert!(taken_back.loops.is_empty());
 
-    complete_prompt(&agent, &mut events, chat, None, "second words").await;
+    complete_prompt(&agent, &mut events, chat, "second words").await;
     let request = model.last_request_text();
     assert!(request.contains("second words"), "{request}");
     assert!(!request.contains("first words"), "{request}");
@@ -340,7 +309,7 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
     let mut events = agent.subscribe();
 
     let with_tool_call = agent
-        .submit(chat, None, "prompt with a tool call".into())
+        .submit(chat, "prompt with a tool call".into())
         .await
         .unwrap();
     loop {
@@ -366,14 +335,11 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
     );
 
     let blocked = agent
-        .submit(chat, None, "prompt before a queued input".into())
+        .submit(chat, "prompt before a queued input".into())
         .await
         .unwrap();
     model.entered.notified().await;
-    let queued = agent
-        .submit(chat, Some(blocked.loop_id), "queued input".into())
-        .await
-        .unwrap();
+    let queued = agent.submit(chat, "queued input".into()).await.unwrap();
     agent.interrupt(chat).await.unwrap();
     assert!(matches!(
         wait_for_run_end(&mut events, blocked.run_id).await,
@@ -400,7 +366,7 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
         "a later prompt follows the interrupted one"
     );
 
-    let finished = complete_prompt(&agent, &mut events, chat, None, "finished prompt").await;
+    let finished = complete_prompt(&agent, &mut events, chat, "finished prompt").await;
     assert!(
         agent
             .take_back_interrupted_prompt(chat, finished.run_id)
@@ -430,7 +396,7 @@ async fn guidance_written_after_the_prompt_is_no_reply_and_leaves_with_it() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .invoke_skill(chat, None, "/tickloop", "show the current Workspace")
+        .invoke_skill(chat, "/tickloop", "show the current Workspace")
         .await
         .unwrap();
     model.entered.notified().await;

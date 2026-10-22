@@ -287,9 +287,9 @@ async fn run_case(scenario: Scenario, use_jev: bool, ids: &RuleIds) -> CaseResul
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let loop_id = if matches!(scenario, Scenario::Revoked) {
+    if matches!(scenario, Scenario::Revoked) {
         let first = agent
-            .submit(chat, None, "You may create proposed-link".into())
+            .submit(chat, "You may create proposed-link".into())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -303,14 +303,8 @@ async fn run_case(scenario: Scenario, use_jev: bool, ids: &RuleIds) -> CaseResul
         })
         .await
         .unwrap();
-        Some(first.loop_id)
-    } else {
-        None
-    };
-    let run = agent
-        .submit(chat, loop_id, scenario.prompt().into())
-        .await
-        .unwrap();
+    }
+    let run = agent.submit(chat, scenario.prompt().into()).await.unwrap();
     let mut assessment = None;
     let mut tool_started = false;
     tokio::time::timeout(Duration::from_secs(10), async {

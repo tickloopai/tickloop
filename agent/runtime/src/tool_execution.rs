@@ -201,18 +201,12 @@ impl ToolRegistry {
                     }),
             );
         }
-        tools.extend(
-            interaction::definitions(is_delegated)
-                .into_iter()
-                .filter(|definition| match definition.name.as_str() {
-                    ASK_USER_QUESTION_TOOL_NAME => policy.questions,
-                    _ => policy.goals,
-                })
-                .map(|definition| RegisteredTool {
-                    definition,
-                    route: ToolRoute::Interaction,
-                }),
-        );
+        if policy.questions {
+            tools.push(RegisteredTool {
+                definition: interaction::definition(is_delegated),
+                route: ToolRoute::Interaction,
+            });
+        }
         if policy.delegation
             && chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
                 delegation.depth() < tickloop_agent_protocol::MAX_SUBAGENT_DEPTH
@@ -2528,7 +2522,7 @@ mod tests {
         tickloop_agent_tools::Tools::definitions()
             .into_iter()
             .chain([false, true].into_iter().flat_map(plan::definitions))
-            .chain([false, true].into_iter().flat_map(interaction::definitions))
+            .chain([false, true].into_iter().map(interaction::definition))
             .chain(delegation::definitions())
             .chain(agent_messages::definitions())
             .chain([crate::handback::definition()])

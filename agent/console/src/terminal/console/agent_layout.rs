@@ -81,11 +81,11 @@ impl AgentRow {
     }
 
     /// The row's own status word retains its state even when a child's request sets the group:
-    /// a failure is an error, while stopping, interrupting or expiring is only a warning.
+    /// a failure is an error, while an interruption is only a warning.
     pub(in crate::terminal) fn status_role(&self) -> Role {
         match self.state {
             LoopState::Failed => Role::Error,
-            LoopState::Stopped | LoopState::Interrupted | LoopState::Expired => Role::Warning,
+            LoopState::Interrupted => Role::Warning,
             _ => group_role(self.group),
         }
     }
@@ -388,20 +388,18 @@ fn group_role(group: AttentionGroup) -> Role {
         AttentionGroup::Errors => Role::Error,
         AttentionGroup::Working => Role::Accent,
         AttentionGroup::Done => Role::Success,
-        AttentionGroup::Waiting => Role::MutedText,
         AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty => Role::MutedText,
     }
 }
 
 /// The semantic shape drawn before a row's title. Shapes differ per state so the list reads
-/// without colour; a finished row that did not complete (stopped, interrupted, expired) is not
-/// drawn as a success.
+/// without colour; a finished row whose last turn did not complete (interrupted) is not drawn as
+/// a success.
 pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
     match group {
         AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
         AttentionGroup::Errors => Glyph::AgentFailed,
         AttentionGroup::Working => Glyph::AgentRunning,
-        AttentionGroup::Waiting => Glyph::AgentWaiting,
         AttentionGroup::Idle => Glyph::AgentIdle,
         AttentionGroup::Done if completed => Glyph::AgentCompleted,
         AttentionGroup::Done => Glyph::AgentStopped,

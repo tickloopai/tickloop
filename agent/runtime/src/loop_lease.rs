@@ -1,8 +1,8 @@
 //! Trigger 的跨进程租约与停止状态，锁文件参考 Claude Code `utils/cronTasksLock.ts`。
 //!
 //! 同一个 Chat 可以在多个进程中恢复，同一个 Loop 的 Trigger 因此可能被多个进程武装，Tick 订阅、
-//! 显式事件与 Artifact 反馈可能同时送到几个进程。"同一 Loop 同一时刻只由一个进程触发、停止之后
-//! 不再触发"是安全约束：每次送达前取得租约的进程才把输入交给 Loop。
+//! 显式事件与 Artifact 反馈可能同时送到几个进程。"同一 Loop 同一时刻只由一个进程触发、`/stop`
+//! 暂停之后不再触发"是安全约束：每次送达前取得租约的进程才把输入交给 Loop。
 //!
 //! **租约**：Trigger 触发前获取 `<Chat 目录>/loops/<loopId>.lock`。锁文件以独占创建（写临时文件
 //! 后硬链接）建立，内容 `{chatId, pid, nonce, startedAt, host}` 只用于诊断；持有权由对该文件的
@@ -17,11 +17,11 @@
 //! 锁内容记录的主机与本机不同时拒绝接管并报告：锁目录可能位于多台机器共享的文件系统上，flock
 //! 不一定跨主机生效。
 //!
-//! **停止状态**：`<loopId>.state` 记录 `{generation, armed, ended, updatedAt, pid}`，以临时文件加
-//! rename 原子替换，读改写在 `loops/.state.lock` 的 flock 内完成。结束（含 rewind 移除）、解除
-//! 武装、重新武装都递增 generation；结束不可撤销，之后的写入不覆盖它。持锁进程每次触发前读取：
-//! 已结束，或已解除武装且 generation 新于本进程所知，就同步本地 Loop（停止或解除武装、取消
-//! 事件派发令牌、归还租约）且不触发。仅删除锁文件的旧做法会让另一实例接手后继续触发。
+//! **停止状态**：`<loopId>.state` 记录 `{generation, armed, updatedAt, pid}`，以临时文件加
+//! rename 原子替换，读改写在 `loops/.state.lock` 的 flock 内完成。解除武装（含 `/stop` 暂停接收）
+//! 与重新武装都递增 generation。持锁进程每次触发前读取：已解除武装且 generation 新于本进程所知，
+//! 就同步本地 Loop（暂停接收、取消事件派发令牌、归还租约）且不触发。仅删除锁文件的旧做法会让
+//! 另一实例接手后继续触发。
 //!
 //! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
@@ -48,7 +48,7 @@ const STATE_WRITE_LOCK_FILE: &str = ".state.lock";
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
 const HELD_ELSEWHERE_MESSAGE: &str =
-    "another Tickloop process holds this goal's trigger; the event was not delivered";
+    "another Tickloop process holds this Chat's Trigger; the event was not delivered";
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +92,6 @@ impl Drop for LoopLease {
 struct LoopRunState {
     generation: u64,
     armed: bool,
-    ended: bool,
     updated_at: u64,
     pid: u32,
 }
@@ -101,7 +100,6 @@ struct LoopRunState {
 pub(super) enum RunStateChange {
     Armed,
     Disarmed,
-    Ended,
 }
 
 enum LeaseAttempt {
@@ -115,7 +113,6 @@ enum LeaseCheck {
     Held,
     HeldElsewhere,
     ForeignHost(String),
-    EndedElsewhere,
     DisarmedElsewhere(u64),
 }
 
@@ -124,7 +121,7 @@ pub(super) enum TriggerPermit {
     Fire,
     /// 暂不能触发（被其他进程持有、锁来自另一台主机、Loop 暂不可触发），稍后重试。
     Wait(String),
-    /// 停止状态显示 Loop 已在其他进程结束或解除武装，本地已同步。
+    /// 停止状态显示 Loop 已在其他进程解除武装，本地已同步。
     Withdrawn,
     Failed(String),
 }
@@ -168,7 +165,6 @@ impl LoopLeases {
         }
         let known = self.known_generation(key);
         Ok(match read_run_state(directory, loop_id)? {
-            Some(state) if state.ended => LeaseCheck::EndedElsewhere,
             Some(state) if !state.armed && state.generation > known => {
                 LeaseCheck::DisarmedElsewhere(state.generation)
             }
@@ -348,7 +344,7 @@ fn read_run_state(
     }
 }
 
-/// 在状态写锁内读取、递增并原子替换停止状态，返回写入后文件中的状态。已结束的状态不被覆盖。
+/// 在状态写锁内读取、递增并原子替换停止状态，返回写入后文件中的状态。
 fn write_run_state(
     directory: &PrivateDirectory,
     loop_id: LoopId,
@@ -365,13 +361,9 @@ fn write_run_state(
         .open(directory.path().join(STATE_WRITE_LOCK_FILE))?;
     guard.lock()?;
     let current = read_run_state(directory, loop_id)?;
-    if let Some(current) = current.filter(|current| current.ended) {
-        return Ok(current);
-    }
     let next = LoopRunState {
         generation: current.map_or(0, |current| current.generation) + 1,
         armed: change == RunStateChange::Armed,
-        ended: change == RunStateChange::Ended,
         updated_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         pid: std::process::id(),
     };
@@ -395,7 +387,7 @@ impl Agent {
     }
 
     /// Trigger 触发前调用：持有租约、读取停止状态，并确认 Loop 仍可触发。停止状态显示已在其他
-    /// 进程结束或解除武装时同步本地 Loop 并返回 `Withdrawn`。
+    /// 进程解除武装时同步本地 Loop 并返回 `Withdrawn`。
     pub(super) async fn acquire_trigger_permit(
         &self,
         chat_id: ChatId,
@@ -448,7 +440,7 @@ impl Agent {
         }
         match checked {
             Err(error) => {
-                let message = format!("could not take this goal's trigger lease: {error}");
+                let message = format!("could not take this Chat's Trigger lease: {error}");
                 leases.set_notice(
                     chat_id,
                     loop_id,
@@ -462,13 +454,13 @@ impl Agent {
                     chat_id,
                     loop_id,
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
-                    "another Tickloop process holds this goal's trigger".into(),
+                    "another Tickloop process holds this Chat's Trigger".into(),
                 );
                 TriggerPermit::Wait(HELD_ELSEWHERE_MESSAGE.into())
             }
             Ok(LeaseCheck::ForeignHost(host)) => {
                 let message = format!(
-                    "this goal's trigger lock was written on host {host}; the loops directory may \
+                    "this Chat's Trigger lock was written on host {host}; the loops directory may \
                      be shared between machines, so this process will not take it over. Remove \
                      the lock file if that host no longer runs Tickloop"
                 );
@@ -479,10 +471,6 @@ impl Agent {
                     message.clone(),
                 );
                 TriggerPermit::Wait(message)
-            }
-            Ok(LeaseCheck::EndedElsewhere) => {
-                let _ = self.end_goal_ended_elsewhere(chat_id, loop_id).await;
-                TriggerPermit::Withdrawn
             }
             Ok(LeaseCheck::DisarmedElsewhere(generation)) => {
                 leases.remember_generation((chat_id, loop_id), generation);
@@ -498,42 +486,36 @@ impl Agent {
                         .await
                         .get(&chat_id)
                         .is_some_and(|chat| {
-                            chat.snapshot.loops.iter().any(|goal| {
-                                goal.id == loop_id
-                                    && !matches!(
-                                        goal.state,
-                                        tickloop_agent_protocol::LoopState::Stopped
-                                            | tickloop_agent_protocol::LoopState::Expired
-                                    )
-                                    && if feedback_replay {
-                                        chat.snapshot.policy.mode != crate::ExecutionMode::Plan
-                                            && super::feedback_inbox::FeedbackInbox::new(
-                                                chat.tools.chat_directory(),
-                                                chat_id,
-                                            )
-                                            .pending()
-                                            .is_ok_and(|inputs| {
+                            let chat_loop = &chat.snapshot.chat_loop;
+                            chat_loop.id == loop_id
+                                && if feedback_replay {
+                                    chat.snapshot.policy.mode != crate::ExecutionMode::Plan
+                                        && super::feedback_inbox::FeedbackInbox::new(
+                                            chat.tools.chat_directory(),
+                                            chat_id,
+                                        )
+                                        .pending()
+                                        .is_ok_and(
+                                            |inputs| {
                                                 inputs
                                                     .iter()
                                                     .any(|input| input.identity.loop_id == loop_id)
-                                            })
-                                    } else {
-                                        (chat.trigger_cancellations.contains_key(&loop_id)
-                                            || chat.event_cancellations.contains_key(&loop_id))
-                                            && (super::triggers::can_trigger(goal)
-                                                || (chat
-                                                    .event_cancellations
-                                                    .contains_key(&loop_id)
-                                                    && goal
-                                                        .event_sources
-                                                        .iter()
-                                                        .any(|source| !source.resume_required)))
-                                    }
-                            })
+                                            },
+                                        )
+                                } else {
+                                    (chat.trigger_cancellations.contains_key(&loop_id)
+                                        || chat.event_cancellations.contains_key(&loop_id))
+                                        && (super::triggers::can_trigger(chat_loop)
+                                            || (chat.event_cancellations.contains_key(&loop_id)
+                                                && chat_loop
+                                                    .event_sources
+                                                    .iter()
+                                                    .any(|source| !source.resume_required)))
+                                }
                         });
                 if !is_still_armed {
                     leases.release(chat_id, loop_id);
-                    return TriggerPermit::Wait("goal is not eligible for a trigger".into());
+                    return TriggerPermit::Wait("the Loop is not eligible for a Trigger".into());
                 }
                 leases.clear_notice(chat_id, loop_id);
                 TriggerPermit::Fire
@@ -541,8 +523,8 @@ impl Agent {
         }
     }
 
-    /// 记录结束、解除武装或重新武装，让其他进程在下一次触发前看到。结束与解除武装应在归还租约
-    /// 之前写入，避免接手的进程在写入前读到旧状态。失败时返回说明，由调用方在归还租约后通过
+    /// 记录解除武装或重新武装，让其他进程在下一次触发前看到。解除武装应在归还租约之前写入，
+    /// 避免接手的进程在写入前读到旧状态。失败时返回说明，由调用方在归还租约后通过
     /// [`Agent::warn_loop_run_state_failure`] 显示，不影响本地操作。
     pub(super) async fn record_loop_run_state(
         &self,
@@ -593,7 +575,7 @@ impl Agent {
                 loop_id,
                 LoopTriggerNoticeKind::Warning,
                 format!(
-                    "could not record this goal's trigger state ({error}); other Tickloop \
+                    "could not record this Chat's Trigger state ({error}); other Tickloop \
                      processes may not see the change"
                 ),
             );
@@ -685,18 +667,17 @@ mod tests {
     }
 
     #[test]
-    fn ended_state_is_not_overwritten_and_generations_increase() {
+    fn every_change_increases_the_generation() {
         let (_root, directory) = lease_directory();
         let loop_id = Uuid::new_v4();
         let armed = write_run_state(&directory, loop_id, RunStateChange::Armed).unwrap();
         let disarmed = write_run_state(&directory, loop_id, RunStateChange::Disarmed).unwrap();
         assert!(armed.armed && !disarmed.armed);
         assert_eq!(disarmed.generation, armed.generation + 1);
-        let ended = write_run_state(&directory, loop_id, RunStateChange::Ended).unwrap();
         let rearmed = write_run_state(&directory, loop_id, RunStateChange::Armed).unwrap();
-        assert!(rearmed.ended && !rearmed.armed);
-        assert_eq!(rearmed.generation, ended.generation);
-        assert!(read_run_state(&directory, loop_id).unwrap().unwrap().ended);
+        assert!(rearmed.armed);
+        assert_eq!(rearmed.generation, disarmed.generation + 1);
+        assert!(read_run_state(&directory, loop_id).unwrap().unwrap().armed);
     }
 
     #[test]
@@ -714,11 +695,6 @@ mod tests {
         assert!(matches!(
             leases.check(&directory, chat_id, loop_id).unwrap(),
             LeaseCheck::DisarmedElsewhere(generation) if generation == armed.generation + 1
-        ));
-        write_run_state(&directory, loop_id, RunStateChange::Ended).unwrap();
-        assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
-            LeaseCheck::EndedElsewhere
         ));
     }
 

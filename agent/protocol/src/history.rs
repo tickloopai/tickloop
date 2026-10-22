@@ -12,14 +12,13 @@ use crate::{
 pub struct BranchRequest {
     pub request_id: Uuid,
     pub source_chat_id: ChatId,
-    pub source_loop_id: Option<LoopId>,
     pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BranchSessionPermissionRegistration {
     pub source_chat_id: ChatId,
-    pub source_loop_id: Option<LoopId>,
+    pub source_loop_id: LoopId,
     pub child_chat_id: ChatId,
 }
 
@@ -62,7 +61,7 @@ pub struct BranchOrigin {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BranchCreation {
-    pub source_loop_id: Option<LoopId>,
+    pub source_loop_id: LoopId,
     pub request_id: Uuid,
     pub requested_name: Option<String>,
     pub source_raw_boundary: usize,
@@ -128,7 +127,6 @@ pub struct RewindPoint {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RewindDraft {
-    pub loop_id: LoopId,
     pub prompt: String,
     pub contexts: Vec<InputContext>,
 }
@@ -136,9 +134,6 @@ pub struct RewindDraft {
 /// A prompt an interrupt took back from the conversation, to edit and send again.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TakenBackPrompt {
-    /// The Loop the prompt was sent to, while it is still in the conversation; without one, the
-    /// prompt sent again starts a new Loop.
-    pub loop_id: Option<LoopId>,
     pub prompt: String,
     pub contexts: Vec<InputContext>,
 }

@@ -473,9 +473,7 @@ mod tests {
                 filter: tickloop_agent_protocol::AgentFilter::default(),
             },
             chat,
-            goal: None,
             overview: false,
-            selected_loops: HashMap::new(),
             configuration: serde_json::to_value(
                 crate::terminal::new_agent_draft::NewAgentDraft::default(),
             )

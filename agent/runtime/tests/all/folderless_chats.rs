@@ -99,7 +99,7 @@ fn tool_result<'a>(
 /// Runs one turn of `prompt` and returns every event of its Run.
 async fn run_turn(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<EventKind> {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut kinds = Vec::new();
     loop {
         let event = next_event(&mut events).await;
@@ -141,7 +141,6 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
             "EnterPlanMode",
             "ExitPlanMode",
             "AskUserQuestion",
-            "StartGoal",
             "Subagent",
             "ListSubagents",
             "SendMessage",
@@ -151,7 +150,6 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
     );
     let prompt = system_prompt(&requests[0]);
     for section in [
-        "StartGoal",
         "# Ticks, Loops, and workspace displays",
         "# Subagent communication",
         "# Agent daemon lifecycle",
@@ -180,7 +178,6 @@ async fn a_folderless_chat_offers_web_fetch_alone_and_hears_of_nothing_else() {
         assert_eq!(tool_names(request), ["WebFetch"]);
         let prompt = system_prompt(request);
         for absent in [
-            "StartGoal",
             "AskUserQuestion",
             "Subagent",
             "TickManage",
@@ -228,7 +225,6 @@ async fn excepted_tool_names_return_disabled_results_without_any_wait() {
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.permissions.is_empty() && snapshot.questions.is_empty());
-    assert_eq!(snapshot.loops.len(), 1);
     agent.shutdown().await;
 }
 
@@ -332,7 +328,7 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
     let unsupported = |result: Result<_, AgentError>| matches!(result, Err(AgentError::Invalid(message)) if message.starts_with("Unsupported: this Chat has no Folder"));
     assert!(unsupported(
         agent
-            .submit_user_shell_for_goal(chat, None, "pwd".into(), false)
+            .submit_user_shell(chat, "pwd".into(), false)
             .await
             .map(|_| ())
     ));
@@ -340,7 +336,6 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
         agent
             .submit_with_file_references(
                 chat,
-                None,
                 "read @notes.txt".into(),
                 vec![directory.path().join("notes.txt")],
             )
@@ -360,13 +355,7 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
     });
     assert!(unsupported(
         agent
-            .submit_with_input_contexts(
-                chat,
-                None,
-                "look".into(),
-                vec![mentioned_image],
-                Vec::new()
-            )
+            .submit_with_input_contexts(chat, "look".into(), vec![mentioned_image], Vec::new())
             .await
             .map(|_| ())
     ));
@@ -470,7 +459,7 @@ async fn local_folder_apis_refuse_a_folderless_harness_before_reading_anything()
     let chat = agent.create_chat_without_folder().await.unwrap();
     assert!(
         agent
-            .submit_user_shell_for_goal(chat, None, "pwd".into(), false)
+            .submit_user_shell(chat, "pwd".into(), false)
             .await
             .is_err()
     );

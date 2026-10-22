@@ -171,7 +171,7 @@
             "child_loop_id": "00000000-0000-0000-0000-000000000011",
             "child_run_id": "00000000-0000-0000-0000-000000000021",
             "handle": "audit",
-            "state": "Completed",
+            "state": "Idle",
             "result": "Actual child report",
             "error": null,
             "started_at": 1,
@@ -318,24 +318,21 @@
             "provider": "api"
           }
         },
-        "loops": [
-          {
-            "id": "00000000-0000-0000-0000-000000000010",
-            "goal": "Watch the counter",
-            "state": "WaitingTrigger",
-            "run_id": "00000000-0000-0000-0000-000000000020",
-            "run_started_at": 1000,
-            "trigger": {
-              "id": "00000000-0000-0000-0000-000000000030",
-              "prompt": "Report changes",
-              "prompt_source": "LoopGoal",
-              "accepts_events": true,
-              "armed": true,
-              "subscriptions": []
-            },
-            "state_since": 2000
-          }
-        ],
+        "chat_loop": {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "state": "Idle",
+          "run_id": "00000000-0000-0000-0000-000000000020",
+          "run_started_at": 1000,
+          "trigger": {
+            "id": "00000000-0000-0000-0000-000000000030",
+            "prompt": "",
+            "prompt_source": "Subscriptions",
+            "accepts_events": true,
+            "armed": true,
+            "subscriptions": []
+          },
+          "state_since": 2000
+        },
         "plans": [],
         "progress": []
       },
@@ -509,7 +506,7 @@
         "slow disk"
       ],
       "request_refs": [],
-      "resume_triggers": [],
+      "trigger_awaits_resume": false,
       "last_queue_sequence": 0,
       "transcript_write_error": "disk full",
       "loop_trigger_notices": [],
@@ -601,7 +598,7 @@
       {
         "id": "00000000-0000-0000-0000-000000000031",
         "loop_id": "00000000-0000-0000-0000-000000000010",
-        "loop_state": "WaitingTrigger",
+        "loop_state": "Idle",
         "instance": "hosted:00000000-0000-0000-0000-000000000040",
         "frequency": "high",
         "accumulated": 2,
@@ -922,24 +919,22 @@
           ],
           "revision": 4
         },
-        "loops": [
-          {
-            "id": "00000000-0000-0000-0000-000000000010",
-            "goal": "Watch the counter",
-            "state": "WaitingTrigger",
-            "run_id": "00000000-0000-0000-0000-000000000020",
-            "run_started_at": 1000,
-            "trigger": {
-              "id": "00000000-0000-0000-0000-000000000030",
-              "prompt": "Report changes",
-              "prompt_source": "LoopGoal",
-              "accepts_events": true,
-              "armed": true,
-              "subscriptions": []
-            },
-            "state_since": 2000
-          }
-        ],
+        "chat_loop": {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "state": "Idle",
+          "run_id": "00000000-0000-0000-0000-000000000020",
+          "run_started_at": 1000,
+          "trigger": {
+            "id": "00000000-0000-0000-0000-000000000030",
+            "prompt": "",
+            "prompt_source": "Subscriptions",
+            "accepts_events": true,
+            "armed": true,
+            "subscriptions": []
+          },
+          "state_since": 2000
+        },
+        "first_prompt": "Audit the counter",
         "plans": [],
         "progress": [],
         "permissions": [],

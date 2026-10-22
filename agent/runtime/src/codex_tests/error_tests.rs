@@ -45,7 +45,7 @@ async fn quota_failure_is_terminal_in_agent_with_one_http_request() {
     let agent = agent_with_codex(&state_dir, &endpoint);
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await
@@ -79,7 +79,7 @@ async fn service_retry_false_stops_agent_after_one_request() {
     let agent = agent_with_codex(&state_dir, &endpoint);
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await
@@ -121,7 +121,7 @@ async fn transient_429_retries_once_using_retry_after() {
     let agent = agent_with_codex(&state_dir, &endpoint);
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     let mut retries = 0;
     loop {
         let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -157,7 +157,7 @@ async fn retry_after_wait_is_cancelled_before_another_http_request() {
     let agent = agent_with_codex(&state_dir, &endpoint);
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await
@@ -344,11 +344,7 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Inspect the directory without making changes".into(),
-        )
+        .submit(chat, "Inspect the directory without making changes".into())
         .await
         .unwrap();
     let mut denial = None;

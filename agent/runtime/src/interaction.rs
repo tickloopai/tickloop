@@ -3,12 +3,11 @@ use crate::QuestionReply;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
-    EventKind, LoopSnapshot, LoopState, OperationState, PendingInput, Question, QuestionAnswer,
-    QuestionRequest, Receipt, ToolDefinition, ToolResult,
+    EventKind, LoopState, OperationState, Question, QuestionAnswer, QuestionRequest, Receipt,
+    ToolDefinition, ToolResult,
 };
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
-    START_GOAL_TOOL_NAME,
 };
 use tickloop_agent_transcript::{ModelVisibleResult, SettledOutcome};
 
@@ -86,11 +85,9 @@ fn ensure_question_waits(chat: &Chat, request: &QuestionRequest) -> Result<(), A
     let run_is_live = !chat
         .run_cancel(request.run_id)
         .is_none_or(CancellationToken::is_cancelled);
-    let loop_waits = chat.snapshot.loops.iter().any(|goal| {
-        goal.id == request.loop_id
-            && goal.run_id == Some(request.run_id)
-            && goal.state == LoopState::WaitingQuestion
-    });
+    let chat_loop = &chat.snapshot.chat_loop;
+    let loop_waits =
+        chat_loop.run_id == Some(request.run_id) && chat_loop.state == LoopState::WaitingQuestion;
     if run_is_live && loop_waits {
         Ok(())
     } else {
@@ -153,7 +150,7 @@ fn answered_questions_result(questions: &[Question], answers: &[QuestionAnswer])
 
 /// Claude Code's `AskUserQuestion` prompt. Its plan mode note points at `ExitPlanMode`, which a
 /// delegated child does not have, so a child's description leaves the note out.
-fn ask_user_question_definition(is_delegated: bool) -> ToolDefinition {
+pub(super) fn definition(is_delegated: bool) -> ToolDefinition {
     let plan_tool = EXIT_PLAN_MODE_TOOL_NAME;
     let plan_mode_note = if is_delegated {
         String::new()
@@ -267,35 +264,6 @@ Usage notes:
             "required": ["questions"],
             "additionalProperties": false
         }),
-    }
-}
-
-pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
-    vec![ask_user_question_definition(is_delegated), ToolDefinition {
-        name: START_GOAL_TOOL_NAME.into(),
-        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run.".into(),
-        input_schema: json!({"type":"object","properties":{
-            "goal":{"type":"string"}
-        },"required":["goal"],"additionalProperties":false}),
-    }]
-}
-
-/// What a StartGoal call that registered `goal` returns: the input queued for it.
-pub(crate) fn started_goal_result(
-    chat_id: ChatId,
-    goal: &LoopSnapshot,
-    queued_run: Option<RunId>,
-) -> ToolResult {
-    let content = match queued_run {
-        Some(run_id) => {
-            json!({"chat_id":chat_id,"loop_id":goal.id,"run_id":run_id,"state":"queued"})
-        }
-        None => json!({"chat_id":chat_id,"loop_id":goal.id,"state":"registered"}),
-    };
-    ToolResult {
-        content: content.to_string(),
-        is_error: false,
-        output_ref: None,
     }
 }
 
@@ -437,136 +405,8 @@ impl Agent {
             ASK_USER_QUESTION_TOOL_NAME => {
                 Some(self.ask_question(receipt, call_id, input, cancel).await)
             }
-            START_GOAL_TOOL_NAME => Some(self.start_goal(receipt, call_id, input, cancel).await),
             _ => None,
         }
-    }
-
-    /// Registers the goal and queues it.
-    async fn start_goal(
-        &self,
-        receipt: &Receipt,
-        call_id: &str,
-        input: &Value,
-        cancel: CancellationToken,
-    ) -> Result<ToolResult, String> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Input {
-            goal: String,
-        }
-        let parsed: Input = serde_json::from_value(input.clone())
-            .map_err(|_| format!("{START_GOAL_TOOL_NAME} requires a goal string"))?;
-        if parsed.goal.trim().is_empty() || parsed.goal.len() > MAX_ANSWER_BYTES {
-            return Err("goal must contain 1 to 65536 bytes".into());
-        }
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or_else(|| "chat is unavailable".to_string())?;
-        if cancel.is_cancelled()
-            || chat.active_run != Some(receipt.run_id)
-            || chat
-                .active
-                .as_ref()
-                .is_none_or(CancellationToken::is_cancelled)
-            || !chat.snapshot.loops.iter().any(|goal| {
-                goal.id == receipt.loop_id
-                    && goal.run_id == Some(receipt.run_id)
-                    && goal.state == LoopState::Running
-            })
-        {
-            return Err("run was cancelled before creating the new goal".into());
-        }
-        // The Loop is named by the answer and call that register it, so a load finds what a
-        // call whose result was lost with its host registered.
-        let loop_id = chat
-            .bookkeeping
-            .lifecycle
-            .active_response(receipt.run_id)
-            .map_or_else(Uuid::new_v4, |response| {
-                tickloop_agent_transcript::input_ids::started_goal(
-                    receipt.chat_id,
-                    response,
-                    call_id,
-                )
-            });
-        if let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) {
-            let queued_run = chat
-                .bookkeeping
-                .lifecycle
-                .input(tickloop_agent_transcript::input_ids::goal(loop_id))
-                .map(|accepted| accepted.run_id);
-            return Ok(started_goal_result(receipt.chat_id, goal, queued_run));
-        }
-        let mut snapshot = chat.snapshot.clone();
-        let new_receipt = Receipt {
-            chat_id: receipt.chat_id,
-            loop_id,
-            run_id: Uuid::new_v4(),
-        };
-        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
-        chat.bookkeeping.add_loop(
-            &mut snapshot,
-            LoopSnapshot {
-                id: new_receipt.loop_id,
-                goal: parsed.goal.clone(),
-                state: LoopState::Queued,
-                run_id: None,
-                run_started_at: None,
-                trigger: None,
-                event_sources: Vec::new(),
-                state_since: Some(now),
-            },
-        );
-        let index = snapshot
-            .pending_inputs
-            .iter()
-            .position(|pending| pending.trigger_source.is_some())
-            .unwrap_or(snapshot.pending_inputs.len());
-        snapshot.last_queue_sequence += 1;
-        let queued_sequence = snapshot.last_queue_sequence;
-        let queued = PendingInput {
-            receipt: new_receipt.clone(),
-            input: parsed.goal,
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: None,
-            armed: true,
-            queued_sequence,
-            task_continuation: false,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
-        };
-        chat.bookkeeping.lifecycle.accept(
-            &lifecycle::LedgerInput::new(
-                tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
-                tickloop_agent_transcript::InputOp::Goal,
-                &queued.input,
-            ),
-            &queued,
-        );
-        snapshot.pending_inputs.insert(index, queued);
-        let queued_run = Some(new_receipt.run_id);
-        let goal = snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == loop_id)
-            .expect("the goal was just added");
-        let result = started_goal_result(receipt.chat_id, goal, queued_run);
-        if let Some(operation) = snapshot
-            .operations
-            .iter_mut()
-            .find(|operation| operation.run_id == receipt.run_id && operation.call_id == call_id)
-        {
-            operation.state = OperationState::Completed;
-            operation.result = Some(result.clone());
-        }
-        self.save(&snapshot);
-        chat.snapshot = snapshot;
-        Ok(result)
     }
 
     async fn ask_question(
@@ -605,15 +445,14 @@ impl Agent {
                 return Err("run was cancelled before clarification".into());
             }
             let mut snapshot = chat.snapshot.clone();
-            let goal = snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == receipt.loop_id && goal.run_id == Some(receipt.run_id))
-                .ok_or_else(|| "question belongs to an expired run".to_string())?;
-            if goal.state != LoopState::Running {
-                return Err("goal cannot ask a question in its current state".into());
+            let chat_loop = &mut snapshot.chat_loop;
+            if chat_loop.run_id != Some(receipt.run_id) {
+                return Err("question belongs to an expired run".into());
             }
-            goal.set_state(LoopState::WaitingQuestion);
+            if chat_loop.state != LoopState::Running {
+                return Err("the Loop cannot ask a question in its current state".into());
+            }
+            chat_loop.set_state(LoopState::WaitingQuestion);
             snapshot.questions.push(request.clone());
             self.save(&snapshot);
             chat.snapshot = snapshot;

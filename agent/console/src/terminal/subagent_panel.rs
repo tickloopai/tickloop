@@ -66,7 +66,7 @@ pub(super) fn family_line(
         (
             state_detail(row, now),
             if row.group == AttentionGroup::Done
-                && row.state == tickloop_agent_protocol::LoopState::Completed
+                && row.state == tickloop_agent_protocol::LoopState::Idle
             {
                 Role::MutedText
             } else {
@@ -126,7 +126,7 @@ fn state_detail(row: &AgentRow, now: u64) -> String {
     }
     if row.group == AttentionGroup::Idle
         || (row.group == AttentionGroup::Done
-            && row.state == tickloop_agent_protocol::LoopState::Completed)
+            && row.state == tickloop_agent_protocol::LoopState::Idle)
     {
         return "idle".into();
     }

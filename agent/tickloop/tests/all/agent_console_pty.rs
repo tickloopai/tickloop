@@ -900,11 +900,11 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     .await
     .expect("ordinary prompt must create the working Agent");
     let running = wait_snapshot(&client, execution, "original model work remains Running", |snapshot| {
-        snapshot.conversation.loops.iter().any(|goal| goal.state == tickloop_agent_protocol::LoopState::Running)
+        snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Running
             && snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_agent_protocol::EventKind::ToolStarted { name, .. } if name == "Bash"))
     }).await;
-    let loop_id = running.conversation.loops[0].id;
-    let run_id = running.conversation.loops[0].run_id;
+    let loop_id = running.conversation.chat_loop.id;
+    let run_id = running.conversation.chat_loop.run_id;
     first
         .wait_for("working Agent visible before detach", |frame| {
             frame.contains("work started")
@@ -916,11 +916,11 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
         .expect("interactive Ctrl+D must detach before the unfinished Agent completes");
     let detached = snapshot(&client, execution).await;
     assert_eq!(
-        detached.conversation.loops[0].state,
+        detached.conversation.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
-    assert_eq!(detached.conversation.loops[0].id, loop_id);
-    assert_eq!(detached.conversation.loops[0].run_id, run_id);
+    assert_eq!(detached.conversation.chat_loop.id, loop_id);
+    assert_eq!(detached.conversation.chat_loop.run_id, run_id);
     let rows = catalog(&client).await;
     assert_eq!(rows.len(), 1);
     assert!(rows[0].views.is_empty());
@@ -951,7 +951,11 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     assert_eq!(catalog(&client).await[0].execution, execution);
     assert_eq!(catalog(&client).await[0].views.len(), 1);
     assert_eq!(
-        snapshot(&client, execution).await.conversation.loops[0].run_id,
+        snapshot(&client, execution)
+            .await
+            .conversation
+            .chat_loop
+            .run_id,
         run_id
     );
     std::fs::write(fixture.path("work/finish"), "finish").unwrap();
@@ -960,12 +964,11 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
         execution,
         "original run completes after reattach",
         |snapshot| {
-            snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         },
     )
     .await;
-    assert_eq!(completed.conversation.loops.len(), 1);
-    assert_eq!(completed.conversation.loops[0].id, loop_id);
+    assert_eq!(completed.conversation.chat_loop.id, loop_id);
     reopened
         .wait_for("original result reaches the replacement View", |frame| {
             frame.contains("original execution completed after reattach")
@@ -1400,14 +1403,12 @@ async fn wait_snapshot(
 
 fn snapshot_diagnostic(snapshot: &LiveChatSnapshot) -> String {
     format!(
-        "sequence={} loops={:?} permissions={:?} questions={} pending_thinking_chars={:?} operations={:?} commands={:?}",
+        "sequence={} loop={:?} permissions={:?} questions={} pending_thinking_chars={:?} operations={:?} commands={:?}",
         snapshot.last_sequence,
-        snapshot
-            .conversation
-            .loops
-            .iter()
-            .map(|goal| (goal.id, goal.run_id, &goal.state))
-            .collect::<Vec<_>>(),
+        (
+            snapshot.conversation.chat_loop.run_id,
+            &snapshot.conversation.chat_loop.state
+        ),
         snapshot
             .permissions
             .iter()
@@ -1438,9 +1439,7 @@ fn snapshot_diagnostic(snapshot: &LiveChatSnapshot) -> String {
 
 fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool {
     frame.lines().any(|line| line.trim() == question)
-        && frame
-            .lines()
-            .any(|line| line.contains("Goal:") && line.contains(requester))
+        && frame.lines().any(|line| line.trim() == requester)
         && frame.contains("enter select")
         && frame.contains("esc cancel")
 }
@@ -1644,7 +1643,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         snapshot(&client, other).await.conversation.folder,
         Some(other_project.clone())
     );
-    let child_loop = child_before.conversation.loops[0].id;
+    let child_loop = child_before.conversation.chat_loop.id;
     let metadata =
         serde_json::to_value(child_before.conversation.delegation.as_ref().unwrap()).unwrap();
     first
@@ -1755,7 +1754,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         "{child_frame}"
     );
     assert_eq!(
-        snapshot(&client, parent).await.conversation.loops[0].state,
+        snapshot(&client, parent).await.conversation.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
     second
@@ -1821,14 +1820,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent,
         "parent waits on its model response after receiving the child result",
         |snapshot| {
-            snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Running
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Running
                 && snapshot.events.iter().any(|event| matches!(&event.kind,
                     tickloop_agent_protocol::EventKind::ToolCompleted { call_id, .. } if call_id == "delegate-cli"))
         },
     )
     .await;
-    let parent_loop = parent_running.conversation.loops[0].id;
-    let parent_run = parent_running.conversation.loops[0].run_id;
+    let parent_loop = parent_running.conversation.chat_loop.id;
+    let parent_run = parent_running.conversation.chat_loop.run_id;
     first
         .wait_for("child request resolves", |frame| {
             frame.contains("child weekly result")
@@ -1936,8 +1935,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     first.send(format!("{FOLLOW_UP}\r").as_bytes());
     let followed = wait_snapshot(&client, child, "original child Loop follow-up", |snapshot| snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_agent_protocol::EventKind::Text(text) if text.contains("child follow-up acknowledged")))).await;
-    assert_eq!(followed.conversation.loops.len(), 1);
-    assert_eq!(followed.conversation.loops[0].id, child_loop);
+    assert_eq!(followed.conversation.chat_loop.id, child_loop);
     assert_eq!(
         serde_json::to_value(followed.conversation.delegation.as_ref().unwrap()).unwrap(),
         metadata
@@ -1958,12 +1956,15 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent_running.conversation.messages.len()
     );
     assert_eq!(
-        parent_after_follow_up.conversation.loops[0].state,
+        parent_after_follow_up.conversation.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
-    assert_eq!(parent_after_follow_up.conversation.loops[0].id, parent_loop);
     assert_eq!(
-        parent_after_follow_up.conversation.loops[0].run_id,
+        parent_after_follow_up.conversation.chat_loop.id,
+        parent_loop
+    );
+    assert_eq!(
+        parent_after_follow_up.conversation.chat_loop.run_id,
         parent_run
     );
     assert_eq!(
@@ -1976,14 +1977,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent,
         "parent processes the delivered follow-up report",
         |snapshot| {
-            snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
                 && snapshot.events.iter().any(|event| matches!(&event.kind,
                     tickloop_agent_protocol::EventKind::Text(text) if text.contains("parent processed the follow-up report")))
         },
     )
     .await;
-    assert_eq!(parent_done.conversation.loops[0].id, parent_loop);
-    assert_ne!(parent_done.conversation.loops[0].run_id, parent_run);
+    assert_eq!(parent_done.conversation.chat_loop.id, parent_loop);
+    assert_ne!(parent_done.conversation.chat_loop.run_id, parent_run);
     assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_agent_protocol::EventKind::Text(text) if text.contains("parent delegated result received"))));
     let shared_fact = second
         .wait_for("shared child fact keeps the second View draft", |frame| {
@@ -2146,7 +2147,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     let first = catalog(&client).await[0].execution;
     let first_running = snapshot(&client, first).await;
     assert_eq!(
-        first_running.conversation.loops[0].state,
+        first_running.conversation.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
     assert!(first_running.events.iter().any(|event| matches!(
@@ -2274,17 +2275,17 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         first,
         "first Agent completes while another is visible",
         |snapshot| {
-            snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         },
     )
     .await;
     assert_eq!(
-        completed.conversation.loops[0].id,
-        first_running.conversation.loops[0].id
+        completed.conversation.chat_loop.id,
+        first_running.conversation.chat_loop.id
     );
     assert_eq!(
-        completed.conversation.loops[0].run_id,
-        first_running.conversation.loops[0].run_id
+        completed.conversation.chat_loop.run_id,
+        first_running.conversation.chat_loop.run_id
     );
     assert!(completed.events.iter().any(|event| matches!(&event.kind,
         tickloop_agent_protocol::EventKind::Text(text) if text.contains("A final output after switching away"))));
@@ -2577,7 +2578,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
         .await;
         let peer = snapshot(&client, other).await;
         assert!(peer.last_model_run.is_none());
-        assert!(peer.conversation.loops.is_empty());
+        assert!(peer.conversation.chat_loop.run_id.is_none());
         assert_eq!(peer.user_shells.len(), 1);
         assert_eq!(catalog(&client).await.len(), 2);
         let returned = snapshot(&client, first).await;
@@ -2586,8 +2587,8 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
             first_before.conversation.folder
         );
         assert_eq!(
-            returned.conversation.loops[0].id,
-            first_before.conversation.loops[0].id
+            returned.conversation.chat_loop.id,
+            first_before.conversation.chat_loop.id
         );
     }
     view.send(b"\x13");
@@ -2651,7 +2652,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
     })
     .await;
     let completed = wait_snapshot(&client, first, "restored image completes on its original Agent", |snapshot| {
-        snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+        snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
             && snapshot.events.iter().any(|event| matches!(
                 &event.kind,
                 tickloop_agent_protocol::EventKind::Text(text) if text.contains("restored image received")
@@ -2660,8 +2661,8 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
     .await;
     assert_eq!(completed.conversation.id, first_before.conversation.id);
     assert_eq!(
-        completed.conversation.loops[0].id,
-        first_before.conversation.loops[0].id
+        completed.conversation.chat_loop.id,
+        first_before.conversation.chat_loop.id
     );
     assert!(completed.last_model_run.is_some());
     assert_ne!(completed.last_model_run, first_before.last_model_run);
@@ -2996,7 +2997,7 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
         Some(expected_directory.clone())
     );
     assert!(submitted.last_model_run.is_none());
-    assert!(submitted.conversation.loops.is_empty());
+    assert!(submitted.conversation.chat_loop.run_id.is_none());
     view.wait_for("restored Shell output reaches the same View", |frame| {
         frame
             .lines()

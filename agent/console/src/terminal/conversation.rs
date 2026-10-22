@@ -110,7 +110,6 @@ pub(super) enum ConversationOutcome {
     Completed,
     Failed { error: String },
     Interrupted,
-    GoalEnded,
 }
 
 #[derive(Clone, Debug)]
@@ -211,26 +210,22 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             }
         }
     }
-    for goal in &snapshot.loops {
-        let Some(run_id) = goal.run_id else {
-            continue;
-        };
-        let Some(thinking) = snapshot.pending_thinking.get(&run_id) else {
-            continue;
-        };
-        if !thinking.is_empty() {
-            blocks.push(ConversationBlock {
-                id: ConversationBlockId::StreamingThinking {
-                    chat_id: snapshot.id,
-                    run_id,
-                },
-                metadata: metadata(Some(run_id), Some(goal.id), None),
-                kind: ConversationBlockKind::Thinking {
-                    text: thinking.clone(),
-                    source: ThinkingSource::ModelText,
-                },
-            });
-        }
+    let chat_loop = &snapshot.chat_loop;
+    if let Some(run_id) = chat_loop.run_id
+        && let Some(thinking) = snapshot.pending_thinking.get(&run_id)
+        && !thinking.is_empty()
+    {
+        blocks.push(ConversationBlock {
+            id: ConversationBlockId::StreamingThinking {
+                chat_id: snapshot.id,
+                run_id,
+            },
+            metadata: metadata(Some(run_id), Some(chat_loop.id), None),
+            kind: ConversationBlockKind::Thinking {
+                text: thinking.clone(),
+                source: ThinkingSource::ModelText,
+            },
+        });
     }
     let pending = super::workflows::pending_reply(snapshot);
     if !pending.is_empty() {
@@ -290,10 +285,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
     for outcome in events.filter_map(|event| {
         matches!(
             event.kind,
-            EventKind::Completed { .. }
-                | EventKind::Failed(_)
-                | EventKind::Interrupted
-                | EventKind::GoalEnded { .. }
+            EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted
         )
         .then(|| project_event(event))
         .flatten()
@@ -487,7 +479,6 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             },
         ),
         EventKind::Interrupted => outcome_block(event, ConversationOutcome::Interrupted),
-        EventKind::GoalEnded { .. } => outcome_block(event, ConversationOutcome::GoalEnded),
         EventKind::CommandUpdated { command } => ConversationBlock {
             id: ConversationBlockId::Command {
                 chat_id: event.chat_id,
@@ -693,7 +684,7 @@ mod tests {
             "id": chat_id,
             "folder": "/work",
             "messages": [],
-            "loops": []
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         }))
         .unwrap();
         snapshot.model = tickloop_agent_protocol::ModelConfig {

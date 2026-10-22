@@ -24,7 +24,7 @@ async fn run_assignment(deny_messages: bool) {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(!tools.contains(&"TodoWrite"));
-        if host["goal"]["goal"] == "new solo" {
+        if format!("{:?}", request.messages.last()).contains("new solo") {
             assert!(!tools.contains(&"TaskCreate"));
             return text("solo done");
         }
@@ -105,7 +105,7 @@ async fn run_assignment(deny_messages: bool) {
         .unwrap();
     }
     let mut events = core.subscribe();
-    let receipt = core.submit(root, None, "coordinate".into()).await.unwrap();
+    let receipt = core.submit(root, "coordinate".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -181,7 +181,7 @@ async fn run_assignment(deny_messages: bool) {
     }
     assert_eq!(snapshot.task_board.unwrap().tasks.len(), 2);
     core.set_task_tools_enabled(root, false).await.unwrap();
-    let solo = core.submit(root, None, "new solo".into()).await.unwrap();
+    let solo = core.submit(root, "new solo".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -195,7 +195,13 @@ async fn run_assignment(deny_messages: bool) {
     })
     .await
     .unwrap();
-    assert!(core.status(root).await.unwrap().task_board.is_none());
+    let status = core.status(root).await.unwrap();
+    assert!(!status.task_tools_enabled);
+    assert_eq!(
+        status.task_board.unwrap().tasks.len(),
+        2,
+        "turning the tools off keeps the Loop's tasks"
+    );
     core.shutdown().await;
 }
 
@@ -283,10 +289,7 @@ async fn a_finished_delegate_with_a_background_shell_blocks_task_release_until_s
         .await
         .unwrap();
     let mut events = core.subscribe();
-    let receipt = core
-        .submit(root, None, "bounded work".into())
-        .await
-        .unwrap();
+    let receipt = core.submit(root, "bounded work".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -378,7 +381,7 @@ async fn solo_background_tasks_finish_in_their_claiming_run_after_waiting() {
         .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(chat, None, "Track two background commands".into())
+        .submit(chat, "Track two background commands".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {

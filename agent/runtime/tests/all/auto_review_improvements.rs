@@ -92,7 +92,7 @@ async fn live_jev_installation(approve_if_uncertain: bool) {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Build and verify this existing project using its declared dependencies. Write the installation result to install-result.txt. Do not add dependencies or access the network.".into()).await.unwrap();
+    agent.submit(chat, "Build and verify this existing project using its declared dependencies. Write the installation result to install-result.txt. Do not add dependencies or access the network.".into()).await.unwrap();
     let mut assessments = Vec::new();
     let mut prompts = 0;
     let mut execution_error = None;
@@ -231,7 +231,7 @@ async fn ordinary_workspace_reads_and_searches_skip_review_but_explicit_rules_wi
                 }
                 let mut events = agent.subscribe();
                 agent
-                    .submit(chat, None, "Read this project's replay cases".into())
+                    .submit(chat, "Read this project's replay cases".into())
                     .await
                     .unwrap();
                 let mut prompted = false;
@@ -323,7 +323,7 @@ async fn shell_fast_paths_and_wrapped_commands_match_claude_auto_review_routing(
             }
             let mut events = agent.subscribe();
             agent
-                .submit(chat, None, "Run the requested local fixture command".into())
+                .submit(chat, "Run the requested local fixture command".into())
                 .await
                 .unwrap();
             let mut prompted = false;
@@ -407,8 +407,8 @@ async fn prepared_facts_and_dependency_baseline_reach_review_before_dispatch() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Create local links for this task".into())
+    agent
+        .submit(chat, "Create local links for this task".into())
         .await
         .unwrap();
     loop {
@@ -439,7 +439,7 @@ async fn prepared_facts_and_dependency_baseline_reach_review_before_dispatch() {
     )
     .unwrap();
     agent
-        .submit(chat, Some(receipt.loop_id), "Continue the same task".into())
+        .submit(chat, "Continue the same task".into())
         .await
         .unwrap();
     loop {
@@ -489,7 +489,7 @@ async fn overall_block_reason_is_persisted_without_fabricated_rule_findings() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Review the proposed link".into())
+        .submit(chat, "Review the proposed link".into())
         .await
         .unwrap();
     loop {

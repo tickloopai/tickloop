@@ -41,7 +41,7 @@ pub(super) async fn family(store: Option<PathBuf>) -> (Agent, Vec<Receipt>) {
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "coordinate".into()).await.unwrap();
+    core.submit(root, "coordinate".into()).await.unwrap();
     let mut receipts = tokio::time::timeout(Duration::from_secs(15), async {
         let mut receipts = Vec::new();
         while receipts.len() < 3 {
@@ -324,7 +324,6 @@ async fn mutation_receipts_survive_restart_without_resuming_claims() {
         .branch_chat(tickloop_agent_protocol::BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: receipts[0].chat_id,
-            source_loop_id: None,
             name: Some("Independent".into()),
         })
         .await

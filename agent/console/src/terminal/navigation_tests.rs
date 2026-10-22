@@ -151,7 +151,6 @@ async fn run_navigation(
         command_id: Uuid::new_v4(),
         command: AgentCommand::Submit {
             execution: execution_a,
-            target_loop: None,
             input: UserInput::Shell {
                 command: "printf 'A started'; while [ ! -f finish ]; do sleep 0.02; done; printf ' A finished'".into(),
                 background: true,

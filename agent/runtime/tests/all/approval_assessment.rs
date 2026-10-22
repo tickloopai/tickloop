@@ -92,7 +92,7 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             .unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(chat, None, "Create the reviewed symlink".into())
+            .submit(chat, "Create the reviewed symlink".into())
             .await
             .unwrap();
         let mut assessments = Vec::new();
@@ -171,8 +171,8 @@ async fn missing_original_evidence_reports_no_actual_reviewer() {
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
     let mut first_events = first.subscribe();
-    let receipt = first
-        .submit(chat, None, "First task has a private restriction".into())
+    first
+        .submit(chat, "First task has a private restriction".into())
         .await
         .unwrap();
     loop {
@@ -217,7 +217,7 @@ async fn missing_original_evidence_reports_no_actual_reviewer() {
     resumed.set_auto_reviewer(reviewer.clone()).await;
     let mut events = resumed.subscribe();
     resumed
-        .submit(chat, Some(receipt.loop_id), "Continue the same Loop".into())
+        .submit(chat, "Continue the same Loop".into())
         .await
         .unwrap();
     let assessment: ApprovalAssessmentDetails = loop {

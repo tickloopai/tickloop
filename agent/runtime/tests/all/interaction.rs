@@ -55,7 +55,7 @@ async fn questions_wait_for_an_answer_to_each_question_and_resume_the_same_goal(
     let other_chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Make that report shorter.".into())
+        .submit(chat, "Make that report shorter.".into())
         .await
         .unwrap();
     let question = loop {
@@ -89,7 +89,7 @@ async fn questions_wait_for_an_answer_to_each_question_and_resume_the_same_goal(
         Some("Revenue | Costs")
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::WaitingQuestion);
+    assert_eq!(snapshot.chat_loop.state, LoopState::WaitingQuestion);
     assert_eq!(snapshot.questions[0].id, question.id);
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 
@@ -138,7 +138,7 @@ async fn questions_wait_for_an_answer_to_each_question_and_resume_the_same_goal(
         );
     }
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::WaitingQuestion
     );
     agent
@@ -160,10 +160,8 @@ async fn questions_wait_for_an_answer_to_each_question_and_resume_the_same_goal(
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.questions.is_empty());
-    assert_eq!(snapshot.loops.len(), 1);
-    assert_eq!(snapshot.loops[0].id, receipt.loop_id);
-    assert_eq!(snapshot.loops[0].goal, "Make that report shorter.");
-    assert_eq!(snapshot.loops[0].state, LoopState::Completed);
+    assert_eq!(snapshot.chat_loop.id, receipt.loop_id);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(
         tool_result(&requests, "clarify"),
@@ -238,7 +236,7 @@ async fn question_input_is_validated_like_claude_code() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Ask me something.".into())
+        .submit(chat, "Ask me something.".into())
         .await
         .unwrap();
     let question = loop {
@@ -328,59 +326,6 @@ async fn question_input_is_validated_like_claude_code() {
 }
 
 #[tokio::test]
-async fn an_independent_goal_is_host_created_and_runs_after_the_current_goal() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "new-goal",
-            "StartGoal",
-            json!({"goal":"Draft the release announcement."}),
-        ),
-        text("The weekly summary is complete; the announcement is queued separately."),
-        text("Release announcement draft."),
-    ]));
-    let agent = Agent::new_embedded(config(), model.clone());
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let mut events = agent.subscribe();
-    let original = agent
-        .submit(
-            chat,
-            None,
-            "Summarize the week. Also draft a separate release announcement.".into(),
-        )
-        .await
-        .unwrap();
-    let mut completions = Vec::new();
-    while completions.len() < 2 {
-        let event = next_event(&mut events).await;
-        match event.kind {
-            EventKind::Completed { .. } => completions.push(event.loop_id),
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops.len(), 2);
-    assert_eq!(snapshot.loops[0].id, original.loop_id);
-    assert_eq!(
-        snapshot.loops[0].goal,
-        "Summarize the week. Also draft a separate release announcement."
-    );
-    let new_goal = snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id != original.loop_id)
-        .unwrap();
-    assert_eq!(new_goal.goal, "Draft the release announcement.");
-    assert_eq!(new_goal.state, LoopState::Completed);
-    assert_eq!(completions, [original.loop_id, new_goal.id]);
-    assert!(snapshot.pending_inputs.is_empty());
-    let requests = model.requests.lock().unwrap().clone();
-    assert!(requests[2].messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,Content::Text {text} if text == "The weekly summary is complete; the announcement is queued separately.")));
-    agent.shutdown().await;
-}
-
-#[tokio::test]
 async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resume_work() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
@@ -398,8 +343,8 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Shorten the report.".into())
+    agent
+        .submit(chat, "Shorten the report.".into())
         .await
         .unwrap();
     let question = loop {
@@ -412,7 +357,6 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
     agent
         .configure_trigger(
             chat,
-            receipt.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the report.".into(),
@@ -428,7 +372,6 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
         agent
             .trigger(
                 chat,
-                receipt.loop_id,
                 TriggerSource {
                     source: "file_changed".into(),
                     payload: json!({})
@@ -438,7 +381,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
             .is_err()
     );
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().loops[0].state,
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::WaitingQuestion
     );
     agent.interrupt(chat).await.unwrap();
@@ -457,11 +400,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
     }
     assert!(agent.snapshot(chat).await.unwrap().questions.is_empty());
     let resumed = agent
-        .submit(
-            chat,
-            Some(receipt.loop_id),
-            "Continue, but clarify first.".into(),
-        )
+        .submit(chat, "Continue, but clarify first.".into())
         .await
         .unwrap();
     let new_question = loop {
@@ -479,7 +418,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
             .await
             .is_err()
     );
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     assert!(
         agent
             .answer_question(
@@ -498,7 +437,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
         }
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::Stopped);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
     assert!(snapshot.questions.is_empty());
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     agent.shutdown().await;
@@ -531,7 +470,7 @@ async fn clarification_process_fixture() {
     let chat = agent.create_chat(directory.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Shorten that report.".into())
+        .submit(chat, "Shorten that report.".into())
         .await
         .unwrap();
     loop {
@@ -597,7 +536,7 @@ async fn a_question_expires_across_processes_and_manual_resume_drops_the_unanswe
             .unwrap();
         let snapshot = agent.resume_chat(question.chat_id).await.unwrap();
         assert!(snapshot.questions.is_empty());
-        assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+        assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
         assert!(model.requests.lock().unwrap().is_empty());
         assert!(
             agent
@@ -639,11 +578,7 @@ async fn a_question_expires_across_processes_and_manual_resume_drops_the_unanswe
         assert!(snapshot.operations.is_empty());
         let mut events = agent.subscribe();
         agent
-            .submit(
-                question.chat_id,
-                Some(question.loop_id),
-                "Continue manually.".into(),
-            )
+            .submit(question.chat_id, "Continue manually.".into())
             .await
             .unwrap();
         loop {
@@ -670,7 +605,7 @@ async fn an_answer_accepted_before_interrupt_remains_in_the_conversation() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Shorten that report.".into())
+        .submit(chat, "Shorten that report.".into())
         .await
         .unwrap();
     let question = loop {
@@ -715,7 +650,7 @@ async fn declining_a_question_rejects_the_call_ends_the_run_and_later_input_star
     let other_chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let asked = agent
-        .submit(chat, None, "Change the protocol.".into())
+        .submit(chat, "Change the protocol.".into())
         .await
         .unwrap();
     let question = loop {
@@ -774,14 +709,14 @@ async fn declining_a_question_rejects_the_call_ends_the_run_and_later_input_star
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.questions.is_empty());
-    assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
     assert_eq!(
         model.requests.lock().unwrap().len(),
         1,
         "the declined run asks the model nothing more"
     );
 
-    let follow_up = agent.submit(chat, None, FOLLOW_UP.into()).await.unwrap();
+    let follow_up = agent.submit(chat, FOLLOW_UP.into()).await.unwrap();
     assert_ne!(follow_up.run_id, asked.run_id);
     loop {
         let event = next_event(&mut events).await;

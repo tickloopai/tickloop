@@ -324,7 +324,6 @@ async fn repeated_legal_images_case(
                 epoch,
                 AgentCommand::Submit {
                     execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: format!("Inspect image group {prompt}"),
                         contexts: image_contexts(&image, images_per_prompt as u32),
@@ -401,7 +400,6 @@ async fn repeated_legal_images_case(
         AgentCommand::EditHistory {
             execution,
             action: HistoryAction::Branch {
-                target_loop: None,
                 name: Some("Retained images".into()),
             },
         },
@@ -554,7 +552,6 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
                 epoch,
                 AgentCommand::Submit {
                     execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: prompt.clone(),
                         contexts: Vec::new(),

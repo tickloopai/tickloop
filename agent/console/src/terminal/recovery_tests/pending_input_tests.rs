@@ -147,10 +147,10 @@ fn pending_input_pty_fixture() {
                     let mut submitted_elsewhere=false;
                     loop {
                         if let Some(snapshot) = proof_core.list_chats().await.into_iter().next() {
-                            if !submitted_elsewhere && std::path::Path::new(OTHER_VIEW_SUBMIT).exists() && !snapshot.loops.is_empty() {
+                            if !submitted_elsewhere && std::path::Path::new(OTHER_VIEW_SUBMIT).exists() && !snapshot.messages.is_empty() {
                                 other_view.display_chat(Some(snapshot.id)).await.unwrap();
                                 for _ in 0..2 {
-                                    other_view.submit(snapshot.id,Some(snapshot.loops[0].id),QUEUED_MESSAGE.into()).await.unwrap();
+                                    other_view.submit(snapshot.id,QUEUED_MESSAGE.into()).await.unwrap();
                                 }
                                 submitted_elsewhere=true;
                             }

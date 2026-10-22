@@ -127,7 +127,6 @@ impl AgentAccess for ActivityAccess {
                 .runtime()
                 .configure_trigger(
                     submitted.chat_id,
-                    submitted.loop_id,
                     Some(Trigger {
                         id: Uuid::new_v4(),
                         prompt: "Check for updates".into(),
@@ -167,11 +166,9 @@ impl AgentAccess for ActivityAccess {
                                 .snapshot(chat)
                                 .await
                                 .unwrap()
-                                .loops
-                                .iter()
-                                .all(|goal| {
-                                    goal.state == tickloop_agent_protocol::LoopState::Completed
-                                })
+                                .chat_loop
+                                .state
+                                == tickloop_agent_protocol::LoopState::Idle
                         {
                             break;
                         }
@@ -183,7 +180,6 @@ impl AgentAccess for ActivityAccess {
                             command_id: Uuid::new_v4(),
                             command: AgentCommand::Submit {
                                 execution,
-                                target_loop: None,
                                 input: UserInput::Text {
                                     text: "A genuine later input while Overview remains open"
                                         .into(),
@@ -292,7 +288,7 @@ fn working_activity_pty_fixture() {
                 std::fs::write(ACTIVITY_EXECUTIONS, serde_json::json!({"execution":agent.reference(chat).await.unwrap(),"other":agent.reference(other).await.unwrap()}).to_string()).unwrap();
                 if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("attach") {
                     agent
-                        .submit(chat, None, "Already running before this View".into())
+                        .submit(chat, "Already running before this View".into())
                         .await
                         .unwrap();
                     while !std::path::Path::new(ACTIVITY_PHASE).exists() {
@@ -581,15 +577,10 @@ fn lose_completed_events(
                 let ObservationValue::Agent(snapshot) = observation.initial else {
                     panic!("the Agent snapshot");
                 };
-                let loops = snapshot
-                    .conversation
-                    .loops
-                    .iter()
-                    .map(|goal| format!("{:?}", goal.state))
-                    .collect::<Vec<_>>();
+                let state = format!("{:?}", snapshot.conversation.chat_loop.state);
                 std::fs::write(
                     ACTIVITY_LOST_END,
-                    serde_json::json!({"phase":"lost-end","loops":loops}).to_string(),
+                    serde_json::json!({"phase":"lost-end","loop":state}).to_string(),
                 )
                 .unwrap();
                 update.change = ObservationChange::Reset {
@@ -615,11 +606,7 @@ fn a_run_whose_end_event_was_lost_stops_working_once_the_snapshot_shows_it_ended
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
     fixture.wait_for("Activity reply 1");
     let lost = fixture.wait_for_phase(&directory.path().join(ACTIVITY_LOST_END), "lost-end");
-    assert_eq!(
-        lost["loops"],
-        serde_json::json!(["WaitingTrigger"]),
-        "the ended run leaves its Loop waiting rather than finished"
-    );
+    assert_eq!(lost["loop"], "Idle", "the ended run leaves its Loop idle");
     fixture.wait_until_shown("the ended run without Working", |frame| {
         frame.contains("Activity reply 1") && !frame.contains("Working")
     });

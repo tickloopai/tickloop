@@ -109,10 +109,7 @@ async fn interruption_during_continuation_preserves_all_streamed_text() {
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Answer fully".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Answer fully".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -162,10 +159,7 @@ async fn output_limit_continues_with_partial_text_and_commits_one_complete_reply
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Answer fully".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Answer fully".into()).await.unwrap();
     let mut streamed_text = String::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -226,7 +220,7 @@ async fn output_limit_without_complete_text_fails_without_retrying_a_partial_too
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Use a tool".into()).await.unwrap();
+    agent.submit(chat, "Use a tool".into()).await.unwrap();
     let failure = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -265,10 +259,7 @@ async fn output_limit_recovery_stops_after_three_continuations() {
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Answer fully".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Answer fully".into()).await.unwrap();
     let failure = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();

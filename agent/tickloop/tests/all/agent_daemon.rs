@@ -262,7 +262,6 @@ async fn ipc_duplicate_commands_and_generations_preserve_the_original_target() {
             client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: invalid,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "must not run".into(),
                     contexts: vec![],
@@ -493,7 +492,6 @@ async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
             client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "stale input".into(),
                     contexts: vec![],
@@ -583,7 +581,6 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
             epoch,
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Shell {
                     command: "sleep 0.1; printf 'still alive'".into(),
                     background: true,
@@ -911,7 +908,6 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
                 epoch,
                 AgentCommand::Submit {
                     execution: target,
-                    target_loop: None,
                     input: UserInput::Shell {
                         command: "sleep 0.1; printf '%s' \"$TICKLOOP_FIXTURE_WORKER\"".into(),
                         background: true,
@@ -1122,7 +1118,6 @@ async fn start_background_shell(client: &LocalAgentClient, target: ExecutionRef)
             client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Shell {
                     command: "sleep 300".into(),
                     background: true,
@@ -1591,7 +1586,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     };
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         let snapshot = first.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.loops.iter().any(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)) { break; }
+        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     first
@@ -1714,7 +1709,6 @@ async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_chang
             old_epoch,
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Must not silently continue".into(),
                     contexts: vec![],
@@ -1808,7 +1802,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     );
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         let snapshot = daemon.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.loops.iter().any(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)) { break; }
+        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     let saved = daemon
@@ -1837,7 +1831,6 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
             daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Must not restart".into(),
                     contexts: vec![],
@@ -2127,7 +2120,7 @@ async fn wait_until_completed(access: &dyn AgentAccess, target: ExecutionRef) {
                 })
                 .await
                 .unwrap();
-            if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.loops.iter().any(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed))
+            if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle)
             {
                 break;
             }
@@ -2204,7 +2197,6 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
             daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Must not reach a second runtime".into(),
                     contexts: vec![],
@@ -2297,7 +2289,6 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
             daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Must stay fenced".into(),
                     contexts: vec![],
@@ -2749,7 +2740,6 @@ async fn moving_a_source_pane_requires_a_new_display_version_before_the_next_inp
             client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Accept this fixed source".into(),
                     contexts: vec![],
@@ -2953,14 +2943,13 @@ async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing
     let ObservationValue::Agent(snapshot) = observed.initial else {
         panic!("expected snapshot");
     };
-    assert!(snapshot.conversation.loops.is_empty());
+    assert!(snapshot.conversation.chat_loop.run_id.is_none());
     assert_eq!(agents(&client).await.len(), 1);
     let corrected = client
         .execute(envelope(
             client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Submit the correction to the existing Agent".into(),
                     contexts: vec![],
@@ -3053,7 +3042,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let observed = client.observe(ObservationRequest::Agent { execution: *ids.last().unwrap(), detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-                if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.loops.iter().any(|goal| matches!(goal.state, tickloop_agent_protocol::LoopState::Completed))) { break; }
+                if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle && snapshot.conversation.messages.len() > 1) { break; }
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
@@ -3339,7 +3328,6 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
             epoch,
             AgentCommand::Submit {
                 execution: target,
-                target_loop: None,
                 input: UserInput::Text {
                     text,
                     contexts: vec![],

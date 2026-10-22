@@ -85,7 +85,7 @@ enum Selection {
     Permission {
         chat: Uuid,
         request: PermissionRequest,
-        goal: String,
+        requester: String,
         /// Whether the requesting Agent may save a grant as a rule; a delegated child's grants
         /// stay within its session.
         persistent: bool,
@@ -93,7 +93,7 @@ enum Selection {
     PermissionRule {
         chat: Uuid,
         request: PermissionRequest,
-        goal: String,
+        requester: String,
         candidates: Vec<PermissionRuleCandidate>,
     },
     Provider {
@@ -406,7 +406,7 @@ impl Selection {
                 Some(request.id)
             }
             Self::Question(flow) => Some(flow.request().id),
-            Self::Workflow(Workflow::Plan { goal, request, .. }) => Some(request.unwrap_or(*goal)),
+            Self::Workflow(Workflow::Plan { chat, request, .. }) => Some(request.unwrap_or(*chat)),
             _ => None,
         }
     }
@@ -460,7 +460,6 @@ impl Selection {
 
 struct RestoredPlanApproval {
     chat: Uuid,
-    loop_id: Uuid,
     version: u64,
 }
 
@@ -570,7 +569,7 @@ pub(super) struct MenuOutcome {
     pub provider_login: Option<super::login::LoginMethod>,
     pub permission: Option<Uuid>,
     pub question: Option<Uuid>,
-    pub selection: Option<(Uuid, Option<Uuid>)>,
+    pub selection: Option<Uuid>,
     pub restored: Option<ChatSnapshot>,
     pub receipt: Option<Receipt>,
     pub command: Option<String>,
@@ -1844,8 +1843,7 @@ impl Menus {
                 )),
                 format!("Execution mode: {}", snapshot.policy.mode),
                 format!(
-                    "Goals: {} · pending permissions: {} · questions: {}",
-                    snapshot.loops.len(),
+                    "Pending permissions: {} · questions: {}",
                     snapshot.permissions.len(),
                     snapshot.questions.len()
                 ),
@@ -1985,22 +1983,20 @@ impl Menus {
         self.sync_dialog_chat(console)?;
         for chat in family {
             if let Some((execution, plans)) = agent.cached_pending_plan_approvals(*chat) {
-                self.restored_plans.retain(|_, request| {
-                    request.chat != *chat || plans.contains(&(request.loop_id, request.version))
-                });
+                self.restored_plans
+                    .retain(|_, request| request.chat != *chat || plans.contains(&request.version));
                 if self.scanned_plan_executions.get(chat) == Some(&execution) {
                     continue;
                 }
                 self.scanned_plan_executions.insert(*chat, execution);
                 self.restored_plans
                     .retain(|_, request| request.chat != *chat);
-                for (goal, version) in plans {
+                for version in plans {
                     let request = Uuid::new_v4();
                     self.restored_plans.insert(
                         request,
                         RestoredPlanApproval {
                             chat: *chat,
-                            loop_id: goal,
                             version,
                         },
                     );
@@ -2013,17 +2009,9 @@ impl Menus {
                 || questions.contains_key(id)
                 || self.restored_plans.contains_key(id)
         });
-        if let Some((
-            _,
-            Selection::Workflow(Workflow::Plan {
-                chat,
-                goal,
-                version,
-                ..
-            }),
-        )) = &self.active
+        if let Some((_, Selection::Workflow(Workflow::Plan { chat, version, .. }))) = &self.active
             && family.contains(chat)
-            && agent.cached_plan_is_pending(*chat, *goal, *version) == Some(false)
+            && agent.cached_plan_is_pending(*chat, *version) == Some(false)
         {
             let request = self
                 .active
@@ -2149,9 +2137,9 @@ impl Menus {
                 .find(|(id, request)| {
                     request.chat == chat && next_request.is_none_or(|next| next == **id)
                 })
-                .map(|(id, request)| (*id, request.loop_id));
-            if let Some((request, goal)) = restored_request {
-                let (mut menu, mut workflow) = Workflow::plan(agent, chat, goal).await?;
+                .map(|(id, _)| *id);
+            if let Some(request) = restored_request {
+                let (mut menu, mut workflow) = Workflow::plan(agent, chat).await?;
                 if let Workflow::Plan {
                     request: current, ..
                 } = &mut workflow
@@ -2167,32 +2155,19 @@ impl Menus {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
                 if request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME {
-                    let (mut menu, workflow) = Workflow::plan(agent, chat, request.loop_id).await?;
+                    let (mut menu, workflow) = Workflow::plan(agent, chat).await?;
                     if console.dialog_chat()? != Some(chat) {
                         menu.title = format!("Plan approval · {requester}");
                     }
                     return self.workflow(console, (menu, workflow));
                 }
-                let goal = status.loops.iter().find(|goal| goal.id == request.loop_id);
-                let context = safe_text(&format!(
-                    "{requester} · Goal: {}",
-                    goal.map(|goal| goal.goal.as_str()).unwrap_or("Task"),
-                ));
+                let context = safe_text(&requester);
                 self.permission(console, chat, request, context, status.delegation.is_none())?;
             } else if let Some(request) = status.questions.iter().find(|request| {
                 questions.contains_key(&request.id)
                     && next_request.is_none_or(|id| id == request.id)
             }) {
-                let goal = status
-                    .loops
-                    .iter()
-                    .find(|goal| goal.id == request.loop_id)
-                    .map(|goal| goal.goal.as_str())
-                    .unwrap_or("Task");
-                self.show_question(
-                    console,
-                    QuestionFlow::new(request.clone(), format!("{requester} · {goal}")),
-                )?;
+                self.show_question(console, QuestionFlow::new(request.clone(), requester))?;
             }
         }
         Ok(())
@@ -2203,15 +2178,15 @@ impl Menus {
         console: &Console,
         chat: Uuid,
         request: &PermissionRequest,
-        goal: String,
+        requester: String,
         persistent: bool,
     ) -> Result<(), String> {
         if request.name == ENTER_PLAN_MODE_TOOL_NAME {
-            let menu = enter_plan_mode_menu(request.id, goal.clone());
+            let menu = enter_plan_mode_menu(request.id, requester.clone());
             let selection = Selection::Permission {
                 chat,
                 request: request.clone(),
-                goal,
+                requester,
                 persistent: false,
             };
             return self.show(console, menu, selection);
@@ -2227,7 +2202,7 @@ impl Menus {
                     }
                 })
         });
-        let mut context = vec![goal.clone()];
+        let mut context = vec![requester.clone()];
         if review.is_none() {
             context.extend(permission_context(request));
         }
@@ -2270,7 +2245,7 @@ impl Menus {
         let selection = Selection::Permission {
             chat,
             request: request.clone(),
-            goal,
+            requester,
             persistent,
         };
         let denial_index = match (explicit_ask, persistent) {
@@ -2301,7 +2276,7 @@ impl Menus {
             Selection::Permission {
                 chat,
                 request,
-                goal,
+                requester,
                 persistent,
             },
         )) = self.active.as_ref()
@@ -2317,7 +2292,7 @@ impl Menus {
         }
         let chat = *chat;
         let request = request.clone();
-        let goal = goal.clone();
+        let requester = requester.clone();
         let candidates = permission_rule_candidates(&request.name, &request.input);
         if candidates.len() < 2 {
             return Err("this command has no broader prefix rules".into());
@@ -2344,7 +2319,7 @@ impl Menus {
             Selection::PermissionRule {
                 chat,
                 request,
-                goal,
+                requester,
                 candidates,
             },
         )
@@ -2517,16 +2492,16 @@ impl Menus {
                 Selection::PermissionRule {
                     chat,
                     request,
-                    goal,
+                    requester,
                     candidates,
                 } => {
                     let Some(index) = index else {
-                        self.permission(console, chat, &request, goal, true)?;
+                        self.permission(console, chat, &request, requester, true)?;
                         return Ok(MenuOutcome::default());
                     };
                     let Some(candidate) = candidates.get(index) else {
                         if index == candidates.len() {
-                            self.permission(console, chat, &request, goal, true)?;
+                            self.permission(console, chat, &request, requester, true)?;
                             return Ok(MenuOutcome::default());
                         }
                         return Err("permission rule option does not exist".into());
@@ -3199,12 +3174,12 @@ async fn requester_label(agent: &Agent, console: &Console, status: &ChatStatus) 
 
 /// The confirmation for the Agent's `EnterPlanMode` request, following Claude Code's
 /// `EnterPlanModePermissionRequest`.
-fn enter_plan_mode_menu(request_id: Uuid, goal: String) -> Menu {
+fn enter_plan_mode_menu(request_id: Uuid, requester: String) -> Menu {
     Menu {
         id: request_id,
         title: "Enter plan mode?".into(),
         context: vec![
-            goal,
+            requester,
             "The Agent wants to enter plan mode to explore and design an implementation approach."
                 .into(),
             "No changes will be made until you approve the plan.".into(),
@@ -3380,7 +3355,7 @@ fn finish_rewind(console: &Console, outcome: RewindOutcome) -> Result<MenuOutcom
     }
     let selection = if let Some(draft) = &outcome.draft {
         console.restore_rewind_draft(&draft.prompt, &draft.contexts)?;
-        Some((outcome.snapshot.id, Some(draft.loop_id)))
+        Some(outcome.snapshot.id)
     } else {
         None
     };
@@ -3508,7 +3483,7 @@ mod tests {
         );
         let chat = core.create_chat(directory.path().into()).await.unwrap();
         let receipt = core
-            .submit(chat, None, "Ask a controlled question".into())
+            .submit(chat, "Ask a controlled question".into())
             .await
             .unwrap();
         let mut snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4151,7 +4126,7 @@ mod tests {
             "folder": "/workspace",
             "model": {"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},
             "messages": [],
-            "loops": [],
+            "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
             "last_sequence": 0
         }))
         .unwrap();
@@ -4235,7 +4210,6 @@ mod tests {
     fn rewind_status_reports_code_failures_and_the_restored_draft() {
         let snapshot = prompt_snapshot(&["Prompt"]);
         let draft = RewindDraft {
-            loop_id: Uuid::from_u128(7),
             prompt: "Prompt".into(),
             contexts: Vec::new(),
         };

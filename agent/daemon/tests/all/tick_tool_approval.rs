@@ -217,7 +217,7 @@ async fn tick_modification_mode_rules_and_human_recovery_apply_to_new_messages_f
                 .await
                 .unwrap();
             agent
-                .submit(chat, None, format!("Send input for step {step}."))
+                .submit(chat, format!("Send input for step {step}."))
                 .await
                 .unwrap();
             let mut prompted = false;
@@ -297,7 +297,7 @@ async fn assert_mode_admits_tick_modification_without_human(mode: ExecutionMode,
     agent.set_execution_mode(chat, mode).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Close the selected Tick.".into())
+        .submit(chat, "Close the selected Tick.".into())
         .await
         .unwrap();
     loop {
@@ -346,14 +346,8 @@ async fn auto_tick_modification_uses_reviewer_instead_of_forced_human_confirmati
 async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if agent
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .loops
-                .last()
-                .is_some_and(|loop_| loop_.state == LoopState::Completed)
-            {
+            let chat_loop = agent.snapshot(chat).await.unwrap().chat_loop;
+            if chat_loop.state == LoopState::Idle && chat_loop.run_id.is_some() {
                 return;
             }
             tokio::task::yield_now().await;

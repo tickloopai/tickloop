@@ -75,14 +75,13 @@ impl TickActionUi<'_> {
         let monitor = &self.state.monitor;
         let rows = crate::monitor_rows::subscriptions_on(&monitor.shown_subscriptions(), instance);
         if rows.is_empty() {
-            return Err("No Loop subscribes to this Tick".into());
+            return Err("The Loop does not subscribe to this Tick".into());
         }
         Ok(super::subscription_detail::SubscriptionDetail::open(
             chat,
             instance.clone(),
             monitor.title_of(instance),
             rows,
-            monitor.loop_goals(),
             operation,
             self.state.display,
         ))

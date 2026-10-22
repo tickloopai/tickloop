@@ -114,7 +114,7 @@ async fn first_and_followup_prompts_capture_exact_inputs_attachments_and_pre_inp
     let mut events = agent.subscribe();
     let first_prompt = "  保留原文\n阅读 @中文-notes.txt\t  ";
     let first = agent
-        .submit_with_file_references(chat, None, first_prompt.into(), vec![path.clone()])
+        .submit_with_file_references(chat, first_prompt.into(), vec![path.clone()])
         .await
         .unwrap();
     completion(&mut events, Some(first.run_id)).await;
@@ -123,12 +123,7 @@ async fn first_and_followup_prompts_capture_exact_inputs_attachments_and_pre_inp
     assert_eq!(before.operations.len(), 1);
     let followup_prompt = "继续\r\nexact followup";
     let followup = agent
-        .submit_with_file_references(
-            chat,
-            Some(first.loop_id),
-            followup_prompt.into(),
-            vec![path],
-        )
+        .submit_with_file_references(chat, followup_prompt.into(), vec![path])
         .await
         .unwrap();
     completion(&mut events, Some(followup.run_id)).await;
@@ -176,26 +171,15 @@ async fn two_queued_inputs_merged_after_a_tool_keep_individual_receipts_and_one_
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Read the source".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "Read the source".into()).await.unwrap();
     tokio::time::timeout(TEST_DEADLINE, model.entered.notified())
         .await
         .unwrap();
     let second = agent
-        .submit_with_file_references(
-            chat,
-            Some(first.loop_id),
-            "修正一\n带附件".into(),
-            vec![path],
-        )
+        .submit_with_file_references(chat, "修正一\n带附件".into(), vec![path])
         .await
         .unwrap();
-    let third = agent
-        .submit(chat, Some(first.loop_id), "修正二  保留空格".into())
-        .await
-        .unwrap();
+    let third = agent.submit(chat, "修正二  保留空格".into()).await.unwrap();
     let waiting = agent.snapshot(chat).await.unwrap();
     assert_eq!(waiting.rewind_points().len(), 1);
     assert_eq!(waiting.pending_inputs.len(), 2);
@@ -237,21 +221,15 @@ async fn accepting_and_taking_back_waiting_input_or_commands_does_not_capture_ph
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, None, "Hold the current request".into())
+        .submit(chat, "Hold the current request".into())
         .await
         .unwrap();
     tokio::time::timeout(TEST_DEADLINE, model.entered.notified())
         .await
         .unwrap();
     let before = checkpoints(&agent, chat).await;
-    let queued = agent
-        .submit(chat, Some(first.loop_id), "Take this back".into())
-        .await
-        .unwrap();
-    let command = agent
-        .queue_command(chat, Some(first.loop_id), "/compact".into())
-        .await
-        .unwrap();
+    let queued = agent.submit(chat, "Take this back".into()).await.unwrap();
+    let command = agent.queue_command(chat, "/compact".into()).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, before);
     let taken = agent.take_queued_inputs(chat, true).await.unwrap();
     assert_eq!(
@@ -294,7 +272,7 @@ async fn permission_allow_and_deny_comments_reach_history_without_becoming_promp
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(chat, None, "Propose a bounded shell action".into())
+            .submit(chat, "Propose a bounded shell action".into())
             .await
             .unwrap();
         let permission = tokio::time::timeout(TEST_DEADLINE, async {
@@ -355,29 +333,21 @@ async fn compaction_commands_and_direct_shell_do_not_capture_points_but_later_pr
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, None, "Initial user prompt".into())
+        .submit(chat, "Initial user prompt".into())
         .await
         .unwrap();
     completion(&mut events, Some(first.run_id)).await;
     let original_points = checkpoints(&agent, chat).await;
     agent.compact(chat).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, original_points);
-    let command = agent
-        .queue_command(chat, Some(first.loop_id), "/rules".into())
-        .await
-        .unwrap();
+    let command = agent.queue_command(chat, "/rules".into()).await.unwrap();
     let dispatched = agent.take_next_queued_command(chat).await.unwrap().unwrap();
     assert_eq!(dispatched.id, command);
     agent.finish_queued_command(chat, command).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, original_points);
     let mut shell_events = agent.subscribe_user_shells();
     let shell = agent
-        .submit_user_shell_for_goal(
-            chat,
-            Some(first.loop_id),
-            "printf direct-shell".into(),
-            false,
-        )
+        .submit_user_shell(chat, "printf direct-shell".into(), false)
         .await
         .unwrap();
     tokio::time::timeout(TEST_DEADLINE, async {
@@ -401,11 +371,7 @@ async fn compaction_commands_and_direct_shell_do_not_capture_points_but_later_pr
     let before = agent.snapshot(chat).await.unwrap();
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     let followup = agent
-        .submit(
-            chat,
-            Some(first.loop_id),
-            "Continue with the compacted context".into(),
-        )
+        .submit(chat, "Continue with the compacted context".into())
         .await
         .unwrap();
     completion(&mut events, Some(followup.run_id)).await;
@@ -438,7 +404,7 @@ async fn explicit_events_preserve_the_single_real_user_checkpoint() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, None, "Observe when triggered".into())
+        .submit(chat, "Observe when triggered".into())
         .await
         .unwrap();
     completion(&mut events, Some(first.run_id)).await;
@@ -446,7 +412,6 @@ async fn explicit_events_preserve_the_single_real_user_checkpoint() {
     agent
         .configure_trigger(
             chat,
-            first.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "External observation".into(),
@@ -461,7 +426,6 @@ async fn explicit_events_preserve_the_single_real_user_checkpoint() {
     let expected_run = agent
         .trigger(
             chat,
-            first.loop_id,
             TriggerSource {
                 source: "fixture-event".into(),
                 payload: json!({"changed":true}),
@@ -472,10 +436,7 @@ async fn explicit_events_preserve_the_single_real_user_checkpoint() {
         .run_id;
     let completed = completion(&mut events, Some(expected_run)).await;
     assert_ne!(completed.run_id, first.run_id);
-    agent
-        .configure_trigger(chat, first.loop_id, None)
-        .await
-        .unwrap();
+    agent.configure_trigger(chat, None).await.unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, before);
     assert_eq!(snapshot.rewind_points().len(), 1);
@@ -504,15 +465,9 @@ async fn restart_preserves_checkpoint_ids() {
     let agent = Agent::open_embedded(archive.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "First prompt".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "First prompt".into()).await.unwrap();
     completion(&mut events, Some(first.run_id)).await;
-    let second = agent
-        .submit(chat, Some(first.loop_id), "Second prompt".into())
-        .await
-        .unwrap();
+    let second = agent.submit(chat, "Second prompt".into()).await.unwrap();
     completion(&mut events, Some(second.run_id)).await;
     let before = agent.snapshot(chat).await.unwrap();
     let original_points = checkpoints(&agent, chat).await;
@@ -543,16 +498,13 @@ async fn more_than_one_hundred_prompts_stay_selectable_and_keep_raw_messages_usa
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(chat, None, "Prompt 0".into()).await.unwrap();
+    let first = agent.submit(chat, "Prompt 0".into()).await.unwrap();
     completion(&mut events, Some(first.run_id)).await;
     let initial = agent.snapshot(chat).await.unwrap();
     let initial_point = initial.rewind_points()[0].clone();
     let initial_operation = serde_json::to_value(&initial.operations[0]).unwrap();
     for index in 1..101 {
-        let receipt = agent
-            .submit(chat, Some(first.loop_id), format!("Prompt {index}"))
-            .await
-            .unwrap();
+        let receipt = agent.submit(chat, format!("Prompt {index}")).await.unwrap();
         completion(&mut events, Some(receipt.run_id)).await;
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
