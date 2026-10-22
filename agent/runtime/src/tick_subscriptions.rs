@@ -2194,14 +2194,35 @@ impl Agent {
         }
         // A watermark that cannot be written only lets the update be delivered again, which
         // the ledger answers with its first receipt.
-        let _ = tokio::task::spawn_blocking(move || {
-            for (subscription, directory, mark) in marks {
-                if let Some(directory) = directory {
+        let written = tokio::task::spawn_blocking(move || {
+            marks
+                .into_iter()
+                .filter_map(|(subscription, directory, mark)| {
+                    let directory = directory?;
                     let _ = write_watermark(&directory, subscription, mark);
-                }
-            }
+                    Some((directory, subscription))
+                })
+                .collect::<Vec<_>>()
         })
-        .await;
+        .await
+        .unwrap_or_default();
+        // A subscription cancelled meanwhile removed its watermark before or after this wrote it;
+        // after, its watermark goes with it here.
+        let cancelled: Vec<_> = {
+            let deliveries = self.tick_deliveries();
+            written
+                .into_iter()
+                .filter(|(_, subscription)| !deliveries.subscriptions.contains_key(subscription))
+                .collect()
+        };
+        if !cancelled.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for (directory, subscription) in cancelled {
+                    let _ = remove_watermark(&directory, subscription);
+                }
+            })
+            .await;
+        }
     }
 
     /// Reads again the watermarks of the Chat's subscriptions, which another process holding
