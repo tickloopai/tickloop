@@ -449,6 +449,8 @@ async fn explicit_events_and_timer_runs_preserve_the_single_real_user_checkpoint
                 chat,
                 first.loop_id,
                 Some(Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: "Scheduled or external observation".into(),
                     prompt_source: TriggerPromptSource::Explicit,

@@ -699,6 +699,8 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
                 chat,
                 initial.loop_id,
                 Some(Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: "Summarize the new event.".into(),
                     prompt_source: TriggerPromptSource::Explicit,

@@ -165,6 +165,8 @@ async fn planned_restore_preserves_armed_timer_and_session_permissions_without_m
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "check later".into(),
                 prompt_source: Default::default(),
@@ -560,6 +562,8 @@ async fn timer_due_while_prepared_waits_for_successor_and_input_cannot_dispatch_
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "scheduled check".into(),
                 prompt_source: Default::default(),

@@ -6025,6 +6025,8 @@ async fn trigger_control(
         return Ok(None);
     }
     let mut trigger = current.unwrap_or(Trigger {
+        title: None,
+        paused_at_ms: None,
         id: uuid::Uuid::new_v4(),
         prompt: String::new(),
         prompt_source: TriggerPromptSource::Explicit,
@@ -6194,6 +6196,8 @@ async fn parse_after_turn(
                 .trigger
                 .clone()
                 .unwrap_or(Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: uuid::Uuid::new_v4(),
                     prompt: String::new(),
                     prompt_source: TriggerPromptSource::Explicit,

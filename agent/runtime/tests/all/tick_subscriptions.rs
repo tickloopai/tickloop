@@ -1620,6 +1620,8 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         .unwrap();
     wait_for_completion(&mut events).await;
     let trigger = |subscriptions| Trigger {
+        title: None,
+        paused_at_ms: None,
         id: Uuid::new_v4(),
         prompt: "check the panel".into(),
         prompt_source: TriggerPromptSource::Explicit,
@@ -3326,6 +3328,8 @@ async fn subscribe_loop(
             chat,
             loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "inspect changes".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -3454,6 +3458,8 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "report the shell".into(),
                 prompt_source: TriggerPromptSource::Explicit,

@@ -940,6 +940,8 @@ mod tests {
                 first,
                 scheduled,
                 Some(tickloop_agent_protocol::Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: "scheduled check".into(),
                     prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,

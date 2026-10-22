@@ -3,8 +3,8 @@ use crate::QuestionReply;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
-    EventKind, LoopSnapshot, LoopState, OperationState, PendingInput, Question, QuestionAnswer,
-    QuestionRequest, Receipt, ToolDefinition, ToolResult, Trigger,
+    EventKind, LoopSnapshot, LoopState, MAX_TRIGGER_TITLE_CHARS, OperationState, PendingInput,
+    Question, QuestionAnswer, QuestionRequest, Receipt, ToolDefinition, ToolResult, Trigger,
 };
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
@@ -275,8 +275,9 @@ pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
         name: START_GOAL_TOOL_NAME.into(),
         description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run. Give a schedule only when the user asked for the goal to run at certain times: the goal then runs at each scheduled time, starting with the next one, instead of now.".into(),
         input_schema: json!({"type":"object","properties":{
-            "goal":{"type":"string"},
-            "schedule":{"type":"string","description":"When the goal runs: `every <N>s|m|h|d` (counted from now), `daily HH:MM [±HH:MM]`, `weekly <day>[,<day>…] HH:MM [±HH:MM]` with days mon..sun, or `at <RFC 3339 time>` for once. Times without an offset are UTC. Runs missed while nothing could run are skipped, not caught up."}
+            "goal":{"type":"string","description":"What the goal does; for a scheduled goal, the instruction each scheduled run receives."},
+            "title":{"type":"string","description":format!("A short name for a scheduled goal, at most {MAX_TRIGGER_TITLE_CHARS} characters, in the user's language, such as \"Daily world news digest\".")},
+            "schedule":{"type":"string","description":"When the goal runs: `every <N>s|m|h|d` (counted from now), `daily HH:MM [<zone>]`, `weekly <day>[,<day>…] HH:MM [<zone>]` with days mon..sun, or `at <RFC 3339 time> [<IANA zone>]` for once. A zone is an IANA time zone such as `Asia/Shanghai` or `America/New_York`, which follows daylight saving, or a fixed offset such as `+08:00`; write wall-clock times in the user's time zone. Times without a zone are UTC. Runs missed while nothing could run are skipped, not caught up."}
         },"required":["goal"],"additionalProperties":false}),
     }]
 }
@@ -290,8 +291,8 @@ pub(crate) fn creates_schedule(name: &str, input: &Value) -> bool {
 }
 
 /// What a StartGoal call that registered `goal` returns: the input queued for it, or for a
-/// scheduled goal its schedule, next scheduled time and expiry, or that it awaits the user's
-/// confirmation.
+/// scheduled goal its title, schedule, next scheduled time and expiry, or that it awaits the
+/// user's confirmation.
 pub(crate) fn started_goal_result(
     chat_id: ChatId,
     goal: &LoopSnapshot,
@@ -314,6 +315,7 @@ pub(crate) fn started_goal_result(
                 "scheduled"
             };
             json!({"chat_id":chat_id,"loop_id":goal.id,"state":state,
+                "title":trigger.and_then(|trigger| trigger.title.as_deref()),
                 "schedule":schedule.to_string(),"next_run_at":next_run_at,"expires_at":expires_at})
         }
         (None, Some(run_id)) => {
@@ -476,9 +478,10 @@ impl Agent {
         }
     }
 
-    /// Registers the goal. A schedule it gives expires after the model's schedule lifetime and
-    /// runs only once the user confirms it: the call's approval when a person approved it,
-    /// otherwise a later `decide_schedule`.
+    /// Registers the goal. A schedule it gives expires after the host's lifetime for the model's
+    /// schedules, if it has one, and runs only once the user confirms it (the call's approval
+    /// when a person approved it, otherwise a later `decide_schedule`) unless the host runs the
+    /// model's schedules without confirmation.
     async fn start_goal(
         &self,
         receipt: &Receipt,
@@ -492,14 +495,28 @@ impl Agent {
         struct Input {
             goal: String,
             #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
             schedule: Option<String>,
         }
         let parsed: Input = serde_json::from_value(input.clone()).map_err(|_| {
-            format!("{START_GOAL_TOOL_NAME} requires a goal string and an optional schedule string")
+            format!(
+                "{START_GOAL_TOOL_NAME} requires a goal string and optional title and schedule \
+                 strings"
+            )
         })?;
         if parsed.goal.trim().is_empty() || parsed.goal.len() > MAX_ANSWER_BYTES {
             return Err("goal must contain 1 to 65536 bytes".into());
         }
+        let title = parsed
+            .title
+            .as_deref()
+            .map(|title| {
+                tickloop_agent_protocol::trigger_title(title).ok_or_else(|| {
+                    format!("title must contain 1 to {MAX_TRIGGER_TITLE_CHARS} characters")
+                })
+            })
+            .transpose()?;
         let schedule = parsed
             .schedule
             .as_deref()
@@ -557,17 +574,23 @@ impl Agent {
                 if triggers::active_schedules(&chat.snapshot) >= triggers::MAX_ACTIVE_SCHEDULES {
                     return Err(triggers::too_many_schedules());
                 }
+                let policy = self.inner.model_schedules;
+                let is_confirmed = was_approved_by_human || policy.run_without_confirmation;
                 let mut trigger = Trigger {
+                    title: title.clone(),
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: parsed.goal.clone(),
                     prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
                     schedule: Some(schedule),
-                    expires_at_ms: Some(now.saturating_add(triggers::MODEL_SCHEDULE_LIFETIME_MS)),
+                    expires_at_ms: policy.lifetime.map(|lifetime| {
+                        now.saturating_add(u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX))
+                    }),
                     accepts_events: false,
-                    armed: was_approved_by_human,
+                    armed: is_confirmed,
                     armed_at_ms: None,
                     last_fired_at_ms: None,
-                    confirmation: Some(if was_approved_by_human {
+                    confirmation: Some(if is_confirmed {
                         tickloop_agent_protocol::ScheduleConfirmation::Confirmed { at_ms: now }
                     } else {
                         tickloop_agent_protocol::ScheduleConfirmation::Pending

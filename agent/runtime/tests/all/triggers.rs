@@ -27,6 +27,8 @@ async fn a_continuous_goal_waits_for_explicit_events_and_stopped_goals_reject_wa
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "Check the notes".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -155,6 +157,8 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "scheduled check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -240,6 +244,8 @@ async fn an_interval_wakes_the_same_goal_and_shutdown_cancels_future_ticks() {
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "timed check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -303,6 +309,8 @@ async fn an_event_only_goal_expires_without_waiting_for_another_event() {
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -396,6 +404,8 @@ async fn manually_resuming_a_restored_goal_rearms_only_its_trigger() {
                 chat,
                 receipt.loop_id,
                 Some(Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: "periodic check".into(),
                     prompt_source: TriggerPromptSource::Explicit,
@@ -549,6 +559,8 @@ async fn replacing_a_trigger_cancels_its_old_interval_and_deadline_even_with_the
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id,
                 prompt: "old schedule".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -569,6 +581,8 @@ async fn replacing_a_trigger_cancels_its_old_interval_and_deadline_even_with_the
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id,
                 prompt: "new schedule".into(),
                 prompt_source: TriggerPromptSource::Explicit,
@@ -676,6 +690,8 @@ async fn expiration_clears_the_selected_goals_waiters_and_preserves_other_queued
                 chat,
                 receipt.loop_id,
                 Some(Trigger {
+                    title: None,
+                    paused_at_ms: None,
                     id: Uuid::new_v4(),
                     prompt: "check".into(),
                     prompt_source: TriggerPromptSource::Explicit,

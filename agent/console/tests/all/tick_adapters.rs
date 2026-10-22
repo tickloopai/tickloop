@@ -645,6 +645,8 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
             observer,
             receipt.loop_id,
             Some(tickloop_agent_protocol::Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "restored foreign watch".into(),
                 prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,

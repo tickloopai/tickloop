@@ -134,6 +134,8 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
     let chat_id = source.create_chat(directory.path().into()).await.unwrap();
     let loop_id = uuid::Uuid::new_v4();
     let trigger = Trigger {
+        title: None,
+        paused_at_ms: None,
         id: uuid::Uuid::new_v4(),
         prompt: "scheduled after restart".into(),
         prompt_source: TriggerPromptSource::Explicit,

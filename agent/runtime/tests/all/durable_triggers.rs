@@ -69,6 +69,8 @@ pub(super) fn durable(store: Arc<dyn TranscriptStore>, model: Arc<Script>) -> Ag
 
 pub(super) fn every(text: &str) -> Trigger {
     Trigger {
+        title: None,
+        paused_at_ms: None,
         id: Uuid::new_v4(),
         prompt: CHECK.into(),
         prompt_source: TriggerPromptSource::Explicit,

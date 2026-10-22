@@ -3,7 +3,7 @@ use super::*;
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
     ChatSnapshot, EventKind, LoopId, LoopSnapshot, LoopState, OperationRecord, OperationState,
-    Receipt, TICK_SUBSCRIPTION_SOURCE, Trigger, TriggerSource, UserShellState,
+    Receipt, Recurrence, TICK_SUBSCRIPTION_SOURCE, Trigger, TriggerSource, UserShellState,
 };
 use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 
@@ -39,10 +39,9 @@ const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const TIMER_SOURCE: &str = "timer";
 /// The most schedules a Chat keeps active at once, confirmed or awaiting confirmation.
 pub(crate) const MAX_ACTIVE_SCHEDULES: usize = 20;
-/// How long a schedule the model created runs before it expires, unless the user changes it.
-pub(crate) const MODEL_SCHEDULE_LIFETIME_MS: u64 = MODEL_SCHEDULE_LIFETIME_DAYS * MS_PER_DAY;
+/// How long a schedule the model created runs on a local Agent before it expires, unless the
+/// user changes it.
 pub(crate) const MODEL_SCHEDULE_LIFETIME_DAYS: u64 = 30;
-const MS_PER_DAY: u64 = SECONDS_PER_DAY * 1_000;
 
 /// How many of the Chat's Loops that have not ended keep a schedule armed or awaiting the user's
 /// confirmation.
@@ -70,6 +69,44 @@ pub(crate) fn too_many_schedules() -> String {
         "this Chat already has {MAX_ACTIVE_SCHEDULES} active schedules; stop one before adding \
          another"
     )
+}
+
+/// A schedule the user makes through the host, for [`Agent::create_schedule`].
+#[derive(Clone, Debug)]
+pub struct NewSchedule {
+    /// A short name; at most [`tickloop_agent_protocol::MAX_TRIGGER_TITLE_CHARS`] characters.
+    pub title: Option<String>,
+    /// The instruction each run receives; it is also the Loop's goal.
+    pub prompt: String,
+    pub schedule: Recurrence,
+    /// When the schedule expires; `None` runs until the user stops it.
+    pub expires_at: Option<std::time::SystemTime>,
+}
+
+/// What [`Agent::edit_schedule`] changes; `None` keeps the field.
+#[derive(Clone, Debug, Default)]
+pub struct ScheduleEdit {
+    pub title: Option<String>,
+    pub prompt: Option<String>,
+    pub schedule: Option<Recurrence>,
+}
+
+fn valid_title(title: &str) -> Result<String, AgentError> {
+    tickloop_agent_protocol::trigger_title(title).ok_or_else(|| {
+        AgentError::Invalid(format!(
+            "the title must contain 1 to {} characters",
+            tickloop_agent_protocol::MAX_TRIGGER_TITLE_CHARS
+        ))
+    })
+}
+
+/// `time` in Unix milliseconds, refused when it has passed.
+fn unix_ms(time: std::time::SystemTime) -> Result<u64, AgentError> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        .filter(|deadline| *deadline > tickloop_agent_base::private_fs::unix_time_milliseconds())
+        .ok_or_else(|| AgentError::Invalid("the new deadline has passed".into()))
 }
 
 /// The user's answer to a schedule the model created.
@@ -539,18 +576,7 @@ impl Agent {
         let _admission = self.inner.tasks.token();
         self.refuse_when_closed()?;
         self.make_resident(chat_id).await?;
-        let expires_at_ms = expires_at
-            .map(|expires_at| {
-                expires_at
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|since| u64::try_from(since.as_millis()).ok())
-                    .filter(|deadline| {
-                        *deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
-                    })
-                    .ok_or_else(|| AgentError::Invalid("the new deadline has passed".into()))
-            })
-            .transpose()?;
+        let expires_at_ms = expires_at.map(unix_ms).transpose()?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         let goal = chat
@@ -581,6 +607,204 @@ impl Agent {
         drop(chats);
         self.trigger_task(chat_id, loop_id, trigger, cancel);
         Ok(())
+    }
+
+    /// Registers a schedule the user made through the host as a new Loop `loop_id` of the
+    /// Chat: it first runs at the schedule's next time, needs no confirmation and expires at
+    /// `expires_at`, if given. Registering the same Loop again changes nothing.
+    pub async fn create_schedule(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        schedule: NewSchedule,
+    ) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let title = schedule.title.as_deref().map(valid_title).transpose()?;
+        let mut trigger = Trigger {
+            id: Uuid::new_v4(),
+            prompt: schedule.prompt.clone(),
+            prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
+            schedule: Some(schedule.schedule),
+            expires_at_ms: schedule.expires_at.map(unix_ms).transpose()?,
+            accepts_events: false,
+            armed: true,
+            armed_at_ms: None,
+            last_fired_at_ms: None,
+            confirmation: None,
+            subscriptions: Vec::new(),
+            title,
+            paused_at_ms: None,
+        };
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let now_on_schedule = self.inner.schedule_clock.now_ms();
+        if let Some(reason) =
+            invalid_trigger(&trigger, self.inner.min_schedule_interval, now_on_schedule)
+        {
+            return Err(AgentError::Invalid(reason));
+        }
+        trigger.arm_at(now_on_schedule);
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        // A Chat without a conversation yet records nothing on its own; a durable host commits
+        // the new Loop now, so another instance finds it, and again for a repeated call whose
+        // first commit failed.
+        if chat.snapshot.loops.iter().any(|goal| goal.id == loop_id) {
+            drop(chats);
+            return self
+                .make_durable(&[chat_id])
+                .await
+                .map_err(AgentError::Storage);
+        }
+        if active_schedules(&chat.snapshot) >= MAX_ACTIVE_SCHEDULES {
+            return Err(AgentError::Invalid(too_many_schedules()));
+        }
+        let mut snapshot = chat.snapshot.clone();
+        chat.bookkeeping.add_loop(
+            &mut snapshot,
+            LoopSnapshot {
+                id: loop_id,
+                goal: schedule.prompt,
+                state: LoopState::WaitingTrigger,
+                run_id: None,
+                run_started_at: None,
+                trigger: Some(trigger.clone()),
+                state_since: Some(now),
+                event_sources: Vec::new(),
+            },
+        );
+        self.save(&snapshot);
+        chat.snapshot = snapshot;
+        let cancel = CancellationToken::new();
+        if let Some(previous) = chat.trigger_cancellations.insert(loop_id, cancel.clone()) {
+            previous.cancel();
+        }
+        drop(chats);
+        self.make_durable(&[chat_id])
+            .await
+            .map_err(AgentError::Storage)?;
+        self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
+            .await;
+        Ok(())
+    }
+
+    /// Changes the title, prompt or rule of a goal's schedule. A new rule counts from now, as
+    /// a schedule just configured does; a paused schedule stays paused.
+    pub async fn edit_schedule(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        edit: ScheduleEdit,
+    ) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let title = edit.title.as_deref().map(valid_title).transpose()?;
+        let mut trigger = self.editable_schedule(chat_id, loop_id).await?;
+        if let Some(title) = title {
+            trigger.title = Some(title);
+        }
+        if let Some(prompt) = edit.prompt {
+            trigger.set_explicit_prompt(prompt);
+        }
+        match edit.schedule {
+            Some(schedule) if trigger.schedule != Some(schedule) => {
+                trigger.id = Uuid::new_v4();
+                trigger.schedule = Some(schedule);
+                self.configure_trigger(chat_id, loop_id, Some(trigger))
+                    .await
+            }
+            // The timer reads the prompt and title from the Loop when it fires.
+            _ => {
+                if trigger.prompt.trim().is_empty() {
+                    return Err(AgentError::Invalid("the prompt is empty".into()));
+                }
+                let mut chats = self.inner.chats.lock().await;
+                let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+                let goal = chat
+                    .snapshot
+                    .loops
+                    .iter_mut()
+                    .find(|goal| goal.id == loop_id)
+                    .ok_or(AgentError::NotFound)?;
+                let current = goal.trigger.as_mut().ok_or(AgentError::NotFound)?;
+                current.title = trigger.title;
+                current.prompt = trigger.prompt;
+                current.prompt_source = trigger.prompt_source;
+                self.save(&chat.snapshot);
+                Ok(())
+            }
+        }
+    }
+
+    /// Pauses a goal's schedule: it does not run until [`Agent::resume_schedule`]. Pausing a
+    /// paused schedule changes nothing.
+    pub async fn pause_schedule(&self, chat_id: ChatId, loop_id: LoopId) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let mut trigger = self.editable_schedule(chat_id, loop_id).await?;
+        if trigger.is_paused() {
+            return Ok(());
+        }
+        trigger.armed = false;
+        trigger.paused_at_ms = Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
+        self.configure_trigger(chat_id, loop_id, Some(trigger))
+            .await
+    }
+
+    /// Resumes a paused schedule, or one a restart left disarmed: it runs again from its next
+    /// time after now. Resuming an armed schedule changes nothing.
+    pub async fn resume_schedule(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+    ) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let mut trigger = self.editable_schedule(chat_id, loop_id).await?;
+        if trigger.armed && !trigger.is_paused() {
+            return Ok(());
+        }
+        trigger.armed = true;
+        trigger.paused_at_ms = None;
+        self.configure_trigger(chat_id, loop_id, Some(trigger))
+            .await
+    }
+
+    /// The Trigger of a goal whose schedule the user may change: one that has not ended and
+    /// does not await the user's confirmation.
+    async fn editable_schedule(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+    ) -> Result<Trigger, AgentError> {
+        let chats = self.inner.chats.lock().await;
+        let goal = chats
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .loops
+            .iter()
+            .find(|goal| goal.id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            return Err(AgentError::Invalid("the goal has ended".into()));
+        }
+        let trigger = goal
+            .trigger
+            .as_ref()
+            .filter(|trigger| trigger.schedule.is_some())
+            .ok_or_else(|| AgentError::Invalid("the goal has no schedule".into()))?;
+        if trigger.awaits_confirmation() {
+            return Err(AgentError::Invalid(
+                "the goal's schedule awaits the user's confirmation; confirm or reject it first"
+                    .into(),
+            ));
+        }
+        Ok(trigger.clone())
     }
 
     fn discard_replaced_trigger_inputs(&self, chat: &mut Chat, loop_id: LoopId) {
@@ -1270,6 +1494,7 @@ mod regression_tests {
                 host_rules: Vec::new(),
                 task_tools: None,
                 min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
+                model_schedules: crate::ModelSchedules::CONFIRMED_BY_THE_USER,
                 waits: WaitHosting::Durable,
                 citation_style: Default::default(),
                 system_prompt_addition: None,

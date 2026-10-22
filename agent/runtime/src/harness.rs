@@ -55,6 +55,8 @@ pub struct HarnessOptions {
     /// The shortest time a Trigger's schedule may leave between two runs; a schedule that runs
     /// more often is refused.
     pub min_schedule_interval: Duration,
+    /// How a schedule the model creates with StartGoal starts and how long it runs.
+    pub model_schedules: ModelSchedules,
     pub waits: WaitHosting,
     pub citation_style: CitationStyle,
     /// Instructions the host adds to every conversation's system prompt, as a section of their
@@ -78,6 +80,7 @@ impl HarnessOptions {
             host_rules: Vec::new(),
             task_tools: None,
             min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
+            model_schedules: ModelSchedules::CONFIRMED_BY_THE_USER,
             waits: WaitHosting::Process,
             citation_style: CitationStyle::default(),
             system_prompt_addition: None,
@@ -103,6 +106,33 @@ pub enum CitationStyle {
     #[default]
     MarkdownLinks,
     Numbered,
+}
+
+/// How a schedule the model creates with StartGoal starts and how long it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelSchedules {
+    /// Whether it runs from its next scheduled time on without the user's confirmation, as one
+    /// the user made does; otherwise it waits for the user to confirm it.
+    pub run_without_confirmation: bool,
+    /// How long it runs before it expires, unless the user changes its deadline; `None` runs
+    /// until the user stops it.
+    pub lifetime: Option<Duration>,
+}
+
+impl ModelSchedules {
+    /// A local Agent's: the user confirms each one, and it expires after 30 days.
+    pub const CONFIRMED_BY_THE_USER: Self = Self {
+        run_without_confirmation: false,
+        lifetime: Some(Duration::from_secs(
+            crate::triggers::MODEL_SCHEDULE_LIFETIME_DAYS * 24 * 60 * 60,
+        )),
+    };
+    /// A host that shows the user every schedule and lets them pause, edit or delete it: each
+    /// one runs at once and never expires.
+    pub const TRUSTED: Self = Self {
+        run_without_confirmation: true,
+        lifetime: None,
+    };
 }
 
 /// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always

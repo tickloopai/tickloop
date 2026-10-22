@@ -99,6 +99,8 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "Check fresh evidence".into(),
                 prompt_source: TriggerPromptSource::Explicit,

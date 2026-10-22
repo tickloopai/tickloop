@@ -108,7 +108,7 @@ async fn live_deepseek_interval_reuses_the_goal_and_stops_future_execution() {
                 _ => {}
             }
         }
-        agent.configure_trigger(chat,initial.loop_id,Some(Trigger {
+        agent.configure_trigger(chat,initial.loop_id,Some(Trigger { title: None, paused_at_ms: None,
             id:uuid::Uuid::new_v4(),
             prompt:"Use Read to read tick-source.txt in the current working directory, then reply with the exact marker from that file. Do not use other tools.".into(),
             prompt_source: TriggerPromptSource::Explicit,

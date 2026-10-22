@@ -129,6 +129,8 @@ impl AgentAccess for ActivityAccess {
                     submitted.chat_id,
                     submitted.loop_id,
                     Some(Trigger {
+                        title: None,
+                        paused_at_ms: None,
                         id: Uuid::new_v4(),
                         prompt: "Check for updates".into(),
                         prompt_source: TriggerPromptSource::Explicit,

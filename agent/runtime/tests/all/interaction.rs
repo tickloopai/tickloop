@@ -414,6 +414,8 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "Check the report.".into(),
                 prompt_source: TriggerPromptSource::Explicit,

@@ -1408,6 +1408,7 @@ mod feedback_admission_tests {
                 host_rules: Vec::new(),
                 task_tools: None,
                 min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
+                model_schedules: crate::ModelSchedules::CONFIRMED_BY_THE_USER,
                 waits: WaitHosting::Durable,
                 citation_style: Default::default(),
                 system_prompt_addition: None,

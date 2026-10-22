@@ -716,6 +716,8 @@ async fn an_expired_loop_cancels_its_model_request_without_interrupt_messages() 
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: uuid::Uuid::new_v4(),
                 prompt: "check".into(),
                 prompt_source: TriggerPromptSource::Explicit,

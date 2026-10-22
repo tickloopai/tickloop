@@ -122,6 +122,8 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
             background,
             watch.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "scheduled market check".into(),
                 prompt_source: TriggerPromptSource::Explicit,

@@ -137,7 +137,8 @@ pub use local_messages::{
 };
 pub use loops::{
     EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind,
-    ScheduleConfirmation, Trigger, TriggerPromptSource, TriggerSource,
+    MAX_TRIGGER_TITLE_CHARS, ScheduleConfirmation, Trigger, TriggerPromptSource, TriggerSource,
+    trigger_title,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
@@ -172,7 +173,10 @@ pub use tick_subscriptions::{
     TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
     TickSubscriptionFrequency, TickSubscriptionStatus,
 };
-pub use tickloop_agent_recurrence::{ParseError as RecurrenceError, Recurrence};
+pub use tickloop_agent_recurrence::{
+    ParseError as RecurrenceError, Recurrence, RecurrenceParts, Tz as RecurrenceTimeZoneName,
+    Zone as RecurrenceZone,
+};
 pub use tool::ToolDefinition;
 pub use tools::{
     CitationSource, CommandSnapshot, CommandState, FileReadRecord, SearchConfig,

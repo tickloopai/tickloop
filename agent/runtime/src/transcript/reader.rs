@@ -169,7 +169,8 @@ pub(crate) fn load_compaction_ancestors(
 
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 组装已读出的记录：重接部分
 /// 压缩的保留区段，从 `leaf`（缺省时取时间最新的叶子）沿父指针重建对话链。没有任何
-/// user／assistant 条目、或找不到 `leaf` 时返回 `None`。第二个返回值表示对话链沿父指针一直走到了
+/// user／assistant 条目时，只有 Loop 条目或使无消息 Chat 成立的元数据才组装出（仅含 Loop 条目的）
+/// 对话链，否则与找不到 `leaf` 时一样返回 `None`。第二个返回值表示对话链沿父指针一直走到了
 /// 根，没有停在缺失的父条目上；记录只从最近的边界读起时，调用方据此改读完整历史。
 pub(crate) fn assemble(
     stored: &StoredTranscript,
@@ -247,17 +248,29 @@ pub(crate) fn assemble(
             }),
     };
     let Some(leaf) = leaf else {
-        let has_chat_without_messages = metadata
-            .artifact_ticks
-            .as_ref()
-            .is_some_and(|entry| entry.cwd.is_some())
+        // A Chat without messages keeps the Loops a host created in it, such as a schedule
+        // waiting for its first time; they are its whole chain.
+        let mut loop_records: Vec<&IndexedEntry> = entries
+            .values()
+            .filter(|indexed| indexed.entry.is_loop_record())
+            .collect();
+        loop_records.sort_by_key(|indexed| indexed.file_index);
+        let has_chat_without_messages = !loop_records.is_empty()
+            || metadata
+                .artifact_ticks
+                .as_ref()
+                .is_some_and(|entry| entry.cwd.is_some())
             || metadata
                 .monitor_members
                 .as_ref()
                 .is_some_and(|entry| entry.materializes_chat());
+        let chain = loop_records
+            .into_iter()
+            .map(|indexed| indexed.entry.clone())
+            .collect();
         let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
-            chain: Vec::new(),
+            chain,
             metadata,
             file_history_snapshots,
             content_replacements,

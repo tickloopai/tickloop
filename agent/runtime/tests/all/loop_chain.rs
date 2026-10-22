@@ -118,6 +118,8 @@ fn message_text(message: &Message) -> String {
 
 fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
     Trigger {
+        title: None,
+        paused_at_ms: None,
         id: Uuid::new_v4(),
         prompt: prompt.into(),
         prompt_source: TriggerPromptSource::Explicit,

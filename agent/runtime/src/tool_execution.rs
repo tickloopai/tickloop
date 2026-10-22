@@ -1255,9 +1255,11 @@ impl Agent {
                 name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
             // A schedule the model creates runs only once the user confirms it: here the prompt
             // confirms it, while a durable host registers it to await the user's decision. A
-            // process host without prompts has no one to confirm it and refuses it.
+            // process host without prompts has no one to confirm it and refuses it. A host that
+            // runs the model's schedules without confirmation asks nothing.
             let requires_schedule_consent = crate::interaction::creates_schedule(&name, &input)
-                && self.inner.waits != WaitHosting::Durable;
+                && self.inner.waits != WaitHosting::Durable
+                && !self.inner.model_schedules.run_without_confirmation;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,

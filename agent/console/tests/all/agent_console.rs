@@ -1150,6 +1150,8 @@ async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
             chat,
             watching.loop_id,
             Some(tickloop_agent_protocol::Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "Check the notes".into(),
                 prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,

@@ -1332,6 +1332,8 @@ async fn an_input_queued_on_an_expiring_loop_settles_discarded_loop_ended() {
             chat,
             loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "check".into(),
                 prompt_source: TriggerPromptSource::Explicit,

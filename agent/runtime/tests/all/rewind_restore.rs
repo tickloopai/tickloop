@@ -508,6 +508,8 @@ async fn conversation_rewind_to_a_triggered_loop_start_removes_the_loop_and_its_
             chat,
             receipt.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: trigger_id,
                 prompt: "check again when requested".into(),
                 prompt_source: TriggerPromptSource::Explicit,

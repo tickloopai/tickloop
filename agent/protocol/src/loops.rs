@@ -91,6 +91,23 @@ pub struct Trigger {
     pub confirmation: Option<ScheduleConfirmation>,
     /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
     pub subscriptions: Vec<TickSubscription>,
+    /// A short name the user or the Agent gave the schedule, such as "Daily news digest".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Unix milliseconds when the user paused the schedule: it stays disarmed until resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at_ms: Option<u64>,
+}
+
+/// The most characters a Trigger's title holds.
+pub const MAX_TRIGGER_TITLE_CHARS: usize = 120;
+
+/// A Trigger's title as given, trimmed; `None` when it is blank or longer than
+/// [`MAX_TRIGGER_TITLE_CHARS`].
+pub fn trigger_title(text: &str) -> Option<String> {
+    let title = text.trim();
+    (!title.is_empty() && title.chars().count() <= MAX_TRIGGER_TITLE_CHARS)
+        .then(|| title.to_owned())
 }
 
 /// A Trigger as records hold it. Records written before schedules held a whole number of
@@ -118,6 +135,10 @@ struct TriggerRecord {
     confirmation: Option<ScheduleConfirmation>,
     #[serde(default)]
     subscriptions: Vec<TickSubscription>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    paused_at_ms: Option<u64>,
 }
 
 impl From<TriggerRecord> for Trigger {
@@ -137,6 +158,8 @@ impl From<TriggerRecord> for Trigger {
             last_fired_at_ms: record.last_fired_at_ms,
             confirmation: record.confirmation,
             subscriptions: record.subscriptions,
+            title: record.title,
+            paused_at_ms: record.paused_at_ms,
         }
     }
 }
@@ -157,6 +180,8 @@ impl Trigger {
             last_fired_at_ms: None,
             confirmation: None,
             subscriptions: Vec::new(),
+            title: None,
+            paused_at_ms: None,
         }
     }
 
@@ -170,6 +195,11 @@ impl Trigger {
     /// Whether the schedule waits for the user to confirm it before it may run.
     pub fn awaits_confirmation(&self) -> bool {
         self.confirmation == Some(ScheduleConfirmation::Pending)
+    }
+
+    /// Whether the user paused the schedule.
+    pub fn is_paused(&self) -> bool {
+        self.paused_at_ms.is_some()
     }
 
     /// Arms the Trigger at `now_ms`: its schedule counts afresh from here.

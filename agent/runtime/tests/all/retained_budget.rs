@@ -183,6 +183,8 @@ async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId, loop_id: Uuid
             chat,
             loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "Check the feed".into(),
                 prompt_source: TriggerPromptSource::Explicit,

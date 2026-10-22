@@ -160,6 +160,8 @@ impl TimerSchedule {
 
     pub(super) fn prepare(self, current: Option<Trigger>) -> Result<Trigger, String> {
         let mut trigger = current.unwrap_or(Trigger {
+            title: None,
+            paused_at_ms: None,
             id: Uuid::new_v4(),
             prompt: String::new(),
             prompt_source: TriggerPromptSource::Explicit,

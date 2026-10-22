@@ -26,10 +26,10 @@ pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
 
 pub use harness::{
     CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL,
-    PersonWait, PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
-    durable_chat_host_rules,
+    ModelSchedules, PersonWait, PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy,
+    WaitHosting, Waits, durable_chat_host_rules,
 };
-pub use triggers::ScheduleDecision;
+pub use triggers::{NewSchedule, ScheduleDecision, ScheduleEdit};
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -336,6 +336,7 @@ struct Inner {
     waits: WaitHosting,
     /// The shortest time a Trigger's schedule may leave between two runs.
     min_schedule_interval: std::time::Duration,
+    model_schedules: harness::ModelSchedules,
     /// The wall clock Trigger schedules run on.
     schedule_clock: triggers::ScheduleClock,
     /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
@@ -1841,6 +1842,7 @@ impl Agent {
             host_rules,
             task_tools,
             min_schedule_interval,
+            model_schedules,
             waits,
             system_prompt_addition,
             citation_style,
@@ -1868,6 +1870,7 @@ impl Agent {
                 host_options,
                 waits,
                 min_schedule_interval,
+                model_schedules,
                 schedule_clock: triggers::ScheduleClock::new(),
                 config_root,
                 settings_writes: Mutex::new(()),
@@ -3082,6 +3085,7 @@ impl Agent {
                 tools: self.inner.tool_policy,
                 waits: self.inner.waits,
                 min_schedule_interval: self.inner.min_schedule_interval,
+                model_schedules: self.inner.model_schedules,
                 host_section: self.inner.system_prompt_addition.as_deref(),
                 citation_style: self.inner.citation_style,
             };

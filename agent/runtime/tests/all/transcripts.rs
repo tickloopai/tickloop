@@ -543,6 +543,8 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
             chat,
             scheduled.loop_id,
             Some(Trigger {
+                title: None,
+                paused_at_ms: None,
                 id: Uuid::new_v4(),
                 prompt: "periodic check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
