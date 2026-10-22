@@ -18,6 +18,11 @@ mod family;
 mod family_load;
 mod family_tree;
 pub mod file_history;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "ticket 06 wires Goal into the Loop")
+)]
+mod goal;
 mod handback;
 mod handover;
 pub use handover::HandOver;
