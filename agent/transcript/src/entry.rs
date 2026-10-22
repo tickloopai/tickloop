@@ -26,6 +26,7 @@ pub enum Line {
     TaskBoards(TaskBoardsEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
+    FamilyMessageHold(FamilyMessageHoldEntry),
     SentAgentMessages(SentAgentMessagesEntry),
     /// Where the Chat's WebFetch URLs and Artifact writes may lead; the latest record wins.
     Provenance(ProvenanceEntry),
@@ -125,6 +126,7 @@ pub enum MetadataKind {
     MonitorMembers,
     Subagents,
     FamilyInputs,
+    FamilyMessageHold,
     SentAgentMessages,
     Provenance,
     CitationSources,
@@ -152,6 +154,7 @@ impl MetadataKind {
             | Self::ArtifactTicks
             | Self::MonitorMembers
             | Self::Subagents
+            | Self::FamilyMessageHold
             | Self::FamilyInputs
             | Self::SentAgentMessages
             | Self::Provenance
@@ -219,6 +222,7 @@ impl Line {
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
             Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
+            Self::FamilyMessageHold(_) => MetadataKind::FamilyMessageHold,
             Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
             Self::Provenance(_) => MetadataKind::Provenance,
             Self::CitationSources(_) => MetadataKind::CitationSources,
@@ -602,6 +606,15 @@ pub struct FamilyCompletionsEntry {
 pub struct FamilyInputsEntry {
     pub chat_id: Uuid,
     pub inputs: std::collections::BTreeMap<Uuid, FamilyInputRecord>,
+}
+
+/// Sender runs stopped in the same batch as this receiver. Their later messages stay queued
+/// until the receiver is explicitly continued or accepts a new deliverable family message.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FamilyMessageHoldEntry {
+    pub chat_id: Uuid,
+    pub stopped_runs: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

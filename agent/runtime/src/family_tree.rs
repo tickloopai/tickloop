@@ -166,8 +166,13 @@ impl Agent {
                         .is_some_and(|source| stopped_chats.contains(&source.sender_chat_id))
                     {
                         pending.armed = false;
+                        child
+                            .bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
                     }
                 }
+                self.persist_family_message_hold(id, &mailbox);
                 child.snapshot.pending_commands.clear();
                 child.ready_runs.clear();
                 let commands = child

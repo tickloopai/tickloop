@@ -44,6 +44,7 @@ enum Reply {
     Says(Vec<Content>),
     /// Holds the request until its Run is cancelled, as a host that dies mid-request would.
     Holds,
+    After(Arc<Notify>, Vec<Content>),
 }
 
 type Route = dyn Fn(&ModelRequest) -> Reply + Send + Sync;
@@ -103,6 +104,14 @@ impl ModelClient for FamilyModel {
                 usage: Default::default(),
                 stop_reason: "end_turn".into(),
             }),
+            Reply::After(ready, content) => {
+                tokio::select! {
+                    () = ready.notified() => Ok(ModelOutput {
+                        private_source: None, content, usage: Default::default(), stop_reason: "end_turn".into(),
+                    }),
+                    () = cancel.cancelled() => Err(ModelError::Cancelled),
+                }
+            }
             Reply::Holds => {
                 self.holding.notify_one();
                 cancel.cancelled().await;
@@ -1380,4 +1389,287 @@ async fn host_rules_reach_a_child_live_and_are_never_recorded_with_its_delegatio
         assert!(!rule_ids(policy).contains(&first_rule.id));
     }
     loading.shutdown().await;
+}
+
+const HELD_FAMILY_MESSAGE: &str = "Message retained across the stop";
+
+/// Stops either the root or, through StopSubagent, a middle member with a child. The receiver
+/// holds a model request so the ordinary message remains queued until the stop disarms it.
+async fn stopped_message_family(
+    subtree: bool,
+) -> (
+    Arc<InMemoryTranscriptStore>,
+    Agent,
+    ChatId,
+    ChatId,
+    Vec<ChatId>,
+) {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let receiver_holding = Arc::new(Notify::new());
+    let model = FamilyModel::new(move |request| match task_of(request).as_deref() {
+        Some("leaf") if !has_tool_result(request, "send") => Reply::After(
+            receiver_holding.clone(),
+            call(
+                "send",
+                "SendMessage",
+                json!({"to": if subtree { "middle" } else { "main" }, "message": HELD_FAMILY_MESSAGE}),
+            ),
+        ),
+        Some("leaf") => Reply::Holds,
+        Some("middle") if !has_tool_result(request, "delegate-leaf") => Reply::Says(call(
+            "delegate-leaf",
+            "Subagent",
+            json!({"task":"leaf", "name":"leaf", "run_in_background":true}),
+        )),
+        Some("middle") => {
+            receiver_holding.notify_one();
+            Reply::Holds
+        }
+        _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
+            DELEGATION_CALL,
+            "Subagent",
+            json!({"task":if subtree {"middle"} else {"leaf"}, "name":if subtree {"middle"} else {"leaf"}, "run_in_background":true}),
+        )),
+        _ if !subtree => {
+            receiver_holding.notify_one();
+            Reply::Holds
+        }
+        _ if !has_tool_result(request, QUESTION_CALL) => Reply::Says(call(
+            QUESTION_CALL,
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("Stop the subtree?"),
+        )),
+        _ if !has_tool_result(request, "stop") => {
+            Reply::Says(call("stop", "StopSubagent", json!({"to":"middle"})))
+        }
+        _ => Reply::Says(text(ROOT_DONE)),
+    });
+    let agent = harness(store.clone(), model, WaitHosting::Durable);
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let turn = agent
+        .advance(root, prompt("Start the family"))
+        .await
+        .unwrap();
+    let target = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let members = agent.family_agents(root).await.unwrap();
+            let target = if subtree {
+                members
+                    .iter()
+                    .find(|member| member.handle == "middle")
+                    .map(|member| member.chat_id)
+            } else {
+                Some(root)
+            };
+            if let Some(target) = target {
+                let snapshot = agent.snapshot(target).await.unwrap();
+                if snapshot
+                    .pending_inputs
+                    .iter()
+                    .any(|pending| pending.input.contains(HELD_FAMILY_MESSAGE))
+                {
+                    break target;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ordinary family message queued before stop");
+    if subtree {
+        let TurnOutcome::Waiting(TurnWait::Question(question)) = outcome(&turn).await else {
+            panic!("root asks before stopping the subtree");
+        };
+        let stopping = agent.advance(root, answer(&question)).await.unwrap();
+        assert!(matches!(
+            outcome(&stopping).await,
+            TurnOutcome::Merged { .. }
+        ));
+        assert!(matches!(
+            settled(&agent, root, turn.input_id()).await,
+            SettledOutcome::Completed { .. }
+        ));
+        let snapshot = agent.snapshot(root).await.unwrap();
+        let result = tool_result(&snapshot.messages, "stop").unwrap();
+        assert_eq!(result["status"], "stopped", "{result}");
+    } else {
+        agent.stop(root).await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = agent.snapshot(target).await.unwrap();
+            if snapshot.pending_inputs.len() == 2
+                && snapshot.pending_inputs.iter().all(|pending| !pending.armed)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ordinary message and stopped completion held together");
+    let members = agent
+        .family_agents(root)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|member| member.chat_id)
+        .collect();
+    agent.sync().await.unwrap();
+    (store, agent, root, target, members)
+}
+
+async fn assert_stopped_family_recovery(
+    subtree: bool,
+    waits: WaitHosting,
+    pending_completion: bool,
+) {
+    let (store, original, root, target, members) = stopped_message_family(subtree).await;
+    let held = original.snapshot(target).await.unwrap();
+    let expected_origins = held.agent_message_origins.len() + held.pending_inputs.len();
+    let message_ids: Vec<_> = held
+        .pending_inputs
+        .iter()
+        .map(|pending| pending.agent_message.as_ref().unwrap().message_id)
+        .collect();
+    let crashed = Arc::new(InMemoryTranscriptStore::new());
+    for member in members {
+        let mut lines = store.lines(member);
+        if pending_completion && member == target {
+            let mut completions = held.family_completions.clone();
+            let completion = completions.last_mut().unwrap();
+            completion.notification = SubagentNotificationDelivery::Pending;
+            let id = completion.child_run_id;
+            lines.retain(|line| !matches!(line, Line::Input(entry) if entry.input_id == id));
+            lines.push(Line::FamilyCompletions(FamilyCompletionsEntry {
+                chat_id: target,
+                completions,
+            }));
+        }
+        crashed.seed(member, lines, StorePosition(1));
+    }
+    let model = FamilyModel::new(|_| Reply::Says(text("Recovered once")));
+    let restarted = harness(crashed.clone(), model.clone(), waits);
+    restarted
+        .resume_chat(if waits == WaitHosting::Durable {
+            root
+        } else {
+            target
+        })
+        .await
+        .unwrap();
+    assert_eq!(restarted.quiesce(target).await, Quiescence::Idle);
+    let snapshot = restarted.snapshot(target).await.unwrap();
+    assert_eq!(
+        snapshot.pending_inputs.len(),
+        2,
+        "both family inputs survive restart"
+    );
+    assert!(
+        snapshot.pending_inputs.iter().all(|pending| !pending.armed),
+        "restart must wait for Continue"
+    );
+    assert!(
+        model.requests.lock().unwrap().is_empty(),
+        "held messages must not run before Continue"
+    );
+    restarted.continue_loop(target).await.unwrap();
+    assert_eq!(restarted.quiesce(target).await, Quiescence::Idle);
+    let snapshot = restarted.snapshot(target).await.unwrap();
+    for id in &message_ids {
+        assert!(
+            snapshot
+                .agent_message_origins
+                .values()
+                .any(|source| source["message_id"] == id.to_string())
+        );
+    }
+    assert_eq!(snapshot.agent_message_origins.len(), expected_origins);
+    restarted.sync().await.unwrap();
+    let delivered_requests = model.requests.lock().unwrap().len();
+    assert!(delivered_requests > 0);
+    let after_continue = harness(crashed, model.clone(), waits);
+    after_continue
+        .resume_chat(if waits == WaitHosting::Durable {
+            root
+        } else {
+            target
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_continue.quiesce(target).await, Quiescence::Idle);
+    assert_eq!(
+        after_continue
+            .snapshot(target)
+            .await
+            .unwrap()
+            .agent_message_origins
+            .len(),
+        expected_origins
+    );
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        delivered_requests,
+        "a second restart must not deliver the messages again"
+    );
+    after_continue.shutdown().await;
+    restarted.shutdown().await;
+    original.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_restart_preserves_queued_family_holds_from_both_stop_entries() {
+    for subtree in [false, true] {
+        assert_stopped_family_recovery(subtree, WaitHosting::Durable, false).await;
+    }
+}
+
+#[tokio::test]
+async fn durable_restart_holds_pending_completion_replay_from_both_stop_entries() {
+    for subtree in [false, true] {
+        assert_stopped_family_recovery(subtree, WaitHosting::Durable, true).await;
+    }
+}
+
+#[tokio::test]
+async fn durable_restart_after_continue_keeps_family_inputs_deliverable() {
+    use tickloop_agent_runtime::trigger_pauses::PausePoint;
+    for subtree in [false, true] {
+        let (store, original, root, target, members) = stopped_message_family(subtree).await;
+        let before = original.snapshot(target).await.unwrap();
+        let expected_origins = before.agent_message_origins.len() + before.pending_inputs.len();
+        let pause = original.pause_next_for_tests(target, PausePoint::ReceivingRecorded);
+        let continuing = tokio::spawn({
+            let original = original.clone();
+            async move { original.continue_loop(target).await.unwrap() }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        original.sync().await.unwrap();
+        let crashed = Arc::new(InMemoryTranscriptStore::new());
+        for member in members {
+            crashed.seed(member, store.lines(member), StorePosition(1));
+        }
+        let model = FamilyModel::new(|_| Reply::Says(text("Continued once")));
+        let restarted = harness(crashed, model.clone(), WaitHosting::Durable);
+        restarted.resume_chat(root).await.unwrap();
+        assert_eq!(restarted.quiesce(target).await, Quiescence::Idle);
+        assert_eq!(
+            restarted
+                .snapshot(target)
+                .await
+                .unwrap()
+                .agent_message_origins
+                .len(),
+            expected_origins,
+            "Continue must persist rearming before the inputs start"
+        );
+        assert!(!model.requests.lock().unwrap().is_empty());
+        drop(pause.release);
+        continuing.await.unwrap();
+        restarted.shutdown().await;
+        original.shutdown().await;
+    }
 }

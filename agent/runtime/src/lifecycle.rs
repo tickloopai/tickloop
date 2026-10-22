@@ -181,6 +181,34 @@ impl Lifecycle {
         );
     }
 
+    /// Updates the delivery state of an accepted input without changing its stable identity.
+    pub(crate) fn set_queued_armed(&mut self, run: RunId, armed: bool) {
+        let Some(id) = self.open_inputs.get(&run).copied() else {
+            return;
+        };
+        let Some(input) = self.inputs.get(&id) else {
+            return;
+        };
+        if input.record.state != InputState::Accepted {
+            return;
+        }
+        let Some(mut queued) = input.record.queued.clone() else {
+            return;
+        };
+        if queued["armed"] == armed {
+            return;
+        }
+        queued["armed"] = armed.into();
+        let revision = self.next_revision();
+        let input = self
+            .inputs
+            .get_mut(&id)
+            .expect("accepted input remains in the ledger");
+        input.record.queued = Some(queued);
+        input.record.timestamp = now();
+        input.revision = revision;
+    }
+
     /// The Run of `run`'s open input started. An input whose prompt does not carry its id
     /// records it; for the others their prompt in the conversation shows it.
     pub(crate) fn start_input(&mut self, run: RunId) {

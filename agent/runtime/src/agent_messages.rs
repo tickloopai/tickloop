@@ -749,6 +749,7 @@ impl Agent {
         }
         if !held {
             mailbox.stopped_runs.remove(&target_id);
+            self.persist_family_message_hold(target_id, &mailbox);
         }
         *original = candidate;
         if !is_result {

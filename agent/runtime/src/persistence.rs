@@ -350,6 +350,19 @@ impl ChatRecorder {
         );
     }
 
+    pub(super) fn record_family_message_hold(&self, chat_id: ChatId, stopped_runs: HashSet<RunId>) {
+        self.outbox.enqueue(
+            chat_id,
+            vec![Line::FamilyMessageHold(
+                tickloop_agent_transcript::FamilyMessageHoldEntry {
+                    chat_id,
+                    stopped_runs,
+                },
+            )],
+            None,
+        );
+    }
+
     pub(super) fn record_family_inputs(
         &self,
         chat_id: ChatId,
@@ -3352,6 +3365,15 @@ impl Agent {
             RestoreTarget::Resume => self.inner.waits,
             RestoreTarget::NewChat { .. } => WaitHosting::Process,
         };
+        let stopped_runs = (chat_id == source_chat_id).then(|| {
+            loaded
+                .metadata
+                .family_message_hold
+                .as_ref()
+                .filter(|entry| entry.chat_id == chat_id)
+                .map(|entry| entry.stopped_runs.clone())
+                .unwrap_or_default()
+        });
         let registrations = if chat_id == source_chat_id {
             loaded
                 .metadata
@@ -3471,6 +3493,14 @@ impl Agent {
             .lock()
             .await
             .insert(chat_id, registrations);
+        if let Some(stopped_runs) = stopped_runs {
+            self.inner
+                .family_mailbox
+                .lock()
+                .await
+                .stopped_runs
+                .insert(chat_id, stopped_runs);
+        }
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {

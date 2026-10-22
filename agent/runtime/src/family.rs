@@ -85,15 +85,36 @@ pub(super) fn resume_messages(chat: &mut Chat) {
     for pending in &mut chat.snapshot.pending_inputs {
         if pending.agent_message.is_some() {
             pending.armed = true;
+            chat.bookkeeping
+                .lifecycle
+                .set_queued_armed(pending.receipt.run_id, true);
         }
     }
 }
 
 impl Agent {
+    pub(super) fn persist_family_message_hold(
+        &self,
+        chat_id: ChatId,
+        mailbox: &family_mailbox::FamilyMailbox,
+    ) {
+        if let Some(recorder) = &self.inner.recorder {
+            recorder.record_family_message_hold(
+                chat_id,
+                mailbox
+                    .stopped_runs
+                    .get(&chat_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
     pub(super) async fn resume_family_messages(&self, chat_id: ChatId) {
         let mut mailbox = self.inner.family_mailbox.lock().await;
         let mut chats = self.inner.chats.lock().await;
         mailbox.stopped_runs.remove(&chat_id);
+        self.persist_family_message_hold(chat_id, &mailbox);
         if let Some(chat) = chats.get_mut(&chat_id) {
             resume_messages(chat);
             self.save(&chat.snapshot);
