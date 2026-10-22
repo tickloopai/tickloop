@@ -4197,6 +4197,7 @@ version = "0.2.19"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "fastrand",
  "futures-util",
  "http",
@@ -4217,6 +4218,7 @@ dependencies = [
  "tickloop-agent-artifacts",
  "tickloop-agent-base",
  "tickloop-agent-config",
+ "tickloop-agent-cron",
  "tickloop-agent-model",
  "tickloop-agent-protocol",
  "tickloop-agent-test-support",

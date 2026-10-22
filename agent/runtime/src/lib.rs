@@ -47,6 +47,11 @@ pub mod mcp_tools;
 mod model_request;
 mod persistence;
 mod remote_skills;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "ticket 08 wires scheduled tasks")
+)]
+mod scheduled_tasks;
 pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tick_tools;
