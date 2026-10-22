@@ -357,6 +357,14 @@ impl Agent {
     /// and it is not in Plan mode. `after_run` names it in the ledger: the turn that just ended,
     /// so a repeat after a crash or from another process runs nothing again.
     pub(crate) async fn continue_goal(&self, chat_id: ChatId, after_run: RunId) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .inner
+            .goal_continuations_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let delivery = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
@@ -623,6 +631,18 @@ impl Agent {
                 true,
             ),
         })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Agent {
+    /// Keeps the host from starting goal continuations, for tests that hand them over through
+    /// the wake-up base themselves.
+    #[doc(hidden)]
+    pub fn hold_goal_continuations_for_tests(&self) {
+        self.inner
+            .goal_continuations_held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

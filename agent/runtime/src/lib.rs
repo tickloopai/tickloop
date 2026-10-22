@@ -404,6 +404,9 @@ struct Inner {
     tick_deliveries: std::sync::Mutex<tick_subscriptions::TickDeliveries>,
     /// Wakes the delivery task when the subscription set or a frequency changed.
     tick_wake: Notify,
+    /// Tests that hand goal continuations over themselves keep the host from starting them.
+    #[cfg(any(test, feature = "test-support"))]
+    goal_continuations_held: AtomicBool,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
     /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
@@ -1920,6 +1923,8 @@ impl Agent {
                     tick_subscriptions::TickDeliveries::default(),
                 ),
                 tick_wake: Notify::new(),
+                #[cfg(any(test, feature = "test-support"))]
+                goal_continuations_held: AtomicBool::new(false),
                 session_permissions: Mutex::new(
                     session_permissions::SessionPermissionContext::default(),
                 ),
