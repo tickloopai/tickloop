@@ -475,6 +475,7 @@ impl Agent {
     /// Relinquishes an already transferred Worker. Explicit user stop still uses `shutdown`.
     pub async fn shutdown_for_upgrade(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.chat_leases.close();
         self.inner.shutdown.cancel();
         self.inner.tasks.abort_all();
         self.inner.tasks.close();

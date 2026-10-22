@@ -715,6 +715,12 @@ impl Agent {
         trigger_pauses::wait_if_paused(self.pause_key(), chat_id, point).await;
     }
 
+    /// Holds the thread at `point` if a test asked to, for a point within work that does not
+    /// yield.
+    pub(super) fn pause_point_blocking(&self, chat_id: ChatId, point: trigger_pauses::PausePoint) {
+        trigger_pauses::wait_if_paused_blocking(self.pause_key(), chat_id, point);
+    }
+
     /// Pauses are this Agent's own: another Agent in the same test process holding the same Chat
     /// passes the same points.
     fn pause_key(&self) -> usize {
@@ -736,6 +742,8 @@ pub mod trigger_pauses {
     pub enum PausePoint {
         /// A takeover read the store and has not applied it.
         TakeoverRead,
+        /// A permit is about to check the lease, on the thread that runs it.
+        LeaseChecking,
         /// The receiving switch turned here and is not recorded yet.
         ReceivingChanged,
         /// The receiving switch was recorded, and a pause has not released its holding.
@@ -765,6 +773,21 @@ pub mod trigger_pauses {
             .get_or_insert_with(HashMap::new)
             .insert((agent, chat, point), (entered_sender, release_receiver));
         Pause { entered, release }
+    }
+
+    pub(crate) fn wait_if_paused_blocking(agent: usize, chat: ChatId, point: PausePoint) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|gates| gates.remove(&(agent, chat, point)));
+        if let Some((entered, mut release)) = gate {
+            let _ = entered.send(());
+            // Waiting within the runtime's own thread: polled, as a blocking receive would refuse.
+            while matches!(release.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     pub(crate) async fn wait_if_paused(agent: usize, chat: ChatId, point: PausePoint) {

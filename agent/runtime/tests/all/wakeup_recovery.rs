@@ -909,6 +909,59 @@ async fn a_stop_and_a_continue_leave_the_switch_and_its_record_alike() {
     agent.shutdown().await;
 }
 
+/// A lease check under way as its delivery is dropped and its Agent shuts down takes no lease
+/// the shutdown would not release: another process takes the lease once the Agent is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_check_cut_short_by_a_shutdown_leaves_the_lease_free() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let leaving = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = leaving.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&leaving, chat, "get ready").await;
+    leaving.flush_transcripts().await;
+    let staying_model = ContractModel::new();
+    let staying = Agent::open_embedded(root.clone(), config(), staying_model.clone()).unwrap();
+    staying.resume_chat(chat).await.unwrap();
+    complete_turn(&staying, chat, "resume here").await;
+
+    let checking = leaving.pause_next_for_tests(chat, PausePoint::LeaseChecking);
+    let delivery = tokio::spawn({
+        let leaving = leaving.clone();
+        async move {
+            leaving
+                .deliver_trigger_for_tests(chat, scheduled("cut-short", 1), "cut-short")
+                .await
+        }
+    });
+    tokio::time::timeout(WAIT, checking.entered)
+        .await
+        .expect("the lease check is under way")
+        .unwrap();
+    delivery.abort();
+    let shutdown = tokio::spawn({
+        let leaving = leaving.clone();
+        async move { leaving.shutdown().await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while !shutdown.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the shutdown completes while the check waits");
+    drop(checking.release);
+    let _ = delivery.await;
+
+    staying
+        .deliver_trigger_for_tests(chat, scheduled("after", 1), "taken-over")
+        .await
+        .unwrap();
+    staying_model.wait_seen("taken-over", 1).await;
+    assert_eq!(model.seen("cut-short") + staying_model.seen("cut-short"), 0);
+    staying.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]

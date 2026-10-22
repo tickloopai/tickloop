@@ -4829,6 +4829,7 @@ impl Agent {
 
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.chat_leases.close();
         for chat in self.inner.chats.lock().await.values() {
             self.release_runs_at_shutdown(chat);
         }

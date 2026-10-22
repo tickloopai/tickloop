@@ -126,6 +126,8 @@ enum LeaseCheck {
     HeldElsewhere,
     ForeignHost(String),
     PausedElsewhere(u64),
+    /// The Agent is shutting down or handing over: no lease is taken any more.
+    Closing,
 }
 
 /// 一次送达前的判断结果。
@@ -180,6 +182,9 @@ struct HeldLease {
 #[derive(Default)]
 pub(super) struct ChatLeases {
     held: Mutex<HashMap<ChatId, HeldLease>>,
+    /// Set as the Agent shuts down, under `held`: a check after it takes no lease, so none is
+    /// taken after the leases are released.
+    closing: std::sync::atomic::AtomicBool,
     epochs: std::sync::atomic::AtomicU64,
     boundaries: Mutex<HashMap<ChatId, Arc<tokio::sync::Mutex<()>>>>,
     retry_ids: std::sync::atomic::AtomicU64,
@@ -198,6 +203,9 @@ impl ChatLeases {
         let key = chat_id;
         let (epoch, synced) = {
             let mut held = self.held.lock().unwrap();
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(LeaseCheck::Closing);
+            }
             // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
             if held
                 .get(&key)
@@ -357,6 +365,14 @@ impl ChatLeases {
         drop(released);
         self.cancel_retry(chat_id);
         self.clear_notice(chat_id);
+    }
+
+    /// No lease is taken from now on; taken under `held`, so a check in progress either took
+    /// its lease before, for `release_all` to release, or takes none.
+    pub(super) fn close(&self) {
+        let _held = self.held.lock().unwrap();
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) fn release_all(&self) {
@@ -592,12 +608,18 @@ impl Agent {
                 recoverable: false,
             };
         };
-        let agent = self.clone();
-        let checked =
-            tokio::task::spawn_blocking(move || agent.inner.chat_leases.check(&directory, chat_id))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|checked| checked.map_err(|error| error.to_string()));
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point_blocking(
+            chat_id,
+            super::wakeup::trigger_pauses::PausePoint::LeaseChecking,
+        );
+        // Done here, not on the blocking pool: a few small local files, and nothing of it may
+        // outlive the boundary, as work handed to the pool would once its waiter is dropped.
+        let checked = self
+            .inner
+            .chat_leases
+            .check(&directory, chat_id)
+            .map_err(|error| error.to_string());
         let leases = &self.inner.chat_leases;
         match checked {
             Err(error) => {
@@ -628,6 +650,10 @@ impl Agent {
                     recoverable: true,
                 }
             }
+            Ok(LeaseCheck::Closing) => TriggerPermit::Wait {
+                reason: "this Agent is shutting down".into(),
+                recoverable: false,
+            },
             Ok(LeaseCheck::PausedElsewhere(generation)) => {
                 leases.remember_generation(chat_id, generation);
                 self.pause_receiving_paused_elsewhere(chat_id).await;
@@ -706,18 +732,15 @@ impl Agent {
         change: ReceivingChange,
         _within: TriggerBoundary,
     ) {
+        // Written here, not on the blocking pool, for the same reason as the lease check.
         let recorded = match self.lease_directory(chat_id).await {
-            Some(directory) if self.inner.recorder.is_some() => {
-                tokio::task::spawn_blocking(move || write_receiving(&directory, change))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|written| written.map_err(|error| error.to_string()))
-                    .map(|state| {
-                        self.inner
-                            .chat_leases
-                            .remember_generation(chat_id, state.generation)
-                    })
-            }
+            Some(directory) if self.inner.recorder.is_some() => write_receiving(&directory, change)
+                .map_err(|error| error.to_string())
+                .map(|state| {
+                    self.inner
+                        .chat_leases
+                        .remember_generation(chat_id, state.generation)
+                }),
             Some(_) | None => Ok(()),
         };
         #[cfg(any(test, feature = "test-support"))]
