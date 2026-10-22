@@ -13,18 +13,9 @@ When what you run is a slash command naming a Skill you can invoke yourself, one
 
 ## Fixed interval
 
-1. Convert the interval to a 5-field cron expression in local time. Seconds round up to whole minutes; the shortest interval is one minute.
-
-   | Interval | Cron expression |
-   | --- | --- |
-   | `Nm`, N up to 59 | `*/N * * * *` |
-   | `Nm`, N of 60 or more | `0 */H * * *` with H = N / 60 |
-   | `Nh`, N up to 23 | `0 */N * * *` |
-   | `Nd` | `0 0 */N * *` (midnight local time) |
-
-   When the interval does not divide its unit evenly (`7m` leaves an uneven gap at the top of the hour; `90m` is no whole number of hours), use the nearest interval that does and tell the user which one you picked.
-2. Call CronCreate with `cron` (the expression), `prompt` (the scheduled prompt) and `recurring: true`.
-3. Confirm briefly: what runs, the cadence and next run the CronCreate result reports (the host states the interval it actually uses), the task id, that the task runs a last time 7 days after it was created and is then deleted, and that the user can cancel it sooner by asking you (CronDelete) or with `x` on its row in the Monitor.
+1. "This /loop" gives the interval actually used and its cron expression in local time. Seconds round up to whole minutes, and an interval no cron step repeats evenly (`7m`, `90m`) becomes the nearest one that does; when "This /loop" says the interval was rounded, tell the user which one is used.
+2. Call CronCreate with `cron` (the cron expression from "This /loop", unchanged), `prompt` (the scheduled prompt) and `recurring: true`.
+3. Confirm briefly: what runs, the interval actually used and the next run the CronCreate result reports, the task id, that the task runs a last time 7 days after it was created and is then deleted, and that the user can cancel it sooner by asking you (CronDelete) or with `x` on its row in the Monitor.
 4. Then run it once now; do not wait for the first scheduled run.
 
 A run that comes due while the Loop is busy waits until the current turn ends. Esc does not stop a fixed-interval task.

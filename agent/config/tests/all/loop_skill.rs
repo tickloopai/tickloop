@@ -2,19 +2,20 @@ use std::fs;
 use std::path::Path;
 
 use tickloop_agent_config::loop_skill::{
-    DEFAULT_INSTRUCTIONS_PROMPT, IntervalUnit, LoopFiles, LoopInstructions, LoopInstructionsSource,
-    LoopInterval, LoopRequest, MAINTENANCE_INSTRUCTIONS, MAX_LOOP_FILE_BYTES, parse_loop_arguments,
+    DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopInstructions, LoopInstructionsSource, LoopRequest,
+    MAINTENANCE_INSTRUCTIONS, MAX_LOOP_FILE_BYTES,
 };
 use tickloop_agent_config::skills::{LOOP_SKILL, SkillCaller, SkillError, SkillRegistry};
+use tickloop_agent_cron::{Interval, IntervalError};
 use tickloop_agent_protocol::SkillSource;
 
-fn interval(amount: u32, unit: IntervalUnit) -> LoopInterval {
-    LoopInterval { amount, unit }
+fn minutes(minutes: u32) -> Interval {
+    Interval::from_minutes(minutes).unwrap()
 }
 
-fn fixed(amount: u32, unit: IntervalUnit, prompt: &str) -> LoopRequest {
+fn fixed(interval_minutes: u32, prompt: &str) -> LoopRequest {
     LoopRequest::FixedInterval {
-        interval: interval(amount, unit),
+        interval: minutes(interval_minutes).to_cron(),
         prompt: prompt.into(),
     }
 }
@@ -33,41 +34,24 @@ fn write_loop_file(path: &Path, content: &str) {
 #[test]
 fn an_interval_leads_as_a_bare_token_or_trails_as_an_every_clause() {
     for (arguments, request) in [
-        (
-            "5m /review-pr 1234",
-            fixed(5, IntervalUnit::Minutes, "/review-pr 1234"),
-        ),
-        (
-            "  30s   poll the queue ",
-            fixed(30, IntervalUnit::Seconds, "poll the queue"),
-        ),
-        (
-            "1d write the digest",
-            fixed(1, IntervalUnit::Days, "write the digest"),
-        ),
-        (
-            "check the deploy every 20m",
-            fixed(20, IntervalUnit::Minutes, "check the deploy"),
-        ),
-        (
-            "run tests every 5 minutes",
-            fixed(5, IntervalUnit::Minutes, "run tests"),
-        ),
-        (
-            "check the deploy Every 2 Hours",
-            fixed(2, IntervalUnit::Hours, "check the deploy"),
-        ),
-        (
-            "back up every 1 day",
-            fixed(1, IntervalUnit::Days, "back up"),
-        ),
-        (
-            "2h summarize every 5m",
-            fixed(2, IntervalUnit::Hours, "summarize every 5m"),
-        ),
+        ("5m /review-pr 1234", fixed(5, "/review-pr 1234")),
+        ("  30s   poll the queue ", fixed(1, "poll the queue")),
+        ("check the deploy every 20m", fixed(20, "check the deploy")),
+        ("run tests every 2 hours", fixed(120, "run tests")),
+        ("2h summarize every 5m", fixed(120, "summarize every 5m")),
     ] {
-        assert_eq!(parse_loop_arguments(arguments), request, "{arguments}");
+        assert_eq!(
+            LoopRequest::parse(arguments).unwrap(),
+            request,
+            "{arguments}"
+        );
     }
+    let LoopRequest::FixedInterval { interval, .. } = LoopRequest::parse("7m check").unwrap()
+    else {
+        panic!("7m is a fixed interval");
+    };
+    assert_eq!(interval.requested, minutes(7));
+    assert!(interval.is_rounded());
 }
 
 #[test]
@@ -75,13 +59,13 @@ fn without_an_interval_the_whole_input_is_a_self_paced_prompt() {
     for prompt in [
         "check the deploy",
         "check every PR",
-        "watch every 5 builds",
-        "5 minutes of review",
-        "0m is not an interval",
         "5M is not an interval",
-        "every",
     ] {
-        assert_eq!(parse_loop_arguments(prompt), self_paced(prompt), "{prompt}");
+        assert_eq!(
+            LoopRequest::parse(prompt).unwrap(),
+            self_paced(prompt),
+            "{prompt}"
+        );
     }
 }
 
@@ -90,19 +74,34 @@ fn an_interval_alone_or_nothing_runs_the_loop_instructions() {
     for (arguments, expected) in [
         ("", None),
         ("   ", None),
-        ("15m", Some(interval(15, IntervalUnit::Minutes))),
-        ("every 2 hours", Some(interval(2, IntervalUnit::Hours))),
-        ("every 90s", Some(interval(90, IntervalUnit::Seconds))),
+        ("15m", Some(minutes(15))),
+        ("every 2 hours", Some(minutes(120))),
     ] {
         assert_eq!(
-            parse_loop_arguments(arguments),
-            LoopRequest::DefaultInstructions { interval: expected },
+            LoopRequest::parse(arguments).unwrap(),
+            LoopRequest::DefaultInstructions {
+                interval: expected.map(Interval::to_cron)
+            },
             "{arguments:?}"
         );
     }
-    assert_eq!(interval(90, IntervalUnit::Seconds).seconds(), 90);
-    assert_eq!(interval(2, IntervalUnit::Hours).seconds(), 7200);
-    assert_eq!(interval(2, IntervalUnit::Hours).to_string(), "2h");
+}
+
+#[test]
+fn a_zero_interval_is_refused_instead_of_becoming_the_prompt() {
+    assert!(matches!(
+        LoopRequest::parse("0m check the deploy"),
+        Err(IntervalError::Zero(_))
+    ));
+    let folder = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        SkillRegistry::discover(folder.path(), None).expand(
+            "loop",
+            "0m check the deploy",
+            SkillCaller::User
+        ),
+        Err(SkillError::InvalidLoopInterval(IntervalError::Zero(_)))
+    ));
 }
 
 #[test]
@@ -303,9 +302,13 @@ fn the_expansion_gives_the_form_what_to_run_and_the_scheduled_prompt() {
     let content = expand("check the deploy every 20m");
     assert!(content.starts_with(LOOP_SKILL.split_once("\n---\n").unwrap().1.trim()));
     assert!(content.ends_with(&format!(
-        "{HOST_READING}Input: check the deploy every 20m\nForm: fixed interval, every 20m\nRun now: check the deploy\nScheduled prompt: check the deploy"
+        "{HOST_READING}Input: check the deploy every 20m\nForm: fixed interval\nInterval: every 20m\nCron: */20 * * * *\nRun now: check the deploy\nScheduled prompt: check the deploy"
     )));
     assert!(!content.contains("## Loop instructions"));
+
+    assert!(expand("90m tidy up").contains(
+        "Form: fixed interval\nInterval: every 2h (90m requested; no cron step repeats it evenly, so the nearest one that does is used)\nCron: 0 */2 * * *\nRun now: tidy up"
+    ));
 
     assert!(expand("check the deploy").ends_with(
         "Form: self-paced\nRun now: check the deploy\nScheduled prompt: /loop check the deploy"
@@ -326,7 +329,7 @@ fn the_expansion_gives_the_form_what_to_run_and_the_scheduled_prompt() {
     assert!(content.contains(&format!("data from {}. They say", user_file.display())));
     assert!(content.contains("<loop-instructions>\nCheck the release PR.\n</loop-instructions>"));
     assert!(content.ends_with(&format!(
-        "Form: no prompt, fixed interval, every 15m\nRun now: the loop instructions above\nScheduled prompt: {DEFAULT_INSTRUCTIONS_PROMPT}"
+        "Form: no prompt, fixed interval\nInterval: every 15m\nCron: */15 * * * *\nRun now: the loop instructions above\nScheduled prompt: {DEFAULT_INSTRUCTIONS_PROMPT}"
     )));
 }
 
@@ -371,8 +374,8 @@ fn the_loop_skill_teaches_the_three_forms_with_the_scheduling_tools() {
         "a Skill you can invoke yourself, one listed in the Skill tool's catalog",
         "invoke that Skill with the Skill tool",
         "a slash command naming a Skill only the user can run, is the instruction itself: act on its full text",
-        "Call CronCreate with `cron` (the expression), `prompt` (the scheduled prompt) and `recurring: true`",
-        "the host states the interval it actually uses",
+        "Call CronCreate with `cron` (the cron expression from \"This /loop\", unchanged), `prompt` (the scheduled prompt) and `recurring: true`",
+        "when \"This /loop\" says the interval was rounded, tell the user which one is used",
         "the task id",
         "runs a last time 7 days after it was created and is then deleted",
         "Both a fixed-interval and a self-paced loop run a last time 7 days after they were created and are then deleted",
@@ -380,7 +383,6 @@ fn the_loop_skill_teaches_the_three_forms_with_the_scheduling_tools() {
         "CronDelete",
         "`x` on its row in the Monitor",
         "Then run it once now",
-        "use the nearest interval that does and tell the user which one you picked",
         "`delaySeconds` (60 to 3600)",
         "`reason`",
         "`stop: true` and no other fields",

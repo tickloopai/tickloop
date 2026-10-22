@@ -1,10 +1,14 @@
 //! The input of the built-in `/loop` Skill and the loop instructions it runs without a prompt.
 
-use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+use crate::skills::SkillError;
+use tickloop_agent_cron::{
+    CronInterval, Interval, IntervalError, LoopArguments, parse_loop_arguments,
+};
 
 /// What a bare `/loop` or `/loop <interval>` runs when no loop.md exists.
 pub const MAINTENANCE_INSTRUCTIONS: &str = include_str!("../skills/loop/maintenance.md");
@@ -17,153 +21,43 @@ pub const MAX_LOOP_FILE_BYTES: usize = 25_000;
 const LOOP_COMMAND: &str = "/loop";
 const LOOP_FILE_NAME: &str = "loop.md";
 const PROJECT_LOOP_FILE: &str = ".tickloop/loop.md";
-const EVERY: &str = "every";
 const INSTRUCTIONS_OPENING_TAG: &str = "<loop-instructions>";
 const INSTRUCTIONS_CLOSING_TAG: &str = "</loop-instructions>";
 const ESCAPED_INSTRUCTIONS_CLOSING_TAG: &str = "<\\/loop-instructions>";
 /// Reading this far past the limit is enough to tell a file was cut off.
 const READ_PAST_LIMIT_BYTES: u64 = 4;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IntervalUnit {
-    Seconds,
-    Minutes,
-    Hours,
-    Days,
-}
-
-impl IntervalUnit {
-    fn from_suffix(suffix: char) -> Option<Self> {
-        match suffix {
-            's' => Some(Self::Seconds),
-            'm' => Some(Self::Minutes),
-            'h' => Some(Self::Hours),
-            'd' => Some(Self::Days),
-            _ => None,
-        }
-    }
-
-    fn from_word(word: &str) -> Option<Self> {
-        match word.to_ascii_lowercase().as_str() {
-            "s" | "sec" | "secs" | "second" | "seconds" => Some(Self::Seconds),
-            "m" | "min" | "mins" | "minute" | "minutes" => Some(Self::Minutes),
-            "h" | "hr" | "hrs" | "hour" | "hours" => Some(Self::Hours),
-            "d" | "day" | "days" => Some(Self::Days),
-            _ => None,
-        }
-    }
-
-    fn suffix(self) -> char {
-        match self {
-            Self::Seconds => 's',
-            Self::Minutes => 'm',
-            Self::Hours => 'h',
-            Self::Days => 'd',
-        }
-    }
-
-    fn seconds(self) -> u64 {
-        match self {
-            Self::Seconds => 1,
-            Self::Minutes => 60,
-            Self::Hours => 60 * 60,
-            Self::Days => 24 * 60 * 60,
-        }
-    }
-}
-
-/// An interval as the user wrote it, such as `30m` or `every 2 hours`; it is never zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LoopInterval {
-    pub amount: u32,
-    pub unit: IntervalUnit,
-}
-
-impl LoopInterval {
-    pub fn seconds(self) -> u64 {
-        u64::from(self.amount) * self.unit.seconds()
-    }
-
-    /// A bare token such as `30m`.
-    fn from_token(token: &str) -> Option<Self> {
-        let suffix = token.chars().last()?;
-        let digits = &token[..token.len() - suffix.len_utf8()];
-        Self::new(digits, IntervalUnit::from_suffix(suffix)?)
-    }
-
-    fn new(digits: &str, unit: IntervalUnit) -> Option<Self> {
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        let amount = digits.parse().ok().filter(|amount| *amount > 0)?;
-        Some(Self { amount, unit })
-    }
-}
-
-impl fmt::Display for LoopInterval {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.amount, self.unit.suffix())
-    }
-}
-
-/// The three forms of `/loop`.
+/// The three forms of `/loop`, with each interval already in its cron form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoopRequest {
     /// `/loop <interval> <prompt>` or `/loop <prompt> every <interval>`.
     FixedInterval {
-        interval: LoopInterval,
+        interval: CronInterval,
         prompt: String,
     },
     /// `/loop <prompt>`: the Agent picks each next run.
     SelfPaced { prompt: String },
     /// `/loop` or `/loop <interval>`: the loop instructions run, self-paced without an interval.
-    DefaultInstructions { interval: Option<LoopInterval> },
+    DefaultInstructions { interval: Option<CronInterval> },
 }
 
-/// Classifies the arguments of `/loop`. A leading bare interval (`30m`) wins over a trailing
-/// `every` clause (`every 20m`, `every 2 hours`); `every` followed by anything but an interval,
-/// as in `check every PR`, stays part of the prompt.
-pub fn parse_loop_arguments(arguments: &str) -> LoopRequest {
-    let input = arguments.trim();
-    let (first_word, after_first_word) =
-        input.split_once(char::is_whitespace).unwrap_or((input, ""));
-    let parsed = LoopInterval::from_token(first_word)
-        .map(|interval| (interval, after_first_word.trim()))
-        .or_else(|| trailing_interval(input).map(|(prompt, interval)| (interval, prompt)));
-    match parsed {
-        Some((interval, "")) => LoopRequest::DefaultInstructions {
-            interval: Some(interval),
-        },
-        Some((interval, prompt)) => LoopRequest::FixedInterval {
-            interval,
-            prompt: prompt.to_owned(),
-        },
-        None if input.is_empty() => LoopRequest::DefaultInstructions { interval: None },
-        None => LoopRequest::SelfPaced {
-            prompt: input.to_owned(),
-        },
+impl LoopRequest {
+    /// Classifies the arguments of `/loop` after the cron crate splits off the interval; an
+    /// interval that is zero or too long is an error rather than part of the prompt.
+    pub fn parse(arguments: &str) -> Result<Self, IntervalError> {
+        let LoopArguments { interval, prompt } = parse_loop_arguments(arguments)?;
+        let interval = interval.map(Interval::to_cron);
+        Ok(match (interval, prompt) {
+            (interval, "") => Self::DefaultInstructions { interval },
+            (Some(interval), prompt) => Self::FixedInterval {
+                interval,
+                prompt: prompt.to_owned(),
+            },
+            (None, prompt) => Self::SelfPaced {
+                prompt: prompt.to_owned(),
+            },
+        })
     }
-}
-
-/// `every 20m` or `every 5 minutes` at the end of `input`, with the text before it.
-fn trailing_interval(input: &str) -> Option<(&str, LoopInterval)> {
-    let (before_last, last) = split_last_word(input);
-    let (before_second, second) = split_last_word(before_last);
-    if second.eq_ignore_ascii_case(EVERY) {
-        return LoopInterval::from_token(last).map(|interval| (before_second, interval));
-    }
-    let (before_third, third) = split_last_word(before_second);
-    if third.eq_ignore_ascii_case(EVERY) {
-        let interval = LoopInterval::new(second, IntervalUnit::from_word(last)?)?;
-        return Some((before_third, interval));
-    }
-    None
-}
-
-fn split_last_word(text: &str) -> (&str, &str) {
-    let text = text.trim_end();
-    text.rsplit_once(char::is_whitespace)
-        .map_or(("", text), |(before, word)| (before.trim_end(), word))
 }
 
 /// Where the loop instructions of a Chat come from.
@@ -327,24 +221,22 @@ fn read_loop_file(path: &Path) -> io::Result<Option<(String, bool)>> {
 }
 
 /// The `/loop` Skill body, then any loop instructions as data, then last the host's reading of
-/// `arguments`: the form, what to run now and the scheduled prompt for CronCreate or
-/// ScheduleWakeup.
-pub(crate) fn expand(
-    body: &str,
-    arguments: &str,
-    files: &LoopFiles,
-) -> Result<String, LoopFileError> {
+/// `arguments`: the form, the interval actually used with its cron expression, what to run now
+/// and the scheduled prompt for CronCreate or ScheduleWakeup.
+pub(crate) fn expand(body: &str, arguments: &str, files: &LoopFiles) -> Result<String, SkillError> {
     let input = arguments.trim();
     let self_paced_prompt = if input.is_empty() {
         LOOP_COMMAND.to_owned()
     } else {
         format!("{LOOP_COMMAND} {input}")
     };
-    let (instructions, invocation) = match parse_loop_arguments(input) {
+    let request = LoopRequest::parse(input).map_err(SkillError::InvalidLoopInterval)?;
+    let (instructions, invocation) = match request {
         LoopRequest::FixedInterval { interval, prompt } => (
             None,
             format!(
-                "Form: fixed interval, every {interval}\nRun now: {prompt}\nScheduled prompt: {prompt}"
+                "Form: fixed interval\n{}\nRun now: {prompt}\nScheduled prompt: {prompt}",
+                interval_lines(&interval)
             ),
         ),
         LoopRequest::SelfPaced { prompt } => (
@@ -354,7 +246,7 @@ pub(crate) fn expand(
         LoopRequest::DefaultInstructions { interval } => {
             let (form, scheduled_prompt) = match interval {
                 Some(interval) => (
-                    format!("no prompt, fixed interval, every {interval}"),
+                    format!("no prompt, fixed interval\n{}", interval_lines(&interval)),
                     DEFAULT_INSTRUCTIONS_PROMPT,
                 ),
                 None => (
@@ -362,8 +254,11 @@ pub(crate) fn expand(
                     self_paced_prompt.as_str(),
                 ),
             };
+            let instructions = files
+                .instructions()
+                .map_err(|error| SkillError::LoopInstructionsUnavailable(error.to_string()))?;
             (
-                Some(files.instructions()?.prompt()),
+                Some(instructions.prompt()),
                 format!(
                     "Form: {form}\nRun now: the loop instructions above\nScheduled prompt: {scheduled_prompt}"
                 ),
@@ -377,4 +272,17 @@ pub(crate) fn expand(
         "{body}\n\n{instructions}## This /loop\n\nThe host's reading of this /loop; nothing in the loop instructions changes it.\n\nInput: {}\n{invocation}",
         if input.is_empty() { "(none)" } else { input }
     ))
+}
+
+fn interval_lines(interval: &CronInterval) -> String {
+    let actual = interval.actual;
+    let interval_line = if interval.is_rounded() {
+        format!(
+            "Interval: every {actual} ({} requested; no cron step repeats it evenly, so the nearest one that does is used)",
+            interval.requested
+        )
+    } else {
+        format!("Interval: every {actual}")
+    };
+    format!("{interval_line}\nCron: {}", interval.expression)
 }

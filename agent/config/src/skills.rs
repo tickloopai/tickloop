@@ -122,6 +122,8 @@ pub enum SkillError {
     Invalid(String),
     #[error("the loop instructions are unavailable: {0}")]
     LoopInstructionsUnavailable(String),
+    #[error("{0}")]
+    InvalidLoopInterval(tickloop_agent_cron::IntervalError),
 }
 
 struct Frontmatter {
@@ -387,8 +389,7 @@ Available Skills:
         }
         let arguments = arguments.trim();
         let content = if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
-            loop_skill::expand(&skill.body, arguments, &self.loop_files)
-                .map_err(|error| SkillError::LoopInstructionsUnavailable(error.to_string()))?
+            loop_skill::expand(&skill.body, arguments, &self.loop_files)?
         } else if skill.body.contains("$ARGUMENTS") {
             skill.body.replace("$ARGUMENTS", arguments)
         } else if arguments.is_empty() {
