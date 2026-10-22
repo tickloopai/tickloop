@@ -803,7 +803,8 @@ async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
         let here = here.clone();
         async move { here.stop(chat).await.unwrap() }
     });
-    tokio::time::sleep(SETTLE).await;
+    // The stop waits for the takeover before it records and releases anything.
+    boundary_waiters(&here, chat, 1).await;
     drop(takeover.release);
     stop.await.unwrap();
     setup.continue_elsewhere().await;
@@ -811,15 +812,15 @@ async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
     setup.ran_once().await;
 }
 
-/// Taking queued Trigger input and a pause's release of its holding do not interleave: an old
-/// `/stop` finishing after a Continue, while the input here passed its checks, and a takeover
-/// elsewhere run the waiting input once.
+/// Taking queued Trigger input and a pause's release of its holding do not interleave: a
+/// Continue waits for an old `/stop` to finish, the input taken here after it is not taken over
+/// elsewhere, and the waiting input runs once.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
     let stop_tail = here.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
-    let mut checked = here.pause_next_for_tests(chat, PausePoint::TriggerChecked);
+    let checked = here.pause_next_for_tests(chat, PausePoint::TriggerChecked);
     let stop = tokio::spawn({
         let here = here.clone();
         async move { here.stop(chat).await.unwrap() }
@@ -828,15 +829,21 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
         .await
         .expect("the stop recorded the pause")
         .unwrap();
-    // Continued here while the stop has not released its holding.
+    // Continued here while the stop has not released its holding: the Continue waits for the
+    // stop, and the waiting input with it.
     let continued = tokio::spawn({
         let here = here.clone();
         async move { here.submit(chat, "continue here".into()).await.unwrap() }
     });
-    // Without one boundary, the waiting input passes its checks here now.
-    let _ = tokio::time::timeout(SETTLE, &mut checked.entered).await;
+    boundary_waiters(&here, chat, 1).await;
     drop(stop_tail.release);
     stop.await.unwrap();
+    // The input passed its checks here under a lease taken after the stop released its own;
+    // the other process asks for the lease meanwhile.
+    tokio::time::timeout(WAIT, checked.entered)
+        .await
+        .expect("the waiting input passes its checks here")
+        .unwrap();
     setup.continue_elsewhere().await;
     drop(checked.release);
     continued.await.unwrap();
