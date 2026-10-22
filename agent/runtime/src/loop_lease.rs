@@ -1,7 +1,8 @@
-//! Trigger 的跨进程租约与停止状态，参考 Claude Code `utils/cronTasksLock.ts` 与 `cronScheduler.ts`。
+//! Trigger 的跨进程租约与停止状态，锁文件参考 Claude Code `utils/cronTasksLock.ts`。
 //!
-//! 同一个 Chat 可以在多个进程中恢复，同一个 Loop 的 Trigger 因此可能被多个进程武装。Loop 将来
-//! 承载定时交易，"同一 Loop 同一时刻只由一个进程触发、停止之后不再触发"是安全约束。
+//! 同一个 Chat 可以在多个进程中恢复，同一个 Loop 的 Trigger 因此可能被多个进程武装，Tick 订阅、
+//! 显式事件与 Artifact 反馈可能同时送到几个进程。"同一 Loop 同一时刻只由一个进程触发、停止之后
+//! 不再触发"是安全约束：每次送达前取得租约的进程才把输入交给 Loop。
 //!
 //! **租约**：Trigger 触发前获取 `<Chat 目录>/loops/<loopId>.lock`。锁文件以独占创建（写临时文件
 //! 后硬链接）建立，内容 `{chatId, pid, nonce, startedAt, host}` 只用于诊断；持有权由对该文件的
@@ -20,7 +21,7 @@
 //! rename 原子替换，读改写在 `loops/.state.lock` 的 flock 内完成。结束（含 rewind 移除）、解除
 //! 武装、重新武装都递增 generation；结束不可撤销，之后的写入不覆盖它。持锁进程每次触发前读取：
 //! 已结束，或已解除武装且 generation 新于本进程所知，就同步本地 Loop（停止或解除武装、取消
-//! Trigger 任务、归还租约）且不触发。仅删除锁文件的旧做法会让另一实例接手后继续触发。
+//! 事件派发令牌、归还租约）且不触发。仅删除锁文件的旧做法会让另一实例接手后继续触发。
 //!
 //! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程

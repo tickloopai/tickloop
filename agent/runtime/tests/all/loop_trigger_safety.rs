@@ -592,6 +592,98 @@ async fn a_killed_holder_process_releases_its_lease_to_the_waiting_instance() {
     other.shutdown().await;
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HolderExit {
+    Shutdown,
+    Drop,
+}
+
+/// 在独立的 tokio 运行时中恢复 Chat、重新武装共享 Loop 并送达一次事件，触发后通知 `ready`，收到
+/// `release` 后按 `exit` 退出；`Drop` 时直接释放 Agent 与运行时，模拟实例退出而未调用 shutdown。
+fn spawn_lease_holder(
+    root: PathBuf,
+    chat: ChatId,
+    loop_id: LoopId,
+    exit: HolderExit,
+    ready: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let model = EchoModel::new();
+            let agent = Agent::open_embedded(root, config(), model.clone()).unwrap();
+            agent.resume_chat(chat).await.unwrap();
+            complete_turn(&agent, chat, Some(loop_id), "resume in the holder").await;
+            agent.trigger(chat, loop_id, event_source()).await.unwrap();
+            wait_until("the holder to fire", WAIT_TIMEOUT, || {
+                model.prompts_containing(SHARED_PROMPT) >= 1
+            })
+            .await;
+            ready.send(()).unwrap();
+            release.await.unwrap();
+            match exit {
+                HolderExit::Shutdown => agent.shutdown().await,
+                HolderExit::Drop => drop(agent),
+            }
+        });
+        drop(runtime);
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_waiting_instance_takes_the_lease_once_the_holder_shuts_down_or_drops() {
+    for exit in [HolderExit::Shutdown, HolderExit::Drop] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let (chat, _, shared) = saved_chat_with_shared_loop(&root, directory.path()).await;
+        let (ready_sender, ready) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let holder = spawn_lease_holder(
+            root.clone(),
+            chat,
+            shared.loop_id,
+            exit,
+            ready_sender,
+            release_receiver,
+        );
+        tokio::time::timeout(WAIT_TIMEOUT, ready)
+            .await
+            .expect("holder did not fire")
+            .unwrap();
+
+        let model = EchoModel::new();
+        let other = Agent::open_embedded(root, config(), model.clone()).unwrap();
+        other.resume_chat(chat).await.unwrap();
+        complete_turn(&other, chat, Some(shared.loop_id), "resume in the other").await;
+        assert!(
+            other
+                .trigger(chat, shared.loop_id, event_source())
+                .await
+                .is_err(),
+            "{exit:?}: the holder still holds the lease"
+        );
+        assert_eq!(model.prompts_containing(SHARED_PROMPT), 0, "{exit:?}");
+
+        release.send(()).unwrap();
+        tokio::task::spawn_blocking(move || holder.join().unwrap())
+            .await
+            .unwrap();
+        other
+            .trigger(chat, shared.loop_id, event_source())
+            .await
+            .unwrap();
+        wait_until("the other instance to take over", WAIT_TIMEOUT, || {
+            model.prompts_containing(SHARED_PROMPT) >= 1
+        })
+        .await;
+        other.shutdown().await;
+    }
+}
+
 fn write_lock(root: &Path, chat: ChatId, loop_id: LoopId, content: &[u8]) {
     let path = lock_path(root, chat, loop_id);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

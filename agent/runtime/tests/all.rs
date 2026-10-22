@@ -10,6 +10,8 @@ mod citations;
 mod cloud_composition;
 #[path = "all/durable_deliveries.rs"]
 mod durable_deliveries;
+#[path = "all/durable_event_triggers.rs"]
+mod durable_event_triggers;
 #[path = "all/durable_family.rs"]
 mod durable_family;
 #[path = "all/durable_queue.rs"]

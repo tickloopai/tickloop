@@ -222,7 +222,7 @@ impl Agent {
         self.discard_invalid_tick_inputs(chat);
     }
 
-    /// 停止状态显示另一个进程解除了该 Trigger 的武装：本地同样解除武装、取消 Trigger 任务并
+    /// 停止状态显示另一个进程解除了该 Trigger 的武装：本地同样解除武装、取消事件派发令牌并
     /// 归还租约，不再写停止状态。
     pub(super) async fn disarm_trigger_disarmed_elsewhere(&self, chat_id: ChatId, loop_id: LoopId) {
         let mut chats = self.inner.chats.lock().await;
