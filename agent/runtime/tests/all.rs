@@ -201,6 +201,8 @@ mod unpersisted_state;
 mod user_settings;
 #[path = "all/waiting_runs.rs"]
 mod waiting_runs;
+#[path = "all/wakeup_contract.rs"]
+mod wakeup_contract;
 #[path = "all/web_tools.rs"]
 mod web_tools;
 #[path = "all/workspace_host_context.rs"]
