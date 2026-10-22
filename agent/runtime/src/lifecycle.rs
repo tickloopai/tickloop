@@ -737,6 +737,44 @@ impl Lifecycle {
     }
 
     /// The ledger and answers stored records describe, the latest record of each id winning.
+    /// Takes in the input records another writer of the Chat's store added: inputs this ledger
+    /// does not know, and the newer record of an input it holds queued that the other writer
+    /// already started or settled, whose runs it returns. They keep revision 0: the store holds
+    /// them already, so no recorder writes them again.
+    pub(crate) fn learn_inputs<'a>(
+        &mut self,
+        lines: impl IntoIterator<Item = &'a Line>,
+    ) -> Vec<RunId> {
+        let mut stored: HashMap<InputId, &InputEntry> = HashMap::new();
+        for line in lines {
+            if let Line::Input(entry) = line {
+                stored.insert(entry.input_id, entry);
+            }
+        }
+        let mut ran_elsewhere = Vec::new();
+        for (id, entry) in stored {
+            match self.inputs.get(&id) {
+                None => {}
+                Some(known)
+                    if known.record.state == InputState::Accepted
+                        && entry.state != InputState::Accepted =>
+                {
+                    ran_elsewhere.push(known.record.run_id);
+                    self.open_inputs.remove(&known.record.run_id);
+                }
+                Some(_) => continue,
+            }
+            self.inputs.insert(
+                id,
+                Revised {
+                    record: entry.clone(),
+                    revision: 0,
+                },
+            );
+        }
+        ran_elsewhere
+    }
+
     /// Inputs restore as they were: an input still open stays open for a continuation. A copy
     /// under a new Chat id keeps the answers but not the source Chat's ledger.
     pub(crate) fn restore<'a>(

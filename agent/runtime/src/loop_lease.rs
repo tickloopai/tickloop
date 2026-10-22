@@ -112,7 +112,11 @@ enum LeaseAttempt {
 
 /// 持有租约后读取接收状态得到的结论。
 enum LeaseCheck {
-    Held,
+    /// Held; `acquired` when this check took it, so another process may have delivered to the
+    /// Chat since this one last held it.
+    Held {
+        acquired: bool,
+    },
     HeldElsewhere,
     ForeignHost(String),
     PausedElsewhere(u64),
@@ -141,6 +145,7 @@ impl ChatLeases {
     /// 因为自己的 flock 而误判为被其他进程持有。
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
+        let mut acquired = false;
         {
             let mut held = self.held.lock().unwrap();
             // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
@@ -154,6 +159,7 @@ impl ChatLeases {
                 match try_acquire(directory, chat_id)? {
                     LeaseAttempt::Acquired(lease) => {
                         vacant.insert(lease);
+                        acquired = true;
                     }
                     LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
                     LeaseAttempt::ForeignHost(host) => return Ok(LeaseCheck::ForeignHost(host)),
@@ -165,7 +171,7 @@ impl ChatLeases {
             Some(state) if !state.receiving && state.generation > known => {
                 LeaseCheck::PausedElsewhere(state.generation)
             }
-            Some(_) | None => LeaseCheck::Held,
+            Some(_) | None => LeaseCheck::Held { acquired },
         })
     }
 
@@ -413,7 +419,11 @@ impl Agent {
                 self.pause_receiving_paused_elsewhere(chat_id).await;
                 TriggerPermit::Withdrawn
             }
-            Ok(LeaseCheck::Held) => {
+            Ok(LeaseCheck::Held { acquired }) => {
+                // Whatever another process delivered while it held the lease is in the store.
+                if acquired {
+                    self.catch_up_with_store(chat_id).await;
+                }
                 let is_receiving = self
                     .inner
                     .chats
@@ -570,7 +580,7 @@ mod tests {
         leases.remember_generation(chat_id, resumed.generation);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
         write_receiving(&directory, ReceivingChange::Paused).unwrap();
         assert!(matches!(
@@ -586,7 +596,7 @@ mod tests {
         let chat_id = Uuid::new_v4();
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
         let path = directory.path().join(LEASE_FILE);
         std::fs::remove_file(&path).unwrap();
@@ -598,7 +608,7 @@ mod tests {
         drop(intruder);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
     }
 }

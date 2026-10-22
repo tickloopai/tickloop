@@ -452,6 +452,34 @@ impl Agent {
         }
     }
 
+    /// Takes in what another process delivered to the Chat while it held the lease: the ledger
+    /// records it wrote, so a delivery it already took is replayed rather than run again, and
+    /// queued input here that it already ran is dropped; and the Tick watermarks it advanced.
+    pub(super) async fn catch_up_with_store(&self, chat_id: ChatId) {
+        let Ok(lines) = self.read_stored_lines(chat_id).await else {
+            return;
+        };
+        {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&chat_id) else {
+                return;
+            };
+            let ran_elsewhere = chat.bookkeeping.lifecycle.learn_inputs(&lines);
+            if !ran_elsewhere.is_empty() {
+                chat.snapshot
+                    .pending_inputs
+                    .retain(|pending| !ran_elsewhere.contains(&pending.receipt.run_id));
+                if chat.snapshot.pending_inputs.is_empty()
+                    && chat.snapshot.chat_loop.state == LoopState::Queued
+                {
+                    chat.snapshot.chat_loop.set_state(LoopState::Idle);
+                }
+                self.save(&chat.snapshot);
+            }
+        }
+        self.refresh_tick_watermarks(chat_id).await;
+    }
+
     /// The pause another process recorded: this process pauses too, without recording it again.
     pub(super) async fn pause_receiving_paused_elsewhere(&self, chat_id: ChatId) {
         {

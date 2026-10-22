@@ -69,3 +69,42 @@ async fn an_update_the_lease_kept_out_is_not_marked_delivered() {
     later_model.wait_seen("kept-out-by-the-lease", 1).await;
     later.shutdown().await;
 }
+
+/// A process that takes the lease over learns what the previous holder delivered: the same
+/// update, held while the other process ran it, is replayed from the ledger instead of running
+/// a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_taking_the_lease_over_does_not_run_what_the_holder_ran() {
+    const SECOND: &str = "\"seq\":\"2\"";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let task = Uuid::new_v4();
+    let holder_model = ContractModel::new();
+    let (holder, holder_shell, chat) =
+        subscribed_process(&root, directory.path(), task, holder_model.clone()).await;
+    holder_shell.update(1, "taken-by-the-holder");
+    holder_model.wait_seen("taken-by-the-holder", 1).await;
+
+    let other_model = ContractModel::new();
+    let (other, other_shell) = resumed_process(&root, chat, task, other_model.clone()).await;
+    other_shell.update(2, "given-to-both");
+    wait_for_notice(&other, chat, LoopTriggerNoticeKind::HeldByAnotherProcess).await;
+    holder_shell.update(2, "given-to-both");
+    holder_model.wait_seen(SECOND, 1).await;
+    holder.shutdown().await;
+
+    // The held delivery is retried once the lease is free, and answered by the ledger.
+    tokio::time::timeout(WAIT, async {
+        while other.tick_subscriptions(chat).await.unwrap()[0]
+            .last_delivery_ms
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the other process retries the held update");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(other_model.seen(SECOND), 0, "{:?}", other_model.prompts());
+    other.shutdown().await;
+}

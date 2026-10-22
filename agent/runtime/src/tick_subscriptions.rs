@@ -2204,6 +2204,44 @@ impl Agent {
         .await;
     }
 
+    /// Reads again the watermarks of the Chat's subscriptions, which another process holding
+    /// the Chat's lease may have advanced: an update at or before them is not delivered again.
+    pub(super) async fn refresh_tick_watermarks(&self, chat_id: ChatId) {
+        let stored: Vec<_> = self
+            .tick_deliveries()
+            .subscriptions
+            .iter()
+            .filter(|(_, runtime)| runtime.chat_id == chat_id)
+            .filter_map(|(id, runtime)| Some((*id, runtime.watermarks.clone()?)))
+            .collect();
+        if stored.is_empty() {
+            return;
+        }
+        let read = tokio::task::spawn_blocking(move || {
+            stored
+                .into_iter()
+                .filter_map(|(subscription, directory)| {
+                    read_watermark(&directory, subscription)
+                        .ok()
+                        .flatten()
+                        .map(|mark| (subscription, mark))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let mut deliveries = self.tick_deliveries();
+        for (subscription, mark) in read {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
+                runtime.delivered = Some(mark);
+            }
+        }
+    }
+
     /// Proves the delivered items' watches again with their Tickhost; one that fails is no longer
     /// certain to be the Tick its subscription was admitted for.
     pub(super) async fn revalidate_tick_source(
