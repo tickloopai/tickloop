@@ -557,6 +557,11 @@ pub(crate) struct TurnAdmission {
     pub branch: Option<turn::BranchSwitch>,
 }
 
+/// How long a started Trigger input whose start cannot be recorded waits before it tries again,
+/// doubling with each failure up to the longest.
+const TRIGGER_START_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
+const TRIGGER_START_RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What taking queued Trigger input came to.
 enum TriggerTake {
     /// It started, and its run runs.
@@ -3830,27 +3835,51 @@ impl Agent {
                         .await;
                     chats = self.inner.chats.lock().await;
                 }
-                // Another process taking the lease over after this boundary finds it started.
-                if let Some(chat) = chats.get(&chat_id)
-                    && let Err(error) = self
-                        .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-                        .await
-                {
-                    self.inner.chat_leases.set_notice(
-                        chat_id,
-                        tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
-                        format!(
-                            "the start of a Trigger input could not be recorded durably \
-                             ({error}); another Tickloop process taking this Chat over may \
-                             run it again"
-                        ),
-                    );
-                }
                 drop(chats);
+                // Another process taking the lease over after this boundary finds it started,
+                // so its run is started only once that is recorded.
+                if !self.record_trigger_start(chat_id, &cancel).await {
+                    return Ok(TriggerTake::Waits);
+                }
                 drop(boundary);
                 self.run_task((receipt, request, cancel));
                 Ok(TriggerTake::Started)
             }
+        }
+    }
+
+    /// Records durably the start of the Trigger input whose run `cancel` stops, trying again
+    /// after a delay that doubles while the Transcript cannot be written: the input stays started
+    /// and waits for it. Whether its run may be started: once recorded, or once interrupted,
+    /// when the run only ends without asking the model; not when the Agent shuts down, which
+    /// leaves the input to the next load as accepted and not started.
+    async fn record_trigger_start(&self, chat_id: ChatId, cancel: &CancellationToken) -> bool {
+        let mut delay = TRIGGER_START_RETRY_FIRST;
+        loop {
+            let recorded = match self.inner.chats.lock().await.get(&chat_id) {
+                Some(chat) => {
+                    self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                        .await
+                }
+                None => return false,
+            };
+            let Err(error) = recorded else {
+                return true;
+            };
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                format!(
+                    "a Trigger input waits to start until its start is recorded in the \
+                     Transcript: {error}"
+                ),
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return true,
+                _ = self.inner.shutdown.cancelled() => return false,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);
         }
     }
 

@@ -995,6 +995,117 @@ async fn a_caller_dropped_as_its_input_starts_leaves_it_running_once() {
     agent.shutdown().await;
 }
 
+/// Two processes on faulty stores over one root, holding one Chat, and Trigger input accepted
+/// durably by the first, waiting behind a turn.
+struct FaultyProcesses {
+    _directory: tempfile::TempDir,
+    chat: Uuid,
+    first: Agent,
+    first_store: Arc<FaultyTranscriptStore>,
+    first_model: Arc<ContractModel>,
+    second: Agent,
+    second_model: Arc<ContractModel>,
+}
+
+impl FaultyProcesses {
+    const MARKER: &str = "starts-once-recorded";
+
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let store = |root: &std::path::Path| {
+            Arc::new(FaultyTranscriptStore::new(Arc::new(
+                tickloop_agent_runtime::transcript::JsonlTranscriptStore::open(root.into())
+                    .unwrap(),
+            )))
+        };
+        let (first_store, first_model) = (store(&root), ContractModel::new());
+        let first = process_on(&root, first_store.clone(), first_model.clone());
+        let chat = first.create_chat(directory.path().into()).await.unwrap();
+        complete_turn(&first, chat, "get ready").await;
+        first.flush_transcripts().await;
+        let second_model = ContractModel::new();
+        let second = process_on(&root, store(&root), second_model.clone());
+        second.resume_chat(chat).await.unwrap();
+        complete_turn(&second, chat, "resume elsewhere").await;
+        hold_a_turn(&first, chat, &first_model).await;
+        first
+            .deliver_trigger_for_tests(chat, scheduled("task", 1), Self::MARKER)
+            .await
+            .unwrap();
+        first.flush_transcripts().await;
+        Self {
+            _directory: directory,
+            chat,
+            first,
+            first_store,
+            first_model,
+            second,
+            second_model,
+        }
+    }
+
+    /// The first process starts the input while its store refuses every write: the input waits.
+    async fn start_while_the_store_refuses(&self) {
+        self.first_store.fail_appends();
+        self.first_model.release_held_turn();
+        wait_for_notice(&self.first, self.chat, LoopTriggerNoticeKind::Warning).await;
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            self.first_model.seen(Self::MARKER),
+            0,
+            "it waits for its record"
+        );
+    }
+
+    /// The second process takes the lease over, and the input ran once across both.
+    async fn taken_over_ran_once(self) {
+        self.second
+            .deliver_trigger_for_tests(self.chat, scheduled("after", 1), "taken-over")
+            .await
+            .unwrap();
+        self.second_model.wait_seen("taken-over", 1).await;
+        tokio::time::timeout(WAIT, async {
+            while self.first_model.seen(Self::MARKER) + self.second_model.seen(Self::MARKER) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the input runs");
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            self.first_model.seen(Self::MARKER) + self.second_model.seen(Self::MARKER),
+            1
+        );
+        self.second.shutdown().await;
+    }
+}
+
+/// Trigger input whose start cannot be recorded does not run until it is: once the store takes
+/// writes again it runs, and a process taking the lease over after that does not run it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_input_runs_once_its_start_is_recorded() {
+    let processes = FaultyProcesses::new().await;
+    processes.start_while_the_store_refuses().await;
+    processes.first_store.heal();
+    processes
+        .first_model
+        .wait_seen(FaultyProcesses::MARKER, 1)
+        .await;
+    processes.first.shutdown().await;
+    processes.taken_over_ran_once().await;
+}
+
+/// Trigger input whose start was never recorded, its process gone meanwhile, runs once in the
+/// process that takes the lease over.
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_input_never_recorded_as_started_runs_once_after_a_takeover() {
+    let processes = FaultyProcesses::new().await;
+    processes.start_while_the_store_refuses().await;
+    processes.first.shutdown().await;
+    processes.taken_over_ran_once().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
