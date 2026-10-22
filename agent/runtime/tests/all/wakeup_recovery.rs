@@ -363,9 +363,8 @@ async fn a_takeover_delivers_only_what_a_partly_repeated_batch_adds() {
     wait_for_notice(&other, chat, LoopTriggerNoticeKind::HeldByAnotherProcess).await;
     holder.shutdown().await;
 
-    // Held updates may come without their data, which the stream no longer has; their sequence
-    // names them.
-    other_model.wait_seen("\"seq\":\"4\"", 1).await;
+    // A held update keeps its data while it waits.
+    other_model.wait_seen("second-four", 1).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(
         other_model.seen("\"seq\":\"2\""),

@@ -978,11 +978,16 @@ impl TickDeliveries {
 
     /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
     /// same instance takes their place and merges their updates. While they wait they hold no
-    /// data: as data too large for the content cache, each keeps only what [`left_out`] keeps and
-    /// is read again before delivery.
+    /// data of their own: each keeps only what [`left_out`] keeps and is read again before
+    /// delivery, and its data waits in the content cache, within its budget, for a Tick that
+    /// cannot be read again then.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
         for mut item in items {
+            if !item.needs_refill {
+                self.content
+                    .put_back(item.subscription, item.sequence, item.data.clone());
+            }
             item.data = left_out(&item.kind, &item.data);
             item.needs_refill = true;
             match pending.items.remove(&item.instance) {
@@ -2073,14 +2078,24 @@ impl Agent {
                     Some(port) => port.read_current(chat_id, &item.instance).await,
                     None => Ok(None),
                 };
-                if let Ok(Some(current)) = current
-                    && current.sequence >= item.sequence
-                {
-                    item.updates += current.sequence - item.sequence;
-                    item.sequence = current.sequence;
-                    item.observed_at = current.observed_at;
-                    item.data = current.data;
-                    item.needs_refill = false;
+                let put_back = self
+                    .tick_deliveries()
+                    .content
+                    .take_put_back(item.subscription, item.sequence);
+                match (current, put_back) {
+                    (Ok(Some(current)), _) if current.sequence >= item.sequence => {
+                        item.updates += current.sequence - item.sequence;
+                        item.sequence = current.sequence;
+                        item.observed_at = current.observed_at;
+                        item.data = current.data;
+                        item.needs_refill = false;
+                    }
+                    // A Tick that cannot be read again is delivered with what it gave before.
+                    (_, Some(data)) => {
+                        item.data = data;
+                        item.needs_refill = false;
+                    }
+                    (_, None) => {}
                 }
                 let still_admitted = match &port {
                     Some(port) => port
