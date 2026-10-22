@@ -740,21 +740,26 @@ pub struct InputEntry {
     pub trigger: Option<TriggerRecord>,
 }
 
-/// A Trigger delivery as its ledger records name it: its source and how many source events it
-/// merges.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// A Trigger delivery as its ledger records name it: the identity its ledger id is named by,
+/// which says which subscription, request, Goal or task it came from, and how many source
+/// events it merges.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TriggerRecord {
-    pub source: tickloop_agent_protocol::TriggerKind,
+    pub identity: tickloop_agent_protocol::TriggerIdentity,
     pub merged: u64,
 }
 
 impl TriggerRecord {
     pub fn of(source: &tickloop_agent_protocol::TriggerSource) -> Self {
         Self {
-            source: source.kind(),
+            identity: source.identity(),
             merged: source.merged(),
         }
+    }
+
+    pub fn kind(&self) -> tickloop_agent_protocol::TriggerKind {
+        self.identity.kind()
     }
 }
 

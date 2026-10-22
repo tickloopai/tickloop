@@ -111,10 +111,8 @@ pub(super) fn trigger_ledger(
         | TriggerSource::TickManual { .. }
         | TriggerSource::GoalContinuation { .. }
         | TriggerSource::ScheduledTask { .. } => {
-            // The id is the delivery's whole identity. What another delivery of it may carry
-            // differently, such as the watch it came through, when it was read or how many
-            // updates it merged, is no part of it, so the payload is the id itself.
-            let id = tickloop_agent_transcript::input_ids::trigger(chat_id, source);
+            // The id is named by the delivery's whole identity, so the payload is the id itself.
+            let id = tickloop_agent_transcript::input_ids::trigger(chat_id, &source.identity());
             lifecycle::LedgerInput::new(id, InputOp::Trigger, &id)
         }
     }

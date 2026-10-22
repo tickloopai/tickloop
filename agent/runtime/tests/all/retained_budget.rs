@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 /// The conversation is compacted after this many fires, as a long-running Chat's would be.
 const FIRES_PER_COMPACTION: usize = 100;
-/// What a load may read of the retained Lines, whatever the number of fires.
-const RETAINED_BYTES_LIMIT: usize = 512 * 1024;
+/// What a load may read of the retained Lines, whatever the number of fires. Each retained
+/// request's ledger record names the delivery it came from, about 170 bytes of it.
+const RETAINED_BYTES_LIMIT: usize = 640 * 1024;
 const LOADED_LINES_LIMIT: usize = 2_000;
 const LOAD_TIME_LIMIT: Duration = Duration::from_secs(2);
 

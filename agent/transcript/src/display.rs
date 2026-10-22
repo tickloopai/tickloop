@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
     AgentColor, AgentMessageSource, Authority, Content, ImageContext, InputContext, LocalMessage,
     LoopState, Protocol, Question, Receiving, Role, SharedTask, SubagentRegistration, TaskBoard,
-    TickSubscription, TriggerKind,
+    TickSubscription, TriggerIdentity,
 };
 use uuid::Uuid;
 
@@ -57,9 +57,9 @@ pub enum DisplayKind {
 pub enum PromptOrigin {
     #[default]
     User,
-    /// A Trigger delivery, with how many source events it merges.
+    /// A Trigger delivery: where it came from, and how many source events it merges.
     Trigger {
-        source: TriggerKind,
+        identity: TriggerIdentity,
         authority: Authority,
         merged: u64,
     },
@@ -257,7 +257,7 @@ pub fn task_boards(lines: &[Line], enabled: bool) -> Vec<DisplayTaskBoard> {
 pub struct DisplayTriggerDelivery {
     pub input_id: Uuid,
     pub run_id: Uuid,
-    pub source: TriggerKind,
+    pub identity: TriggerIdentity,
     pub merged: u64,
     pub state: InputState,
     pub timestamp: String,
@@ -270,13 +270,13 @@ pub fn trigger_deliveries(lines: &[Line]) -> Vec<DisplayTriggerDelivery> {
         let Line::Input(entry) = line else {
             return;
         };
-        let Some(trigger) = entry.trigger else {
+        let Some(trigger) = &entry.trigger else {
             return;
         };
         let delivery = DisplayTriggerDelivery {
             input_id: entry.input_id,
             run_id: entry.run_id,
-            source: trigger.source,
+            identity: trigger.identity.clone(),
             merged: trigger.merged,
             state: entry.state.clone(),
             timestamp: entry.timestamp.clone(),
@@ -593,10 +593,10 @@ impl DisplayProjector {
         let input = entry.run_id.and_then(|run| self.inputs.get(&run));
         match input.map(|input| input.op) {
             Some(InputOp::Trigger) => {
-                let trigger = input?.trigger?;
+                let trigger = input?.trigger.as_ref()?;
                 Some(PromptOrigin::Trigger {
-                    source: trigger.source,
-                    authority: trigger.source.authority(),
+                    identity: trigger.identity.clone(),
+                    authority: trigger.kind().authority(),
                     merged: trigger.merged,
                 })
             }

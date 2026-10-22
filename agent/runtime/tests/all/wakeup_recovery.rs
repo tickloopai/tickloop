@@ -173,7 +173,7 @@ async fn a_merged_delivery_is_recorded_durably() {
         .deliver_trigger_for_tests(chat, merged.clone(), "merges")
         .await
         .unwrap();
-    let merged_id = tickloop_agent_transcript::input_ids::trigger(chat, &merged);
+    let merged_id = tickloop_agent_transcript::input_ids::trigger(chat, &merged.identity());
     let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
     tokio::time::timeout(WAIT, async {
         loop {
@@ -236,4 +236,51 @@ async fn a_merged_delivery_answers_with_the_receipt_it_merged_into() {
     tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("merges"), 0, "{:?}", model.prompts());
     agent.shutdown().await;
+}
+
+/// The stored Transcript says which task a scheduled run's prompt came from, by the identity
+/// its ledger id is named by.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_triggered_prompt_shows_the_source_it_came_from() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let source = scheduled("every-5m", 300_000);
+    let receipt = agent
+        .deliver_trigger_for_tests(chat, source.clone(), "scheduled-prompt")
+        .await
+        .unwrap();
+    model.wait_seen("scheduled-prompt", 1).await;
+    agent.shutdown().await;
+
+    let lines: Vec<tickloop_agent_transcript::Line> =
+        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+    let origins: Vec<_> = tickloop_agent_transcript::display::project(&lines)
+        .into_iter()
+        .filter_map(|node| match node.kind {
+            tickloop_agent_transcript::display::DisplayKind::Prompt { origin, .. } => Some(origin),
+            tickloop_agent_transcript::display::DisplayKind::Answer { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        origins,
+        [tickloop_agent_transcript::display::PromptOrigin::Trigger {
+            identity: source.identity(),
+            authority: tickloop_agent_protocol::Authority::Instruction,
+            merged: 1,
+        }]
+    );
+    let delivery = tickloop_agent_transcript::display::trigger_deliveries(&lines);
+    assert_eq!(delivery.len(), 1);
+    assert_eq!(delivery[0].run_id, receipt.run_id);
+    assert_eq!(
+        delivery[0].input_id,
+        tickloop_agent_transcript::input_ids::trigger(chat, &source.identity())
+    );
 }

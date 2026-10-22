@@ -377,7 +377,10 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
         }
         let expected = match op {
             InputOp::Trigger => PromptOrigin::Trigger {
-                source: tickloop_agent_protocol::TriggerKind::ScheduledTask,
+                identity: tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
+                    task_id: "0a1b2c3d".into(),
+                    scheduled_for_ms: 1_000,
+                },
                 authority: tickloop_agent_protocol::Authority::Instruction,
                 merged: 1,
             },
@@ -618,4 +621,14 @@ fn trigger_deliveries_show_each_delivery_as_its_ledger_last_recorded_it() {
             (Uuid::from_u128(5), 1, merged),
         ]
     );
+    assert_eq!(
+        deliveries[1].identity,
+        tickloop_agent_protocol::TriggerIdentity::TickUpdate {
+            updates: vec![tickloop_agent_protocol::SubscriptionSequence {
+                subscription: Uuid::from_u128(1),
+                sequence: 9,
+            }],
+        }
+    );
+    assert_eq!(deliveries[2].identity, scheduled_run().identity());
 }
