@@ -37,6 +37,8 @@ struct HoldingModel {
     held: Notify,
     released: Mutex<VecDeque<()>>,
     release: Notify,
+    /// The position of a request held as one mentioning [`HOLD`] is.
+    held_request: Mutex<Option<usize>>,
 }
 
 impl HoldingModel {
@@ -46,6 +48,7 @@ impl HoldingModel {
             held: Notify::new(),
             released: Mutex::new(VecDeque::new()),
             release: Notify::new(),
+            held_request: Mutex::new(None),
         })
     }
 
@@ -116,7 +119,10 @@ impl ModelClient for HoldingModel {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        if newest_user_text(&request).contains(HOLD) {
+        let position = self.scripted.requests.lock().unwrap().len();
+        if newest_user_text(&request).contains(HOLD)
+            || *self.held_request.lock().unwrap() == Some(position)
+        {
             self.held.notify_one();
             loop {
                 if self.released.lock().unwrap().pop_front().is_some() {
@@ -1134,4 +1140,44 @@ async fn a_goal_edited_in_another_process_is_continued_with_the_new_objective() 
     assert!(!newest_user_text(&continuation).contains(OBJECTIVE));
     first.shutdown().await;
     second.shutdown().await;
+}
+
+#[tokio::test]
+async fn usage_charged_mid_turn_survives_a_crash() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let model = HoldingModel::new(
+        vec![call("g1", "GetGoal", json!({})), text("unreachable")],
+        vec![usage(300)],
+    );
+    // The continuation's second request waits, as a turn waiting on a long tool would.
+    *model.held_request.lock().unwrap() = Some(1);
+    let agent = Agent::open(root.path().into(), config(), model.clone()).unwrap();
+    approve_everything(&agent);
+    agent
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let held = model.held.notified();
+    tokio::pin!(held);
+    held.as_mut().enable();
+    set_goal(&agent, chat, Some(1_000)).await;
+    tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the turn's second request is held");
+    assert_eq!(goal(&agent, chat).await.unwrap().tokens_used, 300);
+    agent.flush_transcripts().await;
+    let image = super::wakeup_support::crash_image(root.path(), folder.path());
+
+    let reopened = Agent::open(image, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+    let goal = reopened.resume_chat(chat).await.unwrap().goal.unwrap();
+    assert_eq!(goal.tokens_used, 300, "the charged usage was kept");
+    reopened.shutdown().await;
+    model.release();
+    agent.shutdown().await;
 }
