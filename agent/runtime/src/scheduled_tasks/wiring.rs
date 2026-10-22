@@ -27,6 +27,10 @@ use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, 
 /// The longest a Worker's timer sleeps before it looks at the clock again, so a machine that
 /// slept or a wall clock that moved does not delay a run for long.
 const TIMER_RECHECK: Duration = Duration::from_secs(60);
+/// What the last run of a recurring or self-paced task tells the Agent.
+const FINAL_RUN_NOTE: &str = "This is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.";
+/// Why a turn a scheduled run started cannot start a self-paced loop.
+const NO_NEW_LOOP_FROM_A_RUN: &str = "No self-paced loop is running, and a turn a scheduled task started cannot start one: the loop ended, by its seven-day limit or by being cancelled. Tell the user; they can start a new /loop.";
 /// How long a Worker's timer waits before it hands a refused run over again.
 const RETRY_DELAY_MS: u64 = 10_000;
 
@@ -159,6 +163,28 @@ fn tool_error(message: String) -> ToolResult {
         is_error: true,
         output_ref: None,
     }
+}
+
+fn has_self_paced(tasks: &ScheduledTasks) -> bool {
+    tasks
+        .tasks()
+        .iter()
+        .any(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+}
+
+/// Whether a scheduled run started the turn `run`: its open ledger input is a scheduled run.
+fn started_by_scheduled_run(chat: &Chat, run: tickloop_agent_protocol::RunId) -> bool {
+    chat.bookkeeping
+        .lifecycle
+        .open_input(run)
+        .and_then(|input| chat.bookkeeping.lifecycle.input(input))
+        .and_then(|input| input.trigger.as_ref())
+        .is_some_and(|trigger| {
+            matches!(
+                trigger.identity,
+                tickloop_agent_protocol::TriggerIdentity::ScheduledTask { .. }
+            )
+        })
 }
 
 /// A due run of a task, prepared for the base: the task before it ran and as it is after.
@@ -386,6 +412,11 @@ impl Agent {
                 Some(task) => Ok((json!({ "deleted": task.id }), vec![task], Vec::new())),
                 None => Err(ScheduledTaskError::NotFound(id).to_string()),
             },
+            ScheduledTaskCall::Wakeup { .. }
+                if !has_self_paced(&tasks) && started_by_scheduled_run(chat, receipt.run_id) =>
+            {
+                Err(NO_NEW_LOOP_FROM_A_RUN.to_owned())
+            }
             ScheduledTaskCall::Wakeup {
                 delay,
                 reason,
@@ -631,12 +662,18 @@ impl Agent {
                             Some(TriggerSource::ScheduledTask { task_id, .. }) if *task_id == before.id
                         )
                     });
+                    let mut input =
+                        run_input(chat, &fired.task, self.inner.config_root.as_deref());
+                    if fired.is_last && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
+                    {
+                        input.push_str(&format!("\n\n{FINAL_RUN_NOTE}"));
+                    }
                     let delivery = TriggerDelivery {
                         source: TriggerSource::ScheduledTask {
                             task_id: before.id.clone(),
                             scheduled_for_ms: fired.scheduled_for_ms,
                         },
-                        input: run_input(chat, &fired.task, self.inner.config_root.as_deref()),
+                        input,
                         ledger: None,
                     };
                     Some((

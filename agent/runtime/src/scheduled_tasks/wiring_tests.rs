@@ -1142,3 +1142,47 @@ async fn a_history_load_withdraws_the_self_paced_loops_waiting_run() {
     );
     next.shutdown().await;
 }
+
+/// The self-paced loop's last wake-up, past its seven days, tells the Agent it is the final
+/// run, and a ScheduleWakeup from that turn cannot start the loop over.
+#[tokio::test]
+async fn the_final_run_cannot_start_the_self_paced_loop_over() {
+    let day = |day: u32, hour: u32, minute: u32| {
+        Utc.with_ymd_and_hms(2026, 10, day, hour, minute, 0)
+            .unwrap()
+    };
+    let model = HoldingModel::new(vec![
+        wakeup("wake", 600, "watch the build"),
+        text("Waiting."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    agent.set_scheduled_now_for_tests(day(23, 10, 0));
+    turn(&agent, chat, "pace yourself").await;
+
+    // A week later the loop still reschedules itself, past its seven days.
+    agent.set_scheduled_now_for_tests(day(30, 9, 30));
+    model
+        .scripted
+        .enqueue(wakeup("late", 3600, "watch the build"));
+    model.scripted.enqueue(text("Still waiting."));
+    turn(&agent, chat, "keep going").await;
+
+    agent.set_scheduled_now_for_tests(day(30, 10, 30));
+    model
+        .scripted
+        .enqueue(wakeup("again", 600, "watch the build"));
+    model.scripted.enqueue(text("The loop ended."));
+    agent
+        .run_due_scheduled_tasks(chat, day(30, 10, 30))
+        .await
+        .unwrap();
+    wait_seen(&model, "final run of this scheduled task", 1).await;
+    wait_idle(&agent, chat).await;
+    let (result, is_error) = tool_result(&agent, chat, "again").await;
+    assert!(is_error, "{result}");
+    assert!(tasks(&agent, chat).await.is_empty());
+    assert_eq!(
+        Agent::next_scheduled_wake(&chat_of(&agent, chat).await),
+        None
+    );
+}
