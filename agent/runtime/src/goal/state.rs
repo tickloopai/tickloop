@@ -3,7 +3,7 @@
 //! continuation conditions are judged here too, so every goal rule lives in one place.
 
 use tickloop_agent_protocol::{
-    GoalBlock, GoalCheck, GoalNotice, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+    GoalAuthor, GoalBlock, GoalCheck, GoalNotice, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
 };
 use uuid::Uuid;
 
@@ -21,6 +21,7 @@ pub(crate) enum GoalEvent {
         token_budget: Option<u64>,
         /// Whether the user confirmed replacing an unfinished goal.
         replace: bool,
+        set_by: GoalAuthor,
     },
     Edit {
         objective: String,
@@ -185,7 +186,8 @@ pub(crate) fn apply(
                 objective,
                 token_budget,
                 replace,
-            } => set(None, id, &objective, token_budget, replace, now_ms),
+                set_by,
+            } => set(None, id, &objective, token_budget, replace, set_by, now_ms),
             GoalEvent::Checked {
                 goal_id,
                 objective_revision,
@@ -231,13 +233,26 @@ pub(crate) fn apply(
             objective,
             token_budget,
             replace,
-        } => return set(Some(current), id, &objective, token_budget, replace, now_ms),
+            set_by,
+        } => {
+            return set(
+                Some(current),
+                id,
+                &objective,
+                token_budget,
+                replace,
+                set_by,
+                now_ms,
+            );
+        }
         GoalEvent::Edit { objective } => {
             if current.status.is_finished() {
                 return Err(inapplicable("edit"));
             }
             next.objective = valid_objective(&objective)?;
             next.objective_revision = next.objective_revision.saturating_add(1);
+            // Only the user edits a goal.
+            next.set_by = GoalAuthor::User;
             next.last_check = None;
             next.quiet_turns = 0;
             // `/goal pause` does not interrupt the current turn, so a paused goal's turn may
@@ -374,6 +389,7 @@ fn set(
     objective: &str,
     token_budget: Option<u64>,
     replace: bool,
+    set_by: GoalAuthor,
     now_ms: u64,
 ) -> Result<GoalTransition, GoalError> {
     let objective = valid_objective(objective)?;
@@ -391,6 +407,7 @@ fn set(
             id,
             objective,
             objective_revision: current.map_or(1, |goal| goal.objective_revision.saturating_add(1)),
+            set_by,
             status: GoalStatus::Active,
             token_budget,
             tokens_used: 0,

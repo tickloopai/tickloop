@@ -1431,3 +1431,94 @@ async fn leaving_plan_mode_continues_a_goal_it_held_back() {
     assert_eq!(model.continuations(), 1);
     agent.shutdown().await;
 }
+
+/// What each Auto review the checker was asked carried as the user's own words.
+fn reviewed_user_inputs(checker: &ScriptedModel) -> Vec<String> {
+    checker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::to_string(&request.messages).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_goal_the_user_set_authorizes_its_work_in_auto_review_and_one_the_agent_set_does_not() {
+    const FROM_USER: &str = "The user set this Chat's goal with /goal";
+    // Set by the user in a new Chat, the goal is the only user input the review can weigh.
+    let external = tempfile::tempdir().unwrap();
+    let model = HoldingModel::new(
+        vec![
+            call(
+                "w1",
+                "Write",
+                json!({"file_path": external.path().join("export.txt"), "content": "done"}),
+            ),
+            blocked("b1"),
+            text("Blocked."),
+        ],
+        Vec::new(),
+    );
+    let checker = Arc::new(ScriptedModel::new(vec![text(
+        &tickloop_agent_test_support::auto_classification(false).to_string(),
+    )]));
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), model.clone());
+    approve_everything(&agent);
+    agent.set_auto_reviewer(checker.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    let reviews = reviewed_user_inputs(&checker);
+    assert_eq!(reviews.len(), 1, "the Write was reviewed");
+    assert!(reviews[0].contains(FROM_USER) && reviews[0].contains(OBJECTIVE));
+    agent.shutdown().await;
+
+    // Set by the Agent, the goal is its account of the user's request, not the user's word.
+    let model = HoldingModel::new(
+        vec![
+            call("c1", "CreateGoal", json!({"objective": OBJECTIVE})),
+            text("Goal set."),
+            call(
+                "w1",
+                "Write",
+                json!({"file_path": external.path().join("agent-export.txt"), "content": "done"}),
+            ),
+            blocked("b1"),
+            text("Blocked."),
+        ],
+        Vec::new(),
+    );
+    let checker = Arc::new(ScriptedModel::new(vec![text(
+        &tickloop_agent_test_support::auto_classification(false).to_string(),
+    )]));
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), model.clone());
+    approve_everything(&agent);
+    agent.set_auto_reviewer(checker.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    agent
+        .submit(chat, "Keep working on the export command.".into())
+        .await
+        .unwrap();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    let reviews = reviewed_user_inputs(&checker);
+    assert_eq!(reviews.len(), 1, "the Write was reviewed");
+    assert!(reviews.iter().all(|review| !review.contains(FROM_USER)));
+    agent.shutdown().await;
+}

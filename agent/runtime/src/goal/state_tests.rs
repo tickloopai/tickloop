@@ -1,4 +1,5 @@
 use super::*;
+use tickloop_agent_protocol::GoalAuthor;
 
 const SET_AT: u64 = 1_000;
 const NOW: u64 = 2_000;
@@ -9,6 +10,7 @@ fn set_event(token_budget: Option<u64>) -> GoalEvent {
         objective: "Ship the export command".into(),
         token_budget,
         replace: false,
+        set_by: GoalAuthor::User,
     }
 }
 
@@ -85,6 +87,7 @@ fn setting_a_goal_starts_it_active_with_fresh_usage() {
             objective: "  Ship the export command  ".into(),
             token_budget: Some(5_000),
             replace: false,
+            set_by: GoalAuthor::User,
         },
         SET_AT,
     )
@@ -96,6 +99,7 @@ fn setting_a_goal_starts_it_active_with_fresh_usage() {
             id,
             objective: "Ship the export command".into(),
             objective_revision: 1,
+            set_by: GoalAuthor::User,
             status: GoalStatus::Active,
             token_budget: Some(5_000),
             tokens_used: 0,
@@ -134,6 +138,7 @@ fn setting_over_an_unfinished_goal_needs_an_explicit_replacement() {
                 objective: "Write the migration guide".into(),
                 token_budget: None,
                 replace: true,
+                set_by: GoalAuthor::User,
             },
         );
         let goal = replaced.goal.unwrap();
@@ -171,6 +176,7 @@ fn objectives_and_budgets_are_validated() {
                     objective: objective.clone(),
                     token_budget: None,
                     replace: false,
+                    set_by: GoalAuthor::User,
                 },
                 NOW,
             ),
@@ -828,6 +834,7 @@ fn a_check_for_a_replaced_or_cleared_goal_is_discarded() {
             objective: "Write the migration guide".into(),
             token_budget: None,
             replace: true,
+            set_by: GoalAuthor::User,
         },
     );
     assert!(replacement.objective_revision > reported.objective_revision);
@@ -919,4 +926,30 @@ fn a_failed_check_blocks_its_goal_and_a_stale_one_is_discarded() {
             objective_revision: goal.objective_revision,
         }]
     );
+}
+
+#[test]
+fn an_edit_makes_the_objective_the_users() {
+    let agent_set = apply(
+        None,
+        GoalEvent::Set {
+            id: Uuid::new_v4(),
+            objective: "Ship the export command".into(),
+            token_budget: None,
+            replace: false,
+            set_by: GoalAuthor::Agent,
+        },
+        SET_AT,
+    )
+    .unwrap()
+    .goal
+    .unwrap();
+    assert_eq!(agent_set.set_by, GoalAuthor::Agent);
+    let edited = next(
+        &agent_set,
+        GoalEvent::Edit {
+            objective: "Ship the import command".into(),
+        },
+    );
+    assert_eq!(edited.set_by, GoalAuthor::User);
 }

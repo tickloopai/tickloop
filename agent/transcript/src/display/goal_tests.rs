@@ -7,6 +7,7 @@ fn snapshot(objective: &str, status: GoalStatus) -> GoalSnapshot {
         id: Uuid::nil(),
         objective: objective.into(),
         objective_revision: 1,
+        set_by: tickloop_agent_protocol::GoalAuthor::User,
         status,
         token_budget: None,
         tokens_used: 0,

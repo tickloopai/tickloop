@@ -9,10 +9,10 @@ use std::time::Duration;
 use tickloop_agent_base::{private_fs::unix_time_milliseconds, timestamp::format_timestamp};
 use tickloop_agent_model::{ModelConfigExt, REQUEST_OVERHEAD_TOKENS};
 use tickloop_agent_protocol::{
-    ChatId, CommandState, Content, EventKind, ExecutionMode, GoalAction, GoalNotice, GoalSnapshot,
-    GoalStatus, GoalVerdict, LoopState, ModelConfig, ModelRequestKind, OperationRecord, Receipt,
-    RequestOutcome, ResponseRejection, Role, RunId, ToolResult, TriggerIdentity, TriggerSource,
-    Usage, UserShellState, local_messages,
+    ChatId, CommandState, Content, EventKind, ExecutionMode, GoalAction, GoalAuthor, GoalNotice,
+    GoalSnapshot, GoalStatus, GoalVerdict, LoopState, ModelConfig, ModelRequestKind,
+    OperationRecord, Receipt, RequestOutcome, ResponseRejection, Role, RunId, ToolResult,
+    TriggerIdentity, TriggerSource, Usage, UserShellState, local_messages,
 };
 use tickloop_agent_transcript::{GoalEntry, GoalEventEntry, Line};
 use tokio_util::sync::CancellationToken;
@@ -458,6 +458,7 @@ impl Agent {
                 objective,
                 token_budget: token_budget.or_else(|| self.default_goal_budget()),
                 replace,
+                set_by: GoalAuthor::User,
             },
             GoalAction::Edit { objective } => GoalEvent::Edit { objective },
             GoalAction::Pause => GoalEvent::Pause,
@@ -692,6 +693,7 @@ impl Agent {
                     objective,
                     token_budget: token_budget.or_else(|| self.default_goal_budget()),
                     replace: false,
+                    set_by: GoalAuthor::Agent,
                 };
                 Ok(match self.update_goal(receipt.chat_id, vec![event], false).await {
                     Ok(()) => tool_result(

@@ -2,7 +2,7 @@
 
 use serde_json::json;
 use tickloop_agent_protocol::{
-    GoalAction, GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+    GoalAction, GoalAuthor, GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
 };
 use uuid::Uuid;
 
@@ -11,6 +11,7 @@ fn goal(status: GoalStatus) -> GoalSnapshot {
         id: Uuid::nil(),
         objective: "Ship the export command".into(),
         objective_revision: 1,
+        set_by: GoalAuthor::User,
         status,
         token_budget: None,
         tokens_used: 1_200,
@@ -32,6 +33,7 @@ fn a_goal_snapshot_round_trips_and_omits_what_it_lacks() {
             "id": Uuid::nil(),
             "objective": "Ship the export command",
             "objective_revision": 1,
+            "set_by": "user",
             "status": {"state": "active"},
             "tokens_used": 1_200,
             "time_used_ms": 30_000,

@@ -4,6 +4,7 @@ use tickloop_agent_protocol::{ExecutionMode, GoalBlock};
 use tickloop_agent_test_support::{ScriptedModel, config, text};
 
 use super::*;
+use tickloop_agent_protocol::GoalAuthor;
 
 const WAIT: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_millis(400);
@@ -37,6 +38,7 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
                 objective: "Ship the export command".into(),
                 token_budget: None,
                 replace: false,
+                set_by: GoalAuthor::User,
             }],
             false,
         )
@@ -85,6 +87,7 @@ fn a_report_of_the_goal_adds_its_remaining_budget() {
         id: Uuid::nil(),
         objective: "Ship it".into(),
         objective_revision: 1,
+        set_by: GoalAuthor::User,
         status: GoalStatus::Active,
         token_budget: Some(1_000),
         tokens_used: 1_200,
@@ -136,6 +139,7 @@ async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor()
                 objective: "Ship the export command".into(),
                 token_budget: None,
                 replace: false,
+                set_by: GoalAuthor::User,
             }],
             false,
         )
