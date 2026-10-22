@@ -124,6 +124,7 @@ impl Agent {
             task_boards: BTreeMap::new(),
             // A Branch starts without the source's scheduled tasks, as without its Goal.
             scheduled_tasks: Vec::new(),
+            scheduled_task_revocations: Vec::new(),
             task_board: None,
             family_inputs: BTreeMap::new(),
             sent_agent_messages: BTreeMap::new(),

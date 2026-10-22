@@ -2135,19 +2135,23 @@ fn recover_transcript(
         .map(|entry| entry.completions.clone())
         .unwrap_or_default();
     if chat_id == source_chat_id {
-        snapshot.scheduled_tasks = loaded
+        let scheduled = loaded
             .metadata
             .scheduled_tasks
             .as_ref()
-            .filter(|entry| entry.chat_id == chat_id)
+            .filter(|entry| entry.chat_id == chat_id);
+        snapshot.scheduled_tasks = scheduled
             .map(|entry| entry.tasks.clone())
+            .unwrap_or_default();
+        snapshot.scheduled_task_revocations = scheduled
+            .map(|entry| entry.revoked.clone())
             .unwrap_or_default();
         // A Worker loading the Chat from its history keeps only the recurring tasks still
         // running and the one-shot tasks still ahead; a durable host's load is how it runs the
         // Chat, so it keeps them all.
         if waits == WaitHosting::Process {
             super::scheduled_tasks::after_history_load(
-                &mut snapshot.scheduled_tasks,
+                &mut snapshot,
                 std::time::SystemTime::now().into(),
             );
         }
@@ -3628,6 +3632,7 @@ impl StagedBranch {
         snapshot.pending_commands = previous.pending_commands.clone();
         // Choosing another stored branch changes the conversation alone, as a rewind does.
         snapshot.scheduled_tasks = previous.scheduled_tasks.clone();
+        snapshot.scheduled_task_revocations = previous.scheduled_task_revocations.clone();
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }

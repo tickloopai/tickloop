@@ -105,3 +105,11 @@ pub enum ScheduledTaskNotice {
     /// was deleted without running.
     ExpiredUnrun { task_id: String },
 }
+
+/// A task the user or the host cancelled: a run of it handed over before, or restored from the
+/// ledger, is not taken. A one-shot or final run deleting its task is no cancellation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledTaskRevocation {
+    pub task_id: String,
+    pub revoked_at_ms: u64,
+}

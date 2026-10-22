@@ -9,9 +9,9 @@ use chrono_tz::Tz as Zone;
 use serde_json::{Value, json};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
-    ChatId, EventKind, OperationRecord, PromptPolicy, Receipt, ScheduledTask,
+    ChatId, ChatSnapshot, EventKind, OperationRecord, PromptPolicy, Receipt, ScheduledTask,
     ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision, ScheduledTaskKind,
-    ScheduledTaskNotice, ToolResult, TriggerSource,
+    ScheduledTaskNotice, ScheduledTaskRevocation, ToolResult, TriggerSource,
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
@@ -222,6 +222,7 @@ impl Agent {
             Line::ScheduledTasks(ScheduledTasksEntry {
                 chat_id: chat.snapshot.id,
                 tasks: chat.snapshot.scheduled_tasks.clone(),
+                revoked: chat.snapshot.scheduled_task_revocations.clone(),
             }),
         );
         self.save(&chat.snapshot);
@@ -247,6 +248,16 @@ impl Agent {
             );
         }
         self.rearm_scheduled_timer();
+    }
+
+    /// Cancels tasks: none of their runs, waiting or handed over later, is taken any more.
+    fn revoke_scheduled(&self, chat: &mut Chat, cancelled: &[ScheduledTask]) {
+        revoke(
+            &mut chat.snapshot.scheduled_task_revocations,
+            cancelled,
+            self.scheduled_now(),
+        );
+        self.withdraw_deleted_task_runs(chat, cancelled);
     }
 
     /// Withdraws the queued run of each deleted task: a task's input waits only while the task
@@ -283,7 +294,7 @@ impl Agent {
         chat.snapshot
             .scheduled_tasks
             .retain(|task| !deleted.iter().any(|gone| gone.id == task.id));
-        self.withdraw_deleted_task_runs(chat, &deleted);
+        self.revoke_scheduled(chat, &deleted);
         self.persist_scheduled_tasks(chat, notices);
     }
 
@@ -335,7 +346,7 @@ impl Agent {
             ));
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let id = tasks.unused_id();
+        let id = unused_id(&chat.snapshot);
         let outcome = match call {
             ScheduledTaskCall::Create {
                 cron,
@@ -415,7 +426,7 @@ impl Agent {
             Err(message) => return Ok(tool_error(message)),
         };
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
-        self.withdraw_deleted_task_runs(chat, &deleted);
+        self.revoke_scheduled(chat, &deleted);
         self.persist_scheduled_tasks(chat, notices);
         Ok(tool_result(value))
     }
@@ -445,7 +456,7 @@ impl Agent {
             ));
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let id = tasks.unused_id();
+        let id = unused_id(&chat.snapshot);
         let task = tasks
             .create_cron(
                 id,
@@ -487,7 +498,7 @@ impl Agent {
             .iter()
             .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
             .cloned();
-        let id = tasks.unused_id();
+        let id = unused_id(&chat.snapshot);
         tasks
             .start_self_paced(
                 id.clone(),
@@ -501,7 +512,7 @@ impl Agent {
             )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
-        self.withdraw_deleted_task_runs(chat, replaced.as_slice());
+        self.revoke_scheduled(chat, replaced.as_slice());
         self.persist_scheduled_tasks(chat, Vec::new());
         Ok(Some(id))
     }
@@ -859,12 +870,57 @@ impl Agent {
     }
 }
 
-/// The task kinds a Chat's loaded history keeps, as an ordinary history load rules: the
-/// self-paced loop, one-shot tasks whose time passed and expired recurring tasks go.
-pub(crate) fn after_history_load(tasks: &mut Vec<ScheduledTask>, now: DateTime<Utc>) {
-    let mut kept = ScheduledTasks::new(std::mem::take(tasks));
-    kept.after_history_load(&now);
-    *tasks = kept.into_tasks();
+/// A fresh task id that neither a task of the Chat nor a cancellation it remembers uses.
+fn unused_id(snapshot: &ChatSnapshot) -> String {
+    loop {
+        let id = tickloop_agent_cron::generate_task_id();
+        let taken = snapshot.scheduled_tasks.iter().any(|task| task.id == id)
+            || snapshot
+                .scheduled_task_revocations
+                .iter()
+                .any(|revocation| revocation.task_id == id);
+        if !taken {
+            return id;
+        }
+    }
+}
+
+/// How long a cancellation is remembered: past a recurring task's seven days and the day a run
+/// may wait, no run of the task can still come.
+const REVOCATION_MEMORY_MS: u64 = 8 * 24 * 60 * 60 * 1000;
+
+/// Records that `cancelled` tasks were cancelled at `now`, and forgets cancellations too old to
+/// matter.
+fn revoke(
+    revocations: &mut Vec<ScheduledTaskRevocation>,
+    cancelled: &[ScheduledTask],
+    now: DateTime<Utc>,
+) {
+    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    revocations.retain(|revocation| {
+        revocation
+            .revoked_at_ms
+            .saturating_add(REVOCATION_MEMORY_MS)
+            > now_ms
+    });
+    revocations.extend(cancelled.iter().map(|task| ScheduledTaskRevocation {
+        task_id: task.id.clone(),
+        revoked_at_ms: now_ms,
+    }));
+}
+
+/// An ordinary history load: the self-paced loop, one-shot tasks whose time passed and expired
+/// recurring tasks go. The self-paced loop is not restored, so a run of it the ledger restores
+/// is cancelled with it; the others' last runs stand.
+pub(crate) fn after_history_load(snapshot: &mut ChatSnapshot, now: DateTime<Utc>) {
+    let mut kept = ScheduledTasks::new(std::mem::take(&mut snapshot.scheduled_tasks));
+    let removed = kept.after_history_load(&now);
+    snapshot.scheduled_tasks = kept.into_tasks();
+    let self_paced: Vec<ScheduledTask> = removed
+        .into_iter()
+        .filter(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+        .collect();
+    revoke(&mut snapshot.scheduled_task_revocations, &self_paced, now);
 }
 
 #[cfg(test)]

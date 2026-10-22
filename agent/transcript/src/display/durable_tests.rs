@@ -650,6 +650,7 @@ fn the_latest_scheduled_tasks_record_wins_through_retained_snapshots() {
         Line::ScheduledTasks(crate::ScheduledTasksEntry {
             chat_id: chat,
             tasks,
+            revoked: Vec::new(),
         })
     };
     assert_eq!(

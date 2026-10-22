@@ -55,6 +55,9 @@ pub struct ChatSnapshot {
     /// them self-paced at most.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled_tasks: Vec<crate::ScheduledTask>,
+    /// The tasks cancelled lately, whose runs handed over or restored are no longer taken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_task_revocations: Vec<crate::ScheduledTaskRevocation>,
     #[serde(skip)]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]

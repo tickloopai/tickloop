@@ -946,6 +946,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         family_completions: Vec::new(),
         task_boards: BTreeMap::new(),
         scheduled_tasks: Vec::new(),
+        scheduled_task_revocations: Vec::new(),
         task_board: None,
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),

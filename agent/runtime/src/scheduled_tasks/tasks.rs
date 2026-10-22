@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz as Zone;
-use tickloop_agent_cron::{Run, Schedule, TaskKind, generate_task_id, next_run};
+use tickloop_agent_cron::{Run, Schedule, TaskKind, next_run};
 use tickloop_agent_protocol::{
     MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
     ScheduledTaskDecision, ScheduledTaskKind,
@@ -123,18 +123,9 @@ impl ScheduledTasks {
         self.tasks
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, id: &str) -> Option<&ScheduledTask> {
         self.tasks.iter().find(|task| task.id == id)
-    }
-
-    /// A fresh id that no task of this Chat uses.
-    pub(crate) fn unused_id(&self) -> String {
-        loop {
-            let id = generate_task_id();
-            if self.get(&id).is_none() {
-                return id;
-            }
-        }
     }
 
     /// A recurring or one-shot task whose cron expression reads times in `zone`.

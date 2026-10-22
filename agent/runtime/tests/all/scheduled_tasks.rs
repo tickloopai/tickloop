@@ -74,7 +74,7 @@ async fn a_storage_failure_keeps_the_task_due_and_the_retry_runs_it_once() {
 
     faults.fail_appends();
     assert!(agent.wake_scheduled_tasks(chat, due_at).await.is_err());
-    assert_eq!(tasks(&agent, chat).await, [task.clone()]);
+    assert_eq!(tasks(&agent, chat).await, std::slice::from_ref(&task));
 
     faults.heal();
     let handed = agent.wake_scheduled_tasks(chat, due_at).await.unwrap();

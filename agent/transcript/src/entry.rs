@@ -602,6 +602,8 @@ impl MonitorMembersEntry {
 pub struct ScheduledTasksEntry {
     pub chat_id: Uuid,
     pub tasks: Vec<tickloop_agent_protocol::ScheduledTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<tickloop_agent_protocol::ScheduledTaskRevocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

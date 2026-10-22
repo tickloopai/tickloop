@@ -211,7 +211,19 @@ impl Agent {
                     Eligibility::Eligible
                 }
             }
-            TriggerSource::ScheduledTask { .. } => Eligibility::Eligible,
+            // A run stands while its task was not cancelled; a one-shot or final run outlives
+            // its task.
+            TriggerSource::ScheduledTask { task_id, .. } => {
+                if snapshot
+                    .scheduled_task_revocations
+                    .iter()
+                    .any(|revocation| revocation.task_id == *task_id)
+                {
+                    Eligibility::Ended(DiscardReason::SourceEnded)
+                } else {
+                    Eligibility::Eligible
+                }
+            }
         };
         match (source_condition, snapshot.chat_loop.receiving) {
             (Eligibility::Ended(reason), _) => Eligibility::Ended(reason),

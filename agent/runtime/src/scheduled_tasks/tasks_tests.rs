@@ -648,21 +648,6 @@ fn next_wake_is_the_earliest_confirmed_fire_time_while_receiving() {
 }
 
 #[test]
-fn unused_ids_are_eight_hex_characters_not_taken_by_the_chat() {
-    let mut tasks = ScheduledTasks::default();
-    let id = tasks.unused_id();
-    assert_eq!(id.len(), 8);
-    create(
-        &mut tasks,
-        &id,
-        recurring("0 * * * *"),
-        USER,
-        local(22, 10, 0, 0),
-    );
-    assert_ne!(tasks.unused_id(), id);
-}
-
-#[test]
 fn deleting_removes_only_the_named_task() {
     let now = local(22, 10, 0, 0);
     let mut tasks = ScheduledTasks::default();

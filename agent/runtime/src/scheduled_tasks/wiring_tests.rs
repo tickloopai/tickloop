@@ -7,7 +7,7 @@ use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, Mod
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Content, EventKind, LoopState, ModelIdentity, PromptPolicy,
     Receiving, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
-    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice,
+    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, TriggerSource,
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, harness::ChosenModels, text};
 use tokio::sync::Notify;
@@ -1055,4 +1055,90 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     wait_idle(&holder, chat).await;
     assert!(tasks(&holder, chat).await.is_empty());
     holder.shutdown().await;
+}
+
+/// A task cancelled after its run was prepared, before the base took it: the run is refused,
+/// and the cancellation is stored with the tasks.
+#[tokio::test]
+async fn a_run_handed_over_after_its_task_was_cancelled_is_refused() {
+    let model = HoldingModel::new(vec![
+        create("create", "*/10 * * * *", "check the build"),
+        text("Scheduled."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "schedule it").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    agent.delete_scheduled_task(chat, &task.id).await.unwrap();
+    let late = agent
+        .deliver_trigger_for_tests(
+            chat,
+            TriggerSource::ScheduledTask {
+                task_id: task.id.clone(),
+                scheduled_for_ms: task.scheduled_for_ms.unwrap(),
+            },
+            "check the build",
+        )
+        .await;
+    assert!(late.is_err(), "{late:?}");
+    assert_eq!(model.seen("check the build"), 0);
+    assert_eq!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .scheduled_task_revocations
+            .iter()
+            .map(|revocation| revocation.task_id.clone())
+            .collect::<Vec<_>>(),
+        [task.id]
+    );
+}
+
+/// The self-paced loop is not restored by a history load: its run that waited when the process
+/// went down is restored from the ledger and then withdrawn, not run, when the Chat continues.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_load_withdraws_the_self_paced_loops_waiting_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = HoldingModel::new(vec![
+        wakeup("wake", 600, "watch the build"),
+        text("Waiting."),
+    ]);
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    turn(&agent, chat, "pace yourself").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    let _held = agent.submit(chat, HOLD.into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 10, 0))
+        .await
+        .unwrap();
+    assert_eq!(agent.snapshot(chat).await.unwrap().pending_inputs.len(), 1);
+    agent.flush_transcripts().await;
+    agent.shutdown().await;
+
+    let next_model = HoldingModel::new(vec![text("Continued."), text("Again.")]);
+    let next = Agent::open_embedded(root, config(), next_model.clone()).unwrap();
+    next.resume_chat(chat).await.unwrap();
+    assert!(tasks(&next, chat).await.is_empty());
+    turn(&next, chat, "carry on").await;
+    wait_idle(&next, chat).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        next_model.seen("watch the build"),
+        0,
+        "{:?}",
+        next_model.prompts()
+    );
+    let snapshot = next.snapshot(chat).await.unwrap();
+    assert!(snapshot.pending_inputs.is_empty());
+    assert!(
+        snapshot
+            .scheduled_task_revocations
+            .iter()
+            .any(|revocation| revocation.task_id == task.id)
+    );
+    next.shutdown().await;
 }
