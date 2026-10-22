@@ -45,10 +45,9 @@ pub fn highlight_path(path: &str, code: &str) -> Option<Arc<Vec<CodeLine>>> {
 
 #[cfg(feature = "code-highlight")]
 mod engine {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, LazyLock, Mutex, PoisonError},
-    };
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+
+    use lru::LruCache;
 
     use syntect::{
         easy::ScopeRangeIterator,
@@ -58,8 +57,9 @@ mod engine {
 
     use super::{CodeLine, CodeToken};
 
-    /// Highlighted blocks kept for reflows, which lay a reply out again for each width.
-    const CACHED_BLOCKS: usize = 64;
+    /// Source bytes of the highlighted blocks kept for reflows, which lay the whole conversation
+    /// out again for each width: enough for a long conversation, so a resize never highlights again.
+    const CACHED_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
     static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
@@ -101,10 +101,32 @@ mod engine {
         .collect()
     });
 
-    /// Highlighted blocks by syntax name and source.
-    type Cache = HashMap<(String, String), Arc<Vec<CodeLine>>>;
+    /// Highlighted blocks by syntax name and source, least recently used first out.
+    struct Cache {
+        blocks: LruCache<(String, String), Arc<Vec<CodeLine>>>,
+        source_bytes: usize,
+    }
 
-    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+    impl Cache {
+        fn insert(&mut self, key: (String, String), lines: Arc<Vec<CodeLine>>) {
+            self.source_bytes += key.1.len();
+            if let Some(((_, replaced), _)) = self.blocks.push(key, lines) {
+                self.source_bytes -= replaced.len();
+            }
+            while self.source_bytes > CACHED_SOURCE_BYTES
+                && let Some(((_, source), _)) = self.blocks.pop_lru()
+            {
+                self.source_bytes -= source.len();
+            }
+        }
+    }
+
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| {
+        Mutex::new(Cache {
+            blocks: LruCache::unbounded(),
+            source_bytes: 0,
+        })
+    });
 
     pub(super) fn highlight_fenced(info: &str, code: &str) -> Option<Arc<Vec<CodeLine>>> {
         let language = info.split_whitespace().next()?;
@@ -128,6 +150,7 @@ mod engine {
         if let Some(lines) = CACHE
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .blocks
             .get(&key)
         {
             return Some(lines.clone());
@@ -153,11 +176,10 @@ mod engine {
             lines.push(line);
         }
         let lines = Arc::new(lines);
-        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= CACHED_BLOCKS {
-            cache.clear();
-        }
-        cache.insert(key, lines.clone());
+        CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, lines.clone());
         Some(lines)
     }
 
@@ -174,6 +196,23 @@ mod engine {
 #[cfg(all(test, feature = "code-highlight"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_conversation_stays_highlighted_across_reflows() {
+        let sources = (0..500)
+            .map(|index| format!("fn cached_{index}() {{}}\n"))
+            .collect::<Vec<_>>();
+        let first = sources
+            .iter()
+            .map(|source| highlight_fenced("rust", source).unwrap())
+            .collect::<Vec<_>>();
+        for (source, highlighted) in sources.iter().zip(&first) {
+            assert!(Arc::ptr_eq(
+                &highlight_fenced("rust", source).unwrap(),
+                highlighted
+            ));
+        }
+    }
 
     fn tokens(lines: &[CodeLine]) -> Vec<(String, Option<CodeToken>)> {
         lines

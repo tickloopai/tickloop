@@ -4304,6 +4304,7 @@ dependencies = [
 name = "tickloop-ui"
 version = "0.2.19"
 dependencies = [
+ "lru",
  "pulldown-cmark",
  "ratatui",
  "syntect",

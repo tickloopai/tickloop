@@ -915,7 +915,7 @@ fn agent_layout_float_return_keeps_input_geometry_and_escape_priorities() {
         let mut state = console.state.lock().unwrap();
         let (lines, row, column) = state.frame();
         let target = state.back_to_bottom_target.as_ref().unwrap();
-        let label = state.back_to_bottom_label().unwrap();
+        let label = state.back_to_bottom_label(state.content_columns()).unwrap();
         let control = &frame[target.row];
         let left = target.columns.start;
         let right = state.width - target.columns.end;

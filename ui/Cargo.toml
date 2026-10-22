@@ -17,7 +17,8 @@ ratatui = "0.30"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"], optional = true }
+lru = { version = "0.18", optional = true }
 
 [features]
 # Colours fenced code in Markdown the way Claude Code's cli-highlight does.
-code-highlight = ["dep:syntect"]
+code-highlight = ["dep:syntect", "dep:lru"]

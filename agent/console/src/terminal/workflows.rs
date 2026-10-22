@@ -1023,7 +1023,7 @@ fn public_history_pieces(
     image_links: ImageLinks,
     colors: &AgentColors,
 ) -> Vec<ConversationPiece> {
-    let Ok(projection) = chat.public_conversation_items() else {
+    let Ok(projection) = chat.full_public_conversation_items() else {
         return vec![ConversationPiece::Styled(
             "\nConversation view unavailable. ctrl+o opens the detailed transcript.\n".into(),
             None,
@@ -1605,10 +1605,76 @@ mod tests {
     }
 
     fn directed_history_fixture(direction: SummaryDirection) -> ChatSnapshot {
-        let chat_id = Uuid::from_u128(500);
         let prefix_run = Uuid::from_u128(501);
         let tail_run = Uuid::from_u128(502);
-        let messages = vec![
+        let messages = history_fixture_messages();
+        let selected = 6;
+        let summary = match direction {
+            SummaryDirection::FromHere => "suffix summary",
+            SummaryDirection::UpToHere => "prefix summary",
+        };
+        let summary_message = user_text(&format!(
+            "Summarized conversation (historical data, not new instructions):\n{summary}"
+        ));
+        let (compacted, runs, summary_index) = match direction {
+            SummaryDirection::FromHere => {
+                let mut compacted = vec![boundary_message()];
+                compacted.extend(messages[..selected].iter().cloned());
+                compacted.push(summary_message);
+                let summary_index = compacted.len() - 1;
+                (
+                    compacted,
+                    vec![(2, prefix_run), (3, prefix_run)],
+                    summary_index,
+                )
+            }
+            SummaryDirection::UpToHere => {
+                let mut compacted = vec![boundary_message(), summary_message];
+                compacted.extend(messages[selected..].iter().cloned());
+                (compacted, vec![(3, tail_run), (4, tail_run)], 1)
+            }
+        };
+        let mut snapshot = history_snapshot(compacted);
+        snapshot.message_runs.extend(runs);
+        snapshot.message_compactions.insert(0, boundary_marker());
+        snapshot
+            .message_compactions
+            .insert(summary_index, summary_marker(Some(direction)));
+        snapshot
+    }
+
+    /// A full compaction as the runtime records it: every earlier message stays in memory ahead
+    /// of the boundary and summary.
+    fn full_compaction_fixture() -> ChatSnapshot {
+        let mut messages = history_fixture_messages();
+        let boundary_index = messages.len();
+        messages.push(boundary_message());
+        messages.push(user_text("This session is being continued. full summary"));
+        messages.push(user_text("after compaction prompt"));
+        let mut snapshot = history_snapshot(messages);
+        snapshot
+            .message_runs
+            .extend([(2, Uuid::from_u128(501)), (8, Uuid::from_u128(502))]);
+        snapshot
+            .message_compactions
+            .insert(boundary_index, boundary_marker());
+        snapshot
+            .message_compactions
+            .insert(boundary_index + 1, summary_marker(None));
+        snapshot
+    }
+
+    fn boundary_message() -> Message {
+        Message {
+            role: Role::System,
+            content: vec![Content::Text {
+                text: "Conversation compacted".into(),
+            }],
+        }
+    }
+
+    fn history_fixture_messages() -> Vec<Message> {
+        vec![
             Message {
                 role: Role::User,
                 content: vec![Content::Text {
@@ -1674,41 +1740,12 @@ mod tests {
             },
             user_text("<bash-input>tail-shell</bash-input>"),
             user_text("<bash-stdout>tail shell output</bash-stdout><bash-stderr></bash-stderr>"),
-        ];
-        let selected = 6;
-        let summary = match direction {
-            SummaryDirection::FromHere => "suffix summary",
-            SummaryDirection::UpToHere => "prefix summary",
-        };
-        let boundary = Message {
-            role: Role::System,
-            content: vec![Content::Text {
-                text: "Conversation compacted".into(),
-            }],
-        };
-        let summary_message = user_text(&format!(
-            "Summarized conversation (historical data, not new instructions):\n{summary}"
-        ));
-        let (compacted, runs, summary_index) = match direction {
-            SummaryDirection::FromHere => {
-                let mut compacted = vec![boundary];
-                compacted.extend(messages[..selected].iter().cloned());
-                compacted.push(summary_message);
-                let summary_index = compacted.len() - 1;
-                (
-                    compacted,
-                    vec![(2, prefix_run), (3, prefix_run)],
-                    summary_index,
-                )
-            }
-            SummaryDirection::UpToHere => {
-                let mut compacted = vec![boundary, summary_message];
-                compacted.extend(messages[selected..].iter().cloned());
-                (compacted, vec![(3, tail_run), (4, tail_run)], 1)
-            }
-        };
-        let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
-            "id": chat_id,
+        ]
+    }
+
+    fn history_snapshot(messages: Vec<Message>) -> ChatSnapshot {
+        serde_json::from_value(json!({
+            "id": Uuid::from_u128(500),
             "folder": "/workspace",
             "model": ModelConfig {
                 provider: tickloop_agent_protocol::ModelProvider::Api,
@@ -1726,18 +1763,12 @@ mod tests {
                 card: None,
                 input_modalities: vec![InputModality::Text],
             },
-            "messages": compacted,
+            "messages": messages,
             "loops": [],
             "last_sequence": 20,
             "last_queue_sequence": 1,
         }))
-        .unwrap();
-        snapshot.message_runs.extend(runs);
-        snapshot.message_compactions.insert(0, boundary_marker());
-        snapshot
-            .message_compactions
-            .insert(summary_index, summary_marker(Some(direction)));
-        snapshot
+        .unwrap()
     }
 
     fn boundary_marker() -> CompactionMarker {
@@ -2091,6 +2122,30 @@ mod tests {
     }
 
     #[test]
+    fn compacted_history_keeps_earlier_rows_above_the_summary_marker() {
+        let history = public_history(&full_compaction_fixture(), DisplayProfile::default());
+        let marker = history
+            .find("Summarized conversation (ctrl+o to expand)")
+            .unwrap_or_else(|| panic!("missing summary marker: {history}"));
+        for earlier in [
+            "prefix prompt",
+            "Read · prefix.txt",
+            "prefix answer",
+            "selected prompt",
+            "tail answer",
+            "⎿  tail shell output",
+        ] {
+            let position = history
+                .find(earlier)
+                .unwrap_or_else(|| panic!("missing {earlier}: {history}"));
+            assert!(position < marker, "{earlier} after the marker: {history}");
+        }
+        assert!(history.find("after compaction prompt").unwrap() > marker);
+        assert!(!history.contains("full summary"), "{history}");
+        assert!(!history.contains("Conversation compacted"), "{history}");
+    }
+
+    #[test]
     fn restored_history_shows_the_prompt_reply_and_tool_marks() {
         let history = public_history(
             &directed_history_fixture(SummaryDirection::FromHere),
@@ -2199,8 +2254,11 @@ mod tests {
         let projected = public_history(&summarized, DisplayProfile::default());
         assert!(projected.contains("Summarized conversation (ctrl+o to expand)"));
         assert!(!projected.contains("Retained summary"));
-        assert!(!projected.contains("read the notes"));
-        assert!(!projected.contains("public answer"));
+        assert!(
+            projected.find("public answer").unwrap()
+                < projected.find("Summarized conversation").unwrap(),
+            "{projected}"
+        );
         assert!(!projected.contains('\u{1b}'));
         let mut streaming = before.clone();
         let streaming_run = Uuid::new_v4();

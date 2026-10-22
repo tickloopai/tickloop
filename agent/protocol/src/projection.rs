@@ -126,8 +126,16 @@ impl ChatSnapshot {
     pub fn active_conversation_projection(
         &self,
     ) -> Result<Vec<ActiveConversationItem>, InvalidConversation> {
+        self.conversation_projection_from(self.active_start())
+    }
+
+    /// 从 `start` 起的对话，压缩摘要单独成项；工具调用配对只校验模型可见的部分。
+    fn conversation_projection_from(
+        &self,
+        start: usize,
+    ) -> Result<Vec<ActiveConversationItem>, InvalidConversation> {
         history_calls_in(self, self.active_start()..self.messages.len())?;
-        Ok((self.active_start()..self.messages.len())
+        Ok((start..self.messages.len())
             .filter(|index| self.messages[*index].role != Role::System)
             .map(
                 |message_index| match self.message_compactions.get(&message_index) {
@@ -204,7 +212,22 @@ impl ChatSnapshot {
     }
 
     pub fn public_conversation_items(&self) -> Result<Vec<BranchPublicItem>, InvalidConversation> {
-        let active = self.active_conversation_projection()?;
+        self.public_items_from(self.active_start())
+    }
+
+    /// 人看到的整段对话：压缩只裁剪模型上下文，边界之前仍在内存中的消息照常显示，每次压缩在
+    /// 原位置留下摘要项。照 Claude Code 全屏模式保留压缩前消息的做法。
+    pub fn full_public_conversation_items(
+        &self,
+    ) -> Result<Vec<BranchPublicItem>, InvalidConversation> {
+        self.public_items_from(0)
+    }
+
+    fn public_items_from(
+        &self,
+        start: usize,
+    ) -> Result<Vec<BranchPublicItem>, InvalidConversation> {
+        let active = self.conversation_projection_from(start)?;
         let Some(origin) = self
             .branch_origin
             .as_ref()

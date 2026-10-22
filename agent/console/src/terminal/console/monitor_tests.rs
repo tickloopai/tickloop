@@ -736,6 +736,38 @@ fn monitor_sits_beside_reflowed_conversation_until_the_conversation_minimum() {
 }
 
 #[test]
+fn back_to_bottom_centres_over_the_conversation_beside_monitor() {
+    // A non-interactive State keeps `open_monitor` from painting the test's stdout.
+    let mut state = State::new(false, 140, 30);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state
+        .monitor
+        .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "A")]);
+    state.scrollback.append(
+        &(0..200)
+            .map(|row| format!("history {row:03}\n"))
+            .collect::<String>(),
+    );
+    let console = tests::console_with_state(state);
+    console.open_monitor().unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.interactive = true;
+    state.key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.monitor_visible() && !state.monitor.overlay);
+    let content_columns = state.content_columns();
+    assert!(content_columns < state.width);
+    let target = state.back_to_bottom_target.as_ref().unwrap();
+    let left = target.columns.start;
+    let right = content_columns - target.columns.end;
+    assert!(
+        left.abs_diff(right) <= 1,
+        "{left} before and {right} after within {content_columns} columns"
+    );
+}
+
+#[test]
 fn below_the_minimum_width_monitor_overlays_a_conversation_that_keeps_the_full_width() {
     let reply = (0..40)
         .map(|index| format!("reply{index:02} "))

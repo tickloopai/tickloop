@@ -8288,10 +8288,13 @@ impl State {
                 && self
                     .scrollback
                     .has_hidden_tail(content_columns, body_rows.saturating_sub(sticky_rows));
-            let label = reading.then(|| self.back_to_bottom_label()).flatten();
+            // Centred over the conversation, not over a Monitor column beside it.
+            let label = reading
+                .then(|| self.back_to_bottom_label(content_columns))
+                .flatten();
             let return_column = label.as_ref().map(|label| {
                 (
-                    self.width.saturating_sub(display_width(label)) / 2,
+                    content_columns.saturating_sub(display_width(label)) / 2,
                     display_width(label),
                 )
             });
@@ -8568,7 +8571,7 @@ impl State {
                     && self.ordinary_input_is_visible()
                     && !self.scrollback.is_at_bottom()
                 {
-                    return_hint = self.back_to_bottom_label().unwrap_or_default();
+                    return_hint = self.back_to_bottom_label(self.width).unwrap_or_default();
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
                     let navigation_hint = if self.visible_prompt_suggestion().is_some()
@@ -11255,7 +11258,7 @@ impl State {
             && !self.completion.is_open()
     }
 
-    fn back_to_bottom_label(&self) -> Option<String> {
+    fn back_to_bottom_label(&self, columns: usize) -> Option<String> {
         let arrow = self.display.glyph(Glyph::ScrollDown);
         [
             format!("{arrow} Back to bottom · esc"),
@@ -11264,7 +11267,7 @@ impl State {
             "esc".into(),
         ]
         .into_iter()
-        .find(|label| display_width(label) <= self.width)
+        .find(|label| display_width(label) <= columns)
     }
 
     fn overview_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
@@ -12656,8 +12659,9 @@ fn read_keys(
         }
         paused.store(false, Ordering::Release);
     }
-    // A drag reports every cell it crosses; frames wait until the queued motion is read, so a
-    // resize or selection re-lays the conversation once per batch instead of once per cell.
+    // A drag reports every cell it crosses and a window resize every size it passes through;
+    // frames wait until the queued events are read, so a Monitor resize, window resize or
+    // selection re-lays the conversation once per batch instead of once per step.
     let mut deferred_frame = false;
     while !stop.load(Ordering::Acquire) {
         let input_was_idle = !event::poll(Duration::ZERO)?;
@@ -12734,12 +12738,13 @@ fn read_keys(
         let submission_released = input_was_idle && state.release_finished_submissions();
         let mut output = io::stdout().lock();
         let mut redraw = true;
-        let dragging = matches!(
+        let in_burst = matches!(
             event,
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
-                ..
-            })
+            Event::Resize(..)
+                | Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    ..
+                })
         );
         let input = match event {
             Event::Key(key) if state.copy_selection_key(key, &mut output) => None,
@@ -12766,7 +12771,7 @@ fn read_keys(
                 None
             }
         };
-        if (redraw || submission_released) && dragging && event::poll(Duration::ZERO)? {
+        if (redraw || submission_released) && in_burst && event::poll(Duration::ZERO)? {
             deferred_frame = true;
         } else if redraw || submission_released || std::mem::take(&mut deferred_frame) {
             deferred_frame = false;
