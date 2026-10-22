@@ -31,7 +31,7 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
         .await
         .unwrap();
     agent
-        .update_goal(
+        .change_goal(
             chat,
             vec![GoalEvent::Set {
                 id: Uuid::new_v4(),
@@ -40,7 +40,6 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
                 replace: false,
                 set_by: GoalAuthor::User,
             }],
-            false,
         )
         .await
         .unwrap();
@@ -63,7 +62,7 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
     let ran = requests();
 
     agent
-        .update_goal(chat, vec![GoalEvent::Resume], false)
+        .change_goal(chat, vec![GoalEvent::Resume])
         .await
         .unwrap();
     agent.continue_goal(chat, ended_turn).await;
@@ -132,7 +131,7 @@ async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor()
         .unwrap();
     original.hold_goal_continuations_for_tests();
     original
-        .update_goal(
+        .change_goal(
             chat,
             vec![GoalEvent::Set {
                 id: Uuid::new_v4(),
@@ -141,7 +140,6 @@ async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor()
                 replace: false,
                 set_by: GoalAuthor::User,
             }],
-            false,
         )
         .await
         .unwrap();
@@ -232,7 +230,7 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
     let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .update_goal(
+        .change_goal(
             chat_id,
             vec![GoalEvent::Set {
                 id: Uuid::new_v4(),
@@ -241,7 +239,6 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
                 replace: false,
                 set_by: GoalAuthor::User,
             }],
-            false,
         )
         .await
         .unwrap();
@@ -259,5 +256,58 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
     assert_eq!(chat.snapshot.goal.as_ref().unwrap().tokens_used, 30_000);
     assert_eq!(chat.goal_recorded_tokens, 5_000);
     drop(chats);
+    agent.shutdown().await;
+}
+
+/// A usage report waits for the Chat's boundary, which the lease is only released within; once
+/// the lease went within it, the usage is no longer this process's to charge.
+#[tokio::test]
+async fn usage_reported_while_the_lease_is_being_released_is_not_charged() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let agent = Agent::open(
+        root.path().into(),
+        config(),
+        Arc::new(ScriptedModel::new(Vec::new())),
+    )
+    .unwrap();
+    agent
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .change_goal(
+            chat,
+            vec![GoalEvent::Set {
+                id: Uuid::new_v4(),
+                objective: "Ship the export command".into(),
+                token_budget: None,
+                replace: false,
+                set_by: GoalAuthor::User,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(agent.inner.chat_leases.holds_synced(chat));
+
+    let within = agent.enter_trigger_boundary(chat).await;
+    let charge = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.charge_goal_tokens(chat, 100).await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while agent.trigger_boundary_waiters_for_tests(chat) == 0 && !charge.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    agent.inner.chat_leases.release(chat);
+    drop(within);
+    charge.await.unwrap();
+
+    let goal = agent.snapshot(chat).await.unwrap().goal.unwrap();
+    assert_eq!(goal.tokens_used, 0);
     agent.shutdown().await;
 }

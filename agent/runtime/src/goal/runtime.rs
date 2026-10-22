@@ -26,6 +26,7 @@ use super::state::{
 use super::tools::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GoalReport, NewGoal, UPDATE_GOAL_TOOL_NAME,
 };
+use crate::loop_lease::TriggerBoundary;
 use crate::model_request::RequestContext;
 use crate::wakeup::TriggerDelivery;
 use crate::{Agent, AgentError, Chat};
@@ -223,20 +224,22 @@ impl Agent {
             .hold_lease_for_source_change(chat_id, &within)
             .await
             .map_err(GoalUpdateError::Elsewhere)?;
-        let changed = self.update_goal(chat_id, events, false).await;
+        let changed = self.update_goal(chat_id, events, false, &within).await;
         if release_after {
             self.inner.chat_leases.release(chat_id);
         }
         changed
     }
 
-    /// Whether this process keeps the Chat's goal accounts: it holds the Chat's lease, or its
-    /// host has no other process to share the Chat with. The usage and time of a turn the user
-    /// ran in another process than the holder are not the goal's.
-    fn keeps_goal_accounts(&self, chat_id: ChatId) -> bool {
+    /// Whether this process keeps the Chat's goal accounts: it holds the Chat's lease and took
+    /// over what its last holder left, or its host has no other process to share the Chat with.
+    /// The usage and time of a turn the user ran in another process than the holder are not the
+    /// goal's. Asked within the Chat's boundary, which the lease is only released within, the
+    /// answer holds for the update made within the same boundary.
+    fn keeps_goal_accounts(&self, chat_id: ChatId, _within: &TriggerBoundary) -> bool {
         self.inner.recorder.is_none()
             || self.inner.waits == crate::WaitHosting::Durable
-            || self.inner.chat_leases.holds(chat_id)
+            || self.inner.chat_leases.holds_synced(chat_id)
     }
 
     /// Applies `events` to the Chat's goal, then carries out what they ask for. The goal first
@@ -249,6 +252,7 @@ impl Agent {
         chat_id: ChatId,
         events: Vec<GoalEvent>,
         turn_ends: bool,
+        _within: &TriggerBoundary,
     ) -> Result<(), GoalUpdateError> {
         let now_ms = unix_time_milliseconds();
         let mut chats = self.inner.chats.lock().await;
@@ -493,12 +497,13 @@ impl Agent {
             }
             root
         };
-        if !self.keeps_goal_accounts(root) {
+        let within = self.enter_trigger_boundary(root).await;
+        if !self.keeps_goal_accounts(root, &within) {
             tracing::info!(chat = %root, tokens, "usage not charged: another process keeps the goal");
             return;
         }
         if let Err(error) = self
-            .update_goal(root, vec![GoalEvent::TokensUsed(tokens)], false)
+            .update_goal(root, vec![GoalEvent::TokensUsed(tokens)], false, &within)
             .await
         {
             tracing::warn!(chat = %root, %error, "could not charge tokens to the goal");
@@ -532,11 +537,12 @@ impl Agent {
 
     /// The goal's part in ending a turn: the time it ran, what it did, and its usage recorded.
     pub(crate) async fn end_goal_turn(&self, chat_id: ChatId, events: Vec<GoalEvent>) {
-        if !self.keeps_goal_accounts(chat_id) {
+        let within = self.enter_trigger_boundary(chat_id).await;
+        if !self.keeps_goal_accounts(chat_id, &within) {
             tracing::info!(chat = %chat_id, "turn not counted: another process keeps the goal");
             return;
         }
-        if let Err(error) = self.update_goal(chat_id, events, true).await {
+        if let Err(error) = self.update_goal(chat_id, events, true, &within).await {
             tracing::warn!(chat = %chat_id, %error, "could not end the goal's turn");
         }
     }
