@@ -66,7 +66,7 @@ _Avoid_：Tick host、tick-host、tick_host
 _Avoid_：事件触发、定时器、钟点规则
 
 **定时任务（Scheduled Task）**：
-照 Claude Code 的 `/loop` 与 cron 工具，让 Loop 按时间重复或在某一时刻执行一条用户授权的指令，是 Trigger 的定时来源；只属于根 Agent，子 Agent 不创建。每个任务有 8 位 id，每个 Chat 至多 50 个。
+照 Claude Code 的 `/loop` 与 cron 工具，让 Loop 按时间重复或在某一时刻执行一条用户授权的指令，是 Trigger 的定时来源；只属于根 Agent，子 Agent 不创建；只在本地宿主提供，由 Worker 计时，云端不提供（另行设计）。每个任务有 8 位 id，每个 Chat 至多 50 个。
 - 固定间隔：`/loop <间隔> <指令>`，间隔写在开头（`30m`）或结尾（`every 2 hours`），单位 `s`、`m`、`h`、`d`；秒向上取整到分钟，不能化成整齐 cron 步长的间隔（如 `7m`、`90m`）取最接近的可用间隔并告诉用户。创建后立即执行一次。
 - 自定节奏：`/loop <指令>` 不写间隔，每个 Chat 至多一个，新的替换旧的。每轮结束时 Agent 用 ScheduleWakeup 定下次唤醒（60 到 3600 秒）或用 `stop` 结束；一轮既不重排也不结束时约 20 分钟后兜底唤醒一次，那一轮仍不重排就结束。
 - 不写指令：`/loop` 或 `/loop <间隔>` 执行 loop.md（项目 `.tickloop/loop.md` 优先，其次配置根的 `loop.md`，超过 25,000 字节截断，每次触发重新读取）或内置的维护指令。指令可以是 Agent 能自行调用的 Skill。
@@ -244,7 +244,7 @@ Tickloop 的托管服务，用户经 Web / App 使用 Chat 与 Work；Artifacts 
 _Avoid_：云服务、server
 
 **Harness**：
-按 Chat 推进一个回合的开源库：运行 Loop、工具与权限审批、Subagent 与模型调用。它只经 Seam（Transcript Store、Execution Environment、Model Endpoint、Credential Source）访问外部，本地与其他宿主只是 Seam 的实现不同。本地 Worker 与无状态宿主都以库的方式在进程内调用它。持有结束时 Harness 报告 Loop 下次需要宿主的时刻（接收中的定时任务最早的触发时刻）；宿主到时唤醒并带上这个时刻，截至这个时刻到期的定时任务都按定时任务的合并规则触发，宿主时钟落后也不会漏掉。本地由 Worker 内部的定时来源承担同一职责。
+按 Chat 推进一个回合的开源库：运行 Loop、工具与权限审批、Subagent 与模型调用。它只经 Seam（Transcript Store、Execution Environment、Model Endpoint、Credential Source）访问外部，本地与其他宿主只是 Seam 的实现不同。本地 Worker 与无状态宿主都以库的方式在进程内调用它。
 _Avoid_：Agent Runtime、engine
 
 **来源编号（Citation Number）**：
