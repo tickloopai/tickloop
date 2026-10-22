@@ -562,6 +562,54 @@ impl Agent {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl Agent {
+    /// Hands a delivery of `source` to the one entry, for tests standing in for a source that
+    /// has no producer of its own yet.
+    #[doc(hidden)]
+    pub async fn deliver_trigger_for_tests(
+        &self,
+        chat_id: ChatId,
+        source: TriggerSource,
+        input: &str,
+    ) -> Result<Receipt, AgentError> {
+        self.deliver_trigger(
+            chat_id,
+            TriggerDelivery {
+                source,
+                input: input.into(),
+                ledger: None,
+            },
+        )
+        .await
+    }
+
+    /// Takes back the queued deliveries `ended` names, as a source that stopped standing behind
+    /// them does.
+    #[doc(hidden)]
+    pub async fn withdraw_trigger_for_tests(
+        &self,
+        chat_id: ChatId,
+        ended: impl Fn(&TriggerSource) -> bool,
+    ) {
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        let withdrawn: Vec<_> = chat
+            .snapshot
+            .pending_inputs
+            .iter()
+            .filter(|pending| pending.trigger_source.as_ref().is_some_and(&ended))
+            .map(|pending| pending.receipt.clone())
+            .collect();
+        for receipt in withdrawn {
+            self.withdraw_trigger_input(chat, &receipt, DiscardReason::SourceEnded);
+        }
+        self.save(&chat.snapshot);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,53 +658,5 @@ mod tests {
             authority: None,
         };
         assert!(same(&manual(1_000), &manual(2_000)));
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Agent {
-    /// Hands a delivery of `source` to the one entry, for tests standing in for a source that
-    /// has no producer of its own yet.
-    #[doc(hidden)]
-    pub async fn deliver_trigger_for_tests(
-        &self,
-        chat_id: ChatId,
-        source: TriggerSource,
-        input: &str,
-    ) -> Result<Receipt, AgentError> {
-        self.deliver_trigger(
-            chat_id,
-            TriggerDelivery {
-                source,
-                input: input.into(),
-                ledger: None,
-            },
-        )
-        .await
-    }
-
-    /// Takes back the queued deliveries `ended` names, as a source that stopped standing behind
-    /// them does.
-    #[doc(hidden)]
-    pub async fn withdraw_trigger_for_tests(
-        &self,
-        chat_id: ChatId,
-        ended: impl Fn(&TriggerSource) -> bool,
-    ) {
-        let mut chats = self.inner.chats.lock().await;
-        let Some(chat) = chats.get_mut(&chat_id) else {
-            return;
-        };
-        let withdrawn: Vec<_> = chat
-            .snapshot
-            .pending_inputs
-            .iter()
-            .filter(|pending| pending.trigger_source.as_ref().is_some_and(&ended))
-            .map(|pending| pending.receipt.clone())
-            .collect();
-        for receipt in withdrawn {
-            self.withdraw_trigger_input(chat, &receipt, DiscardReason::SourceEnded);
-        }
-        self.save(&chat.snapshot);
     }
 }
