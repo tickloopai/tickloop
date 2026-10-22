@@ -4255,6 +4255,8 @@ impl Agent {
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         // Claude Code's `handlePlanModeTransition`: leaving Plan owes the model an exit notice, and
         // returning to Plan before it is sent withdraws it.
+        let leaves_plan =
+            chat.snapshot.policy.mode == ExecutionMode::Plan && mode != ExecutionMode::Plan;
         match (chat.snapshot.policy.mode, mode) {
             (_, ExecutionMode::Plan) => chat.needs_plan_mode_exit_notice = false,
             (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
@@ -4263,6 +4265,11 @@ impl Agent {
         chat.snapshot.policy.mode = mode;
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
+        drop(chats);
+        // Plan mode held the goal's continuation back.
+        if leaves_plan {
+            self.reconsider_goal(chat_id).await;
+        }
         Ok(())
     }
 

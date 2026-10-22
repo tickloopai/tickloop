@@ -625,8 +625,34 @@ impl Agent {
             }
         };
         if let Err(error) = Box::pin(self.deliver_trigger(chat_id, delivery)).await {
+            // The Chat's waiting input is retried with a backoff, and with it its goal.
             tracing::debug!(chat = %chat_id, %error, "the goal continuation waits");
+            self.retry_waiting_trigger_input(chat_id);
         }
+    }
+
+    /// Considers continuing the goal again after what held it back may have ended: Plan mode
+    /// left, a background command ended, a lease came free or a planned upgrade took over. It
+    /// continues after the Loop's last ended turn, so a continuation already handed over for
+    /// that turn runs nothing again. Its future is named, not inferred: continuing may start a
+    /// run whose commands, once they end, consider the goal again.
+    pub(crate) fn reconsider_goal(
+        &self,
+        chat_id: ChatId,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        let agent = self.clone();
+        Box::pin(async move {
+            let after_run = agent
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .and_then(|chat| chat.snapshot.chat_loop.run_id);
+            agent
+                .continue_goal(chat_id, after_run.unwrap_or_else(Uuid::new_v4))
+                .await;
+        })
     }
 
     /// The objective an active goal gives a Tick delivery as background.

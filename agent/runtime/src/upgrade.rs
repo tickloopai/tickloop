@@ -467,6 +467,9 @@ impl Agent {
                 });
             } else if let Some(next) = self.next_run(id).await? {
                 self.run_task(next);
+            } else {
+                // The predecessor may have stopped just before continuing the goal.
+                self.reconsider_goal(id).await;
             }
         }
         self.tick_deliveries().activate_upgrade();

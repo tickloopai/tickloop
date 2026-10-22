@@ -114,3 +114,70 @@ fn only_fresh_input_and_output_are_charged() {
         120
     );
 }
+
+/// A planned upgrade can take its checkpoint between a turn's end and the goal's continuation,
+/// which the paused predecessor then refuses; the successor continues the goal once it takes
+/// over.
+#[tokio::test]
+async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    original
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    original.hold_goal_continuations_for_tests();
+    original
+        .update_goal(
+            chat,
+            vec![GoalEvent::Set {
+                id: Uuid::new_v4(),
+                objective: "Ship the export command".into(),
+                token_budget: None,
+                replace: false,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+    let checkpoint = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(checkpoint) = original.prepare_upgrade().await.unwrap() {
+                break checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    original
+        .inner
+        .goal_continuations_held
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    original.continue_goal(chat, Uuid::new_v4()).await;
+    assert!(
+        original
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty(),
+        "the paused predecessor refused the continuation"
+    );
+
+    let successor_model = Arc::new(ScriptedModel::new(vec![text("Continuing.")]));
+    let successor = Agent::new_embedded(config(), successor_model.clone());
+    successor.restore_upgrade(checkpoint).await.unwrap();
+    successor.activate_upgrade().await.unwrap();
+    original.shutdown_for_upgrade().await;
+    successor.release_upgrade().await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        while successor_model.requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the successor continued the goal");
+    successor.shutdown().await;
+}

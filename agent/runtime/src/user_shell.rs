@@ -608,10 +608,12 @@ impl Agent {
         Ok(())
     }
 
+    /// Starts what waits in the Chat; with nothing waiting, its goal is considered again, as
+    /// what held its continuation back may have ended.
     pub(super) async fn start_next_agent_run(&self, chat_id: ChatId) -> Result<(), AgentError> {
-        let next = self.next_run(chat_id).await?;
-        if let Some(next) = next {
-            self.run_task(next);
+        match self.next_run(chat_id).await? {
+            Some(next) => self.run_task(next),
+            None => self.reconsider_goal(chat_id).await,
         }
         Ok(())
     }

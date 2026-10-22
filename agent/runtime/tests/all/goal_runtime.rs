@@ -1407,3 +1407,27 @@ async fn a_queued_continuation_waits_for_background_work_a_later_turn_started() 
     assert!(notification < continuation);
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn leaving_plan_mode_continues_a_goal_it_held_back() {
+    let model = HoldingModel::new(vec![blocked("b1"), text("Blocked.")], Vec::new());
+    let (_directory, agent, chat) = new_chat(model.clone()).await;
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.continuations(), 0);
+
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    assert_eq!(model.continuations(), 1);
+    agent.shutdown().await;
+}
