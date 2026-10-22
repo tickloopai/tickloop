@@ -259,18 +259,21 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
     agent.shutdown().await;
 }
 
-/// A usage report waits for the Chat's boundary, which the lease is only released within; once
-/// the lease went within it, the usage is no longer this process's to charge.
+/// A usage report waits for the Chat's boundary, where the lease goes; one made after the lease
+/// went, and another process changed the goal, applies to the goal that process left.
 #[tokio::test]
-async fn usage_reported_while_the_lease_is_being_released_is_not_charged() {
+async fn usage_reported_while_another_process_changes_the_goal_charges_the_goal_it_left() {
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
-    let agent = Agent::open(
-        root.path().into(),
-        config(),
-        Arc::new(ScriptedModel::new(Vec::new())),
-    )
-    .unwrap();
+    let open = || {
+        Agent::open(
+            root.path().into(),
+            config(),
+            Arc::new(ScriptedModel::new(Vec::new())),
+        )
+        .unwrap()
+    };
+    let agent = open();
     agent
         .trust_working_directory(folder.path().into())
         .await
@@ -290,6 +293,7 @@ async fn usage_reported_while_the_lease_is_being_released_is_not_charged() {
         .await
         .unwrap();
     assert!(agent.inner.chat_leases.holds_synced(chat));
+    agent.flush_transcripts().await;
 
     let within = agent.enter_trigger_boundary(chat).await;
     let charge = tokio::spawn({
@@ -304,10 +308,16 @@ async fn usage_reported_while_the_lease_is_being_released_is_not_charged() {
     .await
     .unwrap();
     agent.inner.chat_leases.release(chat);
+    let other = open();
+    other.resume_chat(chat).await.unwrap();
+    other
+        .manage_goal(chat, tickloop_agent_protocol::GoalAction::Clear)
+        .await
+        .unwrap();
+    other.shutdown().await;
     drop(within);
     charge.await.unwrap();
 
-    let goal = agent.snapshot(chat).await.unwrap().goal.unwrap();
-    assert_eq!(goal.tokens_used, 0);
+    assert_eq!(agent.snapshot(chat).await.unwrap().goal, None);
     agent.shutdown().await;
 }

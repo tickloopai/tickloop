@@ -1177,6 +1177,79 @@ async fn a_process_that_only_loaded_a_goal_leaves_without_restoring_it() {
 }
 
 #[tokio::test]
+async fn a_goal_change_made_while_stopped_is_written_before_the_lease_goes_back() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    first.stop(chat).await.unwrap();
+    first.manage_goal(chat, GoalAction::Clear).await.unwrap();
+
+    // No flush: the clear reached the store before the lease went back.
+    second
+        .manage_goal(
+            chat,
+            GoalAction::Set {
+                objective: "Write the migration guide".into(),
+                token_budget: None,
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        goal(&second, chat).await.unwrap().objective,
+        "Write the migration guide"
+    );
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_pauses_the_goal_before_the_lease_goes_back() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    first.stop(chat).await.unwrap();
+    let paused = GoalStatus::Paused {
+        by: GoalPause::Stopped,
+    };
+    assert_eq!(goal(&first, chat).await.unwrap().status, paused);
+
+    // The next holder finds the goal the stop paused, and resumes it.
+    second.manage_goal(chat, GoalAction::Resume).await.unwrap();
+    assert_eq!(
+        goal(&second, chat).await.unwrap().status,
+        GoalStatus::Active
+    );
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn esc_where_another_process_holds_the_chat_tells_why_the_goal_was_not_paused() {
+    let first_model = HoldingModel::new(vec![text("ready")], Vec::new());
+    let second_model = HoldingModel::new(Vec::new(), Vec::new());
+    let (_root, _folder, first, second, chat) = two_processes(first_model, second_model).await;
+    second.interrupt(chat).await.unwrap();
+    let notice = second
+        .loop_trigger_notices()
+        .into_iter()
+        .find(|notice| notice.chat_id == chat)
+        .expect("a notice tells why");
+    assert!(
+        notice.message.contains("the goal was not paused")
+            && notice
+                .message
+                .contains("running in another Tickloop process"),
+        "{}",
+        notice.message
+    );
+    assert_eq!(goal(&first, chat).await.unwrap().status, GoalStatus::Active);
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
 async fn usage_charged_mid_turn_survives_a_crash() {
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();

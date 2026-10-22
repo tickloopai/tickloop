@@ -970,8 +970,6 @@ impl Agent {
         let _ = self
             .change_receiving(chat_id, ReceivingChange::Paused)
             .await;
-        self.pause_goal(chat_id, goal::state::GoalEvent::Stopped)
-            .await;
         Ok(operations)
     }
 

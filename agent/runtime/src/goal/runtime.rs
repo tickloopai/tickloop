@@ -26,9 +26,8 @@ use super::state::{
 use super::tools::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GoalReport, NewGoal, UPDATE_GOAL_TOOL_NAME,
 };
-use crate::loop_lease::TriggerBoundary;
 use crate::model_request::RequestContext;
-use crate::wakeup::TriggerDelivery;
+use crate::wakeup::{SourceChange, SourceChangeError, TriggerDelivery};
 use crate::{Agent, AgentError, Chat};
 
 /// The usage a goal may gain before it is recorded again between turn ends: at most this much
@@ -129,15 +128,36 @@ fn turn_summary(chat: &Chat, run: RunId, failure: Option<String>) -> TurnSummary
     }
 }
 
-/// Why a goal change did not happen.
+/// Why a goal change did not happen, or was not recorded.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GoalUpdateError {
     #[error(transparent)]
     Goal(#[from] GoalError),
     #[error("the Chat is no longer loaded")]
     NotLoaded,
+    /// Another process holds the Chat, or this one cannot take it now.
     #[error("{0}")]
     Elsewhere(String),
+    /// Made here, and not recorded: this process keeps the Chat, and its next change writes the
+    /// record again.
+    #[error("the goal changed here but could not be recorded: {0}")]
+    Unrecorded(String),
+}
+
+/// What a goal change refused for the lease another live process holds tells the user.
+const GOAL_HELD_ELSEWHERE: &str = "this Chat is running in another Tickloop process; change its goal there, or once that process leaves it";
+
+impl From<SourceChangeError> for GoalUpdateError {
+    fn from(error: SourceChangeError) -> Self {
+        match error {
+            SourceChangeError::HeldElsewhere => Self::Elsewhere(GOAL_HELD_ELSEWHERE.into()),
+            SourceChangeError::NotLoaded => Self::NotLoaded,
+            SourceChangeError::Unrecorded(error) => Self::Unrecorded(error),
+            error @ (SourceChangeError::ForeignHost(_) | SourceChangeError::Closing) => {
+                Self::Elsewhere(error.to_string())
+            }
+        }
+    }
 }
 
 impl From<GoalUpdateError> for AgentError {
@@ -145,7 +165,9 @@ impl From<GoalUpdateError> for AgentError {
         match error {
             GoalUpdateError::Goal(error) => invalid(error),
             GoalUpdateError::NotLoaded => AgentError::NotFound,
-            GoalUpdateError::Elsewhere(error) => AgentError::Invalid(error),
+            error @ (GoalUpdateError::Elsewhere(_) | GoalUpdateError::Unrecorded(_)) => {
+                AgentError::Invalid(error.to_string())
+            }
         }
     }
 }
@@ -210,53 +232,63 @@ pub(crate) fn background_work_runs(chats: &HashMap<ChatId, Chat>, chat_id: ChatI
 }
 
 impl Agent {
-    /// A change of the goal by the user, the Agent's report or the host: made under the Chat's
-    /// lease within its Trigger boundary, so it applies to the goal the last holder left and no
-    /// other process changes it meanwhile. While another live process holds the Chat, the change
-    /// is refused with why.
+    /// A change of the goal by the user, the Agent's report or the host: made through the wake-up
+    /// base under the Chat's lease within its Trigger boundary, so it applies to the goal the
+    /// last holder left, no other process changes it meanwhile, and its record is written before
+    /// the lease goes back. While another live process holds the Chat, the change is refused
+    /// with why.
     pub(crate) async fn change_goal(
         &self,
         chat_id: ChatId,
         events: Vec<GoalEvent>,
     ) -> Result<(), GoalUpdateError> {
-        let within = self.enter_trigger_boundary(chat_id).await;
-        let release_after = self
-            .hold_lease_for_source_change(chat_id, &within)
-            .await
-            .map_err(GoalUpdateError::Elsewhere)?;
-        let changed = self.update_goal(chat_id, events, false, &within).await;
-        if release_after {
-            self.inner.chat_leases.release(chat_id);
-        }
-        changed
+        self.run_source_change(chat_id, move |change, chat| {
+            change.agent().update_goal(change, chat, events, false)
+        })
+        .await?
     }
 
     /// Whether this process keeps the Chat's goal accounts: it holds the Chat's lease and took
     /// over what its last holder left, or its host has no other process to share the Chat with.
     /// The usage and time of a turn the user ran in another process than the holder are not the
-    /// goal's. Asked within the Chat's boundary, which the lease is only released within, the
-    /// answer holds for the update made within the same boundary.
-    fn keeps_goal_accounts(&self, chat_id: ChatId, _within: &TriggerBoundary) -> bool {
+    /// goal's, and this process does not take the lease for them.
+    fn keeps_goal_accounts(&self, chat_id: ChatId) -> bool {
         self.inner.recorder.is_none()
             || self.inner.waits == crate::WaitHosting::Durable
             || self.inner.chat_leases.holds_synced(chat_id)
     }
 
-    /// Applies `events` to the Chat's goal, then carries out what they ask for. The goal first
-    /// gets the running time since it was last settled, while a turn runs or as `turn_ends`. A
-    /// record it writes reaches the Transcript before the Chat is let go, and only then counts
-    /// its usage as recorded: a failed write leaves it unrecorded, so the next charge writes it
-    /// again.
-    pub(crate) async fn update_goal(
+    /// Accounts for the goal of a turn this process keeps the accounts of, through the wake-up
+    /// base: a lease that went in the meantime is taken again with the goal its holder left.
+    async fn account_goal(&self, chat_id: ChatId, events: Vec<GoalEvent>, turn_ends: bool) {
+        if !self.keeps_goal_accounts(chat_id) {
+            tracing::info!(chat = %chat_id, "not counted: another process keeps the goal");
+            return;
+        }
+        let accounted = self
+            .run_source_change(chat_id, move |change, chat| {
+                change.agent().update_goal(change, chat, events, turn_ends)
+            })
+            .await;
+        if let Err(error) = accounted
+            .map_err(GoalUpdateError::from)
+            .and_then(|result| result)
+        {
+            tracing::warn!(chat = %chat_id, %error, "could not account for the goal");
+        }
+    }
+
+    /// Applies `events` to the Chat's goal, then carries out what they ask for, under the lease
+    /// `change` proves. The goal first gets the running time since it was last settled, while a
+    /// turn runs or as `turn_ends`.
+    pub(crate) fn update_goal(
         &self,
-        chat_id: ChatId,
+        change: &SourceChange,
+        chat: &mut Chat,
         events: Vec<GoalEvent>,
         turn_ends: bool,
-        _within: &TriggerBoundary,
     ) -> Result<(), GoalUpdateError> {
         let now_ms = unix_time_milliseconds();
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(GoalUpdateError::NotLoaded)?;
         let is_running = turn_ends || chat.active.is_some() || !chat.parked.is_empty();
         let started_ms = chat
             .snapshot
@@ -273,36 +305,24 @@ impl Agent {
         settled.extend(events);
         let (goal, effects) = apply_events(chat.snapshot.goal.as_ref(), settled, now_ms)?;
         chat.goal_clock_ms = now_ms;
-        if self.adopt_goal(chat, goal, effects, turn_ends) {
-            let recorded_tokens = chat
-                .snapshot
-                .goal
-                .as_ref()
-                .map_or(0, |goal| goal.tokens_used);
-            match self
-                .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-                .await
-            {
-                Ok(()) => chat.goal_recorded_tokens = recorded_tokens,
-                Err(error) => {
-                    tracing::warn!(chat = %chat_id, %error, "could not write the goal record")
-                }
-            }
-        }
+        self.adopt_goal(chat, goal, effects, turn_ends, &|line| {
+            change.record_source_state(line)
+        });
         Ok(())
     }
 
     /// Takes on a change of the goal, then its effects and its record. A record is written when
     /// anything but the running usage changed, when a turn ends with an unfinished goal, and
     /// once the usage grew by [`USAGE_RECORD_TOKENS`] since the last record, which bounds what a
-    /// crash leaves uncounted. `true` when it queued a record.
+    /// crash leaves uncounted. `record` writes the goal's record as the source's state.
     fn adopt_goal(
         &self,
         chat: &mut Chat,
         goal: Option<GoalSnapshot>,
         effects: Vec<GoalEffect>,
         turn_ends: bool,
-    ) -> bool {
+        record: &dyn Fn(Line),
+    ) {
         let previous = std::mem::replace(&mut chat.snapshot.goal, goal);
         let mut notices = Vec::new();
         for effect in effects {
@@ -337,31 +357,31 @@ impl Agent {
             || (turn_ends && is_unfinished)
             || unrecorded_tokens >= USAGE_RECORD_TOKENS;
         if !is_recorded && notices.is_empty() {
-            return false;
+            return;
         }
         let subject = goal.or(previous.as_ref());
         let subject = subject.map(|goal| (goal.id, goal.objective.clone()));
-        self.record_goal(chat, subject, notices);
-        true
+        self.record_goal(chat, subject, notices, record);
     }
 
-    /// Queues the goal as it is now for the Transcript, one line for each notice, and tells every
-    /// View.
+    /// Queues the goal as it is now for the Transcript through `record`, one line for each
+    /// notice, and tells every View. Its usage counts as recorded from now on: the base writes
+    /// the record before it lets the Chat go, and one it could not write stays queued for the
+    /// next change of the Chat to write.
     fn record_goal(
         &self,
         chat: &mut Chat,
         subject: Option<(Uuid, String)>,
         notices: Vec<GoalNotice>,
+        record: &dyn Fn(Line),
     ) {
         let chat_id = chat.snapshot.id;
-        self.record_chat_metadata(
-            chat_id,
-            Line::Goal(GoalEntry {
-                chat_id,
-                cwd: chat.snapshot.folder.clone(),
-                goal: chat.snapshot.goal.clone(),
-            }),
-        );
+        chat.goal_recorded_tokens = chat
+            .snapshot
+            .goal
+            .as_ref()
+            .map_or(0, |goal| goal.tokens_used);
+        record(goal_line(chat));
         if let Some((goal_id, objective)) = &subject {
             for notice in &notices {
                 self.record_chat_metadata(
@@ -462,7 +482,7 @@ impl Agent {
             .and_then(|settings| settings.goal_token_budget())
     }
 
-    /// Applies an event that pauses an active goal: Esc, `/stop` or a history load.
+    /// Applies Esc's pause of an active goal; a failure is told with the Chat's Trigger notice.
     pub(crate) async fn pause_goal(&self, chat_id: ChatId, event: GoalEvent) {
         let has_goal = self
             .inner
@@ -473,6 +493,11 @@ impl Agent {
             .is_some_and(|chat| chat.snapshot.goal.is_some());
         if has_goal && let Err(error) = self.change_goal(chat_id, vec![event]).await {
             tracing::warn!(chat = %chat_id, %error, "could not pause the goal");
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                format!("the goal was not paused: {error}"),
+            );
         }
     }
 
@@ -497,17 +522,8 @@ impl Agent {
             }
             root
         };
-        let within = self.enter_trigger_boundary(root).await;
-        if !self.keeps_goal_accounts(root, &within) {
-            tracing::info!(chat = %root, tokens, "usage not charged: another process keeps the goal");
-            return;
-        }
-        if let Err(error) = self
-            .update_goal(root, vec![GoalEvent::TokensUsed(tokens)], false, &within)
-            .await
-        {
-            tracing::warn!(chat = %root, %error, "could not charge tokens to the goal");
-        }
+        self.account_goal(root, vec![GoalEvent::TokensUsed(tokens)], false)
+            .await;
     }
 
     /// What ending the turn `receipt` tells the root Chat's goal; `None` without a goal.
@@ -537,14 +553,7 @@ impl Agent {
 
     /// The goal's part in ending a turn: the time it ran, what it did, and its usage recorded.
     pub(crate) async fn end_goal_turn(&self, chat_id: ChatId, events: Vec<GoalEvent>) {
-        let within = self.enter_trigger_boundary(chat_id).await;
-        if !self.keeps_goal_accounts(chat_id, &within) {
-            tracing::info!(chat = %chat_id, "turn not counted: another process keeps the goal");
-            return;
-        }
-        if let Err(error) = self.update_goal(chat_id, events, true, &within).await {
-            tracing::warn!(chat = %chat_id, %error, "could not end the goal's turn");
-        }
+        self.account_goal(chat_id, events, true).await;
     }
 
     /// Delivers one goal continuation through the wake-up base when the goal is active, the Loop
@@ -594,9 +603,13 @@ impl Agent {
                 input: prompts::continuation_prompt(&prompt_context(goal)),
                 ledger: None,
                 // The goal's usage so far is recorded with the acceptance, before its turn.
-                on_accept: Some(Box::new(|agent: &Agent, chat: &mut Chat, _: &Receipt| {
-                    agent.record_goal(chat, None, Vec::new());
-                })),
+                on_accept: Some(Box::new(
+                    |change: &SourceChange, chat: &mut Chat, _: &Receipt| {
+                        change.agent().record_goal(chat, None, Vec::new(), &|line| {
+                            change.record_source_state(line)
+                        });
+                    },
+                )),
             }
         };
         if let Err(error) = Box::pin(self.deliver_trigger(chat_id, delivery)).await {
@@ -869,7 +882,12 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
                 unix_time_milliseconds(),
             ) {
                 Ok((goal, effects)) => {
-                    agent.adopt_goal(chat, goal, effects, false);
+                    // A takeover is made within the boundary under the lease newly taken, which
+                    // a source change would prove.
+                    let chat_id = chat.snapshot.id;
+                    agent.adopt_goal(chat, goal, effects, false, &|line| {
+                        agent.queue_source_state(chat_id, line)
+                    });
                 }
                 Err(error) => {
                     tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal")
@@ -889,6 +907,36 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
             );
         }
     }
+
+    fn records(&self, chat: &Chat) -> Vec<Line> {
+        if chat.snapshot.delegation.is_some() || chat.snapshot.goal.is_none() {
+            return Vec::new();
+        }
+        vec![goal_line(chat)]
+    }
+
+    /// A stop pauses an active goal and withdraws its continuation, where the lease is.
+    fn on_stop(&self, change: &SourceChange, chat: &mut Chat) {
+        if chat.snapshot.delegation.is_some() || chat.snapshot.goal.is_none() {
+            return;
+        }
+        if let Err(error) =
+            change
+                .agent()
+                .update_goal(change, chat, vec![GoalEvent::Stopped], false)
+        {
+            tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal");
+        }
+    }
+}
+
+/// The record of the Chat's goal as it is now.
+fn goal_line(chat: &Chat) -> Line {
+    Line::Goal(GoalEntry {
+        chat_id: chat.snapshot.id,
+        cwd: chat.snapshot.folder.clone(),
+        goal: chat.snapshot.goal.clone(),
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
