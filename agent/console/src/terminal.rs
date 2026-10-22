@@ -166,7 +166,7 @@ const ANIMATION_FRAME_DURATION: std::time::Duration = std::time::Duration::from_
 /// The activity shown while a run works without an in-progress todo.
 const WORKING_ACTIVITY: &str = "Working";
 const STOPPED_NOTICE: &str =
-    "Stopped. Queued messages were discarded; Triggers are paused until your next message.";
+    "Stopped. Queued messages were discarded; send your next message to resume receiving Triggers.";
 
 struct RunningActivity {
     chat_id: uuid::Uuid,
@@ -7087,7 +7087,7 @@ fn show_opened_chat(
     if has_history {
         outln!(
             console,
-            "\nHistory opened. Enter a message to continue this Chat."
+            "\nHistory opened. Enter a message to continue this Chat; sending it resumes receiving Triggers."
         );
     } else {
         outln!(console, "Enter a message to continue this Chat.");
