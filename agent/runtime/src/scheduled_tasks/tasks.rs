@@ -48,7 +48,18 @@ pub(crate) struct Creation {
 pub(crate) struct Wakeup {
     pub delay: Duration,
     pub reason: String,
+    /// Becomes the instruction only of a self-paced task this call creates; an existing task
+    /// keeps the instruction the user started or confirmed.
     pub prompt: String,
+}
+
+/// The self-paced task after a ScheduleWakeup call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScheduledWakeup<'a> {
+    pub task: &'a ScheduledTask,
+    /// The call named an instruction other than the task's, which was kept; the tool result
+    /// says so.
+    pub ignored_prompt: bool,
 }
 
 /// The result of the user's answer to a pending task.
@@ -183,39 +194,43 @@ impl ScheduledTasks {
     }
 
     /// ScheduleWakeup: reschedules the self-paced task, creating one with `id` when there is
-    /// none. The delay is clamped to one minute through one hour.
+    /// none. The delay is clamped to one minute through one hour. Rescheduling changes only
+    /// the delay and the reason: replacing the instruction would let the Agent swap what the
+    /// user started or confirmed without asking again.
     pub(crate) fn schedule_wakeup<Tz: TimeZone>(
         &mut self,
         id: String,
         wakeup: Wakeup,
         creation: Creation,
         now: &DateTime<Tz>,
-    ) -> Result<&ScheduledTask, ScheduledTaskError> {
+    ) -> Result<ScheduledWakeup<'_>, ScheduledTaskError> {
         let delay = wakeup.delay.clamp(MIN_WAKEUP_DELAY, MAX_WAKEUP_DELAY);
         let kind = ScheduledTaskKind::SelfPaced {
             delay_seconds: Some(delay.as_secs()),
             reason: Some(wakeup.reason),
             fallback: false,
         };
-        let index = match self.tasks.iter().position(is_self_paced) {
+        let (index, ignored_prompt) = match self.tasks.iter().position(is_self_paced) {
             Some(index) => {
                 let task = &mut self.tasks[index];
                 task.kind = kind;
-                task.prompt = wakeup.prompt;
-                index
+                (index, task.prompt != wakeup.prompt)
             }
             None => {
                 self.ensure_room(false)?;
                 let task = new_task(id, kind, wakeup.prompt, creation, now, Some(expiry(now)));
                 self.tasks.push(task);
-                self.tasks.len() - 1
+                (self.tasks.len() - 1, false)
             }
         };
         let task = &mut self.tasks[index];
         if task.confirmation != Some(ScheduledTaskConfirmation::Pending) {
             set_wake(task, now, delay);
         }
-        Ok(&self.tasks[index])
+        Ok(ScheduledWakeup {
+            task: &self.tasks[index],
+            ignored_prompt,
+        })
     }
 
     /// ScheduleWakeup `stop`, or Esc: the self-paced task ends with its pending wake-up.

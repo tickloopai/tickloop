@@ -160,9 +160,9 @@ fn a_chat_holds_at_most_fifty_tasks_and_a_new_self_paced_task_replaces_the_old()
     assert!(tasks.get("aaaaaaaa").is_none());
     let rescheduled = tasks
         .schedule_wakeup("dddddddd".into(), wakeup(300), USER, &now)
-        .unwrap();
+        .unwrap()
+        .task;
     assert_eq!(rescheduled.id, "cccccccc");
-    assert_eq!(rescheduled.prompt, "check the build");
     assert_eq!(tasks.tasks().len(), MAX_SCHEDULED_TASKS_PER_CHAT);
 }
 
@@ -428,7 +428,8 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
 
     let task = tasks
         .schedule_wakeup(NO_JITTER_ID.into(), wakeup(10), USER, &now)
-        .unwrap();
+        .unwrap()
+        .task;
     assert_eq!(task.id, HALF_ID);
     assert_eq!(task.next_fire_at_ms, Some(ms(local(22, 10, 1, 0))));
     assert_eq!(
@@ -446,7 +447,8 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
 
     let task = tasks
         .schedule_wakeup(NO_JITTER_ID.into(), wakeup(7200), USER, &now)
-        .unwrap();
+        .unwrap()
+        .task;
     assert_eq!(task.next_fire_at_ms, Some(ms(local(22, 11, 0, 0))));
 }
 
@@ -741,4 +743,47 @@ fn confirming_a_one_shot_task_before_its_time_keeps_that_time() {
         &local(22, 14, 0, 0),
     ));
     assert_eq!(confirmed.scheduled_for_ms, Some(ms(local(22, 15, 0, 0))));
+}
+
+#[test]
+fn rescheduling_keeps_the_instruction_the_user_started() {
+    let now = local(22, 10, 0, 0);
+    let mut tasks = ScheduledTasks::default();
+    tasks
+        .start_self_paced(HALF_ID.into(), "watch the deploy".into(), USER, &now)
+        .unwrap();
+
+    let agent = Creation {
+        creator: ScheduledTaskCreator::Agent,
+        needs_confirmation: true,
+    };
+    let rescheduled = tasks
+        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(300), agent, &now)
+        .unwrap();
+    assert!(rescheduled.ignored_prompt);
+    let task = rescheduled.task;
+    assert_eq!(task.id, HALF_ID);
+    assert_eq!(task.prompt, "watch the deploy");
+    assert_eq!(task.creator, ScheduledTaskCreator::User);
+    assert_eq!(task.confirmation, None);
+    assert_eq!(task.next_fire_at_ms, Some(ms(local(22, 10, 5, 0))));
+
+    let same_prompt = Wakeup {
+        prompt: "watch the deploy".into(),
+        ..wakeup(600)
+    };
+    let rescheduled = tasks
+        .schedule_wakeup(NO_JITTER_ID.into(), same_prompt, USER, &now)
+        .unwrap();
+    assert!(!rescheduled.ignored_prompt);
+}
+
+#[test]
+fn a_new_wakeup_takes_its_own_instruction() {
+    let mut tasks = ScheduledTasks::default();
+    let created = tasks
+        .schedule_wakeup(HALF_ID.into(), wakeup(300), USER, &local(22, 10, 0, 0))
+        .unwrap();
+    assert!(!created.ignored_prompt);
+    assert_eq!(created.task.prompt, "check the build");
 }
