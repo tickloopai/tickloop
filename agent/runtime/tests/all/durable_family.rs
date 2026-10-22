@@ -1673,3 +1673,10 @@ async fn durable_restart_after_continue_keeps_family_inputs_deliverable() {
         original.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn process_restart_preserves_family_inputs_from_both_stop_entries() {
+    for subtree in [false, true] {
+        assert_stopped_family_recovery(subtree, WaitHosting::Process, false).await;
+    }
+}
