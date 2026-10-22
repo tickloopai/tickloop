@@ -101,6 +101,7 @@ impl Session {
             &self.bookkeeping,
             &operation,
             None,
+            None,
             self.snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
         )

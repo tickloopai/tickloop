@@ -542,6 +542,7 @@ mod tests {
             &bookkeeping,
             &operation,
             None,
+            None,
             snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
         )

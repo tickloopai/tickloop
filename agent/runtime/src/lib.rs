@@ -1367,7 +1367,7 @@ impl Agent {
         cancel: CancellationToken,
         emit_permission: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, bookkeeping, chat_client, boundary_id) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id, root_goal) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1386,11 +1386,18 @@ impl Agent {
             let mut snapshot = chat.snapshot.clone();
             snapshot.policy =
                 delegation::effective_policy(&chats, receipt).map_err(AgentError::Invalid)?;
+            let root_goal = match &chat.snapshot.delegation {
+                None => chat.snapshot.goal.clone(),
+                Some(delegation) => chats
+                    .get(&delegation.root_chat_id())
+                    .and_then(|root| root.snapshot.goal.clone()),
+            };
             (
                 snapshot,
                 chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
+                root_goal,
             )
         };
         // One load serves both the original prompts and the history before the boundary.
@@ -1463,6 +1470,7 @@ impl Agent {
             &snapshot,
             &bookkeeping,
             operation,
+            root_goal.as_ref(),
             legacy,
             &folder,
             auto_settings.policy_for_directory(&folder),

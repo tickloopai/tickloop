@@ -1603,3 +1603,83 @@ async fn a_child_inherits_the_users_goal_as_its_auto_review_authorization() {
     assert!(child_command.contains(FROM_USER) && child_command.contains(OBJECTIVE));
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_child_stops_weighing_a_goal_the_user_cleared_or_edited_since_its_delegation() {
+    const FROM_USER: &str = "The user set this Chat's goal with /goal";
+    const BEFORE: &str = "Starting on the export.";
+    const AFTER: &str = "Wrote the export.";
+    for action in [
+        GoalAction::Clear,
+        GoalAction::Edit {
+            objective: "Ship the import command with tests".into(),
+        },
+    ] {
+        let mut replies = vec![
+            call("s1", "Subagent", json!({"task": "write the export"})),
+            call(
+                "m1",
+                "SendMessage",
+                json!({"to": "main", "message": BEFORE}),
+            ),
+            call("h1", "SubagentHandback", json!({"message": AFTER})),
+            text("Reported."),
+        ];
+        replies.extend(match action {
+            GoalAction::Clear => vec![text("Done.")],
+            _ => vec![blocked("g1"), text("Blocked.")],
+        });
+        let model = HoldingModel::new(replies, Vec::new());
+        // The child's request after its message waits for the goal to change.
+        *model.held_request.lock().unwrap() = Some(2);
+        let allow = tickloop_agent_test_support::auto_classification(false).to_string();
+        let checker = Arc::new(ScriptedModel::new(vec![text(&allow); 4]));
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(config(), model.clone());
+        approve_everything(&agent);
+        agent.set_auto_reviewer(checker.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let held = model.held.notified();
+        tokio::pin!(held);
+        held.as_mut().enable();
+        set_goal(&agent, chat, None).await;
+        until_held(held).await;
+        agent.manage_goal(chat, action.clone()).await.unwrap();
+        model.release();
+        match action {
+            GoalAction::Clear => wait_until_idle(&agent, chat).await,
+            _ => {
+                wait_for_goal(&agent, chat, |status| {
+                    matches!(status, GoalStatus::Blocked { .. })
+                })
+                .await
+            }
+        }
+
+        let reviews = reviewed_user_inputs(&checker);
+        let before = reviews
+            .iter()
+            .find(|review| review.contains(BEFORE) && !review.contains(AFTER))
+            .expect("the child's message was reviewed");
+        assert!(before.contains(FROM_USER), "{action:?}");
+        assert!(
+            model
+                .turn_requests()
+                .iter()
+                .any(|request| mentions(request, AFTER)),
+            "{action:?}: the child handed its report back"
+        );
+        assert!(
+            reviews
+                .iter()
+                .filter(|review| review.contains(AFTER))
+                .all(|review| !review.contains(FROM_USER)),
+            "{action:?}: the child no longer weighs the old goal"
+        );
+        agent.shutdown().await;
+    }
+}
