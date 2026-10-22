@@ -1181,3 +1181,70 @@ async fn usage_charged_mid_turn_survives_a_crash() {
     model.release();
     agent.shutdown().await;
 }
+
+const HELD_FOR: Duration = Duration::from_millis(300);
+
+async fn until_held(held: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the request is held");
+}
+
+#[tokio::test]
+async fn running_time_counts_only_while_the_goal_is_active_within_a_turn() {
+    // A goal set while a user's turn runs counts from then on.
+    let model = HoldingModel::new(
+        vec![text("Done with that."), blocked("b1"), text("Blocked.")],
+        Vec::new(),
+    );
+    let (_directory, agent, chat) = new_chat(model.clone()).await;
+    let held = model.held.notified();
+    tokio::pin!(held);
+    held.as_mut().enable();
+    agent.submit(chat, HOLD.into()).await.unwrap();
+    until_held(held).await;
+    tokio::time::sleep(HELD_FOR).await;
+    set_goal(&agent, chat, None).await;
+    tokio::time::sleep(HELD_FOR).await;
+    model.release();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    let counted = goal(&agent, chat).await.unwrap().time_used_ms;
+    assert!(
+        (250..550).contains(&counted),
+        "only the time since setting counts: {counted} ms"
+    );
+    agent.shutdown().await;
+
+    // A goal paused while its turn runs stops counting then.
+    let model = HoldingModel::new(vec![text("Paused midway.")], Vec::new());
+    let (_directory, agent, chat) = new_chat(model.clone()).await;
+    let held = model.held.notified();
+    tokio::pin!(held);
+    held.as_mut().enable();
+    agent
+        .manage_goal(
+            chat,
+            GoalAction::Set {
+                objective: format!("{HOLD}: ship the export command"),
+                token_budget: None,
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    until_held(held).await;
+    tokio::time::sleep(HELD_FOR).await;
+    agent.manage_goal(chat, GoalAction::Pause).await.unwrap();
+    tokio::time::sleep(HELD_FOR).await;
+    model.release();
+    wait_until_idle(&agent, chat).await;
+    let counted = goal(&agent, chat).await.unwrap().time_used_ms;
+    assert!(
+        (250..550).contains(&counted),
+        "only the time before pausing counts: {counted} ms"
+    );
+    agent.shutdown().await;
+}
