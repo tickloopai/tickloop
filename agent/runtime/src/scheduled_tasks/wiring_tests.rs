@@ -1224,3 +1224,58 @@ async fn a_run_prepared_before_stop_is_refused_after_continuing() {
         .unwrap();
     wait_seen(&model, "check the build", 1).await;
 }
+
+/// A run more than a day past its time is void: handed over late it is refused, and waiting
+/// that long it is withdrawn instead of taken.
+#[tokio::test]
+async fn a_run_older_than_a_day_is_neither_handed_over_nor_taken() {
+    let day = |day: u32, hour: u32, minute: u32| {
+        Utc.with_ymd_and_hms(2026, 10, day, hour, minute, 0)
+            .unwrap()
+    };
+    let model = HoldingModel::new(vec![
+        create("create", "*/10 * * * *", "check the build"),
+        text("Scheduled."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "schedule it").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    let run = TriggerSource::ScheduledTask {
+        task_id: task.id.clone(),
+        scheduled_for_ms: task.scheduled_for_ms.unwrap(),
+    };
+    agent.set_scheduled_now_for_tests(day(24, 10, 11));
+    assert!(
+        agent
+            .deliver_trigger_for_tests(chat, run, "check the build")
+            .await
+            .is_err()
+    );
+
+    // Handed over in time, behind a turn that holds for more than a day; the task's jitter
+    // delays its run by less than five minutes.
+    agent.set_scheduled_now_for_tests(at(10, 15, 0));
+    model.scripted.enqueue(text("Held."));
+    let mut events = agent.subscribe();
+    let held = agent.submit(chat, HOLD.into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 15, 0))
+        .await
+        .unwrap();
+    assert_eq!(agent.snapshot(chat).await.unwrap().pending_inputs.len(), 1);
+    agent.set_scheduled_now_for_tests(day(24, 10, 11));
+    model.release.notify_one();
+    wait_for_run(&mut events, held.run_id).await;
+    wait_idle(&agent, chat).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(model.seen("check the build"), 0, "{:?}", model.prompts());
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+}

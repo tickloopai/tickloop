@@ -35,6 +35,9 @@ async fn unstarted_trigger_input_waits_through_a_crash() {
 
     let restarted_model = ContractModel::new();
     let restarted = Agent::open_embedded(image, config(), restarted_model.clone()).unwrap();
+    // The stand-in run is scheduled for the clock's start; the restarted process keeps the same
+    // time, so the run is not too old to take.
+    restarted.set_scheduled_now_for_tests(chrono::DateTime::from_timestamp_millis(1).unwrap());
     restarted.resume_chat(chat).await.unwrap();
     tokio::time::sleep(SETTLE).await;
     assert_eq!(

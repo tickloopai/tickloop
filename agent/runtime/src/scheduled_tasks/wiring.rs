@@ -215,7 +215,8 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
 
 impl Agent {
     /// Whether a run of `task_id` for `scheduled_for_ms` still stands: its task was not
-    /// cancelled. A one-shot or final run outlives its task.
+    /// cancelled, and it is not older than [`MAX_RUN_AGE_MS`]. A one-shot or final run outlives
+    /// its task.
     pub(crate) fn scheduled_run_eligibility(
         &self,
         snapshot: &ChatSnapshot,
@@ -226,8 +227,9 @@ impl Agent {
             .scheduled_task_revocations
             .iter()
             .any(|revocation| revocation.task_id == task_id);
-        let _ = scheduled_for_ms;
-        if is_revoked {
+        let now_ms = u64::try_from(self.scheduled_now().timestamp_millis()).unwrap_or(0);
+        let is_void = scheduled_for_ms.saturating_add(MAX_RUN_AGE_MS) < now_ms;
+        if is_revoked || is_void {
             crate::wakeup::Eligibility::Ended(DiscardReason::SourceEnded)
         } else {
             crate::wakeup::Eligibility::Eligible
@@ -1001,8 +1003,10 @@ fn unused_id(snapshot: &ChatSnapshot) -> String {
     }
 }
 
-/// How long a cancellation is remembered: past a recurring task's seven days and the day a run
-/// may wait, no run of the task can still come.
+/// The oldest a scheduled run may be, from the time it was scheduled for, to be handed over or
+/// taken: an older one is void, so nothing missed long ago runs late.
+const MAX_RUN_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a cancellation is remembered: well past the age a run of the task may still have.
 const REVOCATION_MEMORY_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 
 /// Whether a new run of `task_id` for `scheduled_for_ms` is the one its task comes due for:
