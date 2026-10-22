@@ -324,3 +324,97 @@ fn local_dates_follow_the_given_zone_not_utc() {
     assert_eq!(late_evening.date_naive(), date);
     assert_eq!(late_evening.with_timezone(&Utc), utc(2026, 10, 24, 3, 0));
 }
+
+fn runs_in_utc(expression: &str, after: DateTime<Tz>, count: usize) -> Vec<DateTime<Utc>> {
+    let schedule = schedule(expression);
+    std::iter::successors(schedule.next_after(&after), |run| schedule.next_after(run))
+        .take(count)
+        .map(|run| run.with_timezone(&Utc))
+        .collect()
+}
+
+#[test]
+fn a_fixed_hour_list_runs_once_through_a_fall_back_overlap() {
+    // 01:30 EDT is 05:30 UTC; 03:30 EST is 08:30 UTC.
+    assert_eq!(
+        runs_in_utc("30 1,3 * * *", new_york(2026, 11, 1, 0, 0), 3),
+        [
+            utc(2026, 11, 1, 5, 30),
+            utc(2026, 11, 1, 8, 30),
+            utc(2026, 11, 2, 6, 30)
+        ]
+    );
+}
+
+#[test]
+fn a_fixed_hour_range_runs_once_through_a_fall_back_overlap() {
+    // 01:30 EDT is 05:30 UTC; 02:30 EST is 07:30 UTC.
+    assert_eq!(
+        runs_in_utc("30 1-2 * * *", new_york(2026, 11, 1, 0, 0), 3),
+        [
+            utc(2026, 11, 1, 5, 30),
+            utc(2026, 11, 1, 7, 30),
+            utc(2026, 11, 2, 6, 30)
+        ]
+    );
+}
+
+#[test]
+fn a_fixed_time_is_not_repeated_when_starting_in_the_second_pass() {
+    let second_pass = Utc
+        .with_ymd_and_hms(2026, 11, 1, 6, 10, 0)
+        .unwrap()
+        .with_timezone(&New_York);
+    assert_eq!(
+        runs_in_utc("30 1,3 * * *", second_pass, 1),
+        [utc(2026, 11, 1, 8, 30)]
+    );
+    let first_pass = schedule("30 1,3 * * *")
+        .next_after(&new_york(2026, 11, 1, 0, 0))
+        .unwrap();
+    assert_eq!(
+        schedule("30 1,3 * * *").next_at_or_after(&first_pass),
+        Some(first_pass)
+    );
+}
+
+#[test]
+fn a_fixed_hour_list_runs_a_skipped_time_right_after_a_spring_forward_gap() {
+    // 03:00 EDT is 07:00 UTC; 04:30 EDT is 08:30 UTC.
+    assert_eq!(
+        runs_in_utc("30 2,4 * * *", new_york(2026, 3, 8, 0, 0), 3),
+        [
+            utc(2026, 3, 8, 7, 0),
+            utc(2026, 3, 8, 8, 30),
+            utc(2026, 3, 9, 6, 30)
+        ]
+    );
+}
+
+#[test]
+fn a_fixed_hour_range_runs_a_skipped_time_right_after_a_spring_forward_gap() {
+    // 01:30 EST is 06:30 UTC; 02:30 does not exist and runs at 03:00 EDT, 07:00 UTC.
+    assert_eq!(
+        runs_in_utc("30 1-2 * * *", new_york(2026, 3, 8, 0, 0), 3),
+        [
+            utc(2026, 3, 8, 6, 30),
+            utc(2026, 3, 8, 7, 0),
+            utc(2026, 3, 9, 5, 30)
+        ]
+    );
+}
+
+#[test]
+fn skipped_fixed_times_and_the_first_real_time_after_the_gap_run_once() {
+    // 02:00 and 02:30 do not exist; they and the real 03:00 run once at 03:00 EDT.
+    assert_eq!(
+        runs_in_utc("0,30 1-3 * * *", new_york(2026, 3, 8, 0, 0), 5),
+        [
+            utc(2026, 3, 8, 6, 0),
+            utc(2026, 3, 8, 6, 30),
+            utc(2026, 3, 8, 7, 0),
+            utc(2026, 3, 8, 7, 30),
+            utc(2026, 3, 9, 5, 0)
+        ]
+    );
+}

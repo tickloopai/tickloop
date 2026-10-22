@@ -36,17 +36,9 @@ pub fn generate_task_id() -> String {
     Uuid::new_v4().simple().to_string()[..TASK_ID_LENGTH].to_string()
 }
 
-/// The first run scheduled strictly after `after`, with jitter derived from `task_id` so that
-/// many tasks on the same expression do not fire at the same moment.
-///
-/// - Recurring tasks fire late by a fixed share of the gap to the following run: under half
-///   of it and at most 30 minutes, so evenly spaced runs are always delayed by the same
-///   amount. A `*/5 * * * *` task fires 15 seconds early instead.
-/// - One-shot tasks scheduled on `:00` or `:30` local time fire up to 90 seconds early;
-///   other minutes fire on time.
-///
-/// No run fires before `after`. To advance a recurring task, pass the previous run's
-/// `scheduled_for`, not its `fire_at`, which may precede it.
+/// The first run scheduled strictly after `after`, fired as [`run_for`] describes and never
+/// before `after`. To advance a recurring task, pass the previous run's `scheduled_for`, not
+/// its `fire_at`, which may precede it.
 pub fn next_run<Tz: TimeZone>(
     schedule: &Schedule,
     kind: TaskKind,
@@ -54,6 +46,26 @@ pub fn next_run<Tz: TimeZone>(
     after: &DateTime<Tz>,
 ) -> Option<Run<Tz>> {
     let scheduled_for = schedule.next_after(after)?;
+    Some(run_for(schedule, kind, task_id, scheduled_for, after))
+}
+
+/// The run of a known scheduled time, such as one restored from storage, with jitter derived
+/// from `task_id` so that many tasks on the same expression do not fire at the same moment.
+///
+/// - Recurring tasks fire late by a fixed share of the gap to the following run: under half
+///   of it and at most 30 minutes, so evenly spaced runs are always delayed by the same
+///   amount. A `*/5 * * * *` task fires 15 seconds early instead.
+/// - One-shot tasks scheduled on `:00` or `:30` local time fire up to 90 seconds early;
+///   other minutes fire on time.
+///
+/// The run never fires before `not_before`, typically when the task was created.
+pub fn run_for<Tz: TimeZone>(
+    schedule: &Schedule,
+    kind: TaskKind,
+    task_id: &str,
+    scheduled_for: DateTime<Tz>,
+    not_before: &DateTime<Tz>,
+) -> Run<Tz> {
     let jitter = match kind {
         TaskKind::Recurring if schedule.is_every_five_minutes() => -EVERY_FIVE_MINUTES_LEAD,
         TaskKind::Recurring => schedule
@@ -65,11 +77,11 @@ pub fn next_run<Tz: TimeZone>(
         }
         TaskKind::OneShot => TimeDelta::zero(),
     };
-    let fire_at = (scheduled_for.clone() + jitter).max(after.clone());
-    Some(Run {
+    let fire_at = (scheduled_for.clone() + jitter).max(not_before.clone());
+    Run {
         scheduled_for,
         fire_at,
-    })
+    }
 }
 
 /// `span` scaled by the task id read as a fraction in `[0, 1)`. Ids that are not 8 hex

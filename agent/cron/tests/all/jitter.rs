@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Asia::Kolkata;
-use tickloop_agent_cron::{Run, Schedule, TaskKind, generate_task_id, next_run};
+use tickloop_agent_cron::{Run, Schedule, TaskKind, generate_task_id, next_run, run_for};
 
 const NO_JITTER_ID: &str = "00000000";
 const HALF_ID: &str = "80000000";
@@ -55,10 +55,34 @@ fn every_five_minutes_fires_fifteen_seconds_early() {
             [utc(22, 10, 4, 45), utc(22, 10, 9, 45), utc(22, 10, 14, 45)]
         );
     }
-    assert_eq!(
-        jitters("0-59/5 * * * *", HALF_ID, 1),
-        [TimeDelta::seconds(-15)]
-    );
+    for expression in [
+        "0-59/5 * * * *",
+        "*/5 * 1-31 * *",
+        "*/5 */1 * * *",
+        "*/5 * * * 0-7",
+        "*/5 * * * 0-6",
+        "*/5 * 1-31 * 1",
+        "0-55/5 0-23 1-31 1-12 0-7",
+    ] {
+        assert_eq!(
+            jitters(expression, HALF_ID, 1),
+            [TimeDelta::seconds(-15)],
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn five_minute_steps_on_only_some_days_are_delayed_normally() {
+    for expression in [
+        "*/5 * * * 1-5",
+        "*/5 * 1-15 * *",
+        "*/5 * 1-15 * 1",
+        "*/5 9-17 * * *",
+    ] {
+        let jitter = jitters(expression, HALF_ID, 1)[0];
+        assert!(jitter > TimeDelta::zero(), "{expression}: {jitter}");
+    }
 }
 
 #[test]
@@ -215,4 +239,50 @@ fn generated_ids_are_eight_lowercase_hex_digits() {
         );
     }
     assert_ne!(first, second);
+}
+
+#[test]
+fn run_for_recomputes_a_stored_scheduled_time() {
+    let schedule = Schedule::parse("0 9 * * *").unwrap();
+    let created = utc(22, 10, 0, 0);
+    let next = next_run(&schedule, TaskKind::Recurring, HALF_ID, &created).unwrap();
+    let restored = run_for(
+        &schedule,
+        TaskKind::Recurring,
+        HALF_ID,
+        next.scheduled_for,
+        &created,
+    );
+    assert_eq!(restored, next);
+
+    let later = run_for(
+        &schedule,
+        TaskKind::Recurring,
+        HALF_ID,
+        utc(25, 9, 0, 0),
+        &created,
+    );
+    assert_eq!(later.fire_at, utc(25, 9, 30, 0));
+}
+
+#[test]
+fn run_for_never_fires_before_not_before() {
+    let schedule = Schedule::parse("0 15 * * *").unwrap();
+    let run = run_for(
+        &schedule,
+        TaskKind::OneShot,
+        HALF_ID,
+        utc(22, 15, 0, 0),
+        &utc(22, 14, 59, 50),
+    );
+    assert_eq!(run.fire_at, utc(22, 14, 59, 50));
+
+    let resumed = run_for(
+        &schedule,
+        TaskKind::Recurring,
+        HALF_ID,
+        utc(22, 15, 0, 0),
+        &utc(22, 15, 20, 0),
+    );
+    assert_eq!(resumed.fire_at, utc(22, 15, 30, 0));
 }
