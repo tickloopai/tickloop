@@ -164,7 +164,7 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
     task.last_scheduled_for_ms.is_some_and(|scheduled_for_ms| {
         let input = tickloop_agent_transcript::input_ids::trigger(
             chat.snapshot.id,
-            &TriggerSource::ScheduledTask {
+            &tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
                 task_id: task.id.clone(),
                 scheduled_for_ms,
             },
@@ -526,12 +526,13 @@ impl Agent {
     }
 
     /// A stateless host's wake-up at `due_at_ms`, the time the Harness reported last: every
-    /// task due by then, or by now when the host's clock is ahead, runs once.
+    /// task due by then, or by now when the host's clock is ahead, runs once. Returns the
+    /// receipts the runs were handed over under.
     pub async fn wake_scheduled_tasks(
         &self,
         chat_id: ChatId,
         due_at_ms: u64,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Vec<Receipt>, AgentError> {
         if !self.inner.chats.lock().await.contains_key(&chat_id) {
             return Err(AgentError::NotFound);
         }
@@ -539,25 +540,31 @@ impl Agent {
             .ok()
             .and_then(DateTime::from_timestamp_millis)
             .ok_or_else(|| AgentError::Invalid("the wake-up time is out of range".into()))?;
-        self.run_due_scheduled_tasks(chat_id, due_at.max(self.scheduled_now()))
-            .await;
-        Ok(())
+        Ok(self
+            .run_due_scheduled_tasks(chat_id, due_at.max(self.scheduled_now()))
+            .await)
     }
 
-    /// Hands the Loop each task due by `now`, at most once each, while it receives.
-    pub(crate) async fn run_due_scheduled_tasks(&self, chat_id: ChatId, now: DateTime<Utc>) {
-        let deliveries = {
+    /// Hands the Loop each task due by `now`, at most once each, while it receives. The tasks'
+    /// next times are recorded only after their runs were handed over: a host that goes down in
+    /// between finds the same runs due again, and their ledger records answer them.
+    pub(crate) async fn run_due_scheduled_tasks(
+        &self,
+        chat_id: ChatId,
+        now: DateTime<Utc>,
+    ) -> Vec<Receipt> {
+        let (deliveries, notices) = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
-                return;
+                return Vec::new();
             };
             if !chat.snapshot.chat_loop.receiving.is_receiving() {
-                return;
+                return Vec::new();
             }
             let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
             let due = tasks.take_due(&now);
             if due.fired.is_empty() && due.removed.is_empty() {
-                return;
+                return Vec::new();
             }
             let mut deliveries = Vec::new();
             let mut notices = Vec::new();
@@ -586,14 +593,21 @@ impl Agent {
                 });
             }
             chat.snapshot.scheduled_tasks = tasks.into_tasks();
-            self.persist_scheduled_tasks(chat, notices);
-            deliveries
+            (deliveries, notices)
         };
+        let mut receipts = Vec::new();
         for delivery in deliveries {
-            if let Err(error) = self.deliver_trigger(chat_id, delivery).await {
-                tracing::debug!(%chat_id, %error, "a scheduled run was not delivered");
+            match self.deliver_trigger(chat_id, delivery).await {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) => {
+                    tracing::debug!(%chat_id, %error, "a scheduled run was not delivered");
+                }
             }
         }
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+            self.persist_scheduled_tasks(chat, notices);
+        }
+        receipts
     }
 
     /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it

@@ -10,15 +10,16 @@ use sha2::{Digest, Sha256};
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
 use tickloop_agent_base::timestamp::format_timestamp;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, EventKind, InputId, PendingInput, Receipt, ResponseId, RunId, Usage,
+    ChatId, ChatSnapshot, EventKind, InputId, PendingInput, Receipt, ResponseId, RunId,
+    TriggerIdentity, Usage,
 };
 use uuid::Uuid;
 
 use crate::{Agent, AgentError, Chat};
 use tickloop_agent_transcript::{
     AbandonReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ModelVisibleResult,
-    ResponseEnding, ResponseEntry, ResponseState, ResumePoint, SettledOutcome, WaitEntry, WaitKind,
-    WaitState,
+    ResponseEnding, ResponseEntry, ResponseState, ResumePoint, SettledOutcome, TriggerRecord,
+    WaitEntry, WaitKind, WaitState,
 };
 
 /// A ledger input a submission carries: its id, operation and payload digest.
@@ -104,6 +105,15 @@ fn now() -> String {
     format_timestamp(unix_time_milliseconds())
 }
 
+/// How far an input got: accepted, started, settled.
+fn progress(state: &InputState) -> u8 {
+    match state {
+        InputState::Accepted => 0,
+        InputState::Started => 1,
+        InputState::Settled { .. } => 2,
+    }
+}
+
 impl Lifecycle {
     fn next_revision(&mut self) -> u64 {
         self.revision += 1;
@@ -164,10 +174,7 @@ impl Lifecycle {
                     queued: Some(
                         serde_json::to_value(queued).expect("a queued input is serializable"),
                     ),
-                    trigger: queued
-                        .trigger_source
-                        .as_ref()
-                        .map(tickloop_agent_transcript::TriggerRecord::of),
+                    trigger: queued.trigger_source.as_ref().map(TriggerRecord::of),
                 },
                 revision,
             },
@@ -230,13 +237,14 @@ impl Lifecycle {
     }
 
     /// Records the ledger input `input` settled as `outcome` from the start, without a Run of its
-    /// own: a reply that ended a wait merged into the waiting Run, or a delivery its ended Loop
-    /// discarded. `receipt`'s Run is only its identity.
+    /// own: a reply that ended a wait merged into the waiting Run, or a Trigger delivery merged
+    /// into the one of its key that waits, `trigger`. `receipt` is what a replay answers.
     pub(crate) fn record_settled(
         &mut self,
         input: &LedgerInput,
         receipt: &Receipt,
         outcome: SettledOutcome,
+        trigger: Option<TriggerRecord>,
     ) {
         let revision = self.next_revision();
         // An earlier acceptance of the input that was lost before it started is settled too.
@@ -254,7 +262,7 @@ impl Lifecycle {
                     timestamp: now(),
                     state: InputState::Settled { outcome },
                     queued: None,
-                    trigger: None,
+                    trigger,
                 },
                 revision,
             },
@@ -734,6 +742,85 @@ impl Lifecycle {
                 })
                 .flatten()
         })
+    }
+
+    /// The store's latest record of each Trigger input in `lines`, in place of this ledger's,
+    /// as a load reads them: what another process accepted, started or settled is known here as
+    /// it is there. This ledger's record stays where it is further along, and where it started
+    /// here and the store only says another loader found it started and interrupted it, which
+    /// ran nothing. The adopted records keep revision 0: the store holds them already, so no
+    /// recorder writes them again.
+    pub(crate) fn adopt_trigger_records<'a>(&mut self, lines: impl IntoIterator<Item = &'a Line>) {
+        let mut stored: HashMap<InputId, &InputEntry> = HashMap::new();
+        for line in lines {
+            if let Line::Input(entry) = line
+                && entry.trigger.is_some()
+            {
+                stored.insert(entry.input_id, entry);
+            }
+        }
+        for (id, entry) in stored {
+            if let Some(known) = self.inputs.get(&id) {
+                let interrupted_by_a_loader = known.record.state == InputState::Started
+                    && entry.state
+                        == (InputState::Settled {
+                            outcome: SettledOutcome::Interrupted {
+                                by: InterruptedBy::Host,
+                            },
+                        });
+                if known.record == *entry
+                    || interrupted_by_a_loader
+                    || progress(&known.record.state) > progress(&entry.state)
+                {
+                    continue;
+                }
+                if self.open_inputs.get(&known.record.run_id) == Some(&id) {
+                    self.open_inputs.remove(&known.record.run_id);
+                }
+            }
+            if entry.state == InputState::Accepted {
+                self.open_inputs.insert(entry.run_id, id);
+            }
+            self.inputs.insert(
+                id,
+                Revised {
+                    record: entry.clone(),
+                    revision: 0,
+                },
+            );
+        }
+    }
+
+    /// Whether the input of `run` is accepted and has not started.
+    pub(crate) fn waits_to_start(&self, run: RunId) -> bool {
+        self.open_inputs
+            .get(&run)
+            .and_then(|id| self.input(*id))
+            .is_some_and(|input| input.state == InputState::Accepted)
+    }
+
+    /// The newest sequence of each Tick Subscription the ledger's Tick Update records hold, and
+    /// the input holding it: every update the ledger accepted was delivered.
+    pub(crate) fn delivered_tick_sequences(&self) -> HashMap<Uuid, (u64, InputId)> {
+        let mut delivered: HashMap<Uuid, (u64, InputId)> = HashMap::new();
+        for input in self.inputs.values() {
+            let Some(TriggerRecord {
+                identity: TriggerIdentity::TickUpdate { updates },
+                ..
+            }) = &input.record.trigger
+            else {
+                continue;
+            };
+            for update in updates {
+                let newest = delivered
+                    .entry(update.subscription)
+                    .or_insert((update.sequence, input.record.input_id));
+                if update.sequence > newest.0 {
+                    *newest = (update.sequence, input.record.input_id);
+                }
+            }
+        }
+        delivered
     }
 
     /// The ledger and answers stored records describe, the latest record of each id winning.

@@ -23,6 +23,11 @@
 //! 开关（暂停接收、停止 Artifact 监听、归还租约）且不送达。仅删除锁文件的旧做法会让另一实例接手
 //! 后继续送达。
 //!
+//! **接手**：每次新取得租约都先从存储整份重建该 Chat 的 Trigger 状态（账本中的 Trigger 记录、
+//! 等待执行的 Trigger 输入、Tick 已送达的序号），完成之前同一 Chat 的所有送达与取用都在同一道
+//! 屏障上等待；重建失败时不送达，下一次送达重试。上一个持有者在租约期间送达、执行或结算的内容
+//! 因此和一次干净装载看到的一致。用户输入与 Agent 消息不需要租约，属于各自的进程，不随接手改变。
+//!
 //! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
 //! 恢复，不使用租约与接收状态。
@@ -32,7 +37,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -112,7 +117,12 @@ enum LeaseAttempt {
 
 /// 持有租约后读取接收状态得到的结论。
 enum LeaseCheck {
-    Held,
+    /// Held as the holding `epoch`; until `synced`, this process has not taken over what another
+    /// process delivered to the Chat while it held the lease.
+    Held {
+        epoch: u64,
+        synced: bool,
+    },
     HeldElsewhere,
     ForeignHost(String),
     PausedElsewhere(u64),
@@ -120,20 +130,62 @@ enum LeaseCheck {
 
 /// 一次送达前的判断结果。
 pub(super) enum TriggerPermit {
-    Fire,
-    /// 暂不能送达（被其他进程持有、锁来自另一台主机、Loop 未在接收），稍后重试。
-    Wait(String),
+    /// Deliver under `holding`, which the acceptance or the start checks again under the Chats
+    /// lock: a lease released meanwhile no longer stands behind it.
+    Fire(LeaseHolding),
+    /// 暂不能送达（被其他进程持有、锁来自另一台主机、Loop 未在接收），稍后重试。`recoverable`
+    /// while the Loop receives and only the lease keeps it out, so waiting input is retried.
+    Wait {
+        reason: String,
+        recoverable: bool,
+    },
     /// 接收状态显示已在其他进程暂停，本地已同步。
     Withdrawn,
     Failed(String),
 }
 
+/// The lease holding a permit was given under; `None` where a host needs no lease, as one that
+/// keeps waits durably or saves no Chats.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LeaseHolding(Option<u64>);
+
+/// How long a Chat whose Trigger input waits on a failed permit waits before the first retry,
+/// doubling with each failure up to the longest.
+const PERMIT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const PERMIT_RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The retry of a Chat's waiting Trigger input after failed permits: how many failed in a row,
+/// and the scheduled retry, if one is, by its id.
+#[derive(Default)]
+struct PermitRetry {
+    failures: u32,
+    scheduled: Option<(u64, tokio_util::sync::CancellationToken)>,
+}
+
+/// The Chat's one serialization boundary for Triggers, held while it is entered. Taking or
+/// releasing the lease, taking the Chat's Trigger state over, recording the receiving switch,
+/// accepting a delivery and starting queued Trigger input, with the start recorded durably,
+/// each happen whole within it.
+pub(super) type TriggerBoundary = tokio::sync::OwnedMutexGuard<()>;
+
+/// One holding of a Chat's lease. Taken, it is not synced: no Trigger is accepted or started
+/// under it until the Chat's Trigger state is taken over from the store.
+struct HeldLease {
+    lease: ChatLease,
+    epoch: u64,
+    synced: bool,
+}
+
 /// 本进程持有的全部租约、已知的接收状态 generation 与待显示的提示，都按 Chat。
 #[derive(Default)]
 pub(super) struct ChatLeases {
-    held: Mutex<HashMap<ChatId, ChatLease>>,
+    held: Mutex<HashMap<ChatId, HeldLease>>,
+    epochs: std::sync::atomic::AtomicU64,
+    boundaries: Mutex<HashMap<ChatId, Arc<tokio::sync::Mutex<()>>>>,
+    retry_ids: std::sync::atomic::AtomicU64,
     known_generations: Mutex<HashMap<ChatId, u64>>,
     notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
+    retries: Mutex<HashMap<ChatId, PermitRetry>>,
 }
 
 impl ChatLeases {
@@ -141,32 +193,155 @@ impl ChatLeases {
     /// 因为自己的 flock 而误判为被其他进程持有。
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
-        {
+        let (epoch, synced) = {
             let mut held = self.held.lock().unwrap();
             // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
             if held
                 .get(&key)
-                .is_some_and(|lease| !lease.is_still_at_path())
+                .is_some_and(|holding| !holding.lease.is_still_at_path())
             {
                 held.remove(&key);
             }
-            if let std::collections::hash_map::Entry::Vacant(vacant) = held.entry(key) {
-                match try_acquire(directory, chat_id)? {
-                    LeaseAttempt::Acquired(lease) => {
-                        vacant.insert(lease);
+            let holding = match held.entry(key) {
+                std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    match try_acquire(directory, chat_id)? {
+                        LeaseAttempt::Acquired(lease) => vacant.insert(HeldLease {
+                            lease,
+                            epoch: self
+                                .epochs
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            synced: false,
+                        }),
+                        LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
+                        LeaseAttempt::ForeignHost(host) => {
+                            return Ok(LeaseCheck::ForeignHost(host));
+                        }
                     }
-                    LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
-                    LeaseAttempt::ForeignHost(host) => return Ok(LeaseCheck::ForeignHost(host)),
                 }
-            }
-        }
+            };
+            (holding.epoch, holding.synced)
+        };
         let known = self.known_generation(key);
         Ok(match read_receiving(directory)? {
             Some(state) if !state.receiving && state.generation > known => {
                 LeaseCheck::PausedElsewhere(state.generation)
             }
-            Some(_) | None => LeaseCheck::Held,
+            Some(_) | None => LeaseCheck::Held { epoch, synced },
         })
+    }
+
+    fn is_synced(&self, chat_id: ChatId, epoch: u64) -> bool {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .is_some_and(|holding| holding.epoch == epoch && holding.synced)
+    }
+
+    /// The epoch of the Chat's current holding, if this process holds its lease.
+    fn holding_epoch(&self, chat_id: ChatId) -> Option<u64> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .map(|holding| holding.epoch)
+    }
+
+    /// The holding `epoch` took the Chat's Trigger state over, and a retry waiting for it is no
+    /// longer needed. A later holding takes it over again.
+    fn mark_synced(&self, chat_id: ChatId, epoch: u64) {
+        if let Some(holding) = self
+            .held
+            .lock()
+            .unwrap()
+            .get_mut(&chat_id)
+            .filter(|holding| holding.epoch == epoch)
+        {
+            holding.synced = true;
+        }
+        self.cancel_retry(chat_id);
+    }
+
+    /// Releases the holding `epoch` only: a pause releases what was held when it was asked for,
+    /// never a holding taken after it.
+    fn release_holding(&self, chat_id: ChatId, epoch: u64) {
+        let released = {
+            let mut held = self.held.lock().unwrap();
+            match held.get(&chat_id) {
+                Some(holding) if holding.epoch == epoch => held.remove(&chat_id),
+                Some(_) | None => None,
+            }
+        };
+        if released.is_some() {
+            self.cancel_retry(chat_id);
+            self.clear_notice(chat_id);
+        }
+    }
+
+    /// Whether a permit given under `holding` still stands: the lease it was given under is still
+    /// held and synced.
+    pub(super) fn stands(&self, chat_id: ChatId, holding: LeaseHolding) -> bool {
+        match holding.0 {
+            None => true,
+            Some(epoch) => self.is_synced(chat_id, epoch),
+        }
+    }
+
+    /// Schedules the retry of the Chat's waiting Trigger input after a failed permit, unless one
+    /// is scheduled: its delay and cancellation.
+    fn schedule_retry(
+        &self,
+        chat_id: ChatId,
+    ) -> Option<(
+        u64,
+        std::time::Duration,
+        tokio_util::sync::CancellationToken,
+    )> {
+        let mut retries = self.retries.lock().unwrap();
+        let retry = retries.entry(chat_id).or_default();
+        if retry.scheduled.is_some() {
+            return None;
+        }
+        let delay = PERMIT_RETRY_FIRST
+            .saturating_mul(2u32.saturating_pow(retry.failures))
+            .min(PERMIT_RETRY_LONGEST);
+        retry.failures = retry.failures.saturating_add(1);
+        let id = self
+            .retry_ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        retry.scheduled = Some((id, cancel.clone()));
+        Some((id, delay, cancel))
+    }
+
+    /// The retry `id` came due: it is no longer scheduled, unless another took its place.
+    fn retry_came_due(&self, chat_id: ChatId, id: u64) {
+        if let Some(retry) = self.retries.lock().unwrap().get_mut(&chat_id)
+            && retry
+                .scheduled
+                .as_ref()
+                .is_some_and(|(scheduled, _)| *scheduled == id)
+        {
+            retry.scheduled = None;
+        }
+    }
+
+    fn cancel_retry(&self, chat_id: ChatId) {
+        if let Some(retry) = self.retries.lock().unwrap().remove(&chat_id)
+            && let Some((_, scheduled)) = retry.scheduled
+        {
+            scheduled.cancel();
+        }
+    }
+
+    fn boundary(&self, chat_id: ChatId) -> Arc<tokio::sync::Mutex<()>> {
+        self.boundaries
+            .lock()
+            .unwrap()
+            .entry(chat_id)
+            .or_default()
+            .clone()
     }
 
     fn known_generation(&self, key: ChatId) -> u64 {
@@ -202,12 +377,18 @@ impl ChatLeases {
     pub(super) fn release(&self, chat_id: ChatId) {
         let released = self.held.lock().unwrap().remove(&chat_id);
         drop(released);
+        self.cancel_retry(chat_id);
         self.clear_notice(chat_id);
     }
 
     pub(super) fn release_all(&self) {
         let released = std::mem::take(&mut *self.held.lock().unwrap());
         drop(released);
+        for (_, retry) in std::mem::take(&mut *self.retries.lock().unwrap()) {
+            if let Some((_, scheduled)) = retry.scheduled {
+                scheduled.cancel();
+            }
+        }
         self.notices.lock().unwrap().clear();
     }
 }
@@ -367,16 +548,28 @@ impl Agent {
             .and_then(|chat| Some(chat.tools.chat_directory()?.join(LEASE_DIRECTORY)))
     }
 
-    /// 每次送达前调用：持有该 Chat 的租约、读取接收状态，并确认 Loop 仍在接收。接收状态显示已在
-    /// 其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
-    pub(super) async fn acquire_trigger_permit(&self, chat_id: ChatId) -> TriggerPermit {
+    /// Enters the Chat's Trigger boundary, waiting while another holds it.
+    pub(super) async fn enter_trigger_boundary(&self, chat_id: ChatId) -> TriggerBoundary {
+        self.inner.chat_leases.boundary(chat_id).lock_owned().await
+    }
+
+    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
+    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    pub(super) async fn acquire_trigger_permit(
+        &self,
+        chat_id: ChatId,
+        _within: &TriggerBoundary,
+    ) -> TriggerPermit {
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
-            return TriggerPermit::Fire;
+            return TriggerPermit::Fire(LeaseHolding(None));
         }
         let Some(directory) = self.lease_directory(chat_id).await else {
-            return TriggerPermit::Wait("chat is no longer loaded".into());
+            return TriggerPermit::Wait {
+                reason: "chat is no longer loaded".into(),
+                recoverable: false,
+            };
         };
         let agent = self.clone();
         let checked =
@@ -397,7 +590,10 @@ impl Agent {
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
                     "another Tickloop process holds this Chat's Trigger".into(),
                 );
-                TriggerPermit::Wait(HELD_ELSEWHERE_MESSAGE.into())
+                TriggerPermit::Wait {
+                    reason: HELD_ELSEWHERE_MESSAGE.into(),
+                    recoverable: true,
+                }
             }
             Ok(LeaseCheck::ForeignHost(host)) => {
                 let message = format!(
@@ -406,14 +602,28 @@ impl Agent {
                      Remove the lock file if that host no longer runs Tickloop"
                 );
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                TriggerPermit::Wait(message)
+                TriggerPermit::Wait {
+                    reason: message,
+                    recoverable: true,
+                }
             }
             Ok(LeaseCheck::PausedElsewhere(generation)) => {
                 leases.remember_generation(chat_id, generation);
                 self.pause_receiving_paused_elsewhere(chat_id).await;
                 TriggerPermit::Withdrawn
             }
-            Ok(LeaseCheck::Held) => {
+            Ok(LeaseCheck::Held { epoch, synced }) => {
+                if !synced {
+                    if let Err(error) = self.reload_trigger_state(chat_id).await {
+                        let message = format!(
+                            "could not take over this Chat's Trigger state from its \
+                             Transcript: {error}; no Trigger is delivered until it can"
+                        );
+                        leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
+                        return TriggerPermit::Failed(message);
+                    }
+                    leases.mark_synced(chat_id, epoch);
+                }
                 let is_receiving = self
                     .inner
                     .chats
@@ -423,17 +633,56 @@ impl Agent {
                     .is_some_and(|chat| chat.snapshot.chat_loop.receiving.is_receiving());
                 if !is_receiving {
                     leases.release(chat_id);
-                    return TriggerPermit::Wait("this Chat's Loop is not receiving".into());
+                    return TriggerPermit::Wait {
+                        reason: "this Chat's Loop is not receiving".into(),
+                        recoverable: false,
+                    };
                 }
                 leases.clear_notice(chat_id);
-                TriggerPermit::Fire
+                TriggerPermit::Fire(LeaseHolding(Some(epoch)))
             }
         }
     }
 
+    /// A permit for the Chat's waiting Trigger input failed: it is tried again after a delay
+    /// that doubles with each failure in a row, once at a time, until a takeover succeeds, the
+    /// lease is released as receiving pauses, or the Agent shuts down.
+    pub(super) fn retry_waiting_trigger_input(&self, chat_id: ChatId) {
+        let Some((id, delay, cancel)) = self.inner.chat_leases.schedule_retry(chat_id) else {
+            return;
+        };
+        self.inner
+            .tasks
+            .spawn(self.clone().retry_after(chat_id, id, delay, cancel));
+    }
+
+    /// The retry's future is named, not inferred: the run it starts asks for a permit, whose
+    /// failure schedules this again.
+    fn retry_after(
+        self,
+        chat_id: ChatId,
+        id: u64,
+        delay: std::time::Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = self.inner.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            self.inner.chat_leases.retry_came_due(chat_id, id);
+            let _ = self.start_next_agent_run(chat_id).await;
+        })
+    }
+
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的
-    /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。
+    /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。Within the Chat's
+    /// Trigger boundary: a pause releases the holding it was asked under, after whatever start
+    /// the boundary was recording.
     pub(super) async fn record_receiving(&self, chat_id: ChatId, change: ReceivingChange) {
+        let asked_under = self.inner.chat_leases.holding_epoch(chat_id);
+        let _within = self.enter_trigger_boundary(chat_id).await;
         let recorded = match self.lease_directory(chat_id).await {
             Some(directory) if self.inner.recorder.is_some() => {
                 tokio::task::spawn_blocking(move || write_receiving(&directory, change))
@@ -448,9 +697,17 @@ impl Agent {
             }
             Some(_) | None => Ok(()),
         };
-        match change {
-            ReceivingChange::Paused => self.inner.chat_leases.release(chat_id),
-            ReceivingChange::Resumed => {}
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(
+            chat_id,
+            super::wakeup::trigger_pauses::PausePoint::ReceivingRecorded,
+        )
+        .await;
+        match (change, asked_under) {
+            (ReceivingChange::Paused, Some(epoch)) => {
+                self.inner.chat_leases.release_holding(chat_id, epoch);
+            }
+            (ReceivingChange::Paused, None) | (ReceivingChange::Resumed, _) => {}
         }
         if let Err(error) = recorded {
             self.inner.chat_leases.set_notice(
@@ -483,6 +740,27 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_is_cancelled_when_a_takeover_succeeds_and_only_its_own_end_clears_it() {
+        let leases = ChatLeases::default();
+        let chat_id = Uuid::new_v4();
+        let (first, _, first_cancel) = leases.schedule_retry(chat_id).unwrap();
+        assert!(
+            leases.schedule_retry(chat_id).is_none(),
+            "one retry at a time"
+        );
+        leases.mark_synced(chat_id, 0);
+        assert!(first_cancel.is_cancelled());
+        let (_, _, second_cancel) = leases.schedule_retry(chat_id).unwrap();
+        leases.retry_came_due(chat_id, first);
+        assert!(
+            leases.schedule_retry(chat_id).is_none(),
+            "a retry that came due late does not clear the one scheduled after it"
+        );
+        leases.release(chat_id);
+        assert!(second_cancel.is_cancelled());
+    }
 
     fn lease_directory() -> (tempfile::TempDir, PrivateDirectory) {
         let root = tempfile::tempdir().unwrap();
@@ -570,7 +848,7 @@ mod tests {
         leases.remember_generation(chat_id, resumed.generation);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
         write_receiving(&directory, ReceivingChange::Paused).unwrap();
         assert!(matches!(
@@ -586,7 +864,7 @@ mod tests {
         let chat_id = Uuid::new_v4();
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
         let path = directory.path().join(LEASE_FILE);
         std::fs::remove_file(&path).unwrap();
@@ -598,7 +876,7 @@ mod tests {
         drop(intruder);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::Held
+            LeaseCheck::Held { .. }
         ));
     }
 }

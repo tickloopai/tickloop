@@ -187,7 +187,14 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
     );
     assert!(
         reopened
-            .deliver_test_trigger(chat_id, "restart", 2, "check after restart")
+            .deliver_trigger_for_tests(
+                chat_id,
+                tickloop_agent_protocol::TriggerSource::ScheduledTask {
+                    task_id: "restart".into(),
+                    scheduled_for_ms: 2
+                },
+                "check after restart"
+            )
             .await
             .is_err(),
         "a paused Loop takes no Trigger"
@@ -207,7 +214,14 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     assert!(recovered_receiving(&reopened, chat_id).await);
     reopened
-        .deliver_test_trigger(chat_id, "restart", 3, "check after resuming")
+        .deliver_trigger_for_tests(
+            chat_id,
+            tickloop_agent_protocol::TriggerSource::ScheduledTask {
+                task_id: "restart".into(),
+                scheduled_for_ms: 3,
+            },
+            "check after resuming",
+        )
         .await
         .unwrap();
     loop {

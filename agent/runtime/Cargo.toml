@@ -56,3 +56,8 @@ tickloop-agent-test-support = { path = "../test-support" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[features]
+# Exposes test-only seams (a stand-in Trigger source) to the tests of the Agent crates; never
+# enabled by a build.
+test-support = []

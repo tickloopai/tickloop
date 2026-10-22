@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, Instant};
 
+use super::loop_lease::TriggerPermit;
 use super::tick_content::{
     DeliveredWatermark, TickContentCache, WATERMARK_DIRECTORY, read_watermark, remove_watermark,
     write_watermark,
@@ -629,6 +630,48 @@ impl TickDeliveries {
             .collect()
     }
 
+    /// The restored delivery's items bound to the watches their subscriptions run now, where the
+    /// subscription, its instance and its authority are still the ones the delivery was
+    /// accepted under: a load or another process watches through a new watch, and the delivery
+    /// stays the same.
+    pub(super) fn rebind_restored_items(
+        &self,
+        chat_id: ChatId,
+        chat_loop: &LoopSnapshot,
+        items: &mut [TickDeliveryItem],
+    ) {
+        for item in items {
+            let Some(configured) = chat_loop.subscriptions.iter().find(|configured| {
+                configured.id == item.subscription && configured.instance == item.instance
+            }) else {
+                continue;
+            };
+            if let Some(runtime) = self
+                .subscriptions
+                .get(&item.subscription)
+                .filter(|runtime| {
+                    runtime.instance == item.instance
+                        && runtime.chat_id == chat_id
+                        && runtime.loop_id == chat_loop.id
+                        && runtime.authority == configured.authority
+                })
+            {
+                item.watch = runtime.watch;
+            }
+        }
+    }
+
+    /// Whether an item of a new delivery was delivered already: a delivery prepared before the
+    /// lease told what another process delivered does not reach the Loop.
+    pub(super) fn holds_delivered_items(&self, items: &[TickDeliveryItem]) -> bool {
+        items.iter().any(|item| {
+            self.subscriptions
+                .get(&item.subscription)
+                .and_then(|runtime| runtime.delivered)
+                .is_some_and(|delivered| item.sequence <= delivered.sequence)
+        })
+    }
+
     /// The Tick Update source's own condition.
     pub(super) fn items_eligibility(
         &self,
@@ -935,25 +978,44 @@ impl TickDeliveries {
 
     /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
     /// same instance takes their place and merges their updates. While they wait they hold no
-    /// data: as data too large for the content cache, each keeps only what [`left_out`] keeps and
-    /// is read again before delivery.
+    /// data of their own: each keeps only what [`left_out`] keeps and is read again before
+    /// delivery, and its data waits in the content cache, within its budget, for a Tick that
+    /// cannot be read again then.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
         for mut item in items {
+            let data = (!item.needs_refill).then(|| item.data.clone());
             item.data = left_out(&item.kind, &item.data);
             item.needs_refill = true;
-            match pending.items.remove(&item.instance) {
-                Some(newer) => {
-                    pending
-                        .items
-                        .insert(item.instance.clone(), newer.superseding(&item));
-                }
-                None => {
-                    pending.items.insert(item.instance.clone(), item);
+            let (subscription, sequence) = (item.subscription, item.sequence);
+            // Deliveries put back in any order: the newest update of the instance stays.
+            let kept = match pending.items.remove(&item.instance) {
+                Some(waiting) if waiting.sequence >= item.sequence => waiting.superseding(&item),
+                Some(waiting) => item.superseding(&waiting),
+                None => item,
+            };
+            if kept.sequence == sequence
+                && let Some(data) = data
+            {
+                self.content.put_back(subscription, sequence, data);
+            }
+            pending.items.insert(kept.instance.clone(), kept);
+        }
+        self.hold(owner, Instant::now());
+    }
+
+    /// The updates `items` carry no longer wait in their subscriptions: they were delivered.
+    fn let_go(&mut self, items: &[DeliveryItem]) {
+        for item in items {
+            if let Some(runtime) = self.subscriptions.get_mut(&item.subscription) {
+                runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
+                if let Some(first) = &runtime.first {
+                    runtime.pending_since = Some(first.received_at);
+                } else if runtime.accumulated == 0 && !runtime.has_pending_change {
+                    runtime.pending_since = None;
                 }
             }
         }
-        self.hold(owner, Instant::now());
     }
 
     /// Keeps `owner`'s pending delivery until its Loop can take it. It flushes when the Loop's
@@ -2016,14 +2078,24 @@ impl Agent {
                     Some(port) => port.read_current(chat_id, &item.instance).await,
                     None => Ok(None),
                 };
-                if let Ok(Some(current)) = current
-                    && current.sequence >= item.sequence
-                {
-                    item.updates += current.sequence - item.sequence;
-                    item.sequence = current.sequence;
-                    item.observed_at = current.observed_at;
-                    item.data = current.data;
-                    item.needs_refill = false;
+                let put_back = self
+                    .tick_deliveries()
+                    .content
+                    .take_put_back(item.subscription, item.sequence);
+                match (current, put_back) {
+                    (Ok(Some(current)), _) if current.sequence >= item.sequence => {
+                        item.updates += current.sequence - item.sequence;
+                        item.sequence = current.sequence;
+                        item.observed_at = current.observed_at;
+                        item.data = current.data;
+                        item.needs_refill = false;
+                    }
+                    // A Tick that cannot be read again is delivered with what it gave before.
+                    (_, Some(data)) => {
+                        item.data = data;
+                        item.needs_refill = false;
+                    }
+                    (_, None) => {}
                 }
                 let still_admitted = match &port {
                     Some(port) => port
@@ -2044,15 +2116,30 @@ impl Agent {
             }
             items.push(item);
         }
+        // What was delivered is known only under the lease, once what another process holding it
+        // delivered is taken over: the items are sorted out and batched after that. The entry
+        // holds back a batch that a later takeover finds delivered.
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        match self.acquire_trigger_permit(chat_id, &boundary).await {
+            TriggerPermit::Fire(_) => {}
+            TriggerPermit::Wait { .. } | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
+                self.tick_deliveries().restore(owner, items);
+                self.inner.tick_wake.notify_one();
+                return;
+            }
+        }
+        drop(boundary);
         {
-            let deliveries = self.tick_deliveries();
-            items.retain(|item| {
+            let mut deliveries = self.tick_deliveries();
+            let (fresh, delivered): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
                 deliveries
                     .subscriptions
                     .get(&item.subscription)
                     .and_then(|runtime| runtime.delivered)
                     .is_none_or(|delivered| item.sequence > delivered.sequence)
             });
+            deliveries.let_go(&delivered);
+            items = fresh;
         }
         if items.is_empty() {
             return;
@@ -2084,10 +2171,10 @@ impl Agent {
             // Held, they flush as soon as the run this delivery starts ends.
             self.tick_deliveries().restore(owner, deferred);
         }
-        let (marks, previous_marks) = {
+        let marks = {
             let deliveries = self.tick_deliveries();
             let delivery = Uuid::new_v4();
-            let marks = items
+            items
                 .iter()
                 .map(|item| {
                     let watermarks = deliveries
@@ -2103,50 +2190,8 @@ impl Agent {
                         },
                     )
                 })
-                .collect::<Vec<_>>();
-            let previous_marks = items
-                .iter()
-                .map(|item| {
-                    (
-                        item.subscription,
-                        deliveries
-                            .subscriptions
-                            .get(&item.subscription)
-                            .and_then(|runtime| runtime.delivered),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (marks, previous_marks)
+                .collect::<Vec<_>>()
         };
-        // The watermark is durable before the delivery is handed on, so a repeat of this update
-        // is never delivered again, even by a later process.
-        let durable = marks.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            durable
-                .iter()
-                .filter_map(|(subscription, directory, mark)| {
-                    directory
-                        .as_ref()
-                        .map(|directory| (directory, subscription, mark))
-                })
-                .try_for_each(|(directory, subscription, mark)| {
-                    write_watermark(directory, *subscription, *mark)
-                })
-        })
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            self.tick_deliveries().restore(owner, items);
-            self.inner.tick_wake.notify_one();
-            return;
-        }
-        {
-            let mut deliveries = self.tick_deliveries();
-            for (subscription, _, mark) in marks {
-                if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
-                    runtime.delivered = Some(mark);
-                }
-            }
-        }
         let source = TriggerSource::TickUpdate {
             items: items
                 .iter()
@@ -2170,34 +2215,146 @@ impl Agent {
                 },
             )
             .await;
-        let mut deliveries = self.tick_deliveries();
         match outcome {
             Ok(_) => {
-                let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
-                for item in &items {
-                    if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
-                        runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
-                        if let Some(first) = &runtime.first {
-                            runtime.pending_since = Some(first.received_at);
-                        } else if runtime.accumulated == 0 && !runtime.has_pending_change {
-                            runtime.pending_since = None;
-                        }
-                        runtime.last_delivery_ms = Some(delivered_at);
-                        runtime.last_delivery = Some(summary.clone());
-                    }
-                }
+                self.record_delivery(&marks, &items, &summary);
+                self.record_delivered_watermarks(chat_id, marks).await;
             }
             Err(_) => {
-                // Not delivered, so not delivered again: the in-memory watermark goes back for
-                // the restored items. A durable watermark written ahead may skip them after a
-                // restart, as a crash right after writing it would.
-                for (subscription, previous) in previous_marks {
-                    if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
-                        runtime.delivered = previous;
-                    }
-                }
-                deliveries.restore(owner, items);
+                self.tick_deliveries().restore(owner, items);
                 self.inner.tick_wake.notify_one();
+            }
+        }
+    }
+
+    /// What an accepted delivery leaves in its subscriptions: the updates it carried are
+    /// delivered and no longer wait.
+    fn record_delivery(
+        &self,
+        marks: &[(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)],
+        items: &[DeliveryItem],
+        summary: &str,
+    ) {
+        let mut deliveries = self.tick_deliveries();
+        let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        for (subscription, _, mark) in marks {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
+                runtime.delivered = Some(*mark);
+            }
+        }
+        deliveries.let_go(items);
+        for item in items {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
+                runtime.last_delivery_ms = Some(delivered_at);
+                runtime.last_delivery = Some(summary.to_owned());
+            }
+        }
+    }
+
+    /// Writes the watermarks of an accepted delivery once its acceptance is durable, so no
+    /// later process skips an update the ledger does not hold: a crash before this leaves the
+    /// update to be delivered again, where the ledger finds it; a crash after it finds the
+    /// accepted input queued again when the Chat loads.
+    async fn record_delivered_watermarks(
+        &self,
+        chat_id: ChatId,
+        marks: Vec<(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)>,
+    ) {
+        if marks.iter().all(|(_, directory, _)| directory.is_none()) {
+            return;
+        }
+        let accepted = {
+            let chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get(&chat_id) else {
+                return;
+            };
+            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await
+        };
+        if accepted.is_err() {
+            return;
+        }
+        // A watermark that cannot be written only lets the update be delivered again, which
+        // the ledger holds already.
+        let written = tokio::task::spawn_blocking(move || {
+            marks
+                .into_iter()
+                .filter_map(|(subscription, directory, mark)| {
+                    let directory = directory?;
+                    let _ = write_watermark(&directory, subscription, mark);
+                    Some((directory, subscription))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        // A subscription cancelled meanwhile removed its watermark before or after this wrote it;
+        // after, its watermark goes with it here.
+        let cancelled: Vec<_> = {
+            let deliveries = self.tick_deliveries();
+            written
+                .into_iter()
+                .filter(|(_, subscription)| !deliveries.subscriptions.contains_key(subscription))
+                .collect()
+        };
+        if !cancelled.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for (directory, subscription) in cancelled {
+                    let _ = remove_watermark(&directory, subscription);
+                }
+            })
+            .await;
+        }
+    }
+
+    /// The Chat's subscriptions delivered up to the newest of what this process knows, their
+    /// watermarks, which another process holding the Chat's lease may have advanced, and the
+    /// sequences `in_ledger` the ledger holds: an update at or before them is not delivered
+    /// again.
+    pub(super) async fn refresh_tick_watermarks(
+        &self,
+        chat_id: ChatId,
+        in_ledger: HashMap<Uuid, (u64, Uuid)>,
+    ) {
+        let stored: Vec<_> = self
+            .tick_deliveries()
+            .subscriptions
+            .iter()
+            .filter(|(_, runtime)| runtime.chat_id == chat_id)
+            .filter_map(|(id, runtime)| Some((*id, runtime.watermarks.clone()?)))
+            .collect();
+        let mut read = tokio::task::spawn_blocking(move || {
+            stored
+                .into_iter()
+                .filter_map(|(subscription, directory)| {
+                    read_watermark(&directory, subscription)
+                        .ok()
+                        .flatten()
+                        .map(|mark| (subscription, mark))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        read.extend(
+            in_ledger
+                .into_iter()
+                .map(|(subscription, (sequence, delivery))| {
+                    (subscription, DeliveredWatermark { sequence, delivery })
+                }),
+        );
+        let mut deliveries = self.tick_deliveries();
+        for (subscription, mark) in read {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
+                runtime.delivered = Some(mark);
             }
         }
     }
@@ -2781,6 +2938,61 @@ mod manual_admission_tests {
             manual_eligibility(&snapshot, &instance),
             Eligibility::Hold(Hold::PlanReview),
             "data must not approve a plan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod put_back_tests {
+    use super::*;
+
+    fn item(subscription: Uuid, instance: &InstanceRef, sequence: u64) -> DeliveryItem {
+        DeliveryItem {
+            title: None,
+            subscription,
+            watch: Uuid::nil(),
+            instance: instance.clone(),
+            first_sequence: sequence,
+            first_observed_at: String::new(),
+            sequence,
+            observed_at: String::new(),
+            updates: 1,
+            waiting_since: Instant::now(),
+            gap: false,
+            kind: ObservationKind::Protocol,
+            recover_with: None,
+            series: Vec::new(),
+            data: json!({ "seq": sequence }),
+            needs_refill: false,
+        }
+    }
+
+    /// Two deliveries of one subscription put back newest first, then the older, within the
+    /// budget: the newer update waits, with its data for a Tick that cannot be read again.
+    #[tokio::test]
+    async fn deliveries_put_back_out_of_order_keep_the_newest_update_and_its_data() {
+        let mut deliveries = TickDeliveries::default();
+        let owner = (Uuid::new_v4(), Uuid::new_v4());
+        let subscription = Uuid::new_v4();
+        let instance: InstanceRef = "calendar:fixture".parse().unwrap();
+        deliveries.restore(owner, vec![item(subscription, &instance, 2)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 1)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].sequence, 2);
+        assert_eq!(waiting[0].updates, 2);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 2),
+            Some(json!({ "seq": 2 }))
+        );
+
+        deliveries.restore(owner, vec![item(subscription, &instance, 3)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 4)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting[0].sequence, 4);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 4),
+            Some(json!({ "seq": 4 }))
         );
     }
 }

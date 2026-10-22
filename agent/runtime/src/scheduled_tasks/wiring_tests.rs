@@ -336,11 +336,31 @@ async fn a_one_shot_task_runs_once_and_is_deleted() {
     ]);
     let (_directory, agent, chat) = local_agent(model.clone()).await;
     turn(&agent, chat, "a reminder in a quarter of an hour").await;
+    let task_id = tasks(&agent, chat).await[0].id.clone();
     let mut events = agent.subscribe();
-    agent.run_due_scheduled_tasks(chat, at(10, 15, 0)).await;
+    let receipts = agent.run_due_scheduled_tasks(chat, at(10, 15, 0)).await;
+    assert_eq!(receipts.len(), 1);
     wait_seen(&model, "remind me", 1).await;
     wait_idle(&agent, chat).await;
     assert!(tasks(&agent, chat).await.is_empty());
+    // The run's ledger record names the task and the time it ran for.
+    let identity = tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
+        task_id,
+        scheduled_for_ms: ms(at(10, 15, 0)),
+    };
+    let input = tickloop_agent_transcript::input_ids::trigger(chat, &identity);
+    let record = chat_of(&agent, chat)
+        .await
+        .bookkeeping
+        .lifecycle
+        .input(input)
+        .cloned()
+        .expect("the run has its ledger record");
+    assert_eq!(record.run_id, receipts[0].run_id);
+    assert_eq!(
+        record.trigger.map(|trigger| trigger.identity),
+        Some(identity)
+    );
     let notice = tokio::time::timeout(WAIT, async {
         loop {
             if let EventKind::ScheduledTasksChanged {

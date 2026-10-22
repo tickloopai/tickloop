@@ -152,6 +152,55 @@ pub struct TickDeliveryItem {
     pub updates: u64,
 }
 
+/// What one Trigger delivery is: the part of its [`TriggerSource`] that every delivery of it
+/// carries alike. What another delivery of it may carry differently, such as the watch a Tick
+/// Update came through, how many updates it merged or when a Tick was read, is no part of it.
+/// It names the delivery's ledger id, and its records keep it to say where it came from.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerIdentity {
+    /// Each subscription's update, ordered by subscription and sequence.
+    TickUpdate {
+        updates: Vec<SubscriptionSequence>,
+    },
+    TickManual {
+        instance: InstanceRef,
+        sequence: u64,
+    },
+    ArtifactFeedback {
+        origin: String,
+        account_id: String,
+        delivery_id: Uuid,
+    },
+    GoalContinuation {
+        goal_id: Uuid,
+        after_run: RunId,
+    },
+    ScheduledTask {
+        task_id: String,
+        scheduled_for_ms: u64,
+    },
+}
+
+/// One Tick Subscription's update by its sequence.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubscriptionSequence {
+    pub subscription: Uuid,
+    pub sequence: u64,
+}
+
+impl TriggerIdentity {
+    pub fn kind(&self) -> TriggerKind {
+        match self {
+            Self::TickUpdate { .. } => TriggerKind::TickUpdate,
+            Self::TickManual { .. } => TriggerKind::TickManual,
+            Self::ArtifactFeedback { .. } => TriggerKind::ArtifactFeedback,
+            Self::GoalContinuation { .. } => TriggerKind::GoalContinuation,
+            Self::ScheduledTask { .. } => TriggerKind::ScheduledTask,
+        }
+    }
+}
+
 /// The kinds of [`TriggerSource`], without their content.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +251,49 @@ impl TriggerSource {
             Self::ArtifactFeedback { .. } => TriggerKind::ArtifactFeedback,
             Self::GoalContinuation { .. } => TriggerKind::GoalContinuation,
             Self::ScheduledTask { .. } => TriggerKind::ScheduledTask,
+        }
+    }
+
+    pub fn identity(&self) -> TriggerIdentity {
+        match self {
+            Self::TickUpdate { items } => {
+                let mut updates: Vec<_> = items
+                    .iter()
+                    .map(|item| SubscriptionSequence {
+                        subscription: item.subscription,
+                        sequence: item.sequence,
+                    })
+                    .collect();
+                updates.sort_unstable();
+                TriggerIdentity::TickUpdate { updates }
+            }
+            Self::TickManual {
+                instance, sequence, ..
+            } => TriggerIdentity::TickManual {
+                instance: instance.clone(),
+                sequence: *sequence,
+            },
+            Self::ArtifactFeedback {
+                origin,
+                account_id,
+                delivery_id,
+                ..
+            } => TriggerIdentity::ArtifactFeedback {
+                origin: origin.clone(),
+                account_id: account_id.clone(),
+                delivery_id: *delivery_id,
+            },
+            Self::GoalContinuation { goal_id, after_run } => TriggerIdentity::GoalContinuation {
+                goal_id: *goal_id,
+                after_run: *after_run,
+            },
+            Self::ScheduledTask {
+                task_id,
+                scheduled_for_ms,
+            } => TriggerIdentity::ScheduledTask {
+                task_id: task_id.clone(),
+                scheduled_for_ms: *scheduled_for_ms,
+            },
         }
     }
 

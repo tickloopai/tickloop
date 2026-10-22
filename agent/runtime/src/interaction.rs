@@ -380,6 +380,7 @@ impl Agent {
                 SettledOutcome::Merged {
                     into: request.run_id,
                 },
+                None,
             );
             self.inner.ledger_changes.send_replace(());
         }

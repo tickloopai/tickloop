@@ -41,6 +41,9 @@ pub(super) enum Hold {
     PlanMode,
     /// The artifact link's account signed out or lost access.
     LinkUnavailable,
+    /// The delivery carries an update the Chat already took, as another process holding its
+    /// lease delivered it; the source sorts it out and delivers the rest.
+    Delivered,
 }
 
 impl Hold {
@@ -53,6 +56,7 @@ impl Hold {
             Self::PlanReview => "this Chat's Loop waits for its plan to be reviewed",
             Self::PlanMode => "Plan mode holds it back",
             Self::LinkUnavailable => "the artifact link's account is unavailable",
+            Self::Delivered => "this Chat already took an update the delivery carries",
         }
     }
 }
@@ -110,11 +114,11 @@ pub(super) fn trigger_ledger(
         TriggerSource::TickUpdate { .. }
         | TriggerSource::TickManual { .. }
         | TriggerSource::GoalContinuation { .. }
-        | TriggerSource::ScheduledTask { .. } => lifecycle::LedgerInput::new(
-            tickloop_agent_transcript::input_ids::trigger(chat_id, source),
-            InputOp::Trigger,
-            source,
-        ),
+        | TriggerSource::ScheduledTask { .. } => {
+            // The id is named by the delivery's whole identity, so the payload is the id itself.
+            let id = tickloop_agent_transcript::input_ids::trigger(chat_id, &source.identity());
+            lifecycle::LedgerInput::new(id, InputOp::Trigger, &id)
+        }
     }
 }
 
@@ -141,10 +145,6 @@ pub(super) fn recover_loop(snapshot: &mut ChatSnapshot, keeps_run: bool, waits: 
                     reason: PauseReason::HistoryLoaded,
                 };
             }
-            // Its Trigger input is lost with the process; the sources deliver again.
-            snapshot
-                .pending_inputs
-                .retain(|pending| pending.trigger_source.is_none());
         }
         WaitHosting::Durable => {}
     }
@@ -250,6 +250,18 @@ impl Agent {
             Eligibility::Hold(hold) => return Admission::Hold(hold),
             Eligibility::Ended(reason) => return Admission::Refuse(reason),
         }
+        let carries_delivered = match source {
+            TriggerSource::TickUpdate { items } => {
+                self.tick_deliveries().holds_delivered_items(items)
+            }
+            TriggerSource::TickManual { .. }
+            | TriggerSource::ArtifactFeedback { .. }
+            | TriggerSource::GoalContinuation { .. }
+            | TriggerSource::ScheduledTask { .. } => false,
+        };
+        if carries_delivered {
+            return Admission::Hold(Hold::Delivered);
+        }
         let waiting = chat.snapshot.pending_inputs.iter().find(|pending| {
             pending
                 .trigger_source
@@ -302,58 +314,42 @@ impl Agent {
     }
 
     /// A delivery that merged into the waiting input `into` keeps its own ledger record, which
-    /// names its source and what it merged into.
+    /// names its source and what it merged into. Its receipt is `into`'s, the run that answers
+    /// it, on its first acceptance and on every replay.
     pub(super) fn record_merged_trigger(
         &self,
         chat: &mut Chat,
         ledger: &lifecycle::LedgerInput,
         source: &TriggerSource,
-        input: &str,
         into: &Receipt,
     ) {
-        let merged = PendingInput {
-            receipt: Receipt {
-                run_id: Uuid::new_v4(),
-                ..into.clone()
-            },
-            input: input.to_owned(),
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: Some(source.clone()),
-            armed: true,
-            queued_sequence: chat.snapshot.last_queue_sequence,
-            task_continuation: false,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
-        };
-        chat.bookkeeping.lifecycle.accept(ledger, &merged);
-        self.settle_input(
-            chat,
-            merged.receipt.run_id,
+        chat.bookkeeping.lifecycle.record_settled(
+            ledger,
+            into,
             SettledOutcome::Merged { into: into.run_id },
+            Some(tickloop_agent_transcript::TriggerRecord::of(source)),
         );
     }
 
-    /// The one entry every Trigger delivery comes through: under the Chat's lease, after its
-    /// source proves it again, it is queued or merged as its source coalesces, or refused. An
-    /// error leaves the delivery with its source.
+    /// The one entry every Trigger delivery comes through: within the Chat's Trigger boundary,
+    /// under its lease, after its source proves it again, it is queued or merged as its source
+    /// coalesces, or refused. An error leaves the delivery with its source.
     pub(super) async fn deliver_trigger(
         &self,
         chat_id: ChatId,
         delivery: TriggerDelivery,
     ) -> Result<Receipt, AgentError> {
-        match self.acquire_trigger_permit(chat_id).await {
-            TriggerPermit::Fire => {}
-            TriggerPermit::Wait(reason) => return Err(AgentError::Invalid(reason)),
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let holding = match self.acquire_trigger_permit(chat_id, &boundary).await {
+            TriggerPermit::Fire(holding) => holding,
+            TriggerPermit::Wait { reason, .. } => return Err(AgentError::Invalid(reason)),
             TriggerPermit::Withdrawn => {
                 return Err(AgentError::Invalid(
                     "receiving was paused in another Tickloop process; the delivery waits".into(),
                 ));
             }
             TriggerPermit::Failed(error) => return Err(AgentError::Storage(error)),
-        }
+        };
         // Boxed: proving a source reads its Tick, which must not enlarge every caller's stack.
         Box::pin(self.revalidate_trigger_source(chat_id, &delivery.source)).await?;
         let TriggerDelivery {
@@ -366,6 +362,7 @@ impl Agent {
             input,
             SubmissionOptions {
                 trigger_source: Some(source),
+                trigger_lease: Some((holding, boundary)),
                 ledger,
                 ..Default::default()
             },
@@ -452,6 +449,89 @@ impl Agent {
                 self.save(&chat.snapshot);
             }
         }
+    }
+
+    /// The Chat's Trigger state as a load would build it from the store, taken over under a
+    /// newly held lease: the ledger's Trigger records, the Trigger input that waits, and the
+    /// Tick sequences delivered. What another process accepted, ran or settled while it held the
+    /// lease is known here as it is there. The user's input and Agent messages are this
+    /// process's own and stay as they are.
+    pub(super) async fn reload_trigger_state(&self, chat_id: ChatId) -> Result<(), String> {
+        // Nothing of the Chat is stored yet, so no other process took anything of it.
+        if !self.transcript_materialized(chat_id) {
+            return Ok(());
+        }
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or("the Chat is no longer loaded")?;
+            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await?;
+        }
+        let lines = match self.read_stored_lines(chat_id).await {
+            Ok(lines) => lines,
+            Err(AgentError::NotFound) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(chat_id, trigger_pauses::PausePoint::TakeoverRead)
+            .await;
+        let (delivered, takes_waiting_input) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&chat_id)
+                .ok_or("the Chat is no longer loaded")?;
+            chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
+            let lifecycle = &chat.bookkeeping.lifecycle;
+            let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut chat.snapshot.pending_inputs)
+                    .into_iter()
+                    .partition(|pending| {
+                        pending.trigger_source.is_none()
+                            || lifecycle.waits_to_start(pending.receipt.run_id)
+                    });
+            chat.snapshot.pending_inputs = kept;
+            for pending in &taken_elsewhere {
+                chat.feedback_inputs.remove(&pending.receipt.run_id);
+                self.inner
+                    .host_contexts
+                    .lock()
+                    .unwrap()
+                    .runs
+                    .remove(&pending.receipt.run_id);
+            }
+            self.requeue_inputs(chat, durable_queue::is_trigger_input);
+            if chat.snapshot.pending_inputs.is_empty()
+                && chat.snapshot.chat_loop.state == LoopState::Queued
+            {
+                chat.snapshot.chat_loop.set_state(LoopState::Idle);
+            }
+            self.save(&chat.snapshot);
+            let takes_waiting_input = chat.active.is_none()
+                && chat
+                    .snapshot
+                    .pending_inputs
+                    .iter()
+                    .any(|pending| pending.trigger_source.is_some());
+            (
+                chat.bookkeeping.lifecycle.delivered_tick_sequences(),
+                takes_waiting_input,
+            )
+        };
+        self.refresh_tick_watermarks(chat_id, delivered).await;
+        if takes_waiting_input {
+            self.inner
+                .tasks
+                .spawn(self.clone().start_waiting_input(chat_id));
+        }
+        Ok(())
+    }
+
+    /// Starts what waits in an idle Loop. Its future is named, not inferred: starting a run asks
+    /// for the lease, whose taking over may start this again.
+    fn start_waiting_input(self, chat_id: ChatId) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = self.start_next_agent_run(chat_id).await;
+        })
     }
 
     /// The pause another process recorded: this process pauses too, without recording it again.
@@ -554,28 +634,178 @@ impl Agent {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Agent {
-    /// A delivery of a source with no condition of its own, for tests of what the base does with
-    /// any delivery: a scheduled run of `task` at `scheduled_for_ms`.
-    pub(crate) async fn deliver_test_trigger(
+    /// Hands a delivery of `source` to the one entry, for tests standing in for a source that
+    /// has no producer of its own yet.
+    #[doc(hidden)]
+    pub async fn deliver_trigger_for_tests(
         &self,
         chat_id: ChatId,
-        task: &str,
-        scheduled_for_ms: u64,
+        source: TriggerSource,
         input: &str,
     ) -> Result<Receipt, AgentError> {
         self.deliver_trigger(
             chat_id,
             TriggerDelivery {
-                source: TriggerSource::ScheduledTask {
-                    task_id: task.into(),
-                    scheduled_for_ms,
-                },
+                source,
                 input: input.into(),
                 ledger: None,
             },
         )
         .await
+    }
+
+    /// Takes back the queued deliveries `ended` names, as a source that stopped standing behind
+    /// them does.
+    #[doc(hidden)]
+    pub async fn withdraw_trigger_for_tests(
+        &self,
+        chat_id: ChatId,
+        ended: impl Fn(&TriggerSource) -> bool,
+    ) {
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        let withdrawn: Vec<_> = chat
+            .snapshot
+            .pending_inputs
+            .iter()
+            .filter(|pending| pending.trigger_source.as_ref().is_some_and(&ended))
+            .map(|pending| pending.receipt.clone())
+            .collect();
+        for receipt in withdrawn {
+            self.withdraw_trigger_input(chat, &receipt, DiscardReason::SourceEnded);
+        }
+        self.save(&chat.snapshot);
+    }
+
+    /// Pauses the Chat the next time it reaches `point`; dropping `release` lets it go on.
+    #[doc(hidden)]
+    pub fn pause_next_for_tests(
+        &self,
+        chat_id: ChatId,
+        point: trigger_pauses::PausePoint,
+    ) -> trigger_pauses::Pause {
+        trigger_pauses::pause_next(self.pause_key(), chat_id, point)
+    }
+
+    /// Holds the Chat at `point` if a test asked to.
+    pub(super) async fn pause_point(&self, chat_id: ChatId, point: trigger_pauses::PausePoint) {
+        trigger_pauses::wait_if_paused(self.pause_key(), chat_id, point).await;
+    }
+
+    /// Pauses are this Agent's own: another Agent in the same test process holding the same Chat
+    /// passes the same points.
+    fn pause_key(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.inner) as usize
+    }
+}
+
+/// Points within the Chat's Trigger boundary a test can hold a Chat at.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod trigger_pauses {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use tickloop_agent_protocol::ChatId;
+    use tokio::sync::oneshot;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum PausePoint {
+        /// A takeover read the store and has not applied it.
+        TakeoverRead,
+        /// The receiving switch was recorded, and a pause has not released its holding.
+        ReceivingRecorded,
+        /// Queued Trigger input passed its permit and the check of its holding, and has not
+        /// started.
+        TriggerChecked,
+    }
+
+    type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    /// A point of one Chat in one Agent.
+    type At = (usize, ChatId, PausePoint);
+
+    static GATES: Mutex<Option<HashMap<At, Gate>>> = Mutex::new(None);
+
+    pub struct Pause {
+        pub entered: oneshot::Receiver<()>,
+        pub release: oneshot::Sender<()>,
+    }
+
+    pub(crate) fn pause_next(agent: usize, chat: ChatId, point: PausePoint) -> Pause {
+        let (entered_sender, entered) = oneshot::channel();
+        let (release, release_receiver) = oneshot::channel();
+        GATES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert((agent, chat, point), (entered_sender, release_receiver));
+        Pause { entered, release }
+    }
+
+    pub(crate) async fn wait_if_paused(agent: usize, chat: ChatId, point: PausePoint) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|gates| gates.remove(&(agent, chat, point)));
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickloop_agent_protocol::TickDeliveryItem;
+
+    fn tick_update(watch: u128, updates: u64, items: &[(u128, u64)]) -> TriggerSource {
+        TriggerSource::TickUpdate {
+            items: items
+                .iter()
+                .map(|(subscription, sequence)| TickDeliveryItem {
+                    subscription: Uuid::from_u128(*subscription),
+                    watch: Uuid::from_u128(watch),
+                    instance: "calendar:fixture".parse().unwrap(),
+                    sequence: *sequence,
+                    updates,
+                })
+                .collect(),
+        }
+    }
+
+    /// A delivery repeated through another watch, read again later or merging more updates is
+    /// the same delivery: its ledger input matches, so the ledger replays it instead of refusing
+    /// it as an id reused with another payload.
+    #[test]
+    fn a_repeated_delivery_names_the_same_ledger_input() {
+        let chat = Uuid::new_v4();
+        let same = |left: &TriggerSource, right: &TriggerSource| {
+            let (left, right) = (
+                trigger_ledger(chat, left, "first rendering"),
+                trigger_ledger(chat, right, "second rendering"),
+            );
+            left.id == right.id && left.digest == right.digest
+        };
+        assert!(same(
+            &tick_update(1, 1, &[(10, 4), (11, 7)]),
+            &tick_update(2, 3, &[(11, 7), (10, 4)]),
+        ));
+        assert!(!same(
+            &tick_update(1, 1, &[(10, 4)]),
+            &tick_update(1, 1, &[(10, 5)]),
+        ));
+        let manual = |read_at_ms| TriggerSource::TickManual {
+            instance: "calendar:fixture".parse().unwrap(),
+            sequence: 9,
+            read_at_ms,
+            authority: None,
+        };
+        assert!(same(&manual(1_000), &manual(2_000)));
     }
 }

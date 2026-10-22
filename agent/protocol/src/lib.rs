@@ -142,7 +142,8 @@ pub use local_messages::{
 };
 pub use loops::{
     Authority, Coalesce, EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice,
-    LoopTriggerNoticeKind, PauseReason, Receiving, TickDeliveryItem, TriggerKind, TriggerSource,
+    LoopTriggerNoticeKind, PauseReason, Receiving, SubscriptionSequence, TickDeliveryItem,
+    TriggerIdentity, TriggerKind, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,

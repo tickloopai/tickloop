@@ -1,7 +1,7 @@
 //! Artifact feedback for the Chat's Loop: linking and unlinking an account's artifacts and the
 //! watcher that claims their @tickloop requests through the service's HTTP lifecycle.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -21,7 +21,7 @@ use tickloop_agent_protocol::{
     ArtifactFeedbackHistory, ArtifactTick, ChatId, EventSourceBinding, InputId, LoopId,
     LoopSnapshot, Receipt, TriggerSource,
 };
-use tickloop_agent_transcript::{DiscardReason, InputOp, InputState};
+use tickloop_agent_transcript::{DiscardReason, InputState};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_PENDING_PAGES_PER_POLL: usize = 8;
@@ -82,35 +82,6 @@ pub(super) fn feedback_eligibility(
         Some(source) if source.resume_required => Eligibility::Hold(Hold::LinkUnavailable),
         Some(_) => Eligibility::Eligible,
     }
-}
-
-/// The ledger inputs of the @tickloop requests a load leaves open under process wait hosting:
-/// accepted and not yet in the conversation, for the Chat's Loop, and still pending in the local
-/// inbox, which delivers them again.
-pub(super) fn requests_the_inbox_delivers_again(chat: &super::Chat) -> HashSet<InputId> {
-    let pending = feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat.snapshot.id)
-        .pending()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|input| input.identity.input_id())
-        .collect::<HashSet<_>>();
-    chat.bookkeeping
-        .lifecycle
-        .open_entries()
-        .into_iter()
-        .filter(|entry| {
-            entry.op == InputOp::Feedback
-                && entry.state == InputState::Accepted
-                && pending.contains(&entry.input_id)
-                && !chat
-                    .snapshot
-                    .message_runs
-                    .values()
-                    .any(|run| *run == entry.run_id)
-                && chat.snapshot.chat_loop.id == entry.loop_id
-        })
-        .map(|entry| entry.input_id)
-        .collect()
 }
 
 /// An @tickloop request the Artifacts service delivered to one receiver, the Loop of a Chat:
@@ -674,12 +645,14 @@ impl Agent {
         if sources.is_empty() {
             return EventPollOutcome::Stop;
         }
-        match self.acquire_trigger_permit(chat_id).await {
-            super::loop_lease::TriggerPermit::Fire => {}
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        match self.acquire_trigger_permit(chat_id, &boundary).await {
+            super::loop_lease::TriggerPermit::Fire(_) => {}
             super::loop_lease::TriggerPermit::Withdrawn => return EventPollOutcome::Stop,
-            super::loop_lease::TriggerPermit::Wait(_)
+            super::loop_lease::TriggerPermit::Wait { .. }
             | super::loop_lease::TriggerPermit::Failed(_) => return EventPollOutcome::Skipped,
         }
+        drop(boundary);
         let Ok(client) = artifact_client(self) else {
             return EventPollOutcome::Stop;
         };
@@ -1179,6 +1152,32 @@ impl Agent {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl Agent {
+    /// Takes `delivery` in as the watcher does once it claimed the request: saved in the local
+    /// inbox, then handed to the Loop as the inbox hands each request.
+    #[doc(hidden)]
+    pub async fn receive_feedback_for_tests(
+        &self,
+        chat_id: ChatId,
+        delivery: ExternalDelivery,
+    ) -> Result<Receipt, AgentError> {
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
+                .stage(feedback_inbox::FeedbackInput::new(
+                    delivery.identity(chat_id, chat.snapshot.chat_loop.id),
+                    delivery.prompt.clone(),
+                ))
+                .map_err(|error| AgentError::Storage(error.to_string()))?;
+        }
+        self.advance(chat_id, super::TurnRequest::deliver(delivery))
+            .await
+            .map(|turn| turn.receipt().clone())
+    }
+}
+
 #[cfg(test)]
 mod feedback_admission_tests {
     use super::*;
@@ -1432,24 +1431,32 @@ mod feedback_admission_tests {
         second.resume_chat(chat_id).await.unwrap();
         assert!(
             matches!(
-                second.acquire_trigger_permit(chat_id).await,
-                super::super::loop_lease::TriggerPermit::Wait(_)
+                second
+                    .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                    .await,
+                super::super::loop_lease::TriggerPermit::Wait { .. }
             ),
             "a loaded Chat pauses receiving"
         );
         second.continue_loop(chat_id).await.unwrap();
         assert!(matches!(
-            first.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Fire
+            first
+                .acquire_trigger_permit(chat_id, &first.enter_trigger_boundary(chat_id).await)
+                .await,
+            super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         assert!(matches!(
-            second.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Wait(_)
+            second
+                .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                .await,
+            super::super::loop_lease::TriggerPermit::Wait { .. }
         ));
         first.shutdown().await;
         assert!(matches!(
-            second.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Fire
+            second
+                .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                .await,
+            super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         second.shutdown().await;
     }
