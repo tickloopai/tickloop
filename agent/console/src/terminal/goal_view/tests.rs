@@ -1,6 +1,7 @@
 use super::*;
 use crate::terminal::style::{ColourDepth, ThemeName};
 use tickloop_agent_config::DisplayPreferences;
+use unicode_width::UnicodeWidthStr;
 
 fn example_goal() -> GoalView<'static> {
     GoalView {
@@ -70,12 +71,12 @@ fn unbudgeted_goals_show_runtime_and_trigger_pause_takes_priority() {
     };
     assert_eq!(
         status_line(Some(&goal), false, 100).unwrap().text(),
-        "Pursuing goal (1m 30s)"
+        "Pursuing goal (1m)"
     );
     goal.state = GoalState::Complete;
     assert_eq!(
         status_line(Some(&goal), false, 100).unwrap().text(),
-        "Goal achieved (1m 30s)"
+        "Goal achieved (1m)"
     );
     goal.state = GoalState::BudgetLimited;
     assert_eq!(
@@ -120,6 +121,76 @@ fn monitor_caps_condition_at_three_wrapped_lines_and_reason_at_one() {
             "Check: The acceptance check still needs evidence"
         ]
     );
+}
+
+#[test]
+fn monitor_three_line_boundary_preserves_whole_graphemes() {
+    for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
+        for (condition, width, expected) in [
+            (
+                format!("{grapheme}abc"),
+                2,
+                vec![grapheme.to_owned(), "ab".into(), "c".into()],
+            ),
+            (
+                format!("{grapheme}abcde"),
+                2,
+                vec![grapheme.to_owned(), "ab".into(), "c…".into()],
+            ),
+            (
+                format!("abc\ndef\n{grapheme}xy"),
+                3,
+                vec!["abc".into(), "def".into(), format!("{grapheme}…")],
+            ),
+        ] {
+            let goal = GoalView {
+                condition: &condition,
+                check_reason: None,
+                ..example_goal()
+            };
+            let lines = goal.monitor_lines(width, DisplayProfile::default(), 0);
+            assert_eq!(text(&lines[1..4]), expected, "{condition:?}");
+        }
+    }
+}
+
+#[test]
+fn unbudgeted_goal_runtime_uses_compact_minute_hour_and_day_boundaries() {
+    for (elapsed_ms, expected) in [
+        (0, "0s"),
+        (59_999, "59s"),
+        (60_000, "1m"),
+        (90_000, "1m"),
+        (3_599_999, "59m"),
+        (3_600_000, "1h"),
+        (3_659_999, "1h"),
+        (3_660_000, "1h 1m"),
+        (5_400_000, "1h 30m"),
+        (7_199_999, "1h 59m"),
+        (7_200_000, "2h"),
+        (86_399_999, "23h 59m"),
+        (86_400_000, "1d 0h 0m"),
+        (258_120_000, "2d 23h 42m"),
+    ] {
+        let goal = GoalView {
+            token_budget: None,
+            elapsed_ms,
+            ..example_goal()
+        };
+        assert_eq!(goal.usage(), expected, "{elapsed_ms}ms");
+        assert_eq!(
+            status_line(Some(&goal), false, 100).unwrap().text(),
+            format!("Pursuing goal ({expected})")
+        );
+        assert_eq!(
+            goal.monitor_lines(100, DisplayProfile::default(), 0)[2].text(),
+            format!("active · {expected}")
+        );
+        assert_eq!(
+            goal.detail_lines(100, 0, 100)[3].text(),
+            format!("Usage: {expected}")
+        );
+    }
 }
 
 #[test]

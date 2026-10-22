@@ -70,6 +70,22 @@ fn rows_show_cadence_instruction_local_time_and_confirmation_without_selection_c
 }
 
 #[test]
+fn rows_preserve_whole_graphemes_in_instruction_summaries() {
+    for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
+        let instruction = format!("{grapheme}abcdefghijk");
+        let task = ScheduledTaskView {
+            schedule: ScheduleView::Cron("x"),
+            instruction: &instruction,
+            ..task()
+        };
+        assert_eq!(
+            text(&task.row_lines(15, false, render(3_750))),
+            format!("  ◷ x ·\n    {grapheme}a…  09:05")
+        );
+    }
+}
+
+#[test]
 fn each_display_time_keeps_its_own_local_offset_across_clock_changes() {
     let next = at(3_900).to_offset(UtcOffset::from_hms(-5, 0, 0).unwrap());
     let task = ScheduledTaskView {

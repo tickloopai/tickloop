@@ -3,8 +3,6 @@
     expect(dead_code, reason = "tickets 07 and 09 wire the views")
 )]
 
-use unicode_width::UnicodeWidthStr;
-
 use super::{
     display::DisplayProfile,
     list_row::{self, RowFlash},
@@ -62,7 +60,7 @@ impl GoalView<'_> {
     fn usage(&self) -> String {
         match self.token_budget {
             Some(budget) => format!("{} / {}", tokens(self.tokens_used), tokens(budget)),
-            None => list_row::format_elapsed(self.elapsed_ms),
+            None => format_elapsed(self.elapsed_ms),
         }
     }
 
@@ -80,8 +78,7 @@ impl GoalView<'_> {
         if condition.len() > CONDITION_ROWS {
             condition.truncate(CONDITION_ROWS);
             let last = condition.last_mut().expect("condition has three rows");
-            let text = ellipsis(&last.text(), width);
-            *last = RoleLine::role(text, Role::Text);
+            *last = clipped(&format!("{}…", last.text()), width, Role::Text);
         }
         lines.extend(condition);
         lines.push(clipped(
@@ -161,10 +158,27 @@ fn tokens(count: u64) -> String {
     compact_count(count).to_ascii_uppercase()
 }
 
-fn ellipsis(text: &str, width: usize) -> String {
-    let mut line = RoleLine::plain(text);
-    line.truncate(width.saturating_sub("…".width()));
-    format!("{}…", line.text())
+fn format_elapsed(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours >= 24 {
+        let days = hours / 24;
+        let remaining_hours = hours % 24;
+        return format!("{days}d {remaining_hours}h {remaining_minutes}m");
+    }
+    if remaining_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {remaining_minutes}m")
+    }
 }
 
 #[cfg(test)]
