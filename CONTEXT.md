@@ -33,11 +33,12 @@ TickDescribe 查询运行实例的能力与工具目录；TickRead 只读取当�
 _Avoid_：Tick Command（已指以命令形式提供的 Tick）、Action（只表示动作类的一种）
 
 **Tick Subscription（Tick 订阅）**：
-Loop 与特定 Tick Instance 之间明确建立的关联，属于该 Loop 的事件 Trigger 配置，按自身频率把最新一份 Tick Update 交给 Agent；同一 Loop 可以对不同实例使用不同频率，无新内容时不触发。频率只有四档：及时、高频（1 分钟）、中频（10 分钟）、低频（30 分钟）。及时由类型决定、不能选择：Shell Tick 固定为及时；扩展 Tick 与 Terminal Tick 在高频、中频、低频中选择，默认高频；Terminal Tick 的程序退出不等周期，立即交付最后一屏与退出结果。进入 Loop 前不另做内容去重。排队的 Tick 输入在真正启动 Loop 前再次校验 Watch 身份与授权；失效或不确定的 Watch 清除对应交付缓存和排队输入。打开或发现 Tick 不等于订阅，按需读取也不要求订阅；已接收而被覆盖的更新可以计数：每次交付写明这次合并了多少次更新及其 seq 与时间范围，正文只放最新一份。正文超出交付额度（每项 4KB，只有一项到期时 16KB，每次合计 16KB）时按整段裁剪，不以空内容交付：只裁最大的数组或长文本，最新的段连续保留，更早的按翻倍间隔抽样，最早一段保留，跳过处标明数量；一次放不下的项目排到紧接的下一回合。订阅交付附带的 Loop 目标只是背景，不当作本回合的新指令。Artifact Tick 不建立 Tick Subscription，它的订阅就是 Artifact 关联（及时、逐条）。
+Chat 的 Loop 与特定 Tick Instance 之间明确建立的关联，是 Loop 的一种 Trigger，按自身频率把最新一份 Tick Update 交给 Agent；同一 Loop 可以对不同实例使用不同频率，无新内容时不触发。频率只有四档：及时、高频（1 分钟）、中频（10 分钟）、低频（30 分钟）。及时由类型决定、不能选择：Shell Tick 固定为及时；扩展 Tick 与 Terminal Tick 在高频、中频、低频中选择，默认高频；Terminal Tick 的程序退出不等周期，立即交付最后一屏与退出结果。进入 Loop 前不另做内容去重。排队的 Tick 输入在真正启动 Loop 前再次校验 Watch 身份与授权；失效或不确定的 Watch 清除对应交付缓存和排队输入。打开或发现 Tick 不等于订阅，按需读取也不要求订阅；已接收而被覆盖的更新可以计数：每次交付写明这次合并了多少次更新及其 seq 与时间范围，正文只放最新一份。正文超出交付额度（每项 4KB，只有一项到期时 16KB，每次合计 16KB）时按整段裁剪，不以空内容交付：只裁最大的数组或长文本，最新的段连续保留，更早的按翻倍间隔抽样，最早一段保留，跳过处标明数量；一次放不下的项目排到紧接的下一回合。订阅交付附带的 Goal 只是背景，不当作本回合的新指令。Artifact Tick 不建立 Tick Subscription，它的订阅就是 Artifact 关联（及时、逐条）。
 _Avoid_：监听、Watch、轮询
 
 **Loop**：
-围绕一个目标持有执行状态、能够执行、等待和继续的任务单元，统一承载对话、定时和事件驱动的 AI 任务。Loop 支持一次性与持续性目标，由完成条件、期限或用户主动停止决定何时结束。
+每个 Chat 恰好一个、持有该 Chat 执行状态的任务单元：按顺序执行输入队列中的输入，空闲时等待，Trigger 到达或 Goal 续跑时继续。用户输入与 Agent 消息（含子 Agent 完成通知）直接进入输入队列，用户输入排在最前；Trigger 经 Loop 的监听开关送达。Loop 没有结束的终态。Esc（以及运行中输入框为空时的 Ctrl+C）只打断当前一轮：各 Trigger 照常送达，Goal 暂停。`/stop` 让 Loop 全部停下：打断当前一轮、暂停 Goal、暂停监听（Tick 订阅与 Artifact 关联保留但不再送达），并停止本 Agent 的全部后代子 Agent；用户明确继续后恢复监听，Goal 仍需 `/goal resume`，被停的子 Agent 需要另行发消息或 Continue。历史装载后 Loop 同样处于暂停监听。离开界面（`/exit`、关闭 Agent Pane、空闲时输入框为空的 Ctrl+C）不影响 Loop，Agent 在本机 Daemon 中继续执行、监听和续跑 Goal。后台 Shell 不受 Esc 和 `/stop` 影响，单独停止；Esc 也不影响子 Agent。
+_Avoid_：多个 Loop、goal 列表、StartGoal
 
 **Tickhost（Tick 宿主服务）**：
 独立于 Daemon 和布局宿主的本机服务，运行本机的全部 Tick 进程（扩展 Tick、Terminal Tick 与 Shell Tick）并持有它们的终端与屏幕，由 Daemon 按需拉起；没有 Daemon 的嵌入式 Agent 不运行 Shell 命令。Tick 在这里运行；Herdr Pane、Monitor 弹窗或任何普通终端只是附着的视图，同一 Tick 可以同时有多个视图，每个都能输入，关闭视图不结束 Tick；窗口大小不同时，屏幕跟随最近一次输入的视图。Esc（隐藏视图）与 Ctrl+B（附着前缀）属于视图，Tick 不绑定。Shell Tick 的生存期跟随执行所有者：普通 Worker 退出、崩溃或明确停止 Daemon 时停止；计划升级通过一次性所有权交接保持同一 Shell 进程。扩展 Tick 与 Terminal Tick 不因空闲被回收，只在被关闭、所属 Agent 被明确停止或 Tickhost 失效时结束；没有所有者的孤儿 Tick 照常清理。服务失效后明确重开产生新实例，旧订阅需要重新确认。Tickhost 的内容身份只随自身生产源码、实际依赖和相关编译输入变化，独立于产品版本及无关 Agent/UI 修改。协议兼容的旧 Tickhost 继续运行；内容改变且宿主原子确认没有需保留的实例、启动请求和附着时自动替换。协议不兼容且仍有工作时保留并延后依赖它的升级，用户可明确用 `tickhost stop` 结束它，普通启动不弹替换菜单。程序、进程和命令统一写作 `tickhost`。
@@ -48,19 +49,21 @@ _Avoid_：Tick host、tick-host、tick_host
 
 ### Loop 的触发配置
 
-**Trigger（触发条件）**：
-Loop 开始或继续执行的条件，包括用户输入、定时和事件触发。Trigger 属于 Loop 的配置，满足条件后仍需遵循目标的执行状态与授权约束。
+**Trigger（唤醒来源）**：
+Loop 主动监听、不经用户输入就让 Loop 继续执行的来源：Tick 订阅、Artifact 关联与 Goal 续跑；以后的定时作为新的来源加入，目前没有定时。所有来源共用同一个投递底座：一个监听开关、一个资格判断、一个投递入口，以及防止多个进程重复触发的租约。每种来源只定义三件事：何时产生投递、合并方式（只留最新一份或逐条）与内容身份（不可信数据或用户授权的指令）。Tick 订阅与 Artifact 关联送达的是数据，Goal 续跑是用户授权的指令。来源输入排在用户输入之后，Loop 忙时排队或按来源合并；每次投递与丢弃都随来源、合并次数和原因写入 Transcript。用户输入与 Agent 消息不是 Trigger，不受监听开关约束。
+_Avoid_：事件触发、定时器、钟点规则
 
-**钟点规则（Schedule）**：
-Trigger 的定时部分：`every <N>s|m|h|d`、`daily HH:MM [±HH:MM]`、`weekly <星期> HH:MM [±HH:MM]` 或一次性的 `at <RFC 3339 时刻>`，按 UTC 与固定偏移计算。`every` 从武装时刻起算，之后接着上一个已处理的计划时刻。每个计划时刻至多触发一次；错过的时刻不补跑，到期时只触发最近的一个；Loop 不能接受触发时到期的时刻，之后也不补跑。宿主规定最短间隔：本地 1 秒，云端 1 分钟。Agent 用 StartGoal 创建的钟点规则须经用户确认才会运行：本地由该调用的权限请求确认，没有权限请求的宿主（云端）先把它登记为待确认，由用户在界面上确认或拒绝；拒绝即停止该 Loop。Agent 创建的钟点规则默认 30 天后到期，用户可以延长或取消期限；用户自己设置的不需要确认。每个 Chat 同时有效（已武装或待确认）的钟点规则至多 20 个。确认、拒绝与到期都随 Loop 记录写入 Transcript。
+**Goal（目标）**：
+用户为 Chat 设定、要求 Agent 持续推进直到达成的完成条件，每个 Chat 同时至多一个，由 `/goal` 设定、查看、编辑、暂停、恢复和清除，正文至多 4000 字符。Goal 为 active 时，每轮结束且 Loop 空闲，宿主以 Goal 续跑再起一轮；用户输入优先，Plan 模式不续跑。Agent 认为已达成时报告完成及依据，经独立判断核对通过才算完成，未通过的理由作为下一轮的续跑指导；同一阻塞持续多轮时 Agent 可报告阻塞。状态为 active、paused、blocked、budget_limited 与 complete：token 预算耗尽为 budget_limited，Agent 报告阻塞、连续 3 轮没有进展或执行出错为 blocked，Esc 与 `/stop` 使其 paused；`/goal pause` 与 `/goal clear` 不打断当前一轮，只是不再续跑。整个家族的用量计入根 Chat 的 Goal，子 Agent 不拥有 Goal；后台子 Agent 或后台 Shell 未结束时既不续跑也不判断完成，等它们的结果送达。历史装载后不自动续跑，恢复会话时提示是否继续 paused 或 blocked 的 Goal。Monitor 底部固定显示 Goal、状态与用量，续跑时提示一次。
+_Avoid_：任务、Loop 目标
 
 ### AI 交互与执行
 
 **Agent**：
-理解目标、进行判断并调用工具完成工作的 AI 执行者，既能通过对话与用户交互，也能执行定时或事件驱动的任务。Agent 在 Loop 中工作，并可通过工具操作 Tick。
+理解目标、进行判断并调用工具完成工作的 AI 执行者，既能通过对话与用户交互，也能在 Trigger 到达或 Goal 续跑时继续工作。Agent 在 Loop 中工作，并可通过工具操作 Tick。
 
 **Chat**：
-用户与一个 Agent 的一段持久对话，用户通过它发起、观察和控制 Loop；一个 Chat 可以关联多个 Loop，可以同时在多个 Agent 界面中打开，每个 Chat 承载独立对话，内部不设 Tab。Chat 不是 Tick：它由 Agent 持有，不由 Tickhost 运行，也不能被订阅。
+用户与一个 Agent 的一段持久对话，用户通过它发起、观察和控制它唯一的 Loop；一个 Chat 可以同时在多个 Agent 界面中打开，每个 Chat 承载独立对话，内部不设 Tab。Chat 不是 Tick：它由 Agent 持有，不由 Tickhost 运行，也不能被订阅。
 
 **Transcript（会话记录）**：
 Chat 对话的持久记录，按发生顺序保存对话内容与 Loop 状态变化，重启后据此恢复 Chat。同一 Transcript 在多处继续时可以形成多条对话链，这些链仍属于同一个 Chat。
@@ -82,7 +85,7 @@ _Avoid_：owner、owner daemon、Agent 执行服务
 由 Daemon 为每个根 Agent 启动的进程，运行该 Agent 的模型调用、工具、审批、Trigger 与 Transcript；其 Shell 命令经审批后交给 Tickhost 运行，生存期仍跟随本 Worker。其子 Agent 与分支复用同一 Worker。Worker 以 Daemon 为生命线，明确停止或未计划的生命线丢失时结束。计划交接保留生命线；完整 Worker 家族到达安全点后，通过专用活状态检查点换成新版，不调用普通历史恢复。Worker 以库的方式调用 Harness；其他宿主中运行 Harness 的进程不称 Worker。
 
 **Monitor（观察列表）**：
-Agent 界面中本 Chat 打开、订阅的 Tick Instance、Artifact 与后台 Shell 的统一入口，同一实例只占一行。成员关系与订阅、所有权分别管理，离开视图不结束实例。周期订阅用 `↻` 表示，类型图标为扩展 Tick `◉`、Terminal Tick `>`、Shell `$`、Artifact `↗`。选中扩展或终端 Tick 时，面板固定底栏显示选中实例的运行状态、已有订阅频率和未读状态；`s subscriptions` 与未订阅扩展／终端 Tick 的 `u send update` 放在全局按键提示栏；`s` 依次切换未订阅、1 分钟、10 分钟、30 分钟、未订阅，立即生效，不确认。Shell 的 `s` 仍为停止；Artifact 的关联保持原生入口。首份待送内容到达后，名称区域显示进度条直到交付，后续更新不重置起点；订阅和类型图标不被进度色覆盖。按 Enter 直接附着已有 Tick 的视图，隐藏视图不结束实例；结束进程与关闭视图分别操作。删除／停止进程的确认保留。详细交互见 Monitor signals 规格。
+Agent 界面中本 Chat 打开、订阅的 Tick Instance、Artifact 与后台 Shell 的统一入口，同一实例只占一行。成员关系与订阅、所有权分别管理，离开视图不结束实例。周期订阅用 `↻` 表示，类型图标为扩展 Tick `◉`、Terminal Tick `>`、Shell `$`、Artifact `↗`。选中扩展或终端 Tick 时，面板固定底栏显示选中实例的运行状态、已有订阅频率和未读状态；`s subscriptions` 与未订阅扩展／终端 Tick 的 `u send update` 放在全局按键提示栏；`s` 依次切换未订阅、1 分钟、10 分钟、30 分钟、未订阅，立即生效，不确认。Shell 的 `s` 仍为停止；Artifact 的关联保持原生入口。首份待送内容到达后，名称区域显示进度条直到交付，后续更新不重置起点；订阅和类型图标不被进度色覆盖。按 Enter 直接附着已有 Tick 的视图，隐藏视图不结束实例；结束进程与关闭视图分别操作。删除／停止进程的确认保留。Goal 不是成员，固定显示在面板底部。详细交互见 Monitor signals 规格。
 
 **未读更新（Unread Update）**：
 Monitor 中一个实例最近一次内容更新晚于当前 Chat 最后一次处理它的时间时的状态。 未读属于当前 Chat 中的 Tick Instance，不属于订阅；调频和取消订阅不等同于处理。取消自动交付后保留已知未读，未订阅时不显示周期进度。用户可用“发送更新”（Send Update，`u`）把未订阅的扩展或 Terminal Tick 当前内容一次性交给 Agent，不建立订阅；仅排队不清未读，真正接收后处理所发送的快照，后续变化仍未读。处理指更新进入了本 Chat Agent 的回合（订阅投递、读取工具或完成通知），或者用户在 Monitor 中打开了这一行；仅排队未运行不算处理。Agent 自己造成的变化不算更新。Shell 只以结束为更新，Terminal Tick 只在被订阅时才判断；人修改 Artifact 正文不是 Tick Update，但刷新该行的最近更新时间，也使它未读。行上不显示更新时间与条数（频繁更新的 Tick 会让它们不停变化），最近更新时间与未处理条数在行的详情中查看。未读以行首类型图标的颜色表示：有未处理的更新时，类型图标改用更新颜色（不再用背景色方块），每来一次更新图标闪一下（亮暗闪烁），处理后恢复表示状态的颜色（Agent 回合取用与用户打开都算处理）。有本 Chat 周期订阅的行，订阅已有待送内容时另有进度条，表示多久后交给 Agent；更新经订阅投递、完成通知或认领的反馈请求进入本 Chat Agent 的回合时，名称区域以更新颜色的暖色闪一下表示交给 Agent，同时图标恢复状态颜色、进度条消失；检查时没有要送的内容则直接消失，不闪。Agent 在本 Chat 的回合中用工具读取或操作这个实例（TickRead、TickCall、TickManage 输入、Read 任务输出文件、ArtifactRead、ArtifactComment、ArtifactEdit）并成功时，名称区域以冷色闪一下表示 Agent 正在用它，与交给 Agent 的暖色闪烁节奏相同、颜色不同；实时内容流中的 Tick Update 来源标签与 TickRead 调用标签分别同步暖色与冷色闪动，历史回放不重播；每次使用都闪，不论有无新更新，两者接连发生时后发生的盖过前一个。读取算处理，操作不算。用户打开这一行时图标直接恢复状态颜色，不闪。未读的结束 Shell 保留到被处理后才离开列表。
@@ -123,13 +126,13 @@ Agent 向另一个 Agent 发送的任务方向、澄清或结果信息。其来�
 用户从一个成员界面直接给同家族另一成员提交的真实人类输入；保留原始文字、附件和来源界面，接收方仍遵守其委派授权上限。与 Agent 转述、完成通知和送达回执分别表达。
 
 **子 Agent 停止（StopSubagent）**：
-Agent 明确停止目标成员及其后代所拥有的执行和等待，保留上下文、代号及界面。根可以选择任一后代，成员可以选择自己的直接孩子。与离开界面、隐藏面板行及整家族停止分别表达。
+Agent 明确停止目标成员及其后代所拥有的执行和等待，保留上下文、代号及界面。根可以选择任一后代，成员可以选择自己的直接孩子。与离开界面、隐藏面板行分别表达；用户在某个 Agent 上 `/stop` 时同样停止它的全部后代。
 
 **用户转述（User Relay）**：
 Agent 引用经过核验的真实用户输入向成员转述的内容；转述者与原用户来源分别记录。转述仍是 Agent 消息，不是人工批准或新的用户授权。
 
 **子 Agent 完成通知（Subagent Completion Notification）**：
-子 Agent 的一次执行结束事实、状态、摘要或实际结果及用量，关联稳定子 Agent 和本次执行身份。子 Agent 每次执行结束都向父 Agent 投递完成通知，唯一例外是前台 Subagent 调用正在返回的那次执行（前台观察被中断后它也改为通知），包括用户在子 Agent 界面输入或 Continue 后的执行；定向用户输入的送达回执和回复预览只留在界面。通知主动进入父 Agent 的 Loop 输入队列，忙时在下个工具回合处理，空闲时开始新一轮执行；父 Loop 失败或中断时暂存到该 Loop 被明确 Continue，停止或过期时记录投递拒绝。其来源由宿主记录，不充当用户输入、用户意图或新增授权。
+子 Agent 的一次执行结束事实、状态、摘要或实际结果及用量，关联稳定子 Agent 和本次执行身份。子 Agent 每次执行结束都向父 Agent 投递完成通知，唯一例外是前台 Subagent 调用正在返回的那次执行（前台观察被中断后它也改为通知），包括用户在子 Agent 界面输入或 Continue 后的执行；定向用户输入的送达回执和回复预览只留在界面。通知照 Claude Code：每次执行结束（完成、失败或被停止，被停止时带已有的部分结果）只投递一次，进入父 Agent 的 Loop 输入队列并排在用户输入之后；忙时在下个工具回合处理，空闲时开始新一轮执行，不因父 Loop 失败或被打断而暂存。唯一例外是 `/stop`：它停下的后代的通知照常记录，但不唤醒父 Loop，用户明确继续后随下一轮送达。其来源由宿主记录，不充当用户输入、用户意图或新增授权。
 
 **协作任务（Shared Task）**：
 同一根 Loop 内可分配、领取、追踪依赖和记录结果的工作项，可由单人按需使用，也可在家族内共享。任务与 Agent 身份、Loop 和一次执行分别存在；分配不表示已开始，执行结束不表示任务已完成。领取者是当前负责人，任务不扩大其原有授权。
@@ -211,8 +214,7 @@ Tickloop 的托管服务，用户经 Web / App 使用 Chat 与 Work；Artifacts 
 _Avoid_：云服务、server
 
 **Harness**：
-按 Chat 推进一个回合的开源库：运行 Loop、工具与权限审批、Subagent 与模型调用。它只经 Seam（Transcript Store、Execution Environment、Model Endpoint、Credential Source）访问外部，本地与其他宿主只是 Seam 的实现不同。本地 Worker 与无状态宿主都以库的方式在进程内调用它。持有结束时 Harness 报告家族下次需要宿主的时刻（最早的可触发计划时刻或任一未结束 Loop 的期限）；宿主到时唤醒家族并带上这个时刻，截至这个时刻的计划时刻都算到期，宿主时钟落后也不会漏掉。本地由 Worker 内部的 Trigger 承担同一职责。
-_Avoid_：Agent Runtime、engine
+按 Chat 推进一个回合的开源库：运行 Loop、工具与权限审批、Subagent 与模型调用。它只经 Seam（Transcript Store、Execution Environment、Model Endpoint、Credential Source）访问外部，本地与其他宿主只是 Seam 的实现不同。本地 Worker 与无状态宿主都以库的方式在进程内调用它。_Avoid_：Agent Runtime、engine
 
 **来源编号（Citation Number）**：
 宿主可在 HarnessOptions 选择 Numbered 引用，默认仍使用 Markdown 超链接。WebSearch 与 WebFetch 的来源按规范化 HTTP(S) URL 在 Chat 家族根的来源表中分配全局编号，之后不重排、不复用；规范化沿用 URL 解析器，去掉 fragment，保留路径和查询参数。来源表通过独立的 citation-sources Transcript 元数据恢复，Branch 和新 Chat 复制继承已有编号。工具正文使用 `[webpage N begin]`／`[webpage N end]`，回复用 `[citation:N]`。ToolCompleted 事件的 sources 旁路字段及 Harness 的 citation_sources 查询提供编号、URL、标题、站点和摘要。每个 Chat 的 citation-sources 元数据还保存逐调用的 callId、runId、messageId、numbers 和保留节点 aliases；visible_citations 按当前分支的实际工具结果和压缩／Branch 别名返回可见来源与调用关联，宿主可自行按每条回复重编号展示。已发送的模型上下文不因新来源而改写；来源表只在压缩摘要中附精简对照表，不进入逐轮重建的 system prompt 或宿主状态。
@@ -299,7 +301,7 @@ _Avoid_：私有评论、标注模式
 登录用户在评论中留下的 `@tickloop` 输入，没有 Agent 也能保存。它没有待处理、处理中、完成或失败的任务状态。同一用户关联该文档的所有 Agent 分别收到新反馈；其他用户的 Agent 不接收。Agent 以该账号的权限编辑或回复，页面作者显示“账号名 (Agent)”。普通回复写一次，传输确认不产生评论。
 
 **Artifact 关联（Artifact Association）**：
-某个用户把自己 Agent 的 Chat／Loop 与 Artifact 建立的关系，同一用户可以关联多个 Agent。Agent 创建 Artifact 时自动关联到创建 Loop；手动关联时选择仅接收新反馈（默认）或包括此前反馈。它不授予权限、不改变 Artifact 所有权，也不属于 Tick Subscription。新输入可以在忙时排队或合并；Esc、Ctrl+Enter、切模型和模型失败不暂停关联，也不重投已经收到的反馈。历史装载不自动执行，显式继续后恢复接收；真正的登录或访问失效显示关联不可用。仅有关联不代表 Agent 在线。Monitor unlink 删除本 Chat 的接收关联，其他 Agent 不受影响。详见 ADR 0028（`docs/adr/0028-persistent-feedback-and-independent-delivery.md`）。
+某个用户把自己 Agent 的 Chat 与 Artifact 建立的关系，是 Chat 的 Loop 的一种 Trigger，同一用户可以关联多个 Agent。Agent 创建 Artifact 时自动关联到创建它的 Chat；手动关联时选择仅接收新反馈（默认）或包括此前反馈。它不授予权限、不改变 Artifact 所有权，也不属于 Tick Subscription。新输入可以在忙时排队或合并；Esc、Ctrl+Enter、切模型和模型失败不暂停关联，也不重投已经收到的反馈。`/stop` 与历史装载暂停接收，显式继续后恢复；真正的登录或访问失效显示关联不可用。仅有关联不代表 Agent 在线。Monitor unlink 删除本 Chat 的接收关联，其他 Agent 不受影响。详见 ADR 0028（`docs/adr/0028-persistent-feedback-and-independent-delivery.md`）。
 _Avoid_：评论绑定、反馈任务
 
 **Artifact 访问范围（Artifact Access Audience）**：

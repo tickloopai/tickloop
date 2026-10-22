@@ -26,7 +26,8 @@ Agent 的列表与菜单沿用 Vim 导航习惯，文本输入沿用 Claude Code
 - 文本输入（含 Shell 输入）不提供 Vim 模式，编辑键沿用 Claude Code 普通模式；`Ctrl+G` 随时用外部编辑器编辑当前输入。
 - 列表与菜单支持 `j`／`k` 和 `Ctrl+N`／`Ctrl+P` 导航，`Enter` 确认，`Esc` 返回或取消当前界面；文本输入中 `j`／`k` 保持文字输入，候选补全使用 `Ctrl+N`／`Ctrl+P` 导航。
 - 菜单和选择器的选项不显示序号，也不提供看不见的数字快捷选择。Monitor、Subagents 面板等共享 `list_row` 的列表只用选中底色标记当前项，不加行首标记；菜单、选择器、权限与问题页继续用光标 `❯` 标记当前项（可同时带选中底色）。
-- `Esc` 按当前上下文逐层处理：先关闭候选或当前弹层；关闭视图与停止任务分别操作。
+- `Esc` 按当前上下文逐层处理：先关闭候选或当前弹层；关闭视图与停止任务分别操作。Agent 运行中没有弹层时，`Esc` 打断当前一轮并暂停 Goal，Trigger 照常送达。
+- Agent 输入框的 `Ctrl+C` 参照 Codex：先交给弹层与候选处理，输入框有文字时清空；运行中且输入框为空时等同 `Esc`；空闲且输入框为空时离开界面，Agent 在 Daemon 中继续。`/stop` 让 Loop 全部停下（打断、暂停 Goal、暂停 Trigger 监听），见 CONTEXT.md 的 Loop。
 - Tick 视图的保留键是 `Esc`（隐藏视图）与 `Ctrl+B`（附着前缀，`Ctrl+B Esc` 把 Esc 发给程序），自带 Tick 不绑定这两个键：Tick 内返回上一层用 `Backspace`，文本输入同样是普通编辑，编辑中 `Ctrl+C` 取消编辑。
 - 按键只作用于当前可见且聚焦的界面；权限、问题和工作流菜单与输入编辑器分别处理按键，隐藏界面不消费输入。界面提示与实际按键行为保持一致。
 
@@ -66,7 +67,7 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 
 Agent 的 HostToolProvider 与 TickStreamPort 是主要接入 Seam：Worker 侧只有 Tickhost 客户端（`hosted:` 与 `shell:`）和 Artifact 两个 Tick 适配器，协议、终端与 Shell 适配器在 Tickhost 中。Shell 的审批留在 Worker，Tickhost 只执行一次性起进程授权绑定的请求。Loop 不持有 Herdr 布局状态，数据 Source 留在 Tick 包中。通用 TickCall 读取目录再调用，不为每个实例生成模型工具；见 ADR 0007、0008、0019、0024。
 
-系统级 Skill 仍名为 tickloop，支持模型渐进披露与用户显式调用；其指令必须匹配实际工具和权限。各数据来源的 argv 写在 Tick 包自带的 Skill 中（`<包>:usage`），系统 Skill 不写死。最小子 Agent 由 `Subagent` 真实委派：前台等待最终报告，后台立即返回并主动推送完成通知；消息自动进入接收 Loop，空闲接收方开始新回合，模型无需查询收件箱。后续输入保持原授权上限；Subagent 可自行派生，最多三层，全部后代仍属于同一家族。根可停止后代子树，成员可停止直接孩子子树；家族内一对一消息和按需共享 Task 已开放，Task 工具由 Settings 的唯一开关控制，默认关闭，主／子 Agent 一致，不由后台或创建成员触发；单人与团队共用任务列表，开启且有数据才显示，关闭立即隐藏并保留数据。修改委派、协作任务或其界面前读取 ADR 0026（`docs/adr/0026-one-subagent-family-and-shared-tasks.md`），以及维护者本地的协作规格 `.scratch/subagent-collaboration/spec.md`（存在时）。跨家族通信、广播、自动任务领取及整家族 stop 不提供。MCP、ACP 和 Hooks 不在这次迁移内。
+系统级 Skill 仍名为 tickloop，支持模型渐进披露与用户显式调用；其指令必须匹配实际工具和权限。各数据来源的 argv 写在 Tick 包自带的 Skill 中（`<包>:usage`），系统 Skill 不写死。最小子 Agent 由 `Subagent` 真实委派：前台等待最终报告，后台立即返回并主动推送完成通知；消息自动进入接收 Loop，空闲接收方开始新回合，模型无需查询收件箱。后续输入保持原授权上限；Subagent 可自行派生，最多三层，全部后代仍属于同一家族。根可停止后代子树，成员可停止直接孩子子树，用户在某个 Agent 上 `/stop` 同时停止它的全部后代；完成通知照 Claude Code 规则送达（见 CONTEXT.md）；家族内一对一消息和按需共享 Task 已开放，Task 工具由 Settings 的唯一开关控制，默认关闭，主／子 Agent 一致，不由后台或创建成员触发；单人与团队共用任务列表，开启且有数据才显示，关闭立即隐藏并保留数据。修改委派、协作任务或其界面前读取 ADR 0026（`docs/adr/0026-one-subagent-family-and-shared-tasks.md`），以及维护者本地的协作规格 `.scratch/subagent-collaboration/spec.md`（存在时）。跨家族通信、广播与自动任务领取不提供。MCP、ACP 和 Hooks 不在这次迁移内。
 
 本仓库是领域无关的宿主：不认识任何 Tick 种类、领域概念或具体包程序名。官方 Tick 包（程序、包清单与 Skill）及其打包、发布在公开仓库 [tickloopai/ticks](https://github.com/tickloopai/ticks)（同时是 Tick 市场，包源码在 `packages/<包>/`，标签 `<包>-v<版本>`），本仓库只保留包机制。宿主接入的验收不需要任何真实数据源账户。
 
