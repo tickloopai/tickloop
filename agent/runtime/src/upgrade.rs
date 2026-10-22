@@ -470,6 +470,8 @@ impl Agent {
         }
         self.tick_deliveries().activate_upgrade();
         self.inner.tick_wake.notify_one();
+        // The Worker keeps time for the Chats it took over, idle ones included.
+        self.rearm_scheduled_timer();
         Ok(())
     }
 
