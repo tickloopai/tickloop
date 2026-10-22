@@ -2764,10 +2764,10 @@ impl Agent {
         }
 
         self.inner.ledger_changes.send_replace(());
+        self.start_title_generation(chat_id).await;
         if continues_chat {
             Box::pin(self.continue_receiving(chat_id)).await;
         }
-        self.start_title_generation(chat_id).await;
         Ok(requested_receipt)
     }
 
