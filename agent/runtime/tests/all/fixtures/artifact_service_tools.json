@@ -16,12 +16,12 @@
       "name": "tickloop-artifacts",
       "version": "0.1.42"
     },
-    "instructions": "Saves are live. Choose the artifact type by the user's intent, in any language: a doc for writing such as reports, notes and plans; a page for visual explanations, UI, prototypes, mockups, wireframes, dashboards and interactive tools; slides for anything someone presents, including every request for a PPT, 幻灯片, 演示文稿, deck, slides, presentation, pitch or talk. Create it with ArtifactEdit create. Honor an explicit local-file or chat-only destination instead of creating an artifact. To work on an artifact the user names by link or id that this Chat has not read or written, take the id from its /artifact/<artifact_id> URL and ArtifactRead read it before writing. What you created or wrote in this Chat is the current content: keep working from it, with expected_revision, expected_hash and expected_title from the latest read or write receipt for that artifact, and read it again only after content_conflict, after a timeout or cancellation that leaves the outcome unknown, or when the user or someone else may have changed it, as with @tickloop feedback. Doc: plain text formatting with # headings, paragraphs, lists, tables, quotes, code blocks, links and basic inline marks; patch blocks using their id and hash; a blank doc has one empty block to replace; a doc's create receipt lists no blocks, so read a new doc once before its first patch. Page: replace the whole page source; use inline <style>/<script>, fit phone widths, and keep <title> equal to the title. Slides: each block is one <section> Slide; patch only the Slides you were asked to change, using their id and hash, changes running in order, or replace all of them. A doc's title is its name and its first \"# \" heading: keep that heading equal to the title, and rename with ArtifactEdit rename, never by writing a different heading. When relevant Skills are listed in your catalog, load them before substantial writing, page creation or redesign. A loaded Skill stays in effect for the whole Chat, so do not load it again. Slides are the exception to loading only for substantial work: load the artifact-slides Skill before writing any Slide, whether you create, patch or replace, however small the change, unless this Chat already loaded it. On content_conflict, read again, merge your change into the latest content and never overwrite other people's changes. Finish by giving the user the artifact URL."
+    "instructions": "Saves are live. Choose the artifact type by the user's intent, in any language: a doc for writing such as reports, notes and plans; a page for visual explanations, UI, prototypes, mockups, wireframes, dashboards and interactive tools; slides for anything someone presents, including every request for a PPT, 幻灯片, 演示文稿, deck, slides, presentation, pitch or talk. Before creating one, call ArtifactRead quickstart with its intent: the result is that type's Skill, as its own text, and counts as loading it. Then create it with ArtifactEdit create. Honor an explicit local-file or chat-only destination instead of creating an artifact. To work on an artifact the user names by link or id that this Chat has not read or written, take the id from its /artifact/<artifact_id> URL and ArtifactRead read it before writing. What you created or wrote in this Chat is the current content: keep working from it, with expected_revision, expected_hash and expected_title from the latest read or write receipt for that artifact, and read it again only after content_conflict, after a timeout or cancellation that leaves the outcome unknown, or when the user or someone else may have changed it, as with @tickloop feedback. Doc: plain text formatting with # headings, paragraphs, lists, tables, quotes, code blocks, links and basic inline marks; patch blocks using their id and hash; a blank doc has one empty block to replace; a doc's create receipt lists no blocks, so read a new doc once before its first patch. Page: replace the whole page source; use inline <style>/<script>, fit phone widths, and keep <title> equal to the title. Slides: each block is one <section> Slide; patch only the Slides you were asked to change, using their id and hash, changes running in order, or replace all of them. A doc's title is its name and its first \"# \" heading: keep that heading equal to the title, and rename with ArtifactEdit rename, never by writing a different heading. Before writing an artifact, however small the change, this Chat needs its type's Skill, from quickstart or by loading it: artifact-design for a page, doc for a doc, artifact-slides for slides. Load artifact-diagramming when a page needs a diagram of a mechanism, and dataviz for charts, dashboards and other data graphics. A loaded Skill, like a quickstart result, stays in effect for the whole Chat, so do not load it again. On content_conflict, read again, merge your change into the latest content and never overwrite other people's changes. Finish by giving the user the artifact URL."
   },
   "tools": [
     {
       "name": "ArtifactRead",
-      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing), page (a visual page) or slides (a presentation). Actions:\n- list (optional query, cursor, limit): your artifacts and those shared with you, each with its revision; query matches titles.\n- read (artifact_id; optional cursor): a doc or slides as blocks, each with id, hash and text, paged by cursor; each slides block is one <section> Slide, and the first slides page lists its uploaded images as assets with their asset: ref. A page reads as its whole page source. Includes title and revision.\n- threads (artifact_id; optional status, cursor): comment threads (open by default) with their latest messages.\naccess_role is owner, edit or view; view can comment but not edit. What you created or wrote in this Chat is current as its write receipt states; read it again only after content_conflict, an unknown outcome, or when the user or someone else may have changed it.",
+      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing), page (a visual page) or slides (a presentation). Actions:\n- list (optional query, cursor, limit): your artifacts and those shared with you, each with its revision; query matches titles.\n- read (artifact_id; optional cursor): a doc or slides as blocks, each with id, hash and text, paged by cursor; each slides block is one <section> Slide, and the first slides page lists its uploaded images as assets with their asset: ref. A page reads as its whole page source. Includes title and revision.\n- threads (artifact_id; optional status, cursor): comment threads (open by default) with their latest messages.\n- quickstart (intent): before creating an artifact, the Skill that guides its type, as that Skill's own text: artifact-design for a page, doc for a doc, artifact-slides for slides. It counts as loading that Skill, so do not load it as well.\naccess_role is owner, edit or view; view can comment but not edit. What you created or wrote in this Chat is current as its write receipt states; read it again only after content_conflict, an unknown outcome, or when the user or someone else may have changed it.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -31,7 +31,8 @@
             "enum": [
               "list",
               "read",
-              "threads"
+              "threads",
+              "quickstart"
             ]
           },
           "query": {
@@ -61,6 +62,15 @@
               "all"
             ],
             "description": "threads: open (the default), resolved or all"
+          },
+          "intent": {
+            "type": "string",
+            "enum": [
+              "doc",
+              "page",
+              "slides"
+            ],
+            "description": "quickstart: the type of the artifact to create"
           }
         },
         "required": [

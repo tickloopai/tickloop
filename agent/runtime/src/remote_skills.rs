@@ -11,8 +11,8 @@ const MAX_RESOURCES: usize = 64;
 const PRODUCT_NAMES: [&str; 5] = [
     "artifact-design",
     "artifact-diagramming",
-    "artifact-dataviz",
-    "artifact-draft",
+    "dataviz",
+    "doc",
     "artifact-slides",
 ];
 

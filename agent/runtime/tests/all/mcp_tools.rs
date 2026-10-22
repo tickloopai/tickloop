@@ -313,17 +313,17 @@ async fn remote_resource_reads_do_not_activate_skills_and_repeated_reads_return_
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "repeat",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "old-resource-input",
             "Skill",
-            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/guide.md"}),
         ),
         text("done"),
     ]));
@@ -416,12 +416,12 @@ async fn remote_resource_reads_reject_unknown_sources_paths_and_obey_denials() {
             call(
                 "wrong-server",
                 "ReadMcpResourceTool",
-                json!({"server":"other","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"other","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             call(
                 "traversal",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/../artifact-draft/SKILL.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/../doc/SKILL.md"}),
             ),
             call(
                 "unlisted",
@@ -431,7 +431,7 @@ async fn remote_resource_reads_reject_unknown_sources_paths_and_obey_denials() {
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
         ]));
@@ -495,7 +495,7 @@ async fn remote_resource_reads_discard_responses_when_account_or_policy_changes(
                 "reference",
                 tool,
                 if tool == "ReadMcpResourceTool" {
-                    json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"})
+                    json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"})
                 } else {
                     json!({"server":"tickloop-artifacts"})
                 },
@@ -557,11 +557,12 @@ async fn remote_resource_reads_discard_responses_when_account_or_policy_changes(
 }
 
 #[tokio::test]
-async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
+async fn guidance_instructions_and_an_unchanged_reference_enter_history_once() {
     let service = ArtifactService::start().await;
     service.control.skills_enabled.store(true, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
-    let design_runtime = "skill://tickloop-artifacts/artifact-design/references/runtime.md";
+    let design_guide = "skill://tickloop-artifacts/artifact-design/references/guide.md";
+    let diagram_guide = "skill://tickloop-artifacts/artifact-diagramming/references/guide.md";
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "design",
@@ -569,9 +570,9 @@ async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
             json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         call(
-            "design-runtime",
+            "design-guide",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":design_runtime}),
+            json!({"server":"tickloop-artifacts","uri":design_guide}),
         ),
         call(
             "diagram",
@@ -579,9 +580,14 @@ async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
             json!({"skill":"tickloop-artifacts:artifact-diagramming"}),
         ),
         call(
-            "diagram-runtime",
+            "diagram-guide",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-diagramming/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":diagram_guide}),
+        ),
+        call(
+            "design-guide-again",
+            "ReadMcpResourceTool",
+            json!({"server":"tickloop-artifacts","uri":design_guide}),
         ),
         text("Designed."),
         call(
@@ -598,7 +604,7 @@ async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
     {
         let instructions = artifact_service::instructions(&service.control);
         let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8);
         for (earlier, later) in requests.iter().zip(requests.iter().skip(1)) {
             assert_extends(earlier, later);
         }
@@ -612,7 +618,7 @@ async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
                 1
             );
         }
-        let last = &requests[6];
+        let last = &requests[7];
         assert_eq!(
             mentions(last, "Page guidance fixture for artifact-design"),
             1
@@ -621,24 +627,40 @@ async fn guidance_instructions_and_a_shared_reference_enter_history_once() {
             mentions(last, "Page guidance fixture for artifact-diagramming"),
             1
         );
-        assert_eq!(mentions(last, "Reference fixture: preserve data units"), 1);
-        let repeated = tool_result_text(last, "diagram-runtime");
-        assert!(repeated.contains(design_runtime), "{repeated}");
-        assert!(repeated.contains("identical"), "{repeated}");
+        // Like Claude Code's Read, only the same resource unchanged is elided: another URI with
+        // the same text is still read in full.
+        assert_eq!(mentions(last, "Reference fixture: preserve data units"), 2);
+        let repeated = tool_result_text(last, "design-guide-again");
+        assert!(
+            repeated.contains(design_guide) && repeated.contains("unchanged since it was read"),
+            "{repeated}"
+        );
+        assert!(!repeated.contains("Reference fixture"), "{repeated}");
         let reused = tool_result_text(last, "reuse");
         assert!(reused.contains("Already loaded"), "{reused}");
         assert!(reused.contains("already in this conversation"), "{reused}");
     }
+    let reads = service
+        .control
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["body"]["method"] == "resources/read")
+        .map(|request| {
+            request["body"]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 4, "{reads:?}");
     assert_eq!(
-        service
-            .control
-            .requests
-            .lock()
-            .unwrap()
+        reads
             .iter()
-            .filter(|request| request["body"]["method"] == "resources/read")
+            .filter(|uri| uri.as_str() == design_guide)
             .count(),
-        3
+        1
     );
     agent.shutdown().await;
 }
@@ -690,7 +712,7 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "reuse",
@@ -723,8 +745,8 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
         for name in [
             "artifact-design",
             "artifact-diagramming",
-            "artifact-dataviz",
-            "artifact-draft",
+            "dataviz",
+            "doc",
             "artifact-slides",
         ] {
             assert!(
@@ -775,7 +797,7 @@ async fn remote_skill_arguments_do_not_absorb_resource_reads_and_identical_repea
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "changed",
@@ -850,7 +872,7 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
             text("next"),
@@ -927,7 +949,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let account = service.login(directory.path()).await;
-        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-artifacts:artifact-design"})), call("reference", "ReadMcpResourceTool", json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"})), text("done")]))).unwrap();
+        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-artifacts:artifact-design"})), call("reference", "ReadMcpResourceTool", json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"})), text("done")]))).unwrap();
         agent
             .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
             .unwrap();
@@ -1121,7 +1143,7 @@ async fn remote_skill_and_resource_digest_mismatches_never_enter_context() {
         call(
             "reference-first",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         call(
             "load-tampered",
@@ -4688,7 +4710,7 @@ async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
             call(
                 "reference",
                 "ReadMcpResourceTool",
-                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+                json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
             ),
             text("done"),
             text("A compact summary"),
@@ -4747,14 +4769,14 @@ async fn remote_resource_requested_after_compaction_returns_complete_content_wit
         call(
             "reference",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         text("done"),
         text("A compact summary"),
         call(
             "reload",
             "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/runtime.md"}),
+            json!({"server":"tickloop-artifacts","uri":"skill://tickloop-artifacts/artifact-design/references/guide.md"}),
         ),
         text("continued"),
     ]));

@@ -147,8 +147,8 @@ impl Agent {
             if let Some((definition, relative)) = &prepared.skill {
                 let resource =
                     crate::remote_skills::resource_entry(definition, relative.as_deref())?;
-                if let Some(earlier) = earlier_read(chat, &resource.digest) {
-                    return Ok(already_read(&resource.uri, &earlier));
+                if read_unchanged(chat, &resource.uri, &resource.digest) {
+                    return Ok(unchanged(&resource.uri));
                 }
             }
             (
@@ -192,13 +192,11 @@ impl Agent {
             return Err("MCP resource source, policy or Run changed during reading".into());
         }
         if prepared.name == READ_MCP_RESOURCE_TOOL
+            && let Some(uri) = prepared.input["uri"].as_str()
             && let Some(text) = sole_text(&result)
-            && let Some(earlier) = earlier_read(chat, &digest(text))
+            && read_unchanged(chat, uri, &digest(text))
         {
-            return Ok(already_read(
-                prepared.input["uri"].as_str().unwrap_or_default(),
-                &earlier,
-            ));
+            return Ok(unchanged(uri));
         }
         if prepared.name == LIST_MCP_RESOURCES_TOOL {
             if let Some(resources) = result["resources"].as_array_mut() {
@@ -216,10 +214,11 @@ impl Agent {
     }
 }
 
-/// Like Claude Code's unchanged-file Read, a resource whose text the model can still see in an
-/// earlier `ReadMcpResourceTool` result: Skills share their runtime contract under each Skill's
-/// own URI, and a compaction or a saved-file preview hides the earlier text again.
-fn earlier_read(chat: &crate::Chat, digest_of_text: &str) -> Option<String> {
+/// Like Claude Code's `file_unchanged` Read, whether the model can still see this same resource,
+/// with the same text, in an earlier `ReadMcpResourceTool` result. Another resource with the same
+/// text is read in full, as another path is; a compaction or a saved-file preview hides the
+/// earlier text again.
+fn read_unchanged(chat: &crate::Chat, uri: &str, digest_of_text: &str) -> bool {
     let messages = &chat.snapshot.messages[chat.snapshot.active_start()..];
     let calls = messages
         .iter()
@@ -232,7 +231,7 @@ fn earlier_read(chat: &crate::Chat, digest_of_text: &str) -> Option<String> {
     messages
         .iter()
         .flat_map(|message| &message.content)
-        .find_map(|block| match block {
+        .any(|block| match block {
             Content::ToolResult {
                 tool_use_id,
                 content,
@@ -240,12 +239,12 @@ fn earlier_read(chat: &crate::Chat, digest_of_text: &str) -> Option<String> {
             } if calls.contains(tool_use_id)
                 && !chat.content_replacements.is_replaced(tool_use_id) =>
             {
-                let result = serde_json::from_str::<Value>(&content.text()).ok()?;
-                (sole_text(&result).map(digest).as_deref() == Some(digest_of_text))
-                    .then(|| result["contents"][0]["uri"].as_str().map(str::to_owned))
-                    .flatten()
+                serde_json::from_str::<Value>(&content.text()).is_ok_and(|result| {
+                    result["contents"][0]["uri"] == uri
+                        && sole_text(&result).map(digest).as_deref() == Some(digest_of_text)
+                })
             }
-            _ => None,
+            _ => false,
         })
 }
 
@@ -260,17 +259,11 @@ fn digest(text: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
 }
 
-fn already_read(uri: &str, earlier: &str) -> ToolResult {
+fn unchanged(uri: &str) -> ToolResult {
     ToolResult {
-        content: if uri == earlier {
-            format!(
-                "{uri} is unchanged since it was read earlier in this conversation; refer to that result instead of reading it again."
-            )
-        } else {
-            format!(
-                "The content of {uri} is identical to {earlier}, which was already read earlier in this conversation; refer to that result instead of reading it again."
-            )
-        },
+        content: format!(
+            "{uri} is unchanged since it was read earlier in this conversation; refer to that result instead of reading it again."
+        ),
         is_error: false,
         output_ref: None,
     }

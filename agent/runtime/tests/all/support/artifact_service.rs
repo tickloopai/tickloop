@@ -364,9 +364,9 @@ fn skill_reference(extra_bytes: usize) -> String {
 }
 
 fn skill_entries(revision: usize, reference_bytes: usize) -> Vec<Value> {
-    ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft", "artifact-slides"].into_iter().map(|name| {
+    ["artifact-design", "artifact-diagramming", "dataviz", "doc", "artifact-slides"].into_iter().map(|name| {
         let uri = format!("skill://tickloop-artifacts/{name}/SKILL.md");
-        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
+        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/guide.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
         json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
     }).collect()
 }
