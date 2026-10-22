@@ -19,12 +19,22 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 ```sh
 make build     # build tickloop and tickhost
-make dev       # build incrementally and start the agent in the current directory
+make dev       # build incrementally and start the agent in the current directory (ENV=prod, pre or dev)
 make install   # install both programs into ~/.cargo/bin
 make package   # build a release archive into dist/
 ```
 
 `make dev` uses your normal configuration root (`~/.tickloop` or `TICKLOOP_CONFIG_DIR`), including logins and installed Tick packages, and isolates the daemon and Tickhost per worktree and branch. Model API keys can go in a `.env` file at the repository root (ignored by Git), for example `DEEPSEEK_API_KEY=...`.
+
+`ENV` picks the Tickloop Cloud the agent talks to. `make dev` always sets the agent's `TICKLOOP_ARTIFACT_ORIGIN`, which also gives the Accounts issuer and the MCP endpoint, replacing any value from `.env` or your shell, and prints the choice before it builds:
+
+```sh
+make dev                    # ENV=prod, the default: https://tickloop.ai
+make dev ENV=pre            # https://pre.tickloop.ai
+make dev ENV=dev ARGS="-c"  # TICKLOOP_DEV_ARTIFACT_ORIGIN from .env
+```
+
+For `ENV=dev`, put `TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin>` in `.env`; without it `make dev ENV=dev` stops before building. Only the Makefile reads this key, and the agent never sees it. Only an `ENV=` on the `make` command line counts: an `ENV` exported in your shell is ignored and is not passed to the agent.
 
 The daemon only starts a `tickhost` built from the same sources. When a View meets a daemon or Tickhost from another build, it asks whether to replace it. To replace a stale development daemon by hand:
 

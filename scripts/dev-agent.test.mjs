@@ -7,6 +7,11 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const launcher = resolve('scripts/dev-agent.sh');
+const makefile = resolve('Makefile');
+const PROD_ORIGIN = 'https://tickloop.ai';
+const PRE_ORIGIN = 'https://pre.tickloop.ai';
+const DEV_ORIGIN = 'https://dev-cloud.example.test';
+const STALE_ORIGIN = 'https://stale-cloud.example.test';
 
 function makeWritable(directory) {
   if (!lstatSync(directory).isDirectory()) return;
@@ -53,7 +58,9 @@ function fixture(t) {
     console.log(JSON.stringify({ cwd: fs.realpathSync('.'), executable: fs.realpathSync(process.argv[1]), args,
       developmentRoot, compiledFor: __COMPILED_CHECKOUT__, buildTarget: __BUILD_TARGET__,
       daemon: process.env.TICKLOOP_DAEMON_RUNTIME_DIR, tickhost: process.env.TICKLOOP_TICKHOST_RUNTIME_DIR,
-      config: process.env.TICKLOOP_CONFIG_DIR, home: process.env.HOME }));
+      config: process.env.TICKLOOP_CONFIG_DIR, home: process.env.HOME,
+      artifactOrigin: process.env.TICKLOOP_ARTIFACT_ORIGIN, devArtifactOrigin: process.env.TICKLOOP_DEV_ARTIFACT_ORIGIN,
+      shellStartupFile: process.env.ENV }));
   `;
   executable('cargo', `
     const fs = require('node:fs'); const path = require('node:path');
@@ -76,25 +83,40 @@ function fixture(t) {
     const directory = join(root, name);
     mkdirSync(join(directory, 'scripts'), { recursive: true });
     copyFileSync(launcher, join(directory, 'scripts/dev-agent.sh'));
+    copyFileSync(makefile, join(directory, 'Makefile'));
     if (!archive) writeFileSync(join(directory, '.git'), 'fixture-only git metadata\n');
     if (branch !== null) writeFileSync(join(directory, 'branch'), branch);
     if (revision) writeFileSync(join(directory, 'revision'), revision);
     return directory;
   }
 
-  function run(directory, overrides = {}, args = []) {
+  function environment(overrides) {
     const env = { ...process.env, PATH: `${commands}:/usr/bin:/bin`,
       TICKLOOP_CONFIG_DIR: join(root, 'global configuration') };
-    delete env.TICKLOOP_DAEMON_RUNTIME_DIR;
-    delete env.TICKLOOP_TICKHOST_RUNTIME_DIR;
-    delete env.CARGO_TARGET_DIR;
-    Object.assign(env, overrides);
-    const result = spawnSync('/bin/sh', [join(directory, 'scripts/dev-agent.sh'), ...args], {
-      cwd: caller, env, encoding: 'utf8', timeout: 15_000,
-    });
-    return { ...result, reported: result.status === 0 ? JSON.parse(result.stdout.trim()) : null };
+    // An enclosing `make test` passes its own variables and command line down to every sub-make.
+    for (const name of ['TICKLOOP_DAEMON_RUNTIME_DIR', 'TICKLOOP_TICKHOST_RUNTIME_DIR', 'CARGO_TARGET_DIR',
+      'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
+      delete env[name];
+    return Object.assign(env, overrides);
   }
-  return { root, caller, checkout, run };
+
+  // make echoes the launcher command before the Agent prints its report.
+  function reportedBy(result) {
+    return { ...result, reported: result.status === 0 ? JSON.parse(result.stdout.trim().split('\n').at(-1)) : null };
+  }
+
+  function run(directory, overrides = {}, args = []) {
+    return reportedBy(spawnSync('/bin/sh', [join(directory, 'scripts/dev-agent.sh'), ...args], {
+      cwd: caller, env: environment(overrides), encoding: 'utf8', timeout: 15_000,
+    }));
+  }
+
+  function runMake(directory, makeArguments = [], overrides = {}) {
+    return reportedBy(spawnSync('make', ['--no-print-directory', '-C', directory, 'dev', ...makeArguments], {
+      cwd: caller, env: environment(overrides), encoding: 'utf8', timeout: 15_000,
+    }));
+  }
+  return { root, caller, checkout, run, runMake };
 }
 
 test('actual launcher reuses branch services but publishes a fresh immutable program bundle', t => {
@@ -242,3 +264,77 @@ test('switching branches during a build cannot publish into the previous branch 
   assert.equal(result.stdout, '');
   assert.deepEqual(readdirSync(join(checkout, 'target/dev-runs')), []);
 });
+
+test('make dev talks to production Tickloop Cloud by default, over any configured origin', t => {
+  const f = fixtureWithStaleOrigin(t);
+  for (const makeArguments of [[], ['ENV=prod']]) {
+    const result = f.runMake(f.directory, makeArguments, { TICKLOOP_ARTIFACT_ORIGIN: STALE_ORIGIN });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.reported.artifactOrigin, PROD_ORIGIN);
+    assert.match(result.stderr, /^Tickloop Cloud: https:\/\/tickloop\.ai \(ENV=prod\)$/m);
+  }
+});
+
+test('make dev ENV=pre talks to pre and keeps ARGS', t => {
+  const f = fixtureWithStaleOrigin(t);
+  const result = f.runMake(f.directory, ['ENV=pre', 'ARGS=-c'], { TICKLOOP_ARTIFACT_ORIGIN: STALE_ORIGIN });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.reported.artifactOrigin, PRE_ORIGIN);
+  assert.deepEqual(result.reported.args, ['-c']);
+  assert.match(result.stderr, /^Tickloop Cloud: https:\/\/pre\.tickloop\.ai \(ENV=pre\)$/m);
+});
+
+test('make dev ENV=dev uses the Makefile-only dev origin and stops before building without it', t => {
+  const f = fixture(t);
+  const configured = f.checkout('dev from dotenv');
+  writeFileSync(join(configured, '.env'),
+    `TICKLOOP_DEV_ARTIFACT_ORIGIN=${DEV_ORIGIN}\nTICKLOOP_ARTIFACT_ORIGIN=${STALE_ORIGIN}\n`);
+  const result = f.runMake(configured, ['ENV=dev'], { TICKLOOP_ARTIFACT_ORIGIN: STALE_ORIGIN });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.reported.artifactOrigin, DEV_ORIGIN);
+  assert.equal(result.reported.devArtifactOrigin, undefined);
+  assert.match(result.stderr, /^Tickloop Cloud: https:\/\/dev-cloud\.example\.test \(ENV=dev\)$/m);
+
+  // The Agent's own origin variable, from .env or the shell, never stands in for the dev origin.
+  const unconfigured = f.checkout('dev without origin');
+  writeFileSync(join(unconfigured, '.env'), `TICKLOOP_ARTIFACT_ORIGIN=${STALE_ORIGIN}\n`);
+  const missing = f.runMake(unconfigured, ['ENV=dev'], { TICKLOOP_ARTIFACT_ORIGIN: STALE_ORIGIN });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /put TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin> in \.env/);
+  assert.doesNotMatch(missing.stderr, /^Tickloop Cloud: /m);
+  assert.ok(!existsSync(join(unconfigured, 'cargo-calls')));
+});
+
+test('an exported ENV or TICKLOOP_ARTIFACT_ORIGIN does not move make dev off production', t => {
+  const f = fixture(t);
+  const checkout = f.checkout('exported env');
+  writeFileSync(join(checkout, '.env'), `TICKLOOP_DEV_ARTIFACT_ORIGIN=${DEV_ORIGIN}\n`);
+  for (const exportedEnvironment of ['pre', 'dev', 'staging']) {
+    const result = f.runMake(checkout, [], { ENV: exportedEnvironment, TICKLOOP_ARTIFACT_ORIGIN: STALE_ORIGIN });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.reported.artifactOrigin, PROD_ORIGIN);
+    assert.equal(result.reported.shellStartupFile, undefined);
+    assert.equal(result.reported.devArtifactOrigin, undefined);
+  }
+  const chosen = f.runMake(checkout, ['ENV=pre'], { ENV: 'dev' });
+  assert.equal(chosen.reported.artifactOrigin, PRE_ORIGIN);
+  assert.equal(chosen.reported.shellStartupFile, undefined);
+});
+
+test('an unknown ENV fails immediately and lists the valid values', t => {
+  const f = fixture(t);
+  const checkout = f.checkout('unknown env');
+  for (const value of ['staging', '', 'pre dev']) {
+    const result = f.runMake(checkout, [`ENV=${value}`]);
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(`Unknown ENV '${value}'; use ENV=prod (the default), ENV=pre or ENV=dev`), result.stderr);
+  }
+  assert.ok(!existsSync(join(checkout, 'cargo-calls')));
+});
+
+function fixtureWithStaleOrigin(t) {
+  const f = fixture(t);
+  const directory = f.checkout('stale origin');
+  writeFileSync(join(directory, '.env'), `TICKLOOP_ARTIFACT_ORIGIN=${STALE_ORIGIN}\n`);
+  return { ...f, directory };
+}
