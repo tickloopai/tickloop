@@ -1,5 +1,5 @@
-//! Chat 的 Loop 随对话链记录：rewind、Branch、压缩与重启后保持同一个 Loop 与它的 Trigger。
-//! 同一测试进程中的多个 Agent 实例模拟多个进程；Trigger 租约、锁文件接管、停止状态与子进程持锁见
+//! Chat 的 Loop 随对话链记录：rewind、Branch、压缩与重启后保持同一个 Loop、它的 Tick 订阅与接收开关。
+//! 同一测试进程中的多个 Agent 实例模拟多个进程；Trigger 租约、锁文件接管、接收状态与子进程持锁见
 //! `loop_trigger_safety.rs`。
 
 use std::{
@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     BranchRequest, ChatId, Content, DirectedSummaryRequest, EventKind, LoopState, Message,
-    ModelIdentity, Protocol, Receipt, RewindMode, Role, SummaryDirection, Trigger,
-    TriggerPromptSource, TriggerSource, Usage,
+    ModelIdentity, PauseReason, Protocol, Receipt, Receiving, RewindMode, Role, SummaryDirection,
+    Usage,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::{config, next_event};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -115,15 +116,20 @@ fn message_text(message: &Message) -> String {
         .join("\n")
 }
 
-fn watching(prompt: &str) -> Trigger {
-    Trigger {
-        id: Uuid::new_v4(),
-        prompt: prompt.into(),
-        prompt_source: TriggerPromptSource::Explicit,
-        accepts_events: true,
-        armed: true,
-        subscriptions: Vec::new(),
-    }
+const HISTORY_LOADED: Receiving = Receiving::Paused {
+    reason: PauseReason::HistoryLoaded,
+};
+
+/// An Agent opened on `root` watching the Shell Tick of `task` on its own in-memory stream.
+async fn watching_agent(
+    root: &std::path::Path,
+    model: Arc<EchoModel>,
+    task: Uuid,
+) -> (Agent, ShellTick) {
+    let agent = Agent::open_embedded(root.into(), config(), model).unwrap();
+    let shell = ShellTick::new(task);
+    shell.install(&agent).await;
+    (agent, shell)
 }
 
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
@@ -238,10 +244,6 @@ async fn a_restart_pauses_an_idle_loop_and_keeps_its_state_time() {
     let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, chat, "watched goal").await;
-    agent
-        .configure_trigger(chat, Some(watching("watch check")))
-        .await
-        .unwrap();
     let before = agent.snapshot(chat).await.unwrap();
     assert_eq!(before.chat_loop.state, LoopState::Idle);
     let idle_at = before.chat_loop.state_since;
@@ -253,24 +255,22 @@ async fn a_restart_pauses_an_idle_loop_and_keeps_its_state_time() {
     let restored = restarted.resume_chat(chat).await.unwrap();
     assert_eq!(restored.chat_loop.state, LoopState::Idle);
     assert_eq!(restored.chat_loop.state_since, idle_at);
-    assert!(!restored.chat_loop.trigger.as_ref().unwrap().armed);
-    assert!(restored.trigger_awaits_resume);
+    assert_eq!(restored.chat_loop.receiving, HISTORY_LOADED);
     restarted.shutdown().await;
 }
 
 #[tokio::test]
-async fn rewind_keeps_the_loop_and_its_trigger_across_restarts() {
+async fn rewind_keeps_the_loop_and_its_subscriptions_across_restarts() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
+    let task = Uuid::new_v4();
     let model = EchoModel::new();
-    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let (agent, shell) = watching_agent(&root, model.clone(), task).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let first = complete_turn(&agent, chat, "first goal").await;
     complete_turn(&agent, chat, "second goal").await;
-    agent
-        .configure_trigger(chat, Some(watching("second check")))
-        .await
-        .unwrap();
+    shell.subscribe(&agent, chat).await;
+    let subscriptions = agent.snapshot(chat).await.unwrap().chat_loop.subscriptions;
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[1].clone();
     let outcome = agent
         .rewind(chat, point.message_id, RewindMode::Conversation)
@@ -278,19 +278,11 @@ async fn rewind_keeps_the_loop_and_its_trigger_across_restarts() {
         .unwrap();
     assert_eq!(outcome.draft.unwrap().prompt, "second goal");
     assert_eq!(outcome.snapshot.chat_loop.id, first.loop_id);
-    assert!(outcome.snapshot.chat_loop.trigger.as_ref().unwrap().armed);
-    agent
-        .trigger(
-            chat,
-            TriggerSource {
-                source: "manual".into(),
-                payload: serde_json::json!({"note": "changed"}),
-            },
-        )
-        .await
-        .unwrap();
+    assert_eq!(outcome.snapshot.chat_loop.subscriptions, subscriptions);
+    assert!(outcome.snapshot.chat_loop.receiving.is_receiving());
+    shell.update(1, "second check");
     wait_until(
-        "the Trigger to deliver after the rewind",
+        "the subscription to deliver after the rewind",
         Duration::from_secs(3),
         || model.prompts_containing("second check") >= 1,
     )
@@ -301,7 +293,7 @@ async fn rewind_keeps_the_loop_and_its_trigger_across_restarts() {
     drop(agent);
 
     let restarted_model = EchoModel::new();
-    let restarted = Agent::open_embedded(root.clone(), config(), restarted_model.clone()).unwrap();
+    let (restarted, _shell) = watching_agent(&root, restarted_model.clone(), task).await;
     let restored = restarted.resume_chat(chat).await.unwrap();
     assert_eq!(restored.chat_loop.id, first.loop_id);
     let third_point = restored
@@ -331,21 +323,18 @@ async fn rewind_keeps_the_loop_and_its_trigger_across_restarts() {
     let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = reopened.resume_chat(chat).await.unwrap();
     assert_eq!(restored.chat_loop.id, first.loop_id);
-    assert!(restored.chat_loop.trigger.is_some());
+    assert_eq!(restored.chat_loop.subscriptions, subscriptions);
     reopened.shutdown().await;
 }
 
 #[tokio::test]
-async fn branch_copies_the_loop_with_its_trigger_disarmed_until_continued() {
+async fn branch_copies_the_loop_paused_until_the_branch_is_continued() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let (agent, shell) = watching_agent(&root, EchoModel::new(), Uuid::new_v4()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let watched = complete_turn(&agent, chat, "watch goal").await;
-    agent
-        .configure_trigger(chat, Some(watching("watch check")))
-        .await
-        .unwrap();
+    shell.subscribe(&agent, chat).await;
 
     let outcome = agent
         .branch_chat(BranchRequest {
@@ -356,12 +345,20 @@ async fn branch_copies_the_loop_with_its_trigger_disarmed_until_continued() {
         .await
         .unwrap();
     let child = outcome.snapshot;
-    assert_eq!(child.chat_loop.id, watched.loop_id);
-    assert!(!child.chat_loop.trigger.as_ref().unwrap().armed);
-    assert_eq!(child.chat_loop.state, LoopState::Idle);
-    assert!(child.trigger_awaits_resume);
     let source = agent.snapshot(chat).await.unwrap();
-    assert!(source.chat_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(child.chat_loop.id, watched.loop_id);
+    assert_eq!(child.chat_loop.receiving, HISTORY_LOADED);
+    assert_eq!(child.chat_loop.state, LoopState::Idle);
+    assert_eq!(child.chat_loop.subscriptions.len(), 1);
+    assert_eq!(
+        child.chat_loop.subscriptions[0].instance,
+        source.chat_loop.subscriptions[0].instance
+    );
+    assert_ne!(
+        child.chat_loop.subscriptions[0].id, source.chat_loop.subscriptions[0].id,
+        "the copy subscribes on its own"
+    );
+    assert!(source.chat_loop.receiving.is_receiving());
 
     complete_turn(
         &agent,
@@ -370,7 +367,7 @@ async fn branch_copies_the_loop_with_its_trigger_disarmed_until_continued() {
     )
     .await;
     let resumed = agent.snapshot(outcome.child_chat_id).await.unwrap();
-    assert!(resumed.chat_loop.trigger.as_ref().unwrap().armed);
+    assert!(resumed.chat_loop.receiving.is_receiving());
     assert_eq!(resumed.chat_loop.state, LoopState::Idle);
     agent.shutdown().await;
     drop(agent);
@@ -378,23 +375,20 @@ async fn branch_copies_the_loop_with_its_trigger_disarmed_until_continued() {
     let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
     let restored = reopened.resume_chat(outcome.child_chat_id).await.unwrap();
     assert_eq!(restored.chat_loop.id, watched.loop_id);
-    assert!(restored.trigger_awaits_resume);
+    assert_eq!(restored.chat_loop.receiving, HISTORY_LOADED);
     reopened.shutdown().await;
 }
 
 #[tokio::test]
-async fn trigger_settings_survive_restart_after_compaction() {
+async fn subscriptions_survive_restart_after_compaction() {
     for directed in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
-        let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+        let (agent, shell) = watching_agent(&root, EchoModel::new(), Uuid::new_v4()).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let watched = complete_turn(&agent, chat, "watch goal").await;
-        let trigger = watching("watch check");
-        agent
-            .configure_trigger(chat, Some(trigger.clone()))
-            .await
-            .unwrap();
+        shell.subscribe(&agent, chat).await;
+        let subscriptions = agent.snapshot(chat).await.unwrap().chat_loop.subscriptions;
         complete_turn(&agent, chat, "other goal").await;
         complete_turn(&agent, chat, "third goal").await;
         if directed {
@@ -428,13 +422,9 @@ async fn trigger_settings_survive_restart_after_compaction() {
         let restored = restarted.resume_chat(chat).await.unwrap();
         let label = if directed { "directed" } else { "full" };
         assert_eq!(restored.chat_loop.id, watched.loop_id, "{label}");
-        let restored_trigger = restored.chat_loop.trigger.as_ref().unwrap();
-        assert_eq!(restored_trigger.id, trigger.id, "{label}");
-        assert_eq!(restored_trigger.prompt, trigger.prompt, "{label}");
-        assert!(restored_trigger.accepts_events, "{label}");
-        assert!(!restored_trigger.armed, "{label}");
+        assert_eq!(restored.chat_loop.subscriptions, subscriptions, "{label}");
         assert_eq!(restored.chat_loop.state, LoopState::Idle, "{label}");
-        assert!(restored.trigger_awaits_resume, "{label}");
+        assert_eq!(restored.chat_loop.receiving, HISTORY_LOADED, "{label}");
 
         complete_turn(&restarted, chat, "resume watching").await;
         // Loop 条目不进入发给模型的对话：重启后的请求只多出恢复哨兵与新的提示。
@@ -463,56 +453,56 @@ async fn trigger_settings_survive_restart_after_compaction() {
                 .await
                 .unwrap()
                 .chat_loop
-                .trigger
-                .as_ref()
-                .unwrap()
-                .armed,
+                .receiving
+                .is_receiving(),
             "{label}"
         );
         restarted.shutdown().await;
     }
 }
 
+/// A loaded Loop pauses receiving but keeps watching: the latest update waits, and the next user
+/// input continues the Chat and delivers it.
 #[tokio::test]
-async fn restarted_triggers_are_paused_and_a_new_input_resumes_them() {
+async fn a_restarted_loop_keeps_the_latest_update_until_a_new_input_resumes_it() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let task = Uuid::new_v4();
+    let (agent, shell) = watching_agent(&root, EchoModel::new(), task).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, chat, "watched goal").await;
-    agent
-        .configure_trigger(chat, Some(watching("watch check")))
-        .await
-        .unwrap();
+    shell.subscribe(&agent, chat).await;
     agent.shutdown().await;
     drop(agent);
 
     let model = EchoModel::new();
-    let restarted = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    let (restarted, shell) = watching_agent(&root, model.clone(), task).await;
     let restored = restarted.resume_chat(chat).await.unwrap();
     assert_eq!(restored.chat_loop.state, LoopState::Idle);
-    assert!(!restored.chat_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(restored.chat_loop.receiving, HISTORY_LOADED);
+    shell.wait_until_live(&restarted, chat).await;
+    shell.update(1, "older check");
+    shell.update(2, "newest check");
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(model.requests.lock().unwrap().is_empty());
 
     complete_turn(&restarted, chat, "resume watching").await;
-    let resumed = restarted.snapshot(chat).await.unwrap();
-    assert!(resumed.chat_loop.trigger.as_ref().unwrap().armed);
-    restarted
-        .trigger(
-            chat,
-            TriggerSource {
-                source: "manual".into(),
-                payload: serde_json::json!({"note": "changed"}),
-            },
-        )
-        .await
-        .unwrap();
+    assert!(
+        restarted
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .chat_loop
+            .receiving
+            .is_receiving()
+    );
     wait_until(
-        "the resumed trigger to deliver",
+        "the held update to deliver once resumed",
         Duration::from_secs(3),
-        || model.prompts_containing("watch check") >= 1,
+        || model.prompts_containing("newest check") >= 1,
     )
     .await;
+    assert_eq!(model.prompts_containing("older check"), 0);
     restarted.shutdown().await;
 }
 
@@ -527,7 +517,8 @@ async fn a_new_chat_has_one_loop_that_every_turn_and_restart_keep() {
     let created = agent.snapshot(chat).await.unwrap().chat_loop;
     assert_eq!(created.state, LoopState::Idle);
     assert!(created.run_id.is_none());
-    assert!(created.trigger.is_none());
+    assert!(created.receiving.is_receiving());
+    assert!(created.subscriptions.is_empty());
     assert!(created.event_sources.is_empty());
     let first = complete_turn(&agent, chat, "first task").await;
     let second = complete_turn(&agent, chat, "an unrelated task").await;
@@ -609,13 +600,10 @@ async fn interrupted_and_failed_turns_continue_with_the_next_input() {
 async fn old_format_loop_records_are_dropped_and_the_history_stays_visible() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let (agent, shell) = watching_agent(&root, EchoModel::new(), Uuid::new_v4()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let before = complete_turn(&agent, chat, "OLD-FORMAT-PROMPT").await;
-    agent
-        .configure_trigger(chat, Some(watching("watch check")))
-        .await
-        .unwrap();
+    shell.subscribe(&agent, chat).await;
     agent.shutdown().await;
     drop(agent);
     for path in transcript_files(&root) {
@@ -638,7 +626,7 @@ async fn old_format_loop_records_are_dropped_and_the_history_stays_visible() {
     );
     assert_ne!(restored.chat_loop.id, before.loop_id);
     assert_eq!(restored.chat_loop.state, LoopState::Idle);
-    assert!(restored.chat_loop.trigger.is_none());
+    assert!(restored.chat_loop.subscriptions.is_empty());
     let continued = complete_turn(&reopened, chat, "go on").await;
     assert_eq!(continued.loop_id, restored.chat_loop.id);
     assert!(

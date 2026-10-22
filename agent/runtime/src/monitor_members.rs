@@ -16,9 +16,7 @@ use serde_json::Value;
 use tick_protocol::InstanceRef;
 
 use super::{Agent, AgentError, Chat};
-use tickloop_agent_protocol::{
-    ChatId, MonitorMembership, PendingInput, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE,
-};
+use tickloop_agent_protocol::{ChatId, MonitorMembership, PendingInput, TriggerSource};
 use uuid::Uuid;
 
 /// What a completed tool call read or operated, as far as Monitor cares.
@@ -244,42 +242,35 @@ impl Agent {
     /// notifications already written into the conversation.
     pub(super) fn mark_run_inputs_handled(&self, chat: &mut Chat, pending: &PendingInput) {
         let mut instances = std::mem::take(&mut chat.bookkeeping.unread_notifications);
-        if let Some(source) = pending
-            .trigger_source
-            .as_ref()
-            .filter(|source| source.source == TICK_SUBSCRIPTION_SOURCE)
-        {
-            instances.extend(
-                source.payload["items"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| serde_json::from_value(item["instance"].clone()).ok()),
-            );
-        }
-        if let Some(claim) = chat.feedback_inputs.get(&pending.receipt.run_id) {
-            instances.extend(InstanceRef::artifact(&claim.origin, &claim.artifact_id).ok());
-        }
-        if let Some(source) = pending
-            .trigger_source
-            .as_ref()
-            .filter(|source| source.source == TICK_MANUAL_SOURCE)
-        {
-            for item in source.payload["items"].as_array().into_iter().flatten() {
-                if let (Ok(instance), Some(through_ms)) = (
-                    serde_json::from_value(item["instance"].clone()),
-                    item["through_ms"].as_u64(),
-                ) {
-                    chat.snapshot
-                        .monitor
-                        .mark_taken_in_through(instance, through_ms, now_ms());
-                }
+        match &pending.trigger_source {
+            Some(TriggerSource::TickUpdate { items }) => {
+                instances.extend(items.iter().map(|item| item.instance.clone()));
             }
-            self.record_monitor_membership(
-                chat.snapshot.id,
-                chat.snapshot.folder.as_deref(),
-                chat.snapshot.monitor.clone(),
-            );
+            Some(TriggerSource::ArtifactFeedback {
+                origin,
+                artifact_id,
+                ..
+            }) => {
+                instances.extend(InstanceRef::artifact(origin, artifact_id).ok());
+            }
+            Some(TriggerSource::TickManual {
+                instance,
+                read_at_ms,
+                ..
+            }) => {
+                chat.snapshot.monitor.mark_taken_in_through(
+                    instance.clone(),
+                    *read_at_ms,
+                    now_ms(),
+                );
+                self.record_monitor_membership(
+                    chat.snapshot.id,
+                    chat.snapshot.folder.as_deref(),
+                    chat.snapshot.monitor.clone(),
+                );
+            }
+            Some(TriggerSource::GoalContinuation { .. } | TriggerSource::ScheduledTask { .. })
+            | None => {}
         }
         self.mark_taken_in(chat, instances);
     }
@@ -299,9 +290,8 @@ impl Agent {
         let is_subscribed = chat
             .snapshot
             .chat_loop
-            .trigger
+            .subscriptions
             .iter()
-            .flat_map(|trigger| &trigger.subscriptions)
             .any(|subscription| subscription.instance == instance);
         is_subscribed
             || (!chat.snapshot.monitor.is_removed(&instance)

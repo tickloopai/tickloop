@@ -1180,14 +1180,9 @@ impl Agent {
                             host_tools,
                             tick_instances: snapshot
                                 .chat_loop
-                                .trigger
+                                .subscriptions
                                 .iter()
-                                .flat_map(|trigger| {
-                                    trigger
-                                        .subscriptions
-                                        .iter()
-                                        .map(|subscription| subscription.instance.clone())
-                                })
+                                .map(|subscription| subscription.instance.clone())
                                 .collect(),
                         },
                     };

@@ -150,12 +150,7 @@ impl TickLabels {
             &snapshot.artifact_ticks,
             super::shown_folder(snapshot.folder.as_deref()),
         );
-        for subscription in snapshot
-            .chat_loop
-            .trigger
-            .iter()
-            .flat_map(|trigger| &trigger.subscriptions)
-        {
+        for subscription in &snapshot.chat_loop.subscriptions {
             labels
                 .subscriptions
                 .insert(subscription.id, subscription.instance.clone());

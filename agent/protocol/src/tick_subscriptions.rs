@@ -4,11 +4,8 @@ use serde::{Deserialize, Serialize};
 use tick_protocol::InstanceRef;
 use uuid::Uuid;
 
-use crate::{HostToolAuthority, LoopId, LoopState};
+use crate::{HostToolAuthority, LoopState};
 
-pub const TICK_MANUAL_SOURCE: &str = "manual_tick_update";
-
-pub const TICK_SUBSCRIPTION_SOURCE: &str = "tick_subscription";
 /// The most one delivery may add to the model's context; an item it carries alone may take all of
 /// it. Tick Update data over its item's share is trimmed by whole segments, and items that no
 /// longer fit wait for the Loop's next turn.
@@ -88,11 +85,11 @@ pub enum TickLinkState {
     IdentityUncertain,
 }
 
-/// One subscription of the Chat's Loops, as Monitor shows it on its Tick Instance's row.
+/// One subscription of the Chat's Loop, as Monitor shows it on its Tick Instance's row.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TickSubscriptionStatus {
     pub id: Uuid,
-    pub loop_id: LoopId,
+    /// The state of the Loop the subscription wakes.
     pub loop_state: LoopState,
     pub instance: InstanceRef,
     pub frequency: TickSubscriptionFrequency,

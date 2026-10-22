@@ -2,13 +2,11 @@ use serde_json::json;
 use std::sync::Arc;
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
-    Content, EventKind, INTERRUPT_MESSAGE_FOR_TOOL_USE, LoopState, QuestionAnswer, Trigger,
-    TriggerPromptSource, TriggerSource,
+    Content, EventKind, INTERRUPT_MESSAGE_FOR_TOOL_USE, LoopState, QuestionAnswer,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::*;
 use tickloop_agent_tools::{ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT};
-use uuid::Uuid;
 
 const UNIQUENESS_ERROR: &str =
     "Question texts must be unique, option labels must be unique within each question";
@@ -326,7 +324,7 @@ async fn question_input_is_validated_like_claude_code() {
 }
 
 #[tokio::test]
-async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resume_work() {
+async fn cancelled_answers_cannot_resume_work() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -354,32 +352,6 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
             _ => {}
         }
     };
-    agent
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "Check the report.".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    assert!(
-        agent
-            .trigger(
-                chat,
-                TriggerSource {
-                    source: "file_changed".into(),
-                    payload: json!({})
-                }
-            )
-            .await
-            .is_err()
-    );
     assert_eq!(
         agent.snapshot(chat).await.unwrap().chat_loop.state,
         LoopState::WaitingQuestion

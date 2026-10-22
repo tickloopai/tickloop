@@ -3,9 +3,14 @@
 //! record.
 
 use sha2::{Digest, Sha256};
+use tickloop_agent_protocol::TriggerIdentity;
 use uuid::Uuid;
 
 const FEEDBACK: &str = "tickloop.input.feedback";
+const TICK_UPDATE: &str = "tickloop.input.tick-update";
+const TICK_MANUAL: &str = "tickloop.input.tick-manual";
+const GOAL_CONTINUATION: &str = "tickloop.input.goal-continuation";
+const SCHEDULED_TASK: &str = "tickloop.input.scheduled-task";
 const FAMILY_MESSAGE: &str = "tickloop.input.family-message";
 const HOST_RULE: &str = "tickloop.host-rule";
 
@@ -28,6 +33,56 @@ pub fn feedback(origin: &str, account: &str, delivery: Uuid) -> Uuid {
         FEEDBACK,
         &[origin.as_bytes(), account.as_bytes(), delivery.as_bytes()],
     )
+}
+
+/// A Trigger delivery to the Chat `chat`, by its identity: Tick Updates by subscription and
+/// sequence, a sent Tick by its instance and sequence, feedback by its delivery, a Goal
+/// continuation by the Goal and the turn it follows, a scheduled run by its task and time.
+pub fn trigger(chat: Uuid, identity: &TriggerIdentity) -> Uuid {
+    match identity {
+        TriggerIdentity::TickUpdate { updates } => {
+            let parts: Vec<Vec<u8>> = updates
+                .iter()
+                .map(|update| {
+                    [
+                        update.subscription.as_bytes().as_slice(),
+                        &update.sequence.to_be_bytes(),
+                    ]
+                    .concat()
+                })
+                .collect();
+            let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            named(TICK_UPDATE, &parts)
+        }
+        TriggerIdentity::TickManual { instance, sequence } => named(
+            TICK_MANUAL,
+            &[
+                chat.as_bytes(),
+                instance.to_string().as_bytes(),
+                &sequence.to_be_bytes(),
+            ],
+        ),
+        TriggerIdentity::ArtifactFeedback {
+            origin,
+            account_id,
+            delivery_id,
+        } => feedback(origin, account_id, *delivery_id),
+        TriggerIdentity::GoalContinuation { goal_id, after_run } => named(
+            GOAL_CONTINUATION,
+            &[goal_id.as_bytes(), after_run.as_bytes()],
+        ),
+        TriggerIdentity::ScheduledTask {
+            task_id,
+            scheduled_for_ms,
+        } => named(
+            SCHEDULED_TASK,
+            &[
+                chat.as_bytes(),
+                task_id.as_bytes(),
+                &scheduled_for_ms.to_be_bytes(),
+            ],
+        ),
+    }
 }
 
 /// A message one family member sends with a tool call of its answer.

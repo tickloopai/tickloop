@@ -2,12 +2,16 @@
 //! accepted with its content, so with durable wait hosting a load queues again what was waiting,
 //! after another attempt at each input whose answer lost its host.
 
-use tickloop_agent_protocol::{ChatId, EventKind, LoopState, Receipt};
+use tickloop_agent_protocol::{ChatId, EventKind, LoopState, PendingInput, Receipt, TriggerSource};
 use tickloop_agent_transcript::{
     InputEntry, InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
 };
 
 use super::{Agent, Chat, LoopSnapshotExt, WaitHosting, event_sources, turn};
+
+pub(super) fn is_trigger_input(pending: &PendingInput) -> bool {
+    pending.trigger_source.is_some()
+}
 
 /// An input whose answer lost its host this many times in a row fails instead of continuing.
 const LOST_HOST_LIMIT: usize = 3;
@@ -17,9 +21,9 @@ impl Agent {
     /// After a load. With durable wait hosting: another attempt continues each input whose
     /// answer lost its host, unless it lost its host three times in a row; the inputs that were
     /// queued are queued again after them; suspended Runs are rebuilt. With process wait
-    /// hosting, the inputs the Agent queued for itself are lost with the process, as they always
-    /// were, and an @tickloop request that had not started waits for the local inbox, which
-    /// delivers it again.
+    /// hosting, Trigger input that had not started is queued again, to wait for the Chat to be
+    /// continued, since its source already moved past it; the rest the Agent queued for itself
+    /// is lost with the process, as it always was.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -27,8 +31,16 @@ impl Agent {
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     return;
                 };
-                let redelivered = event_sources::requests_the_inbox_delivers_again(chat);
-                self.forget_inputs(chat, |entry| !redelivered.contains(&entry.input_id));
+                let waiting = chat
+                    .bookkeeping
+                    .lifecycle
+                    .queued_inputs()
+                    .into_iter()
+                    .filter(is_trigger_input)
+                    .map(|pending| pending.receipt.run_id)
+                    .collect::<std::collections::HashSet<_>>();
+                self.forget_inputs(chat, |entry| !waiting.contains(&entry.run_id));
+                self.requeue_inputs(chat, is_trigger_input);
                 self.save(&chat.snapshot);
             }
             WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,
@@ -44,7 +56,7 @@ impl Agent {
             return;
         };
         self.continue_lost_inputs(chat);
-        self.requeue_inputs(chat);
+        self.requeue_inputs(chat, |_| true);
         self.save(&chat.snapshot);
     }
 
@@ -127,10 +139,16 @@ impl Agent {
         self.emit(chat, receipt, EventKind::Failed(LOST_HOST_ERROR.into()));
     }
 
-    /// Queues again the inputs accepted and not started, behind the continuations, in the order
-    /// they were queued, each to the Chat's Loop.
-    fn requeue_inputs(&self, chat: &mut Chat) {
-        for mut pending in chat.bookkeeping.lifecycle.queued_inputs() {
+    /// Queues again the inputs accepted and not started that `requeued` selects, behind the
+    /// continuations, in the order they were queued, each to the Chat's Loop.
+    pub(super) fn requeue_inputs(&self, chat: &mut Chat, requeued: impl Fn(&PendingInput) -> bool) {
+        for mut pending in chat
+            .bookkeeping
+            .lifecycle
+            .queued_inputs()
+            .into_iter()
+            .filter(|pending| requeued(pending))
+        {
             let is_queued = chat
                 .snapshot
                 .pending_inputs
@@ -140,6 +158,13 @@ impl Agent {
                 continue;
             }
             pending.receipt.loop_id = chat.snapshot.chat_loop.id;
+            if let Some(TriggerSource::TickUpdate { items }) = &mut pending.trigger_source {
+                self.tick_deliveries().rebind_restored_items(
+                    chat.snapshot.id,
+                    &chat.snapshot.chat_loop,
+                    items,
+                );
+            }
             let chat_loop = &mut chat.snapshot.chat_loop;
             if !matches!(
                 chat_loop.state,
@@ -169,9 +194,9 @@ impl Agent {
                     .take_while(|queued| queued.task_continuation)
                     .count(),
             );
-            if let Some(identity) =
-                event_sources::queued_feedback_identity(chat.snapshot.id, &pending)
-            {
+            if let Some(identity) = pending.trigger_source.as_ref().and_then(|source| {
+                event_sources::feedback_identity(chat.snapshot.id, pending.receipt.loop_id, source)
+            }) {
                 chat.feedback_inputs
                     .insert(pending.receipt.run_id, identity);
             }

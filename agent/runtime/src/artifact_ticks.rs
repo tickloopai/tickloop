@@ -89,7 +89,7 @@ impl Agent {
             self.unlink_feedback_receivers(chat_id, Some((origin, artifact_id)))
                 .await?;
         }
-        let (ticks, released_loop) = {
+        let ticks = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             chat.snapshot
@@ -98,13 +98,11 @@ impl Agent {
             chat.snapshot
                 .artifact_ticks
                 .retain(|tick| tick.instance_id() != instance_id);
-            let released_loop = instance_id
-                .parse::<tick_protocol::InstanceRef>()
-                .ok()
-                .and_then(|instance| {
-                    let (origin, artifact_id) = instance.artifact_parts()?;
-                    self.unlink_artifact(chat, origin, artifact_id)
-                });
+            if let Ok(instance) = instance_id.parse::<tick_protocol::InstanceRef>()
+                && let Some((origin, artifact_id)) = instance.artifact_parts()
+            {
+                self.unlink_artifact(chat, origin, artifact_id);
+            }
             let ticks = chat.snapshot.artifact_ticks.clone();
             self.record_artifact_ticks(
                 chat_id,
@@ -112,11 +110,8 @@ impl Agent {
                 ticks.clone(),
                 chat.snapshot.removed_artifact_ticks.clone(),
             );
-            (ticks, released_loop)
+            ticks
         };
-        if let Some(released) = released_loop {
-            self.disarm_feedback_lease(chat_id, released).await;
-        }
         Ok(ticks)
     }
     pub async fn artifact_ticks(&self, chat_id: ChatId) -> Result<Vec<ArtifactTick>, AgentError> {

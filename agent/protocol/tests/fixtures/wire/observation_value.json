@@ -323,15 +323,19 @@
           "state": "Idle",
           "run_id": "00000000-0000-0000-0000-000000000020",
           "run_started_at": 1000,
-          "trigger": {
-            "id": "00000000-0000-0000-0000-000000000030",
-            "prompt": "",
-            "prompt_source": "Subscriptions",
-            "accepts_events": true,
-            "armed": true,
-            "subscriptions": []
+          "state_since": 2000,
+          "receiving": {
+            "state": "paused",
+            "reason": "stopped"
           },
-          "state_since": 2000
+          "subscriptions": [
+            {
+              "id": "00000000-0000-0000-0000-000000000031",
+              "instance": "hosted:00000000-0000-0000-0000-000000000040",
+              "frequency": "medium",
+              "authority": null
+            }
+          ]
         },
         "plans": [],
         "progress": []
@@ -506,7 +510,6 @@
         "slow disk"
       ],
       "request_refs": [],
-      "trigger_awaits_resume": false,
       "last_queue_sequence": 0,
       "transcript_write_error": "disk full",
       "loop_trigger_notices": [],
@@ -597,7 +600,6 @@
     "Subscriptions": [
       {
         "id": "00000000-0000-0000-0000-000000000031",
-        "loop_id": "00000000-0000-0000-0000-000000000010",
         "loop_state": "Idle",
         "instance": "hosted:00000000-0000-0000-0000-000000000040",
         "frequency": "high",
@@ -924,15 +926,19 @@
           "state": "Idle",
           "run_id": "00000000-0000-0000-0000-000000000020",
           "run_started_at": 1000,
-          "trigger": {
-            "id": "00000000-0000-0000-0000-000000000030",
-            "prompt": "",
-            "prompt_source": "Subscriptions",
-            "accepts_events": true,
-            "armed": true,
-            "subscriptions": []
+          "state_since": 2000,
+          "receiving": {
+            "state": "paused",
+            "reason": "stopped"
           },
-          "state_since": 2000
+          "subscriptions": [
+            {
+              "id": "00000000-0000-0000-0000-000000000031",
+              "instance": "hosted:00000000-0000-0000-0000-000000000040",
+              "frequency": "medium",
+              "authority": null
+            }
+          ]
         },
         "first_prompt": "Audit the counter",
         "plans": [],

@@ -441,7 +441,6 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
                 .filter(|row| row.instance == reopened.instance)
         })
         .await;
-        assert_eq!(restored.loop_id, subscribed.loop_id);
         assert_eq!(restored.frequency, TickSubscriptionFrequency::High);
         assert_eq!(
             launch_record_count(&fixture),

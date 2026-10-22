@@ -2496,7 +2496,7 @@ async fn family_stop_cancels_owned_background_commands_and_keeps_other_families(
             && child.questions.is_empty()
     );
     assert!(
-        child.trigger_awaits_resume,
+        !child.chat_loop.receiving.is_receiving(),
         "the stopped child waits to be continued"
     );
     assert!(core.snapshot(unrelated).await.unwrap().messages.is_empty());

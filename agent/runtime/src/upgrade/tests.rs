@@ -1,6 +1,6 @@
 use super::*;
 use std::time::Duration;
-use tickloop_agent_protocol::{CommandState, Trigger};
+use tickloop_agent_protocol::CommandState;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 async fn complete(agent: &Agent, chat: ChatId, input: &str) -> Receipt {
@@ -43,7 +43,9 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
     snapshot.policy.mode = ExecutionMode::FullAccess;
     snapshot.thinking_enabled = false;
     snapshot.context_window_tokens = Some(4096);
-    snapshot.trigger_awaits_resume = true;
+    snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+        reason: tickloop_agent_protocol::PauseReason::Stopped,
+    };
     snapshot.last_queue_sequence = 13;
     let sequence = snapshot
         .request_usage
@@ -135,7 +137,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
     );
     assert!(!actual.thinking_enabled);
     assert_eq!(actual.context_window_tokens, Some(4096));
-    assert!(actual.trigger_awaits_resume);
+    assert_eq!(actual.chat_loop.receiving, expected.chat_loop.receiving);
     assert_eq!(actual.last_queue_sequence, 13);
     assert_eq!(actual.last_sequence, expected.last_sequence);
     assert_eq!(actual.message_compactions, expected.message_compactions);
@@ -154,26 +156,12 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
 }
 
 #[tokio::test]
-async fn planned_restore_preserves_an_armed_trigger_and_session_permissions_without_model_calls() {
+async fn planned_restore_keeps_receiving_and_session_permissions_without_model_calls() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("ready")]));
     let original = Agent::new_embedded(config(), model);
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     let receipt = complete(&original, chat, "wait for later").await;
-    original
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "check later".into(),
-                prompt_source: Default::default(),
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
     let owner = PermissionOwner::new(chat, receipt.loop_id).unwrap();
     let operation = session_permissions::SessionPermissionOperation::from_normalized(
         "Read".into(),
@@ -247,16 +235,15 @@ async fn planned_restore_preserves_an_armed_trigger_and_session_permissions_with
     assert!(successor_model.requests.lock().unwrap().is_empty());
     original.shutdown_for_upgrade().await;
     successor.release_upgrade().await.unwrap();
+    // A live handoff is no history load: the Loop keeps receiving.
     assert!(
         successor
             .snapshot(chat)
             .await
             .unwrap()
             .chat_loop
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
+            .receiving
+            .is_receiving()
     );
     assert!(successor_model.requests.lock().unwrap().is_empty());
     successor.shutdown().await;
@@ -609,17 +596,16 @@ async fn watch_reconnect_delivers_one_latest_update_since_the_original_baseline(
         .await;
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     complete(&original, chat, "watch state").await;
-    let mut trigger = Trigger::for_subscriptions();
-    trigger
-        .subscriptions
-        .push(tickloop_agent_protocol::TickSubscription {
-            id: Uuid::new_v4(),
-            instance: instance.clone(),
-            frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
-            authority: None,
-        });
     original
-        .configure_trigger(chat, Some(trigger))
+        .configure_subscriptions(
+            chat,
+            vec![tickloop_agent_protocol::TickSubscription {
+                id: Uuid::new_v4(),
+                instance: instance.clone(),
+                frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+                authority: None,
+            }],
+        )
         .await
         .unwrap();
     let watch = *first_stream.stream.watches().keys().next().unwrap();

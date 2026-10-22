@@ -979,6 +979,7 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         state: InputState::Accepted,
         queued: None,
+        trigger: None,
     };
     let response = ResponseEntry {
         response_id: Uuid::new_v4(),

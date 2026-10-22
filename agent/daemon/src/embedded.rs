@@ -1276,13 +1276,6 @@ impl EmbeddedAgentAccess {
                 agent.disable_event_sources_for_chat(chat).await;
                 Ok(CommandResult::Done)
             }
-            LoopAction::ConfigureTrigger { trigger } => {
-                agent.configure_trigger(chat, trigger).await?;
-                Ok(CommandResult::Done)
-            }
-            LoopAction::EmitTrigger { source } => {
-                Ok(CommandResult::Submitted(agent.trigger(chat, source).await?))
-            }
             LoopAction::ApprovePlan { version, mode } => {
                 match agent.approve_plan(chat, version, mode).await? {
                     Some(continuation) => Ok(CommandResult::Text(continuation)),

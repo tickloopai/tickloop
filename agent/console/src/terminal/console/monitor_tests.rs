@@ -987,7 +987,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     let mut state = State::new(true, 140, 30);
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"calendar:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":"calendar:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
     let console = tests::console_with_state(state);
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1072,7 +1072,7 @@ fn an_artifact_tick_subscription_brings_no_row() {
     let chat = Uuid::new_v4();
     state.chat = Some(chat);
     let console = tests::console_with_state(state);
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     assert!(console.state.lock().unwrap().monitor.entries().is_empty());
 }
@@ -2177,7 +2177,6 @@ fn subscribed_fixture(subscriptions: usize) -> State {
         .map(|index| {
             let mut row = tests::subscription_row(3 + index as u64);
             row.instance = tick_protocol::InstanceRef::new("calendar", "fixture-run").unwrap();
-            row.loop_id = Uuid::from_u128(900 + index as u128);
             row.accumulated = index as u64;
             row
         })
@@ -3139,7 +3138,6 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
         chat,
     };
     let other = tick_protocol::InstanceRef::new("cal", "other").unwrap();
-    let loop_id = agent.tick_subscriptions(chat).await.unwrap()[0].loop_id;
     let frequency_of_other = || async {
         agent
             .tick_subscriptions(chat)
@@ -3147,14 +3145,14 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
             .unwrap()
             .into_iter()
             .find(|row| row.instance == other)
-            .map(|row| (row.loop_id, row.frequency))
+            .map(|row| row.frequency)
     };
     let status = || console.state.lock().unwrap().status.clone();
 
     run_intent(context, TickIntent::Subscribe(other.clone()))
         .await
         .unwrap();
-    assert_eq!(frequency_of_other().await, Some((loop_id, High)));
+    assert_eq!(frequency_of_other().await, Some(High));
     assert!(
         status().is_empty(),
         "frequency stays in the Monitor footer: {}",
@@ -3164,7 +3162,7 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
     run_intent(context, TickIntent::Subscribe(other.clone()))
         .await
         .unwrap();
-    assert_eq!(frequency_of_other().await, Some((loop_id, Medium)));
+    assert_eq!(frequency_of_other().await, Some(Medium));
     assert!(status().is_empty());
 
     let (first, second) = {

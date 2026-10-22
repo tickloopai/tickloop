@@ -1,15 +1,14 @@
-//! A Loop that fires thousands of times leaves a Transcript whose load stays bounded: the chain
-//! is read from the latest compact boundary and the retained Lines from the latest snapshot.
+//! A Loop that takes thousands of Trigger deliveries leaves a Transcript whose load stays bounded:
+//! the chain is read from the latest compact boundary and the retained Lines from the latest
+//! snapshot.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_protocol::{
-    AgentHostOptions, EventKind, PromptPolicy, Trigger, TriggerPromptSource, TriggerSource, Usage,
-};
-use tickloop_agent_runtime::transcript::{LoadRange, TranscriptStore};
+use tickloop_agent_protocol::{AgentHostOptions, EventKind, PromptPolicy, Usage};
+use tickloop_agent_runtime::transcript::{LoadRange, StorePosition, TranscriptStore};
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
     TurnRequest, UserMessage, WaitHosting,
@@ -24,8 +23,9 @@ use uuid::Uuid;
 
 /// The conversation is compacted after this many fires, as a long-running Chat's would be.
 const FIRES_PER_COMPACTION: usize = 100;
-/// What a load may read of the retained Lines, whatever the number of fires.
-const RETAINED_BYTES_LIMIT: usize = 512 * 1024;
+/// What a load may read of the retained Lines, whatever the number of fires. Each retained
+/// request's ledger record names the delivery it came from, about 170 bytes of it.
+const RETAINED_BYTES_LIMIT: usize = 640 * 1024;
 const LOADED_LINES_LIMIT: usize = 2_000;
 const LOAD_TIME_LIMIT: Duration = Duration::from_secs(2);
 
@@ -106,9 +106,10 @@ async fn until_completed(
     }
 }
 
-/// A Loop taking `fires` Trigger events over holdings of `fires_per_holding` each, every one on
-/// a fresh instance as a host gives each holding, and the conversation compacted as a
-/// long-running Chat's is. Every load reads a bounded part of the Transcript.
+/// A Loop taking `fires` @tickloop requests a durable host delivers over holdings of
+/// `fires_per_holding` each, every one on a fresh instance as a host gives each holding, and the
+/// conversation compacted as a long-running Chat's is. Every load reads a bounded part of the
+/// Transcript.
 async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let agent = harness(store.clone());
@@ -116,9 +117,13 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     let mut events = agent.subscribe();
     let turn = agent.advance(chat, check_feed()).await.unwrap();
     until_completed(&mut events, turn.receipt().run_id).await;
-    arm(&agent, chat).await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
+    store.seed(
+        chat,
+        super::durable_deliveries::linked(store.lines(chat), turn.receipt().loop_id),
+        StorePosition(1),
+    );
     for holding in 0..fires / fires_per_holding {
         assert_bounded_load(&store, chat).await;
         let started = Instant::now();
@@ -129,20 +134,15 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
             "loading took {:?}",
             started.elapsed()
         );
-        // The Trigger stays armed and its Loop waits for it across holdings.
+        // A durable load keeps the Loop receiving across holdings.
         let mut events = agent.subscribe();
         for fire in holding * fires_per_holding..(holding + 1) * fires_per_holding {
-            let receipt = agent
-                .trigger(
-                    chat,
-                    TriggerSource {
-                        source: "feed".into(),
-                        payload: serde_json::json!({ "fire": fire }),
-                    },
-                )
+            let delivery = super::durable_deliveries::delivery(&format!("feedback-{fire}"));
+            let turn = agent
+                .advance(chat, TurnRequest::deliver(delivery))
                 .await
                 .unwrap();
-            until_completed(&mut events, receipt.run_id).await;
+            until_completed(&mut events, turn.receipt().run_id).await;
             if fire % FIRES_PER_COMPACTION == FIRES_PER_COMPACTION - 1 {
                 agent.compact(chat).await.unwrap();
             }
@@ -172,23 +172,6 @@ fn check_feed() -> TurnRequest {
         delivery: Delivery::Queue,
         host_context: None,
     }
-}
-
-async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId) {
-    agent
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "Check the feed".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
 }
 
 /// What a load from the latest boundary reads stays within the limits, however many fires

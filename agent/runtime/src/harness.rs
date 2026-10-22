@@ -282,8 +282,8 @@ impl ModelClients for OneClient {
 pub enum Quiescence {
     /// Nothing of the Chat runs or waits to run.
     Idle,
-    /// Nothing runs, but a Run waits for a person, or a Loop waits for its Trigger or the
-    /// requests of an artifact it is linked to.
+    /// Nothing runs, but a Run waits for a person, or a receiving Loop waits for its Tick
+    /// Subscriptions or the requests of an artifact it is linked to.
     Waiting(Waits),
 }
 
@@ -371,7 +371,7 @@ impl Agent {
             let (state, members) = {
                 let chats = self.inner.chats.lock().await;
                 let members = family_members(&chats, chat_id);
-                (family_state(&chats, &members), members)
+                (family_state(self, &chats, &members), members)
             };
             match state {
                 // Nothing starts once the instance shuts down or hands its families over.
@@ -414,6 +414,7 @@ fn family_members(chats: &HashMap<ChatId, Chat>, chat_id: ChatId) -> Vec<ChatId>
 
 /// Whether anything of the family runs, and what it waits on; `None` when no member is here.
 fn family_state(
+    agent: &Agent,
     chats: &HashMap<ChatId, Chat>,
     members: &[ChatId],
 ) -> Option<(bool, Option<Waits>)> {
@@ -425,7 +426,7 @@ fn family_state(
             continue;
         };
         found = true;
-        let (member_runs, member_waits) = chat_state(*member, chat);
+        let (member_runs, member_waits) = chat_state(agent, *member, chat);
         runs |= member_runs;
         if let Some(member_waits) = member_waits {
             let family_waits = waits.get_or_insert_with(Waits::default);
@@ -436,7 +437,7 @@ fn family_state(
     found.then_some((runs, waits))
 }
 
-fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
+fn chat_state(agent: &Agent, chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
     let user_shell_in = |states: &[UserShellState]| {
         chat.snapshot
             .user_shells
@@ -469,7 +470,7 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
             .is_some()
     });
     let runs = ((chat.active.is_some() || chat.active_run.is_some()) && !waits_for_member)
-        || has_startable_input(chat)
+        || has_startable_input(agent, chat)
         || !chat.family_finishing.is_empty()
         // A Run that ended still records its end with its parent and delivers notifications.
         || !chat.ready_runs.is_empty()
@@ -479,8 +480,7 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
     let waits = !chat.parked.is_empty()
         || !deliveries.is_empty()
         || waits_for_member
-        || !chat.trigger_cancellations.is_empty()
-        || !chat.event_cancellations.is_empty()
+        || crate::wakeup::listens(&chat.snapshot.chat_loop)
         || user_shell_in(&[UserShellState::WaitingPermission]);
     (
         runs,
@@ -493,7 +493,7 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
 
 /// Whether an input queued to a Loop that can take it starts once the free execution slot is
 /// taken, as between a Run's end and the next Run's start: the Chat still runs then.
-fn has_startable_input(chat: &Chat) -> bool {
+fn has_startable_input(agent: &Agent, chat: &Chat) -> bool {
     let snapshot = &chat.snapshot;
     let is_held_back = !snapshot.pending_commands.is_empty()
         || chat.has_foreground_user_shell()
@@ -510,12 +510,13 @@ fn has_startable_input(chat: &Chat) -> bool {
         && snapshot.pending_inputs.iter().any(|pending| {
             pending.armed
                 && pending.trigger_source.as_ref().is_none_or(|source| {
-                    crate::triggers::takes_trigger_input(&snapshot.chat_loop, source)
+                    agent.takes_trigger_input(chat, source) == crate::wakeup::Eligibility::Eligible
                 })
         })
 }
 
-/// The links of the Chat's Loop that receive their artifact's requests.
+/// The links of the Chat's Loop that receive their artifact's requests: none while it pauses
+/// receiving.
 fn deliveries_of(
     chat: ChatId,
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
@@ -524,7 +525,7 @@ fn deliveries_of(
     chat_loop
         .event_sources
         .iter()
-        .filter(|source| !source.resume_required)
+        .filter(|source| chat_loop.receiving.is_receiving() && !source.resume_required)
         .map(|source| DeliveryBinding {
             chat,
             loop_id: chat_loop.id,

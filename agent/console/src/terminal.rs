@@ -137,8 +137,8 @@ use tickloop_agent_protocol::{
     InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
     QueuedInputKind, ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin,
-    ShellTaskPromptWatchdog, ShellTaskState, TaskNotification, TaskNotificationStatus, Trigger,
-    TriggerPromptSource, TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
+    ShellTaskPromptWatchdog, ShellTaskState, TaskNotification, TaskNotificationStatus, Usage,
+    UserInput, UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -3839,15 +3839,6 @@ async fn interact_with_herdr(
                                 }
                             } else {outln!(console, "No Chat is selected.");}
                         },
-                        _ if line=="/clear-trigger" || line.starts_with("/events ") || line.starts_with("/trigger ") => {
-                            if let Some(chat)=selected_chat {
-                                match trigger_control(console, agent,chat,&line).await {
-                                    Ok(Some(receipt))=>{outln!(console, "Accepted: Run {}",receipt.run_id);pending.insert(receipt.run_id,receipt);},
-                                    Ok(None)=>{},
-                                    Err(error)=>outln!(console, "Trigger control failed: {}",safe_text(&error)),
-                                }
-                            } else {outln!(console, "No Chat is selected.");}
-                        },
                         "/interrupt" => {
                             if let Some(chat) = selected_chat {
                                 let operations = agent.interrupt(chat).await.map_err(|error|error.to_string())?;
@@ -5847,70 +5838,12 @@ async fn answer_typed_question(
     Ok(())
 }
 
-async fn trigger_control(
-    console: &Console,
-    agent: &Agent,
-    chat: uuid::Uuid,
-    command: &str,
-) -> Result<Option<Receipt>, String> {
-    if let Some(arguments) = command.strip_prefix("/trigger ") {
-        let mut fields = arguments.splitn(2, ' ');
-        let source = fields.next().ok_or("event source is required")?.to_owned();
-        let payload = fields
-            .next()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|_| "event payload must be valid JSON")?
-            .unwrap_or(serde_json::Value::Null);
-        return agent
-            .trigger(chat, TriggerSource { source, payload })
-            .await
-            .map(Some)
-            .map_err(|error| error.to_string());
-    }
-    let snapshot = agent
-        .snapshot(chat)
-        .await
-        .map_err(|error| error.to_string())?;
-    let current = snapshot.chat_loop.trigger;
-    if command == "/clear-trigger" {
-        agent
-            .configure_trigger(chat, None)
-            .await
-            .map_err(|error| error.to_string())?;
-        outln!(console, "Trigger disabled.");
-        return Ok(None);
-    }
-    let mut trigger = current.unwrap_or(Trigger {
-        id: uuid::Uuid::new_v4(),
-        prompt: String::new(),
-        prompt_source: TriggerPromptSource::Explicit,
-        accepts_events: false,
-        armed: true,
-        subscriptions: Vec::new(),
-    });
-    trigger.id = uuid::Uuid::new_v4();
-    trigger.armed = true;
-    if let Some(prompt) = command.strip_prefix("/events ") {
-        trigger.set_explicit_prompt(prompt.trim().into());
-        trigger.accepts_events = true;
-    }
-    agent
-        .configure_trigger(chat, Some(trigger.clone()))
-        .await
-        .map_err(|error| error.to_string())?;
-    print_trigger(console, &trigger)?;
-    Ok(None)
-}
-
 async fn parse_after_turn(
     agent: &Agent,
     chat: uuid::Uuid,
     command: &str,
 ) -> Result<AfterTurnAction, AccessError> {
-    use tickloop_agent_protocol::{
-        AfterTurnAction, ConfigurationChange, HistoryAction, LoopAction, UserInput,
-    };
+    use tickloop_agent_protocol::{AfterTurnAction, ConfigurationChange, HistoryAction, UserInput};
     let invalid = |message: &str| AccessError::invalid(message);
     let (name, arguments) = command
         .trim()
@@ -5987,44 +5920,6 @@ async fn parse_after_turn(
                 },
             })
         }
-        "/clear-trigger" => Ok(AfterTurnAction::Loop {
-            action: LoopAction::ConfigureTrigger { trigger: None },
-        }),
-        "/trigger" => {
-            let (source, payload) = arguments
-                .split_once(char::is_whitespace)
-                .unwrap_or((arguments, "null"));
-            let payload = serde_json::from_str(payload)
-                .map_err(|_| invalid("event payload must be valid JSON"))?;
-            Ok(AfterTurnAction::Loop {
-                action: LoopAction::EmitTrigger {
-                    source: TriggerSource {
-                        source: source.into(),
-                        payload,
-                    },
-                },
-            })
-        }
-        "/events" => {
-            let snapshot = agent.snapshot(chat).await?;
-            let mut trigger = snapshot.chat_loop.trigger.unwrap_or(Trigger {
-                id: uuid::Uuid::new_v4(),
-                prompt: String::new(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: false,
-                armed: true,
-                subscriptions: Vec::new(),
-            });
-            trigger.id = uuid::Uuid::new_v4();
-            trigger.armed = true;
-            trigger.accepts_events = true;
-            trigger.set_explicit_prompt(arguments.into());
-            Ok(AfterTurnAction::Loop {
-                action: LoopAction::ConfigureTrigger {
-                    trigger: Some(trigger),
-                },
-            })
-        }
         _ => {
             let skill = name
                 .strip_prefix('/')
@@ -6041,18 +5936,6 @@ async fn parse_after_turn(
             })
         }
     }
-}
-
-fn print_trigger(console: &Console, trigger: &Trigger) -> Result<(), String> {
-    outln!(
-        console,
-        "Trigger: {} · armed {} · explicit events {}",
-        trigger.id,
-        trigger.armed,
-        trigger.accepts_events
-    );
-    outln!(console, "Prompt: {}", safe_text(&trigger.prompt));
-    Ok(())
 }
 
 async fn command_control(
@@ -8438,10 +8321,7 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let instance = "hosted:7247ea8b-fced-497c-8e04-2885648826e";
         let payload = serde_json::json!({"items":[{"instance":instance,"title":"Stock watcher","seq":"7","updates":1,"data":{"text":"second check"}}]});
-        let text = tickloop_agent_protocol::local_messages::tick_delivery(
-            &payload,
-            &tickloop_agent_protocol::Trigger::for_subscriptions(),
-        );
+        let text = tickloop_agent_protocol::local_messages::tick_delivery(&payload);
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
             "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         })).unwrap();
@@ -8508,7 +8388,6 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let tick = tickloop_agent_protocol::local_messages::tick_delivery(
             &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
-            &tickloop_agent_protocol::Trigger::for_subscriptions(),
         );
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
         snapshot.message_runs.insert(0, run);

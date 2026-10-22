@@ -141,8 +141,9 @@ pub use local_messages::{
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
-    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
-    TriggerPromptSource, TriggerSource,
+    Authority, Coalesce, EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice,
+    LoopTriggerNoticeKind, PauseReason, Receiving, SubscriptionSequence, TickDeliveryItem,
+    TriggerIdentity, TriggerKind, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
@@ -177,9 +178,8 @@ pub use shell_tasks::{
 };
 pub use skill::{InvokedSkill, RemoteSkillDefinition, RemoteSkillResource, SkillSource};
 pub use tick_subscriptions::{
-    MAX_DELIVERY_ITEM_BYTES, MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, TICK_MANUAL_SOURCE,
-    TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
-    TickSubscriptionFrequency, TickSubscriptionStatus,
+    MAX_DELIVERY_ITEM_BYTES, MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, TickLinkState,
+    TickSubscription, TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus,
 };
 pub use tool::ToolDefinition;
 pub use tools::{

@@ -10,8 +10,6 @@ mod citations;
 mod cloud_composition;
 #[path = "all/durable_deliveries.rs"]
 mod durable_deliveries;
-#[path = "all/durable_event_triggers.rs"]
-mod durable_event_triggers;
 #[path = "all/durable_family.rs"]
 mod durable_family;
 #[path = "all/durable_queue.rs"]
@@ -195,8 +193,6 @@ mod tool_results;
 mod transcript_stores;
 #[path = "all/transcripts.rs"]
 mod transcripts;
-#[path = "all/triggers.rs"]
-mod triggers;
 #[path = "all/trusted_approval_context.rs"]
 mod trusted_approval_context;
 #[path = "all/unpersisted_state.rs"]
@@ -205,6 +201,12 @@ mod unpersisted_state;
 mod user_settings;
 #[path = "all/waiting_runs.rs"]
 mod waiting_runs;
+#[path = "all/wakeup_contract.rs"]
+mod wakeup_contract;
+#[path = "all/wakeup_recovery.rs"]
+mod wakeup_recovery;
+#[path = "all/wakeup_support.rs"]
+mod wakeup_support;
 #[path = "all/web_tools.rs"]
 mod web_tools;
 #[path = "all/workspace_host_context.rs"]

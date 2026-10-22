@@ -319,7 +319,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     .unwrap();
     chat.monitor.remove(instance.clone());
     let subscription = |accumulated: u64| -> tickloop_agent_protocol::TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
     };
     let unread = |rows: &[tickloop_agent_console::monitor_rows::TickDescriptor]| {
         rows[0]
@@ -405,7 +405,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     unstoppable.capabilities.can_stop = false;
     finished.updated_at_ms = Some(1_000);
     let subscription = |instance: &str| -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
     };
     let (pane, artifact) = (
         subscription("calendar:pane"),
@@ -539,7 +539,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
                frequency: &str,
                link: &str|
      -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"hosted:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":"hosted:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
     };
     let recent = row(Some(2000), Some("Shared Tick"), "high", "Live");
     let baseline = row(None, None, "low", "Initializing");
@@ -569,7 +569,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
 }
 
 #[tokio::test]
-async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration() {
+async fn shell_subscription_refuses_a_foreign_chat_before_its_baseline() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -641,36 +641,6 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
         agent.tick_subscriptions(observer).await.unwrap().is_empty(),
         "foreign Shell watch became configured"
     );
-    agent
-        .configure_trigger(
-            observer,
-            Some(tickloop_agent_protocol::Trigger {
-                id: Uuid::new_v4(),
-                prompt: "restored foreign watch".into(),
-                prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: vec![tickloop_agent_protocol::TickSubscription {
-                    id: Uuid::new_v4(),
-                    instance: instance.clone(),
-                    frequency: tickloop_agent_protocol::TickSubscriptionFrequency::Immediate,
-                    authority: None,
-                }],
-            }),
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rows = agent.tick_subscriptions(observer).await.unwrap();
-            if rows[0].link == tickloop_agent_protocol::TickLinkState::IdentityUncertain {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("restored foreign watch must fail closed before its baseline");
     std::fs::write(directory.path().join("release"), "").unwrap();
     tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert!(!model.requests.lock().unwrap().iter().any(|request| {

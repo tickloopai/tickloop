@@ -16,7 +16,7 @@ use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
 use tickloop_agent_protocol::{
     AgentAccess, AgentCommand, AgentDetailQuery, CommandResult, EnvironmentValue, ExecutionMode,
     ExecutionRef, LaunchSpec, LoopAction, ObservationRequest, ObservationValue, PendingInput,
-    PromptPolicy, Receipt, TICK_SUBSCRIPTION_SOURCE, TriggerSource, UserInput,
+    PromptPolicy, Receipt, TriggerSource, UserInput,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -286,13 +286,16 @@ fn seed_queued_tick(checkpoint: &mut Value) -> Uuid {
         agent_message: None,
         directed_human: None,
         denial_reference: None,
-        trigger_source: Some(TriggerSource {
-            source: TICK_SUBSCRIPTION_SOURCE.into(),
-            payload: json!({"items":[{
-                "subscription":subscription, "watch":watch["watch"], "instance":watch["instance"],
-                "data":{"value":0,"marker":QUEUED_MARKER}, "seq":0,
-            }]}),
-        }),
+        trigger_source: Some(
+            serde_json::from_value::<TriggerSource>(json!({
+                "kind": "tick_update",
+                "items": [{
+                    "subscription": subscription, "watch": watch["watch"],
+                    "instance": watch["instance"], "sequence": 0, "updates": 1,
+                }],
+            }))
+            .unwrap(),
+        ),
         armed: true,
         queued_sequence,
         task_continuation: false,

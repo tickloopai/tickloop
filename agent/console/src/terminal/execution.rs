@@ -34,8 +34,8 @@ use tickloop_agent_protocol::{
     REPLAY_CAPACITY, ReasoningEffort, Receipt, ReceiptState, RequestRef, RewindMode, RewindOutcome,
     SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskAction,
     TaskNotification, TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus,
-    ToolResult, TranscriptRef, Trigger, TriggerSource, UserInput, UserShellReceipt,
-    UserShellRecord, ViewRef, recover_shell_update_time,
+    ToolResult, TranscriptRef, UserInput, UserShellReceipt, UserShellRecord, ViewRef,
+    recover_shell_update_time,
 };
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
@@ -3105,28 +3105,6 @@ impl ConsoleExecution {
         Ok(())
     }
 
-    pub(super) async fn configure_trigger(
-        &self,
-        chat: Uuid,
-        trigger: Option<Trigger>,
-    ) -> Result<(), AccessError> {
-        self.loop_command(chat, LoopAction::ConfigureTrigger { trigger })
-            .await
-            .map(|_| ())
-    }
-    pub(super) async fn trigger(
-        &self,
-        chat: Uuid,
-        source: TriggerSource,
-    ) -> Result<Receipt, AccessError> {
-        match self
-            .loop_command(chat, LoopAction::EmitTrigger { source })
-            .await?
-        {
-            CommandResult::Submitted(receipt) => Ok(receipt),
-            _ => Err(unexpected()),
-        }
-    }
     pub(super) async fn approve_plan(
         &self,
         chat: Uuid,

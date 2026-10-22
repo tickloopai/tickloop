@@ -183,11 +183,22 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     })
     .await;
     assert!(
-        snapshot(&client, audit).await.trigger_awaits_resume,
+        !snapshot(&client, audit)
+            .await
+            .conversation
+            .chat_loop
+            .receiving
+            .is_receiving(),
         "the stopped member waits to be continued"
     );
     let echo_snapshot = snapshot(&client, echo).await;
-    assert!(!echo_snapshot.trigger_awaits_resume);
+    assert!(
+        echo_snapshot
+            .conversation
+            .chat_loop
+            .receiving
+            .is_receiving()
+    );
     assert_eq!(
         echo_snapshot.conversation.chat_loop.state,
         tickloop_agent_protocol::LoopState::Idle

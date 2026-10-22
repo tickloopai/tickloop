@@ -1,16 +1,16 @@
 //! Tick Subscriptions: the path from a Tick Update to a Loop.
 //!
-//! A subscription is Trigger configuration, so every mutation goes through
-//! [`Agent::configure_trigger`] and inherits its chain entries, resume rules and leases. The
-//! Agent keeps the union of every armed subscription's Tick Instance as the desired set of one
-//! [`TickStreamPort`]; updates arriving from that stream accumulate per subscription. A Terminal
+//! A subscription belongs to the Chat's Loop, so every mutation goes through
+//! [`Agent::configure_subscriptions`] and is recorded with the Loop. The Agent keeps the union of
+//! every subscription's Tick Instance as the desired set of one [`TickStreamPort`], whether or
+//! not its Loop receives now; updates arriving from that stream accumulate per subscription. A Terminal
 //! Tick pushes no screen: the stream only says when its screen first changed since a subscription
 //! last got it, which marks that change pending; when the subscription's period elapses, the
 //! stream reads the screen once and reports it as an update if it differs from what that
 //! subscription last got. Its program's exit is read at once. When a subscription's period
 //! elapses with updates pending, or as soon as an immediate one receives an update, the latest
 //! update per Tick Instance merges into the owning Loop's pending delivery and is handed to
-//! [`Agent::trigger`] as soon as the Loop can take it.
+//! [`Agent::deliver_trigger`] as soon as the Loop can take it: it receives and its turn ended.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -18,10 +18,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, Instant};
 
+use super::loop_lease::TriggerPermit;
 use super::tick_content::{
     DeliveredWatermark, TickContentCache, WATERMARK_DIRECTORY, read_watermark, remove_watermark,
     write_watermark,
 };
+use super::wakeup::{Eligibility, Hold, TriggerDelivery};
 use super::*;
 use crate::tick_stream::{
     TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
@@ -30,9 +32,9 @@ use crate::tick_trim::{Trimmed, encoded_len, omits_values, omitted_value, trim};
 use tick_protocol::{InstanceRef, StateSeries};
 use tickloop_agent_protocol::{
     HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_ITEM_BYTES,
-    MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, Receipt, TICK_SUBSCRIPTION_SOURCE, TickLinkState,
+    MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, Receipt, TickDeliveryItem, TickLinkState,
     TickSubscription, TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus,
-    ToolDefinition, ToolResult, Trigger, TriggerSource,
+    ToolDefinition, ToolResult, TriggerSource,
 };
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,42 +62,44 @@ const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps i
 const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
 const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with the Chat is its subscription and brings each @tickloop feedback request to the Chat's Loop. An artifact the Chat creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
 
-/// Whether the Loop takes a Tick's current content the user sends it: not while a plan waits
-/// for review.
-pub(super) fn can_take_manual_update(chat_loop: &LoopSnapshot) -> bool {
-    match chat_loop.state {
-        LoopState::WaitingPlan => false,
+/// The source condition of a Tick the user sends with Send Update: it is still one of the
+/// Chat's Monitor members, and no plan waits for review.
+pub(super) fn manual_eligibility(snapshot: &ChatSnapshot, instance: &InstanceRef) -> Eligibility {
+    let monitor = &snapshot.monitor;
+    if monitor.is_removed(instance)
+        || !monitor
+            .members
+            .iter()
+            .any(|member| member.instance == *instance)
+    {
+        return Eligibility::Ended(tickloop_agent_transcript::DiscardReason::SourceEnded);
+    }
+    match snapshot.chat_loop.state {
+        LoopState::WaitingPlan => Eligibility::Hold(Hold::PlanReview),
         LoopState::Idle
         | LoopState::Queued
         | LoopState::Running
         | LoopState::WaitingPermission
         | LoopState::WaitingQuestion
         | LoopState::Failed
-        | LoopState::Interrupted => true,
+        | LoopState::Interrupted => Eligibility::Eligible,
     }
 }
 
-/// The Loop's Trigger that a Tick delivery to `loop_id` comes through: armed, or disarmed only
-/// until the Chat is continued.
-fn delivering_trigger(
-    chat_loop: &LoopSnapshot,
-    awaits_resume: bool,
-    loop_id: LoopId,
-) -> Option<&Trigger> {
-    chat_loop.trigger.as_ref().filter(|trigger| {
-        chat_loop.id == loop_id && trigger.accepts_events && (trigger.armed || awaits_resume)
-    })
+/// What the user hears when a Tick they send cannot reach the Loop.
+fn manual_admission(eligibility: Eligibility) -> Result<(), AgentError> {
+    match eligibility {
+        Eligibility::Eligible => Ok(()),
+        Eligibility::Ended(_) => Err(AgentError::Invalid(
+            "Send Update requires a Tick owned by this Chat".into(),
+        )),
+        Eligibility::Hold(_) => Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into())),
+    }
 }
 
-pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
-    if trigger.subscriptions.is_empty() {
-        return Ok(());
-    }
-    if !trigger.accepts_events {
-        return Err("Tick Subscriptions require a trigger that accepts events".into());
-    }
+fn validate(subscriptions: &[TickSubscription]) -> Result<(), String> {
     let mut instances = BTreeSet::new();
-    for subscription in &trigger.subscriptions {
+    for subscription in subscriptions {
         check_frequency(&subscription.instance, subscription.frequency)?;
         if !instances.insert(subscription.instance.clone()) {
             return Err("a Loop holds at most one Tick Subscription per Tick Instance".into());
@@ -587,47 +591,36 @@ impl TickDeliveries {
         self.ready_changed.notify_waiters();
     }
 
-    fn source_bindings(
+    /// The watches the delivered items came through, while each is still the subscription the
+    /// Loop configures, on the watch it was admitted for; otherwise why the delivery ended.
+    fn item_bindings(
         &self,
         chat_id: ChatId,
-        loop_id: LoopId,
-        payload: &Value,
-        (chat_loop, awaits_resume): (&LoopSnapshot, bool),
-    ) -> Result<Vec<WatchBinding>, AgentError> {
-        let trigger = delivering_trigger(chat_loop, awaits_resume, loop_id).ok_or_else(|| {
-            AgentError::Invalid("Tick delivery has no active subscription configuration".into())
-        })?;
-        let items = payload["items"]
-            .as_array()
-            .filter(|items| !items.is_empty())
-            .ok_or_else(|| AgentError::Invalid("Tick delivery has no watch bindings".into()))?;
+        chat_loop: &LoopSnapshot,
+        items: &[TickDeliveryItem],
+    ) -> Result<Vec<WatchBinding>, DiscardReason> {
         items
             .iter()
             .map(|item| {
-                let subscription = serde_json::from_value::<Uuid>(item["subscription"].clone())
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                let watch = serde_json::from_value::<Uuid>(item["watch"].clone())
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                let instance = serde_json::from_value::<InstanceRef>(item["instance"].clone())
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                let configured = chat_loop
+                    .subscriptions
+                    .iter()
+                    .find(|configured| {
+                        configured.id == item.subscription && configured.instance == item.instance
+                    })
+                    .ok_or(DiscardReason::Unsubscribed)?;
                 let runtime = self
                     .subscriptions
-                    .get(&subscription)
+                    .get(&item.subscription)
                     .filter(|runtime| {
-                        runtime.watch == watch
-                            && runtime.instance == instance
+                        runtime.watch == item.watch
+                            && runtime.instance == item.instance
                             && runtime.chat_id == chat_id
-                            && runtime.loop_id == loop_id
+                            && runtime.loop_id == chat_loop.id
                             && runtime.blocked.is_none()
-                            && trigger.subscriptions.iter().any(|configured| {
-                                configured.id == subscription
-                                    && configured.instance == runtime.instance
-                                    && configured.authority == runtime.authority
-                            })
+                            && runtime.authority == configured.authority
                     })
-                    .ok_or_else(|| {
-                        AgentError::Invalid("Tick watch is no longer admitted for this Loop".into())
-                    })?;
+                    .ok_or(DiscardReason::SourceEnded)?;
                 Ok(WatchBinding {
                     watch: runtime.watch,
                     instance: runtime.instance.clone(),
@@ -635,6 +628,61 @@ impl TickDeliveries {
                 })
             })
             .collect()
+    }
+
+    /// The restored delivery's items bound to the watches their subscriptions run now, where the
+    /// subscription, its instance and its authority are still the ones the delivery was
+    /// accepted under: a load or another process watches through a new watch, and the delivery
+    /// stays the same.
+    pub(super) fn rebind_restored_items(
+        &self,
+        chat_id: ChatId,
+        chat_loop: &LoopSnapshot,
+        items: &mut [TickDeliveryItem],
+    ) {
+        for item in items {
+            let Some(configured) = chat_loop.subscriptions.iter().find(|configured| {
+                configured.id == item.subscription && configured.instance == item.instance
+            }) else {
+                continue;
+            };
+            if let Some(runtime) = self
+                .subscriptions
+                .get(&item.subscription)
+                .filter(|runtime| {
+                    runtime.instance == item.instance
+                        && runtime.chat_id == chat_id
+                        && runtime.loop_id == chat_loop.id
+                        && runtime.authority == configured.authority
+                })
+            {
+                item.watch = runtime.watch;
+            }
+        }
+    }
+
+    /// Whether an item of a new delivery was delivered already: a delivery prepared before the
+    /// lease told what another process delivered does not reach the Loop.
+    pub(super) fn holds_delivered_items(&self, items: &[TickDeliveryItem]) -> bool {
+        items.iter().any(|item| {
+            self.subscriptions
+                .get(&item.subscription)
+                .and_then(|runtime| runtime.delivered)
+                .is_some_and(|delivered| item.sequence <= delivered.sequence)
+        })
+    }
+
+    /// The Tick Update source's own condition.
+    pub(super) fn items_eligibility(
+        &self,
+        chat_id: ChatId,
+        chat_loop: &LoopSnapshot,
+        items: &[TickDeliveryItem],
+    ) -> Eligibility {
+        match self.item_bindings(chat_id, chat_loop, items) {
+            Ok(_) => Eligibility::Eligible,
+            Err(reason) => Eligibility::Ended(reason),
+        }
     }
 
     fn next_due(&self) -> Option<Instant> {
@@ -930,25 +978,44 @@ impl TickDeliveries {
 
     /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
     /// same instance takes their place and merges their updates. While they wait they hold no
-    /// data: as data too large for the content cache, each keeps only what [`left_out`] keeps and
-    /// is read again before delivery.
+    /// data of their own: each keeps only what [`left_out`] keeps and is read again before
+    /// delivery, and its data waits in the content cache, within its budget, for a Tick that
+    /// cannot be read again then.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
         for mut item in items {
+            let data = (!item.needs_refill).then(|| item.data.clone());
             item.data = left_out(&item.kind, &item.data);
             item.needs_refill = true;
-            match pending.items.remove(&item.instance) {
-                Some(newer) => {
-                    pending
-                        .items
-                        .insert(item.instance.clone(), newer.superseding(&item));
-                }
-                None => {
-                    pending.items.insert(item.instance.clone(), item);
+            let (subscription, sequence) = (item.subscription, item.sequence);
+            // Deliveries put back in any order: the newest update of the instance stays.
+            let kept = match pending.items.remove(&item.instance) {
+                Some(waiting) if waiting.sequence >= item.sequence => waiting.superseding(&item),
+                Some(waiting) => item.superseding(&waiting),
+                None => item,
+            };
+            if kept.sequence == sequence
+                && let Some(data) = data
+            {
+                self.content.put_back(subscription, sequence, data);
+            }
+            pending.items.insert(kept.instance.clone(), kept);
+        }
+        self.hold(owner, Instant::now());
+    }
+
+    /// The updates `items` carry no longer wait in their subscriptions: they were delivered.
+    fn let_go(&mut self, items: &[DeliveryItem]) {
+        for item in items {
+            if let Some(runtime) = self.subscriptions.get_mut(&item.subscription) {
+                runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
+                if let Some(first) = &runtime.first {
+                    runtime.pending_since = Some(first.received_at);
+                } else if runtime.accumulated == 0 && !runtime.has_pending_change {
+                    runtime.pending_since = None;
                 }
             }
         }
-        self.hold(owner, Instant::now());
     }
 
     /// Keeps `owner`'s pending delivery until its Loop can take it. It flushes when the Loop's
@@ -998,10 +1065,9 @@ impl Agent {
         let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
         let chat_loop = &chat.snapshot.chat_loop;
         let configured: Vec<_> = chat_loop
-            .trigger
+            .subscriptions
             .iter()
-            .flat_map(|trigger| &trigger.subscriptions)
-            .map(|subscription| (chat_loop.id, chat_loop.state.clone(), subscription.clone()))
+            .map(|subscription| (chat_loop.state.clone(), subscription.clone()))
             .collect();
         drop(chats);
         let deliveries = self.tick_deliveries();
@@ -1009,7 +1075,7 @@ impl Agent {
         let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
         Ok(configured
             .into_iter()
-            .map(|(loop_id, loop_state, subscription)| {
+            .map(|(loop_state, subscription)| {
                 let runtime = deliveries.subscriptions.get(&subscription.id);
                 let period = subscription.frequency.period();
                 // A check already due reads as now until the delivery task reschedules it.
@@ -1023,7 +1089,6 @@ impl Agent {
                     });
                 TickSubscriptionStatus {
                     id: subscription.id,
-                    loop_id,
                     loop_state,
                     instance: subscription.instance.clone(),
                     frequency: subscription.frequency,
@@ -1050,48 +1115,101 @@ impl Agent {
             .collect())
     }
 
-    /// Changes one subscription's frequency or cancels it, from Monitor or a model tool. The
-    /// change is written through the Loop's Trigger, which refuses a frequency the Tick type does
-    /// not allow.
+    /// Changes one subscription's frequency or cancels it, from Monitor or a model tool; a
+    /// frequency the Tick type does not allow is refused.
     pub async fn update_tick_subscription(
         &self,
         chat_id: ChatId,
         subscription_id: Uuid,
         change: TickSubscriptionChange,
     ) -> Result<(), AgentError> {
-        let chats = self.inner.chats.lock().await;
-        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-        let mut trigger = chat
-            .snapshot
-            .chat_loop
-            .trigger
-            .clone()
-            .filter(|trigger| {
-                trigger
-                    .subscriptions
-                    .iter()
-                    .any(|subscription| subscription.id == subscription_id)
-            })
-            .ok_or(AgentError::NotFound)?;
-        drop(chats);
+        let mut subscriptions = self.loop_subscriptions(chat_id).await?;
+        if !subscriptions
+            .iter()
+            .any(|subscription| subscription.id == subscription_id)
+        {
+            return Err(AgentError::NotFound);
+        }
         match change {
-            TickSubscriptionChange::Cancel => trigger
-                .subscriptions
-                .retain(|subscription| subscription.id != subscription_id),
+            TickSubscriptionChange::Cancel => {
+                subscriptions.retain(|subscription| subscription.id != subscription_id)
+            }
             TickSubscriptionChange::Frequency(frequency) => {
-                for subscription in &mut trigger.subscriptions {
+                for subscription in &mut subscriptions {
                     if subscription.id == subscription_id {
                         subscription.frequency = frequency;
                     }
                 }
             }
         }
-        self.configure_trigger(chat_id, Some(trigger)).await
+        self.configure_subscriptions(chat_id, subscriptions).await
     }
 
-    /// Subscribes the Chat's Loop to `instance` at the default frequency because its user asked
-    /// to on the instance's Monitor row; an instance the Loop already subscribes to is refused
-    /// with what to do instead.
+    async fn loop_subscriptions(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Vec<TickSubscription>, AgentError> {
+        Ok(self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .chat_loop
+            .subscriptions
+            .clone())
+    }
+
+    /// Replaces the Loop's Tick Subscriptions: the one place they change. The receiving switch
+    /// stays as it is; the watches follow the new set, and queued Tick Updates of a cancelled
+    /// subscription are withdrawn.
+    pub(super) async fn configure_subscriptions(
+        &self,
+        chat_id: ChatId,
+        subscriptions: Vec<TickSubscription>,
+    ) -> Result<(), AgentError> {
+        validate(&subscriptions).map_err(AgentError::Invalid)?;
+        {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(delegation) = &chat.snapshot.delegation {
+                if subscriptions.iter().any(|subscription| {
+                    !delegation
+                        .ceiling
+                        .tick_instances
+                        .contains(&subscription.instance)
+                }) {
+                    return Err(AgentError::Invalid("Unsupported: Tick Subscription is outside the inherited delegated instance scope".into()));
+                }
+                if subscriptions
+                    .iter()
+                    .filter_map(|subscription| subscription.authority.as_ref())
+                    .any(|authority| {
+                        !delegation
+                            .ceiling
+                            .host_tools
+                            .values()
+                            .any(|allowed| allowed.contains(authority))
+                    })
+                {
+                    return Err(AgentError::Invalid(
+                        "Tick watch authority is outside the frozen delegated account/endpoint scope"
+                            .into(),
+                    ));
+                }
+            }
+            chat.snapshot.chat_loop.subscriptions = subscriptions;
+            self.save(&chat.snapshot);
+        }
+        self.sync_tick_subscriptions().await;
+        Ok(())
+    }
+
+    /// Subscribes the Chat's Loop to `instance` because its user asked to on the instance's
+    /// Monitor row, at the frequency its type fixes or else the default; an instance the Loop
+    /// already subscribes to is refused with what to do instead.
     pub async fn tick_subscribe_for_user(
         &self,
         chat_id: ChatId,
@@ -1103,15 +1221,17 @@ impl Agent {
             let is_subscribed = chat
                 .snapshot
                 .chat_loop
-                .trigger
+                .subscriptions
                 .iter()
-                .flat_map(|trigger| &trigger.subscriptions)
                 .any(|subscription| subscription.instance == instance);
             if is_subscribed {
                 return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
             }
         }
-        self.subscribe_loop_for_user(chat_id, instance, DEFAULT_FREQUENCY)
+        let frequency = fixed_frequency(&instance)
+            .map_err(AgentError::Invalid)?
+            .unwrap_or(DEFAULT_FREQUENCY);
+        self.subscribe_loop_for_user(chat_id, instance, frequency)
             .await
     }
 
@@ -1130,9 +1250,8 @@ impl Agent {
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.snapshot
                 .chat_loop
-                .trigger
+                .subscriptions
                 .iter()
-                .flat_map(|trigger| &trigger.subscriptions)
                 .filter(|subscription| subscription.instance == *lost)
                 .map(|subscription| (subscription.id, subscription.frequency))
                 .collect::<Vec<_>>()
@@ -1197,23 +1316,7 @@ impl Agent {
         {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            if chat.snapshot.monitor.is_removed(instance)
-                || !chat
-                    .snapshot
-                    .monitor
-                    .members
-                    .iter()
-                    .any(|member| member.instance == *instance)
-            {
-                return Err(AgentError::Invalid(
-                    "Send Update requires a Tick owned by this Chat".into(),
-                ));
-            }
-            if chat.snapshot.chat_loop.id != loop_id
-                || !can_take_manual_update(&chat.snapshot.chat_loop)
-            {
-                return Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()));
-            }
+            manual_admission(manual_eligibility(&chat.snapshot, instance))?;
             let operation = SessionPermissionOperation::from_normalized(
                 policy_name.to_owned(),
                 permission_input.clone(),
@@ -1265,18 +1368,22 @@ impl Agent {
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             let chat_loop = &chat.snapshot.chat_loop;
             if chat_loop
-                .trigger
+                .subscriptions
                 .iter()
-                .flat_map(|trigger| &trigger.subscriptions)
                 .any(|subscription| subscription.instance == instance)
             {
                 return Err(AgentError::Invalid(
                     "Send Update is available for unsubscribed Ticks".into(),
                 ));
             }
-            if !can_take_manual_update(chat_loop) {
-                return Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()));
-            }
+            // Asked before the Tick is read; the entry asks again with what was read.
+            let unread = TriggerSource::TickManual {
+                instance: instance.clone(),
+                sequence: 0,
+                read_at_ms: 0,
+                authority: None,
+            };
+            manual_admission(self.eligibility(chat, &unread))?;
             let title = chat
                 .snapshot
                 .monitor
@@ -1370,20 +1477,19 @@ impl Agent {
                 ..Default::default()
             },
         );
-        let input = tickloop_agent_protocol::local_messages::tick_delivery(
-            &payload,
-            &Trigger::for_subscriptions(),
-        );
-        let source = TriggerSource {
-            source: TICK_MANUAL_SOURCE.into(),
-            payload: json!({"items":payload["items"],"authority":authority}),
+        let input = tickloop_agent_protocol::local_messages::tick_delivery(&payload);
+        let source = TriggerSource::TickManual {
+            instance,
+            sequence: observation.sequence,
+            read_at_ms: through_ms,
+            authority,
         };
-        self.submit_internal(
+        self.deliver_trigger(
             chat_id,
-            input,
-            SubmissionOptions {
-                trigger_source: Some(source),
-                ..Default::default()
+            TriggerDelivery {
+                source,
+                input,
+                ledger: None,
             },
         )
         .await
@@ -1391,17 +1497,22 @@ impl Agent {
 
     pub(super) async fn revalidate_manual_tick_source(
         &self,
-        chat: ChatId,
-        loop_id: LoopId,
-        payload: &Value,
+        chat_id: ChatId,
+        instance: &InstanceRef,
+        expected: &Option<HostToolAuthority>,
     ) -> Result<(), AgentError> {
-        let instance: InstanceRef = serde_json::from_value(payload["items"][0]["instance"].clone())
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        let expected: Option<HostToolAuthority> =
-            serde_json::from_value(payload["authority"].clone())
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        let authority = self.admit_manual_tick(chat, loop_id, &instance).await?;
-        if authority != expected {
+        let loop_id = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .chat_loop
+            .id;
+        let authority = self.admit_manual_tick(chat_id, loop_id, instance).await?;
+        if authority != *expected {
             return Err(AgentError::Invalid(
                 "Tick authority changed before delivery".into(),
             ));
@@ -1446,7 +1557,7 @@ impl Agent {
                 (admission.policy_name(), admission.permission_input())
             });
         self.refresh_project_rules(chat_id).await?;
-        let mut trigger = {
+        let mut subscriptions = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             let loop_id = chat.snapshot.chat_loop.id;
@@ -1476,27 +1587,21 @@ impl Agent {
                     "a Deny rule for {policy_name} refuses subscribing to {instance}"
                 )));
             }
-            chat.snapshot
-                .chat_loop
-                .trigger
-                .clone()
-                .unwrap_or_else(Trigger::for_subscriptions)
+            chat.snapshot.chat_loop.subscriptions.clone()
         };
-        if trigger
-            .subscriptions
+        if subscriptions
             .iter()
             .any(|subscription| subscription.instance == instance)
         {
             return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
         }
-        trigger.accepts_events = true;
-        trigger.subscriptions.push(TickSubscription {
+        subscriptions.push(TickSubscription {
             id: Uuid::new_v4(),
             instance,
             frequency,
             authority,
         });
-        self.configure_trigger(chat_id, Some(trigger)).await
+        self.configure_subscriptions(chat_id, subscriptions).await
     }
 
     pub(super) async fn tick_subscription_tool(
@@ -1542,15 +1647,10 @@ impl Agent {
             .run_cancel(receipt.run_id)
             .cloned()
             .ok_or_else(|| "run is unavailable".to_string())?;
-        let mut trigger = chat
-            .snapshot
-            .chat_loop
-            .trigger
-            .clone()
-            .unwrap_or_else(Trigger::for_subscriptions);
+        let mut subscriptions = chat.snapshot.chat_loop.subscriptions.clone();
+        let is_receiving = chat.snapshot.chat_loop.receiving.is_receiving();
         drop(chats);
-        if let Some(existing) = trigger
-            .subscriptions
+        if let Some(existing) = subscriptions
             .iter()
             .find(|subscription| subscription.instance == instance)
         {
@@ -1559,35 +1659,30 @@ impl Agent {
                 existing.instance, existing.id
             ));
         }
-        // A Trigger the user disarmed stays disarmed: subscribing is not consent to resume.
-        let armed = trigger.armed;
-        trigger.accepts_events = true;
         let subscription = TickSubscription {
             id: Uuid::new_v4(),
             instance,
             frequency,
             authority,
         };
-        trigger.subscriptions.push(subscription.clone());
-        self.configure_trigger(receipt.chat_id, Some(trigger))
+        subscriptions.push(subscription.clone());
+        self.configure_subscriptions(receipt.chat_id, subscriptions)
             .await
             .map_err(|error| error.to_string())?;
-        let (ready, link) = if armed {
-            self.wait_for_subscription_ready(subscription.id, &run_cancel)
-                .await
-        } else {
-            (false, TickLinkState::Initializing)
-        };
+        let (ready, link) = self
+            .wait_for_subscription_ready(subscription.id, &run_cancel)
+            .await;
         let mut answer = json!({
             "subscription": subscription.id,
             "tick_instance_id": subscription.instance,
             "frequency": subscription.frequency,
-            "armed": armed,
+            "receiving": is_receiving,
             "ready": ready,
         });
-        if !armed {
+        // Subscribing is no consent to continue a paused Loop.
+        if !is_receiving {
             answer["note"] = json!(
-                "this Chat's Trigger is disarmed, so the subscription is configured but delivers nothing until it is armed again"
+                "this Chat's Loop has paused receiving: the subscription watches its Tick and delivers the latest update once the Chat is continued"
             );
         } else if !ready {
             answer["link"] = json!(format!("{link:?}"));
@@ -1654,14 +1749,15 @@ impl Agent {
         Ok(json!({"subscription": input.subscription, "cancelled": true}).to_string())
     }
 
-    /// Reconciles the runtime with the Trigger configuration of every loaded Chat and republishes
-    /// the desired set. Called after any change that can arm, disarm or end a Loop.
+    /// Reconciles the runtime with the subscriptions of every loaded Chat's Loop and republishes
+    /// the desired set. A paused Loop keeps watching, so its subscriptions keep their watches and
+    /// pending updates and only wait to be taken.
     pub(super) async fn sync_tick_subscriptions(&self) {
         if !self.inner.tick_stream_installed.load(Ordering::SeqCst) {
             return;
         }
         let saves_chats = self.inner.recorder.is_some();
-        let (configured, existing, members) = {
+        let (configured, members) = {
             let chats = self.inner.chats.lock().await;
             let configured: Vec<_> = chats
                 .iter()
@@ -1672,14 +1768,9 @@ impl Agent {
                         .filter(|_| saves_chats)
                         .map(|directory| directory.join(WATERMARK_DIRECTORY).path().to_path_buf());
                     let chat_loop = &chat.snapshot.chat_loop;
-                    // A paused Loop keeps watching, so its subscriptions keep their watches and
-                    // queued updates and only wait to be taken.
-                    let is_paused = chat.snapshot.trigger_awaits_resume;
                     chat_loop
-                        .trigger
+                        .subscriptions
                         .iter()
-                        .filter(|trigger| trigger.armed || is_paused)
-                        .flat_map(|trigger| &trigger.subscriptions)
                         .map(|subscription| {
                             (
                                 *chat_id,
@@ -1690,14 +1781,6 @@ impl Agent {
                         })
                         .collect::<Vec<_>>()
                 })
-                .collect();
-            // A disarmed or paused Loop keeps its subscriptions' delivered watermarks; only a
-            // subscription no Loop configures any more is cancelled.
-            let existing: BTreeSet<Uuid> = chats
-                .values()
-                .filter_map(|chat| chat.snapshot.chat_loop.trigger.as_ref())
-                .flat_map(|trigger| &trigger.subscriptions)
-                .map(|subscription| subscription.id)
                 .collect();
             let members: BTreeSet<_> = chats
                 .iter()
@@ -1710,7 +1793,7 @@ impl Agent {
                         .map(|member| (*chat_id, member.instance.clone()))
                 })
                 .collect();
-            (configured, existing, members)
+            (configured, members)
         };
         // Watermark files are read and removed outside the delivery lock.
         let mut cancelled = Vec::new();
@@ -1770,7 +1853,8 @@ impl Agent {
                     }
                 }
                 deliveries.content.remove(id);
-                if !existing.contains(&id)
+                // Only a subscription no Loop configures any more loses its watermark.
+                if !kept.contains(&id)
                     && let Some(directory) = watermarks
                 {
                     cancelled.push((directory, id));
@@ -1896,7 +1980,7 @@ impl Agent {
             }
         }
         self.inner.tick_wake.notify_one();
-        self.discard_invalid_pending_tick_inputs().await;
+        self.withdraw_every_ended_input().await;
     }
 
     /// Flushes a Loop's pending delivery that came due while the Loop could not take it.
@@ -1920,9 +2004,9 @@ impl Agent {
         });
     }
 
-    /// Hands one Loop's pending delivery to [`Agent::trigger`], or marks it due while the Loop
-    /// cannot take it, as when it executes or waits for the user, so it flushes once the Loop's
-    /// run ends instead of bypassing the user's answer.
+    /// Hands one Loop's pending delivery to [`Agent::deliver_trigger`], or marks it due while the
+    /// Loop cannot take it, as when it pauses receiving, executes or waits for the user, so it
+    /// flushes once the Loop's run ends or it is continued.
     async fn deliver(&self, chat_id: ChatId, loop_id: LoopId) {
         let _upgrade = self.inner.upgrade_gate.read().await;
         let owner = (chat_id, loop_id);
@@ -1938,24 +2022,15 @@ impl Agent {
             else {
                 return;
             };
+            // Asked of the delivery before its items are known; the entry asks again with them.
+            let unprepared = TriggerSource::TickUpdate { items: Vec::new() };
+            let takes = self.would_admit(chat, &unprepared);
             let mut deliveries = self.tick_deliveries();
-            match chat.snapshot.chat_loop.state {
-                // A paused Loop holds the latest update until the Chat is continued.
-                _ if chat.snapshot.trigger_awaits_resume => {
-                    deliveries.hold(owner, Instant::now());
-                    None
-                }
-                LoopState::Idle | LoopState::Interrupted | LoopState::Failed => {
-                    deliveries.take_delivery(owner)
-                }
-                LoopState::Queued
-                | LoopState::Running
-                | LoopState::WaitingPermission
-                | LoopState::WaitingQuestion
-                | LoopState::WaitingPlan => {
-                    deliveries.hold(owner, Instant::now());
-                    None
-                }
+            if takes {
+                deliveries.take_delivery(owner)
+            } else {
+                deliveries.hold(owner, Instant::now());
+                None
             }
         };
         let Some(items) = delivery else {
@@ -2003,14 +2078,24 @@ impl Agent {
                     Some(port) => port.read_current(chat_id, &item.instance).await,
                     None => Ok(None),
                 };
-                if let Ok(Some(current)) = current
-                    && current.sequence >= item.sequence
-                {
-                    item.updates += current.sequence - item.sequence;
-                    item.sequence = current.sequence;
-                    item.observed_at = current.observed_at;
-                    item.data = current.data;
-                    item.needs_refill = false;
+                let put_back = self
+                    .tick_deliveries()
+                    .content
+                    .take_put_back(item.subscription, item.sequence);
+                match (current, put_back) {
+                    (Ok(Some(current)), _) if current.sequence >= item.sequence => {
+                        item.updates += current.sequence - item.sequence;
+                        item.sequence = current.sequence;
+                        item.observed_at = current.observed_at;
+                        item.data = current.data;
+                        item.needs_refill = false;
+                    }
+                    // A Tick that cannot be read again is delivered with what it gave before.
+                    (_, Some(data)) => {
+                        item.data = data;
+                        item.needs_refill = false;
+                    }
+                    (_, None) => {}
                 }
                 let still_admitted = match &port {
                     Some(port) => port
@@ -2031,15 +2116,30 @@ impl Agent {
             }
             items.push(item);
         }
+        // What was delivered is known only under the lease, once what another process holding it
+        // delivered is taken over: the items are sorted out and batched after that. The entry
+        // holds back a batch that a later takeover finds delivered.
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        match self.acquire_trigger_permit(chat_id, &boundary).await {
+            TriggerPermit::Fire(_) => {}
+            TriggerPermit::Wait { .. } | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
+                self.tick_deliveries().restore(owner, items);
+                self.inner.tick_wake.notify_one();
+                return;
+            }
+        }
+        drop(boundary);
         {
-            let deliveries = self.tick_deliveries();
-            items.retain(|item| {
+            let mut deliveries = self.tick_deliveries();
+            let (fresh, delivered): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
                 deliveries
                     .subscriptions
                     .get(&item.subscription)
                     .and_then(|runtime| runtime.delivered)
                     .is_none_or(|delivered| item.sequence > delivered.sequence)
             });
+            deliveries.let_go(&delivered);
+            items = fresh;
         }
         if items.is_empty() {
             return;
@@ -2092,99 +2192,188 @@ impl Agent {
                 })
                 .collect::<Vec<_>>()
         };
-        // The watermark is durable before the delivery is handed on, so a repeat of this update
-        // is never delivered again, even by a later process.
-        let durable = marks.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            durable
+        let source = TriggerSource::TickUpdate {
+            items: items
                 .iter()
-                .filter_map(|(subscription, directory, mark)| {
-                    directory
-                        .as_ref()
-                        .map(|directory| (directory, subscription, mark))
+                .map(|item| TickDeliveryItem {
+                    subscription: item.subscription,
+                    watch: item.watch,
+                    instance: item.instance.clone(),
+                    sequence: item.sequence,
+                    updates: item.updates,
                 })
-                .try_for_each(|(directory, subscription, mark)| {
-                    write_watermark(directory, *subscription, *mark)
-                })
-        })
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            self.tick_deliveries().restore(owner, items);
-            self.inner.tick_wake.notify_one();
-            return;
-        }
-        {
-            let mut deliveries = self.tick_deliveries();
-            for (subscription, _, mark) in marks {
-                if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
-                    runtime.delivered = Some(mark);
-                }
-            }
-        }
-        let source = TriggerSource {
-            source: TICK_SUBSCRIPTION_SOURCE.into(),
-            payload,
+                .collect(),
         };
-        let outcome = self.trigger(chat_id, source).await;
-        let mut deliveries = self.tick_deliveries();
+        let input = tickloop_agent_protocol::local_messages::tick_delivery(&payload);
+        let outcome = self
+            .deliver_trigger(
+                chat_id,
+                TriggerDelivery {
+                    source,
+                    input,
+                    ledger: None,
+                },
+            )
+            .await;
         match outcome {
             Ok(_) => {
-                let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
-                for item in &items {
-                    if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
-                        runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
-                        if let Some(first) = &runtime.first {
-                            runtime.pending_since = Some(first.received_at);
-                        } else if runtime.accumulated == 0 && !runtime.has_pending_change {
-                            runtime.pending_since = None;
-                        }
-                        runtime.last_delivery_ms = Some(delivered_at);
-                        runtime.last_delivery = Some(summary.clone());
-                    }
-                }
+                self.record_delivery(&marks, &items, &summary);
+                self.record_delivered_watermarks(chat_id, marks).await;
             }
             Err(_) => {
-                deliveries.restore(owner, items);
+                self.tick_deliveries().restore(owner, items);
                 self.inner.tick_wake.notify_one();
             }
         }
     }
 
-    pub(super) fn validate_tick_source_bindings(
+    /// What an accepted delivery leaves in its subscriptions: the updates it carried are
+    /// delivered and no longer wait.
+    fn record_delivery(
         &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        payload: &Value,
-        snapshot: &ChatSnapshot,
-    ) -> Result<(), AgentError> {
-        self.tick_deliveries()
-            .source_bindings(
-                chat_id,
-                loop_id,
-                payload,
-                (&snapshot.chat_loop, snapshot.trigger_awaits_resume),
-            )
-            .map(|_| ())
+        marks: &[(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)],
+        items: &[DeliveryItem],
+        summary: &str,
+    ) {
+        let mut deliveries = self.tick_deliveries();
+        let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        for (subscription, _, mark) in marks {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
+                runtime.delivered = Some(*mark);
+            }
+        }
+        deliveries.let_go(items);
+        for item in items {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
+                runtime.last_delivery_ms = Some(delivered_at);
+                runtime.last_delivery = Some(summary.to_owned());
+            }
+        }
     }
 
+    /// Writes the watermarks of an accepted delivery once its acceptance is durable, so no
+    /// later process skips an update the ledger does not hold: a crash before this leaves the
+    /// update to be delivered again, where the ledger finds it; a crash after it finds the
+    /// accepted input queued again when the Chat loads.
+    async fn record_delivered_watermarks(
+        &self,
+        chat_id: ChatId,
+        marks: Vec<(Uuid, Option<std::path::PathBuf>, DeliveredWatermark)>,
+    ) {
+        if marks.iter().all(|(_, directory, _)| directory.is_none()) {
+            return;
+        }
+        let accepted = {
+            let chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get(&chat_id) else {
+                return;
+            };
+            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await
+        };
+        if accepted.is_err() {
+            return;
+        }
+        // A watermark that cannot be written only lets the update be delivered again, which
+        // the ledger holds already.
+        let written = tokio::task::spawn_blocking(move || {
+            marks
+                .into_iter()
+                .filter_map(|(subscription, directory, mark)| {
+                    let directory = directory?;
+                    let _ = write_watermark(&directory, subscription, mark);
+                    Some((directory, subscription))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        // A subscription cancelled meanwhile removed its watermark before or after this wrote it;
+        // after, its watermark goes with it here.
+        let cancelled: Vec<_> = {
+            let deliveries = self.tick_deliveries();
+            written
+                .into_iter()
+                .filter(|(_, subscription)| !deliveries.subscriptions.contains_key(subscription))
+                .collect()
+        };
+        if !cancelled.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for (directory, subscription) in cancelled {
+                    let _ = remove_watermark(&directory, subscription);
+                }
+            })
+            .await;
+        }
+    }
+
+    /// The Chat's subscriptions delivered up to the newest of what this process knows, their
+    /// watermarks, which another process holding the Chat's lease may have advanced, and the
+    /// sequences `in_ledger` the ledger holds: an update at or before them is not delivered
+    /// again.
+    pub(super) async fn refresh_tick_watermarks(
+        &self,
+        chat_id: ChatId,
+        in_ledger: HashMap<Uuid, (u64, Uuid)>,
+    ) {
+        let stored: Vec<_> = self
+            .tick_deliveries()
+            .subscriptions
+            .iter()
+            .filter(|(_, runtime)| runtime.chat_id == chat_id)
+            .filter_map(|(id, runtime)| Some((*id, runtime.watermarks.clone()?)))
+            .collect();
+        let mut read = tokio::task::spawn_blocking(move || {
+            stored
+                .into_iter()
+                .filter_map(|(subscription, directory)| {
+                    read_watermark(&directory, subscription)
+                        .ok()
+                        .flatten()
+                        .map(|mark| (subscription, mark))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        read.extend(
+            in_ledger
+                .into_iter()
+                .map(|(subscription, (sequence, delivery))| {
+                    (subscription, DeliveredWatermark { sequence, delivery })
+                }),
+        );
+        let mut deliveries = self.tick_deliveries();
+        for (subscription, mark) in read {
+            if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription)
+                && runtime
+                    .delivered
+                    .is_none_or(|delivered| delivered.sequence < mark.sequence)
+            {
+                runtime.delivered = Some(mark);
+            }
+        }
+    }
+
+    /// Proves the delivered items' watches again with their Tickhost; one that fails is no longer
+    /// certain to be the Tick its subscription was admitted for.
     pub(super) async fn revalidate_tick_source(
         &self,
         chat_id: ChatId,
-        loop_id: LoopId,
-        payload: &Value,
+        items: &[TickDeliveryItem],
     ) -> Result<(), AgentError> {
-        let (bindings, chat_loop, awaits_resume) = {
+        let bindings = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let chat_loop = chat.snapshot.chat_loop.clone();
-            let awaits_resume = chat.snapshot.trigger_awaits_resume;
-            let bindings = self.tick_deliveries().source_bindings(
-                chat_id,
-                loop_id,
-                payload,
-                (&chat_loop, awaits_resume),
-            )?;
-            (bindings, chat_loop, awaits_resume)
+            self.tick_deliveries()
+                .item_bindings(chat_id, &chat.snapshot.chat_loop, items)
+                .map_err(|_| {
+                    AgentError::Invalid("Tick watch is no longer admitted for this Loop".into())
+                })?
         };
         let port = self
             .tick_deliveries()
@@ -2204,76 +2393,7 @@ impl Agent {
                 return Err(AgentError::Invalid(error));
             }
         }
-        self.tick_deliveries().source_bindings(
-            chat_id,
-            loop_id,
-            payload,
-            (&chat_loop, awaits_resume),
-        )?;
         Ok(())
-    }
-
-    pub(super) fn discard_invalid_tick_inputs(&self, chat: &mut Chat) -> bool {
-        let deliveries = self.tick_deliveries();
-        let mut discarded = Vec::new();
-        let delivering = (
-            &chat.snapshot.chat_loop,
-            chat.snapshot.trigger_awaits_resume,
-        );
-        chat.snapshot.pending_inputs.retain(|pending| {
-            let valid = pending.trigger_source.as_ref().is_none_or(|source| {
-                source.source != TICK_SUBSCRIPTION_SOURCE
-                    || deliveries
-                        .source_bindings(
-                            pending.receipt.chat_id,
-                            pending.receipt.loop_id,
-                            &source.payload,
-                            delivering,
-                        )
-                        .is_ok()
-            });
-            if !valid {
-                discarded.push(pending.receipt.clone());
-            }
-            valid
-        });
-        if discarded.is_empty() {
-            return false;
-        }
-        for receipt in discarded {
-            self.finish_discarded_trigger_input(chat, &receipt);
-        }
-        true
-    }
-
-    pub(super) fn finish_discarded_trigger_input(&self, chat: &mut Chat, receipt: &Receipt) {
-        self.settle_input(
-            chat,
-            receipt.run_id,
-            SettledOutcome::Discarded {
-                reason: tickloop_agent_transcript::DiscardReason::SourceEnded,
-            },
-        );
-        self.inner
-            .host_contexts
-            .lock()
-            .unwrap()
-            .runs
-            .remove(&receipt.run_id);
-        if chat.snapshot.pending_inputs.is_empty()
-            && chat.snapshot.chat_loop.state == LoopState::Queued
-        {
-            chat.snapshot.chat_loop.set_state(LoopState::Idle);
-        }
-    }
-
-    pub(super) async fn discard_invalid_pending_tick_inputs(&self) {
-        let mut chats = self.inner.chats.lock().await;
-        for chat in chats.values_mut() {
-            if self.discard_invalid_tick_inputs(chat) {
-                self.save(&chat.snapshot);
-            }
-        }
     }
 
     pub(super) fn tick_deliveries(&self) -> std::sync::MutexGuard<'_, TickDeliveries> {
@@ -2552,7 +2672,7 @@ impl Agent {
         );
         self.tick_deliveries().apply_event(event);
         if invalidates_watch {
-            self.discard_invalid_pending_tick_inputs().await;
+            self.withdraw_every_ended_input().await;
         }
     }
 }
@@ -2698,26 +2818,181 @@ fn left_out(kind: &ObservationKind, data: &Value) -> Value {
 mod manual_admission_tests {
     use super::*;
 
+    /// A subscription no admission let in, as one restored from another Chat's history, to a
+    /// Shell another Chat owns never watches it.
+    #[tokio::test]
+    async fn a_configured_watch_of_another_chats_shell_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::<
+                Vec<tickloop_agent_protocol::Content>,
+            >::new(
+            ))),
+        );
+        let owner = agent.create_chat(directory.path().into()).await.unwrap();
+        let observer = agent.create_chat(directory.path().into()).await.unwrap();
+        let task = agent
+            .submit_user_shell(owner, "sleep 30".into(), true)
+            .await
+            .unwrap();
+        agent
+            .install_tick_stream(Arc::new(crate::tick_stream::ShellTickStream::new(
+                agent.clone(),
+            )))
+            .await;
+        agent
+            .configure_subscriptions(
+                observer,
+                vec![TickSubscription {
+                    id: Uuid::new_v4(),
+                    instance: InstanceRef::shell(task.command_id),
+                    frequency: TickSubscriptionFrequency::Immediate,
+                    authority: None,
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = agent.tick_subscriptions(observer).await.unwrap();
+                if rows[0].link == TickLinkState::IdentityUncertain {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a foreign Shell watch fails closed before its baseline");
+        agent.shutdown().await;
+    }
+
+    #[test]
+    fn a_loop_refuses_subscriptions_it_cannot_honour() {
+        let subscription = |instance: InstanceRef, frequency| TickSubscription {
+            id: Uuid::new_v4(),
+            instance,
+            frequency,
+            authority: None,
+        };
+        let fixture = InstanceRef::new("calendar", "fixture").unwrap();
+        let shell = InstanceRef::shell(Uuid::new_v4());
+        let artifact = InstanceRef::artifact("https://docs.example", "doc").unwrap();
+        use TickSubscriptionFrequency::{High, Immediate, Low};
+        for rejected in [
+            vec![subscription(fixture.clone(), Immediate)],
+            vec![subscription(shell.clone(), High)],
+            vec![subscription(artifact.clone(), High)],
+            vec![subscription(artifact, Immediate)],
+            vec![
+                subscription(fixture.clone(), High),
+                subscription(fixture.clone(), Low),
+            ],
+        ] {
+            assert!(validate(&rejected).is_err());
+        }
+        assert!(validate(&[subscription(fixture, High), subscription(shell, Immediate),]).is_ok());
+    }
+
     #[test]
     fn manual_updates_wait_only_for_plan_approval() {
-        let mut chat_loop = LoopSnapshot::new(Uuid::new_v4());
-        assert!(can_take_manual_update(&chat_loop));
+        let instance = InstanceRef::new("calendar", "fixture").unwrap();
+        let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "folder": null, "messages": [],
+            "chat_loop": {"id": Uuid::new_v4(), "state": "Idle"},
+        }))
+        .unwrap();
+        assert_eq!(
+            manual_eligibility(&snapshot, &instance),
+            Eligibility::Ended(DiscardReason::SourceEnded),
+            "a Tick the Chat does not own is no source"
+        );
+        snapshot
+            .monitor
+            .members
+            .push(tickloop_agent_protocol::MonitorMember {
+                is_terminal: false,
+                instance: instance.clone(),
+                title: None,
+            });
+        assert_eq!(
+            manual_eligibility(&snapshot, &instance),
+            Eligibility::Eligible
+        );
         for state in [LoopState::Interrupted, LoopState::Failed] {
-            chat_loop.state = state;
-            assert!(
-                can_take_manual_update(&chat_loop),
+            snapshot.chat_loop.state = state;
+            assert_eq!(
+                manual_eligibility(&snapshot, &instance),
+                Eligibility::Eligible,
                 "how the last turn ended never holds data back"
             );
         }
-        chat_loop.state = LoopState::WaitingPermission;
-        assert!(
-            can_take_manual_update(&chat_loop),
+        snapshot.chat_loop.state = LoopState::WaitingPermission;
+        assert_eq!(
+            manual_eligibility(&snapshot, &instance),
+            Eligibility::Eligible,
             "permission waits may queue data"
         );
-        chat_loop.state = LoopState::WaitingPlan;
-        assert!(
-            !can_take_manual_update(&chat_loop),
+        snapshot.chat_loop.state = LoopState::WaitingPlan;
+        assert_eq!(
+            manual_eligibility(&snapshot, &instance),
+            Eligibility::Hold(Hold::PlanReview),
             "data must not approve a plan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod put_back_tests {
+    use super::*;
+
+    fn item(subscription: Uuid, instance: &InstanceRef, sequence: u64) -> DeliveryItem {
+        DeliveryItem {
+            title: None,
+            subscription,
+            watch: Uuid::nil(),
+            instance: instance.clone(),
+            first_sequence: sequence,
+            first_observed_at: String::new(),
+            sequence,
+            observed_at: String::new(),
+            updates: 1,
+            waiting_since: Instant::now(),
+            gap: false,
+            kind: ObservationKind::Protocol,
+            recover_with: None,
+            series: Vec::new(),
+            data: json!({ "seq": sequence }),
+            needs_refill: false,
+        }
+    }
+
+    /// Two deliveries of one subscription put back newest first, then the older, within the
+    /// budget: the newer update waits, with its data for a Tick that cannot be read again.
+    #[tokio::test]
+    async fn deliveries_put_back_out_of_order_keep_the_newest_update_and_its_data() {
+        let mut deliveries = TickDeliveries::default();
+        let owner = (Uuid::new_v4(), Uuid::new_v4());
+        let subscription = Uuid::new_v4();
+        let instance: InstanceRef = "calendar:fixture".parse().unwrap();
+        deliveries.restore(owner, vec![item(subscription, &instance, 2)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 1)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].sequence, 2);
+        assert_eq!(waiting[0].updates, 2);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 2),
+            Some(json!({ "seq": 2 }))
+        );
+
+        deliveries.restore(owner, vec![item(subscription, &instance, 3)]);
+        deliveries.restore(owner, vec![item(subscription, &instance, 4)]);
+        let waiting = deliveries.take_delivery(owner).unwrap();
+        assert_eq!(waiting[0].sequence, 4);
+        assert_eq!(
+            deliveries.content.take_put_back(subscription, 4),
+            Some(json!({ "seq": 4 }))
         );
     }
 }

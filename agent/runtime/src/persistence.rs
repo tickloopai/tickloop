@@ -34,9 +34,9 @@ use tickloop_agent_protocol::{
     CompactTrigger, CompactionMarker, Content, DelegationMetadata, DenialRecord,
     DirectedHumanSource, Event, EventKind, ExecutionMode, FamilyCompletion, FamilyInputRecord,
     HostNote, InputContext, LocalMessage, LoopId, LoopSnapshot, LoopState, MAX_RECENT_DENIALS,
-    Message, ModelConfig, MonitorMembership, PrivateHistorySource, Role, RunId, SavedChat,
-    SubagentRegistration, SummarizeMetadata, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
-    Usage,
+    Message, ModelConfig, MonitorMembership, PrivateHistorySource, Receiving, Role, RunId,
+    SavedChat, SubagentRegistration, SummarizeMetadata, SummaryDirection, TickSubscription,
+    TodoItem, ToolCallRecovery, Usage,
 };
 use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
@@ -1508,11 +1508,15 @@ fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) ->
                 .collect(),
             loop_id: chat_loop.id,
             state: serde_json::to_value(&chat_loop.state).unwrap_or(serde_json::Value::Null),
-            trigger: chat_loop
-                .trigger
-                .as_ref()
-                .and_then(|trigger| serde_json::to_value(trigger).ok()),
-            trigger_awaits_resume: snapshot.trigger_awaits_resume,
+            // Receiving is the default a record without the field reads as.
+            receiving: (!chat_loop.receiving.is_receiving())
+                .then(|| serde_json::to_value(chat_loop.receiving).ok())
+                .flatten(),
+            subscriptions: chat_loop
+                .subscriptions
+                .iter()
+                .filter_map(|subscription| serde_json::to_value(subscription).ok())
+                .collect(),
             event_sources: chat_loop
                 .event_sources
                 .iter()
@@ -2325,7 +2329,6 @@ impl RestoredChain {
     /// 沿对话链按顺序重放 Loop 条目：每条以完整状态覆盖 Loop。无法解析的条目跳过；没有条目时
     /// 保留新 Chat 的 Loop。
     fn replay_loop(&self, snapshot: &mut ChatSnapshot) {
-        snapshot.trigger_awaits_resume = false;
         snapshot.failure_events.clear();
         for (_, (record, run_id)) in &self.loop_records {
             if let (Some(run), Some(report)) = (run_id, &record.subagent_report) {
@@ -2334,11 +2337,20 @@ impl RestoredChain {
             let Ok(state) = serde_json::from_value::<LoopState>(record.state.clone()) else {
                 continue;
             };
-            let Ok(trigger) = record
-                .trigger
+            let Ok(receiving) = record
+                .receiving
                 .clone()
-                .map(serde_json::from_value::<Trigger>)
+                .map(serde_json::from_value::<Receiving>)
                 .transpose()
+            else {
+                continue;
+            };
+            let Ok(subscriptions) = record
+                .subscriptions
+                .iter()
+                .cloned()
+                .map(serde_json::from_value::<TickSubscription>)
+                .collect::<Result<Vec<_>, _>>()
             else {
                 continue;
             };
@@ -2361,7 +2373,8 @@ impl RestoredChain {
                 state,
                 run_id: *run_id,
                 run_started_at: record.run_started_at,
-                trigger,
+                receiving: receiving.unwrap_or_default(),
+                subscriptions,
                 event_sources: record
                     .event_sources
                     .iter()
@@ -2372,7 +2385,6 @@ impl RestoredChain {
                     .as_ref()
                     .and_then(serde_json::Value::as_u64),
             };
-            snapshot.trigger_awaits_resume = record.trigger_awaits_resume;
         }
     }
 }
@@ -2400,7 +2412,7 @@ fn recover_snapshot_for_resume(
         .chat_loop
         .run_id
         .is_some_and(|run| rebuilt.contains(&run));
-    super::triggers::recover_loop_keeping(&mut snapshot, keeps_run, waits);
+    super::wakeup::recover_loop(&mut snapshot, keeps_run, waits);
     let rebuilt = rebuilt_runs(&snapshot);
     // A family call's effect is in the family's records: its result is what they say.
     let message_responses = bookkeeping.message_responses.clone();
@@ -2564,6 +2576,15 @@ impl Agent {
         recorder.adopt_restored_loop(snapshot, bookkeeping, &checkpoints, records_loop);
         recorder.adopt_lifecycle(snapshot.id, &bookkeeping.lifecycle);
         Ok(())
+    }
+
+    /// Whether the store holds anything of the Chat yet: a process host records nothing ahead of
+    /// its conversation.
+    pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {
+        self.inner
+            .recorder
+            .as_ref()
+            .is_some_and(|recorder| recorder.outbox.is_materialized(chat_id))
     }
 
     pub(super) async fn checkpoint_transcript(
@@ -3477,8 +3498,7 @@ impl Agent {
                 watching_commands: false,
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
-                trigger_cancellations: HashMap::new(),
-                event_cancellations: HashMap::new(),
+                feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
                 deferred_messages: Vec::new(),
@@ -3498,6 +3518,8 @@ impl Agent {
         }
         self.save(&snapshot);
         self.start_feedback_cleanup(chat_id).await;
+        // A loaded Loop watches its subscriptions even while it pauses receiving.
+        self.sync_tick_subscriptions().await;
         if family.is_none() {
             self.restore_after_load(chat_id, waits).await;
         }

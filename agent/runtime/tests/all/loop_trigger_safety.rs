@@ -1,6 +1,7 @@
-//! 同一 Loop 只触发一次、停止即停止：跨实例的 Trigger 租约（flock）与停止状态文件。
-//! 同一测试进程中的多个 Agent 实例模拟多个进程；需要真实进程退出时，以本测试可执行文件
-//! 运行 `lease_holder_child_process` 作为子进程持有租约。
+//! 同一 Chat 只送达一次、停止即停止：跨实例的 Trigger 租约（flock）与接收状态文件。
+//! 同一测试进程中的多个 Agent 实例模拟多个进程，每个实例在自己的内存 Tick 流上观察同一个 Shell
+//! Tick；需要真实进程退出时，以本测试可执行文件运行 `lease_holder_child_process` 作为子进程持有
+//! 租约。
 
 use std::{
     path::{Path, PathBuf},
@@ -11,18 +12,28 @@ use std::{
 use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    ChatId, Content, EventKind, LoopId, LoopState, LoopTriggerNoticeKind, Message, ModelIdentity,
-    Protocol, Receipt, Trigger, TriggerPromptSource, TriggerSource, Usage,
+    ChatId, Content, EventKind, LoopState, LoopTriggerNoticeKind, Message, ModelIdentity,
+    PauseReason, Protocol, Receipt, Receiving, Usage,
 };
-use tickloop_agent_runtime::{Agent, AgentError};
+use tickloop_agent_runtime::Agent;
+use tickloop_agent_runtime::tick_stream::InMemoryTickStream;
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::{config, next_event};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longer than a held delivery's retry, so a delivery the lease keeps out would have arrived.
+const SETTLE: Duration = Duration::from_secs(1);
 const LEASE_HOLDER_ENV: &str = "TICKLOOP_TEST_LEASE_HOLDER";
-const SHARED_PROMPT: &str = "shared check";
+const SHARED_NOTE: &str = "shared check";
+/// The delivery of the update a waiting instance holds until it takes the lease over; held, its
+/// data is read again, which an in-memory Tick cannot, so only its sequence shows.
+const SECOND_UPDATE: &str = "\"seq\":\"2\"";
+const STOPPED: Receiving = Receiving::Paused {
+    reason: PauseReason::Stopped,
+};
 
 struct EchoModel {
     prompts: Mutex<Vec<String>>,
@@ -99,24 +110,6 @@ fn message_text(message: &Message) -> String {
         .join("\n")
 }
 
-fn watching(prompt: &str) -> Trigger {
-    Trigger {
-        id: Uuid::new_v4(),
-        prompt: prompt.into(),
-        prompt_source: TriggerPromptSource::Explicit,
-        accepts_events: true,
-        armed: true,
-        subscriptions: Vec::new(),
-    }
-}
-
-fn event_source() -> TriggerSource {
-    TriggerSource {
-        source: "test".into(),
-        payload: serde_json::json!({}),
-    }
-}
-
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, prompt.into()).await.unwrap();
@@ -151,236 +144,213 @@ fn chat_directory(root: &Path, chat: ChatId) -> PathBuf {
         .with_extension("")
 }
 
-fn lock_path(root: &Path, chat: ChatId, loop_id: LoopId) -> PathBuf {
+fn lock_path(root: &Path, chat: ChatId) -> PathBuf {
     chat_directory(root, chat)
-        .join("loops")
-        .join(format!("{loop_id}.lock"))
+        .join("trigger")
+        .join("lease.lock")
 }
 
-/// 已保存的 Chat，它的 Loop 接收事件。
-async fn saved_chat_with_shared_loop(root: &Path, workdir: &Path) -> (ChatId, Receipt) {
+/// 已保存的 Chat，它的 Loop 订阅 `task` 的 Shell Tick。
+async fn saved_chat_with_shared_loop(root: &Path, workdir: &Path, task: Uuid) -> ChatId {
     let creator = Agent::open_embedded(root.into(), config(), EchoModel::new()).unwrap();
+    let shell = ShellTick::new(task);
+    shell.install(&creator).await;
     let chat = creator.create_chat(workdir.into()).await.unwrap();
-    let shared = complete_turn(&creator, chat, "shared goal").await;
-    creator
-        .configure_trigger(chat, Some(watching(SHARED_PROMPT)))
-        .await
-        .unwrap();
+    complete_turn(&creator, chat, "shared goal").await;
+    shell.subscribe(&creator, chat).await;
     creator.shutdown().await;
-    (chat, shared)
+    chat
 }
 
-struct ArmedInstances {
+/// 一个实例：恢复共享 Chat，以一条用户输入继续它，并在自己的流上观察那个 Shell Tick。
+struct Instance {
+    agent: Agent,
+    model: Arc<EchoModel>,
+    shell: ShellTick,
+}
+
+async fn resumed_instance(root: &Path, chat: ChatId, task: Uuid, prompt: &str) -> Instance {
+    let model = EchoModel::new();
+    let agent = Agent::open_embedded(root.into(), config(), model.clone()).unwrap();
+    let shell = ShellTick::new(task);
+    shell.install(&agent).await;
+    agent.resume_chat(chat).await.unwrap();
+    complete_turn(&agent, chat, prompt).await;
+    shell.wait_until_live(&agent, chat).await;
+    Instance {
+        agent,
+        model,
+        shell,
+    }
+}
+
+async fn wait_for_notice(agent: &Agent, chat: ChatId, kind: LoopTriggerNoticeKind) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    while !agent
+        .loop_trigger_notices()
+        .iter()
+        .any(|notice| notice.chat_id == chat && notice.kind == kind)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a {kind:?} notice"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_receiving(agent: &Agent, chat: ChatId, expected: Receiving) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    while agent.snapshot(chat).await.unwrap().chat_loop.receiving != expected {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct SharedInstances {
     _directory: tempfile::TempDir,
     root: PathBuf,
     chat: ChatId,
-    loop_id: LoopId,
-    holder: Agent,
-    holder_model: Arc<EchoModel>,
-    other: Agent,
-    other_model: Arc<EchoModel>,
+    holder: Instance,
+    other: Instance,
 }
 
-/// 两个实例恢复同一 Chat 并都武装共享 Loop；先触发的实例持有租约，另一个实例的事件被拒绝。
-async fn two_armed_instances() -> ArmedInstances {
+/// 两个实例恢复同一 Chat；先送达的实例持有租约，另一个实例的送达留在它的订阅里。
+async fn two_receiving_instances() -> SharedInstances {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let (chat, shared) = saved_chat_with_shared_loop(&root, directory.path()).await;
+    let task = Uuid::new_v4();
+    let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
 
-    let holder_model = EchoModel::new();
-    let holder = Agent::open_embedded(root.clone(), config(), holder_model.clone()).unwrap();
-    holder.resume_chat(chat).await.unwrap();
-    complete_turn(&holder, chat, "resume in the holder").await;
-    holder.trigger(chat, event_source()).await.unwrap();
-    wait_until("the holder to fire", WAIT_TIMEOUT, || {
-        holder_model.prompts_containing(SHARED_PROMPT) >= 1
+    let holder = resumed_instance(&root, chat, task, "resume in the holder").await;
+    holder.shell.update(1, SHARED_NOTE);
+    wait_until("the holder to deliver", WAIT_TIMEOUT, || {
+        holder.model.prompts_containing(SHARED_NOTE) >= 1
     })
     .await;
 
-    let other_model = EchoModel::new();
-    let other = Agent::open_embedded(root.clone(), config(), other_model.clone()).unwrap();
-    other.resume_chat(chat).await.unwrap();
-    complete_turn(&other, chat, "resume in the other").await;
-    assert!(other.trigger(chat, event_source()).await.is_err());
-    assert_eq!(other_model.prompts_containing(SHARED_PROMPT), 0);
-    ArmedInstances {
+    // A later update: the holder's watermark keeps the one it delivered from any instance.
+    let other = resumed_instance(&root, chat, task, "resume in the other").await;
+    other.shell.update(2, SHARED_NOTE);
+    wait_for_notice(
+        &other.agent,
+        chat,
+        LoopTriggerNoticeKind::HeldByAnotherProcess,
+    )
+    .await;
+    assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0);
+    SharedInstances {
         _directory: directory,
         root,
         chat,
-        loop_id: shared.loop_id,
         holder,
-        holder_model,
         other,
-        other_model,
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum StopPath {
-    Stop,
-    Disarm,
-}
-
-async fn stop_in_the_holder(path: StopPath) {
-    let instances = two_armed_instances().await;
-    let ArmedInstances {
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_chat_in_the_lease_holder_keeps_the_other_instance_from_delivering() {
+    // Bound whole: a field left out of the pattern would drop the Chat's directory.
+    let SharedInstances {
+        _directory,
         chat,
         holder,
         other,
-        other_model,
         ..
-    } = &instances;
-    match path {
-        StopPath::Stop => {
-            holder.stop(*chat).await.unwrap();
-        }
-        StopPath::Disarm => {
-            holder
-                .configure_trigger(
-                    *chat,
-                    Some(Trigger {
-                        armed: false,
-                        ..watching(SHARED_PROMPT)
-                    }),
-                )
-                .await
-                .unwrap();
-        }
-    }
-    assert!(
-        other.trigger(*chat, event_source()).await.is_err(),
-        "{path:?}: the other instance took an event after the holder stopped the Loop"
-    );
-    assert_eq!(
-        other_model.prompts_containing(SHARED_PROMPT),
-        0,
-        "{path:?}: the other instance fired after the holder stopped the Loop"
-    );
-    let synced = other.snapshot(*chat).await.unwrap();
-    assert!(!synced.chat_loop.trigger.as_ref().unwrap().armed);
-    match path {
-        StopPath::Stop => assert!(synced.trigger_awaits_resume, "{path:?}"),
-        StopPath::Disarm => {}
-    }
-    holder.shutdown().await;
-    other.shutdown().await;
+    } = two_receiving_instances().await;
+    holder.agent.stop(chat).await.unwrap();
+    other.shell.update(3, SHARED_NOTE);
+    // 接手租约的实例读到暂停：同步为暂停接收且不送达。
+    wait_for_receiving(&other.agent, chat, STOPPED).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0);
+    holder.agent.shutdown().await;
+    other.agent.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stopping_a_loop_in_the_lease_holder_keeps_the_other_instance_from_firing() {
-    stop_in_the_holder(StopPath::Stop).await;
+async fn stopping_the_chat_in_the_waiting_instance_pauses_the_lease_holder() {
+    let SharedInstances {
+        _directory,
+        root,
+        chat,
+        holder,
+        other,
+    } = two_receiving_instances().await;
+    other.agent.stop(chat).await.unwrap();
+    // 持有者下一次送达前读到接收状态：同步为暂停接收、归还租约且不送达。
+    let delivered = holder.model.prompts_containing(SHARED_NOTE);
+    holder.shell.update(3, SHARED_NOTE);
+    wait_for_receiving(&holder.agent, chat, STOPPED).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(holder.model.prompts_containing(SHARED_NOTE), delivered);
+    assert!(!lock_path(&root, chat).exists());
+    holder.agent.shutdown().await;
+    other.agent.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn disarming_a_trigger_in_the_lease_holder_keeps_the_other_instance_from_firing() {
-    stop_in_the_holder(StopPath::Disarm).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stopping_a_loop_in_the_waiting_instance_pauses_the_lease_holder() {
-    let instances = two_armed_instances().await;
-    instances.other.stop(instances.chat).await.unwrap();
-    // 持有者下一次收到事件时读到停止状态：同步为暂停接收、归还租约且不触发。
-    let holder_fires = instances.holder_model.prompts_containing(SHARED_PROMPT);
-    assert!(
-        instances
-            .holder
-            .trigger(instances.chat, event_source())
-            .await
-            .is_err()
-    );
-    let synced = instances.holder.snapshot(instances.chat).await.unwrap();
-    assert!(!synced.chat_loop.trigger.as_ref().unwrap().armed);
-    assert!(synced.trigger_awaits_resume);
-    assert_eq!(
-        instances.holder_model.prompts_containing(SHARED_PROMPT),
-        holder_fires
-    );
-    assert!(!lock_path(&instances.root, instances.chat, instances.loop_id).exists());
-    instances.holder.shutdown().await;
-    instances.other.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_first_triggers_leave_exactly_one_holder_and_keep_its_lock() {
+async fn concurrent_first_deliveries_leave_exactly_one_holder_and_keep_its_lock() {
     const INSTANCES: usize = 4;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let creator = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
-    let chat = creator.create_chat(directory.path().into()).await.unwrap();
-    let loop_id = complete_turn(&creator, chat, "goal").await.loop_id;
-    creator.shutdown().await;
-    drop(creator);
-
+    let task = Uuid::new_v4();
+    let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
     let mut instances = Vec::new();
-    for _ in 0..INSTANCES {
-        let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
-        agent.resume_chat(chat).await.unwrap();
-        instances.push(agent);
+    for index in 0..INSTANCES {
+        instances.push(resumed_instance(&root, chat, task, &format!("resume {index}")).await);
     }
-    // 全部恢复之后再武装：先武装的实例写出的 Trigger 会被之后恢复的实例按恢复规则解除武装。
-    for agent in &instances {
-        agent
-            .configure_trigger(chat, Some(watching("event check")))
-            .await
-            .unwrap();
+    for instance in &instances {
+        instance.shell.update(1, SHARED_NOTE);
     }
-    let barrier = Arc::new(tokio::sync::Barrier::new(INSTANCES));
-    let attempts = instances
+    wait_until("one instance to deliver", WAIT_TIMEOUT, || {
+        instances
+            .iter()
+            .any(|instance| instance.model.prompts_containing(SHARED_NOTE) >= 1)
+    })
+    .await;
+    tokio::time::sleep(SETTLE).await;
+    let delivered = instances
         .iter()
-        .cloned()
-        .map(|agent| {
-            let barrier = barrier.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                agent.trigger(chat, event_source()).await
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut delivered = 0;
-    for attempt in attempts {
-        match attempt.await.unwrap() {
-            Ok(_) => delivered += 1,
-            Err(AgentError::Invalid(message)) => {
-                assert!(message.contains("another Tickloop process"), "{message}")
-            }
-            Err(error) => panic!("unexpected trigger failure: {error}"),
-        }
-    }
-    assert_eq!(delivered, 1, "the Loop was delivered {delivered} times");
+        .map(|instance| instance.model.prompts_containing(SHARED_NOTE))
+        .sum::<usize>();
+    assert_eq!(delivered, 1, "the Chat was delivered {delivered} times");
     assert!(
-        lock_path(&root, chat, loop_id).exists(),
+        lock_path(&root, chat).exists(),
         "a failed attempt removed the holder's lock"
     );
-    for agent in instances {
-        agent.shutdown().await;
+    for instance in instances {
+        instance.agent.shutdown().await;
     }
 }
 
-#[tokio::test]
-async fn a_stopped_loop_stays_paused_after_a_restart_until_a_new_input() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_chat_stays_paused_after_a_restart_until_a_new_input() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, "goal to stop").await;
-    agent
-        .configure_trigger(chat, Some(watching("stopped check")))
-        .await
-        .unwrap();
-    // 先写出武装状态，暂停写成对话叶子之后的尾随 Loop 条目。
-    agent.flush_transcripts().await;
-    agent.stop(chat).await.unwrap();
-    agent.shutdown().await;
-    drop(agent);
+    let task = Uuid::new_v4();
+    let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
+    let first = resumed_instance(&root, chat, task, "goal to stop").await;
+    // 先写出接收中的状态，暂停写成对话叶子之后的尾随 Loop 条目。
+    first.agent.flush_transcripts().await;
+    first.agent.stop(chat).await.unwrap();
+    first.agent.shutdown().await;
+    drop(first);
 
     let model = EchoModel::new();
     let restarted = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let shell = ShellTick::new(task);
+    shell.install(&restarted).await;
     let restored = restarted.resume_chat(chat).await.unwrap();
     assert_eq!(restored.chat_loop.state, LoopState::Idle);
-    assert!(!restored.chat_loop.trigger.as_ref().unwrap().armed);
-    assert!(restored.trigger_awaits_resume);
-    assert!(restarted.trigger(chat, event_source()).await.is_err());
+    assert_eq!(restored.chat_loop.receiving, STOPPED);
+    shell.wait_until_live(&restarted, chat).await;
+    shell.update(1, "stopped check");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.prompts_containing("stopped check"), 0);
     complete_turn(&restarted, chat, "continue after restart").await;
     assert!(
         restarted
@@ -388,15 +358,14 @@ async fn a_stopped_loop_stays_paused_after_a_restart_until_a_new_input() {
             .await
             .unwrap()
             .chat_loop
-            .trigger
-            .as_ref()
-            .unwrap()
-            .armed
+            .receiving
+            .is_receiving()
     );
-    restarted.trigger(chat, event_source()).await.unwrap();
-    wait_until("the continued Loop to take the event", WAIT_TIMEOUT, || {
-        model.prompts_containing("stopped check") >= 1
-    })
+    wait_until(
+        "the continued Loop to take the update",
+        WAIT_TIMEOUT,
+        || model.prompts_containing("stopped check") >= 1,
+    )
     .await;
     restarted.shutdown().await;
 }
@@ -405,24 +374,22 @@ async fn a_stopped_loop_stays_paused_after_a_restart_until_a_new_input() {
 struct LeaseHolderPlan {
     root: PathBuf,
     chat: ChatId,
+    task: Uuid,
     ready: PathBuf,
 }
 
-/// 子进程入口：未设置 `TICKLOOP_TEST_LEASE_HOLDER` 时什么也不做。设置时恢复 Chat、重新武装共享
-/// Loop 并送达一次事件，触发后写出就绪文件，之后一直持有租约直到被杀死。
+/// 子进程入口：未设置 `TICKLOOP_TEST_LEASE_HOLDER` 时什么也不做。设置时恢复并继续 Chat，送达
+/// 一次 Shell Tick 更新后写出就绪文件，之后一直持有租约直到被杀死。
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_holder_child_process() {
     let Ok(plan) = std::env::var(LEASE_HOLDER_ENV) else {
         return;
     };
     let plan: LeaseHolderPlan = serde_json::from_str(&plan).unwrap();
-    let model = EchoModel::new();
-    let agent = Agent::open_embedded(plan.root, config(), model.clone()).unwrap();
-    agent.resume_chat(plan.chat).await.unwrap();
-    complete_turn(&agent, plan.chat, "resume in the child").await;
-    agent.trigger(plan.chat, event_source()).await.unwrap();
-    wait_until("the child to fire", WAIT_TIMEOUT, || {
-        model.prompts_containing(SHARED_PROMPT) >= 1
+    let holder = resumed_instance(&plan.root, plan.chat, plan.task, "resume in the child").await;
+    holder.shell.update(1, SHARED_NOTE);
+    wait_until("the child to deliver", WAIT_TIMEOUT, || {
+        holder.model.prompts_containing(SHARED_NOTE) >= 1
     })
     .await;
     std::fs::write(&plan.ready, std::process::id().to_string()).unwrap();
@@ -438,11 +405,13 @@ fn lock_holder_pid(path: &Path) -> Option<u64> {
 async fn a_killed_holder_process_releases_its_lease_to_the_waiting_instance() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let (chat, shared) = saved_chat_with_shared_loop(&root, directory.path()).await;
+    let task = Uuid::new_v4();
+    let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
     let ready = directory.path().join("holder-ready");
     let plan = LeaseHolderPlan {
         root: root.clone(),
         chat,
+        task,
         ready: ready.clone(),
     };
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -461,35 +430,30 @@ async fn a_killed_holder_process_releases_its_lease_to_the_waiting_instance() {
         || ready.exists(),
     )
     .await;
-    let lock = lock_path(&root, chat, shared.loop_id);
+    let lock = lock_path(&root, chat);
     assert_eq!(lock_holder_pid(&lock), Some(u64::from(child.id())));
 
-    let model = EchoModel::new();
-    let other = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    other.resume_chat(chat).await.unwrap();
-    complete_turn(&other, chat, "resume in the other").await;
-    assert!(other.trigger(chat, event_source()).await.is_err());
-    assert_eq!(model.prompts_containing(SHARED_PROMPT), 0);
-    assert!(
-        other
-            .loop_trigger_notices()
-            .iter()
-            .any(|notice| notice.loop_id == shared.loop_id
-                && notice.kind == LoopTriggerNoticeKind::HeldByAnotherProcess)
-    );
+    let other = resumed_instance(&root, chat, task, "resume in the other").await;
+    other.shell.update(2, SHARED_NOTE);
+    wait_for_notice(
+        &other.agent,
+        chat,
+        LoopTriggerNoticeKind::HeldByAnotherProcess,
+    )
+    .await;
+    assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0);
 
-    // SIGKILL：子进程来不及归还租约，锁文件留在原处，由内核释放 flock。
+    // SIGKILL：子进程来不及归还租约，锁文件留在原处，由内核释放 flock；等待中的送达随后重试。
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(lock.exists());
-    other.trigger(chat, event_source()).await.unwrap();
     wait_until("the waiting instance to take over", WAIT_TIMEOUT, || {
-        model.prompts_containing(SHARED_PROMPT) >= 1
+        other.model.prompts_containing(SECOND_UPDATE) >= 1
     })
     .await;
     assert_eq!(lock_holder_pid(&lock), Some(u64::from(std::process::id())));
-    assert!(other.loop_trigger_notices().is_empty());
-    other.shutdown().await;
+    assert!(other.agent.loop_trigger_notices().is_empty());
+    other.agent.shutdown().await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -498,11 +462,12 @@ enum HolderExit {
     Drop,
 }
 
-/// 在独立的 tokio 运行时中恢复 Chat、重新武装共享 Loop 并送达一次事件，触发后通知 `ready`，收到
-/// `release` 后按 `exit` 退出；`Drop` 时直接释放 Agent 与运行时，模拟实例退出而未调用 shutdown。
+/// 在独立的 tokio 运行时中恢复并继续 Chat、送达一次更新，送达后通知 `ready`，收到 `release`
+/// 后按 `exit` 退出；`Drop` 时直接释放 Agent 与运行时，模拟实例退出而未调用 shutdown。
 fn spawn_lease_holder(
     root: PathBuf,
     chat: ChatId,
+    task: Uuid,
     exit: HolderExit,
     ready: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
@@ -513,20 +478,17 @@ fn spawn_lease_holder(
             .build()
             .unwrap();
         runtime.block_on(async {
-            let model = EchoModel::new();
-            let agent = Agent::open_embedded(root, config(), model.clone()).unwrap();
-            agent.resume_chat(chat).await.unwrap();
-            complete_turn(&agent, chat, "resume in the holder").await;
-            agent.trigger(chat, event_source()).await.unwrap();
-            wait_until("the holder to fire", WAIT_TIMEOUT, || {
-                model.prompts_containing(SHARED_PROMPT) >= 1
+            let holder = resumed_instance(&root, chat, task, "resume in the holder").await;
+            holder.shell.update(1, SHARED_NOTE);
+            wait_until("the holder to deliver", WAIT_TIMEOUT, || {
+                holder.model.prompts_containing(SHARED_NOTE) >= 1
             })
             .await;
             ready.send(()).unwrap();
             release.await.unwrap();
             match exit {
-                HolderExit::Shutdown => agent.shutdown().await,
-                HolderExit::Drop => drop(agent),
+                HolderExit::Shutdown => holder.agent.shutdown().await,
+                HolderExit::Drop => drop(holder),
             }
         });
         drop(runtime);
@@ -538,40 +500,47 @@ async fn the_waiting_instance_takes_the_lease_once_the_holder_shuts_down_or_drop
     for exit in [HolderExit::Shutdown, HolderExit::Drop] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
-        let (chat, _) = saved_chat_with_shared_loop(&root, directory.path()).await;
+        let task = Uuid::new_v4();
+        let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
         let (ready_sender, ready) = tokio::sync::oneshot::channel();
         let (release, release_receiver) = tokio::sync::oneshot::channel();
-        let holder = spawn_lease_holder(root.clone(), chat, exit, ready_sender, release_receiver);
+        let holder = spawn_lease_holder(
+            root.clone(),
+            chat,
+            task,
+            exit,
+            ready_sender,
+            release_receiver,
+        );
         tokio::time::timeout(WAIT_TIMEOUT, ready)
             .await
-            .expect("holder did not fire")
+            .expect("holder did not deliver")
             .unwrap();
 
-        let model = EchoModel::new();
-        let other = Agent::open_embedded(root, config(), model.clone()).unwrap();
-        other.resume_chat(chat).await.unwrap();
-        complete_turn(&other, chat, "resume in the other").await;
-        assert!(
-            other.trigger(chat, event_source()).await.is_err(),
-            "{exit:?}: the holder still holds the lease"
-        );
-        assert_eq!(model.prompts_containing(SHARED_PROMPT), 0, "{exit:?}");
+        let other = resumed_instance(&root, chat, task, "resume in the other").await;
+        other.shell.update(2, SHARED_NOTE);
+        wait_for_notice(
+            &other.agent,
+            chat,
+            LoopTriggerNoticeKind::HeldByAnotherProcess,
+        )
+        .await;
+        assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0, "{exit:?}");
 
         release.send(()).unwrap();
         tokio::task::spawn_blocking(move || holder.join().unwrap())
             .await
             .unwrap();
-        other.trigger(chat, event_source()).await.unwrap();
         wait_until("the other instance to take over", WAIT_TIMEOUT, || {
-            model.prompts_containing(SHARED_PROMPT) >= 1
+            other.model.prompts_containing(SECOND_UPDATE) >= 1
         })
         .await;
-        other.shutdown().await;
+        other.agent.shutdown().await;
     }
 }
 
-fn write_lock(root: &Path, chat: ChatId, loop_id: LoopId, content: &[u8]) {
-    let path = lock_path(root, chat, loop_id);
+fn write_lock(root: &Path, chat: ChatId, content: &[u8]) {
+    let path = lock_path(root, chat);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
@@ -582,14 +551,20 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
     let root = directory.path().join("root");
     let model = EchoModel::new();
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let stream = InMemoryTickStream::new();
     let names = ["corrupt", "exited", "reused", "own", "foreign"];
     let mut chats = Vec::new();
+    let mut shells = Vec::new();
     for name in names {
+        let shell = ShellTick::on(stream.clone(), Uuid::new_v4());
+        if shells.is_empty() {
+            shell.install(&agent).await;
+        }
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let loop_id = complete_turn(&agent, chat, &format!("{name} goal"))
-            .await
-            .loop_id;
-        chats.push((chat, loop_id));
+        complete_turn(&agent, chat, &format!("{name} goal")).await;
+        shell.subscribe(&agent, chat).await;
+        chats.push(chat);
+        shells.push(shell);
     }
     agent.flush_transcripts().await;
 
@@ -606,18 +581,15 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
             .to_string()
             .into_bytes()
     };
-    let lock = |index: usize, content: &[u8]| {
-        let (chat, loop_id) = chats[index];
-        write_lock(&root, chat, loop_id, content);
-    };
-    lock(0, b"{\"chatId\":");
-    lock(1, &holder(chats[1].0, exited_pid));
-    lock(2, &holder(chats[2].0, unrelated.id()));
-    lock(3, &holder(chats[3].0, std::process::id()));
-    lock(
-        4,
+    write_lock(&root, chats[0], b"{\"chatId\":");
+    write_lock(&root, chats[1], &holder(chats[1], exited_pid));
+    write_lock(&root, chats[2], &holder(chats[2], unrelated.id()));
+    write_lock(&root, chats[3], &holder(chats[3], std::process::id()));
+    write_lock(
+        &root,
+        chats[4],
         serde_json::json!({
-            "chatId": chats[4].0,
+            "chatId": chats[4],
             "pid": std::process::id(),
             "nonce": Uuid::new_v4(),
             "startedAt": 1,
@@ -627,35 +599,22 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
         .as_bytes(),
     );
 
-    for ((chat, _), name) in chats.iter().zip(names) {
-        agent
-            .configure_trigger(*chat, Some(watching(&format!("{name} check"))))
-            .await
-            .unwrap();
-        let delivered = agent.trigger(*chat, event_source()).await;
-        assert_eq!(
-            delivered.is_ok(),
-            name != "foreign",
-            "{name}: {delivered:?}"
-        );
+    for (shell, name) in shells.iter().zip(names) {
+        shell.update(1, &format!("{name} check"));
     }
-    wait_until(
-        "stale locks to be taken over",
-        Duration::from_secs(4),
-        || {
-            ["corrupt", "exited", "reused", "own"]
-                .iter()
-                .all(|name| model.prompts_containing(&format!("{name} check")) >= 1)
-        },
-    )
+    wait_until("stale locks to be taken over", WAIT_TIMEOUT, || {
+        ["corrupt", "exited", "reused", "own"]
+            .iter()
+            .all(|name| model.prompts_containing(&format!("{name} check")) >= 1)
+    })
     .await;
+    wait_for_notice(&agent, chats[4], LoopTriggerNoticeKind::Warning).await;
     assert_eq!(model.prompts_containing("foreign check"), 0);
     let notices = agent.loop_trigger_notices();
     let foreign = notices
         .iter()
-        .find(|notice| notice.loop_id == chats[4].1)
+        .find(|notice| notice.chat_id == chats[4])
         .expect("the foreign host lock is reported");
-    assert_eq!(foreign.kind, LoopTriggerNoticeKind::Warning);
     assert!(
         foreign.message.contains("another-host.invalid"),
         "{}",
@@ -667,33 +626,24 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unusable_lease_directory_fails_the_trigger_with_a_visible_warning() {
+async fn an_unusable_lease_directory_keeps_the_delivery_back_with_a_visible_warning() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let model = EchoModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let shell = ShellTick::new(Uuid::new_v4());
+    shell.install(&agent).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let goal = complete_turn(&agent, chat, "event goal").await;
+    complete_turn(&agent, chat, "event goal").await;
+    shell.subscribe(&agent, chat).await;
     agent.flush_transcripts().await;
     let chat_directory = chat_directory(&root, chat);
     std::fs::create_dir_all(&chat_directory).unwrap();
-    std::fs::write(chat_directory.join("loops"), b"not a directory").unwrap();
+    std::fs::write(chat_directory.join("trigger"), b"not a directory").unwrap();
 
-    agent
-        .configure_trigger(chat, Some(watching("event check")))
-        .await
-        .unwrap();
-    let error = agent.trigger(chat, event_source()).await.unwrap_err();
-    assert!(matches!(error, AgentError::Storage(_)), "{error}");
-    let notices = agent.loop_trigger_notices();
-    assert!(
-        notices.iter().any(|notice| notice.chat_id == chat
-            && notice.loop_id == goal.loop_id
-            && notice.kind == LoopTriggerNoticeKind::Warning),
-        "{:?}",
-        notices
-            .iter()
-            .map(|notice| &notice.message)
-            .collect::<Vec<_>>()
-    );
+    shell.update(1, "event check");
+    wait_for_notice(&agent, chat, LoopTriggerNoticeKind::Warning).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.prompts_containing("event check"), 0);
     agent.shutdown().await;
 }

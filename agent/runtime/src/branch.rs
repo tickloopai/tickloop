@@ -147,7 +147,6 @@ impl Agent {
             message_sources: BTreeMap::new(),
             message_models: BTreeMap::new(),
             chat_loop: LoopSnapshot::new(Uuid::new_v4()),
-            trigger_awaits_resume: false,
             last_sequence: 0,
             permissions: Vec::new(),
             questions: Vec::new(),
@@ -271,8 +270,7 @@ impl Agent {
                 watching_commands: false,
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
-                trigger_cancellations: Default::default(),
-                event_cancellations: Default::default(),
+                feedback_watcher: None,
                 feedback_inputs: Default::default(),
                 feedback_cleanup_started: false,
                 deferred_messages: Vec::new(),
@@ -315,6 +313,7 @@ impl Agent {
         if let Some(next) = next {
             self.run_task(next);
         }
+        self.sync_tick_subscriptions().await;
         self.flush_transcripts().await;
         Ok(BranchOutcome {
             source_chat_id: request.source_chat_id,
@@ -462,12 +461,15 @@ fn carry_citation_results(
     Ok(())
 }
 
-/// Branch 复制源 Chat 的 Loop，照重启恢复的规则进入子 Chat：运行或等待中的转为已中断，武装中的
-/// Trigger 解除武装，Chat 继续时重新武装。
+/// Branch 复制源 Chat 的 Loop，照历史装载的规则进入子 Chat：运行或等待中的转为已中断，接收暂停，
+/// Chat 继续时恢复。
 fn carry_loop(child: &mut ChatSnapshot, source: &ChatSnapshot) {
     child.chat_loop = source.chat_loop.clone();
-    child.trigger_awaits_resume = source.trigger_awaits_resume;
-    super::triggers::recover_loop(child);
+    // The copy subscribes on its own: a subscription id names one Loop's subscription.
+    for subscription in &mut child.chat_loop.subscriptions {
+        subscription.id = Uuid::new_v4();
+    }
+    super::wakeup::recover_loop(child, false, super::WaitHosting::Process);
 }
 
 /// Copies Loop plans and progress without process-local approvals or execution modes.

@@ -375,7 +375,7 @@ pub const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 /// 有多个 Loop 时的旧格式，恢复时丢弃。
 pub const LOOP_SUBTYPE: &str = "chat_loop";
 
-/// Loop 在对话链上的完整状态。状态与 Trigger 按原始 JSON 保存，本模块不解析其结构。
+/// Loop 在对话链上的完整状态。状态、接收开关与订阅按原始 JSON 保存，本模块不解析其结构。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LoopRecord {
@@ -385,11 +385,11 @@ pub struct LoopRecord {
     pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,
     pub state: serde_json::Value,
+    /// 接收开关；暂停时带原因（`/stop` 或历史装载）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<serde_json::Value>,
-    /// Trigger 已解除武装、等待 Chat 继续时重新武装（`/stop`、重启恢复或 Branch 复制后）。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub trigger_awaits_resume: bool,
+    pub receiving: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_sources: Vec<serde_json::Value>,
     /// The submitted version is durable before the approval tool receives its result.
@@ -733,6 +733,34 @@ pub struct InputEntry {
     /// While `Accepted`: the queued input as it waits, enough to queue it again after a load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued: Option<serde_json::Value>,
+    /// What a Trigger delivery was, in every record of the input: its acceptance, the turn it
+    /// started or merged into, and its withdrawal with the reason. The acceptance's `queued`
+    /// holds the whole source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerRecord>,
+}
+
+/// A Trigger delivery as its ledger records name it: the identity its ledger id is named by,
+/// which says which subscription, request, Goal or task it came from, and how many source
+/// events it merges.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRecord {
+    pub identity: tickloop_agent_protocol::TriggerIdentity,
+    pub merged: u64,
+}
+
+impl TriggerRecord {
+    pub fn of(source: &tickloop_agent_protocol::TriggerSource) -> Self {
+        Self {
+            identity: source.identity(),
+            merged: source.merged(),
+        }
+    }
+
+    pub fn kind(&self) -> tickloop_agent_protocol::TriggerKind {
+        self.identity.kind()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -821,10 +849,14 @@ pub enum SettledOutcome {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DiscardReason {
-    /// Its Trigger source ended or was replaced before the input started.
+    /// Its Trigger source ended or could no longer be proved before the input started.
     SourceEnded,
     /// Its Agent was stopped while it waited.
     Stopped,
+    /// The Tick Subscription it came from was cancelled before it started.
+    Unsubscribed,
+    /// The artifact it came from was unlinked from the Chat before it started.
+    Unlinked,
 }
 
 /// A Run's durable wait: a point in the Run that only an outside event ends, and where the Run
@@ -1071,6 +1103,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00.000Z".into(),
                 state: InputState::Accepted,
                 queued: None,
+                trigger: None,
             }),
             Line::Wait(WaitEntry {
                 wait_id: Uuid::nil(),

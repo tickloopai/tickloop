@@ -689,9 +689,14 @@ fn assert_restored_like(restored: &ChatSnapshot, in_process: &ChatSnapshot, labe
             .collect::<Vec<_>>()
     };
     assert_eq!(markers(restored), markers(in_process), "{label}");
+    // The load is a history load: the same Loop comes back with receiving paused.
+    let mut loaded = in_process.chat_loop.clone();
+    loaded.receiving = tickloop_agent_protocol::Receiving::Paused {
+        reason: tickloop_agent_protocol::PauseReason::HistoryLoaded,
+    };
     assert_eq!(
         serde_json::to_value(&restored.chat_loop).unwrap(),
-        serde_json::to_value(&in_process.chat_loop).unwrap(),
+        serde_json::to_value(&loaded).unwrap(),
         "{label}"
     );
 }

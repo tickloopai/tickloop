@@ -2095,66 +2095,6 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
 }
 
 #[tokio::test]
-async fn terminal_can_enable_and_deliver_an_explicit_trigger() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut requests = Vec::new();
-        for answer in ["The task is ready.", "Event processed."] {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            requests.push(read_request(&mut socket).await);
-            let body = messages_stream(answer);
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-            socket.write_all(body.as_bytes()).await.unwrap();
-        }
-        requests
-    });
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("model.json");
-    std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--transport-fixture")
-        .arg(config)
-        .arg("--no-session-persistence")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    input.write_all(b"Observe a generic task\n").await.unwrap();
-    tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while !output
-            .next_line()
-            .await
-            .unwrap()
-            .unwrap()
-            .starts_with("Reply completed")
-        {}
-    })
-    .await
-    .unwrap();
-    input.write_all(b"/events Check the task when an explicit event arrives\n/trigger terminal {\"update\":42}\n").await.unwrap();
-    drop(input);
-    let mut transcript = String::new();
-    tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while let Some(line) = output.next_line().await.unwrap() {
-            transcript.push_str(&line);
-        }
-    })
-    .await
-    .unwrap();
-    assert!(child.wait().await.unwrap().success());
-    assert!(transcript.contains("Event processed."));
-    let requests = server.await.unwrap();
-    assert!(requests[1]["messages"].to_string().contains("terminal"));
-    assert!(requests[1]["messages"].to_string().contains("42"));
-}
-
-#[tokio::test]
 async fn terminal_can_configure_a_search_service_and_return_source_links() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -4,9 +4,10 @@ use serde_json::json;
 use tickloop_agent_model::{ModelRequest, cards::model_for_persistent_selection};
 use tickloop_agent_protocol::{
     BranchRequest, ChatSnapshot, Content, EventKind, ExecutionMode, InputContext, LoopState,
-    ModelChange, Protocol, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
+    ModelChange, Protocol, RewindMode,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text, transcript_file};
 use uuid::Uuid;
 
@@ -468,32 +469,21 @@ async fn conversation_rewind_truncates_messages_and_binds_the_draft_to_a_new_loo
 }
 
 #[tokio::test]
-async fn conversation_rewind_keeps_the_loop_and_its_trigger() {
+async fn conversation_rewind_keeps_the_loop_and_its_subscriptions() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         text("initial answer"),
         text("checked again"),
     ]));
     let agent = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    let shell = ShellTick::new(Uuid::new_v4());
+    shell.install(&agent).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = run_prompt(&agent, &mut events, chat, "keep checking this").await;
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[0].clone();
-    let trigger_id = Uuid::new_v4();
-    agent
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: trigger_id,
-                prompt: "check again when requested".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
+    shell.subscribe(&agent, chat).await;
+    let subscriptions = agent.snapshot(chat).await.unwrap().chat_loop.subscriptions;
 
     let outcome = agent
         .rewind(chat, point.message_id, RewindMode::Conversation)
@@ -502,18 +492,16 @@ async fn conversation_rewind_keeps_the_loop_and_its_trigger() {
     let chat_loop = &outcome.snapshot.chat_loop;
     assert_eq!(chat_loop.id, receipt.loop_id);
     assert_eq!(chat_loop.state, LoopState::Idle);
-    assert_eq!(chat_loop.trigger.as_ref().unwrap().id, trigger_id);
+    assert_eq!(chat_loop.subscriptions, subscriptions);
+    assert!(chat_loop.receiving.is_receiving());
     assert!(outcome.draft.is_some());
-    agent
-        .trigger(
-            chat,
-            TriggerSource {
-                source: "after rewind".into(),
-                payload: serde_json::Value::Null,
-            },
-        )
-        .await
-        .unwrap();
+    shell.update(1, "after rewind");
+    loop {
+        let event = events.recv().await.unwrap();
+        if event.chat_id == chat && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
     agent.shutdown().await;
 }
 

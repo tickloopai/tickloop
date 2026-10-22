@@ -1,7 +1,8 @@
 //! Test code shared by the Agent crates' unit and integration tests: a scripted model with its
 //! replies, runtime events, Transcript files and stores, a reference stateless host with its
-//! Event Stream, PTY screens, a terminal's kitty keyboard flags, transport limits and model HTTP
-//! servers. Helpers that only one crate's tests use stay in that crate.
+//! Event Stream, a Shell Tick that tests update at will, PTY screens, a terminal's kitty keyboard
+//! flags, transport limits and model HTTP servers. Helpers that only one crate's tests use stay in
+//! that crate.
 
 pub mod event_stream;
 pub mod harness;
@@ -11,6 +12,7 @@ pub mod legacy_models;
 pub mod model_http_support;
 pub mod routed;
 pub mod screen;
+pub mod shell_ticks;
 pub mod stateless_host;
 pub mod transcripts;
 

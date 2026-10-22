@@ -84,10 +84,6 @@ pub fn serialize<S: Serializer>(snapshot: &ChatSnapshot, serializer: S) -> Resul
         serde_json::to_value(snapshot.thinking_enabled).map_err(serde::ser::Error::custom)?,
     );
     live.insert(
-        "trigger_awaits_resume".into(),
-        serde_json::to_value(snapshot.trigger_awaits_resume).map_err(serde::ser::Error::custom)?,
-    );
-    live.insert(
         "last_sequence".into(),
         serde_json::to_value(snapshot.last_sequence).map_err(serde::ser::Error::custom)?,
     );
@@ -223,9 +219,6 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ChatSna
         .map_err(serde::de::Error::custom)?;
     snapshot.thinking_enabled = serde_json::from_value(take(&mut live, "thinking_enabled")?)
         .map_err(serde::de::Error::custom)?;
-    snapshot.trigger_awaits_resume =
-        serde_json::from_value(take(&mut live, "trigger_awaits_resume")?)
-            .map_err(serde::de::Error::custom)?;
     snapshot.last_sequence = serde_json::from_value(take(&mut live, "last_sequence")?)
         .map_err(serde::de::Error::custom)?;
     snapshot.permissions = serde_json::from_value(take(&mut live, "permissions")?)

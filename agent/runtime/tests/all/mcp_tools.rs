@@ -2903,7 +2903,17 @@ async fn stopping_pauses_the_link_without_releasing_received_input() {
         service.link("doc").is_some(),
         "a paused Loop keeps its link"
     );
-    assert!(agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
+    let chat_loop = agent.snapshot(chat).await.unwrap().chat_loop;
+    assert_eq!(
+        chat_loop.receiving,
+        tickloop_agent_protocol::Receiving::Paused {
+            reason: tickloop_agent_protocol::PauseReason::Stopped
+        }
+    );
+    assert!(
+        !chat_loop.event_sources[0].resume_required,
+        "pausing leaves the link itself available"
+    );
     assert!(!service.is_pending("request-1"));
     assert!(service.releases().is_empty());
     agent.shutdown().await;
@@ -3104,8 +3114,10 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
     }
 }
 
+/// After a restart the Loop pauses receiving: linking the artifact again is no consent to
+/// continue, and only the user's next input delivers the request that waited.
 #[tokio::test]
-async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pending_requests() {
+async fn relinking_after_a_restart_waits_for_continue_before_claiming_pending_requests() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
@@ -3142,7 +3154,10 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
     drop(agent);
 
     service.request_feedback("doc", "request-1");
-    let model = Arc::new(ScriptedModel::new(vec![text("Handled after restart.")]));
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Continuing."),
+        text("Handled after restart."),
+    ]));
     let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
     restored
         .install_host_tools(Arc::new(McpHostToolProvider::new(
@@ -3157,7 +3172,12 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
         .unwrap();
     let goal = &snapshot.chat_loop;
     assert_eq!(goal.state, LoopState::Idle);
-    assert!(goal.event_sources[0].resume_required);
+    assert_eq!(
+        goal.receiving,
+        tickloop_agent_protocol::Receiving::Paused {
+            reason: tickloop_agent_protocol::PauseReason::HistoryLoaded
+        }
+    );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
         service.is_pending("request-1"),
@@ -3171,11 +3191,18 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
         )
         .await
         .unwrap();
-    let continued = restored.snapshot(chat).await.unwrap();
-    assert_eq!(continued.chat_loop.id, goal.id);
+    let relinked = restored.snapshot(chat).await.unwrap();
+    assert_eq!(relinked.chat_loop.id, goal.id);
+    assert!(!relinked.chat_loop.receiving.is_receiving());
     let renewed = service.link("doc").unwrap();
     assert_ne!(renewed.binding_id, first_binding);
     assert_eq!(renewed.epoch, 2);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        service.is_pending("request-1"),
+        "a new link of a paused Loop receives nothing yet"
+    );
+    restored.submit(chat, "Continue".into()).await.unwrap();
     eventually(async || service.finished() == [("request-1".into(), "received".into())]).await;
     let binding = &restored
         .snapshot(chat)
