@@ -843,6 +843,36 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     setup.ran_once().await;
 }
 
+/// Trigger input that waited while receiving was paused starts once a Continue turns receiving
+/// back on, even when the Continue's own turn ended before that.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_trigger_input_starts_once_receiving_is_back_on() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let stop_tail = here.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
+    let stop = tokio::spawn({
+        let here = here.clone();
+        async move { here.stop(chat).await.unwrap() }
+    });
+    tokio::time::timeout(WAIT, stop_tail.entered)
+        .await
+        .expect("the stop recorded the pause")
+        .unwrap();
+    let continued = tokio::spawn({
+        let here = here.clone();
+        async move { here.submit(chat, "continue here".into()).await.unwrap() }
+    });
+    // The Continue's turn ends while its change of the switch waits for the stop.
+    setup.model.wait_seen("continue here", 1).await;
+    wait_for_state(&here, chat, tickloop_agent_protocol::LoopState::Idle).await;
+    boundary_waiters(&here, chat, 1).await;
+    drop(stop_tail.release);
+    stop.await.unwrap();
+    continued.await.unwrap();
+    setup.model.wait_seen(WaitingInput::MARKER, 1).await;
+    setup.ran_once().await;
+}
+
 /// Waits until `count` wait to enter the Chat's Trigger boundary.
 async fn boundary_waiters(agent: &Agent, chat: Uuid, count: usize) {
     tokio::time::timeout(WAIT, async {

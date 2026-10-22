@@ -556,6 +556,10 @@ impl Agent {
             .await
         {
             self.flush_due_tick_delivery(chat_id, loop_id);
+            // A turn that ended while the switch was off left the input waiting for it.
+            self.inner
+                .tasks
+                .spawn(self.clone().start_waiting_input(chat_id));
         }
         Box::pin(self.resume_feedback_sources(chat_id)).await;
     }
