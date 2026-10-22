@@ -1182,7 +1182,8 @@ async fn usage_charged_mid_turn_survives_a_crash() {
     agent.shutdown().await;
 }
 
-const HELD_FOR: Duration = Duration::from_millis(300);
+/// Each stretch of a held turn; settling a whole turn would count two of them.
+const HELD_FOR: Duration = Duration::from_millis(500);
 
 async fn until_held(held: impl std::future::Future<Output = ()>) {
     tokio::time::timeout(WAIT, held)
@@ -1213,7 +1214,7 @@ async fn running_time_counts_only_while_the_goal_is_active_within_a_turn() {
     .await;
     let counted = goal(&agent, chat).await.unwrap().time_used_ms;
     assert!(
-        (250..550).contains(&counted),
+        (450..950).contains(&counted),
         "only the time since setting counts: {counted} ms"
     );
     agent.shutdown().await;
@@ -1243,7 +1244,7 @@ async fn running_time_counts_only_while_the_goal_is_active_within_a_turn() {
     wait_until_idle(&agent, chat).await;
     let counted = goal(&agent, chat).await.unwrap().time_used_ms;
     assert!(
-        (250..550).contains(&counted),
+        (450..950).contains(&counted),
         "only the time before pausing counts: {counted} ms"
     );
     agent.shutdown().await;
