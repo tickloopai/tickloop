@@ -8162,7 +8162,7 @@ mod tests {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Rejected(
                 tickloop_agent_protocol::FamilyMessageRejection {
                     code: tickloop_agent_protocol::FamilyMessageRejectionCode::StaleTarget,
-                    message: "The receiving parent is stopped".into(),
+                    message: "The receiving parent is unavailable".into(),
                 },
             ),
             usage: Default::default(),
@@ -8230,7 +8230,7 @@ mod tests {
             text.contains("Reply from @audit")
                 && text.contains("Actual reply preview")
                 && text.contains("Actual child completion")
-                && text.contains("Notification not delivered: The receiving parent is stopped")
+                && text.contains("Notification not delivered: The receiving parent is unavailable")
         );
         observation.events.retain(|event| event.sequence > 2);
         super::render_restored_observation(

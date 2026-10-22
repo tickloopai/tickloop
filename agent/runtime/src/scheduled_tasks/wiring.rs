@@ -756,8 +756,8 @@ impl Agent {
                         source,
                         input,
                         ledger: None,
-                        on_accept: Some(Box::new(move |agent, chat, receipt| {
-                            agent.commit_scheduled_run(chat, &run, receipt);
+                        on_accept: Some(Box::new(move |change, chat, receipt| {
+                            change.agent().commit_scheduled_run(chat, &run, receipt);
                         })),
                     })
                 })

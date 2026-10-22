@@ -8,8 +8,9 @@ use std::time::Duration;
 use tickloop_agent_protocol::ChatId;
 use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
-    FamilyCompletionsEntry, FamilyInputsEntry, LastPromptEntry, Line, MonitorMembersEntry,
-    ProvenanceEntry, ScheduledTasksEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
+    FamilyCompletionsEntry, FamilyInputsEntry, FamilyMessageHoldEntry, LastPromptEntry, Line,
+    MonitorMembersEntry, ProvenanceEntry, ScheduledTasksEntry, SentAgentMessagesEntry,
+    SubagentsEntry, TaskBoardsEntry,
 };
 use uuid::Uuid;
 
@@ -31,6 +32,7 @@ pub(crate) struct CachedMetadata {
     pub subagents: Option<SubagentsEntry>,
     pub family_completions: Option<FamilyCompletionsEntry>,
     pub family_inputs: Option<FamilyInputsEntry>,
+    pub family_message_hold: Option<FamilyMessageHoldEntry>,
     pub sent_agent_messages: Option<SentAgentMessagesEntry>,
     pub provenance: Option<ProvenanceEntry>,
     pub citation_sources: Option<tickloop_agent_transcript::CitationSourcesEntry>,
@@ -51,6 +53,7 @@ impl CachedMetadata {
             Line::ScheduledTasks(entry) => self.scheduled_tasks = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
+            Line::FamilyMessageHold(entry) => self.family_message_hold = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
             Line::Provenance(entry) => self.provenance = Some(entry.clone()),
             Line::CitationSources(entry) => self.citation_sources = Some(entry.clone()),
@@ -72,6 +75,11 @@ impl CachedMetadata {
             .chain(self.scheduled_tasks.clone().map(Line::ScheduledTasks))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
+            .chain(
+                self.family_message_hold
+                    .clone()
+                    .map(Line::FamilyMessageHold),
+            )
             .chain(
                 self.sent_agent_messages
                     .clone()
@@ -219,6 +227,23 @@ impl TranscriptOutbox {
     }
 
     pub(crate) fn enqueue(&self, chat: ChatId, lines: Vec<Line>, events_through: Option<u64>) {
+        self.enqueue_lines(chat, lines, events_through, true);
+    }
+
+    /// Queues the record of a Trigger source's own state, which its lease holder writes: never
+    /// kept to be written again as metadata, nor folded into a retained snapshot, so no stale
+    /// copy of it is written by a process that does not hold the lease.
+    pub(crate) fn enqueue_source_state(&self, chat: ChatId, line: Line) {
+        self.enqueue_lines(chat, vec![line], None, false);
+    }
+
+    fn enqueue_lines(
+        &self,
+        chat: ChatId,
+        lines: Vec<Line>,
+        events_through: Option<u64>,
+        kept: bool,
+    ) {
         let mut chats = self.chats.lock().unwrap();
         let Some(outbox) = chats.get_mut(&chat) else {
             return;
@@ -239,8 +264,10 @@ impl TranscriptOutbox {
             {
                 continue;
             }
-            outbox.metadata.remember(&line);
-            outbox.retained.apply(&line);
+            if kept {
+                outbox.metadata.remember(&line);
+                outbox.retained.apply(&line);
+            }
             accepted.push(line);
         }
         // A new start of the chain, or enough retained Lines since the last snapshot, are folded
@@ -415,14 +442,6 @@ impl TranscriptOutbox {
                 outbox.write_failure = Some(message.clone());
                 Settled::Failed(message)
             }
-        }
-    }
-
-    /// Drops what the Chat has queued and not committed, a failed batch included, and writes
-    /// nothing more of it: what this holder could not record of it is left unrecorded.
-    pub(crate) fn withhold(&self, chat: ChatId, reason: &str) {
-        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
-            outbox.refuse(TranscriptError::Storage(reason.into()));
         }
     }
 

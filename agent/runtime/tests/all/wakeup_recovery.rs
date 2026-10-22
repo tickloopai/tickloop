@@ -1039,6 +1039,7 @@ async fn a_caller_dropped_as_its_input_starts_leaves_it_running_once() {
 /// durably by the first, waiting behind a turn.
 struct FaultyProcesses {
     _directory: tempfile::TempDir,
+    root: std::path::PathBuf,
     chat: Uuid,
     first: Agent,
     first_store: Arc<FaultyTranscriptStore>,
@@ -1076,6 +1077,7 @@ impl FaultyProcesses {
         first.flush_transcripts().await;
         Self {
             _directory: directory,
+            root,
             chat,
             first,
             first_store,
@@ -1146,12 +1148,14 @@ async fn trigger_input_never_recorded_as_started_runs_once_after_a_takeover() {
     processes.taken_over_ran_once().await;
 }
 
-/// A shutdown abandons Trigger input whose start was not recorded, and the store taking writes
-/// again before the shutdown's last flush records nothing of it: the process taking the lease
-/// over runs it once.
+/// A shutdown abandons Trigger input whose start was not recorded and the store takes writes
+/// again before the shutdown's last flush: the start is taken back after it, and the previous
+/// turn's answer, queued with the start and not yet stored, is stored all the same. The process
+/// taking the lease over runs the input once.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_abandoned_start_stays_unrecorded_when_the_store_recovers_at_shutdown() {
+async fn an_abandoned_start_keeps_the_chats_other_records_when_the_store_recovers() {
     let processes = FaultyProcesses::new().await;
+    // The held turn ends with its answer while the store refuses writes.
     processes.start_while_the_store_refuses().await;
     let abandoned = processes
         .first
@@ -1166,6 +1170,82 @@ async fn an_abandoned_start_stays_unrecorded_when_the_store_recovers_at_shutdown
         .unwrap();
     processes.first_store.heal();
     drop(abandoned.release);
+    shutdown.await.unwrap();
+    let stored: Vec<tickloop_agent_transcript::Line> = std::fs::read_to_string(
+        tickloop_agent_test_support::transcript_file(&processes.root, processes.chat),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str(line).ok())
+    .collect();
+    let held_prompt = stored
+        .iter()
+        .find_map(|line| match line {
+            tickloop_agent_transcript::Line::User(entry)
+                if serde_json::to_string(&entry.message)
+                    .unwrap()
+                    .contains("HOLD:turn this turn") =>
+            {
+                Some(entry.uuid)
+            }
+            _ => None,
+        })
+        .expect("the held turn's prompt is stored");
+    assert!(
+        stored.iter().any(|line| matches!(
+            line,
+            tickloop_agent_transcript::Line::Response(entry)
+                if entry.input_id == Some(held_prompt)
+                    && entry.state
+                        == tickloop_agent_transcript::ResponseState::Ended {
+                            ending: tickloop_agent_transcript::ResponseEnding::Completed,
+                        }
+        )),
+        "the held turn's answer is stored as completed"
+    );
+    processes.taken_over_ran_once().await;
+}
+
+/// A write of the start already in the store, waiting there, as the shutdown abandons the
+/// start: it lands, and the start taken back after it lands too, so the process taking the
+/// lease over runs the input once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_start_already_being_written_is_taken_back_after_it() {
+    let processes = FaultyProcesses::new().await;
+    let (first, chat) = (processes.first.clone(), processes.chat);
+    let retrying = first.pause_next_for_tests(chat, PausePoint::TriggerStartRetrying);
+    processes.start_while_the_store_refuses().await;
+    tokio::time::timeout(WAIT, retrying.entered)
+        .await
+        .expect("the start waits to try again")
+        .unwrap();
+    // Another write of the same batch reaches the store, which takes writes again, and waits.
+    processes.first_store.hold_appends();
+    processes.first_store.heal();
+    let in_flight = tokio::spawn({
+        let first = first.clone();
+        async move { first.flush_transcripts().await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while processes.first_store.waiting_appends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the write waits in the store");
+    let abandoned = first.pause_next_for_tests(chat, PausePoint::TriggerStartAbandoned);
+    let shutdown = tokio::spawn({
+        let first = first.clone();
+        async move { first.shutdown().await }
+    });
+    drop(retrying.release);
+    tokio::time::timeout(WAIT, abandoned.entered)
+        .await
+        .expect("the shutdown abandons the start")
+        .unwrap();
+    drop(abandoned.release);
+    processes.first_store.release_appends();
+    in_flight.await.unwrap();
     shutdown.await.unwrap();
     processes.taken_over_ran_once().await;
 }
@@ -1214,21 +1294,23 @@ async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease
     processes.second.shutdown().await;
 }
 
-/// Trigger input interrupted while it waits for its start to be recorded ends without asking
-/// the model.
+/// Trigger input stopped while it waits for its start to be recorded never starts: its start
+/// is taken back, and it runs once the Chat is continued.
 #[tokio::test(flavor = "multi_thread")]
-async fn trigger_input_stopped_before_its_start_is_recorded_never_runs() {
+async fn trigger_input_stopped_before_its_start_is_recorded_waits_for_the_continue() {
     let processes = FaultyProcesses::new().await;
     processes.start_while_the_store_refuses().await;
     processes.first.stop(processes.chat).await.unwrap();
-    wait_for_state(
-        &processes.first,
-        processes.chat,
-        tickloop_agent_protocol::LoopState::Interrupted,
-    )
-    .await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 0);
+    processes.first_store.heal();
+    processes.first.continue_loop(processes.chat).await.unwrap();
+    processes
+        .first_model
+        .wait_seen(FaultyProcesses::MARKER, 1)
+        .await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 1);
     processes.first.shutdown().await;
     processes.second.shutdown().await;
 }
@@ -1275,6 +1357,29 @@ async fn a_continue_dropped_midway_still_records_the_switch() {
             .is_receiving()
     );
     agent.shutdown().await;
+}
+
+/// A Continue whose caller stops waiting after the switch turned here still starts what
+/// waited through the pause, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_dropped_midway_still_starts_what_waited() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    here.stop(chat).await.unwrap();
+    let changed = here.pause_next_for_tests(chat, PausePoint::ReceivingChanged);
+    let continued = tokio::spawn({
+        let here = here.clone();
+        async move { here.continue_loop(chat).await }
+    });
+    tokio::time::timeout(WAIT, changed.entered)
+        .await
+        .expect("the switch turned here")
+        .unwrap();
+    continued.abort();
+    assert!(continued.await.unwrap_err().is_cancelled());
+    drop(changed.release);
+    setup.model.wait_seen(WaitingInput::MARKER, 1).await;
+    setup.ran_once().await;
 }
 
 /// A record of the switch waiting for another process's write holds no thread: on a runtime of
@@ -1367,12 +1472,38 @@ async fn a_source_change_made_with_an_acceptance_lands_before_its_turn() {
     agent.shutdown().await;
 }
 
+/// A custom title Line, the record the example sources of these tests keep their state in.
+fn source_record(chat: Uuid, record: &str) -> tickloop_agent_transcript::Line {
+    tickloop_agent_transcript::Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {
+        chat_id: chat,
+        custom_title: record.into(),
+    })
+}
+
+fn stored_lines(root: &std::path::Path, chat: Uuid) -> Vec<tickloop_agent_transcript::Line> {
+    std::fs::read_to_string(tickloop_agent_test_support::transcript_file(root, chat))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn records_of(lines: &[tickloop_agent_transcript::Line], record: &str) -> usize {
+    lines
+        .iter()
+        .filter(|line| {
+            matches!(line, tickloop_agent_transcript::Line::CustomTitle(entry)
+                if entry.custom_title == record)
+        })
+        .count()
+}
+
 /// A source's own state is taken over from the store with a newly taken lease, before anything
 /// is accepted under it: what another process recorded decides whether the delivery that took
-/// the lease is eligible.
+/// the lease goes in.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
-    const PLAN_FROM_NOW: &str = "plan from now on";
+    const STOP_ELSEWHERE: &str = "stop receiving";
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let model = ContractModel::new();
@@ -1382,18 +1513,17 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     holder.flush_transcripts().await;
     let taker_model = ContractModel::new();
     let taker = Agent::open_embedded(root.clone(), config(), taker_model.clone()).unwrap();
-    // An example source whose state is a record in the Transcript: once it says so, the Chat
-    // plans, and Plan mode holds a Goal's continuation back.
-    taker.register_trigger_source_state_for_tests(|snapshot, stored| {
-        if stored.iter().any(|line| {
-            matches!(
-                line,
-                tickloop_agent_transcript::Line::CustomTitle(entry)
-                    if entry.custom_title == PLAN_FROM_NOW
-            )
-        }) {
-            snapshot.policy.mode = tickloop_agent_protocol::ExecutionMode::Plan;
-        }
+    // An example source whose state is a record in the Transcript: once it says so, the Loop
+    // stops receiving, which holds every delivery back.
+    taker.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+        take_over: Some(Box::new(|snapshot, stored| {
+            if records_of(stored, STOP_ELSEWHERE) > 0 {
+                snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                    reason: tickloop_agent_protocol::PauseReason::Stopped,
+                };
+            }
+        })),
+        ..Default::default()
     });
     taker.resume_chat(chat).await.unwrap();
     complete_turn(&taker, chat, "resume here").await;
@@ -1403,38 +1533,152 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
             chat,
             scheduled("records", 1),
             "recorded-here",
-            |snapshot, _| {
-                vec![tickloop_agent_transcript::Line::CustomTitle(
-                    tickloop_agent_transcript::CustomTitleEntry {
-                        chat_id: snapshot.id,
-                        custom_title: PLAN_FROM_NOW.into(),
-                    },
-                )]
-            },
+            move |_, _| vec![source_record(chat, STOP_ELSEWHERE)],
         )
         .await
         .unwrap();
     model.wait_seen("recorded-here", 1).await;
     holder.shutdown().await;
 
-    let continuation = tickloop_agent_protocol::TriggerSource::GoalContinuation {
-        goal_id: Uuid::from_u128(7),
-        after_run: Uuid::from_u128(1),
-    };
     let held = taker
-        .deliver_trigger_for_tests(chat, continuation, "continues-the-goal")
+        .deliver_trigger_for_tests(chat, scheduled("after", 1), "held-back")
         .await;
     assert!(
         held.is_err(),
         "the state taken over holds it back: {held:?}"
     );
-    assert_eq!(
-        taker.snapshot(chat).await.unwrap().policy.mode,
-        tickloop_agent_protocol::ExecutionMode::Plan
-    );
     tokio::time::sleep(SETTLE).await;
-    assert_eq!(taker_model.seen("continues-the-goal"), 0);
+    assert_eq!(taker_model.seen("held-back"), 0);
     taker.shutdown().await;
+}
+
+/// A source changes its state under the Chat's lease while the Loop does not receive: the
+/// change is recorded, and the lease goes back after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_change_holds_the_lease_while_the_loop_does_not_receive() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    here.stop(chat).await.unwrap();
+    here.run_source_change_for_tests(chat, move |_| vec![source_record(chat, "paused goal")])
+        .await
+        .unwrap();
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "paused goal"),
+        1
+    );
+    // The lease went back: the other process takes it for a change of its own.
+    setup
+        .elsewhere
+        .run_source_change_for_tests(chat, move |_| vec![source_record(chat, "elsewhere")])
+        .await
+        .unwrap();
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    here.shutdown().await;
+}
+
+/// A source's change while another live process holds the Chat's lease is refused as such.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_change_is_refused_while_another_process_holds_the_lease() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let refused = setup
+        .elsewhere
+        .run_source_change_for_tests(chat, move |_| vec![source_record(chat, "refused")])
+        .await;
+    assert_eq!(refused, Err("held elsewhere".into()));
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    here.shutdown().await;
+}
+
+/// A stop lets the sources stop with the Loop before the lease goes back, here and, as it
+/// learns of the stop, in a process that takes the lease next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let stopping = |record: &'static str| tickloop_agent_runtime::TestSourceState {
+        on_stop: Some(Box::new(move |snapshot| {
+            vec![source_record(snapshot.id, record)]
+        })),
+        ..Default::default()
+    };
+    here.register_trigger_source_state_for_tests(stopping("stopped here"));
+    setup
+        .elsewhere
+        .register_trigger_source_state_for_tests(stopping("stopped elsewhere"));
+    here.stop(chat).await.unwrap();
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "stopped here"),
+        1
+    );
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "stopped elsewhere"),
+        0
+    );
+    // The other process learns of the stop as it next takes the lease.
+    let withdrawn = setup
+        .elsewhere
+        .deliver_trigger_for_tests(chat, scheduled("other", 1), "after-the-stop")
+        .await;
+    assert!(withdrawn.is_err(), "{withdrawn:?}");
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "stopped elsewhere"),
+        1
+    );
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    here.shutdown().await;
+}
+
+/// A source's record is written once, by its lease holder: never again from what a process
+/// keeps as metadata, as at its exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_record_is_not_written_again_at_exit() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    here.run_source_change_for_tests(chat, move |_| vec![source_record(chat, "recorded once")])
+        .await
+        .unwrap();
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    here.shutdown().await;
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "recorded once"),
+        1
+    );
+}
+
+/// After a compaction, the lease holder writes the sources' records again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_has_the_holder_write_the_source_records_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+        records: Some(Box::new(|snapshot| {
+            vec![source_record(snapshot.id, "as it stands")]
+        })),
+        ..Default::default()
+    });
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    complete_turn(&agent, chat, "and again").await;
+    agent.compact(chat).await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            agent.flush_transcripts().await;
+            if records_of(&stored_lines(&root, chat), "as it stands") == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the records are written again after the compaction");
+    agent.shutdown().await;
 }
 
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs

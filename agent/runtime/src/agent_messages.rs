@@ -74,39 +74,6 @@ pub(super) struct SentMessage {
     result: ToolResult,
 }
 
-const ENDED_TARGET_REFUSAL: &str =
-    "message not dispatched: interrupted or ended work requires explicit user continuation";
-
-/// Why a family delivery was not dispatched.
-pub(super) enum DispatchRefusal {
-    /// The receiving root run is being cancelled, or its Loop failed or was interrupted: a
-    /// completion notification stays pending until that run ends or the Loop is explicitly
-    /// continued, rather than starting the Loop.
-    Deferred,
-    Refused(String),
-}
-
-impl From<String> for DispatchRefusal {
-    fn from(message: String) -> Self {
-        Self::Refused(message)
-    }
-}
-
-impl From<&str> for DispatchRefusal {
-    fn from(message: &str) -> Self {
-        Self::Refused(message.into())
-    }
-}
-
-impl From<DispatchRefusal> for String {
-    fn from(refusal: DispatchRefusal) -> Self {
-        match refusal {
-            DispatchRefusal::Deferred => ENDED_TARGET_REFUSAL.into(),
-            DispatchRefusal::Refused(message) => message,
-        }
-    }
-}
-
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
@@ -116,24 +83,16 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: SEND_AGENT_MESSAGE_TOOL_NAME.into(),
-            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization; an interrupted or failed root requires human continuation. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families and broadcast are unavailable.".into(),
+            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families and broadcast are unavailable.".into(),
             input_schema: json!({"type":"object","properties":{"to":{"type":"string","minLength":1},"message":{"type":"string","minLength":1},"relay_user_message_id":{"type":"string","format":"uuid","description":"Optional reference to genuine human input in your own current chain. Relay stays Agent-origin, never user authorization."}},"required":["to","message"],"additionalProperties":false}),
         },
     ];
     definitions.push(ToolDefinition {
             name: STOP_SUBAGENT_TOOL_NAME.into(),
-            description: "Stop one direct child and its descendants under your normal admission policy. The root may target any descendant. Cancels active/parked runs, queued work, requests, triggers and owned commands; preserves context, handles and Views. Repeated stop is idempotent. View close or panel hiding does not stop execution. Parent, siblings, other families and whole-family stop are unavailable.".into(),
+            description: "Stop one direct child and its descendants under your normal admission policy. The root may target any descendant. Cancels active/parked runs, requests and queued work; pauses Trigger receiving and preserves background Shells, Ticks, context, handles and Views. Repeated stop is idempotent. View close or panel hiding does not stop execution. Parent, siblings, other families and whole-family stop are unavailable.".into(),
             input_schema: json!({"type":"object","properties":{"to":{"type":"string","minLength":1}},"required":["to"],"additionalProperties":false}),
         });
     definitions
-}
-
-fn requires_human_continuation(snapshot: &ChatSnapshot) -> bool {
-    snapshot.delegation.is_none()
-        && matches!(
-            snapshot.chat_loop.state,
-            LoopState::Interrupted | LoopState::Failed
-        )
 }
 
 fn result(value: Value) -> ToolResult {
@@ -398,12 +357,6 @@ impl Agent {
             input["to"].as_str().unwrap_or_default(),
         )
         .map_err(|message| reject(FamilyMessageRejectionCode::InvalidTarget, message))?;
-        if requires_human_continuation(&chats[&target].snapshot) {
-            return Err(reject(
-                FamilyMessageRejectionCode::StaleTarget,
-                "an interrupted or failed root requires explicit human continuation".into(),
-            ));
-        }
         let relay = input
             .get("relay_user_message_id")
             .map(|reference| {
@@ -498,7 +451,6 @@ impl Agent {
                     &cancel,
                 )
                 .await
-                .map_err(String::from)
             }
             _ => Err("Agent message tool is unavailable".into()),
         }
@@ -510,14 +462,13 @@ impl Agent {
         call_id: &str,
         delivery: FamilyDelivery<'_>,
         cancel: &CancellationToken,
-    ) -> Result<ToolResult, DispatchRefusal> {
+    ) -> Result<ToolResult, String> {
         if call_id.starts_with("task-assignment-") {
             self.refresh_task_tools_setting()
                 .await
                 .map_err(|error| error.to_string())?;
         }
         let is_handback = matches!(&delivery, FamilyDelivery::Handback { .. });
-        let is_completion = matches!(&delivery, FamilyDelivery::Completion { .. });
         let (target, message, is_result, prepared) = match delivery {
             FamilyDelivery::Message { prepared, body } => {
                 (prepared.target.to_string(), body, false, Some(prepared))
@@ -675,33 +626,19 @@ impl Agent {
                 json!({"status":"accepted","message_id":message_id,"target_chat_id":target_id,"delivery":"already_accepted"}),
             ));
         }
+        let held = mailbox
+            .stopped_runs
+            .get(&target_id)
+            .is_some_and(|runs| runs.contains(&sender.run_id));
         let original = chats.get_mut(&target_id).unwrap();
-        if original.family_stopping {
-            return Err("Subagent subtree is stopping".into());
-        }
-        let is_target_run_ending = original
-            .active
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-            || original
-                .parked
-                .values()
-                .any(|run| run.receipt.loop_id == loop_id && run.cancel.is_cancelled());
         if original.snapshot.chat_loop.id != loop_id {
             return Err("target Loop is unavailable".into());
         }
-        let awaits_continuation = requires_human_continuation(&original.snapshot);
-        if is_completion && (awaits_continuation || is_target_run_ending) {
-            return Err(DispatchRefusal::Deferred);
-        }
-        if is_target_run_ending {
-            return Err("message not dispatched: target run was interrupted".into());
-        }
-        if awaits_continuation {
-            return Err(ENDED_TARGET_REFUSAL.into());
-        }
         let mut candidate = original.clone();
         let receiver = &mut candidate;
+        if !held {
+            super::family::resume_messages(receiver);
+        }
         let registry = self.inner.subagent_registry.lock().await;
         let target_registration = receiver.snapshot.delegation.as_ref().and_then(|metadata| {
             registry
@@ -712,13 +649,15 @@ impl Agent {
         let target_label = family_label(&receiver.snapshot, target_registration);
         drop(registry);
         let chat_loop = &mut receiver.snapshot.chat_loop;
-        if !matches!(
-            chat_loop.state,
-            LoopState::Running
-                | LoopState::WaitingPermission
-                | LoopState::WaitingQuestion
-                | LoopState::WaitingPlan
-        ) {
+        if !held
+            && !matches!(
+                chat_loop.state,
+                LoopState::Running
+                    | LoopState::WaitingPermission
+                    | LoopState::WaitingQuestion
+                    | LoopState::WaitingPlan
+            )
+        {
             chat_loop.set_state(LoopState::Queued);
         }
         let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
@@ -779,7 +718,7 @@ impl Agent {
             directed_human: None,
             denial_reference: None,
             trigger_source: None,
-            armed: true,
+            armed: !held,
             queued_sequence,
             task_continuation: false,
             is_skill_invocation: false,
@@ -802,6 +741,10 @@ impl Agent {
                 source: source.clone(),
             },
         );
+        if !held {
+            mailbox.stopped_runs.remove(&target_id);
+            self.persist_family_message_hold(receiver, &mailbox);
+        }
         if is_handback {
             self.checkpoint_transcript(&receiver.snapshot, &receiver.bookkeeping)
                 .await?;
@@ -879,7 +822,6 @@ impl Agent {
             cancel,
         )
         .await
-        .map_err(String::from)
     }
 
     pub(super) async fn deliver_subagent_notification(
@@ -887,7 +829,7 @@ impl Agent {
         child: &Receipt,
         parent: &Receipt,
         completion: &FamilyCompletion,
-    ) -> Result<ToolResult, DispatchRefusal> {
+    ) -> Result<ToolResult, String> {
         let body = local_messages::subagent_notification(completion);
         self.deliver_agent_message(
             child,
