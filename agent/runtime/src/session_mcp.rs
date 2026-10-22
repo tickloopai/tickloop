@@ -40,7 +40,11 @@ impl crate::Agent {
         let Some(provider) = provider else {
             return Ok(());
         };
-        for call in provider.session_bootstrap()? {
+        let starts = provider.session_bootstrap()?;
+        if starts.is_empty() {
+            return Ok(());
+        }
+        for call in starts {
             let operation_id = uuid::Uuid::new_v4();
             let (session_operation, evaluation, revision, ancestors) = {
                 let mut chats = self.inner.chats.lock().await;
@@ -209,6 +213,8 @@ impl crate::Agent {
                 .await;
             result?;
         }
+        // Titling waited for the approval that every model call needs first.
+        self.start_title_generation(receipt.chat_id).await;
         Ok(())
     }
 
@@ -239,7 +245,7 @@ impl crate::Agent {
 
 use crate::host_tools::{
     HostCallResult, HostCallScope, HostToolPermission, HostToolProvider, McpResourceServer,
-    PreparedHostCall, WorkspaceHostContext,
+    McpServerInstructions, PreparedHostCall, WorkspaceHostContext,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -369,6 +375,22 @@ struct Wire {
     reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
 }
+/// Why a request produced no result. Only a server's own JSON-RPC error answer leaves the
+/// connection usable; every other failure closes it.
+enum RequestError {
+    /// The server answered with this JSON-RPC error object.
+    Rejected(Value),
+    /// Timeout, cancellation, I/O or framing failure; the connection is closed.
+    Failed(String),
+}
+impl From<RequestError> for String {
+    fn from(error: RequestError) -> Self {
+        match error {
+            RequestError::Rejected(_) => "MCP server rejected the request".into(),
+            RequestError::Failed(message) => message,
+        }
+    }
+}
 struct Peer {
     wire: Mutex<Wire>,
     lifetime: Mutex<Option<Box<dyn SessionMcpLifetime>>>,
@@ -401,9 +423,11 @@ impl Peer {
         method: &str,
         params: Value,
         cancel: CancellationToken,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, RequestError> {
         if self.broken.load(Ordering::SeqCst) || cancel.is_cancelled() {
-            return Err("MCP connection unavailable or cancelled".into());
+            return Err(RequestError::Failed(
+                "MCP connection unavailable or cancelled".into(),
+            ));
         }
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let operation = async {
@@ -443,42 +467,55 @@ impl Peer {
                     return Err("invalid MCP response version".into());
                 }
                 if response.get("method").is_some() {
-                    // Sampling, roots, elicitation and all other client callbacks are unsupported.
+                    // A ping gets the empty result MCP requires. Sampling, roots, elicitation and
+                    // all other client callbacks are unsupported.
                     if let Some(request_id) = response.get("id") {
-                        let mut refusal = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Client capability not supported"}})).map_err(|_| "invalid MCP callback")?;
-                        refusal.push(b'\n');
+                        let reply = if response["method"] == "ping" {
+                            json!({"jsonrpc":"2.0","id":request_id,"result":{}})
+                        } else {
+                            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Client capability not supported"}})
+                        };
+                        let mut reply =
+                            serde_json::to_vec(&reply).map_err(|_| "invalid MCP callback")?;
+                        reply.push(b'\n');
                         wire.writer
-                            .write_all(&refusal)
+                            .write_all(&reply)
                             .await
-                            .map_err(|_| "MCP callback refusal failed")?;
+                            .map_err(|_| "MCP callback reply failed")?;
                         wire.writer
                             .flush()
                             .await
-                            .map_err(|_| "MCP callback refusal failed")?;
+                            .map_err(|_| "MCP callback reply failed")?;
                     }
                     continue;
                 }
                 if response["id"] != id {
                     return Err("MCP response identity mismatch".into());
                 }
-                if response.get("error").is_some() {
-                    return Err("MCP server rejected the request".into());
+                if let Some(error) = response.get("error") {
+                    return Ok(Err(error.clone()));
                 }
                 return response
                     .get("result")
                     .cloned()
+                    .map(Ok)
                     .ok_or_else(|| "MCP result missing".into());
             }
             Err("MCP notification limit exceeded".into())
         };
-        let result = tokio::select! { biased;
+        let result: Result<Result<Value, Value>, String> = tokio::select! { biased;
             () = cancel.cancelled() => Err("MCP request cancelled".into()),
             result = tokio::time::timeout(REQUEST_TIMEOUT, operation) => result.unwrap_or_else(|_| Err("MCP request timed out".into())),
         };
-        if result.is_err() {
-            let _ = self.close().await;
+        match result {
+            Ok(Ok(result)) => Ok(result),
+            // The server answered on an intact connection, which stays open.
+            Ok(Err(error)) => Err(RequestError::Rejected(error)),
+            Err(failure) => {
+                let _ = self.close().await;
+                Err(RequestError::Failed(failure))
+            }
         }
-        result
     }
     async fn initialize(&self, cancel: CancellationToken) -> Result<(bool, bool), String> {
         let result = self.request("initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tickloop","version":"1"}}), cancel.clone()).await?;
@@ -517,18 +554,97 @@ struct Directory {
     tools: BTreeMap<String, ToolDefinition>,
     originals: BTreeMap<String, String>,
     resources: bool,
-    tools_supported: bool,
 }
 struct Server {
     descriptor: SessionMcpServer,
     id: Uuid,
+    /// Launch values kept out of everything the model sees, longest first.
+    private: Vec<String>,
     state: RwLock<ServerState>,
 }
 #[derive(Default)]
 struct ServerState {
     attempted: bool,
     peer: Option<Arc<Peer>>,
+    /// Whether initialization declared tools and resources; a failed refresh keeps these so a
+    /// later one can restore the directory.
+    capabilities: Option<(bool, bool)>,
     directory: Option<Directory>,
+}
+
+/// Shorter values are never treated as private, so common strings such as `.`, `-y` or `run`
+/// never redact ordinary output or reject a directory.
+const MIN_PRIVATE_VALUE: usize = 8;
+
+/// The launch values kept out of everything the model sees: every explicit argument and
+/// environment value, plus the credential a credential-shaped argument embeds (`--token=V`,
+/// `API_KEY=V`, `Authorization: Bearer V`, URL user information or credential query parameters),
+/// which a server may echo on its own.
+fn private_launch_values(server: &SessionMcpServer) -> Vec<String> {
+    /// A flag, variable or header name (not a URL or path) that names a credential.
+    fn names_credential(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+            && [
+                "key",
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "credential",
+                "auth",
+            ]
+            .iter()
+            .any(|word| name.contains(word))
+    }
+    let mut values = server
+        .args
+        .iter()
+        .chain(server.env.values())
+        .cloned()
+        .collect::<Vec<_>>();
+    for argument in &server.args {
+        if let Some((name, value)) = argument.split_once('=')
+            && names_credential(name)
+        {
+            values.push(value.into());
+        } else if let Some((name, value)) = argument.split_once(':')
+            && !value.starts_with("//")
+            && names_credential(name.rsplit('=').next().unwrap_or(name))
+        {
+            let value = value.trim();
+            values.push(value.into());
+            if let Some((_, token)) = value.split_once(' ') {
+                values.push(token.trim().into());
+            }
+        }
+        for (_, rest) in argument
+            .match_indices("://")
+            .map(|(at, _)| argument.split_at(at + 3))
+        {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            if let Some((user_information, _)) = authority.rsplit_once('@') {
+                values.push(user_information.into());
+            }
+        }
+        if let Some((_, query)) = argument.split_once('?') {
+            for (name, value) in query
+                .split(['&', '#'])
+                .filter_map(|pair| pair.split_once('='))
+            {
+                if names_credential(name) {
+                    values.push(value.into());
+                }
+            }
+        }
+    }
+    values.retain(|value| value.len() >= MIN_PRIVATE_VALUE);
+    values.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    values.dedup();
+    values
 }
 
 /// Outer provider: session tools coexist with native host tools and fixed Artifacts/Skill support.
@@ -550,6 +666,7 @@ impl SessionMcpProvider {
             servers: servers
                 .into_iter()
                 .map(|descriptor| Server {
+                    private: private_launch_values(&descriptor),
                     descriptor,
                     id: Uuid::new_v4(),
                     state: RwLock::new(ServerState::default()),
@@ -567,16 +684,30 @@ impl SessionMcpProvider {
             account_id: "session".into(),
         }
     }
+    /// The server offering `name`. A name two servers' directories both produce, such as
+    /// `a_` + `b` and `a` + `_b`, is offered by neither, whatever order they started or
+    /// refreshed in.
     fn tool(&self, name: &str) -> Option<(usize, Directory)> {
-        self.servers.iter().enumerate().find_map(|(index, server)| {
-            let state = server.state.read().unwrap();
+        let states = self.states();
+        let mut offering = states.iter().enumerate().filter_map(|(index, state)| {
             state
                 .directory
                 .as_ref()
                 .filter(|dir| dir.tools.contains_key(name))
-                .cloned()
                 .map(|dir| (index, dir))
-        })
+        });
+        let (index, directory) = offering.next()?;
+        offering
+            .next()
+            .is_none()
+            .then(|| (index, directory.clone()))
+    }
+    /// Every server's state at once, so lookups see one consistent set of directories.
+    fn states(&self) -> Vec<std::sync::RwLockReadGuard<'_, ServerState>> {
+        self.servers
+            .iter()
+            .map(|server| server.state.read().unwrap())
+            .collect()
     }
     fn peer(&self, index: usize) -> Result<Arc<Peer>, String> {
         self.servers[index]
@@ -614,15 +745,11 @@ impl SessionMcpProvider {
                 _ => {}
             }
         }
-        let server = &self.servers[index].descriptor;
-        let mut secrets = server
-            .args
+        let secrets = self.servers[index]
+            .private
             .iter()
-            .chain(server.env.values())
             .map(String::as_str)
-            .filter(|v| !v.is_empty())
             .collect::<Vec<_>>();
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         visit(value, &secrets);
     }
     async fn directory(
@@ -638,7 +765,6 @@ impl SessionMcpProvider {
                 tools: BTreeMap::new(),
                 originals: BTreeMap::new(),
                 resources,
-                tools_supported,
             });
         }
         let peer = self.peer(index)?;
@@ -679,7 +805,14 @@ impl SessionMcpProvider {
                 {
                     return Err("session MCP tool name collision".into());
                 }
-                let schema = tool
+                // Keep private launch values out of all model-visible directory metadata. A name
+                // routes the call, so one that would need redaction is not offered at all.
+                let mut public_tool = tool.clone();
+                self.sanitize(index, &mut public_tool);
+                if public_tool["name"] != tool["name"] {
+                    continue;
+                }
+                let schema = public_tool
                     .get("inputSchema")
                     .cloned()
                     .ok_or("session MCP schema missing")?;
@@ -692,15 +825,9 @@ impl SessionMcpProvider {
                 {
                     return Err("invalid or oversized session MCP tool schema".into());
                 }
-                let description = tool["description"].as_str().unwrap_or(original);
+                let description = public_tool["description"].as_str().unwrap_or(original);
                 if description.len() > 16 * 1024 {
                     return Err("session MCP description too large".into());
-                }
-                // Keep private launch values out of all model-visible directory metadata.
-                let mut public_tool = tool.clone();
-                self.sanitize(index, &mut public_tool);
-                if public_tool != *tool {
-                    return Err("session MCP directory includes private launch data".into());
                 }
                 originals.insert(name.clone(), original.to_owned());
                 tools.insert(
@@ -718,8 +845,11 @@ impl SessionMcpProvider {
                 _ => return Err("invalid session MCP cursor".into()),
             };
             if cursor.is_none() {
+                // Schemas keep the server's key order, which must not change the revision.
                 let revision = Sha256::digest(
-                    serde_json::to_vec(&tools).map_err(|_| "invalid MCP directory")?,
+                    serde_json::to_value(&tools)
+                        .and_then(|tools| tickloop_agent_base::canonical_json_bytes(&tools))
+                        .map_err(|_| "invalid MCP directory")?,
                 )
                 .into();
                 return Ok(Directory {
@@ -727,7 +857,6 @@ impl SessionMcpProvider {
                     tools,
                     originals,
                     resources,
-                    tools_supported,
                 });
             }
             if !seen.insert(cursor.clone().unwrap()) {
@@ -741,9 +870,7 @@ impl SessionMcpProvider {
             .state
             .read()
             .unwrap()
-            .directory
-            .as_ref()
-            .map(|d| (d.tools_supported, d.resources))
+            .capabilities
             .ok_or("session MCP directory unavailable")?;
         let result = self
             .directory(index, tools_supported, resources, cancel)
@@ -757,10 +884,25 @@ impl SessionMcpProvider {
 impl HostToolProvider for SessionMcpProvider {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.native.definitions();
-        for server in &self.servers {
-            if let Some(dir) = &server.state.read().unwrap().directory {
-                tools.extend(dir.tools.values().cloned());
-            }
+        let states = self.states();
+        let directories = states
+            .iter()
+            .filter_map(|state| state.directory.as_ref())
+            .collect::<Vec<_>>();
+        for directory in &directories {
+            tools.extend(
+                directory
+                    .tools
+                    .values()
+                    .filter(|tool| {
+                        directories
+                            .iter()
+                            .filter(|other| other.tools.contains_key(&tool.name))
+                            .count()
+                            == 1
+                    })
+                    .cloned(),
+            );
         }
         tools
     }
@@ -768,7 +910,7 @@ impl HostToolProvider for SessionMcpProvider {
         if self.closed.load(Ordering::SeqCst) {
             return Ok(Vec::new());
         }
-        let mut starts = Vec::new();
+        let mut starts = self.native.session_bootstrap()?;
         for (index, server) in self.servers.iter().enumerate() {
             if server.state.read().unwrap().attempted {
                 continue;
@@ -801,9 +943,10 @@ impl HostToolProvider for SessionMcpProvider {
         if self.closed.load(Ordering::SeqCst) || cancel.is_cancelled() {
             return Err("session MCP startup cancelled".into());
         }
-        let start = call
-            .into_payload::<PreparedStart>()
-            .map_err(|_| "invalid session MCP startup payload")?;
+        let start = match call.into_payload::<PreparedStart>() {
+            Ok(start) => start,
+            Err(call) => return self.native.start_session_server(*call, cancel).await,
+        };
         let server = self
             .servers
             .get(start.index)
@@ -826,6 +969,7 @@ impl HostToolProvider for SessionMcpProvider {
         server.state.write().unwrap().peer = Some(peer.clone());
         let result = async {
             let (tools_supported, resources) = peer.initialize(cancel.clone()).await?;
+            server.state.write().unwrap().capabilities = Some((tools_supported, resources));
             let directory = self
                 .directory(start.index, tools_supported, resources, cancel)
                 .await?;
@@ -1056,7 +1200,13 @@ impl HostToolProvider for SessionMcpProvider {
         };
         match peer.request("tools/call",json!({"name":prepared.original,"arguments":prepared.arguments}),cancel).await{
             Ok(mut result)=>{self.sanitize(prepared.index,&mut result);let is_error=result["isError"]==true;HostCallResult::Completed(ToolResult{content:result.to_string(),is_error,output_ref:None})},
-            Err(_)=>HostCallResult::OutcomeUnknown("session MCP response unavailable after dispatch; do not automatically repeat the call".into()),
+            // The server answered, so the outcome is known: it refused the call.
+            Err(RequestError::Rejected(error))=>{
+                let mut error=json!({"code":error.get("code"),"message":error.get("message")});
+                self.sanitize(prepared.index,&mut error);
+                HostCallResult::Completed(ToolResult{content:format!("session MCP server rejected the call: {error}"),is_error:true,output_ref:None})
+            },
+            Err(RequestError::Failed(_))=>HostCallResult::OutcomeUnknown("session MCP response unavailable after dispatch; do not automatically repeat the call".into()),
         }
     }
     async fn execute(
@@ -1077,6 +1227,23 @@ impl HostToolProvider for SessionMcpProvider {
     }
     fn mcp_resource_server(&self) -> Option<McpResourceServer> {
         self.native.mcp_resource_server()
+    }
+    fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
+        self.native.mcp_instructions()
+    }
+    async fn list_mcp_resources(
+        &self,
+        cursor: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        self.native.list_mcp_resources(cursor, cancel).await
+    }
+    async fn read_mcp_resource(
+        &self,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        self.native.read_mcp_resource(uri, cancel).await
     }
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
         let mut sources = self.native.mcp_resource_servers();
@@ -1214,6 +1381,10 @@ mod tests {
         no_response: AtomicBool,
         close_fails: AtomicBool,
         resources_only: AtomicBool,
+        reject: AtomicBool,
+        ping: AtomicBool,
+        ping_reply: std::sync::Mutex<Option<Value>>,
+        reorder: AtomicBool,
     }
     struct Lifetime {
         control: Arc<Control>,
@@ -1237,8 +1408,16 @@ mod tests {
     struct Launcher(Arc<Control>);
     #[async_trait]
     impl SessionMcpLauncher for Launcher {
-        async fn launch(&self, _: &SessionMcpServer) -> Result<SessionMcpTransport, String> {
+        async fn launch(
+            &self,
+            descriptor: &SessionMcpServer,
+        ) -> Result<SessionMcpTransport, String> {
             self.0.starts.fetch_add(1, Ordering::SeqCst);
+            let tool = descriptor
+                .env
+                .get("TOOL")
+                .cloned()
+                .unwrap_or_else(|| "echo".into());
             let (control, client) = (self.0.clone(), tokio::io::duplex(MAX_FRAME * 2));
             let (client_reader, client_writer) = tokio::io::split(client.0);
             let (server_reader, mut server_writer) = tokio::io::split(client.1);
@@ -1252,7 +1431,20 @@ mod tests {
                     if request.get("id").is_none() {
                         continue;
                     }
-                    let result = match request["method"].as_str().unwrap() {
+                    let method = request["method"].as_str().unwrap();
+                    if control.reject.load(Ordering::SeqCst)
+                        && matches!(method, "tools/call" | "resources/read")
+                    {
+                        let response = format!(
+                            "{}\n",
+                            json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"Unknown target for private-value","data":{"private":"private-value"}}})
+                        );
+                        if server_writer.write_all(response.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let result = match method {
                         "initialize" => {
                             let capabilities = if control.resources_only.load(Ordering::SeqCst) {
                                 json!({"resources":{}})
@@ -1263,14 +1455,33 @@ mod tests {
                         }
                         "tools/list" => {
                             assert!(!control.resources_only.load(Ordering::SeqCst));
-                            json!({"tools":[{"name":"echo","description":format!("revision {}",control.revision.load(Ordering::SeqCst)),"inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false}}]})
+                            // The same schema, with its keys in another order on request.
+                            let schema = if control.reorder.load(Ordering::SeqCst) {
+                                r#"{"properties":{"path":{"type":"string"}},"type":"object"}"#
+                            } else {
+                                r#"{"type":"object","properties":{"path":{"type":"string"}}}"#
+                            };
+                            let schema: Value = serde_json::from_str(schema).unwrap();
+                            json!({"tools":[{"name":tool,"description":format!("Reads ./ and /fixture/project at debug level, revision {}",control.revision.load(Ordering::SeqCst)),"inputSchema":schema,"annotations":{"readOnlyHint":true,"destructiveHint":false}}]})
                         }
                         "tools/call" => {
                             control.calls.fetch_add(1, Ordering::SeqCst);
                             if control.no_response.load(Ordering::SeqCst) {
                                 continue;
                             }
-                            json!({"content":[{"type":"text","text":"private-argument private-value"}]})
+                            if control.ping.load(Ordering::SeqCst) {
+                                let ping =
+                                    "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"ping\"}\n";
+                                if server_writer.write_all(ping.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                let Ok(Some(reply)) = lines.next_line().await else {
+                                    break;
+                                };
+                                *control.ping_reply.lock().unwrap() =
+                                    Some(serde_json::from_str(&reply).unwrap());
+                            }
+                            json!({"content":[{"type":"text","text":"private-argument private-value /fixture/project . debug"}]})
                         }
                         "resources/list" => {
                             json!({"resources":[{"uri":"fixture://info","name":"info"}]})
@@ -1300,20 +1511,36 @@ mod tests {
             })
         }
     }
-    fn provider(directory: &std::path::Path) -> (Arc<SessionMcpProvider>, Arc<Control>) {
-        let control = Arc::new(Control::default());
-        let server = SessionMcpServer {
+    fn server(directory: &std::path::Path) -> SessionMcpServer {
+        SessionMcpServer {
             name: "fixture".into(),
             program: "/bin/cat".into(),
-            args: vec!["private-argument".into()],
-            env: BTreeMap::from([("EXPLICIT_KEY".into(), "private-value".into())]),
+            args: vec![
+                "--token=private-argument".into(),
+                "-y".into(),
+                ".".into(),
+                "/fixture/project".into(),
+            ],
+            env: BTreeMap::from([
+                ("EXPLICIT_KEY".into(), "private-value".into()),
+                ("LEVEL".into(), "debug".into()),
+            ]),
             cwd: directory.into(),
-        };
+        }
+    }
+    fn provider(directory: &std::path::Path) -> (Arc<SessionMcpProvider>, Arc<Control>) {
+        provider_with(directory, Arc::new(Native))
+    }
+    fn provider_with(
+        directory: &std::path::Path,
+        native: Arc<dyn HostToolProvider>,
+    ) -> (Arc<SessionMcpProvider>, Arc<Control>) {
+        let control = Arc::new(Control::default());
         (
             Arc::new(
                 SessionMcpProvider::new(
-                    vec![server],
-                    Arc::new(Native),
+                    vec![server(directory)],
+                    native,
                     Arc::new(Launcher(control.clone())),
                 )
                 .unwrap(),
@@ -1326,7 +1553,7 @@ mod tests {
         let public = format!("{call:?}");
         assert!(!public.contains("private-argument"));
         assert!(!public.contains("private-value"));
-        assert_eq!(call.input()["argument_count"], 1);
+        assert_eq!(call.input()["argument_count"], 4);
         provider
             .start_session_server(call, CancellationToken::new())
             .await
@@ -1368,10 +1595,235 @@ mod tests {
         assert!(!result.is_error);
         assert!(!result.content.contains("private-argument"));
         assert!(!result.content.contains("private-value"));
-        assert!(result.content.contains("[redacted]"));
+        assert!(
+            result
+                .content
+                .contains("[redacted] [redacted] [redacted] . debug")
+        );
         provider.close_session().await.unwrap();
         assert_eq!(control.closes.load(Ordering::SeqCst), 1);
         assert!(provider.upgrade_checkpoint().unwrap().is_some());
+    }
+    #[test]
+    fn launch_values_are_private_above_a_minimum_length() {
+        let mut server = server(std::path::Path::new("/"));
+        server.args = [
+            "run",
+            "-y",
+            ".",
+            "/Users/me/project",
+            "acp-argv-value-1234",
+            "--secret-token=equals-value-1234",
+            "API_SECRET=key-value-1234",
+            "--header=Authorization: Bearer bearer-value-1234",
+            "postgres://user:password@db.example/name",
+            "https://example.com/mcp?access_token=query-value-1234&mode=fast",
+            "--password",
+            "short",
+        ]
+        .map(String::from)
+        .into();
+        let private = private_launch_values(&server);
+        // Every long value, and the credential a credential-shaped argument embeds.
+        for expected in [
+            "private-value",
+            "/Users/me/project",
+            "acp-argv-value-1234",
+            "--secret-token=equals-value-1234",
+            "equals-value-1234",
+            "key-value-1234",
+            "Bearer bearer-value-1234",
+            "bearer-value-1234",
+            "user:password",
+            "query-value-1234",
+            "--password",
+        ] {
+            assert!(private.iter().any(|value| value == expected), "{expected}");
+        }
+        for visible in ["run", "-y", ".", "short", "debug", "/bin/cat"] {
+            assert!(private.iter().all(|value| value != visible), "{visible}");
+        }
+    }
+    #[tokio::test]
+    async fn short_launch_values_never_reject_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, _) = provider(directory.path());
+        start(&provider).await;
+        let tool = provider
+            .definitions()
+            .into_iter()
+            .find(|tool| tool.name == "mcp__fixture__echo")
+            .unwrap();
+        // A long launch value is redacted in place rather than withdrawing the directory.
+        assert_eq!(
+            tool.description,
+            "Reads ./ and [redacted] at debug level, revision 0"
+        );
+        provider.close_session().await.unwrap();
+    }
+    #[tokio::test]
+    async fn server_errors_complete_the_call_and_keep_the_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, control) = provider(directory.path());
+        start(&provider).await;
+        control.reject.store(true, Ordering::SeqCst);
+        assert_eq!(
+            provider
+                .read_mcp_resource_from("fixture", "fixture://missing", CancellationToken::new())
+                .await
+                .unwrap_err(),
+            "MCP server rejected the request"
+        );
+        let call = provider
+            .prepare_call(
+                Uuid::new_v4(),
+                "mcp__fixture__echo",
+                &json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let HostCallResult::Completed(result) = provider
+            .execute_prepared(Uuid::new_v4(), call, CancellationToken::new())
+            .await
+        else {
+            panic!("a server error is a known outcome");
+        };
+        assert!(result.is_error);
+        assert!(result.content.contains("-32602"));
+        assert!(result.content.contains("Unknown target for [redacted]"));
+        assert!(!result.content.contains("private-value"));
+        assert_eq!(control.closes.load(Ordering::SeqCst), 0);
+        control.reject.store(false, Ordering::SeqCst);
+        let call = provider
+            .prepare_call(
+                Uuid::new_v4(),
+                "mcp__fixture__echo",
+                &json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !provider
+                .execute_prepared(Uuid::new_v4(), call, CancellationToken::new())
+                .await
+                .into_tool_result()
+                .is_error
+        );
+        assert_eq!(
+            provider
+                .read_mcp_resource_from("fixture", "fixture://info", CancellationToken::new())
+                .await
+                .unwrap()["contents"][0]["text"],
+            "information"
+        );
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+        provider.close_session().await.unwrap();
+    }
+    #[tokio::test]
+    async fn server_ping_gets_an_empty_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, control) = provider(directory.path());
+        start(&provider).await;
+        control.ping.store(true, Ordering::SeqCst);
+        let call = provider
+            .prepare_call(
+                Uuid::new_v4(),
+                "mcp__fixture__echo",
+                &json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let result = provider
+            .execute_prepared(Uuid::new_v4(), call, CancellationToken::new())
+            .await
+            .into_tool_result();
+        assert!(!result.is_error);
+        assert_eq!(
+            control.ping_reply.lock().unwrap().clone().unwrap(),
+            json!({"jsonrpc":"2.0","id":"ping","result":{}})
+        );
+        provider.close_session().await.unwrap();
+    }
+    #[tokio::test]
+    async fn tool_names_two_servers_both_produce_are_offered_by_neither() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = Arc::new(Control::default());
+        let server = |name: &str, tool: &str| SessionMcpServer {
+            name: name.into(),
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: BTreeMap::from([("TOOL".into(), tool.into())]),
+            cwd: directory.path().into(),
+        };
+        let provider = SessionMcpProvider::new(
+            vec![server("a_", "b"), server("a", "_b"), server("c", "echo")],
+            Arc::new(Native),
+            Arc::new(Launcher(control.clone())),
+        )
+        .unwrap();
+        for call in provider.session_bootstrap().unwrap() {
+            provider
+                .start_session_server(call, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            provider
+                .definitions()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["NativeFixture", "mcp__c__echo"]
+        );
+        assert!(provider.tool("mcp__a___b").is_none());
+        assert_eq!(
+            provider.permission(Uuid::new_v4(), "mcp__a___b", &json!({})),
+            HostToolPermission::ReadOnly,
+            "the colliding name is no session tool"
+        );
+        assert!(provider.tool("mcp__c__echo").is_some());
+        provider.close_session().await.unwrap();
+    }
+    struct Instructed;
+    #[async_trait]
+    impl HostToolProvider for Instructed {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
+            vec![McpServerInstructions {
+                server: McpResourceServer {
+                    name: "tickloop-artifacts".into(),
+                    authority: HostToolAuthority::Mcp {
+                        server_id: "artifacts".into(),
+                        account_id: "account".into(),
+                    },
+                },
+                text: "Use the Artifacts tools".into(),
+            }]
+        }
+        fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+            HostToolPermission::ReadOnly
+        }
+        async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
+            ToolResult {
+                content: "native".into(),
+                is_error: false,
+                output_ref: None,
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_mcp_instructions_survive_the_session_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, _) = provider_with(directory.path(), Arc::new(Instructed));
+        assert_eq!(provider.mcp_instructions(), Instructed.mcp_instructions());
+        start(&provider).await;
+        assert_eq!(provider.mcp_instructions(), Instructed.mcp_instructions());
+        provider.close_session().await.unwrap();
     }
     #[test]
     fn private_values_are_redacted_in_keys_and_nested_values() {
@@ -1417,6 +1869,28 @@ mod tests {
             .await;
         assert!(matches!(result, HostCallResult::NotDispatched(_)));
         assert_eq!(control.calls.load(Ordering::SeqCst), 0);
+        provider.close_session().await.unwrap();
+    }
+    #[tokio::test]
+    async fn directory_revision_ignores_the_servers_schema_key_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, control) = provider(directory.path());
+        start(&provider).await;
+        let call = provider
+            .prepare_call(
+                Uuid::new_v4(),
+                "mcp__fixture__echo",
+                &json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        control.reorder.store(true, Ordering::SeqCst);
+        let result = provider
+            .execute_prepared(Uuid::new_v4(), call, CancellationToken::new())
+            .await;
+        assert!(matches!(result, HostCallResult::Completed(_)));
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
         provider.close_session().await.unwrap();
     }
     #[tokio::test]
@@ -1516,11 +1990,15 @@ mod tests {
             .submit(chat, None, "Use the approved MCP fixture".into())
             .await
             .unwrap();
+        // Not even the title request precedes the startup approval.
+        assert!(agent.inner.title_requests.lock().await.is_empty());
         let request = permission(&agent, chat).await;
         assert!(
             matches!(request.execution,PermissionExecution::HostOperation{run_id,..} if run_id==receipt.run_id)
         );
         assert!(model.requests.lock().unwrap().is_empty());
+        assert!(model.title_requests.lock().unwrap().is_empty());
+        assert!(agent.inner.title_requests.lock().await.is_empty());
         assert_eq!(control.starts.load(Ordering::SeqCst), 0);
         assert!(
             agent
@@ -1535,6 +2013,13 @@ mod tests {
         completed(&agent, &receipt).await;
         assert_eq!(control.starts.load(Ordering::SeqCst), 1);
         assert_eq!(control.closes.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while model.title_requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admitted startup starts the deferred title");
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert!(!snapshot.messages.iter().flat_map(|m|&m.content).any(|c|matches!(c,tickloop_agent_protocol::Content::ToolUse{name,..} if name==MCP_SERVER_START)));
         let public = serde_json::to_string(&snapshot).unwrap();
@@ -1576,6 +2061,8 @@ mod tests {
             completed(&agent, &receipt).await;
             assert_eq!(control.starts.load(Ordering::SeqCst), 0);
             assert!(model.requests.lock().unwrap().is_empty());
+            assert!(model.title_requests.lock().unwrap().is_empty());
+            assert!(agent.inner.title_requests.lock().await.is_empty());
             agent.shutdown().await;
         }
     }

@@ -43,16 +43,24 @@ pub async fn transcript(
     record: TranscriptRef,
     page: Page,
 ) -> Result<ObservationValue, AccessError> {
-    let store = JsonlTranscriptStore::open(record.store_root.clone())
-        .map_err(|e| AccessError::storage(e.to_string()))?;
-    let stored = store
-        .load(record.chat_id, LoadRange::Full)
-        .await
-        .map_err(|e| AccessError::storage(e.to_string()))?
-        .ok_or_else(|| AccessError::not_found("Transcript not found"))?;
-    let loaded = super::reader::assemble(&stored, None)
-        .0
-        .ok_or_else(|| AccessError::not_found("Transcript contains no conversation"))?;
+    // A read-only observation: it opens no store, so it creates no directory and registers no
+    // Chat, and it loads from the latest boundary the way the Harness does.
+    let requested = record.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let Some(path) = super::path::locate(&requested.store_root, requested.chat_id)? else {
+            return Ok(None);
+        };
+        super::jsonl::load_file(&path)
+    })
+    .await
+    .map_err(|error| AccessError::new(AccessErrorCode::Storage, error.to_string()))?
+    .map_err(|error| AccessError::new(AccessErrorCode::Storage, error.to_string()))?
+    .ok_or_else(|| {
+        AccessError::new(
+            AccessErrorCode::NotFound,
+            "Transcript contains no conversation",
+        )
+    })?;
     let total_messages = loaded.chain.len();
     let folder = loaded
         .chain
@@ -110,14 +118,6 @@ pub async fn acp_session(record: &TranscriptRef) -> Result<Option<AcpSessionEntr
     Ok(latest.filter(|entry| entry.chat_id == record.chat_id))
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HistoryCursor {
-    record: TranscriptRef,
-    position: u64,
-    offset: usize,
-}
-
 /// Reads the public history exactly once; managed hosts retain this snapshot across pages.
 pub async fn managed_history_snapshot(
     record: &TranscriptRef,
@@ -132,62 +132,6 @@ pub async fn managed_history_snapshot(
     stored
         .display_history(None)
         .ok_or_else(|| AccessError::invalid("history branch cannot be reconstructed"))
-}
-
-pub async fn managed_history(
-    record: TranscriptRef,
-    cursor: Option<String>,
-) -> Result<tickloop_agent_protocol::ManagedHistoryPage, AccessError> {
-    let store = JsonlTranscriptStore::open(record.store_root.clone())
-        .map_err(|e| AccessError::storage(e.to_string()))?;
-    let stored = store
-        .load(record.chat_id, LoadRange::Full)
-        .await
-        .map_err(|e| AccessError::storage(e.to_string()))?
-        .ok_or_else(|| AccessError::not_found("ACP history not found"))?;
-    let offset = if let Some(cursor) = cursor {
-        if cursor.len() > 4096 {
-            return Err(AccessError::invalid("history cursor too large"));
-        }
-        let previous: HistoryCursor = serde_json::from_str(&cursor)
-            .map_err(|_| AccessError::invalid("invalid history cursor"))?;
-        if previous.record != record || previous.position != stored.position.0 {
-            return Err(AccessError::new(
-                AccessErrorCode::VersionConflict,
-                "history snapshot changed; restart replay",
-            ));
-        }
-        previous.offset
-    } else {
-        0
-    };
-    let history = stored
-        .display_history(None)
-        .ok_or_else(|| AccessError::invalid("history branch cannot be reconstructed"))?;
-    let page = history
-        .page(offset, 100)
-        .map_err(|e| AccessError::invalid(e.to_string()))?;
-    let next_cursor = page
-        .next_offset
-        .map(|offset| {
-            serde_json::to_string(&HistoryCursor {
-                record: record.clone(),
-                position: page.position.0,
-                offset,
-            })
-        })
-        .transpose()
-        .map_err(|e| AccessError::invalid(e.to_string()))?;
-    Ok(tickloop_agent_protocol::ManagedHistoryPage {
-        session_id: record.chat_id,
-        items: page
-            .items
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| AccessError::invalid(e.to_string()))?,
-        next_cursor,
-    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -292,4 +236,26 @@ pub async fn managed_sessions(
         sessions: sessions[offset..end].to_vec(),
         next_cursor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn observing_a_transcript_never_creates_its_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("absent-root");
+        let error = transcript(
+            TranscriptRef {
+                store_root: root.clone(),
+                chat_id: uuid::Uuid::new_v4(),
+            },
+            Page::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, AccessErrorCode::NotFound);
+        assert!(!root.exists());
+    }
 }

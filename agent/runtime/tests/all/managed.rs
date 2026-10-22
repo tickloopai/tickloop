@@ -531,3 +531,43 @@ async fn managed_cancellation_keeps_the_chat_reusable_and_other_chats_running() 
     );
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn only_managed_chats_record_proposed_edits_for_history_replay() {
+    for (policy, records) in [(ToolPolicy::local(), false), (ToolPolicy::acp(), true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("edited.txt");
+        let store =
+            Arc::new(tickloop_agent_test_support::transcripts::InMemoryTranscriptStore::new());
+        let agent = harness_with_store(
+            policy,
+            Arc::new(ScriptedModel::new(vec![
+                call(
+                    "write",
+                    "Write",
+                    json!({"file_path":path,"content":"edit\n"}),
+                ),
+                text("done"),
+            ])),
+            Some(store.clone()),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .submit(chat, None, "write a file".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), agent.quiesce(chat))
+            .await
+            .unwrap();
+        agent.flush_transcripts().await;
+        assert_eq!(
+            store
+                .lines(chat)
+                .iter()
+                .any(|line| matches!(line, tickloop_agent_transcript::Line::RecordedEdit(_))),
+            records,
+            "a managed Chat records its edits, a Console Chat does not"
+        );
+        agent.shutdown().await;
+    }
+}

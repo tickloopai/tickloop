@@ -11,6 +11,9 @@ use super::path::TRANSCRIPT_FILE_SUFFIX;
 /// 照 Claude Code `LITE_READ_BUF_SIZE`：列表只读每个文件的头尾各 64KB。
 pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
+/// How an ACP origin Line starts, alone or nested in a retained snapshot. A JSON string escapes
+/// its quotes, so only a record itself contains this text; lines without it are never parsed.
+const ACP_SESSION_PATTERN: &str = "{\"type\":\"acp-session\"";
 
 #[derive(Clone, Debug)]
 pub struct TranscriptSummary {
@@ -124,35 +127,40 @@ fn first_prompt(head: &str) -> Option<String> {
 /// The lite listing window can miss a large or middle-of-file ACP origin. This fallback is
 /// only for ACP listing: scan one line at a time and never project or retain conversation data.
 /// The first origin is sufficient here; cwd/root identity is immutable across configurations.
-pub(super) fn scan_acp_session(path: &Path) -> io::Result<Option<AcpSessionEntry>> {
-    let mut reader = io::BufReader::new(std::fs::File::open(path)?);
-    let mut line = String::new();
-    while reader.read_line(&mut line)? != 0 {
-        if (line.starts_with("{\"type\":\"acp-session\"")
-            || line.starts_with("{\"type\":\"retained-snapshot\""))
-            && let Some(entry) = acp_session(&line)
+/// Only lines containing an ACP origin are parsed, and a file that cannot be read is no ACP
+/// session, so a damaged or concurrently deleted Transcript never fails the listing.
+pub(super) fn scan_acp_session(path: &Path) -> Option<AcpSessionEntry> {
+    let mut reader = io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).ok()? != 0 {
+        if line
+            .windows(ACP_SESSION_PATTERN.len())
+            .any(|window| window == ACP_SESSION_PATTERN.as_bytes())
+            && let Some(entry) = serde_json::from_slice(&line).ok().and_then(acp_session_of)
         {
-            return Ok(Some(entry));
+            return Some(entry);
         }
         line.clear();
     }
-    Ok(None)
+    None
 }
 
 fn acp_session(text: &str) -> Option<AcpSessionEntry> {
-    fn from_line(line: Line) -> Option<AcpSessionEntry> {
-        match line {
-            Line::AcpSession(entry) => Some(entry),
-            Line::RetainedSnapshot(snapshot) => {
-                snapshot.lines.into_iter().rev().find_map(from_line)
-            }
-            _ => None,
-        }
-    }
     text.lines()
         .rev()
+        .filter(|line| line.contains(ACP_SESSION_PATTERN))
         .filter_map(|line| serde_json::from_str::<Line>(line).ok())
-        .find_map(from_line)
+        .find_map(acp_session_of)
+}
+
+fn acp_session_of(line: Line) -> Option<AcpSessionEntry> {
+    match line {
+        Line::AcpSession(entry) => Some(entry),
+        Line::RetainedSnapshot(snapshot) => {
+            snapshot.lines.into_iter().rev().find_map(acp_session_of)
+        }
+        _ => None,
+    }
 }
 
 fn forked_from(text: &str) -> Option<ForkedFrom> {
@@ -249,7 +257,7 @@ mod tests {
             summary.acp_session.is_none(),
             "fixture must exceed the lite windows"
         );
-        assert_eq!(scan_acp_session(&path).unwrap().unwrap().chat_id, chat);
+        assert_eq!(scan_acp_session(&path).unwrap().chat_id, chat);
 
         // Snapshot-only stores can put the origin inside a line larger than both windows.
         let filler: Line = serde_json::from_str(filler.trim()).unwrap();
@@ -267,7 +275,17 @@ mod tests {
                 .acp_session
                 .is_none()
         );
-        assert_eq!(scan_acp_session(&path).unwrap().unwrap().chat_id, chat);
+        assert_eq!(scan_acp_session(&path).unwrap().chat_id, chat);
+
+        // A crash can leave invalid UTF-8 in the tail; a deleted file is simply no ACP session.
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged.extend_from_slice(b"{\"type\":\"user\",\"text\":\"\xff\xfe");
+        std::fs::write(&path, &damaged).unwrap();
+        assert_eq!(scan_acp_session(&path).unwrap().chat_id, chat);
+        std::fs::write(&path, b"{\"type\":\"user\"}\n\xff\xfe\n").unwrap();
+        assert!(scan_acp_session(&path).is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert!(scan_acp_session(&path).is_none());
     }
 
     #[test]
