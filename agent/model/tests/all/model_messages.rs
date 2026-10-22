@@ -230,6 +230,12 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
         receiver.recv().await,
         Some(ModelDelta::Thinking("I should read the notes.".into()))
     );
+    assert_eq!(
+        crate::model_protocols::started_tool_uses(&crate::model_protocols::sent_deltas(
+            &mut receiver
+        )),
+        [("call-1".to_owned(), "Read".to_owned())]
+    );
     assert_eq!(output.usage.input_tokens, None);
     assert_eq!(output.usage.output_tokens, None);
     assert_eq!(output.usage.cache_read_input_tokens, None);

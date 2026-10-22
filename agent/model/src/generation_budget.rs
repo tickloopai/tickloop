@@ -121,7 +121,7 @@ impl GenerationBudget {
             ModelDelta::Usage(usage) => usage
                 .output_tokens
                 .is_some_and(|tokens| tokens >= u64::from(self.output_tokens)),
-            ModelDelta::OutputStarted => false,
+            ModelDelta::ToolUseStarted { .. } | ModelDelta::OutputStarted => false,
         }
     }
 }

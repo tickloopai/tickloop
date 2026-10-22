@@ -307,7 +307,8 @@ pub(super) async fn complete(
                     .map_err(|_| failure(ModelError::ConnectionAt { stage: ModelRequestStage::RequestSend }, false))?;
             }
         }
-        let mut stream = ResponsesStream::for_codex();
+        let mut stream = ResponsesStream::for_codex()
+            .with_codex_origin(&super::codex_origin(&config.model, account_id));
         let mut structured_response =
             crate::structured_response::StructuredResponsePolicy::for_codex_body(&request_body);
         let mut started = false;

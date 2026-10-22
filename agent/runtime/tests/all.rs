@@ -195,6 +195,8 @@ mod tickhost_versions;
 mod tool_batches;
 #[path = "all/tool_results.rs"]
 mod tool_results;
+#[path = "all/tool_use_started.rs"]
+mod tool_use_started;
 #[path = "all/transcript_stores.rs"]
 mod transcript_stores;
 #[path = "all/transcripts.rs"]
