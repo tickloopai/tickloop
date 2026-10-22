@@ -1306,3 +1306,104 @@ async fn a_continuation_waiting_through_an_edit_carries_the_new_objective() {
     assert!(!prompt.contains(OBJECTIVE));
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_queued_continuation_waits_for_background_work_a_later_turn_started() {
+    const QUEUED: &str = "the queued continuation";
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("release");
+    let model = HoldingModel::new(
+        vec![
+            call(
+                "sh1",
+                "Bash",
+                json!({
+                    "command": format!("while [ ! -e '{}' ]; do sleep 0.05; done", gate.display()),
+                    "run_in_background": true,
+                    "description": "Wait for the release gate"
+                }),
+            ),
+            text("Started the shell."),
+            blocked("b1"),
+            text("Blocked."),
+        ],
+        Vec::new(),
+    );
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
+    approve_everything(&agent);
+    agent.hold_goal_continuations_for_tests();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+    let held = model.held.notified();
+    tokio::pin!(held);
+    held.as_mut().enable();
+    agent.submit(chat, HOLD.into()).await.unwrap();
+    until_held(held).await;
+    // Queued while nothing runs in the background; the user's turn then starts a Shell.
+    let current = goal(&agent, chat).await.unwrap();
+    agent
+        .deliver_trigger_for_tests(
+            chat,
+            tickloop_agent_protocol::TriggerSource::GoalContinuation {
+                goal_id: current.id,
+                after_run: uuid::Uuid::new_v4(),
+                objective_revision: current.objective_revision,
+            },
+            QUEUED,
+        )
+        .await
+        .unwrap();
+    model.release();
+    tokio::time::timeout(WAIT, async {
+        while model.turn_requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the user's turn started the shell");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        model.turn_requests().len(),
+        2,
+        "the continuation waited while the shell ran"
+    );
+    let refused = agent
+        .deliver_trigger_for_tests(
+            chat,
+            tickloop_agent_protocol::TriggerSource::GoalContinuation {
+                goal_id: current.id,
+                after_run: uuid::Uuid::new_v4(),
+                objective_revision: current.objective_revision,
+            },
+            "handed over while the shell runs",
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a continuation is not queued while the shell runs"
+    );
+
+    std::fs::write(&gate, b"release").unwrap();
+    wait_for_goal(&agent, chat, |status| {
+        matches!(status, GoalStatus::Blocked { .. })
+    })
+    .await;
+    let last = model.turn_requests().pop().unwrap();
+    let notification = last
+        .messages
+        .iter()
+        .position(|message| mentions_text(message, "<task-notification>"))
+        .expect("the shell's completion reached the model");
+    let continuation = last
+        .messages
+        .iter()
+        .position(|message| mentions_text(message, QUEUED))
+        .expect("the continuation ran");
+    assert!(notification < continuation);
+    agent.shutdown().await;
+}

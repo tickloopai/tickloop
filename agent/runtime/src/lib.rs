@@ -2563,6 +2563,13 @@ impl Agent {
             let sessions = self.inner.session_permissions.lock().await;
             Self::validate_attachment_admission(&chats, &sessions, chat_id, admission)?;
         }
+        if matches!(trigger_source, Some(TriggerSource::GoalContinuation { .. }))
+            && goal::background_work_runs(&chats, chat_id)
+        {
+            return Err(AgentError::Invalid(
+                "the goal's continuation waits for the Chat's background work".into(),
+            ));
+        }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
@@ -3752,11 +3759,12 @@ impl Agent {
         loop {
             let admission = {
                 let mut chats = self.inner.chats.lock().await;
+                let background_work = goal::background_work_runs(&chats, chat_id);
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                 if chat.family_stopping {
                     return Ok(None);
                 }
-                self.select_next_run(chat, None)?
+                self.select_next_run(chat, None, background_work)?
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
@@ -3805,6 +3813,7 @@ impl Agent {
         // Boxed: proving a source must not enlarge every run's shared async stack.
         let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
         let mut chats = self.inner.chats.lock().await;
+        let background_work = goal::background_work_runs(&chats, chat_id);
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if validation.is_err() {
             self.withdraw_trigger_input(chat, &pending.receipt, DiscardReason::SourceEnded);
@@ -3827,7 +3836,7 @@ impl Agent {
             chats = self.inner.chats.lock().await;
             chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?
         };
-        match self.select_next_run(chat, Some(pending))? {
+        match self.select_next_run(chat, Some(pending), background_work)? {
             RunAdmission::Idle => Ok(Some(None)),
             RunAdmission::ValidateTrigger(_) => Ok(None),
             RunAdmission::Ready(receipt, request, cancel) => {
@@ -3854,10 +3863,13 @@ impl Agent {
         }
     }
 
+    /// `background_work` holds back a goal continuation while the Chat's background children
+    /// or Shells still run.
     fn select_next_run(
         &self,
         chat: &mut Chat,
         validated_trigger: Option<&PendingInput>,
+        background_work: bool,
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
@@ -3917,6 +3929,8 @@ impl Agent {
                     // Trigger input waits while its Loop pauses receiving or its source holds it.
                     && pending.trigger_source.as_ref().is_none_or(|source| {
                         self.takes_trigger_input(&candidate, source) == wakeup::Eligibility::Eligible
+                            && !(background_work
+                                && matches!(source, TriggerSource::GoalContinuation { .. }))
                     })
             })
         {

@@ -70,12 +70,23 @@ enum UserStop {
     PausesSource,
 }
 
+/// Whether a source's deliveries wait for the Chat's background children and Shells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundWork {
+    /// They are taken whatever runs in the background.
+    Ignored,
+    /// They are refused while background work runs; the source hands them over again once it
+    /// ended.
+    Waits,
+}
+
 /// What a Trigger source is to the contract.
 #[async_trait]
 trait Source: Sized + Send + Sync {
     const COALESCING: Coalescing;
     const UNDER_PLAN: UnderPlan;
     const USER_STOP: UserStop;
+    const BACKGROUND_WORK: BackgroundWork;
 
     /// An Agent and a Chat whose first turn completed, with this source feeding its Loop.
     async fn new(model: Arc<ContractModel>) -> Self;
@@ -271,6 +282,14 @@ async fn an_agent_message_goes_before_trigger_input<S: Source>() {
     .expect("the child's completion queues behind the running turn");
     let turns_before = model.prompts().len();
     model.release_held_turn();
+    match S::BACKGROUND_WORK {
+        BackgroundWork::Ignored => {}
+        BackgroundWork::Waits => {
+            // Handed over while the child ran, it was refused; the source hands it again.
+            wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
+            source.deliver(1, "trigger-input").await;
+        }
+    }
     model.wait_seen("trigger-input", 1).await;
     let after = &model.prompts()[turns_before..];
     let completion = after
@@ -563,6 +582,7 @@ impl Source for TickSource {
     const COALESCING: Coalescing = Coalescing::LatestOnly;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
     const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let directory = Arc::new(tempfile::tempdir().unwrap());
@@ -738,6 +758,7 @@ impl Source for LocalFeedbackSource {
     const COALESCING: Coalescing = Coalescing::EachItem;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
     const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let service = Arc::new(ArtifactService::start().await);
@@ -874,6 +895,7 @@ impl Source for DurableFeedbackSource {
     const COALESCING: Coalescing = Coalescing::EachItem;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
     const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let store = Arc::new(InMemoryTranscriptStore::new());
@@ -1015,6 +1037,7 @@ macro_rules! stand_in {
             const COALESCING: Coalescing = Coalescing::OnePerKey;
             const UNDER_PLAN: UnderPlan = $under_plan;
             const USER_STOP: UserStop = UserStop::Receiving;
+            const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
             async fn new(model: Arc<ContractModel>) -> Self {
                 Self(StandIn::new(model, $source).await)
@@ -1086,6 +1109,7 @@ impl Source for GoalSource {
     const COALESCING: Coalescing = Coalescing::OnePerKey;
     const UNDER_PLAN: UnderPlan = UnderPlan::Held;
     const USER_STOP: UserStop = UserStop::PausesSource;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Waits;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let process = ProcessChat::new(model).await;

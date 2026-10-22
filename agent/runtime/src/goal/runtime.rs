@@ -3,6 +3,7 @@
 //! effects reach the Transcript, the conversation, the event stream and the wake-up base, which
 //! delivers every continuation.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tickloop_agent_base::{private_fs::unix_time_milliseconds, timestamp::format_timestamp};
@@ -163,6 +164,46 @@ fn apply_events(
         effects.extend(more);
     }
     Ok((goal, effects))
+}
+
+/// Whether a member of the Chat's family below it still works or has work queued; a lineage that
+/// cannot be read counts as working.
+fn background_children_run(chats: &HashMap<ChatId, Chat>, chat_id: ChatId) -> bool {
+    crate::family_tree::descendants(chats, chat_id).map_or(true, |members| {
+        members.iter().filter_map(|id| chats.get(id)).any(|member| {
+            !member.snapshot.pending_inputs.is_empty()
+                || !matches!(
+                    member.snapshot.chat_loop.state,
+                    LoopState::Idle | LoopState::Interrupted | LoopState::Failed
+                )
+        })
+    })
+}
+
+fn background_shells_run(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> bool {
+    snapshot.commands.iter().any(|command| {
+        matches!(
+            command.state,
+            CommandState::Running | CommandState::Background
+        )
+    }) || snapshot.user_shells.iter().any(|shell| {
+        matches!(
+            shell.state,
+            UserShellState::Queued
+                | UserShellState::WaitingPermission
+                | UserShellState::Running
+                | UserShellState::Background
+        )
+    })
+}
+
+/// Whether the Chat's background children or Shells still run, which holds its goal's
+/// continuation back where it is delivered and where it is taken.
+pub(crate) fn background_work_runs(chats: &HashMap<ChatId, Chat>, chat_id: ChatId) -> bool {
+    background_children_run(chats, chat_id)
+        || chats
+            .get(&chat_id)
+            .is_some_and(|chat| background_shells_run(&chat.snapshot))
 }
 
 fn goal_store(chat: &Chat) -> Option<GoalStore> {
@@ -553,16 +594,6 @@ impl Agent {
             let Some(chat) = chats.get(&chat_id) else {
                 return;
             };
-            let background_agents_running = crate::family_tree::descendants(&chats, chat_id)
-                .map_or(true, |members| {
-                    members.iter().filter_map(|id| chats.get(id)).any(|member| {
-                        !member.snapshot.pending_inputs.is_empty()
-                            || !matches!(
-                                member.snapshot.chat_loop.state,
-                                LoopState::Idle | LoopState::Interrupted | LoopState::Failed
-                            )
-                    })
-                });
             let snapshot = &chat.snapshot;
             let conditions = ContinuationConditions {
                 receiving: snapshot.chat_loop.receiving.is_receiving(),
@@ -573,21 +604,8 @@ impl Agent {
                         LoopState::Idle | LoopState::Interrupted | LoopState::Failed
                     ),
                 input_queue_empty: snapshot.pending_inputs.is_empty(),
-                background_agents_running,
-                background_shells_running: snapshot.commands.iter().any(|command| {
-                    matches!(
-                        command.state,
-                        CommandState::Running | CommandState::Background
-                    )
-                }) || snapshot.user_shells.iter().any(|shell| {
-                    matches!(
-                        shell.state,
-                        UserShellState::Queued
-                            | UserShellState::WaitingPermission
-                            | UserShellState::Running
-                            | UserShellState::Background
-                    )
-                }),
+                background_agents_running: background_children_run(&chats, chat_id),
+                background_shells_running: background_shells_run(snapshot),
                 plan_mode: snapshot.policy.mode == ExecutionMode::Plan,
             };
             if snapshot.delegation.is_some()
