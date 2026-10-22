@@ -1,7 +1,6 @@
 //! What the wake-up base tests share: a model that can hold a turn, the waits they need, and the
 //! processes and crash images they run a Chat in.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,16 +23,51 @@ use tickloop_agent_runtime::Agent;
 pub(crate) const WAIT: Duration = Duration::from_secs(10);
 /// Long enough for a delivery that was going to start a turn to have started it.
 pub(crate) const SETTLE: Duration = Duration::from_millis(500);
-/// A prompt containing it holds its turn until the test releases it.
-pub(crate) const HOLD: &str = "HOLD this turn";
+/// A prompt containing `HOLD:<key>` holds its turn until the test releases `key`.
+const HOLD: &str = "HOLD:";
+/// The key of the turn [`hold_a_turn`] holds.
+const HELD_TURN: &str = "turn";
+/// A prompt containing it starts a background Subagent whose task holds it under `child`.
+pub(crate) const SPAWN_HELD_CHILD: &str = "SPAWN a held child";
+pub(crate) const HELD_CHILD: &str = "child";
 
-/// Answers every turn at once, except one whose prompt holds it, which waits to be released.
+/// Answers every turn at once, except a turn its prompt holds, which waits for its key to be
+/// released, and a turn asked to start a held child, which calls Subagent for it.
 #[derive(Default)]
 pub(crate) struct ContractModel {
     requests: Mutex<Vec<ModelRequest>>,
-    entered: Notify,
-    release: Notify,
-    released: Mutex<VecDeque<()>>,
+    entered: Mutex<Vec<String>>,
+    changed: Notify,
+    released: Mutex<Vec<String>>,
+}
+
+fn hold_key(text: &str) -> Option<String> {
+    let start = text.find(HOLD)? + HOLD.len();
+    Some(
+        text[start..]
+            .chars()
+            .take_while(|character| character.is_alphanumeric())
+            .collect(),
+    )
+}
+
+/// The text of the user messages that end the request: the turn's prompt with any host notes
+/// that follow it.
+fn last_user_text(request: &ModelRequest) -> Option<String> {
+    let start = request
+        .messages
+        .iter()
+        .rposition(|message| message.role != Role::User)
+        .map_or(0, |index| index + 1);
+    let texts: Vec<&str> = request.messages[start..]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
 impl ContractModel {
@@ -48,24 +82,7 @@ impl ContractModel {
             .unwrap()
             .iter()
             .filter(|request| !request.tools.is_empty())
-            .filter_map(|request| {
-                let message = request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == Role::User)?;
-                Some(
-                    message
-                        .content
-                        .iter()
-                        .filter_map(|content| match content {
-                            Content::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            })
+            .filter_map(last_user_text)
             .collect()
     }
 
@@ -93,9 +110,53 @@ impl ContractModel {
         .unwrap_or_else(|_| panic!("{marker} reached {turns} turn(s): {:?}", self.prompts()));
     }
 
+    /// Waits until a turn held under `key` reached the model, once for each such turn.
+    pub(crate) async fn wait_held(&self, key: &str) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let mut entered = self.entered.lock().unwrap();
+                    if let Some(index) = entered.iter().position(|held| held == key) {
+                        entered.remove(index);
+                        return;
+                    }
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a turn held under {key} reaches the model: {:?}",
+                self.prompts()
+                    .iter()
+                    .map(|prompt| prompt.chars().take(60).collect::<String>())
+                    .collect::<Vec<_>>()
+            )
+        });
+    }
+
+    pub(crate) fn release(&self, key: &str) {
+        self.released.lock().unwrap().push(key.into());
+        self.changed.notify_waiters();
+    }
+
     pub(crate) fn release_held_turn(&self) {
-        self.released.lock().unwrap().push_back(());
-        self.release.notify_one();
+        self.release(HELD_TURN);
+    }
+
+    fn take_release(&self, key: &str) -> bool {
+        let mut released = self.released.lock().unwrap();
+        match released.iter().position(|released| released == key) {
+            Some(index) => {
+                released.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -125,17 +186,46 @@ impl ModelClient for ContractModel {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        let holds = !request.tools.is_empty()
-            && request
-                .messages
-                .last()
-                .is_some_and(|message| format!("{:?}", message.content).contains(HOLD));
+        let is_turn = !request.tools.is_empty();
+        let answers_a_tool = request.messages.last().is_some_and(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolResult { .. }))
+        });
+        let prompt = last_user_text(&request).unwrap_or_default();
         self.requests.lock().unwrap().push(request);
-        if holds {
-            self.entered.notify_one();
-            while self.released.lock().unwrap().pop_front().is_none() {
+        if is_turn && !answers_a_tool && prompt.contains(SPAWN_HELD_CHILD) {
+            return Ok(ModelOutput {
+                private_source: None,
+                content: vec![Content::ToolUse {
+                    id: "spawn".into(),
+                    name: tickloop_agent_protocol::SUBAGENT_TOOL_NAME.into(),
+                    input: serde_json::json!({
+                        "task": format!("{HOLD}{HELD_CHILD} child task"),
+                        "name": "helper",
+                        "run_in_background": true,
+                    }),
+                }],
+                usage: Usage::default(),
+                stop_reason: "tool_use".into(),
+            });
+        }
+        if is_turn
+            && !answers_a_tool
+            && let Some(key) = hold_key(&prompt)
+        {
+            self.entered.lock().unwrap().push(key.clone());
+            self.changed.notify_waiters();
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.take_release(&key) {
+                    break;
+                }
                 tokio::select! {
-                    _ = self.release.notified() => {}
+                    _ = changed => {}
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                 }
             }
@@ -170,15 +260,14 @@ pub(crate) async fn complete_turn(agent: &Agent, chat: ChatId, text: &str) {
     .expect("the turn ends");
 }
 
-/// Starts a turn the model holds, and waits until the model has it.
+/// Starts a turn the model holds until [`ContractModel::release_held_turn`], and waits until the
+/// model has it.
 pub(crate) async fn hold_a_turn(agent: &Agent, chat: ChatId, model: &ContractModel) {
-    let entered = model.entered.notified();
-    tokio::pin!(entered);
-    entered.as_mut().enable();
-    agent.submit(chat, HOLD.into()).await.unwrap();
-    tokio::time::timeout(WAIT, entered)
+    agent
+        .submit(chat, format!("{HOLD}{HELD_TURN} this turn"))
         .await
-        .expect("the held turn reaches the model");
+        .unwrap();
+    model.wait_held(HELD_TURN).await;
 }
 
 pub(crate) async fn wait_for_state(agent: &Agent, chat: ChatId, expected: LoopState) {

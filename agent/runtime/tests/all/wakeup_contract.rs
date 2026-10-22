@@ -1,181 +1,68 @@
 //! The contract every Trigger source keeps with the wake-up base, run once per source. A source
-//! only says how it hands a delivery over, how it ends, and what a crash or a second host is for
-//! it; each case below is the same for every source. Goal continuations and scheduled tasks add
-//! their instances when they join the base.
+//! says how its deliveries wait and what Plan mode does to them, how it hands a delivery over,
+//! how it ends, and what a crash or a second host is for it; each case below is the same for
+//! every source.
 //!
-//! The Tick instance runs where Tick streams run, in a process that keeps its own waits; the
-//! artifact feedback instance runs where @tickloop requests are pushed, on a durable host. Tick
-//! Updates have no durable host to push them, so the durable push case is feedback's alone.
+//! Tick Subscriptions run where Tick streams run, in a process that keeps its own waits.
+//! Artifact feedback runs there too, and on a durable host that pushes each request. Goal
+//! continuations and scheduled tasks have no producer yet: stand-ins hand their deliveries to the
+//! same entry until 06 and 08 replace them with their real sources.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tick_protocol::InstanceRef;
-use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_agent_artifacts::ClaimedFeedback;
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, LoopState, ModelIdentity,
-    PauseReason, PromptPolicy, Protocol, Receiving, Role, TickSubscriptionChange, Usage,
+    AgentHostOptions, ArtifactFeedbackHistory, ArtifactTick, ChatId, ExecutionMode, LoopState,
+    PauseReason, PromptPolicy, Receipt, Receiving, TickSubscriptionChange, TriggerSource,
 };
-use tickloop_agent_runtime::transcript::{StorePosition, TranscriptStore};
+use tickloop_agent_runtime::transcript::TranscriptStore;
 use tickloop_agent_runtime::{
-    Agent, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnRequest, WaitHosting,
+    Agent, ExternalDelivery, HarnessOptions, HarnessSeams, ToolPolicy, TurnRequest, WaitHosting,
+    mcp_tools::McpHostToolProvider,
 };
+use tickloop_agent_test_support::config;
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
-use tickloop_agent_test_support::{config, next_event};
 use tickloop_agent_transcript::{DiscardReason, InputState, Line, SettledOutcome};
-use tokio::sync::Notify;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::durable_deliveries::{claimed, linked};
-use super::durable_queue::{prompt, settled};
+use super::mcp_tools::artifact_service::ArtifactService;
+use super::wakeup_support::*;
 
-const WAIT: Duration = Duration::from_secs(10);
-/// Long enough for a delivery that was going to start a turn to have started it.
-const SETTLE: Duration = Duration::from_millis(500);
-/// A prompt containing it holds its turn until the test releases it.
-const HOLD: &str = "HOLD this turn";
 const STOPPED: Receiving = Receiving::Paused {
     reason: PauseReason::Stopped,
 };
 
-/// Answers every turn at once, except one whose prompt holds it, which waits to be released.
-#[derive(Default)]
-struct ContractModel {
-    requests: Mutex<Vec<ModelRequest>>,
-    entered: Notify,
-    release: Notify,
-    released: Mutex<VecDeque<()>>,
+/// How a source's deliveries wait while the Loop cannot take them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coalescing {
+    /// Only the latest waits, at the source.
+    LatestOnly,
+    /// Each waits on its own, queued.
+    EachItem,
+    /// One per key waits, queued; a later one of the key merges into it.
+    OnePerKey,
 }
 
-impl ContractModel {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// The text of the newest user message of each conversation request, in order.
-    fn prompts(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| !request.tools.is_empty())
-            .filter_map(|request| {
-                request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == Role::User)
-                    .map(|message| {
-                        message
-                            .content
-                            .iter()
-                            .filter_map(|content| match content {
-                                Content::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-            })
-            .collect()
-    }
-
-    /// How many turns took a prompt mentioning `marker`.
-    fn seen(&self, marker: &str) -> usize {
-        self.prompts()
-            .iter()
-            .filter(|prompt| prompt.contains(marker))
-            .count()
-    }
-
-    /// The position of the first turn whose prompt mentions `marker`.
-    fn first_turn_with(&self, marker: &str) -> Option<usize> {
-        self.prompts()
-            .iter()
-            .position(|prompt| prompt.contains(marker))
-    }
-
-    async fn wait_seen(&self, marker: &str, turns: usize) {
-        tokio::time::timeout(WAIT, async {
-            while self.seen(marker) < turns {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{marker} reached {turns} turn(s): {:?}", self.prompts()));
-    }
-
-    fn release_held_turn(&self) {
-        self.released.lock().unwrap().push_back(());
-        self.release.notify_one();
-    }
-}
-
-#[async_trait]
-impl ModelClient for ContractModel {
-    async fn generate_title(
-        &self,
-        request: ModelRequest,
-        _: UnboundedSender<ModelDelta>,
-        _: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_agent_test_support::title_output(request))
-    }
-
-    fn identity(&self) -> ModelIdentity {
-        ModelIdentity {
-            provider: tickloop_agent_protocol::ModelProvider::Api,
-            profile: "fixture".into(),
-            protocol: Protocol::Messages,
-            requested_model: "fixture".into(),
-        }
-    }
-
-    async fn complete(
-        &self,
-        request: ModelRequest,
-        events: UnboundedSender<ModelDelta>,
-        cancel: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        let holds = !request.tools.is_empty()
-            && request
-                .messages
-                .last()
-                .is_some_and(|message| format!("{:?}", message.content).contains(HOLD));
-        self.requests.lock().unwrap().push(request);
-        if holds {
-            self.entered.notify_one();
-            loop {
-                if self.released.lock().unwrap().pop_front().is_some() {
-                    break;
-                }
-                tokio::select! {
-                    _ = self.release.notified() => {}
-                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                }
-            }
-        }
-        let _ = events.send(ModelDelta::Text("ok".into()));
-        Ok(ModelOutput {
-            private_source: None,
-            content: vec![Content::Text { text: "ok".into() }],
-            usage: Usage::default(),
-            stop_reason: "end_turn".into(),
-        })
-    }
+/// What Plan mode does to a source's deliveries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnderPlan {
+    /// They are taken; the turn they start stays in Plan mode.
+    Delivered,
+    /// They wait at the source until Plan mode ends.
+    Held,
 }
 
 /// What a Trigger source is to the contract.
 #[async_trait]
 trait Source: Sized + Send + Sync {
-    /// Only the latest delivery waits while the Loop cannot take it.
-    const LATEST_ONLY: bool;
+    const COALESCING: Coalescing;
+    const UNDER_PLAN: UnderPlan;
 
     /// An Agent and a Chat whose first turn completed, with this source feeding its Loop.
     async fn new(model: Arc<ContractModel>) -> Self;
@@ -186,64 +73,14 @@ trait Source: Sized + Send + Sync {
     async fn deliver(&self, n: u64, marker: &str);
     /// The source stops standing behind what it delivered: what no turn took is withdrawn.
     async fn end(&self);
-    /// The host after a crash right after the source's last delivery was accepted: it loads the
-    /// Chat again from its history.
+    /// Whether delivery `n`, handed over again, was accepted as the ledger record of its first
+    /// hand-over, rather than refused or run anew.
+    async fn replayed(&self, n: u64) -> bool;
+    /// The host of the Chat after a crash: it loads what the store held when the host went down,
+    /// with nothing written by a graceful end.
     async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self;
     /// Another host of the same Chat, as this source's hosting allows one.
     async fn another_host(&self, model: Arc<ContractModel>) -> Self;
-}
-
-async fn complete_turn(agent: &Agent, chat: ChatId, text: &str) {
-    let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, text.into()).await.unwrap();
-    tokio::time::timeout(WAIT, async {
-        loop {
-            let event = next_event(&mut events).await;
-            if event.run_id == receipt.run_id
-                && matches!(
-                    event.kind,
-                    EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted
-                )
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("the turn ends");
-}
-
-/// Starts a turn the model holds, and waits until the model has it.
-async fn hold_a_turn<S: Source>(source: &S, model: &ContractModel) {
-    let entered = model.entered.notified();
-    tokio::pin!(entered);
-    entered.as_mut().enable();
-    source
-        .agent()
-        .submit(source.chat(), HOLD.into())
-        .await
-        .unwrap();
-    tokio::time::timeout(WAIT, entered)
-        .await
-        .expect("the held turn reaches the model");
-}
-
-async fn wait_for_state<S: Source>(source: &S, expected: LoopState) {
-    tokio::time::timeout(WAIT, async {
-        while source
-            .agent()
-            .snapshot(source.chat())
-            .await
-            .unwrap()
-            .chat_loop
-            .state
-            != expected
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("the Loop reaches {expected:?}"));
 }
 
 async fn receiving<S: Source>(source: &S) -> Receiving {
@@ -256,6 +93,23 @@ async fn receiving<S: Source>(source: &S) -> Receiving {
         .receiving
 }
 
+/// Waits until the deliveries `ran` started turns and the rest of `markers` did not.
+async fn only_these_ran(model: &ContractModel, markers: &[&str], ran: &[&str]) {
+    for marker in ran {
+        model.wait_seen(marker, 1).await;
+    }
+    tokio::time::sleep(SETTLE).await;
+    for marker in markers {
+        let expected = usize::from(ran.contains(marker));
+        assert_eq!(
+            model.seen(marker),
+            expected,
+            "{marker}: {:?}",
+            model.prompts()
+        );
+    }
+}
+
 async fn delivers_while_receiving<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
@@ -265,15 +119,15 @@ async fn delivers_while_receiving<S: Source>() {
 }
 
 /// `/stop` pauses receiving: a delivery queued before it is not taken, one after it is refused
-/// and stays with its source. Continuing takes what waited, once, and repeats nothing that
-/// already ran.
+/// and stays with its source. Continuing takes what waited, as the source coalesces it, once,
+/// and repeats nothing that already ran.
 async fn stop_pauses_and_continuing_takes_what_waited_once<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
     source.deliver(1, "ran-before-stop").await;
     model.wait_seen("ran-before-stop", 1).await;
 
-    hold_a_turn(&source, &model).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     source.deliver(2, "waited-through-stop").await;
     source.agent().stop(source.chat()).await.unwrap();
     model.release_held_turn();
@@ -283,22 +137,19 @@ async fn stop_pauses_and_continuing_takes_what_waited_once<S: Source>() {
     assert_eq!(model.seen("waited-through-stop"), 0);
     assert_eq!(model.seen("came-while-stopped"), 0);
 
-    complete_turn(source.agent(), source.chat(), "carry on").await;
+    // The user's input continues the Chat while its own turn runs, so what waited and what the
+    // source hands again meet before either is taken.
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     assert!(receiving(&source).await.is_receiving());
     source.deliver(3, "came-while-stopped").await;
-    model.wait_seen("came-while-stopped", 1).await;
-    if S::LATEST_ONLY {
-        assert_eq!(
-            model.seen("waited-through-stop"),
-            0,
-            "only the latest waits"
-        );
-    } else {
-        model.wait_seen("waited-through-stop", 1).await;
+    model.release_held_turn();
+    let markers = ["waited-through-stop", "came-while-stopped"];
+    match S::COALESCING {
+        Coalescing::LatestOnly => only_these_ran(&model, &markers, &["came-while-stopped"]).await,
+        Coalescing::EachItem => only_these_ran(&model, &markers, &markers).await,
+        Coalescing::OnePerKey => only_these_ran(&model, &markers, &["waited-through-stop"]).await,
     }
-    tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("ran-before-stop"), 1, "{:?}", model.prompts());
-    assert_eq!(model.seen("came-while-stopped"), 1, "{:?}", model.prompts());
     source.agent().shutdown().await;
 }
 
@@ -306,10 +157,10 @@ async fn stop_pauses_and_continuing_takes_what_waited_once<S: Source>() {
 async fn esc_leaves_receiving_on<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
-    hold_a_turn(&source, &model).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     source.agent().interrupt(source.chat()).await.unwrap();
     model.release_held_turn();
-    wait_for_state(&source, LoopState::Interrupted).await;
+    wait_for_state(source.agent(), source.chat(), LoopState::Interrupted).await;
     assert!(receiving(&source).await.is_receiving());
     source.deliver(1, "after-esc").await;
     model.wait_seen("after-esc", 1).await;
@@ -321,18 +172,17 @@ async fn esc_leaves_receiving_on<S: Source>() {
 async fn a_busy_loop_waits_as_the_source_coalesces<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
-    hold_a_turn(&source, &model).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     source.deliver(1, "busy-first").await;
     source.deliver(2, "busy-second").await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("busy-first") + model.seen("busy-second"), 0);
     model.release_held_turn();
-    model.wait_seen("busy-second", 1).await;
-    if S::LATEST_ONLY {
-        tokio::time::sleep(SETTLE).await;
-        assert_eq!(model.seen("busy-first"), 0, "{:?}", model.prompts());
-    } else {
-        model.wait_seen("busy-first", 1).await;
+    let markers = ["busy-first", "busy-second"];
+    match S::COALESCING {
+        Coalescing::LatestOnly => only_these_ran(&model, &markers, &["busy-second"]).await,
+        Coalescing::EachItem => only_these_ran(&model, &markers, &markers).await,
+        Coalescing::OnePerKey => only_these_ran(&model, &markers, &["busy-first"]).await,
     }
     source.agent().shutdown().await;
 }
@@ -341,7 +191,7 @@ async fn a_busy_loop_waits_as_the_source_coalesces<S: Source>() {
 async fn user_input_goes_before_trigger_input<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
-    hold_a_turn(&source, &model).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     source.deliver(1, "trigger-input").await;
     tokio::time::sleep(SETTLE).await;
     source
@@ -360,14 +210,74 @@ async fn user_input_goes_before_trigger_input<S: Source>() {
     source.agent().shutdown().await;
 }
 
-/// A delivery handed again after a crash finds its ledger record and runs nothing again.
+/// An Agent message, here a background child's completion, queued behind the same turn goes
+/// before Trigger input.
+async fn an_agent_message_goes_before_trigger_input<S: Source>() {
+    let model = ContractModel::new();
+    let source = S::new(model.clone()).await;
+    // Delegation goes through without review.
+    source
+        .agent()
+        .set_execution_mode(source.chat(), ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    source
+        .agent()
+        .submit(source.chat(), SPAWN_HELD_CHILD.into())
+        .await
+        .unwrap();
+    model.wait_held(HELD_CHILD).await;
+    wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
+    source.deliver(1, "trigger-input").await;
+    model.release(HELD_CHILD);
+    tokio::time::timeout(WAIT, async {
+        while !source
+            .agent()
+            .snapshot(source.chat())
+            .await
+            .unwrap()
+            .pending_inputs
+            .iter()
+            .any(|pending| pending.agent_message.is_some())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the child's completion queues behind the running turn");
+    let turns_before = model.prompts().len();
+    model.release_held_turn();
+    model.wait_seen("trigger-input", 1).await;
+    let after = &model.prompts()[turns_before..];
+    let completion = after
+        .iter()
+        .position(|prompt| !prompt.contains("trigger-input") && !prompt.contains("child task"));
+    let trigger = after
+        .iter()
+        .position(|prompt| prompt.contains("trigger-input"));
+    assert!(
+        completion.is_some() && completion < trigger,
+        "{:?}",
+        model.prompts()
+    );
+    source.agent().shutdown().await;
+}
+
+/// A delivery handed again after a crash finds its ledger record: it is accepted as that
+/// record, and runs once.
 async fn a_repeated_delivery_after_a_crash_runs_once<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
     source.deliver(1, "delivered-once").await;
     model.wait_seen("delivered-once", 1).await;
+    wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
     let reopened = source.crash_and_reopen(model.clone()).await;
     reopened.deliver(1, "delivered-once").await;
+    assert!(
+        reopened.replayed(1).await,
+        "the repeated delivery is answered by its record"
+    );
     tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("delivered-once"), 1, "{:?}", model.prompts());
     reopened.agent().shutdown().await;
@@ -403,12 +313,12 @@ async fn two_hosts_run_one_delivery_once<S: Source>() {
 async fn an_ended_source_withdraws_what_waited<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
-    hold_a_turn(&source, &model).await;
+    hold_a_turn(source.agent(), source.chat(), &model).await;
     source.deliver(1, "withdrawn-delivery").await;
     tokio::time::sleep(SETTLE).await;
     source.end().await;
     model.release_held_turn();
-    wait_for_state(&source, LoopState::Idle).await;
+    wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(model.seen("withdrawn-delivery"), 0, "{:?}", model.prompts());
     assert!(
@@ -423,8 +333,9 @@ async fn an_ended_source_withdraws_what_waited<S: Source>() {
     source.agent().shutdown().await;
 }
 
-/// Plan mode takes deliveries, and the turn they start stays in Plan mode.
-async fn plan_mode_takes_deliveries_under_plan<S: Source>() {
+/// Plan mode takes the deliveries of a source that keeps going under it, and the turn they
+/// start stays in Plan mode; a source that only continues the work waits.
+async fn plan_mode_takes_or_holds_as_the_source_declares<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
     source
@@ -433,18 +344,17 @@ async fn plan_mode_takes_deliveries_under_plan<S: Source>() {
         .await
         .unwrap();
     source.deliver(1, "while-planning").await;
-    model.wait_seen("while-planning", 1).await;
-    wait_for_state(&source, LoopState::Idle).await;
-    assert_eq!(
-        source
-            .agent()
-            .snapshot(source.chat())
-            .await
-            .unwrap()
-            .policy
-            .mode,
-        ExecutionMode::Plan
-    );
+    match S::UNDER_PLAN {
+        UnderPlan::Delivered => model.wait_seen("while-planning", 1).await,
+        UnderPlan::Held => {
+            tokio::time::sleep(SETTLE).await;
+            assert_eq!(model.seen("while-planning"), 0, "{:?}", model.prompts());
+        }
+    }
+    wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
+    let snapshot = source.agent().snapshot(source.chat()).await.unwrap();
+    assert_eq!(snapshot.policy.mode, ExecutionMode::Plan);
+    assert!(snapshot.pending_inputs.is_empty());
     source.agent().shutdown().await;
 }
 
@@ -479,6 +389,11 @@ macro_rules! contract {
             }
 
             #[tokio::test(flavor = "multi_thread")]
+            async fn an_agent_message_goes_before_trigger_input() {
+                super::an_agent_message_goes_before_trigger_input::<$source>().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
             async fn a_repeated_delivery_after_a_crash_runs_once() {
                 super::a_repeated_delivery_after_a_crash_runs_once::<$source>().await;
             }
@@ -494,82 +409,157 @@ macro_rules! contract {
             }
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn plan_mode_takes_deliveries_under_plan() {
-                super::plan_mode_takes_deliveries_under_plan::<$source>().await;
+            async fn plan_mode_takes_or_holds_as_the_source_declares() {
+                super::plan_mode_takes_or_holds_as_the_source_declares::<$source>().await;
             }
         }
     };
 }
 
 contract!(tick_subscription, TickSource);
-contract!(artifact_feedback, FeedbackSource);
+contract!(artifact_feedback_local, LocalFeedbackSource);
+contract!(artifact_feedback_durable, DurableFeedbackSource);
+contract!(scheduled_task_stand_in, ScheduledStandIn);
+contract!(goal_continuation_stand_in, GoalStandIn);
 
-/// A Shell Tick subscription of a saved Chat, in a process that keeps its own waits.
-struct TickSource {
-    _directory: Arc<tempfile::TempDir>,
+/// The receipts each hand-over of a delivery got, for sources that hand over synchronously.
+#[derive(Default)]
+struct HandOvers(Mutex<HashMap<u64, Vec<Result<Receipt, String>>>>);
+
+impl HandOvers {
+    fn record(&self, n: u64, outcome: Result<Receipt, String>) {
+        self.0.lock().unwrap().entry(n).or_default().push(outcome);
+    }
+
+    /// The last hand-over of `n` was accepted under the receipt of the first accepted one.
+    fn replayed(&self, n: u64) -> bool {
+        let hand_overs = self.0.lock().unwrap();
+        let Some(outcomes) = hand_overs.get(&n) else {
+            return false;
+        };
+        let first = outcomes.iter().find_map(|outcome| outcome.as_ref().ok());
+        match (first, outcomes.last()) {
+            (Some(first), Some(Ok(last))) => outcomes.len() > 1 && first.run_id == last.run_id,
+            (Some(_), Some(Err(_)) | None) | (None, _) => false,
+        }
+    }
+
+    fn refused(&self, n: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&n)
+            .and_then(|outcomes| outcomes.last())
+            .is_some_and(Result::is_err)
+    }
+}
+
+/// A saved Chat in a process that keeps its own waits, its state root inside `directory`.
+struct ProcessChat {
+    directory: Arc<tempfile::TempDir>,
     root: std::path::PathBuf,
     agent: Agent,
     chat: ChatId,
+}
+
+impl ProcessChat {
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let root = directory.path().join("state");
+        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        complete_turn(&agent, chat, "get ready").await;
+        Self {
+            directory,
+            root,
+            agent,
+            chat,
+        }
+    }
+
+    /// The same Chat in another process on `root`, set up by `prepare` before it loads the
+    /// Chat, and continued by its user.
+    async fn resumed(
+        &self,
+        root: std::path::PathBuf,
+        model: Arc<ContractModel>,
+        prepare: impl AsyncFnOnce(&Agent),
+    ) -> Self {
+        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
+        prepare(&agent).await;
+        agent.resume_chat(self.chat).await.unwrap();
+        complete_turn(&agent, self.chat, "resume here").await;
+        Self {
+            directory: self.directory.clone(),
+            root,
+            agent,
+            chat: self.chat,
+        }
+    }
+
+    /// The Chat's state root as a process that crashes now leaves it; the crashed process is
+    /// gone.
+    async fn crashed(&self) -> std::path::PathBuf {
+        self.agent.flush_transcripts().await;
+        let image = crash_image(&self.root, self.directory.path());
+        self.agent.shutdown().await;
+        image
+    }
+}
+
+/// A Shell Tick subscription of a saved Chat, in a process that keeps its own waits.
+struct TickSource {
+    process: ProcessChat,
     shell: ShellTick,
     task: Uuid,
 }
 
 impl TickSource {
-    /// An instance on `root` resuming `chat`, continued by its user and watching the Shell Tick.
-    async fn resumed(
-        directory: Arc<tempfile::TempDir>,
-        root: std::path::PathBuf,
-        chat: ChatId,
-        task: Uuid,
-        model: Arc<ContractModel>,
-    ) -> Self {
-        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
-        let shell = ShellTick::new(task);
-        shell.install(&agent).await;
-        agent.resume_chat(chat).await.unwrap();
-        complete_turn(&agent, chat, "resume here").await;
-        shell.wait_until_live(&agent, chat).await;
+    async fn resumed(&self, root: std::path::PathBuf, model: Arc<ContractModel>) -> Self {
+        let shell = ShellTick::new(self.task);
+        let process = self
+            .process
+            .resumed(root, model, async |agent: &Agent| {
+                shell.install(agent).await
+            })
+            .await;
+        shell.wait_until_live(&process.agent, process.chat).await;
         Self {
-            _directory: directory,
-            root,
-            agent,
-            chat,
+            process,
             shell,
-            task,
+            task: self.task,
         }
     }
 }
 
 #[async_trait]
 impl Source for TickSource {
-    const LATEST_ONLY: bool = true;
+    const COALESCING: Coalescing = Coalescing::LatestOnly;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let directory = Arc::new(tempfile::tempdir().unwrap());
         let root = directory.path().join("state");
-        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
         let task = Uuid::new_v4();
-        let shell = ShellTick::new(task);
-        shell.install(&agent).await;
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        complete_turn(&agent, chat, "watch the Shell").await;
-        shell.subscribe(&agent, chat).await;
+        let (agent, shell, chat) = subscribed_process(&root, directory.path(), task, model).await;
         Self {
-            _directory: directory,
-            root,
-            agent,
-            chat,
+            process: ProcessChat {
+                directory,
+                root,
+                agent,
+                chat,
+            },
             shell,
             task,
         }
     }
 
     fn agent(&self) -> &Agent {
-        &self.agent
+        &self.process.agent
     }
 
     fn chat(&self) -> ChatId {
-        self.chat
+        self.process.chat
     }
 
     async fn deliver(&self, n: u64, marker: &str) {
@@ -577,70 +567,219 @@ impl Source for TickSource {
     }
 
     async fn end(&self) {
-        let subscription = self.agent.tick_subscriptions(self.chat).await.unwrap()[0].id;
-        self.agent
-            .update_tick_subscription(self.chat, subscription, TickSubscriptionChange::Cancel)
+        let subscription = self.agent().tick_subscriptions(self.chat()).await.unwrap()[0].id;
+        self.agent()
+            .update_tick_subscription(self.chat(), subscription, TickSubscriptionChange::Cancel)
             .await
             .unwrap();
     }
 
-    /// The watermark a delivered update leaves is lost with the crash, so only the ledger
-    /// stands between the repeated update and a second run.
+    /// This process's subscription, which started without any delivery, got the base's answer
+    /// for the update.
+    async fn replayed(&self, _n: u64) -> bool {
+        tokio::time::timeout(WAIT, async {
+            while self.agent().tick_subscriptions(self.chat()).await.unwrap()[0]
+                .last_delivery_ms
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The crash came after the delivery's acceptance was durable and before its watermark was
+    /// written, so only the ledger stands between the repeated update and a second run.
     async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
-        self.agent.shutdown().await;
-        for watermark in files_under(&self.root, "tick-watermarks") {
+        let image = self.process.crashed().await;
+        for watermark in files_under(&image, "tick-watermarks") {
             std::fs::remove_file(watermark).unwrap();
         }
-        Self::resumed(self._directory, self.root, self.chat, self.task, model).await
+        self.resumed(image, model).await
     }
 
     /// Another process holding the same Chat at the same time; only the lease holder delivers.
     async fn another_host(&self, model: Arc<ContractModel>) -> Self {
-        Self::resumed(
-            self._directory.clone(),
-            self.root.clone(),
-            self.chat,
-            self.task,
-            model,
-        )
-        .await
+        self.resumed(self.process.root.clone(), model).await
     }
 }
 
-fn files_under(directory: &std::path::Path, parent: &str) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(&directory)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path
-                .parent()
-                .is_some_and(|parent_path| parent_path.ends_with(parent))
-            {
-                found.push(path);
-            }
+/// An artifact linked to a saved Chat in a process that keeps its own waits; each request is
+/// taken in as the watcher takes a claimed one, through the local inbox.
+struct LocalFeedbackSource {
+    process: ProcessChat,
+    service: Arc<ArtifactService>,
+    origin: String,
+    account: String,
+    hand_overs: HandOvers,
+}
+
+fn fixture_artifact(service: &ArtifactService) -> ArtifactTick {
+    ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: service.origin.clone(),
+        title: "Fixture".into(),
+        format: "markdown".into(),
+        url: tickloop_agent_artifacts::artifact_url(&service.origin, "doc"),
+        access_role: "owner".into(),
+        added_at_ms: 1,
+    }
+}
+
+fn claim(origin: &str, account: &str, n: u64, marker: &str) -> ExternalDelivery {
+    ExternalDelivery::from_claim(
+        origin,
+        account,
+        "doc",
+        &ClaimedFeedback {
+            delivery_id: Uuid::from_u128(u128::from(n)).to_string(),
+            feedback_id: format!("feedback-{n}"),
+            claim_id: Uuid::new_v4().to_string(),
+            fencing_token: "fence-secret".into(),
+            lease_expires_at: "2099-01-01T00:00:00Z".into(),
+            input: serde_json::json!({"messages": [{"text": marker}]}),
+        },
+    )
+    .expect("the claim reaches the model")
+}
+
+async fn hand_over(
+    agent: &Agent,
+    chat: ChatId,
+    delivery: ExternalDelivery,
+) -> Result<Receipt, String> {
+    agent
+        .advance(chat, TurnRequest::deliver(delivery))
+        .await
+        .map(|turn| turn.receipt().clone())
+        .map_err(|error| error.to_string())
+}
+
+impl LocalFeedbackSource {
+    fn sign_in(agent: &Agent, service: &ArtifactService, directory: &std::path::Path) {
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(
+                service.client(directory),
+                None,
+            )))
+            .unwrap();
+    }
+
+    async fn resumed(
+        &self,
+        root: std::path::PathBuf,
+        model: Arc<ContractModel>,
+        hand_overs: HandOvers,
+    ) -> Self {
+        let service = self.service.clone();
+        let directory = self.process.directory.clone();
+        let process = self
+            .process
+            .resumed(root, model, async |agent: &Agent| {
+                Self::sign_in(agent, &service, directory.path())
+            })
+            .await;
+        Self {
+            process,
+            service: self.service.clone(),
+            origin: self.origin.clone(),
+            account: self.account.clone(),
+            hand_overs,
         }
     }
-    found
+}
+
+#[async_trait]
+impl Source for LocalFeedbackSource {
+    const COALESCING: Coalescing = Coalescing::EachItem;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let service = Arc::new(ArtifactService::start().await);
+        let process = ProcessChat::new(model).await;
+        service.login(process.directory.path()).await;
+        Self::sign_in(&process.agent, &service, process.directory.path());
+        process
+            .agent
+            .link_artifact(
+                process.chat,
+                &fixture_artifact(&service),
+                ArtifactFeedbackHistory::NewOnly,
+            )
+            .await
+            .unwrap();
+        let binding = process
+            .agent
+            .snapshot(process.chat)
+            .await
+            .unwrap()
+            .chat_loop
+            .event_sources[0]
+            .clone();
+        Self {
+            process,
+            service,
+            origin: binding.origin,
+            account: binding.account_id,
+            hand_overs: HandOvers::default(),
+        }
+    }
+
+    fn agent(&self) -> &Agent {
+        &self.process.agent
+    }
+
+    fn chat(&self) -> ChatId {
+        self.process.chat
+    }
+
+    async fn deliver(&self, n: u64, marker: &str) {
+        let delivery = claim(&self.origin, &self.account, n, marker);
+        let outcome = self
+            .agent()
+            .receive_feedback_for_tests(self.chat(), delivery)
+            .await
+            .map_err(|error| error.to_string());
+        self.hand_overs.record(n, outcome);
+    }
+
+    async fn end(&self) {
+        let instance = InstanceRef::artifact(&self.origin, "doc").unwrap();
+        self.agent()
+            .remove_artifact_tick(self.chat(), &instance.to_string())
+            .await
+            .unwrap();
+    }
+
+    async fn replayed(&self, n: u64) -> bool {
+        self.hand_overs.replayed(n)
+    }
+
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        let image = self.process.crashed().await;
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        self.resumed(image, model, hand_overs).await
+    }
+
+    /// Another process holding the same Chat at the same time; only the lease holder delivers.
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        self.resumed(self.process.root.clone(), model, HandOvers::default())
+            .await
+    }
 }
 
 /// A Chat on a durable host whose Loop is linked to an artifact; the host pushes each
 /// @tickloop request with `TurnOp::Deliver`.
-struct FeedbackSource {
+struct DurableFeedbackSource {
     store: Arc<InMemoryTranscriptStore>,
     faults: Arc<FaultyTranscriptStore>,
     agent: Agent,
     chat: ChatId,
+    hand_overs: HandOvers,
 }
 
-const FEEDBACK_ORIGIN: &str = "https://tickloop.ai/artifact";
-const FEEDBACK_ARTIFACT: &str = "doc";
+const DURABLE_ORIGIN: &str = "https://tickloop.ai/artifact";
 
 fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ContractModel>) -> Agent {
     Agent::with_seams(
@@ -656,6 +795,7 @@ fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ContractModel>) -
             },
             tools: ToolPolicy {
                 questions: true,
+                delegation: true,
                 ..ToolPolicy::web_fetch_only()
             },
             waits: WaitHosting::Durable,
@@ -665,11 +805,12 @@ fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ContractModel>) -
     .unwrap()
 }
 
-impl FeedbackSource {
+impl DurableFeedbackSource {
     async fn loaded(
         store: Arc<InMemoryTranscriptStore>,
         chat: ChatId,
         model: Arc<ContractModel>,
+        hand_overs: HandOvers,
     ) -> Self {
         let faults = Arc::new(FaultyTranscriptStore::new(store.clone()));
         let agent = durable_harness(faults.clone(), model);
@@ -679,30 +820,30 @@ impl FeedbackSource {
             faults,
             agent,
             chat,
+            hand_overs,
         }
     }
 }
 
 #[async_trait]
-impl Source for FeedbackSource {
-    const LATEST_ONLY: bool = false;
+impl Source for DurableFeedbackSource {
+    const COALESCING: Coalescing = Coalescing::EachItem;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let store = Arc::new(InMemoryTranscriptStore::new());
         let setup = durable_harness(store.clone(), model.clone());
         let chat = setup.create_chat_without_folder().await.unwrap();
-        let ready = prompt("get ready", ParentSelection::CurrentLeaf);
-        let loop_id = setup
-            .advance(chat, ready.clone())
-            .await
-            .unwrap()
-            .receipt()
-            .loop_id;
-        settled(&setup, chat, ready.input_id).await;
+        complete_turn(&setup, chat, "get ready").await;
+        let loop_id = setup.snapshot(chat).await.unwrap().chat_loop.id;
         setup.sync().await.unwrap();
         setup.shutdown().await;
-        store.seed(chat, linked(store.lines(chat), loop_id), StorePosition(1));
-        Self::loaded(store, chat, model).await
+        store.seed(
+            chat,
+            super::durable_deliveries::linked(store.lines(chat), loop_id),
+            store.position(chat).unwrap(),
+        );
+        Self::loaded(store, chat, model, HandOvers::default()).await
     }
 
     fn agent(&self) -> &Agent {
@@ -713,79 +854,189 @@ impl Source for FeedbackSource {
         self.chat
     }
 
+    /// A refusal leaves the request with the host, which pushes it again later.
     async fn deliver(&self, n: u64, marker: &str) {
-        let delivery = claimed(
-            &format!("feedback-{n}"),
-            Uuid::from_u128(u128::from(n)),
-            "fence-secret",
-            marker,
-        );
-        // A refusal leaves the request with the host, which pushes it again later.
-        let _ = self
-            .agent
-            .advance(self.chat, TurnRequest::deliver(delivery))
-            .await;
+        let delivery = claim(DURABLE_ORIGIN, "owner", n, marker);
+        self.hand_overs
+            .record(n, hand_over(&self.agent, self.chat, delivery).await);
     }
 
     async fn end(&self) {
-        let instance = InstanceRef::artifact(FEEDBACK_ORIGIN, FEEDBACK_ARTIFACT).unwrap();
+        let instance = InstanceRef::artifact(DURABLE_ORIGIN, "doc").unwrap();
         self.agent
             .remove_artifact_tick(self.chat, &instance.to_string())
             .await
             .unwrap();
     }
 
-    /// The store commits the host's last write and loses its acknowledgement, and the host goes
-    /// down; the next host loads what was committed.
+    async fn replayed(&self, n: u64) -> bool {
+        self.hand_overs.replayed(n)
+    }
+
+    /// The store commits the host's last write and loses its acknowledgement, and the host
+    /// goes down there: the next host loads what was committed, nothing more.
     async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
         self.faults.lose_next_acknowledgement();
         let _ = self.agent.sync().await;
+        let image = Arc::new(InMemoryTranscriptStore::new());
+        image.seed(
+            self.chat,
+            self.store.lines(self.chat),
+            self.store.position(self.chat).unwrap(),
+        );
         self.agent.shutdown().await;
-        Self::loaded(self.store, self.chat, model).await
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        Self::loaded(image, self.chat, model, hand_overs).await
     }
 
     /// The host the family moves to: this one hands the Chat over first.
     async fn another_host(&self, model: Arc<ContractModel>) -> Self {
         self.agent.sync().await.unwrap();
         self.agent.shutdown().await;
-        Self::loaded(self.store.clone(), self.chat, model).await
+        Self::loaded(self.store.clone(), self.chat, model, HandOvers::default()).await
     }
 }
+
+/// A stand-in for a source with no producer yet, handing its deliveries to the same entry.
+struct StandIn {
+    process: ProcessChat,
+    source: fn(u64) -> TriggerSource,
+    hand_overs: HandOvers,
+}
+
+impl StandIn {
+    async fn new(model: Arc<ContractModel>, source: fn(u64) -> TriggerSource) -> Self {
+        Self {
+            process: ProcessChat::new(model).await,
+            source,
+            hand_overs: HandOvers::default(),
+        }
+    }
+
+    async fn deliver(&self, n: u64, marker: &str) {
+        let outcome = self
+            .process
+            .agent
+            .deliver_trigger_for_tests(self.process.chat, (self.source)(n), marker)
+            .await;
+        self.hand_overs
+            .record(n, outcome.map_err(|error| error.to_string()));
+    }
+
+    async fn end(&self) {
+        let kind = (self.source)(0).kind();
+        self.process
+            .agent
+            .withdraw_trigger_for_tests(self.process.chat, |queued| queued.kind() == kind)
+            .await;
+    }
+
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        let image = self.process.crashed().await;
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        Self {
+            process: self
+                .process
+                .resumed(image, model, async |_: &Agent| {})
+                .await,
+            source: self.source,
+            hand_overs,
+        }
+    }
+
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        Self {
+            process: self
+                .process
+                .resumed(self.process.root.clone(), model, async |_: &Agent| {})
+                .await,
+            source: self.source,
+            hand_overs: HandOvers::default(),
+        }
+    }
+}
+
+fn scheduled_run(n: u64) -> TriggerSource {
+    scheduled("contract", n)
+}
+
+fn goal_continuation(n: u64) -> TriggerSource {
+    TriggerSource::GoalContinuation {
+        goal_id: Uuid::from_u128(7),
+        after_run: Uuid::from_u128(u128::from(n)),
+    }
+}
+
+/// Scheduled runs of one task: one waits at a time, and Plan mode takes them.
+struct ScheduledStandIn(StandIn);
+
+/// Continuations of one Goal: one waits at a time, and Plan mode holds them back.
+struct GoalStandIn(StandIn);
+
+macro_rules! stand_in {
+    ($name:ident, $source:expr, $under_plan:expr) => {
+        #[async_trait]
+        impl Source for $name {
+            const COALESCING: Coalescing = Coalescing::OnePerKey;
+            const UNDER_PLAN: UnderPlan = $under_plan;
+
+            async fn new(model: Arc<ContractModel>) -> Self {
+                Self(StandIn::new(model, $source).await)
+            }
+
+            fn agent(&self) -> &Agent {
+                &self.0.process.agent
+            }
+
+            fn chat(&self) -> ChatId {
+                self.0.process.chat
+            }
+
+            async fn deliver(&self, n: u64, marker: &str) {
+                self.0.deliver(n, marker).await;
+            }
+
+            async fn end(&self) {
+                self.0.end().await;
+            }
+
+            async fn replayed(&self, n: u64) -> bool {
+                self.0.hand_overs.replayed(n)
+            }
+
+            async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+                Self(self.0.crash_and_reopen(model).await)
+            }
+
+            async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+                Self(self.0.another_host(model).await)
+            }
+        }
+    };
+}
+
+stand_in!(ScheduledStandIn, scheduled_run, UnderPlan::Delivered);
+stand_in!(GoalStandIn, goal_continuation, UnderPlan::Held);
 
 /// The durable host pushes a request while the Loop is paused: it is refused and stays with the
 /// host, and pushed again after the Chat is continued it runs once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_durable_hosts_push_goes_through_the_same_entry() {
     let model = ContractModel::new();
-    let source = FeedbackSource::new(model.clone()).await;
+    let source = DurableFeedbackSource::new(model.clone()).await;
     source.agent.stop(source.chat).await.unwrap();
-    let delivery = claimed(
-        "feedback-9",
-        Uuid::from_u128(9),
-        "fence-secret",
-        "pushed-while-paused",
-    );
+    source.deliver(9, "pushed-while-paused").await;
     assert!(
-        source
-            .agent
-            .advance(source.chat, TurnRequest::deliver(delivery.clone()))
-            .await
-            .is_err(),
+        source.hand_overs.refused(9),
         "a paused Loop refuses the push"
     );
     complete_turn(&source.agent, source.chat, "continue").await;
-    let turn = source
-        .agent
-        .advance(source.chat, TurnRequest::deliver(delivery.clone()))
-        .await
-        .unwrap();
+    source.deliver(9, "pushed-while-paused").await;
     model.wait_seen("pushed-while-paused", 1).await;
-    let again = source
-        .agent
-        .advance(source.chat, TurnRequest::deliver(delivery))
-        .await
-        .unwrap();
-    assert_eq!(again.receipt().run_id, turn.receipt().run_id);
+    source.deliver(9, "pushed-while-paused").await;
+    assert!(source.hand_overs.replayed(9));
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("pushed-while-paused"), 1);
     source.agent.shutdown().await;
 }
 
@@ -793,14 +1044,14 @@ async fn a_durable_hosts_push_goes_through_the_same_entry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unlinked_artifacts_waiting_request_is_withdrawn_with_its_reason() {
     let model = ContractModel::new();
-    let source = FeedbackSource::new(model.clone()).await;
-    hold_a_turn(&source, &model).await;
+    let source = DurableFeedbackSource::new(model.clone()).await;
+    hold_a_turn(&source.agent, source.chat, &model).await;
     source.deliver(4, "unlinked-request").await;
     source.end().await;
     model.release_held_turn();
-    wait_for_state(&source, LoopState::Idle).await;
+    wait_for_state(&source.agent, source.chat, LoopState::Idle).await;
     source.agent.sync().await.unwrap();
-    let input_id = claimed("feedback-4", Uuid::from_u128(4), "fence-secret", "").input_id();
+    let input_id = claim(DURABLE_ORIGIN, "owner", 4, "").input_id();
     let state = source
         .store
         .lines(source.chat)

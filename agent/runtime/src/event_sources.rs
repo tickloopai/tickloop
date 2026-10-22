@@ -1150,6 +1150,32 @@ impl Agent {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl Agent {
+    /// Takes `delivery` in as the watcher does once it claimed the request: saved in the local
+    /// inbox, then handed to the Loop as the inbox hands each request.
+    #[doc(hidden)]
+    pub async fn receive_feedback_for_tests(
+        &self,
+        chat_id: ChatId,
+        delivery: ExternalDelivery,
+    ) -> Result<Receipt, AgentError> {
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
+                .stage(feedback_inbox::FeedbackInput::new(
+                    delivery.identity(chat_id, chat.snapshot.chat_loop.id),
+                    delivery.prompt.clone(),
+                ))
+                .map_err(|error| AgentError::Storage(error.to_string()))?;
+        }
+        self.advance(chat_id, super::TurnRequest::deliver(delivery))
+            .await
+            .map(|turn| turn.receipt().clone())
+    }
+}
+
 #[cfg(test)]
 mod feedback_admission_tests {
     use super::*;
