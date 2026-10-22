@@ -256,13 +256,6 @@ impl Lifecycle {
         );
     }
 
-    /// The ledger holds an input of the Loop `loop_id`.
-    pub(crate) fn knows_loop(&self, loop_id: Uuid) -> bool {
-        self.inputs
-            .values()
-            .any(|input| input.record.loop_id == loop_id)
-    }
-
     pub(crate) fn feedback_entries(&self) -> impl Iterator<Item = &InputEntry> {
         self.inputs
             .values()

@@ -94,12 +94,6 @@ pub enum WorkerRequest {
         chat: Uuid,
         instance: InstanceRef,
     },
-    /// Root Chat `chat` stopped its direct child `child` with StopSubagent.
-    EndStoppedChild {
-        chat: Uuid,
-        child: Uuid,
-        operation: Uuid,
-    },
     /// A one-time grant for this worker to start the command `chat` approved and checked last.
     AllowShellSpawn {
         chat: Uuid,
@@ -159,7 +153,6 @@ impl WorkerRequest {
             Self::ListHostedTicks { .. }
             | Self::GetHostedOperationReceipt { .. }
             | Self::AllowHostedView { .. }
-            | Self::EndStoppedChild { .. }
             | Self::AllowShellSpawn { .. }
             | Self::AllowShellView { .. } => None,
         }
@@ -173,7 +166,6 @@ impl WorkerRequest {
             | Self::ListHostedTicks { chat, .. }
             | Self::GetHostedOperationReceipt { chat, .. }
             | Self::AllowHostedView { chat, .. }
-            | Self::EndStoppedChild { chat, .. }
             | Self::AllowShellSpawn { chat, .. }
             | Self::AllowShellView { chat, .. } => *chat,
         }

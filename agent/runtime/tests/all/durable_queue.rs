@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{AgentHostOptions, ChatId, Content, PromptPolicy, Usage};
 use tickloop_agent_runtime::transcript::{StorePosition, TranscriptStore};
@@ -20,7 +19,7 @@ use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
 use tickloop_agent_test_support::{call, config, text};
 use tickloop_agent_transcript::{
-    InputOp, InputState, InterruptedBy, Line, ResponseEnding, ResponseState, SettledOutcome,
+    InputState, InterruptedBy, Line, ResponseEnding, ResponseState, SettledOutcome,
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -153,7 +152,6 @@ pub(super) fn harness(
             },
             tools: match waits {
                 WaitHosting::Durable => ToolPolicy {
-                    goals: true,
                     questions: true,
                     ..ToolPolicy::web_fetch_only()
                 },
@@ -173,7 +171,6 @@ pub(super) fn prompt(text: &str, after: ParentSelection) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -322,80 +319,6 @@ async fn the_third_lost_host_in_a_row_fails_the_input_and_a_handover_does_not_co
 }
 
 #[tokio::test]
-async fn a_goal_queued_for_itself_is_queued_again_only_under_durable_waits() {
-    for waits in [WaitHosting::Process, WaitHosting::Durable] {
-        let store = Arc::new(InMemoryTranscriptStore::new());
-        let model = Script::new(vec![
-            Step::Reply(call(
-                "goal",
-                tickloop_agent_tools::START_GOAL_TOOL_NAME,
-                json!({"goal": "an independent goal"}),
-            )),
-            Step::Hang,
-        ]);
-        let first = harness(store.clone(), model.clone(), WaitHosting::Durable);
-        let chat = first.create_chat_without_folder().await.unwrap();
-        first
-            .advance(
-                chat,
-                prompt("start another goal", ParentSelection::CurrentLeaf),
-            )
-            .await
-            .unwrap();
-        model.until_holding().await;
-        let store = lost_holder(&first, &store, chat).await;
-        let goal = store
-            .lines(chat)
-            .into_iter()
-            .find_map(|line| match line {
-                Line::Input(entry) if entry.op == InputOp::Goal => Some(entry),
-                _ => None,
-            })
-            .expect("the goal is a ledger input");
-        assert_eq!(goal.state, InputState::Accepted);
-        assert!(
-            goal.queued.is_some(),
-            "it carries its content until it starts"
-        );
-
-        let model = Script::new(vec![
-            Step::Reply(text("continued")),
-            Step::Reply(text("goal done")),
-        ]);
-        let next = harness(store.clone(), model.clone(), waits);
-        next.resume_chat(chat).await.unwrap();
-        match waits {
-            WaitHosting::Process => {
-                next.sync().await.unwrap();
-                assert_eq!(
-                    input_state(&store.lines(chat), goal.input_id),
-                    Some(InputState::Settled {
-                        outcome: SettledOutcome::Interrupted {
-                            by: InterruptedBy::Host
-                        }
-                    })
-                );
-                assert!(model.requests().is_empty());
-            }
-            WaitHosting::Durable => {
-                assert!(matches!(
-                    settled(&next, chat, goal.input_id).await,
-                    SettledOutcome::Completed { .. }
-                ));
-                assert!(
-                    model
-                        .requests()
-                        .iter()
-                        .any(|request| request.contains("an independent goal"))
-                );
-            }
-        }
-        next.shutdown().await;
-        first.shutdown().await;
-    }
-}
-
-#[tokio::test]
 async fn a_repeated_input_still_finds_its_ledger_record_after_folding() {
     const TURNS: usize = 140;
     let store = Arc::new(InMemoryTranscriptStore::new());
@@ -450,13 +373,13 @@ async fn a_repeated_input_still_finds_its_ledger_record_after_folding() {
         settled(&next, chat, following.input_id).await;
         loaded.push((
             serde_json::to_string(&snapshot.messages).unwrap(),
-            serde_json::to_string(&snapshot.loops).unwrap(),
+            serde_json::to_string(&snapshot.chat_loop).unwrap(),
             model.requests(),
         ));
         next.shutdown().await;
     }
     assert_eq!(loaded[0].0, loaded[1].0, "the conversation");
-    assert_eq!(loaded[0].1, loaded[1].1, "the Loops");
+    assert_eq!(loaded[0].1, loaded[1].1, "the Loop");
     assert_eq!(loaded[0].2.len(), 1);
     let normalize = |request: &str| {
         request
@@ -500,7 +423,6 @@ async fn inputs_queued_behind_a_suspended_run_are_queued_again_in_their_order() 
     let follow_ups = ["also keep it brief", "and add a chart"].map(|text| TurnRequest {
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: Some(turn.receipt().loop_id),
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()

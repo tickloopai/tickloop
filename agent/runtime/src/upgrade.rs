@@ -434,8 +434,9 @@ impl Agent {
             for command in tools.user_commands().await {
                 self.record_user_shell(id, command).await?;
             }
-            for goal in saved.snapshot.loops {
-                if goal.trigger.is_some_and(|trigger| trigger.armed) {
+            {
+                let chat_loop = saved.snapshot.chat_loop;
+                if chat_loop.trigger.is_some_and(|trigger| trigger.armed) {
                     let cancel = self.inner.shutdown.child_token();
                     self.inner
                         .chats
@@ -444,14 +445,14 @@ impl Agent {
                         .get_mut(&id)
                         .unwrap()
                         .trigger_cancellations
-                        .insert(goal.id, cancel);
+                        .insert(chat_loop.id, cancel);
                 }
-                if goal
+                if chat_loop
                     .event_sources
                     .iter()
                     .any(|source| !source.resume_required)
                 {
-                    self.start_event_source_watcher(id, goal.id).await;
+                    self.start_event_source_watcher(id, chat_loop.id).await;
                 }
             }
             self.start_feedback_cleanup(id).await;

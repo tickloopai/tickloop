@@ -33,7 +33,7 @@ async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
     let parent = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(parent, None, "Audit the reports".into())
+        .submit(parent, "Audit the reports".into())
         .await
         .unwrap();
     loop {
@@ -76,10 +76,7 @@ async fn invalid_handles_never_create_a_child_or_reserve_a_name() {
         );
         let parent = core.create_chat(directory.path().into()).await.unwrap();
         let mut events = core.subscribe();
-        let receipt = core
-            .submit(parent, None, "Check handles".into())
-            .await
-            .unwrap();
+        let receipt = core.submit(parent, "Check handles".into()).await.unwrap();
         let mut refused = false;
         loop {
             let event = tickloop_agent_test_support::next_event(&mut events).await;
@@ -127,7 +124,7 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
     let parent = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(parent, None, "Audit both files".into())
+        .submit(parent, "Audit both files".into())
         .await
         .unwrap();
     loop {
@@ -158,7 +155,7 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
     restored.resume_chat(parent).await.unwrap();
     let mut events = restored.subscribe();
     let receipt = restored
-        .submit(parent, Some(receipt.loop_id), "Audit the third file".into())
+        .submit(parent, "Audit the third file".into())
         .await
         .unwrap();
     loop {
@@ -369,7 +366,6 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
         &access,
         AgentCommand::Submit {
             execution: parent,
-            target_loop: None,
             input: UserInput::Text {
                 text: "Delegate the scoped host read.".into(),
                 contexts: vec![],
@@ -443,10 +439,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
                 workspace: Some(workspace.into()),
             });
         }
-        let CommandResult::Loaded {
-            execution,
-            snapshot,
-        } = access_command(
+        let CommandResult::Loaded { execution, .. } = access_command(
             &access,
             AgentCommand::LoadRecord {
                 record: TranscriptRef {
@@ -466,7 +459,6 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
             &access,
             AgentCommand::Submit {
                 execution,
-                target_loop: Some(snapshot.conversation.loops[0].id),
                 input: UserInput::Text {
                     text: "Read the original host scope.".into(),
                     contexts: vec![],
@@ -596,7 +588,6 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         &access,
         AgentCommand::Submit {
             execution: parent,
-            target_loop: None,
             input: UserInput::Text {
                 text: "Delegate the read.".into(),
                 contexts: vec![],
@@ -659,10 +650,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         ))
         .unwrap();
     let access = EmbeddedAgentAccess::for_worker(restored.clone(), uuid::Uuid::new_v4());
-    let CommandResult::Loaded {
-        execution,
-        snapshot,
-    } = access_command(
+    let CommandResult::Loaded { execution, .. } = access_command(
         &access,
         AgentCommand::LoadRecord {
             record: TranscriptRef {
@@ -682,7 +670,6 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         &access,
         AgentCommand::Submit {
             execution,
-            target_loop: Some(snapshot.conversation.loops[0].id),
             input: UserInput::Text {
                 text: "Read a hosted Tick.".into(),
                 contexts: vec![],
@@ -842,8 +829,8 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let denied = agent
-        .submit(parent, None, "Try the scoped write.".into())
+    agent
+        .submit(parent, "Try the scoped write.".into())
         .await
         .unwrap();
     loop {
@@ -871,11 +858,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         .await
         .unwrap();
     let delegation = agent
-        .submit(
-            parent,
-            Some(denied.loop_id),
-            "Delegate the denied write.".into(),
-        )
+        .submit(parent, "Delegate the denied write.".into())
         .await
         .unwrap();
     let mut child = None;
@@ -928,11 +911,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
     );
     let mut events = restored.subscribe();
     restored
-        .submit(
-            child,
-            Some(snapshot.loops[0].id),
-            "Try the same write after restore.".into(),
-        )
+        .submit(child, "Try the same write after restore.".into())
         .await
         .unwrap();
     let mut denied = false;
@@ -977,8 +956,8 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let delegation = agent
-        .submit(parent, None, "Delegate the write.".into())
+    agent
+        .submit(parent, "Delegate the write.".into())
         .await
         .unwrap();
     let (child, child_request) = loop {
@@ -996,11 +975,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         }
     }
     let denial = agent
-        .submit(
-            parent,
-            Some(delegation.loop_id),
-            "Deny the same write for this session.".into(),
-        )
+        .submit(parent, "Deny the same write for this session.".into())
         .await
         .unwrap();
     loop {
@@ -1058,11 +1033,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
     );
     let mut events = restored.subscribe();
     restored
-        .submit(
-            child,
-            Some(snapshot.loops[0].id),
-            "Try the write after restoring.".into(),
-        )
+        .submit(child, "Try the write after restoring.".into())
         .await
         .unwrap();
     let mut denied = false;
@@ -1108,7 +1079,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         .unwrap();
     let mut events = agent.subscribe();
     let parent_receipt = agent
-        .submit(parent, None, "Delegate the file check.".into())
+        .submit(parent, "Delegate the file check.".into())
         .await
         .unwrap();
     let result = loop {
@@ -1134,8 +1105,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         child_snapshot.folder,
         Some(directory.path().canonicalize().unwrap())
     );
-    assert_eq!(child_snapshot.loops.len(), 1);
-    assert_ne!(child_snapshot.loops[0].id, parent_receipt.loop_id);
+    assert_ne!(child_snapshot.chat_loop.id, parent_receipt.loop_id);
     let metadata = child_snapshot.delegation.clone().unwrap();
     let registration = agent.subagent_registration(child).await.unwrap().unwrap();
     assert_eq!(registration.handle, "file-check");
@@ -1151,11 +1121,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         }
     }
     agent
-        .submit(
-            child,
-            Some(child_snapshot.loops[0].id),
-            "Continue with the same scope.".into(),
-        )
+        .submit(child, "Continue with the same scope.".into())
         .await
         .unwrap();
     loop {
@@ -1254,7 +1220,7 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Delegate the bounded check.".into())
+        .submit(parent, "Delegate the bounded check.".into())
         .await
         .unwrap();
     let mut child = None;
@@ -1318,9 +1284,8 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         )
         .await
         .unwrap();
-    let child_loop = agent.snapshot(child).await.unwrap().loops[0].id;
     let follow_up = agent
-        .submit(child, Some(child_loop), "Check scope.txt again.".into())
+        .submit(child, "Check scope.txt again.".into())
         .await
         .unwrap();
     let mut newly_restricted = false;
@@ -1358,12 +1323,12 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         "python3 -c 'print(123)'".into(),
     ] {
         agent
-            .submit_user_shell_for_goal(child, None, command, false)
+            .submit_user_shell(child, command, false)
             .await
             .unwrap();
     }
     let shell = agent
-        .submit_user_shell_for_goal(child, None, "touch direct.txt".into(), false)
+        .submit_user_shell(child, "touch direct.txt".into(), false)
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1436,7 +1401,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Delegate the report.".into())
+        .submit(parent, "Delegate the report.".into())
         .await
         .unwrap();
     let mut child = None;
@@ -1547,7 +1512,6 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         },
         AgentCommand::Submit {
             execution: parent,
-            target_loop: None,
             input: UserInput::Text {
                 text: "Delegate the cadence question.".into(),
                 contexts: vec![],
@@ -1602,7 +1566,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     let ObservationValue::Agent(snapshot) = observation.initial else {
         panic!("expected child snapshot");
     };
-    let child_loop = snapshot.conversation.loops[0].id;
+    let child_loop = snapshot.conversation.chat_loop.id;
     let metadata = snapshot.conversation.delegation.clone().unwrap();
     let host = HostLocation {
         host_instance: "controlled-console-host".into(),
@@ -1686,7 +1650,6 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: child.execution,
-                target_loop: None,
                 input: UserInput::Shell {
                     command: "python3 -c 'print(123)'".into(),
                     background: false,
@@ -1720,7 +1683,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
                 .await
                 .unwrap();
             if let ObservationValue::Agent(snapshot) = observation.initial
-                && snapshot.conversation.loops[0].state == LoopState::Completed
+                && snapshot.conversation.chat_loop.state == LoopState::Idle
             {
                 break snapshot;
             }
@@ -1759,7 +1722,6 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: console.projection().visible.unwrap(),
-                target_loop: Some(child_loop),
                 input: UserInput::Text {
                     text: "Continue the same bounded task.".into(),
                     contexts: vec![],
@@ -1799,7 +1761,6 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     })
     .await
     .unwrap();
-    assert_eq!(child_snapshot.conversation.loops.len(), 1);
     assert_eq!(
         serde_json::to_value(child_snapshot.conversation.delegation.as_ref().unwrap()).unwrap(),
         serde_json::to_value(&metadata).unwrap()
@@ -1846,8 +1807,8 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(parent, None, "Delegate and wait.".into())
+    agent
+        .submit(parent, "Delegate and wait.".into())
         .await
         .unwrap();
     let (child, request) = loop {
@@ -1864,19 +1825,11 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         }
     }
     assert_eq!(
-        agent
-            .snapshot(parent)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .unwrap()
-            .state,
+        agent.snapshot(parent).await.unwrap().chat_loop.state,
         LoopState::Interrupted
     );
     assert_eq!(
-        agent.snapshot(child).await.unwrap().loops[0].state,
+        agent.snapshot(child).await.unwrap().chat_loop.state,
         LoopState::WaitingQuestion
     );
     agent
@@ -1891,8 +1844,8 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
     }
     assert_eq!(agent.list_chats().await.len(), 2);
     assert_eq!(
-        agent.snapshot(child).await.unwrap().loops[0].state,
-        LoopState::Completed
+        agent.snapshot(child).await.unwrap().chat_loop.state,
+        LoopState::Idle
     );
     agent.shutdown().await;
 }
@@ -1910,7 +1863,7 @@ async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Delegate fixture inspection".into())
+        .submit(parent, "Delegate fixture inspection".into())
         .await
         .unwrap();
     loop {
@@ -1982,7 +1935,7 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Delegate fixture task".into())
+        .submit(parent, "Delegate fixture task".into())
         .await
         .unwrap();
     loop {
@@ -2102,7 +2055,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Run the bounded interpreter check".into())
+        .submit(root, "Run the bounded interpreter check".into())
         .await
         .unwrap();
     let mut result = None;
@@ -2167,7 +2120,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Run an interpreter after approval".into())
+        .submit(root, "Run an interpreter after approval".into())
         .await
         .unwrap();
     let (child, request) = loop {
@@ -2279,7 +2232,7 @@ async fn parent_mode_tightening_turns_the_childs_frozen_full_access_bash_into_as
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "Run a check under current authority".into())
+    core.submit(root, "Run a check under current authority".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -2331,7 +2284,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
         .unwrap();
     let mut events = core.subscribe();
     let root_run = core
-        .submit(root, None, "Create a child for direct commands".into())
+        .submit(root, "Create a child for direct commands".into())
         .await
         .unwrap();
     loop {
@@ -2341,15 +2294,9 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
         }
     }
     let child = core.subagents(root).await.unwrap()[0].child_chat_id;
-    let child_loop = core.snapshot(child).await.unwrap().loops[0].id;
     let sent = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        core.submit_user_shell_for_goal(
-            child,
-            Some(child_loop),
-            "python3 -c 'print(4268)'".into(),
-            false,
-        ),
+        core.submit_user_shell(child, "python3 -c 'print(4268)'".into(), false),
     )
     .await
     .unwrap();
@@ -2377,7 +2324,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
     core.answer_permission(child, request.id, true)
         .await
         .unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let snapshot = core.snapshot(child).await.unwrap();
             if snapshot.user_shells.iter().any(|shell| {
@@ -2397,7 +2344,6 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
         .unwrap();
     core.shutdown().await;
     assert!(output.content.contains("4268"));
-    assert_eq!(completed.loops.len(), 1);
     assert_eq!(
         model.requests.lock().unwrap().len(),
         3,
@@ -2443,11 +2389,7 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
         .unwrap();
         let mut events = core.subscribe();
         let receipt = core
-            .submit(
-                root,
-                None,
-                "Run according to the explicit Shell rule".into(),
-            )
+            .submit(root, "Run according to the explicit Shell rule".into())
             .await
             .unwrap();
         let mut result = None;
@@ -2505,7 +2447,7 @@ async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_chil
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(root, None, "Keep the inherited Shell denial current".into())
+    core.submit(root, "Keep the inherited Shell denial current".into())
         .await
         .unwrap();
     let (child, request) = loop {
@@ -2630,7 +2572,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Create a result reader".into())
+        .submit(root, "Create a result reader".into())
         .await
         .unwrap();
     loop {
@@ -2659,7 +2601,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         .enqueue(call("read-result", "Read", json!({"file_path":path})));
     model.scripted.enqueue(text("Read complete"));
     let receipt = core
-        .submit(child, None, "Read your announced output file".into())
+        .submit(child, "Read your announced output file".into())
         .await
         .unwrap();
     let mut result = None;
@@ -2707,7 +2649,7 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
             .unwrap();
         let mut events = core.subscribe();
         let receipt = core
-            .submit(root, None, "Create a cancellable child Shell".into())
+            .submit(root, "Create a cancellable child Shell".into())
             .await
             .unwrap();
         loop {
@@ -2718,9 +2660,8 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
         }
         let child = core.subagents(root).await.unwrap()[0].child_chat_id;
         let shell = core
-            .submit_user_shell_for_goal(
+            .submit_user_shell(
                 child,
-                None,
                 "python3 -c 'print(unsupported_after_cancel)'".into(),
                 false,
             )
@@ -2734,21 +2675,15 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
         };
         let queued = if stop_loop {
             Some(
-                core.submit_user_shell_for_goal(
-                    child,
-                    None,
-                    "touch queued-after-stop".into(),
-                    false,
-                )
-                .await
-                .unwrap(),
+                core.submit_user_shell(child, "touch queued-after-stop".into(), false)
+                    .await
+                    .unwrap(),
             )
         } else {
             None
         };
         let stopped = if stop_loop {
-            let loop_id = core.snapshot(child).await.unwrap().loops[0].id;
-            core.stop(child, loop_id).await.unwrap();
+            core.stop(child).await.unwrap();
             core.snapshot(child)
                 .await
                 .unwrap()
@@ -2812,7 +2747,7 @@ async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admis
         .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Create a child before tightening".into())
+        .submit(root, "Create a child before tightening".into())
         .await
         .unwrap();
     loop {
@@ -2835,7 +2770,7 @@ async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admis
     );
     let mut events = restored.subscribe();
     let command = restored
-        .submit_user_shell_for_goal(child, None, "python3 -c 'print(8841)'".into(), false)
+        .submit_user_shell(child, "python3 -c 'print(8841)'".into(), false)
         .await
         .unwrap();
     let request = loop {
@@ -2883,10 +2818,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
     core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    let receipt = core
-        .submit(root, None, "Create a child".into())
-        .await
-        .unwrap();
+    let receipt = core.submit(root, "Create a child".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
@@ -2896,7 +2828,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
     let child = core.subagents(root).await.unwrap()[0].child_chat_id;
     let command = "python3 -c 'print(4268)'";
     let first = core
-        .submit_user_shell_for_goal(child, None, command.into(), false)
+        .submit_user_shell(child, command.into(), false)
         .await
         .unwrap();
     let request = loop {
@@ -2929,7 +2861,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
     .await
     .unwrap();
     let second = core
-        .submit_user_shell_for_goal(child, None, command.into(), false)
+        .submit_user_shell(child, command.into(), false)
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -2985,7 +2917,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
         .unwrap();
     let mut events = core.subscribe();
     let initial = core
-        .submit(root, None, "Establish the parent Loop".into())
+        .submit(root, "Establish the parent Loop".into())
         .await
         .unwrap();
     loop {
@@ -3009,11 +2941,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
     .await
     .unwrap();
     let receipt = core
-        .submit(
-            root,
-            Some(initial.loop_id),
-            "Delegate under that Loop denial".into(),
-        )
+        .submit(root, "Delegate under that Loop denial".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -3061,10 +2989,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
     let core = Agent::new_embedded(config(), model.clone());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    let initial = core
-        .submit(root, None, "Create a child".into())
-        .await
-        .unwrap();
+    let initial = core.submit(root, "Create a child".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
@@ -3072,7 +2997,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
         }
     }
     let child = core.subagents(root).await.unwrap()[0].child_chat_id;
-    core.submit_user_shell_for_goal(child, None, "python3 -c 'print(8841)'".into(), false)
+    core.submit_user_shell(child, "python3 -c 'print(8841)'".into(), false)
         .await
         .unwrap();
     let request = loop {
@@ -3087,9 +3012,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
         json!({"to":"waiting"}),
     ));
     model.enqueue(text("Root stopped child"));
-    core.submit(root, Some(initial.loop_id), "Stop the child".into())
-        .await
-        .unwrap();
+    core.submit(root, "Stop the child".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if let EventKind::ToolCompleted {
@@ -3144,7 +3067,7 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
     .unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Use the saved Shell permission".into())
+        .submit(root, "Use the saved Shell permission".into())
         .await
         .unwrap();
     let mut result = None;

@@ -6,15 +6,14 @@
 //! selected display node is checked when the input is accepted, and the Chat must be idle for it;
 //! a node off the current chain is reached by rebuilding the Chat on that branch from its store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Serialize;
 use tickloop_agent_protocol::{
-    ChatId, ExecutionMode, HostCallContext, InputContext, InputId, LoopId, LoopState,
-    OperationRecord, OperationState, PermissionRequest, QuestionAnswer, QuestionRequest, Receipt,
-    RunId, Usage,
+    ChatId, ExecutionMode, HostCallContext, InputContext, InputId, LoopState, OperationRecord,
+    OperationState, PermissionRequest, QuestionAnswer, QuestionRequest, Receipt, RunId, Usage,
 };
 use uuid::Uuid;
 
@@ -52,7 +51,6 @@ pub enum TurnOp {
     /// A prompt after `after`.
     Continue {
         after: ParentSelection,
-        target_loop: Option<LoopId>,
         message: UserMessage,
     },
     /// A prompt in place of the top-level prompt `prompt`, as its sibling.
@@ -65,18 +63,13 @@ pub enum TurnOp {
     /// A user Skill invocation after `after`.
     Skill {
         after: ParentSelection,
-        target_loop: Option<LoopId>,
         skill: SkillInvocation,
     },
     /// The user's reply to the question `request` a Run waits on; it joins that Run.
     Answer { request: Uuid, reply: QuestionReply },
-    /// An @tickloop request delivered to the Loop `target_loop`, under the input id its delivery
-    /// names. It queues behind the Loop's work, whatever the delivery mode, and a Loop that has
-    /// ended discards it.
-    Deliver {
-        target_loop: LoopId,
-        delivery: ExternalDelivery,
-    },
+    /// An @tickloop request delivered to the Chat's Loop, under the input id its delivery names.
+    /// It queues behind the Loop's work, whatever the delivery mode.
+    Deliver { delivery: ExternalDelivery },
 }
 
 /// How the user settles a question.
@@ -336,7 +329,6 @@ struct ChainNode {
 impl TurnRequest {
     /// A new prompt queued after the current leaf: a local host's submission.
     pub fn after_current_leaf(
-        target_loop: Option<LoopId>,
         text: String,
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
@@ -346,7 +338,6 @@ impl TurnRequest {
             input_id: Uuid::new_v4(),
             op: TurnOp::Continue {
                 after: ParentSelection::CurrentLeaf,
-                target_loop,
                 message: UserMessage {
                     text,
                     contexts,
@@ -360,28 +351,22 @@ impl TurnRequest {
 }
 
 impl TurnRequest {
-    /// The delivery of an @tickloop request to the Loop `target_loop`, under the input id the
-    /// delivery names.
-    pub fn deliver(target_loop: LoopId, delivery: ExternalDelivery) -> Self {
+    /// The delivery of an @tickloop request to the Chat's Loop, under the input id the delivery
+    /// names.
+    pub fn deliver(delivery: ExternalDelivery) -> Self {
         Self {
             input_id: delivery.input_id(),
-            op: TurnOp::Deliver {
-                target_loop,
-                delivery,
-            },
+            op: TurnOp::Deliver { delivery },
             delivery: Delivery::Queue,
             host_context: None,
         }
     }
 }
 
-/// The ledger input of a delivery to the Loop `target_loop`, as `advance` records it.
-pub(crate) fn delivery_ledger(target_loop: LoopId, delivery: ExternalDelivery) -> LedgerInput {
+/// The ledger input of a delivery to the Chat's Loop, as `advance` records it.
+pub(crate) fn delivery_ledger(delivery: ExternalDelivery) -> LedgerInput {
     let input_id = delivery.input_id();
-    let op = TurnOp::Deliver {
-        target_loop,
-        delivery,
-    };
+    let op = TurnOp::Deliver { delivery };
     LedgerInput::new(input_id, op.kind(), &op)
 }
 
@@ -411,10 +396,9 @@ impl Agent {
     pub(super) async fn advance_received_delivery(
         &self,
         chat_id: ChatId,
-        target: LoopId,
         delivery: ExternalDelivery,
     ) -> Result<Turn, AgentError> {
-        self.advance_with_delivery_binding(chat_id, TurnRequest::deliver(target, delivery), false)
+        self.advance_with_delivery_binding(chat_id, TurnRequest::deliver(delivery), false)
             .await
     }
 
@@ -502,18 +486,13 @@ impl Agent {
                     .reply_to_question(chat_id, request, reply, Some(ledger))
                     .await;
             }
-            TurnOp::Deliver {
-                target_loop,
-                delivery,
-            } => {
+            TurnOp::Deliver { delivery } => {
                 if !requires_binding {
                     return self
-                        .take_received_delivery(chat_id, target_loop, delivery, ledger, false)
+                        .take_received_delivery(chat_id, delivery, ledger, false)
                         .await;
                 }
-                return self
-                    .take_delivery(chat_id, target_loop, delivery, ledger)
-                    .await;
+                return self.take_delivery(chat_id, delivery, ledger).await;
             }
         };
         let turn = match self
@@ -525,14 +504,9 @@ impl Agent {
         };
         let reservation = turn.branch.as_ref().map(BranchSwitch::reservation);
         let accepted = match op {
-            TurnOp::Continue {
-                target_loop,
-                message,
-                ..
-            } => {
+            TurnOp::Continue { message, .. } | TurnOp::ReplacePrompt { message, .. } => {
                 self.submit_contexts(message_submission(
                     chat_id,
-                    target_loop,
                     message,
                     host_context,
                     ledger,
@@ -540,21 +514,8 @@ impl Agent {
                 ))
                 .await
             }
-            TurnOp::ReplacePrompt { message, .. } => {
-                self.submit_contexts(message_submission(
-                    chat_id,
-                    None,
-                    message,
-                    host_context,
-                    ledger,
-                    turn,
-                ))
-                .await
-            }
-            TurnOp::Skill {
-                target_loop, skill, ..
-            } => {
-                self.submit_skill(chat_id, target_loop, skill, host_context, ledger, turn)
+            TurnOp::Skill { skill, .. } => {
+                self.submit_skill(chat_id, skill, host_context, ledger, turn)
                     .await
             }
             TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } | TurnOp::Deliver { .. } => {
@@ -803,29 +764,21 @@ impl Agent {
         leaf
     }
 
-    /// Builds `candidate` on the conversation cut at `cut`, a copy of `original`'s; gives the
-    /// Loops that existed before, to tell the ones the cut removed.
+    /// Builds `candidate` on the conversation cut at `cut`, a copy of `original`'s.
     pub(crate) fn prepare_cut(
         original: &Chat,
         candidate: &mut Chat,
         cut: Option<(usize, Option<ExecutionMode>)>,
-    ) -> Result<HashSet<LoopId>, AgentError> {
-        let loops_at_start = original
-            .snapshot
-            .loops
-            .iter()
-            .map(|goal| goal.id)
-            .collect::<HashSet<_>>();
+    ) -> Result<(), AgentError> {
         if let Some((index, mode)) = cut {
             (candidate.snapshot, candidate.bookkeeping) = rewind::conversation_before(
                 &original.snapshot,
                 &original.bookkeeping,
                 index,
                 mode,
-                &loops_at_start,
             )?;
         }
-        Ok(loops_at_start)
+        Ok(())
     }
 
     /// Commits the cut at message `index` that `candidate` was built on: the stored chain forks
@@ -837,61 +790,28 @@ impl Agent {
             index,
             first_removed,
             (candidate.snapshot.clone(), candidate.bookkeeping.clone()),
-            Uuid::nil(),
         );
         candidate.snapshot = original.snapshot.clone();
         candidate.bookkeeping = original.bookkeeping.clone();
         candidate.needs_plan_mode_exit_notice = original.needs_plan_mode_exit_notice;
     }
 
-    /// Cuts the conversation before message `index`; gives the Loops the cut removed.
+    /// Cuts the conversation before message `index`.
     fn cut(
         &self,
         chat: &mut Chat,
         index: usize,
         mode: Option<ExecutionMode>,
-    ) -> Result<Vec<LoopId>, AgentError> {
-        let loops_at_start = chat
-            .snapshot
-            .loops
-            .iter()
-            .map(|goal| goal.id)
-            .collect::<HashSet<_>>();
-        let candidate = rewind::conversation_before(
-            &chat.snapshot,
-            &chat.bookkeeping,
-            index,
-            mode,
-            &loops_at_start,
-        )?;
+    ) -> Result<(), AgentError> {
+        let candidate =
+            rewind::conversation_before(&chat.snapshot, &chat.bookkeeping, index, mode)?;
         let first_removed = first_removed_message(chat, index);
-        self.replace_conversation(chat, index, first_removed, candidate, Uuid::nil());
-        Ok(rewind::stop_listening_to_removed_loops(
-            chat,
-            loops_at_start,
-        ))
-    }
-
-    pub(crate) async fn retire_cut_loops(&self, chat_id: ChatId, removed_loops: Vec<LoopId>) {
-        if removed_loops.is_empty() {
-            return;
-        }
-        let Some(tools) = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .map(|chat| chat.tools.clone())
-        else {
-            return;
-        };
-        self.retire_removed_loops(chat_id, removed_loops, &tools)
-            .await;
+        self.replace_conversation(chat, index, first_removed, candidate);
+        Ok(())
     }
 
     /// Another answer to the prompt of `answer`: the conversation is cut after that prompt and
-    /// a Run answers it again in the answer's Loop. A prompt off the current chain is reached by
+    /// a Run answers it again. A prompt off the current chain is reached by
     /// its staged branch, installed together with the acceptance.
     async fn regenerate(
         &self,
@@ -933,7 +853,7 @@ impl Agent {
         switch: Option<BranchSwitch>,
     ) -> Result<Receipt, AgentError> {
         let _admission = self.inner.tasks.token();
-        let (receipt, removed_loops) = {
+        let receipt = {
             let mut chats = self.inner.chats.lock().await;
             self.refuse_when_closed()?;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
@@ -949,48 +869,31 @@ impl Agent {
             };
             let base = staged.as_ref().map_or(&*chat, |staged| &staged.chat);
             rewind::ensure_idle(base).map_err(|_| chat_is_busy())?;
-            let loop_id = answered_prompt(base, answer).and_then(|_| {
-                base.bookkeeping
-                    .lifecycle
-                    .response(answer)
-                    .map(|response| response.loop_id)
-                    .ok_or_else(unknown_node)
-            })?;
+            answered_prompt(base, answer)?;
+            if base.bookkeeping.lifecycle.response(answer).is_none() {
+                return Err(unknown_node());
+            }
             let node = chain_node(base, &chain_nodes(base), prompt)
                 .filter(|node| node.is_prompt)
                 .ok_or_else(unknown_node)?;
             let index = node.last + 1;
-            let loop_survives_cut = base
-                .bookkeeping
-                .loop_starts
-                .get(&loop_id)
-                .is_none_or(|start| *start < index);
-            if !loop_survives_cut {
-                return Err(AgentError::Invalid(
-                    "the answer's Loop is no longer part of the conversation".into(),
-                ));
-            }
-            admit_answer_loop(base, loop_id)?;
+            admit_answer_loop(base)?;
             let mut candidate = base.clone();
             let cut = (index < base.snapshot.messages.len()).then_some((index, None));
-            let loops_at_start = Self::prepare_cut(base, &mut candidate, cut)?;
+            Self::prepare_cut(base, &mut candidate, cut)?;
             let selected_leaf = staged.map(|staged| self.install_branch(chat, staged));
             if cut.is_some() {
                 self.commit_cut(chat, &mut candidate, index);
             }
             *chat = candidate;
-            let removed_loops = match cut {
-                Some(_) => rewind::stop_listening_to_removed_loops(chat, loops_at_start),
-                None => Vec::new(),
-            };
             if cut.is_none()
                 && let Some(leaf) = selected_leaf
             {
-                self.emit_conversation_rewound(chat, Uuid::nil(), leaf);
+                self.emit_conversation_rewound(chat, leaf);
             }
             let receipt = Receipt {
                 chat_id,
-                loop_id,
+                loop_id: chat.snapshot.chat_loop.id,
                 run_id: Uuid::new_v4(),
             };
             self.queue_answer_run(chat, &receipt, Some(prompt))?;
@@ -1002,9 +905,8 @@ impl Agent {
                 .expect("the answer's Run is queued")
                 .clone();
             chat.bookkeeping.lifecycle.accept(&ledger, &queued);
-            (receipt, removed_loops)
+            receipt
         };
-        self.retire_cut_loops(chat_id, removed_loops).await;
         self.start_next_run(chat_id).await?;
         Ok(receipt)
     }
@@ -1036,7 +938,7 @@ impl Agent {
             admit_continuation(chat, &entry, answer_parent)?;
             let receipt = Receipt {
                 chat_id,
-                loop_id: entry.loop_id,
+                loop_id: chat.snapshot.chat_loop.id,
                 run_id: entry.run_id,
             };
             self.queue_answer_run(chat, &receipt, answer_parent)?;
@@ -1066,17 +968,7 @@ impl Agent {
         {
             self.cut(chat, last, None)?;
         }
-        let goal = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == receipt.loop_id)
-            .ok_or_else(|| {
-                AgentError::Invalid(
-                    "the answer's Loop is no longer part of the conversation".into(),
-                )
-            })?;
-        goal.set_state(LoopState::Queued);
+        chat.snapshot.chat_loop.set_state(LoopState::Queued);
         if let Some(parent) = answer_parent {
             chat.bookkeeping
                 .lifecycle
@@ -1202,7 +1094,6 @@ fn classify(chat: &Chat, ledger: &LedgerInput) -> Result<Admission, AgentError> 
 
 fn message_submission(
     chat_id: ChatId,
-    goal: Option<LoopId>,
     message: UserMessage,
     host_context: Option<HostCallContext>,
     ledger: LedgerInput,
@@ -1210,7 +1101,6 @@ fn message_submission(
 ) -> crate::family::ContextSubmission {
     crate::family::ContextSubmission {
         chat_id,
-        goal,
         input: message.text,
         contexts: message.contexts,
         paths: message.paths,
@@ -1384,7 +1274,7 @@ pub(crate) fn admit_continuation(
     if !is_at_tail && !ends_the_conversation(chat, entry) {
         return Err(moved_on());
     }
-    admit_answer_loop(chat, entry.loop_id)
+    admit_answer_loop(chat)
 }
 
 /// An Agent message, a Trigger's prompt or an @tickloop request is no display node of its own:
@@ -1415,24 +1305,16 @@ fn ends_the_conversation(chat: &Chat, entry: &InputEntry) -> bool {
     })
 }
 
-fn admit_answer_loop(chat: &Chat, loop_id: LoopId) -> Result<(), AgentError> {
-    let goal = chat
-        .snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id == loop_id)
-        .ok_or_else(|| {
-            AgentError::Invalid("the answer's Loop is no longer part of the conversation".into())
-        })?;
-    match goal.state {
-        LoopState::Idle | LoopState::Completed | LoopState::Interrupted | LoopState::Failed => {
-            Ok(())
-        }
-        LoopState::Stopped | LoopState::Expired => Err(AgentError::Invalid(
-            "goal has ended; create a new goal".into(),
-        )),
-        _ => Err(AgentError::Invalid(
-            "the answer's Loop is waiting; finish or stop it first".into(),
+/// An answer runs again only on a Loop whose turn has ended.
+fn admit_answer_loop(chat: &Chat) -> Result<(), AgentError> {
+    match chat.snapshot.chat_loop.state {
+        LoopState::Idle | LoopState::Interrupted | LoopState::Failed => Ok(()),
+        LoopState::Queued
+        | LoopState::Running
+        | LoopState::WaitingPermission
+        | LoopState::WaitingQuestion
+        | LoopState::WaitingPlan => Err(AgentError::Invalid(
+            "the Loop is busy; finish or interrupt its turn first".into(),
         )),
     }
 }
@@ -1518,13 +1400,7 @@ fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Opt
         tickloop_agent_transcript::WaitKind::Children { children } => children
             .iter()
             .filter_map(|child| chats.get(child))
-            .flat_map(|child| {
-                child
-                    .snapshot
-                    .loops
-                    .iter()
-                    .filter_map(|goal| Some((child.snapshot.id, goal.run_id?)))
-            })
+            .filter_map(|child| Some((child.snapshot.id, child.snapshot.chat_loop.run_id?)))
             .collect(),
         tickloop_agent_transcript::WaitKind::Question { .. }
         | tickloop_agent_transcript::WaitKind::Handover => Vec::new(),

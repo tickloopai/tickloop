@@ -416,8 +416,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         snapshot(&client, execution)
             .await
             .conversation
-            .loops
-            .is_empty()
+            .chat_loop
+            .run_id
+            .is_none()
     );
     assert!(requests.try_recv().is_err());
     pty.wait_for(

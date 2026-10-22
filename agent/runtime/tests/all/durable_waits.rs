@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Content, EventKind, LoopState, PromptPolicy, QuestionAnswer,
     QuestionRequest, Role,
@@ -23,8 +22,6 @@ use tickloop_agent_transcript::display::{DisplayKind, DisplayStatus, project};
 use tickloop_agent_transcript::{
     AbandonReason, InterruptedBy, Line, ResponseEnding, ResponseState, SettledOutcome, WaitState,
 };
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DONE: &str = "Report ready.";
@@ -80,7 +77,6 @@ fn prompt(text: &str, after: ParentSelection, delivery: Delivery) -> TurnRequest
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -283,185 +279,6 @@ async fn a_durable_shutdown_leaves_the_question_suspended_and_another_instance_a
     answering.shutdown().await;
 }
 
-/// The stored Lines up to the first chain entry carrying the question's result: when `with_it`,
-/// that entry is kept and the lifecycle records committed with it are not.
-fn cut_at_result(lines: &[Line], with_it: bool) -> Vec<Line> {
-    let at = lines
-        .iter()
-        .position(|line| {
-            matches!(line, Line::User(entry) if entry.message.content.iter().any(|content| matches!(content, Content::ToolResult { tool_use_id, .. } if tool_use_id == QUESTION_CALL)))
-        })
-        .expect("the result reached the chain");
-    lines[..at + usize::from(with_it)].to_vec()
-}
-
-const HOLD: &str = "Hold the slot.";
-
-/// Holds the execution slot with the request of a prompt saying [`HOLD`] until released.
-struct SlotHolder {
-    script: ScriptedModel,
-    holding: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[async_trait::async_trait]
-impl ModelClient for SlotHolder {
-    async fn generate_title(
-        &self,
-        request: ModelRequest,
-        events: UnboundedSender<ModelDelta>,
-        cancel: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        self.script.generate_title(request, events, cancel).await
-    }
-
-    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
-        self.script.identity()
-    }
-
-    async fn complete(
-        &self,
-        request: ModelRequest,
-        events: UnboundedSender<ModelDelta>,
-        cancel: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        if format!("{:?}", request.messages.last()).contains(HOLD) {
-            self.holding.notify_one();
-            tokio::select! {
-                _ = self.release.notified() => {}
-                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-            }
-        }
-        self.script.complete(request, events, cancel).await
-    }
-}
-
-/// Stored Lines of an answered question whose Run, after the reply committed, waited for the
-/// slot another Loop's Run held: up to the reply, and up to the result with the lifecycle
-/// records committed with it left out.
-async fn replied_while_the_slot_was_held() -> (ChatId, Turn, TurnRequest, Vec<Line>, Vec<Line>) {
-    let store = Arc::new(InMemoryTranscriptStore::new());
-    let (chat, turn, request) = asked_and_released(&store).await;
-    let model = Arc::new(SlotHolder {
-        script: ScriptedModel::new(vec![text("Held."), text(DONE)]),
-        holding: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
-    let answering = Agent::with_seams(
-        HarnessSeams {
-            transcripts: Some(store.clone()),
-            environment: None,
-            models: ChosenModels::new(model.clone()),
-        },
-        options(WaitHosting::Durable),
-    )
-    .unwrap();
-    answering
-        .advance(
-            chat,
-            prompt(HOLD, ParentSelection::CurrentLeaf, Delivery::Queue),
-        )
-        .await
-        .unwrap();
-    model.holding.notified().await;
-    let reply = answer(&request, weekly());
-    answering.advance(chat, reply.clone()).await.unwrap();
-    answering.sync().await.unwrap();
-    let replied = store.lines(chat);
-    model.release.notify_one();
-    answering
-        .settled_input(chat, turn.input_id())
-        .await
-        .unwrap();
-    answering.sync().await.unwrap();
-    let with_result = cut_at_result(&store.lines(chat), true);
-    answering.shutdown().await;
-    (chat, turn, reply, replied, with_result)
-}
-
-fn lost_store(chat: ChatId, lines: Vec<Line>) -> Arc<InMemoryTranscriptStore> {
-    let lost = Arc::new(InMemoryTranscriptStore::new());
-    lost.seed(chat, lines, StorePosition(1));
-    lost
-}
-
-#[tokio::test]
-async fn a_reply_committed_before_its_result_reached_the_chain_is_appended_by_the_next_holder() {
-    let (chat, turn, reply, replied, _) = replied_while_the_slot_was_held().await;
-    let store = lost_store(chat, replied);
-    assert_eq!(wait_states(&store.lines(chat)), ["open", "resolved"]);
-    let model = Arc::new(ScriptedModel::new(vec![text(DONE), text("Held again.")]));
-    let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    // The repeated reply only attaches; loading the Chat rebuilds the Run, which goes on.
-    let repeated = next.advance(chat, reply).await.unwrap();
-    assert!(matches!(
-        outcome(&repeated).await,
-        TurnOutcome::Merged { .. }
-    ));
-    assert!(matches!(
-        next.settled_input(chat, turn.input_id()).await.unwrap(),
-        SettledOutcome::Completed { .. }
-    ));
-    // The rebuilt Run goes first; the slot holder lost its host and goes on after it.
-    let requests = model.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 2);
-    assert!(format!("{:?}", requests[0].messages).contains("Weekly"));
-    let snapshot = next.snapshot(chat).await.unwrap();
-    assert_eq!(results_of(&snapshot.messages, QUESTION_CALL).len(), 1);
-    next.sync().await.unwrap();
-    let states = response_states(&store.lines(chat), turn.receipt().run_id);
-    assert!(
-        states.iter().all(|(attempt, _)| *attempt == 1),
-        "no other attempt: {states:?}"
-    );
-    assert_eq!(
-        states.last().unwrap().1,
-        ResponseState::Ended {
-            ending: ResponseEnding::Completed
-        }
-    );
-    next.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_result_on_the_chain_whose_resume_was_lost_is_not_appended_again() {
-    let (chat, turn, reply, _, with_result) = replied_while_the_slot_was_held().await;
-    let store = lost_store(chat, with_result);
-    let lines = store.lines(chat);
-    assert_eq!(wait_states(&lines), ["open", "resolved"]);
-    assert_eq!(
-        response_states(&lines, turn.receipt().run_id)
-            .last()
-            .unwrap()
-            .1,
-        ResponseState::Suspended
-    );
-    let model = Arc::new(ScriptedModel::new(vec![text(DONE), text("Held again.")]));
-    let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    next.advance(chat, reply).await.unwrap();
-    assert!(matches!(
-        next.settled_input(chat, turn.input_id()).await.unwrap(),
-        SettledOutcome::Completed { .. }
-    ));
-    let snapshot = next.snapshot(chat).await.unwrap();
-    assert_eq!(results_of(&snapshot.messages, QUESTION_CALL).len(), 1);
-    next.sync().await.unwrap();
-    let lines = store.lines(chat);
-    assert_eq!(wait_states(&lines), ["open", "resolved", "appended"]);
-    let states = response_states(&lines, turn.receipt().run_id);
-    assert!(
-        states.iter().all(|(attempt, _)| *attempt == 1),
-        "{states:?}"
-    );
-    assert_eq!(
-        states.last().unwrap().1,
-        ResponseState::Ended {
-            ending: ResponseEnding::Completed
-        }
-    );
-    next.shutdown().await;
-}
-
 /// The question's call result when a prompt sent now interrupts the waiting Run, with ids
 /// replaced by their order of appearance.
 async fn interrupted_result(agent: &Agent, chat: ChatId) -> String {
@@ -528,13 +345,11 @@ async fn a_prompt_sent_now_interrupts_a_rebuilt_question_as_it_does_the_asking_r
             .join(" ")
     };
     assert_eq!(shape(&rebuilt), shape(&in_process));
-    let snapshot = next.snapshot(chat).await.unwrap();
-    let goal = snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id == turn.receipt().loop_id)
-        .unwrap();
-    assert_eq!(goal.state, LoopState::Interrupted);
+    assert_eq!(
+        next.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Idle,
+        "the prompt sent now finished its own turn"
+    );
     next.sync().await.unwrap();
     let states = response_states(&store.lines(chat), turn.receipt().run_id);
     assert_eq!(
@@ -592,15 +407,7 @@ async fn a_worker_restarted_mid_question_ends_it_as_a_lost_host_as_before() {
     );
     let snapshot = restarted.resume_chat(chat).await.unwrap();
     assert!(snapshot.questions.is_empty());
-    assert_eq!(
-        snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == turn.receipt().loop_id)
-            .unwrap()
-            .state,
-        LoopState::Interrupted
-    );
+    assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
     // The batch had no result yet, so the load drops it, as it always has.
     assert!(!format!("{:?}", snapshot.messages).contains(ASK_USER_QUESTION_TOOL_NAME));
     restarted.sync().await.unwrap();

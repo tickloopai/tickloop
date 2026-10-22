@@ -155,7 +155,7 @@ async fn piped_git_diff_runs_without_approval_in_accept_edits_and_auto() {
         agent.set_execution_mode(chat, mode).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Summarize the staged changes".into())
+            .submit(chat, "Summarize the staged changes".into())
             .await
             .unwrap();
         let mut completed_tool = false;

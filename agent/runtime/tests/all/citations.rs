@@ -150,17 +150,12 @@ impl std::ops::Deref for CompletedTool {
 }
 
 async fn turn(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<CompletedTool> {
-    turn_for_loop(agent, chat, None, prompt).await
+    turn_for_loop(agent, chat, prompt).await
 }
 
-async fn turn_for_loop(
-    agent: &Agent,
-    chat: Uuid,
-    goal: Option<Uuid>,
-    prompt: &str,
-) -> Vec<CompletedTool> {
+async fn turn_for_loop(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<CompletedTool> {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut results = Vec::new();
     loop {
         let event = next_event(&mut events).await;
@@ -212,8 +207,7 @@ async fn numbered_sources_reuse_urls_across_turns_and_keep_existing_request_pref
     let first = turn(&agent, chat, "Find evidence").await;
     assert_eq!(numbers(&first[0]), [1, 2]);
     assert_eq!(numbers(&first[1]), [1, 3]);
-    let goal = agent.snapshot(chat).await.unwrap().loops[0].id;
-    let second = turn_for_loop(&agent, chat, Some(goal), "Find more evidence").await;
+    let second = turn_for_loop(&agent, chat, "Find more evidence").await;
     assert_eq!(numbers(&second[0]), [4]);
     for result in first.iter().chain(&second) {
         assert!(!result.is_error, "{}", result.content);
@@ -337,7 +331,6 @@ async fn source_metadata_survives_restore_new_chat_copy_and_branch_without_renum
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("Evidence branch".into()),
         })
         .await
@@ -799,7 +792,7 @@ async fn process_host_does_not_publish_a_childs_number_when_the_root_source_writ
     assert!(child_events.iter().any(|event|matches!(&event.kind, EventKind::Failed(message) if message.contains("root source write failed"))));
     assert!(!child_events.iter().any(|event|matches!(&event.kind, EventKind::ToolCompleted { sources, .. } if !sources.is_empty())));
     assert_eq!(
-        agent.snapshot(child).await.unwrap().loops[0].state,
+        agent.snapshot(child).await.unwrap().chat_loop.state,
         tickloop_agent_protocol::LoopState::Failed
     );
     agent.flush_transcripts().await;
@@ -896,7 +889,6 @@ async fn every_call_is_recorded_and_rewind_filters_reused_call_ids_and_sources_a
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("Evidence copy".into()),
         })
         .await
@@ -1075,7 +1067,7 @@ async fn call_associations_precede_results_and_failed_reused_source_writes_deliv
         agent.sync().await.unwrap();
         store.fail_calls.store(true, Ordering::SeqCst);
         let mut events = agent.subscribe();
-        let receipt = agent.submit(chat, None, "Again".into()).await.unwrap();
+        let receipt = agent.submit(chat, "Again".into()).await.unwrap();
         loop {
             let event = next_event(&mut events).await;
             if event.run_id != receipt.run_id {
@@ -1191,10 +1183,7 @@ async fn a_result_is_durable_before_events_snapshots_or_an_immediate_new_holder_
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Find evidence".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Find evidence".into()).await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         store.result_started.notified(),
@@ -1301,7 +1290,7 @@ async fn a_failed_result_node_write_keeps_the_durable_association_and_exact_pend
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Search".into()).await.unwrap();
+    agent.submit(chat, "Search".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Failed(error) => {
@@ -1429,7 +1418,6 @@ async fn physical_parallel_anchors_survive_retained_rewrites_and_branches_after_
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("Parallel copy".into()),
         })
         .await

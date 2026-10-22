@@ -4869,6 +4869,17 @@ impl Console {
         Ok(RendererSwitch::Switched)
     }
 
+    /// Ctrl+C on the empty input of an idle Agent leaves this View at once; the Agent goes on in
+    /// the daemon.
+    pub fn leave_on_control_c(&self) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let leaves = state.may_leave();
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(leaves)
+    }
+
     pub fn confirm_control_c_exit(&self) -> Result<bool, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let confirmed = state.request_exit('C');
@@ -9577,6 +9588,13 @@ impl State {
         }
     }
 
+    /// Closes the open completion candidates, if any.
+    fn cancel_candidates(&mut self) -> bool {
+        self.apply_shell_completion(ShellCompletionKey::Cancel)
+            || self.apply_file_mention(FileMentionKey::Cancel)
+            || self.apply_completion(CompletionKey::Cancel)
+    }
+
     fn apply_file_mention(&mut self, key: FileMentionKey) -> bool {
         match self.file_mentions.handle_key(key) {
             FileMentionAction::Ignored => false,
@@ -10978,10 +10996,18 @@ impl State {
             .map(|confirmation| confirmation.control)
     }
 
+    /// Whether this View may leave now; unsent local messages hold it.
+    fn may_leave(&mut self) -> bool {
+        if self.delayed_submissions.is_empty() {
+            return true;
+        }
+        self.exit_confirmation = None;
+        self.hold_status("Unsent local messages remain; return to their Chat, empty input + Up to edit/cancel before exit");
+        false
+    }
+
     fn request_exit(&mut self, control: char) -> bool {
-        if !self.delayed_submissions.is_empty() {
-            self.exit_confirmation = None;
-            self.hold_status("Unsent local messages remain; return to their Chat, empty input + Up to edit/cancel before exit");
+        if !self.may_leave() {
             return false;
         }
         if self.pending_exit_control() == Some(control) {
@@ -12038,6 +12064,7 @@ impl State {
                     Some(InputEvent::OpenTranscript { id })
                 }
                 KeyCode::Char('c') if !self.prompt_enabled => Some(InputEvent::Interrupt),
+                KeyCode::Char('c') if self.cancel_candidates() => None,
                 KeyCode::Char('c') if !self.editor.draft().is_empty() => {
                     self.edit(EditorCommand::Clear);
                     None
@@ -13573,7 +13600,7 @@ mod tests {
             kind: None,
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
-            loop_state: tickloop_agent_protocol::LoopState::WaitingTrigger,
+            loop_state: tickloop_agent_protocol::LoopState::Idle,
             instance: tick_protocol::InstanceRef::new(
                 "calendar",
                 &format!("fixture-run-{instance}"),
@@ -15404,7 +15431,7 @@ mod tests {
             assert_eq!(state.restored_contexts, std::slice::from_ref(&context));
         }
 
-        let error = branch_from_terminal(&console, &agent, Some(source_chat), None, command, false)
+        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, false)
             .await
             .unwrap_err();
 
@@ -15483,23 +15510,16 @@ mod tests {
         let command = "/branch @branch-context";
 
         let (console, context, cursor) = pending_branch_console(None, command);
-        let error = branch_from_terminal(&console, &agent, None, None, command, false)
+        let error = branch_from_terminal(&console, &agent, None, command, false)
             .await
             .unwrap_err();
         assert!(error.contains("No Chat is selected"));
         assert_pre_save_branch_input_preserved(&console, None, command, &context, cursor, false);
 
         let (console, context, cursor) = pending_branch_console(Some(empty_chat), command);
-        let error = branch_from_terminal(
-            &console,
-            &agent,
-            Some(empty_chat),
-            None,
-            "/branching",
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = branch_from_terminal(&console, &agent, Some(empty_chat), "/branching", false)
+            .await
+            .unwrap_err();
         assert!(error.contains("use /branch [NAME]"));
         assert_pre_save_branch_input_preserved(
             &console,
@@ -15511,7 +15531,7 @@ mod tests {
         );
 
         let (console, context, cursor) = pending_branch_console(Some(empty_chat), command);
-        let error = branch_from_terminal(&console, &agent, Some(empty_chat), None, command, false)
+        let error = branch_from_terminal(&console, &agent, Some(empty_chat), command, false)
             .await
             .unwrap_err();
         assert!(error.contains("there is no conversation to branch"));
@@ -15556,7 +15576,7 @@ mod tests {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(source_chat, None, "source prompt".into())
+            .submit(source_chat, "source prompt".into())
             .await
             .unwrap();
         loop {
@@ -15569,8 +15589,8 @@ mod tests {
                 _ => {}
             }
         }
-        let waiting = agent
-            .submit(source_chat, None, "request a write".into())
+        agent
+            .submit(source_chat, "request a write".into())
             .await
             .unwrap();
         loop {
@@ -15586,16 +15606,9 @@ mod tests {
         let command = "/branch @branch-context";
         let (console, context, cursor) = pending_branch_console(Some(source_chat), command);
 
-        let error = branch_from_terminal(
-            &console,
-            &agent,
-            Some(source_chat),
-            Some(waiting.loop_id),
-            command,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, true)
+            .await
+            .unwrap_err();
 
         assert_eq!(error, "Failed to branch conversation: chat is busy");
         assert_pre_save_branch_input_preserved(
@@ -15626,8 +15639,8 @@ mod tests {
         );
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let source = agent
-            .submit(source_chat, None, "source prompt".into())
+        agent
+            .submit(source_chat, "source prompt".into())
             .await
             .unwrap();
         loop {
@@ -15643,16 +15656,9 @@ mod tests {
         let command = "/branch completion-ready-summary";
         let (console, context, cursor) = pending_branch_console(Some(source_chat), command);
 
-        let error = branch_from_terminal(
-            &console,
-            &agent,
-            Some(source_chat),
-            Some(source.loop_id),
-            command,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, true)
+            .await
+            .unwrap_err();
 
         assert_eq!(error, "Failed to branch conversation: chat is busy");
         assert_pre_save_branch_input_preserved(
@@ -15683,8 +15689,8 @@ mod tests {
         );
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let source = agent
-            .submit(source_chat, None, "source prompt".into())
+        agent
+            .submit(source_chat, "source prompt".into())
             .await
             .unwrap();
         loop {
@@ -15701,16 +15707,9 @@ mod tests {
         let (console, _, _) = pending_branch_console(Some(source_chat), command);
         console.fail_next_reset_chat("renderer failed").unwrap();
 
-        let error = branch_from_terminal(
-            &console,
-            &agent,
-            Some(source_chat),
-            Some(source.loop_id),
-            command,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, false)
+            .await
+            .unwrap_err();
         let child = agent
             .list_chats()
             .await
@@ -16038,7 +16037,7 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Shorten the report".into())
+            .submit(chat, "Shorten the report".into())
             .await
             .unwrap();
         let request = loop {
@@ -16249,7 +16248,7 @@ mod tests {
         assert!(notice_name.ends_with(')'), "{notice_name}");
         let mut menus = Menus::default();
         let mut events = agent.subscribe();
-        agent.submit(chat, None, TITLE.into()).await.unwrap();
+        agent.submit(chat, TITLE.into()).await.unwrap();
         let request = loop {
             if let EventKind::PermissionRequested { request } =
                 tickloop_agent_test_support::next_event(&mut events)
@@ -16275,17 +16274,18 @@ mod tests {
         let frame = console.state.lock().unwrap().frame().0;
         let context = frame
             .iter()
-            .find(|line| line.contains("Goal:"))
-            .unwrap_or_else(|| panic!("the request names its goal: {frame:#?}"));
-        assert!(
-            context.contains(&format!("{notice_name} · Goal: {TITLE}")),
-            "the requester reads as its background notices do ({notice_name}): {context}"
+            .find(|line| line.trim_start().starts_with("Agent "))
+            .unwrap_or_else(|| panic!("the request names its Agent: {frame:#?}"));
+        assert_eq!(
+            context.trim(),
+            notice_name,
+            "the requester reads as its background notices do"
         );
         agent.shutdown().await;
     }
 
     #[tokio::test]
-    async fn a_permission_request_names_its_agent_and_goal_without_a_loop_hash() {
+    async fn a_permission_request_names_its_agent_without_a_loop_hash() {
         use crate::terminal::menus::Menus;
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
@@ -16316,7 +16316,7 @@ mod tests {
         let mut menus = Menus::default();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(chat, None, "Inspect commit deadbeef".into())
+            .submit(chat, "Inspect commit deadbeef".into())
             .await
             .unwrap();
         let request = loop {
@@ -16344,14 +16344,12 @@ mod tests {
         let frame = console.state.lock().unwrap().frame().0;
         let context = frame
             .iter()
-            .find(|line| line.contains("Goal:"))
-            .unwrap_or_else(|| panic!("the request names its goal: {frame:#?}"));
+            .find(|line| line.trim_start().starts_with("Agent "))
+            .unwrap_or_else(|| panic!("the request names its Agent: {frame:#?}"));
         let loop_prefix = &receipt.loop_id.to_string()[..8];
         assert!(
-            context.contains("Agent Inspect commit deadbeef")
-                && context.contains("Goal: Inspect commit deadbeef")
-                && !context.contains(loop_prefix),
-            "the requester and goal are named by text, the Loop by nothing generated: {context}"
+            context.contains("Agent Inspect commit deadbeef") && !context.contains(loop_prefix),
+            "the requester is named by text, the Loop by nothing generated: {context}"
         );
         agent.shutdown().await;
     }
@@ -16420,10 +16418,7 @@ mod tests {
             }
         }
 
-        let receipt = agent
-            .submit(chat, None, "Add caching".into())
-            .await
-            .unwrap();
+        agent.submit(chat, "Add caching".into()).await.unwrap();
         let request = show_request(&agent, &console, &mut menus, chat, &mut events).await;
         {
             let mut state = console.state.lock().unwrap();
@@ -16473,10 +16468,7 @@ mod tests {
             ExecutionMode::Auto
         );
 
-        agent
-            .submit(chat, Some(receipt.loop_id), "Plan it first".into())
-            .await
-            .unwrap();
+        agent.submit(chat, "Plan it first".into()).await.unwrap();
         let request = show_request(&agent, &console, &mut menus, chat, &mut events).await;
         let choice = console.state.lock().unwrap().key(key(KeyCode::Enter));
         let Some(InputEvent::Choice {
@@ -16883,6 +16875,28 @@ mod tests {
             state.key(key(KeyCode::Esc)),
             Some(InputEvent::Cancel { .. })
         ));
+    }
+
+    #[test]
+    fn control_c_closes_candidates_then_clears_the_draft_then_hands_an_empty_input_on() {
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.insert("/he");
+        assert!(state.completion.is_open());
+        assert!(state.key(control_c).is_none());
+        assert!(!state.completion.is_open(), "candidates close first");
+        assert_eq!(state.editor.draft(), "/he");
+        assert!(state.key(control_c).is_none());
+        assert!(state.editor.draft().is_empty(), "then the draft clears");
+        assert!(
+            matches!(state.key(control_c), Some(InputEvent::Interrupt)),
+            "an empty input leaves the choice between interrupting and leaving to the View"
+        );
+        assert!(
+            state.exit_confirmation.is_none(),
+            "Ctrl+C on the Agent input asks for no second press"
+        );
     }
 
     #[test]
@@ -18256,7 +18270,7 @@ mod tests {
                         "id": chat,
                         "folder": "/work",
                         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                        "loops": [],
+                        "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
                     }))
                     .unwrap(),
                     state.display,
@@ -21499,7 +21513,7 @@ mod tests {
         let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
             "id":chat_id,"folder":"/workspace","model":config,
             "messages":[{"role":"user","content":[{"type":"text","text":"Recorded prompt"}]}],
-            "operations":[],"loops":[],"last_sequence":0,
+            "operations":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"last_sequence":0,
             "message_ids":{"0":Uuid::new_v4()},
             "prompt_execution_modes":{"0":tickloop_agent_protocol::ExecutionMode::AcceptEdits}
         }))

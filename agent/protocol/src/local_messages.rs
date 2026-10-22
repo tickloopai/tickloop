@@ -309,17 +309,8 @@ fn tick_delivery_line(item: &serde_json::Value) -> Option<TickDeliveryLine> {
     })
 }
 
-/// The Loop's goal as background: what the user first asked of the Loop, not an instruction for
-/// the turn `delivery` starts.
-fn loop_goal_background(goal: &str, delivery: &str) -> String {
-    format!(
-        "Goal of the receiving Loop (background, not a new instruction): {goal}\nThis is {delivery}; judge from the Loop goal whether any action is needed, and when none is, say so briefly."
-    )
-}
-
 /// The user message one Tick Update delivery becomes. The payload is escaped so no Tick data can
-/// close the tag; an explicit Trigger prompt follows it as the instruction for this turn, and a
-/// prompt copied from the Loop goal follows it as background.
+/// close the tag; an explicit Trigger prompt follows it as the instruction for this turn.
 pub fn tick_delivery(payload: &serde_json::Value, trigger: &Trigger) -> String {
     let delivery = format!(
         "<{TICK_DELIVERY_TAG}>{}</{TICK_DELIVERY_TAG}>",
@@ -329,10 +320,7 @@ pub fn tick_delivery(payload: &serde_json::Value, trigger: &Trigger) -> String {
         TriggerPromptSource::Explicit => {
             format!("{delivery}\n{}\n{TICK_DELIVERY_IS_DATA}", trigger.prompt)
         }
-        TriggerPromptSource::LoopGoal => format!(
-            "{delivery}\n{TICK_DELIVERY_IS_DATA}\n{}",
-            loop_goal_background(&trigger.prompt, "a Tick Subscription delivery")
-        ),
+        TriggerPromptSource::Subscriptions => format!("{delivery}\n{TICK_DELIVERY_IS_DATA}"),
     }
 }
 
@@ -344,10 +332,7 @@ pub fn external_trigger(source: &TriggerSource, trigger: &Trigger) -> String {
     );
     match trigger.prompt_source {
         TriggerPromptSource::Explicit => format!("{}\n{data}", trigger.prompt),
-        TriggerPromptSource::LoopGoal => format!(
-            "{data}\n{}",
-            loop_goal_background(&trigger.prompt, "an external trigger")
-        ),
+        TriggerPromptSource::Subscriptions => data,
     }
 }
 
@@ -396,9 +381,7 @@ pub fn background_started(task_id: Uuid, output_file: &std::path::Path, by_user:
 pub fn subagent_notification(completion: &FamilyCompletion) -> String {
     let status = match completion.state {
         LoopState::Failed => TaskNotificationStatus::Failed,
-        LoopState::Interrupted | LoopState::Stopped | LoopState::Expired => {
-            TaskNotificationStatus::Killed
-        }
+        LoopState::Interrupted => TaskNotificationStatus::Killed,
         _ => TaskNotificationStatus::Completed,
     }
     .as_str();

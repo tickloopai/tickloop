@@ -242,7 +242,7 @@ async fn run_web_with(
     agent.set_permission_rules(chat, rules).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read the requested external information".into())
+        .submit(chat, "Read the requested external information".into())
         .await
         .unwrap();
     let mut permission_requests = Vec::new();
@@ -476,7 +476,7 @@ async fn interrupting_the_page_request_cancels_it_without_changing_the_conversat
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read the delivery page".into())
+        .submit(chat, "Read the delivery page".into())
         .await
         .unwrap();
     let permission = loop {
@@ -798,7 +798,7 @@ async fn search_off_removes_the_tool_and_explains_how_to_enable_it_without_disab
             .await
             .unwrap();
         agent
-            .submit(chat, None, "Check web search availability".into())
+            .submit(chat, "Check web search availability".into())
             .await
             .unwrap();
         loop {
@@ -901,7 +901,7 @@ async fn configured_search_freezes_the_approved_source_and_returns_claude_code_r
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Search for Rust documentation".into())
+        .submit(chat, "Search for Rust documentation".into())
         .await
         .unwrap();
     let mut saw_result = false;

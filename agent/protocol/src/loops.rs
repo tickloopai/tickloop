@@ -3,6 +3,9 @@ use uuid::Uuid;
 
 use crate::{ChatId, LoopId, RunId, TickSubscription};
 
+/// What the Chat's Loop is doing in its current turn. A Loop has no ending state: a failed or
+/// interrupted turn is only how that turn ended, and whether Triggers reach the Loop is kept
+/// apart from it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoopState {
     Idle,
@@ -10,19 +13,14 @@ pub enum LoopState {
     WaitingPermission,
     WaitingQuestion,
     WaitingPlan,
-    WaitingTrigger,
-    Expired,
     Running,
-    Completed,
     Failed,
     Interrupted,
-    Stopped,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoopSnapshot {
     pub id: LoopId,
-    pub goal: String,
     pub state: LoopState,
     pub run_id: Option<RunId>,
     pub run_started_at: Option<u64>,
@@ -37,6 +35,19 @@ pub struct LoopSnapshot {
 }
 
 impl LoopSnapshot {
+    /// The Loop a new Chat starts with: idle, with nothing to receive yet.
+    pub fn new(id: LoopId) -> Self {
+        Self {
+            id,
+            state: LoopState::Idle,
+            run_id: None,
+            run_started_at: None,
+            trigger: None,
+            state_since: None,
+            event_sources: Vec::new(),
+        }
+    }
+
     /// A state the Loop is found in when it is restored, not one it entered now: when the state
     /// changes, nobody knows when that happened, so its time becomes unknown.
     pub fn recover_state(&mut self, state: LoopState) {
@@ -81,13 +92,13 @@ pub struct Trigger {
 }
 
 impl Trigger {
-    /// The Trigger a Tick Subscription adds to a Loop that has none: it takes events and carries
-    /// the Loop's goal, which deliveries present as background rather than as an instruction.
-    pub fn for_loop_goal(goal: &str) -> Self {
+    /// The Trigger a Tick Subscription adds to a Loop that has none: it takes events and has no
+    /// prompt, so its deliveries carry only their data.
+    pub fn for_subscriptions() -> Self {
         Self {
             id: Uuid::new_v4(),
-            prompt: goal.to_owned(),
-            prompt_source: TriggerPromptSource::LoopGoal,
+            prompt: String::new(),
+            prompt_source: TriggerPromptSource::Subscriptions,
             accepts_events: true,
             armed: true,
             subscriptions: Vec::new(),
@@ -108,9 +119,8 @@ pub enum TriggerPromptSource {
     /// Written for this Trigger: the instruction for the turn each firing starts.
     #[default]
     Explicit,
-    /// Copied from the Loop's goal because a Tick Subscription needed a Trigger: what the user
-    /// first asked of the Loop, given as background and never as a new instruction.
-    LoopGoal,
+    /// None: the Trigger exists because a Tick Subscription needed one.
+    Subscriptions,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

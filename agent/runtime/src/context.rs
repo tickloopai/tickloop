@@ -275,7 +275,7 @@ impl Agent {
                 return Ok(false);
             };
             if !chat.parked.is_empty() {
-                return Err(AgentError::Invalid("context requires compaction while another goal is waiting; resolve its pending interaction before compacting".into()));
+                return Err(AgentError::Invalid("context requires compaction while a turn waits for an answer; resolve its pending interaction before compacting".into()));
             }
             trigger
         };
@@ -343,17 +343,11 @@ impl Agent {
                 ));
             }
             projection::complete_boundaries(&messages)?;
-            let goal = chat
-                .snapshot
-                .loops
-                .iter()
-                .find(|goal| run.is_some() && goal.run_id == run)
-                .or_else(|| chat.snapshot.loops.last())
-                .ok_or_else(|| AgentError::Invalid("there is no goal to compact".into()))?;
+            let chat_loop = &chat.snapshot.chat_loop;
             let receipt = Receipt {
                 chat_id,
-                loop_id: goal.id,
-                run_id: goal.run_id.unwrap_or_else(uuid::Uuid::new_v4),
+                loop_id: chat_loop.id,
+                run_id: chat_loop.run_id.unwrap_or_else(uuid::Uuid::new_v4),
             };
             let original = chat.snapshot.clone();
             self.emit(
@@ -385,7 +379,7 @@ impl Agent {
             role: Role::User,
             content: vec![Content::Text {
                 text: format!(
-                    "Create the continuation summary now. Current goals and plans: {}{instructions_text}",
+                    "Create the continuation summary now. Current plan and progress: {}{instructions_text}",
                     pinned_state(&original)
                 ),
             }],
@@ -447,13 +441,7 @@ impl Agent {
                     if cancel.is_cancelled()
                         || chat.snapshot.model != original.model
                         || chat.snapshot.messages != original.messages
-                        || run.is_some_and(|run| {
-                            !chat
-                                .snapshot
-                                .loops
-                                .iter()
-                                .any(|goal| goal.run_id == Some(run))
-                        })
+                        || run.is_some_and(|run| chat.snapshot.chat_loop.run_id != Some(run))
                     {
                         return Err((ResponseRejection::ContextChanged,
                             "conversation or model changed while compacting; original context was retained".into()));
@@ -580,7 +568,7 @@ fn changed_model(current: &ModelConfig, selected: &ModelConfig) -> bool {
 
 fn pinned_state(snapshot: &ChatSnapshot) -> serde_json::Value {
     serde_json::json!({
-        "goals": snapshot.loops,
+        "loop": snapshot.chat_loop,
         "plans": snapshot.plans,
         "progress": snapshot.progress,
         "pending_inputs": snapshot.pending_inputs,
@@ -731,7 +719,7 @@ mod tests {
             )
             .unwrap();
             let id = agent.create_chat(directory.path().into()).await.unwrap();
-            agent.submit(id, None, "Discuss".into()).await.unwrap();
+            agent.submit(id, "Discuss".into()).await.unwrap();
             agent.quiesce(id).await;
             {
                 let mut chats = agent.inner.chats.lock().await;

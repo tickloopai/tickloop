@@ -1,5 +1,7 @@
 use serde_json::Value;
-use tickloop_agent_protocol::{Decision, EventKind, ExecutionMode, PermissionRule};
+use tickloop_agent_protocol::{
+    Decision, EventKind, ExecutionMode, PermissionRule, TickSubscriptionChange,
+};
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, next_event, text};
 use uuid::Uuid;
@@ -42,14 +44,14 @@ pub async fn verify_admission_policy(
                     .set_permission_rules(chat, vec![rule(decision)])
                     .await
                     .unwrap();
-                let before = agent.tick_subscriptions(chat).await.unwrap().len();
+                let before = agent.tick_subscriptions(chat).await.unwrap();
                 model.enqueue(call("admission", case.name, case.input.clone()));
                 if !revoke {
                     model.enqueue(text("done"));
                 }
                 let mut events = agent.subscribe();
                 agent
-                    .submit(chat, None, format!("{mode:?}: {}", case.name))
+                    .submit(chat, format!("{mode:?}: {}", case.name))
                     .await
                     .unwrap();
                 let mut asked = 0;
@@ -113,10 +115,10 @@ pub async fn verify_admission_policy(
                         case.name, result.content
                     );
                 }
-                let after = agent.tick_subscriptions(chat).await.unwrap().len();
+                let after = agent.tick_subscriptions(chat).await.unwrap();
                 assert_eq!(
-                    after,
-                    before
+                    after.len(),
+                    before.len()
                         + usize::from(
                             case.name == "TickManage"
                                 && case.input["action"] == "subscribe"
@@ -125,6 +127,17 @@ pub async fn verify_admission_policy(
                     "{} {mode:?}",
                     case.name
                 );
+                // The Chat's one Loop subscribes to an instance once; the next case starts from
+                // the same subscriptions.
+                for added in after
+                    .iter()
+                    .filter(|row| before.iter().all(|kept| kept.id != row.id))
+                {
+                    agent
+                        .update_tick_subscription(chat, added.id, TickSubscriptionChange::Cancel)
+                        .await
+                        .unwrap();
+                }
             }
         }
     }

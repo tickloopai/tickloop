@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -39,9 +38,7 @@ struct RawModeState {
 pub(super) struct ViewSelection {
     pub navigation: crate::agent_console::UpgradeNavigation,
     pub chat: Option<Uuid>,
-    pub goal: Option<Uuid>,
     pub overview: bool,
-    pub selected_loops: HashMap<Uuid, Option<Uuid>>,
     pub configuration: serde_json::Value,
 }
 
@@ -64,6 +61,11 @@ pub(super) struct ViewHandoff {
 }
 
 fn load_handoff(path: &Path, process: u32) -> Result<ViewHandoff, String> {
+    load_raw_handoff(path, process).map(|(handoff, _)| handoff)
+}
+
+/// The handoff with the JSON it was read from, which may carry fields of another View version.
+fn load_raw_handoff(path: &Path, process: u32) -> Result<(ViewHandoff, serde_json::Value), String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -85,8 +87,10 @@ fn load_handoff(path: &Path, process: u32) -> Result<ViewHandoff, String> {
     if bytes.len() as u64 > MAX_HANDOFF_BYTES {
         return Err("View handoff exceeds its size limit".into());
     }
-    let handoff: ViewHandoff =
+    let raw: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| format!("Invalid View handoff: {error}"))?;
+    let handoff =
+        ViewHandoff::deserialize(&raw).map_err(|error| format!("Invalid View handoff: {error}"))?;
     if handoff.schema != HANDOFF_SCHEMA || handoff.process != process {
         return Err("View handoff schema or process does not match".into());
     }
@@ -99,7 +103,7 @@ fn load_handoff(path: &Path, process: u32) -> Result<ViewHandoff, String> {
         handoff.selection.configuration.clone(),
     )
     .map_err(|error| format!("Invalid saved View configuration: {error}"))?;
-    Ok(handoff)
+    Ok((handoff, raw))
 }
 
 pub(super) fn read_handoff(path: &Path) -> Result<ViewHandoff, String> {
@@ -177,7 +181,7 @@ pub(super) fn recover_handoff(arguments: &[OsString]) -> Result<bool, String> {
         }
     }
     let _restore_terminal = RestoreTerminal;
-    let mut handoff = load_handoff(path, std::process::id())?;
+    let (mut handoff, raw) = load_raw_handoff(path, std::process::id())?;
     if handoff.recovery_attempted {
         return Ok(false);
     }
@@ -204,22 +208,41 @@ pub(super) fn recover_handoff(arguments: &[OsString]) -> Result<bool, String> {
             .map_err(|error| error.to_string())?;
         handoff.predecessor_lease = Some(lease.raw_descriptor());
     }
-    handoff.recovery_attempted = true;
+    mark_recovery_attempted(path, raw, handoff.predecessor_lease)?;
+    let error = std::process::Command::new(&handoff.predecessor)
+        .args(arguments)
+        .exec();
+    Err(format!("Cannot restore the predecessor View: {error}"))
+}
+
+/// Rewrites the handoff for the predecessor to restore from. Only the recovery mark and the lease
+/// change: the rest stays as the predecessor wrote it, so fields this version does not know reach
+/// it unchanged.
+fn mark_recovery_attempted(
+    path: &Path,
+    mut raw: serde_json::Value,
+    predecessor_lease: Option<i32>,
+) -> Result<(), String> {
+    let fields = raw.as_object_mut().ok_or("View handoff is not an object")?;
+    fields.insert("recovery_attempted".into(), true.into());
+    fields.insert(
+        "predecessor_lease".into(),
+        serde_json::to_value(predecessor_lease).map_err(|error| error.to_string())?,
+    );
     let parent = path.parent().ok_or("View handoff has no parent")?;
     let mut updated = tempfile::Builder::new()
         .prefix(".view-recovery-")
         .tempfile_in(parent)
         .map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut updated, &handoff).map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut updated, &raw).map_err(|error| error.to_string())?;
     updated
         .flush()
         .and_then(|()| updated.as_file().sync_all())
         .map_err(|error| error.to_string())?;
-    updated.persist(path).map_err(|error| error.to_string())?;
-    let error = std::process::Command::new(&handoff.predecessor)
-        .args(arguments)
-        .exec();
-    Err(format!("Cannot restore the predecessor View: {error}"))
+    updated
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn check_handoff(path: &Path) -> Result<(), String> {
@@ -342,9 +365,7 @@ mod tests {
                     filter: tickloop_agent_protocol::AgentFilter::default(),
                 },
                 chat: Some(chat),
-                goal: None,
                 overview: false,
-                selected_loops: HashMap::new(),
                 configuration: serde_json::to_value(
                     super::super::new_agent_draft::NewAgentDraft::default(),
                 )
@@ -395,6 +416,34 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read_handoff(&path).is_err());
+    }
+
+    #[test]
+    fn recovery_keeps_the_fields_another_view_version_wrote() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state");
+        let mut written = serde_json::to_value(saved_view()).unwrap();
+        written["selection"]["selected_loops"] = serde_json::json!({});
+        written["selection"]["goal"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&written).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (handoff, raw) = load_raw_handoff(&path, std::process::id()).unwrap();
+        assert!(!handoff.recovery_attempted);
+
+        mark_recovery_attempted(&path, raw, Some(7)).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored["recovery_attempted"], true);
+        assert_eq!(restored["predecessor_lease"], 7);
+        assert_eq!(
+            restored["selection"]["selected_loops"],
+            serde_json::json!({}),
+            "the predecessor gets back the fields it needs"
+        );
+        assert!(restored["selection"].get("goal").is_some());
+        written["recovery_attempted"] = true.into();
+        written["predecessor_lease"] = 7.into();
+        assert_eq!(restored, written, "nothing else changes");
     }
 
     #[test]

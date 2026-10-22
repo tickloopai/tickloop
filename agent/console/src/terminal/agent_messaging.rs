@@ -342,7 +342,6 @@ pub(super) fn completion_runs(
     let (word, dot) = match completion.state {
         LoopState::Failed => ("failed", Role::Error),
         LoopState::Interrupted => ("was interrupted", Role::Warning),
-        LoopState::Stopped | LoopState::Expired => ("was stopped", Role::Warning),
         _ => ("finished", Role::Success),
     };
     let mut heading = vec![
@@ -621,7 +620,7 @@ mod tests {
         serde_json::from_value(json!({
             "id":Uuid::new_v4(),"folder":"/work","messages":[
                 {"role":"user","content":[{"type":"text","text":message}]}
-            ],"loops":[],"message_ids":{"0":child_run},"agent_message_origins":{child_run.to_string():{"is_result":true}}
+            ],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"message_ids":{"0":child_run},"agent_message_origins":{child_run.to_string():{"is_result":true}}
         }))
         .unwrap()
     }
@@ -642,7 +641,7 @@ mod tests {
 
     #[test]
     fn a_finished_child_reads_as_a_teammate_block_in_its_outcome_colour() {
-        let mut finished = completion(LoopState::Completed, SUBAGENT_REPORT_RECEIPT, None);
+        let mut finished = completion(LoopState::Idle, SUBAGENT_REPORT_RECEIPT, None);
         let warning = "SECURITY WARNING: auto review flagged this subagent's report.";
         let report = SubagentReportMessage {
             note: Some(warning.into()),
@@ -685,8 +684,6 @@ mod tests {
         for (state, word, dot) in [
             (LoopState::Failed, "failed", Role::Error),
             (LoopState::Interrupted, "was interrupted", Role::Warning),
-            (LoopState::Stopped, "was stopped", Role::Warning),
-            (LoopState::Expired, "was stopped", Role::Warning),
         ] {
             let ended = completion(state, SUBAGENT_MISSING_REPORT, Some("Model\nunavailable"));
             let (heading, body) = block(&ended, &snapshot, OutputDetail::Preview);
@@ -707,11 +704,11 @@ mod tests {
             report: "Another child's report".into(),
         };
         let snapshot = delivered(Uuid::new_v4(), &other);
-        let silent = completion(LoopState::Completed, SUBAGENT_MISSING_REPORT, None);
+        let silent = completion(LoopState::Idle, SUBAGENT_MISSING_REPORT, None);
         let (_, body) = block(&silent, &snapshot, OutputDetail::Preview);
         assert_eq!(joined(&body), "  Ended without a report\n");
 
-        let mut refused = completion(LoopState::Completed, "Plain reply text", None);
+        let mut refused = completion(LoopState::Idle, "Plain reply text", None);
         refused.started_at = None;
         refused.notification = SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
             code: FamilyMessageRejectionCode::StaleTarget,

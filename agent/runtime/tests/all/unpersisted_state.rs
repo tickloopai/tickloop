@@ -29,7 +29,7 @@ async fn wait_for(
 
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     wait_for(&mut events, chat, |kind| {
         matches!(kind, EventKind::Completed { .. })
     })
@@ -92,8 +92,8 @@ async fn restart_keeps_the_conversation_but_forgets_session_only_state() {
         .unwrap();
 
     let mut events = first.subscribe();
-    let waiting = first
-        .submit(chat, None, "Run a shell command".into())
+    first
+        .submit(chat, "Run a shell command".into())
         .await
         .unwrap();
     wait_for(&mut events, chat, |kind| {
@@ -101,17 +101,14 @@ async fn restart_keeps_the_conversation_but_forgets_session_only_state() {
     })
     .await;
     first
-        .submit(chat, Some(waiting.loop_id), "Then add a conclusion".into())
+        .submit(chat, "Then add a conclusion".into())
         .await
         .unwrap();
-    first
-        .queue_command(chat, None, "/status".into())
-        .await
-        .unwrap();
+    first.queue_command(chat, "/status".into()).await.unwrap();
 
     let asking = first.create_chat(workdir.clone()).await.unwrap();
     first
-        .submit(asking, None, "Write the report".into())
+        .submit(asking, "Write the report".into())
         .await
         .unwrap();
     wait_for(&mut events, asking, |kind| {

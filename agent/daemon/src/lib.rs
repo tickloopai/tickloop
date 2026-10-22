@@ -763,11 +763,6 @@ pub async fn build_runtime_with_models(
     )
     .map_err(|error| error.to_string())?;
     use tickloop_agent_runtime::tick_adapter::TickAdapters;
-    if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
-        agent.install_stopped_child_hook(Arc::new(
-            tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
-        ));
-    }
     let tick_tools = hosted
         .clone()
         .map(|hosted| hosted as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>);

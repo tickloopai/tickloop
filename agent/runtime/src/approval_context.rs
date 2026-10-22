@@ -615,23 +615,20 @@ pub(super) fn capture(
                 })
             })
             .collect(),
-        dependency_files: bookkeeping
-            .dependency_baselines
-            .get(&operation.loop_id)
-            .map(|baseline| {
-                let current = dependency_fingerprints(folder);
-                baseline
-                    .keys()
-                    .chain(current.keys())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .map(|path| DependencyEvidence {
-                        path: path.clone(),
-                        unchanged_since_loop_start: baseline.get(path).is_some()
-                            && baseline.get(path) == current.get(path),
-                    })
-                    .collect()
-            }),
+        dependency_files: bookkeeping.dependency_baseline.as_ref().map(|baseline| {
+            let current = dependency_fingerprints(folder);
+            baseline
+                .keys()
+                .chain(current.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|path| DependencyEvidence {
+                    path: path.clone(),
+                    unchanged_since_loop_start: baseline.get(path).is_some()
+                        && baseline.get(path) == current.get(path),
+                })
+                .collect()
+        }),
         prepared_facts: None,
         creation_receipt: None,
         context_version: APPROVAL_CONTEXT_VERSION,

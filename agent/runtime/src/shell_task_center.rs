@@ -679,7 +679,7 @@ mod tests {
         let mut subscription = center.subscribe(chat_id).await.unwrap();
         let mut completion_events = agent.subscribe_user_shells();
         let receipt = agent
-            .submit_user_shell_for_goal(chat_id, None, "printf finished".into(), false)
+            .submit_user_shell(chat_id, "printf finished".into(), false)
             .await
             .unwrap();
         let terminal = tokio::time::timeout(Duration::from_secs(3), async {
@@ -725,7 +725,7 @@ mod tests {
         let mut subscription = center.subscribe(chat_id).await.unwrap();
         let mut completion_events = agent.subscribe_user_shells();
         let receipt = agent
-            .submit_user_shell_for_goal(chat_id, None, "printf lag-output".into(), true)
+            .submit_user_shell(chat_id, "printf lag-output".into(), true)
             .await
             .unwrap();
         let terminal = tokio::time::timeout(Duration::from_secs(3), async {
@@ -772,7 +772,7 @@ mod tests {
             .await
             .unwrap();
         let receipt = agent
-            .submit_user_shell_for_goal(chat_id, None, "printf 'abcdef'".into(), false)
+            .submit_user_shell(chat_id, "printf 'abcdef'".into(), false)
             .await
             .unwrap();
 
@@ -824,7 +824,7 @@ mod tests {
         let agent = agent();
         let chat_id = create_chat(&agent, directory.path()).await;
         let completed = agent
-            .submit_user_shell_for_goal(chat_id, None, "printf first".into(), false)
+            .submit_user_shell(chat_id, "printf first".into(), false)
             .await
             .unwrap();
         loop {
@@ -838,11 +838,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let older_active = agent
-            .submit_user_shell_for_goal(chat_id, None, "sleep 5".into(), true)
+            .submit_user_shell(chat_id, "sleep 5".into(), true)
             .await
             .unwrap();
         let newer_active = agent
-            .submit_user_shell_for_goal(chat_id, None, "sleep 5".into(), true)
+            .submit_user_shell(chat_id, "sleep 5".into(), true)
             .await
             .unwrap();
         let center = ShellTaskCenter::new(agent.clone());

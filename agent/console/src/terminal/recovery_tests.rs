@@ -504,8 +504,8 @@ async fn run_completed_reply_recovery_fixture() {
     assert_eq!(buffered_chat, chat);
     assert!(!complete_line);
     let running = core.snapshot(chat).await.unwrap();
-    assert_eq!(running.loops[0].run_id, Some(run));
-    assert_eq!(running.loops[0].state, LoopState::Running);
+    assert_eq!(running.chat_loop.run_id, Some(run));
+    assert_eq!(running.chat_loop.state, LoopState::Running);
     assert!(running.events.iter().any(|event| event.sequence == sequence
         && event.run_id == run
         && matches!(&event.kind, EventKind::Text(text) if text == if route=="running" {FIRST_REPLY_DELTA}else{REPLY})));
@@ -559,7 +559,6 @@ async fn run_completed_reply_recovery_fixture() {
                     command_id: Uuid::new_v4(),
                     command: AgentCommand::Submit {
                         execution: other_execution.unwrap(),
-                        target_loop: None,
                         input: UserInput::Text {
                             text: "bounded background traffic".into(),
                             contexts: Vec::new(),
@@ -605,7 +604,7 @@ async fn run_completed_reply_recovery_fixture() {
     assert_eq!(after, sequence);
     if route == "running" {
         let recovered = core.snapshot(chat).await.unwrap();
-        assert_eq!(recovered.loops[0].state, LoopState::Running);
+        assert_eq!(recovered.chat_loop.state, LoopState::Running);
         assert_eq!(recovered.last_sequence, last_sequence);
         finish_model.send(()).unwrap();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -623,15 +622,14 @@ async fn run_completed_reply_recovery_fixture() {
         .unwrap();
     }
     let completed = core.snapshot(chat).await.unwrap();
-    assert_eq!(completed.loops.len(), 1);
-    assert_eq!(completed.loops[0].id, running.loops[0].id);
-    assert_eq!(completed.loops[0].run_id, Some(run));
+    assert_eq!(completed.chat_loop.id, running.chat_loop.id);
+    assert_eq!(completed.chat_loop.run_id, Some(run));
     assert_eq!(
-        completed.loops[0].state,
+        completed.chat_loop.state,
         if route == "interrupted" {
             LoopState::Interrupted
         } else {
-            LoopState::Completed
+            LoopState::Idle
         }
     );
     if route == "running" {
@@ -1112,7 +1110,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
         let other_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         let mut buffered = HashMap::new();
-        let prior = agent.submit(chat, None, "prior goal".into()).await.unwrap();
+        let prior = agent.submit(chat, "prior goal".into()).await.unwrap();
         buffer_actual_text(&mut events, &prior, &mut buffered).await;
         release_prior.send(()).unwrap();
         loop {
@@ -1126,13 +1124,10 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
                 break;
             }
         }
-        let current = agent
-            .submit(chat, None, "new running goal".into())
-            .await
-            .unwrap();
+        let current = agent.submit(chat, "new running goal".into()).await.unwrap();
         let after = buffer_actual_text(&mut events, &current, &mut buffered).await;
         let other = agent
-            .submit(other_chat, None, "other running goal".into())
+            .submit(other_chat, "other running goal".into())
             .await
             .unwrap();
         buffer_actual_text(&mut events, &other, &mut buffered).await;
@@ -1223,10 +1218,9 @@ impl AgentAccess for SavedInputObservation {
         let mut observation = self.daemon.observe(query).await?;
         if std::path::Path::new(UNARMED_INPUT_FILE).exists()
             && let ObservationValue::Agent(snapshot) = &mut observation.initial
-            && let Some(goal) = snapshot.conversation.loops.first()
         {
             snapshot.pending_inputs = vec![serde_json::from_value(serde_json::json!({
-                "receipt": {"chat_id":snapshot.conversation.id,"loop_id":goal.id,"run_id":self.pending_run},
+                "receipt": {"chat_id":snapshot.conversation.id,"loop_id":snapshot.conversation.chat_loop.id,"run_id":self.pending_run},
                 "input":UNARMED_INPUT,"armed":false
             }))
             .unwrap()];
@@ -1303,7 +1297,7 @@ fn routine_restore_pty_fixture() {
                 if std::env::var(ROUTE_VARIABLE).as_deref() == Ok(PLAIN_ROUTE) {
                     let chat = agent.create_chat(workdir).await.unwrap();
                     let mut events = core.subscribe();
-                    agent.submit(chat, None, ROUTINE_INPUT.into()).await.unwrap();
+                    agent.submit(chat, ROUTINE_INPUT.into()).await.unwrap();
                     loop {
                         let event = tickloop_agent_test_support::next_event(&mut events).await;
                         if matches!(event.kind, EventKind::Completed { .. }) {
@@ -1324,7 +1318,7 @@ fn routine_restore_pty_fixture() {
                     )
                     .await
                     .unwrap();
-                    println!("PIPE_RESTORE_PROOF {}", serde_json::json!({"chat":chat,"saved":observation.snapshot.pending_inputs[0],"goal":observation.snapshot.loops[0].id}));
+                    println!("PIPE_RESTORE_PROOF {}", serde_json::json!({"chat":chat,"saved":observation.snapshot.pending_inputs[0],"goal":observation.snapshot.chat_loop.id}));
                     assert_eq!(model.requests.lock().unwrap().len(), 1);
                     core.shutdown().await;
                     return;
@@ -1356,10 +1350,9 @@ fn routine_restore_pty_fixture() {
                     unreachable!()
                 };
                 let snapshot = core.snapshot(chat).await.unwrap();
-                assert_eq!(snapshot.loops.len(), 1);
-                assert_eq!(snapshot.loops[0].run_id, Some(run));
-                assert_eq!(snapshot.loops[0].state, LoopState::Completed);
-                write_phase(serde_json::json!({"phase":"completed","completed":completed,"goal":snapshot.loops[0].id}));
+                assert_eq!(snapshot.chat_loop.run_id, Some(run));
+                assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
+                write_phase(serde_json::json!({"phase":"completed","completed":completed,"goal":snapshot.chat_loop.id}));
                 let passes = if route == PENDING_INPUT_ROUTE || route == RESET_ROUTE {
                     1
                 } else {
@@ -1559,14 +1552,14 @@ async fn run_retained_completion_lifecycle_fixture() {
     let mut receipts = Vec::new();
     let mut snapshots = Vec::new();
     for prompt in ["Read the first report.", "Read another report."] {
-        let loop_id = receipts.first().map(|receipt: &Receipt| receipt.loop_id);
-        let receipt = core.submit(chat, loop_id, prompt.into()).await.unwrap();
+        receipts.first().map(|receipt: &Receipt| receipt.loop_id);
+        let receipt = core.submit(chat, prompt.into()).await.unwrap();
         let snapshot = tokio::time::timeout(LAGGED_DRAIN_TIMEOUT, async {
             loop {
                 let snapshot = core.snapshot(chat).await.unwrap();
-                if snapshot.loops.iter().any(|goal| {
-                    goal.run_id == Some(receipt.run_id) && goal.state == LoopState::Completed
-                }) {
+                if snapshot.chat_loop.run_id == Some(receipt.run_id)
+                    && snapshot.chat_loop.state == LoopState::Idle
+                {
                     break snapshot;
                 }
                 tokio::task::yield_now().await;
@@ -1782,17 +1775,11 @@ fn plain_restore_keeps_public_history_without_internal_identity_notices() {
         !stdout.contains(&format!("Chat {chat} restored. Current model:")),
         "{stdout}"
     );
+    assert!(stdout.contains("Loop: Idle"), "{stdout}");
     assert!(
         stdout.contains(&format!(
-            "Goal: {} · Completed · {ROUTINE_INPUT}",
-            receipt.loop_id
-        )),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "Saved input awaiting manual continuation: Goal {} · Run {}\n{UNARMED_INPUT}",
-            receipt.loop_id, receipt.run_id
+            "Saved input awaiting manual continuation: Run {}\n{UNARMED_INPUT}",
+            receipt.run_id
         )),
         "{stdout}"
     );
@@ -1893,7 +1880,7 @@ fn run_routine_restore_pty(route: &str) {
                 assert!(frame.contains(line), "{frame}");
             }
             assert!(
-                !frame.contains("Saved input awaiting manual continuation: Goal"),
+                !frame.contains("Saved input awaiting manual continuation: Run"),
                 "{frame}"
             );
             let receipt: Receipt = serde_json::from_value(saved["receipt"].clone()).unwrap();
@@ -1901,10 +1888,7 @@ fn run_routine_restore_pty(route: &str) {
                 !frame.contains(&format!("Run {}", receipt.run_id)),
                 "{frame}"
             );
-            assert!(
-                !frame.contains(&format!("Goal: {}", receipt.loop_id)),
-                "{frame}"
-            );
+            assert!(!frame.contains(&receipt.loop_id.to_string()), "{frame}");
         } else if route == RESET_ROUTE {
             assert_eq!(restored["restored"]["Restored"]["reset_required"], true);
             assert!(
@@ -2201,14 +2185,7 @@ async fn run_merge_boundary_fixture() {
     requests.recv().await.unwrap();
     release_second.send(()).unwrap();
     tokio::time::timeout(RECOVERY_TIMEOUT, async {
-        while !core
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .all(|goal| goal.state == LoopState::Completed)
-        {
+        while core.snapshot(chat).await.unwrap().chat_loop.state != LoopState::Idle {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

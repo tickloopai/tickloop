@@ -2,16 +2,16 @@ use std::{sync::Arc, time::Duration};
 
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
-    BranchRequest, ChatId, EventKind, LoopId, Receipt, ShellTaskState, Trigger,
-    TriggerPromptSource, TriggerSource,
+    BranchRequest, ChatId, EventKind, Receipt, ShellTaskState, Trigger, TriggerPromptSource,
+    TriggerSource,
 };
 use tickloop_agent_runtime::{Agent, AgentError, ShellTaskCenter};
 use tickloop_agent_test_support::{ScriptedModel, config, next_event, text, transcript_file};
 use uuid::Uuid;
 
-async fn complete_turn(agent: &Agent, chat: ChatId, goal: Option<LoopId>, prompt: &str) -> Receipt {
+async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -44,7 +44,7 @@ async fn forking_a_saved_chat_writes_a_new_transcript_and_leaves_the_source_unch
     )
     .unwrap();
     let source = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, source, None, "Remember cedar.").await;
+    complete_turn(&agent, source, "Remember cedar.").await;
     agent.shutdown().await;
     drop(agent);
     let source_path = transcript_file(&root, source);
@@ -67,7 +67,7 @@ async fn forking_a_saved_chat_writes_a_new_transcript_and_leaves_the_source_unch
             .all(|chat| chat.id != source),
         "copying must not load the source Chat"
     );
-    complete_turn(&copying, copy.id, None, "What was the word?").await;
+    complete_turn(&copying, copy.id, "What was the word?").await;
     let sent = request_text(&model.requests.lock().unwrap()[0]);
     assert!(sent.contains("Remember cedar."), "{sent}");
     assert!(sent.contains("Saved the word cedar."), "{sent}");
@@ -114,14 +114,13 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let background = agent.create_chat(directory.path().into()).await.unwrap();
-    let watch = complete_turn(&agent, background, None, "Watch the market.").await;
+    complete_turn(&agent, background, "Watch the market.").await;
 
     let foreground = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
         .configure_trigger(
             background,
-            watch.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "triggered market check".into(),
@@ -133,12 +132,11 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         )
         .await
         .unwrap();
-    complete_turn(&agent, foreground, None, "Foreground question.").await;
+    complete_turn(&agent, foreground, "Foreground question.").await;
     for sequence in 1..=2 {
         agent
             .trigger(
                 background,
-                watch.loop_id,
                 TriggerSource {
                     source: "market".into(),
                     payload: serde_json::json!({ "sequence": sequence }),
@@ -158,10 +156,7 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         .await
         .expect("the background Chat's triggered Loop stopped running");
     }
-    agent
-        .configure_trigger(background, watch.loop_id, None)
-        .await
-        .unwrap();
+    agent.configure_trigger(background, None).await.unwrap();
 
     let background_text = conversation_text(&agent.snapshot(background).await.unwrap());
     let foreground_text = conversation_text(&agent.snapshot(foreground).await.unwrap());
@@ -188,7 +183,7 @@ async fn the_task_center_lists_tasks_from_every_chat_with_their_owner() {
     let background = agent.create_chat(directory.path().into()).await.unwrap();
     let foreground = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = agent
-        .submit_user_shell_for_goal(background, None, "sleep 30".into(), true)
+        .submit_user_shell(background, "sleep 30".into(), true)
         .await
         .unwrap();
     let center = ShellTaskCenter::new(agent.clone());
@@ -236,12 +231,11 @@ async fn branch_titles_follow_claude_code_and_count_saved_branches() {
     )
     .unwrap();
     let source = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, source, None, "  compare   two stocks ").await;
+    complete_turn(&agent, source, "  compare   two stocks ").await;
     let first = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -251,7 +245,6 @@ async fn branch_titles_follow_claude_code_and_count_saved_branches() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: Some("value path".into()),
         })
         .await
@@ -271,7 +264,6 @@ async fn branch_titles_follow_claude_code_and_count_saved_branches() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: None,
         })
         .await

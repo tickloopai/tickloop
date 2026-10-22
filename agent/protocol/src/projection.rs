@@ -644,7 +644,7 @@ pub fn append_raw_projection(
                         };
                         (content.clone(), *is_error)
                     } else {
-                        ("Tool result is pending. No final execution result is recorded. This placeholder does not authorize execution or repetition; wait for the host to resume the owning goal.".into(), false)
+                        ("Tool result is pending. No final execution result is recorded. This placeholder does not authorize execution or repetition; wait for the host to resume the owning Loop.".into(), false)
                     };
                     results.push(Content::ToolResult {
                         tool_use_id: call.wire_id.clone(),

@@ -87,7 +87,7 @@ async fn recovery_process_fixture() {
     let mut events = agent.subscribe();
     let completed = if mode == "queue" {
         let completed = agent
-            .submit(chat, None, "Already completed goal".into())
+            .submit(chat, "Already completed goal".into())
             .await
             .unwrap();
         loop {
@@ -104,18 +104,14 @@ async fn recovery_process_fixture() {
     } else {
         None
     };
-    let first = agent.submit(chat, None, "First goal".into()).await.unwrap();
+    let first = agent.submit(chat, "First goal".into()).await.unwrap();
     let second = if mode == "queue" {
         let second = agent
-            .submit(chat, None, "Second goal must remain parked".into())
+            .submit(chat, "Second goal must remain parked".into())
             .await
             .unwrap();
         agent
-            .submit(
-                chat,
-                Some(first.loop_id),
-                "Earlier queued first-goal instruction".into(),
-            )
+            .submit(chat, "Earlier queued first-goal instruction".into())
             .await
             .unwrap();
         Some(second)
@@ -186,24 +182,17 @@ fn run_fixture(directory: &Path, mode: &str) -> Fixture {
     serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap()).unwrap()
 }
 
-/// 照 Claude Code，排队输入不随 Chat 保存：恢复后运行中与等待中的目标都转为已中断，
-/// 之前排队的输入不会进入之后的请求。
+/// 照 Claude Code，排队输入不随 Chat 保存：恢复后运行中的一轮转为已中断，之前排队的输入不会
+/// 进入之后的请求。
 #[tokio::test]
-async fn reopening_interrupts_goals_and_forgets_their_queued_inputs() {
+async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = run_fixture(directory.path(), "queue");
     let model = Arc::new(ScriptedModel::new(vec![text("New instruction processed")]));
     let agent =
         Agent::open_embedded(directory.path().join("archive"), config(), model.clone()).unwrap();
     let before = agent.resume_chat(fixture.chat).await.unwrap();
-    assert_eq!(
-        before
-            .loops
-            .iter()
-            .filter(|goal| goal.state == LoopState::Interrupted)
-            .count(),
-        2
-    );
+    assert_eq!(before.chat_loop.state, LoopState::Interrupted);
     assert!(before.queued_inputs().is_empty());
     assert_eq!(
         before.latest_compact_summary().as_deref(),
@@ -212,11 +201,7 @@ async fn reopening_interrupts_goals_and_forgets_their_queued_inputs() {
     assert!(model.requests.lock().unwrap().is_empty());
     let mut events = agent.subscribe();
     let resumed = agent
-        .submit(
-            fixture.chat,
-            Some(fixture.first.loop_id),
-            "New first-goal instruction".into(),
-        )
+        .submit(fixture.chat, "New first-goal instruction".into())
         .await
         .unwrap();
     loop {
@@ -228,25 +213,7 @@ async fn reopening_interrupts_goals_and_forgets_their_queued_inputs() {
         }
     }
     let after = agent.snapshot(fixture.chat).await.unwrap();
-    let second = fixture.second.unwrap();
-    assert_eq!(
-        after
-            .loops
-            .iter()
-            .find(|goal| goal.id == fixture.completed.as_ref().unwrap().loop_id)
-            .unwrap()
-            .state,
-        LoopState::Completed
-    );
-    assert_eq!(
-        after
-            .loops
-            .iter()
-            .find(|goal| goal.id == second.loop_id)
-            .unwrap()
-            .state,
-        LoopState::Interrupted
-    );
+    assert_eq!(after.chat_loop.state, LoopState::Idle);
     assert!(after.pending_inputs.is_empty());
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
@@ -286,7 +253,6 @@ async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowl
     let receipt = agent
         .submit(
             fixture.chat,
-            Some(fixture.first.loop_id),
             "Continue without repeating the command".into(),
         )
         .await
@@ -347,7 +313,6 @@ async fn an_operation_waiting_for_permission_at_exit_is_never_executed_after_res
     agent
         .submit(
             fixture.chat,
-            Some(fixture.first.loop_id),
             "Continue without executing the old command".into(),
         )
         .await
@@ -400,10 +365,7 @@ async fn archives_remain_readable_when_credentials_or_the_working_directory_are_
     .unwrap();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Record this".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Record this".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -427,27 +389,19 @@ async fn archives_remain_readable_when_credentials_or_the_working_directory_are_
     .unwrap();
     let restored = agent.resume_chat(chat).await.unwrap();
     assert_eq!(restored.messages.len(), 2);
-    let error = agent
-        .submit(chat, None, "Continue".into())
-        .await
-        .unwrap_err();
+    let error = agent.submit(chat, "Continue".into()).await.unwrap_err();
     assert!(
         error.to_string().contains("directory is unavailable"),
         "{error}"
     );
-    assert_eq!(agent.snapshot(chat).await.unwrap().loops.len(), 1);
     std::fs::create_dir(&workdir).unwrap();
-    let error = agent
-        .submit(chat, None, "Continue".into())
-        .await
-        .unwrap_err();
+    let error = agent.submit(chat, "Continue".into()).await.unwrap_err();
     assert!(
         error
             .to_string()
             .contains("API key environment variable is unset"),
         "{error}"
     );
-    assert_eq!(agent.snapshot(chat).await.unwrap().loops.len(), 1);
     assert!(model.requests.lock().unwrap().is_empty());
     save_api_key(
         &directory.path().canonicalize().unwrap().join("archive"),
@@ -456,7 +410,7 @@ async fn archives_remain_readable_when_credentials_or_the_working_directory_are_
     )
     .unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Continue".into()).await.unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,

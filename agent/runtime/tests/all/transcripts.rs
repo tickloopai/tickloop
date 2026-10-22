@@ -104,9 +104,9 @@ impl ModelClient for SequenceModel {
     }
 }
 
-async fn complete_turn(agent: &Agent, chat: ChatId, goal: Option<LoopId>, prompt: &str) -> Receipt {
+async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -166,8 +166,8 @@ async fn two_agents_on_one_root_finish_turns_concurrently() {
     let first_chat = first.create_chat(directory.path().into()).await.unwrap();
     let second_chat = second.create_chat(directory.path().into()).await.unwrap();
     tokio::join!(
-        complete_turn(&first, first_chat, None, "prompt for first host"),
-        complete_turn(&second, second_chat, None, "prompt for second host"),
+        complete_turn(&first, first_chat, "prompt for first host"),
+        complete_turn(&second, second_chat, "prompt for second host"),
     );
     first.shutdown().await;
     second.shutdown().await;
@@ -198,7 +198,7 @@ async fn two_agents_on_one_root_finish_turns_concurrently() {
         ),
     ] {
         third.resume_chat(chat).await.unwrap();
-        complete_turn(&third, chat, None, "continue").await;
+        complete_turn(&third, chat, "continue").await;
         let requests = model.requests.lock().unwrap();
         let sent = request_text(requests.last().unwrap());
         assert!(sent.contains(own), "{sent}");
@@ -218,7 +218,7 @@ async fn two_resumes_of_one_chat_fork_and_the_latest_leaf_wins() {
     )
     .unwrap();
     let chat = origin.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&origin, chat, None, "shared prompt").await;
+    complete_turn(&origin, chat, "shared prompt").await;
     origin.shutdown().await;
     drop(origin);
 
@@ -236,17 +236,17 @@ async fn two_resumes_of_one_chat_fork_and_the_latest_leaf_wins() {
     .unwrap();
     left.resume_chat(chat).await.unwrap();
     right.resume_chat(chat).await.unwrap();
-    complete_turn(&left, chat, None, "from the left host").await;
+    complete_turn(&left, chat, "from the left host").await;
     left.flush_transcripts().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    complete_turn(&right, chat, None, "from the right host").await;
+    complete_turn(&right, chat, "from the right host").await;
     left.shutdown().await;
     right.shutdown().await;
 
     let model = Arc::new(ScriptedModel::new(vec![text("after the fork")]));
     let latest = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     latest.resume_chat(chat).await.unwrap();
-    complete_turn(&latest, chat, None, "which branch").await;
+    complete_turn(&latest, chat, "which branch").await;
     let sent = request_text(&model.requests.lock().unwrap()[0]);
     assert!(sent.contains("shared prompt"), "{sent}");
     assert!(sent.contains("from the right host"), "{sent}");
@@ -270,8 +270,8 @@ async fn corrupt_and_truncated_lines_are_skipped_on_resume() {
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = complete_turn(&agent, chat, None, "first prompt").await;
-    complete_turn(&agent, chat, Some(first.loop_id), "second prompt").await;
+    complete_turn(&agent, chat, "first prompt").await;
+    complete_turn(&agent, chat, "second prompt").await;
     agent.shutdown().await;
     drop(agent);
 
@@ -297,7 +297,7 @@ async fn corrupt_and_truncated_lines_are_skipped_on_resume() {
     let model = Arc::new(ScriptedModel::new(vec![text("third answer")]));
     let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
     restored.resume_chat(chat).await.unwrap();
-    complete_turn(&restored, chat, Some(first.loop_id), "third prompt").await;
+    complete_turn(&restored, chat, "third prompt").await;
     assert_eq!(
         conversation(&model.requests.lock().unwrap()[0]),
         vec![
@@ -343,9 +343,9 @@ async fn killed_process_fixture() {
         .await
         .unwrap();
     std::fs::write(directory.join("chat"), chat.to_string()).unwrap();
-    let first = complete_turn(&agent, chat, None, "first prompt").await;
+    complete_turn(&agent, chat, "first prompt").await;
     agent
-        .submit(chat, Some(first.loop_id), "prompt before the kill".into())
+        .submit(chat, "prompt before the kill".into())
         .await
         .unwrap();
     std::future::pending::<()>().await;
@@ -381,13 +381,8 @@ async fn killed_process_resumes_from_its_flushed_transcript() {
     let restored =
         Agent::open_embedded(directory.path().join("root"), config(), model.clone()).unwrap();
     let snapshot = restored.resume_chat(chat).await.unwrap();
-    assert!(
-        snapshot
-            .loops
-            .iter()
-            .all(|goal| goal.state != LoopState::Running)
-    );
-    complete_turn(&restored, chat, None, "after the kill").await;
+    assert_ne!(snapshot.chat_loop.state, LoopState::Running);
+    complete_turn(&restored, chat, "after the kill").await;
     assert_eq!(
         conversation(&model.requests.lock().unwrap()[0]),
         vec![
@@ -418,7 +413,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         )
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        complete_turn(&agent, chat, None, "read the notes").await;
+        complete_turn(&agent, chat, "read the notes").await;
         agent.shutdown().await;
         drop(agent);
         truncate_transcript_before(&transcript_file(&root, chat), |line| {
@@ -428,7 +423,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         let model = Arc::new(ScriptedModel::new(vec![text("continued")]));
         let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
         restored.resume_chat(chat).await.unwrap();
-        complete_turn(&restored, chat, None, "next prompt").await;
+        complete_turn(&restored, chat, "next prompt").await;
         let sent = conversation(&model.requests.lock().unwrap()[0]);
         assert!(matches!(
             &sent[1].content[..],
@@ -463,7 +458,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         )
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        complete_turn(&agent, chat, None, "read the notes").await;
+        complete_turn(&agent, chat, "read the notes").await;
         agent.shutdown().await;
         drop(agent);
         truncate_transcript_before(&transcript_file(&root, chat), |line| {
@@ -473,7 +468,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         let model = Arc::new(ScriptedModel::new(vec![text("continued")]));
         let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
         restored.resume_chat(chat).await.unwrap();
-        complete_turn(&restored, chat, None, "next prompt").await;
+        complete_turn(&restored, chat, "next prompt").await;
         assert_eq!(
             conversation(&model.requests.lock().unwrap()[0]),
             vec![
@@ -501,15 +496,15 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         )
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let first = complete_turn(&agent, chat, None, "think only").await;
-        complete_turn(&agent, chat, Some(first.loop_id), "answer now").await;
+        complete_turn(&agent, chat, "think only").await;
+        complete_turn(&agent, chat, "answer now").await;
         agent.shutdown().await;
         drop(agent);
 
         let model = Arc::new(ScriptedModel::new(vec![text("continued")]));
         let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
         restored.resume_chat(chat).await.unwrap();
-        complete_turn(&restored, chat, Some(first.loop_id), "next prompt").await;
+        complete_turn(&restored, chat, "next prompt").await;
         assert_eq!(
             conversation(&model.requests.lock().unwrap()[0]),
             vec![
@@ -531,17 +526,16 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
 }
 
 #[tokio::test]
-async fn restored_loops_are_interrupted_and_triggers_disarmed() {
+async fn a_restored_loop_is_interrupted_and_paused_until_a_new_input() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let model = SequenceModel::new(vec![Some(text("watching")), None]);
     let original = Agent::open_embedded(root.clone(), config(), model).unwrap();
     let chat = original.create_chat(directory.path().into()).await.unwrap();
-    let watching = complete_turn(&original, chat, None, "watch for events").await;
+    complete_turn(&original, chat, "watch for events").await;
     original
         .configure_trigger(
             chat,
-            watching.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "event check".into(),
@@ -553,43 +547,33 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
         )
         .await
         .unwrap();
-    let running = original
-        .submit(chat, None, "long running goal".into())
+    original
+        .submit(chat, "long running work".into())
         .await
         .unwrap();
     let live = original.snapshot(chat).await.unwrap();
-    let state_of = |loops: &[tickloop_agent_protocol::LoopSnapshot], id: LoopId| {
-        loops.iter().find(|goal| goal.id == id).unwrap().clone()
-    };
-    assert_eq!(
-        state_of(&live.loops, running.loop_id).state,
-        LoopState::Running
-    );
-    assert_eq!(
-        state_of(&live.loops, watching.loop_id).state,
-        LoopState::WaitingTrigger
-    );
+    assert_eq!(live.chat_loop.state, LoopState::Running);
     original.flush_transcripts().await;
 
     // 原进程仍在运行时，另一个实例恢复同一 Chat。
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("trigger resumed")]));
     let other = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
     let restored = other.resume_chat(chat).await.unwrap();
+    assert_eq!(restored.chat_loop.id, live.chat_loop.id);
+    assert_eq!(restored.chat_loop.state, LoopState::Interrupted);
     assert_eq!(
-        state_of(&restored.loops, running.loop_id).state,
-        LoopState::Interrupted
+        restored.chat_loop.state_since, None,
+        "a recovery conversion does not reuse the running state's time"
     );
-    let restored_watch = state_of(&restored.loops, watching.loop_id);
-    assert_eq!(restored_watch.state, LoopState::Interrupted);
-    assert!(!restored_watch.trigger.unwrap().armed);
-    assert!(restored.resume_triggers.contains(&watching.loop_id));
+    assert!(!restored.chat_loop.trigger.unwrap().armed);
+    assert!(restored.trigger_awaits_resume);
     assert!(resumed_model.requests.lock().unwrap().is_empty());
 
-    complete_turn(&other, chat, Some(watching.loop_id), "resume the trigger").await;
+    complete_turn(&other, chat, "resume the trigger").await;
     let rearmed = other.snapshot(chat).await.unwrap();
-    let watch = state_of(&rearmed.loops, watching.loop_id);
-    assert!(watch.trigger.unwrap().armed);
-    assert_eq!(watch.state, LoopState::WaitingTrigger);
+    assert!(rearmed.chat_loop.trigger.unwrap().armed);
+    assert!(!rearmed.trigger_awaits_resume);
+    assert_eq!(rearmed.chat_loop.state, LoopState::Idle);
     other.shutdown().await;
     original.shutdown().await;
 }
@@ -608,14 +592,8 @@ async fn branch_copies_only_the_visible_conversation_and_records_its_source() {
     )
     .unwrap();
     let source = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = complete_turn(&agent, source, None, "kept prompt").await;
-    complete_turn(
-        &agent,
-        source,
-        Some(first.loop_id),
-        "ABANDONED-MARKER prompt",
-    )
-    .await;
+    complete_turn(&agent, source, "kept prompt").await;
+    complete_turn(&agent, source, "ABANDONED-MARKER prompt").await;
     let checkpoint = agent.snapshot(source).await.unwrap().rewind_points()[1].clone();
     agent
         .rewind(source, checkpoint.message_id, RewindMode::Conversation)
@@ -625,7 +603,6 @@ async fn branch_copies_only_the_visible_conversation_and_records_its_source() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: Some("clean branch".into()),
         })
         .await
@@ -643,7 +620,7 @@ async fn branch_copies_only_the_visible_conversation_and_records_its_source() {
     assert_eq!(child.branch_source, Some(source));
     assert_eq!(child.title.as_deref(), Some("clean branch (Branch)"));
     reopened.resume_chat(branch.child_chat_id).await.unwrap();
-    complete_turn(&reopened, branch.child_chat_id, None, "continue the branch").await;
+    complete_turn(&reopened, branch.child_chat_id, "continue the branch").await;
     let sent = request_text(&model.requests.lock().unwrap()[0]);
     assert!(sent.contains("kept prompt"), "{sent}");
     assert!(!sent.contains("ABANDONED-MARKER"), "{sent}");
@@ -706,7 +683,6 @@ async fn branch_and_reopen(
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -738,8 +714,8 @@ async fn string_tool_results_from_earlier_transcripts_resume_rewind_and_branch()
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = complete_turn(&agent, chat, None, "read the notes").await;
-    complete_turn(&agent, chat, Some(first.loop_id), "ABANDONED-MARKER prompt").await;
+    complete_turn(&agent, chat, "read the notes").await;
+    complete_turn(&agent, chat, "ABANDONED-MARKER prompt").await;
     agent.shutdown().await;
     drop(agent);
     let stored = edit_stored_tool_result(&transcript_file(&root, chat), "read-1", |_| {});
@@ -764,7 +740,7 @@ async fn string_tool_results_from_earlier_transcripts_resume_rewind_and_branch()
 
     let model = Arc::new(ScriptedModel::new(vec![text("branch answer")]));
     let (branched, child) = branch_and_reopen(resumed, &root, chat, model.clone()).await;
-    complete_turn(&branched, child, None, "continue the branch").await;
+    complete_turn(&branched, child, "continue the branch").await;
     let request = model.requests.lock().unwrap()[0].clone();
     assert_eq!(
         tool_results(&request),
@@ -793,7 +769,7 @@ async fn block_array_tool_results_round_trip_through_resume_and_branch() {
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "read the notes").await;
+    complete_turn(&agent, chat, "read the notes").await;
     agent.shutdown().await;
     drop(agent);
     let blocks = json!([
@@ -813,7 +789,7 @@ async fn block_array_tool_results_round_trip_through_resume_and_branch() {
     resumed.resume_chat(chat).await.unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("branch answer")]));
     let (branched, child) = branch_and_reopen(resumed, &root, chat, model.clone()).await;
-    complete_turn(&branched, child, None, "continue the branch").await;
+    complete_turn(&branched, child, "continue the branch").await;
     branched.shutdown().await;
     assert_eq!(
         tool_results(&model.requests.lock().unwrap()[0]),
@@ -851,10 +827,7 @@ async fn resuming_a_loaded_chat_returns_the_live_instance() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     require_workspace_write_approval(&agent, chat).await;
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "write a file".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "write a file".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { .. } => break,
@@ -899,7 +872,7 @@ async fn transcript_file_is_created_lazily_and_stays_after_cwd_changes() {
         .set_directories(moved, second_directory.clone(), Vec::new())
         .await
         .unwrap();
-    complete_turn(&agent, moved, None, "prompt after moving").await;
+    complete_turn(&agent, moved, "prompt after moving").await;
     let first_listing = agent.saved_chats(&first_directory).await.unwrap();
     assert_eq!(
         first_listing.iter().map(|chat| chat.id).collect::<Vec<_>>(),
@@ -939,7 +912,7 @@ async fn long_working_directory_names_share_one_project() {
     )
     .unwrap();
     let chat = first.create_chat(workdir.clone()).await.unwrap();
-    complete_turn(&first, chat, None, "long path prompt").await;
+    complete_turn(&first, chat, "long path prompt").await;
     first.flush_transcripts().await;
 
     let second = Agent::open_embedded(
@@ -979,10 +952,7 @@ async fn interruption_while_waiting_for_permission_leaves_no_pending_work_after_
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     require_workspace_write_approval(&original, chat).await;
     let mut events = original.subscribe();
-    original
-        .submit(chat, None, "write a file".into())
-        .await
-        .unwrap();
+    original.submit(chat, "write a file".into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { .. } => break,
@@ -1002,7 +972,6 @@ async fn interruption_while_waiting_for_permission_leaves_no_pending_work_after_
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("after interruption".into()),
         })
         .await
@@ -1022,7 +991,7 @@ async fn another_instance_without_new_messages_keeps_the_rewound_branch_latest()
     )
     .unwrap();
     let chat = origin.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&origin, chat, None, "shared prompt").await;
+    complete_turn(&origin, chat, "shared prompt").await;
     origin.shutdown().await;
     drop(origin);
 
@@ -1043,13 +1012,13 @@ async fn another_instance_without_new_messages_keeps_the_rewound_branch_latest()
     .unwrap();
     idle_instance.resume_chat(chat).await.unwrap();
     rewinding.resume_chat(chat).await.unwrap();
-    complete_turn(&rewinding, chat, None, "ABANDONED-MARKER prompt").await;
+    complete_turn(&rewinding, chat, "ABANDONED-MARKER prompt").await;
     let checkpoint = rewinding.snapshot(chat).await.unwrap().rewind_points()[1].clone();
     rewinding
         .rewind(chat, checkpoint.message_id, RewindMode::Conversation)
         .await
         .unwrap();
-    complete_turn(&rewinding, chat, None, "replacement prompt").await;
+    complete_turn(&rewinding, chat, "replacement prompt").await;
     rewinding.flush_transcripts().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     idle_instance
@@ -1063,9 +1032,15 @@ async fn another_instance_without_new_messages_keeps_the_rewound_branch_latest()
     let model = Arc::new(ScriptedModel::new(vec![text("after the rewind")]));
     let latest = Agent::open_embedded(root, config(), model.clone()).unwrap();
     let restored = latest.resume_chat(chat).await.unwrap();
-    // 被 rewind 截断的 Loop 不在新的对话链上：共享提示、rewind 草稿与替换提示各一个。
-    assert_eq!(restored.loops.len(), 3);
-    complete_turn(&latest, chat, None, "continue after the rewind").await;
+    assert_eq!(
+        restored
+            .rewind_points()
+            .iter()
+            .map(|point| point.prompt.as_str())
+            .collect::<Vec<_>>(),
+        ["shared prompt", "replacement prompt"]
+    );
+    complete_turn(&latest, chat, "continue after the rewind").await;
     let sent = request_text(&model.requests.lock().unwrap()[0]);
     assert!(sent.contains("shared prompt"), "{sent}");
     assert!(sent.contains("replacement answer"), "{sent}");
@@ -1090,7 +1065,7 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     )
     .unwrap();
     let warm = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, warm, None, "warm prompt").await;
+    complete_turn(&agent, warm, "warm prompt").await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while agent
             .snapshot(warm)
@@ -1111,7 +1086,7 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
 
     set_mode(0o500);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = complete_turn(&agent, chat, None, "prompt while read-only").await;
+    complete_turn(&agent, chat, "prompt while read-only").await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while agent
             .snapshot(chat)
@@ -1132,7 +1107,7 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     assert!(error.is_some());
     assert!(!path.exists());
 
-    complete_turn(&agent, chat, Some(first.loop_id), "prompt after recovery").await;
+    complete_turn(&agent, chat, "prompt after recovery").await;
     agent.flush_transcripts().await;
     assert_eq!(agent.transcript_write_error(), None);
     agent.shutdown().await;
@@ -1149,7 +1124,7 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     let model = Arc::new(ScriptedModel::new(vec![text("resumed answer")]));
     let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
     restored.resume_chat(chat).await.unwrap();
-    complete_turn(&restored, chat, Some(first.loop_id), "resumed prompt").await;
+    complete_turn(&restored, chat, "resumed prompt").await;
     assert_eq!(
         conversation(&model.requests.lock().unwrap()[0]),
         vec![
@@ -1176,7 +1151,7 @@ async fn a_resumed_chat_whose_transcript_was_deleted_is_not_recreated() {
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "saved prompt").await;
+    complete_turn(&agent, chat, "saved prompt").await;
     agent.shutdown().await;
     drop(agent);
     let path = transcript_file(&root, chat);
@@ -1189,7 +1164,7 @@ async fn a_resumed_chat_whose_transcript_was_deleted_is_not_recreated() {
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
     std::fs::remove_file(&path).unwrap();
-    complete_turn(&restored, chat, None, "prompt after deletion").await;
+    complete_turn(&restored, chat, "prompt after deletion").await;
     restored.flush_transcripts().await;
 
     let error = restored
@@ -1218,13 +1193,13 @@ async fn externally_removing_the_transcript_of_a_running_chat_stops_saving_it() 
     )
     .unwrap();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
-    complete_turn(&agent, chat, None, "saved prompt").await;
+    complete_turn(&agent, chat, "saved prompt").await;
     agent.flush_transcripts().await;
     let transcript = transcript_file(&root, chat);
 
     std::fs::remove_file(&transcript).unwrap();
 
-    complete_turn(&agent, chat, None, "prompt after removal").await;
+    complete_turn(&agent, chat, "prompt after removal").await;
     agent.flush_transcripts().await;
     let error = agent
         .transcript_write_error()
@@ -1265,7 +1240,7 @@ async fn a_zero_cleanup_period_writes_no_transcript() {
     assert!(!agent.saves_chats());
 
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
-    complete_turn(&agent, chat, None, "Keep this private").await;
+    complete_turn(&agent, chat, "Keep this private").await;
     tickloop_agent_config::UserSettings::in_root(&root)
         .save_thinking_enabled(false)
         .unwrap();
@@ -1306,7 +1281,7 @@ async fn the_working_directory_resumes_from_the_last_recorded_entry() {
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "first prompt").await;
+    complete_turn(&agent, chat, "first prompt").await;
     let directories = [
         directory.path().join("left"),
         directory.path().join("right"),
@@ -1318,7 +1293,7 @@ async fn the_working_directory_resumes_from_the_last_recorded_entry() {
             .await
             .unwrap();
     }
-    complete_turn(&agent, chat, None, "prompt in the right directory").await;
+    complete_turn(&agent, chat, "prompt in the right directory").await;
     agent.flush_transcripts().await;
     // 之后的切换没有写出任何新条目，不在 Transcript 中。
     agent
@@ -1362,10 +1337,10 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     )
     .unwrap();
     let chat = origin.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&origin, chat, None, "first prompt").await;
+    complete_turn(&origin, chat, "first prompt").await;
     origin.compact(chat).await.unwrap();
-    complete_turn(&origin, chat, None, "second prompt").await;
-    complete_turn(&origin, chat, None, "third prompt").await;
+    complete_turn(&origin, chat, "second prompt").await;
+    complete_turn(&origin, chat, "third prompt").await;
     origin.shutdown().await;
     drop(origin);
 
@@ -1377,7 +1352,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     assert!(restored.is_compact_boundary(0));
     assert!(restored.is_compact_summary(1));
     assert_eq!(restored.rewind_points().len(), 2);
-    complete_turn(&first_resume, chat, None, "fourth prompt").await;
+    complete_turn(&first_resume, chat, "fourth prompt").await;
     let sent = request_text(&first_model.requests.lock().unwrap()[0]);
     assert!(sent.contains("compacted summary"), "{sent}");
     assert!(!sent.contains("first answer"), "{sent}");
@@ -1390,7 +1365,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     let restored = second_resume.resume_chat(chat).await.unwrap();
     assert_eq!(restored.messages.len(), 7);
     assert_eq!(restored.rewind_points().len(), 3);
-    complete_turn(&second_resume, chat, None, "fifth prompt").await;
+    complete_turn(&second_resume, chat, "fifth prompt").await;
     let sent = request_text(&second_model.requests.lock().unwrap()[0]);
     assert!(sent.contains("compacted summary"), "{sent}");
     assert!(sent.contains("fourth answer"), "{sent}");
@@ -1419,32 +1394,24 @@ const SPECIFIED_LINE_TYPES: [&str; 17] = [
     "retained-snapshot",
 ];
 
-/// Loop id、目标、计划（版本与内容）与进度步骤。
-type LoopPlanState = (LoopId, String, Option<(u64, String)>, Option<String>);
+/// Loop id、计划（版本与内容）与进度步骤。
+type LoopPlanState = (LoopId, Option<(u64, String)>, Option<String>);
 
-fn plan_and_progress(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Vec<LoopPlanState> {
-    let mut state = snapshot
-        .loops
-        .iter()
-        .map(|goal| {
-            (
-                goal.id,
-                goal.goal.clone(),
-                snapshot
-                    .plans
-                    .iter()
-                    .find(|plan| plan.loop_id == goal.id)
-                    .map(|plan| (plan.version, plan.markdown.clone())),
-                snapshot
-                    .progress
-                    .iter()
-                    .find(|progress| progress.loop_id == goal.id)
-                    .map(|progress| format!("{:?}", progress.todos)),
-            )
-        })
-        .collect::<Vec<_>>();
-    state.sort_by_key(|(loop_id, ..)| *loop_id);
-    state
+fn plan_and_progress(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> LoopPlanState {
+    let loop_id = snapshot.chat_loop.id;
+    (
+        loop_id,
+        snapshot
+            .plans
+            .iter()
+            .find(|plan| plan.loop_id == loop_id)
+            .map(|plan| (plan.version, plan.markdown.clone())),
+        snapshot
+            .progress
+            .iter()
+            .find(|progress| progress.loop_id == loop_id)
+            .map(|progress| format!("{:?}", progress.todos)),
+    )
 }
 
 fn compaction_positions(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Vec<(usize, bool)> {
@@ -1511,15 +1478,12 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Plan the report".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Plan the report".into()).await.unwrap();
     loop {
         if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
             assert_eq!(request.name, "ExitPlanMode");
             agent
-                .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::AcceptEdits)
+                .approve_plan(chat, 1, ExecutionMode::AcceptEdits)
                 .await
                 .unwrap();
             break;
@@ -1533,7 +1497,6 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
             break;
         }
     }
-    let goal = receipt.loop_id;
     agent.compact(chat).await.unwrap();
     agent
         .set_directories(chat, other.clone(), Vec::new())
@@ -1558,13 +1521,12 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         )
         .await
         .unwrap();
-    complete_turn(&agent, chat, Some(goal), "Write the first draft").await;
-    complete_turn(&agent, chat, Some(goal), "Write the second draft").await;
+    complete_turn(&agent, chat, "Write the first draft").await;
+    complete_turn(&agent, chat, "Write the second draft").await;
     let child = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("report branch".into()),
         })
         .await
@@ -1593,7 +1555,8 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         .await
         .unwrap();
     assert!(files_before.as_ref().is_some_and(|files| !files.is_empty()));
-    assert!(!plan_and_progress(&before).is_empty());
+    let (_, plan, progress) = plan_and_progress(&before);
+    assert!(plan.is_some() || progress.is_some());
     agent.shutdown().await;
     drop(agent);
 
@@ -1680,7 +1643,7 @@ async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
     let model = Arc::new(ScriptedModel::new(vec![text("first"), text("second")]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "first prompt").await;
+    complete_turn(&agent, chat, "first prompt").await;
     let doc = tickloop_agent_protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
@@ -1700,7 +1663,7 @@ async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
     let ticks = vec![doc.clone(), slides.clone()];
     agent.add_artifact_tick(chat, doc).await.unwrap();
     agent.add_artifact_tick(chat, slides).await.unwrap();
-    complete_turn(&agent, chat, None, "second prompt").await;
+    complete_turn(&agent, chat, "second prompt").await;
     let host_request = request_text(model.requests.lock().unwrap().last().unwrap());
     assert!(
         host_request.contains("artifact_ticks")
@@ -1717,7 +1680,6 @@ async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: Some("artifact branch".into()),
         })
         .await
@@ -1795,7 +1757,7 @@ async fn artifact_tick_metadata_before_a_compaction_boundary_survives_restart() 
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "a saved prompt").await;
+    complete_turn(&agent, chat, "a saved prompt").await;
     let tick = tickloop_agent_protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),

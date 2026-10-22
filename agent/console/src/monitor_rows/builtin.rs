@@ -1,7 +1,5 @@
 use super::*;
-use tickloop_agent_protocol::{
-    EventSourceBinding, LoopState, ShellTask, ShellTaskState, TickLinkState,
-};
+use tickloop_agent_protocol::{EventSourceBinding, ShellTask, ShellTaskState, TickLinkState};
 
 /// Stops a running Shell from its Monitor row after confirmation.
 pub(crate) const SHELL_STOP_KEY: char = 's';
@@ -696,10 +694,10 @@ fn subscriptions<'a>(
     context: &'a MonitorContext,
     access: &'a str,
 ) -> impl Iterator<Item = &'a TickSubscriptionStatus> {
-    context.subscriptions.iter().filter(move |row| {
-        row.instance.access() == access
-            && !matches!(row.loop_state, LoopState::Stopped | LoopState::Expired)
-    })
+    context
+        .subscriptions
+        .iter()
+        .filter(move |row| row.instance.access() == access)
 }
 pub(super) fn link_status(link: TickLinkState) -> &'static str {
     match link {
@@ -712,17 +710,15 @@ pub(super) fn link_status(link: TickLinkState) -> &'static str {
 }
 const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifacts");
 
-/// This Chat's association with the artifact: the binding a Loop that has not ended holds, live
-/// or paused.
+/// This Chat's association with the artifact: the binding its Loop holds, live or paused.
 pub(crate) fn feedback_binding<'a>(
     chat: &'a ChatStatus,
     origin: &str,
     artifact_id: &str,
 ) -> Option<&'a EventSourceBinding> {
-    chat.loops
+    chat.chat_loop
+        .event_sources
         .iter()
-        .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-        .flat_map(|goal| &goal.event_sources)
         .find(|binding| binding.origin == origin && binding.artifact_id == artifact_id)
 }
 
@@ -927,7 +923,7 @@ mod tests {
                     "id": shell.chat_id,
                     "folder": "/fixture",
                     "messages": [],
-                    "loops": []
+                    "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
                 }))
                 .unwrap(),
             );
@@ -1012,7 +1008,7 @@ mod tests {
             subscriptions: vec![TickSubscriptionStatus {
                 id: Uuid::from_u128(2),
                 loop_id: Uuid::from_u128(3),
-                loop_state: LoopState::WaitingTrigger,
+                loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: quote.clone(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 0,
@@ -1045,7 +1041,7 @@ mod tests {
                 "id": Uuid::from_u128(1),
                 "folder": "/fixture",
                 "messages": [],
-                "loops": []
+                "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
             }))
             .unwrap(),
         )
@@ -1059,7 +1055,7 @@ mod tests {
         TickSubscriptionStatus {
             id: Uuid::new_v4(),
             loop_id: Uuid::from_u128(3),
-            loop_state: LoopState::WaitingTrigger,
+            loop_state: tickloop_agent_protocol::LoopState::Idle,
             instance: instance.clone(),
             frequency: TickSubscriptionFrequency::High,
             accumulated,

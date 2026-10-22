@@ -24,7 +24,7 @@ async fn complete_turn(
     expected_tool: Option<&str>,
 ) -> TurnEvidence {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt).await.unwrap();
+    let receipt = agent.submit(chat, prompt).await.unwrap();
     tokio::time::timeout(LIVE_TIMEOUT, async {
         let mut evidence = TurnEvidence::default();
         loop {
@@ -184,7 +184,7 @@ async fn verify_live_lifecycle(provider: &str, model: &str) {
 
     let cancel_chat = reopened.create_chat(workdir).await.unwrap();
     let mut events = reopened.subscribe();
-    let receipt = reopened.submit(cancel_chat, None, "Count from 1 to 100000, one number per line, without skipping numbers or using any tools. Start the list immediately.".into()).await.unwrap();
+    let receipt = reopened.submit(cancel_chat, "Count from 1 to 100000, one number per line, without skipping numbers or using any tools. Start the list immediately.".into()).await.unwrap();
     tokio::time::timeout(LIVE_TIMEOUT, async {
         let mut interrupted = false;
         loop {

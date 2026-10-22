@@ -199,7 +199,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let initial = agent
-        .submit(chat, None, "Read the sensitive fixture.".into())
+        .submit(chat, "Read the sensitive fixture.".into())
         .await
         .unwrap();
     loop {
@@ -230,7 +230,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
     models.choose(LocalModelClients::new(None).client(&model).unwrap());
     agent.set_model(chat, model).await.unwrap();
     let next = agent
-        .submit(chat, None, "Check the public summary.".into())
+        .submit(chat, "Check the public summary.".into())
         .await
         .unwrap();
     loop {

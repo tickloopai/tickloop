@@ -120,14 +120,7 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
     let parent = snapshot.conversation.id;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if core
-                .snapshot(parent)
-                .await
-                .unwrap()
-                .loops
-                .iter()
-                .all(|goal| goal.state == LoopState::Completed)
-            {
+            if core.snapshot(parent).await.unwrap().chat_loop.state == LoopState::Idle {
                 break;
             }
             tokio::task::yield_now().await;
@@ -154,16 +147,12 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
     view.refresh().await.unwrap();
     assert_eq!(view.family(execution).len(), 1, "finished child is hidden");
     assert_eq!(core.subagents(parent).await.unwrap()[0].handle, "audit");
-    core.submit(
-        parent,
-        Some(snapshot.conversation.loops[0].id),
-        "reactivate hidden".into(),
-    )
-    .await
-    .unwrap();
+    core.submit(parent, "reactivate hidden".into())
+        .await
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if core.snapshot(child).await.unwrap().loops[0].state == LoopState::WaitingQuestion {
+            if core.snapshot(child).await.unwrap().chat_loop.state == LoopState::WaitingQuestion {
                 break;
             }
             tokio::task::yield_now().await;
@@ -385,7 +374,7 @@ async fn child_auto_review_uses_frozen_parent_human_intent_instead_of_model_gene
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(parent, None, original.into()).await.unwrap();
+    let receipt = agent.submit(parent, original.into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id {
@@ -432,7 +421,7 @@ async fn child_clarification_wakes_a_parent_waiting_in_delegate_and_receives_its
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate the report review.".into())
+        .submit(parent, "Delegate the report review.".into())
         .await
         .unwrap();
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -510,11 +499,7 @@ async fn a_child_continuation_pushes_its_final_result_to_the_completed_parent() 
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(
-            parent,
-            None,
-            "Delegate and report the eventual result.".into(),
-        )
+        .submit(parent, "Delegate and report the eventual result.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -531,11 +516,7 @@ async fn a_child_continuation_pushes_its_final_result_to_the_completed_parent() 
         .unwrap();
     assert_eq!(delegated["status"], "completed");
     let child_receipt = agent
-        .submit(
-            parent,
-            Some(receipt.loop_id),
-            "Finish the child now.".into(),
-        )
+        .submit(parent, "Finish the child now.".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -550,8 +531,7 @@ async fn a_child_continuation_pushes_its_final_result_to_the_completed_parent() 
     .await
     .unwrap();
     let parent_after = agent.snapshot(parent).await.unwrap();
-    assert_eq!(parent_after.loops.len(), 1);
-    assert_eq!(parent_after.loops[0].id, receipt.loop_id);
+    assert_eq!(parent_after.chat_loop.id, receipt.loop_id);
     assert_eq!(
         agent_body_count(
             &parent_after,
@@ -616,11 +596,7 @@ async fn concurrent_child_messages_stay_ordered_and_cannot_be_taken_back_as_user
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(
-            parent,
-            None,
-            "Delegate the scoped two-message probe.".into(),
-        )
+        .submit(parent, "Delegate the scoped two-message probe.".into())
         .await
         .unwrap();
     let request = loop {
@@ -638,9 +614,8 @@ async fn concurrent_child_messages_stay_ordered_and_cannot_be_taken_back_as_user
         .find(|chat| chat.id != parent)
         .unwrap()
         .id;
-    let child_loop = agent.snapshot(child).await.unwrap().loops[0].id;
     agent
-        .submit(child, Some(child_loop), "Send the pair now.".into())
+        .submit(child, "Send the pair now.".into())
         .await
         .unwrap();
     let mut queued = 0;
@@ -763,7 +738,7 @@ async fn agent_claims_do_not_become_auto_authority(review_child: bool) {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(parent, None, human.into()).await.unwrap();
+    let receipt = agent.submit(parent, human.into()).await.unwrap();
     completed(&mut events, &receipt).await;
     assert_eq!(tick.executions.load(std::sync::atomic::Ordering::SeqCst), 1);
     {
@@ -819,11 +794,7 @@ async fn unrelated_roots_and_forged_parent_targets_are_rejected_by_the_model_vis
         };
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(
-                sender,
-                None,
-                "Try the bounded communication interface.".into(),
-            )
+            .submit(sender, "Try the bounded communication interface.".into())
             .await
             .unwrap();
         completed(&mut events, &receipt).await;
@@ -875,11 +846,7 @@ async fn same_family_siblings_route_by_the_parent_handle_registry() {
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(
-            parent,
-            None,
-            "Delegate two independent bounded tasks.".into(),
-        )
+        .submit(parent, "Delegate two independent bounded tasks.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -965,14 +932,14 @@ async fn ended_parent_does_not_resume_from_child_messages(stopped: bool) {
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate, then await context.".into())
+        .submit(parent, "Delegate, then await context.".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
         .await
         .unwrap();
     if stopped {
-        agent.stop(parent, receipt.loop_id).await.unwrap();
+        agent.stop(parent).await.unwrap();
     } else {
         agent.interrupt(parent).await.unwrap();
     }
@@ -990,25 +957,17 @@ async fn ended_parent_does_not_resume_from_child_messages(stopped: bool) {
         .find(|chat| chat.id != parent)
         .unwrap();
     let child_receipt = agent
-        .submit(
-            child.id,
-            Some(child.loops[0].id),
-            "Try your parent now.".into(),
-        )
+        .submit(child.id, "Try your parent now.".into())
         .await
         .unwrap();
     completed(&mut events, &child_receipt).await;
     let after = agent.snapshot(parent).await.unwrap();
     assert_eq!(
-        after.loops[0].state,
-        if stopped {
-            tickloop_agent_protocol::LoopState::Stopped
-        } else {
-            tickloop_agent_protocol::LoopState::Interrupted
-        }
+        after.chat_loop.state,
+        tickloop_agent_protocol::LoopState::Interrupted
     );
     assert_eq!(after.messages.len(), before.messages.len());
-    assert_eq!(after.loops[0].run_id, before.loops[0].run_id);
+    assert_eq!(after.chat_loop.run_id, before.chat_loop.run_id);
     assert!(agent.snapshot(child.id).await.unwrap().events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted { call_id, result, .. } if call_id=="later" && result.is_error)));
     agent.shutdown().await;
 }
@@ -1034,7 +993,7 @@ async fn restarting_the_daemon_loads_origin_metadata_without_replaying_messages_
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate the report review.".into())
+        .submit(parent, "Delegate the report review.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -1120,11 +1079,7 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
             .unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(
-                parent,
-                None,
-                "Delegate only the original scoped report.".into(),
-            )
+            .submit(parent, "Delegate only the original scoped report.".into())
             .await
             .unwrap();
         completed(&mut events, &receipt).await;
@@ -1200,11 +1155,7 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
         assert!(reviewer.requests.lock().unwrap().is_empty());
         let mut events = restored.subscribe();
         restored
-            .submit(
-                child.id,
-                Some(child.loops[0].id),
-                "Explicitly continue this bounded child.".into(),
-            )
+            .submit(child.id, "Explicitly continue this bounded child.".into())
             .await
             .unwrap();
         let request = loop {
@@ -1258,7 +1209,7 @@ async fn repeated_model_call_cannot_duplicate_a_delivered_message() {
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate the idempotency probe.".into())
+        .submit(parent, "Delegate the idempotency probe.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -1327,7 +1278,6 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: tickloop_agent_protocol::UserInput::Text {
                     text: "Delegate the report review.".into(),
                     contexts: vec![],
@@ -1355,13 +1305,17 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
         .await
         .unwrap();
     assert!(matches!(
-        agent.snapshot(receipt.chat_id).await.unwrap().loops[0].state,
-        tickloop_agent_protocol::LoopState::Running | tickloop_agent_protocol::LoopState::Completed
+        agent
+            .snapshot(receipt.chat_id)
+            .await
+            .unwrap()
+            .chat_loop
+            .state,
+        tickloop_agent_protocol::LoopState::Running | tickloop_agent_protocol::LoopState::Idle
     ));
     agent
         .submit(
             receipt.chat_id,
-            Some(receipt.loop_id),
             "Additional context: Use only 2024 reports.".into(),
         )
         .await
@@ -1369,7 +1323,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
     tokio::time::timeout(std::time::Duration::from_secs(3),async {
         loop {
             let current=agent.snapshot(receipt.chat_id).await.unwrap();
-            if current.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+            if current.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
                 && current.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,Content::Text {text} if text=="Additional context: Use only 2024 reports.")) {break;}
             tokio::task::yield_now().await;
         }
@@ -1431,7 +1385,7 @@ async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_huma
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate this scoped task.".into())
+        .submit(parent, "Delegate this scoped task.".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), model.entered.notified())
@@ -1444,11 +1398,7 @@ async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_huma
         .find(|chat| chat.id != parent)
         .unwrap();
     agent
-        .submit(
-            child.id,
-            Some(child.loops[0].id),
-            "Queue the later message now.".into(),
-        )
+        .submit(child.id, "Queue the later message now.".into())
         .await
         .unwrap();
     loop {
@@ -1475,7 +1425,7 @@ async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_huma
     }
     let interrupted = agent.snapshot(parent).await.unwrap();
     assert_eq!(
-        interrupted.loops[0].state,
+        interrupted.chat_loop.state,
         tickloop_agent_protocol::LoopState::Interrupted
     );
     assert!(
@@ -1498,11 +1448,7 @@ async fn interrupt_disarms_an_already_accepted_agent_message_until_explicit_huma
             .is_empty()
     );
     let resumed = agent
-        .submit(
-            parent,
-            Some(receipt.loop_id),
-            "Explicitly continue the parent.".into(),
-        )
+        .submit(parent, "Explicitly continue the parent.".into())
         .await
         .unwrap();
     completed(&mut events, &resumed).await;
@@ -1568,7 +1514,6 @@ async fn a_parent_message_cannot_resolve_the_childs_real_permission_request() {
     let receipt = agent
         .submit(
             parent,
-            None,
             "Delegate the operation and retain explicit human approval.".into(),
         )
         .await
@@ -1584,7 +1529,6 @@ async fn a_parent_message_cannot_resolve_the_childs_real_permission_request() {
     agent
         .submit(
             parent,
-            Some(receipt.loop_id),
             "Supply clarification while the child waits for human approval.".into(),
         )
         .await
@@ -1594,7 +1538,7 @@ async fn a_parent_message_cannot_resolve_the_childs_real_permission_request() {
     assert_eq!(waiting.permissions.len(), 1);
     assert_eq!(waiting.permissions[0].id, request.id);
     assert_eq!(
-        waiting.loops[0].state,
+        waiting.chat_loop.state,
         tickloop_agent_protocol::LoopState::WaitingPermission
     );
     assert!(
@@ -1649,14 +1593,11 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Audit the original report scope.".into())
+        .submit(chat, "Audit the original report scope.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
-    let follow_up = agent
-        .submit(chat, Some(receipt.loop_id), literal.clone())
-        .await
-        .unwrap();
+    let follow_up = agent.submit(chat, literal.clone()).await.unwrap();
     completed(&mut events, &follow_up).await;
     agent.shutdown().await;
 
@@ -1721,11 +1662,7 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
         .unwrap();
     let mut events = restored.subscribe();
     let continued = restored
-        .submit(
-            chat,
-            Some(receipt.loop_id),
-            "Continue original report scope.".into(),
-        )
+        .submit(chat, "Continue original report scope.".into())
         .await
         .unwrap();
     completed(&mut events, &continued).await;
@@ -1792,14 +1729,11 @@ async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text
     let parent = snapshot.conversation.id;
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(parent, None, "Delegate this report check.".into())
+        .submit(parent, "Delegate this report check.".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
-    let receipt = agent
-        .submit(parent, Some(receipt.loop_id), literal.clone())
-        .await
-        .unwrap();
+    let receipt = agent.submit(parent, literal.clone()).await.unwrap();
     completed(&mut events, &receipt).await;
     let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1863,7 +1797,7 @@ async fn every_family_member_lists_the_root_and_retained_children_without_waking
     let root = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(root, None, "Check bounded evidence using a child".into())
+        .submit(root, "Check bounded evidence using a child".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -1876,7 +1810,7 @@ async fn every_family_member_lists_the_root_and_retained_children_without_waking
     assert_eq!(root_list["members"][1]["handle"], "audit");
     assert_eq!(root_list["members"][1]["created_at"], child.created_at);
     assert_eq!(root_list["members"][1]["availability"], "idle");
-    assert_eq!(root_list["members"][1]["run_state"], "Completed");
+    assert_eq!(root_list["members"][1]["run_state"], "Idle");
     let child_snapshot = agent.snapshot(child.child_chat_id).await.unwrap();
     let child_list = tool_result(&child_snapshot.messages, "child-list").unwrap();
     assert_eq!(child_list["members"][0]["handle"], "main");
@@ -1922,7 +1856,7 @@ async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_
         let core = Agent::new_embedded(tickloop_agent_test_support::config(), model);
         let root = core.create_chat(directory.path().into()).await.unwrap();
         let mut events = core.subscribe();
-        let first = core.submit(root, None, original_text.into()).await.unwrap();
+        let first = core.submit(root, original_text.into()).await.unwrap();
         completed(&mut events, &first).await;
         let before = core.snapshot(root).await.unwrap();
         *original_id.lock().unwrap() = if forged {
@@ -1932,7 +1866,7 @@ async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_
         };
         let child = core.subagents(root).await.unwrap()[0].child_chat_id;
         let receipt = core
-            .submit(root, Some(first.loop_id), "Relay greeting now".into())
+            .submit(root, "Relay greeting now".into())
             .await
             .unwrap();
         completed(&mut events, &receipt).await;
@@ -2029,15 +1963,14 @@ async fn a_sender_burst_is_typed_rejected_after_twenty_admitted_messages() {
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.submit(
         root,
-        None,
         "Delegate a bounded child and send bounded context".into(),
     )
     .await
     .unwrap();
     // The burst outpaces an event subscriber; wait on the Loop instead.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while core.snapshot(root).await.unwrap().loops[0].state
-            != tickloop_agent_protocol::LoopState::Completed
+        while core.snapshot(root).await.unwrap().chat_loop.state
+            != tickloop_agent_protocol::LoopState::Idle
         {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -2096,17 +2029,13 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let first = core
-        .submit(root, None, "Delegate a bounded check".into())
+        .submit(root, "Delegate a bounded check".into())
         .await
         .unwrap();
     completed(&mut events, &first).await;
     let child = core.subagents(root).await.unwrap()[0].child_chat_id;
     let second = core
-        .submit(
-            root,
-            Some(first.loop_id),
-            "Steer the completed child".into(),
-        )
+        .submit(root, "Steer the completed child".into())
         .await
         .unwrap();
     completed(&mut events, &second).await;
@@ -2114,10 +2043,7 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
         loop {
             let snapshot = core.snapshot(root).await.unwrap();
             let settled = snapshot.pending_inputs.is_empty()
-                && snapshot
-                    .loops
-                    .iter()
-                    .all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed);
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle;
             let value = serde_json::to_value(snapshot).unwrap();
             if settled
                 && value["family_completions"]
@@ -2173,78 +2099,6 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
     restored.shutdown().await;
 }
 
-/// Records each stopped child and answers with `answer`.
-struct RecordingStopHook {
-    stopped: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
-    answer: Result<(), String>,
-}
-
-#[async_trait::async_trait]
-impl tickloop_agent_runtime::StoppedChildHook for RecordingStopHook {
-    async fn child_stopped(&self, root: Uuid, child: Uuid) -> Result<(), String> {
-        self.stopped.lock().unwrap().push((root, child));
-        self.answer.clone()
-    }
-}
-
-#[tokio::test]
-async fn stop_subagent_tells_its_hook_which_direct_child_stopped_and_reports_a_failed_end() {
-    for answer in [Ok(()), Err("the Agent daemon did not answer".to_owned())] {
-        let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(RoutedModel::new(|request| {
-            if !state(request)["delegation"].is_null() {
-                if !has_tool_result(request, "ready") {
-                    tickloop_agent_test_support::call(
-                        "ready",
-                        "SendMessage",
-                        json!({"to":"parent","message":"Child is ready to wait"}),
-                    )
-                } else {
-                    tickloop_agent_test_support::text("Awaiting family context.")
-                }
-            } else if !has_tool_result(request, "delegate") {
-                tickloop_agent_test_support::call(
-                    "delegate",
-                    "Subagent",
-                    json!({"task":"Wait to be stopped","name":"waiter"}),
-                )
-            } else if !has_tool_result(request, "stop") {
-                tickloop_agent_test_support::call("stop", "StopSubagent", json!({"to":"waiter"}))
-            } else {
-                tickloop_agent_test_support::text("Stopped")
-            }
-        }));
-        let core = Agent::new_embedded(tickloop_agent_test_support::config(), model);
-        let hook = Arc::new(RecordingStopHook {
-            stopped: std::sync::Mutex::new(Vec::new()),
-            answer: answer.clone(),
-        });
-        core.install_stopped_child_hook(hook.clone());
-        let root = core.create_chat(directory.path().into()).await.unwrap();
-        let mut events = core.subscribe();
-        let receipt = core
-            .submit(root, None, "Delegate a waiter then stop it".into())
-            .await
-            .unwrap();
-        completed(&mut events, &receipt).await;
-        let child = core.subagents(root).await.unwrap()[0].child_chat_id;
-        assert_eq!(*hook.stopped.lock().unwrap(), vec![(root, child)]);
-        let stopped = tool_result(&core.snapshot(root).await.unwrap().messages, "stop").unwrap();
-        assert_eq!(
-            stopped["status"],
-            if answer.is_err() {
-                "partial_failure"
-            } else {
-                "stopped"
-            }
-        );
-        if let Err(error) = answer {
-            assert_eq!(stopped["failures"][0]["error"], error);
-        }
-        core.shutdown().await;
-    }
-}
-
 #[tokio::test]
 async fn the_root_can_stop_its_parked_child_idempotently_without_losing_context_or_routing() {
     let directory = tempfile::tempdir().unwrap();
@@ -2277,7 +2131,7 @@ async fn the_root_can_stop_its_parked_child_idempotently_without_losing_context_
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Delegate a bounded waiter then stop it".into())
+        .submit(root, "Delegate a bounded waiter then stop it".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -2294,10 +2148,10 @@ async fn the_root_can_stop_its_parked_child_idempotently_without_losing_context_
     assert_eq!(registry.len(), 1);
     assert_eq!(registry[0].handle, "waiter");
     let child = core.snapshot(registry[0].child_chat_id).await.unwrap();
-    assert_eq!(
-        child.loops[0].state,
-        tickloop_agent_protocol::LoopState::Stopped
-    );
+    assert!(matches!(
+        child.chat_loop.state,
+        tickloop_agent_protocol::LoopState::Idle | tickloop_agent_protocol::LoopState::Interrupted
+    ));
     assert!(!child.messages.is_empty());
     assert!(
         child.pending_inputs.is_empty()
@@ -2377,9 +2231,9 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
                 .snapshot(snapshot.conversation.id)
                 .await
                 .unwrap()
-                .loops
-                .iter()
-                .all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)
+                .chat_loop
+                .state
+                == tickloop_agent_protocol::LoopState::Idle
             {
                 break;
             }
@@ -2426,7 +2280,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     };
     let root_before = core.snapshot(root_chat).await.unwrap();
     let child_before = core.snapshot(child).await.unwrap();
-    let command: AgentCommand = serde_json::from_value(json!({"kind":"send_family_input","source_execution":source,"target_execution":target,"target_loop":child_before.loops[0].id,"origin":origin,"input":{"kind":"text","text":"@audit 你好","contexts":[],"paths":[]}})).expect("business4 directed input command");
+    let command: AgentCommand = serde_json::from_value(json!({"kind":"send_family_input","source_execution":source,"target_execution":target,"origin":origin,"input":{"kind":"text","text":"@audit 你好","contexts":[],"paths":[]}})).expect("business4 directed input command");
     let command_id = Uuid::new_v4();
     let envelope = CommandEnvelope {
         daemon_epoch: access.daemon_epoch(),
@@ -2457,7 +2311,6 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     );
     completed(&mut events, &target_receipt).await;
     let received = core.snapshot(child).await.unwrap();
-    assert_eq!(received.loops.len(), 1);
     assert_eq!(
         serde_json::to_value(&received.delegation).unwrap(),
         serde_json::to_value(&child_before.delegation).unwrap()
@@ -2488,10 +2341,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
                 tickloop_agent_protocol::SubagentNotificationDelivery::Queued
             )
             && snapshot.pending_inputs.is_empty()
-            && snapshot
-                .loops
-                .iter()
-                .all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)
+            && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
     })
     .await;
     assert_eq!(
@@ -2524,10 +2374,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
         audit.response.as_deref(),
         Some("Direct human greeting received")
     );
-    assert_eq!(
-        audit.state,
-        Some(tickloop_agent_protocol::LoopState::Completed)
-    );
+    assert_eq!(audit.state, Some(tickloop_agent_protocol::LoopState::Idle));
     assert_eq!(receipt.chat_id, root_chat);
     let mut stale_source = command.clone();
     if let AgentCommand::SendFamilyInput { origin, .. } = &mut stale_source {
@@ -2631,11 +2478,7 @@ async fn family_stop_cancels_owned_background_commands_and_keeps_other_families(
     let unrelated = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(
-            root,
-            None,
-            "Delegate a sleep command and stop that child".into(),
-        )
+        .submit(root, "Delegate a sleep command and stop that child".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -2652,11 +2495,11 @@ async fn family_stop_cancels_owned_background_commands_and_keeps_other_families(
             && child.permissions.is_empty()
             && child.questions.is_empty()
     );
-    assert_eq!(
-        child.loops[0].state,
-        tickloop_agent_protocol::LoopState::Stopped
+    assert!(
+        child.trigger_awaits_resume,
+        "the stopped child waits to be continued"
     );
-    assert!(core.snapshot(unrelated).await.unwrap().loops.is_empty());
+    assert!(core.snapshot(unrelated).await.unwrap().messages.is_empty());
     assert_eq!(
         tool_result(&core.snapshot(root).await.unwrap().messages, "stop").unwrap()["status"],
         "stopped"
@@ -2723,7 +2566,7 @@ impl DirectedFixture {
         let root_chat = snapshot.conversation.id;
         let mut events = core.subscribe();
         let receipt = core
-            .submit(root_chat, None, "Delegate bounded evidence".into())
+            .submit(root_chat, "Delegate bounded evidence".into())
             .await
             .unwrap();
         completed(&mut events, &receipt).await;
@@ -2787,7 +2630,6 @@ impl DirectedFixture {
                 command: AgentCommand::SendFamilyInput {
                     source_execution: self.root,
                     target_execution: self.child,
-                    target_loop: None,
                     origin: self.origin.clone(),
                     input: UserInput::Text {
                         text: "@audit Attachment".into(),
@@ -2877,24 +2719,24 @@ async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_curre
 }
 
 #[tokio::test]
-async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_the_oldest_loop() {
+async fn family_human_main_input_after_stop_continues_the_root_loop() {
     use tickloop_agent_protocol::{
         AgentAccess, AgentCommand, CommandEnvelope, CommandResult, DisplayUpdate,
         InteractionSource, UserInput,
     };
     let fixture = DirectedFixture::new().await;
-    let oldest = fixture
+    let chat_loop = fixture
         .core
         .snapshot(fixture.root_chat)
         .await
         .unwrap()
-        .loops[0]
+        .chat_loop
         .id;
-    fixture.core.stop(fixture.root_chat, oldest).await.unwrap();
+    fixture.core.stop(fixture.root_chat).await.unwrap();
     let mut events = fixture.core.subscribe();
     let current = fixture
         .core
-        .submit(fixture.root_chat, None, "New root task".into())
+        .submit(fixture.root_chat, "New root task".into())
         .await
         .unwrap();
     completed(&mut events, &current).await;
@@ -2916,7 +2758,6 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
             command: AgentCommand::SendFamilyInput {
                 source_execution: fixture.child,
                 target_execution: fixture.root,
-                target_loop: None,
                 origin: InteractionSource {
                     view: fixture.origin.view,
                     display_version: shown.version,
@@ -2933,17 +2774,14 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
         .unwrap();
     assert!(
         result.error.is_none(),
-        "a stopped old Loop cannot block a live root's directed input: {:?}",
+        "a stopped root still takes directed input: {:?}",
         result.error
     );
     let CommandResult::FamilyInputSent { receipt, .. } = result.into_result().unwrap() else {
         panic!("directed root receipt");
     };
-    assert_ne!(receipt.loop_id, oldest);
-    assert_ne!(
-        receipt.loop_id, current.loop_id,
-        "multiple-Loop normal input starts its own new Loop"
-    );
+    assert_eq!(receipt.loop_id, chat_loop);
+    assert_eq!(current.loop_id, chat_loop, "the Chat keeps its one Loop");
     completed(&mut events, &receipt).await;
     assert_eq!(
         fixture
@@ -2951,9 +2789,9 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
             .snapshot(fixture.root_chat)
             .await
             .unwrap()
-            .loops[0]
+            .chat_loop
             .state,
-        tickloop_agent_protocol::LoopState::Stopped
+        tickloop_agent_protocol::LoopState::Idle
     );
     fixture.core.shutdown().await;
 }
@@ -2994,7 +2832,7 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
     let mut shell_events = fixture.core.subscribe_user_shells();
     let shell = fixture
         .core
-        .submit_user_shell_for_goal(fixture.root_chat, None, "sleep 30".into(), false)
+        .submit_user_shell(fixture.root_chat, "sleep 30".into(), false)
         .await
         .unwrap();
     let mut last_shell = None;
@@ -3034,11 +2872,7 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
                 .iter()
                 .map(|request| (&request.name, &request.execution))
                 .collect::<Vec<_>>(),
-            snapshot
-                .loops
-                .iter()
-                .map(|goal| &goal.state)
-                .collect::<Vec<_>>()
+            snapshot.chat_loop.state
         );
     }
     let root = fixture
@@ -3077,7 +2911,6 @@ async fn directed_human_body_preserves_whitespace_after_the_routing_separator() 
             command: AgentCommand::SendFamilyInput {
                 source_execution: fixture.root,
                 target_execution: fixture.child,
-                target_loop: None,
                 origin: fixture.origin.clone(),
                 input: UserInput::Text {
                     text: text.into(),
@@ -3100,9 +2933,9 @@ async fn directed_human_body_preserves_whitespace_after_the_routing_separator() 
             .snapshot(fixture.child_chat)
             .await
             .unwrap()
-            .loops[0]
+            .chat_loop
             .state
-            != tickloop_agent_protocol::LoopState::Completed
+            != tickloop_agent_protocol::LoopState::Idle
         {
             let _ = events.recv().await;
         }
@@ -3196,7 +3029,6 @@ async fn sender_rate_budget_survives_partial_family_restore(compact: bool) {
     let receipt = core
         .submit(
             root,
-            None,
             "Delegate two children and send twenty contexts to a".into(),
         )
         .await
@@ -3236,7 +3068,7 @@ async fn sender_rate_budget_survives_partial_family_restore(compact: bool) {
     resumed.resume_chat(b).await.unwrap();
     let mut events = resumed.subscribe();
     let after = resumed
-        .submit(root, None, "AFTER-RESTART send one context to b".into())
+        .submit(root, "AFTER-RESTART send one context to b".into())
         .await
         .unwrap();
     completed(&mut events, &after).await;
@@ -3258,7 +3090,7 @@ async fn the_model_has_exactly_four_subagent_tools_and_no_pull_contract() {
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Inspect your tool catalog".into())
+        .submit(root, "Inspect your tool catalog".into())
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -3373,7 +3205,7 @@ async fn a_background_subagent_returns_before_the_child_finishes() {
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let parent = core
-        .submit(root, None, "Start an independent background child".into())
+        .submit(root, "Start an independent background child".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -3405,7 +3237,7 @@ async fn a_background_completion_pushes_result_and_usage_and_wakes_the_idle_pare
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let parent = core
-        .submit(root, None, "Start a background audit".into())
+        .submit(root, "Start a background audit".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -3474,7 +3306,7 @@ async fn a_foreground_subagent_blocks_until_its_final_report_without_an_extra_no
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let parent = core
-        .submit(root, None, "Wait for a bounded foreground audit".into())
+        .submit(root, "Wait for a bounded foreground audit".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -3482,7 +3314,6 @@ async fn a_foreground_subagent_blocks_until_its_final_report_without_an_extra_no
         .unwrap();
     core.submit(
         root,
-        Some(parent.loop_id),
         "Retain this human context until the foreground result".into(),
     )
     .await
@@ -3516,7 +3347,6 @@ async fn a_background_completion_is_drained_at_the_busy_parents_next_tool_round(
     let parent = core
         .submit(
             root,
-            None,
             "Start a background child and hold the controlled root tool boundary".into(),
         )
         .await
@@ -3532,10 +3362,7 @@ async fn a_background_completion_is_drained_at_the_busy_parents_next_tool_round(
             break;
         }
     }
-    let command = core
-        .queue_command(root, Some(parent.loop_id), "/model".into())
-        .await
-        .unwrap();
+    let command = core.queue_command(root, "/model".into()).await.unwrap();
     model.release.notify_one();
     let queued = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -3609,11 +3436,7 @@ async fn send_message_resumes_a_finished_stopped_child_without_replacing_its_ide
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let parent = core
-        .submit(
-            root,
-            None,
-            "Retain, stop and resume one bounded child".into(),
-        )
+        .submit(root, "Retain, stop and resume one bounded child".into())
         .await
         .unwrap();
     completed(&mut events, &parent).await;
@@ -3653,7 +3476,7 @@ async fn background_completion_cannot_spawn_an_unbounded_subagent_chain() {
     let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let directory = tempfile::tempdir().unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
-    core.submit(root, None, "Run a bounded background chain".into())
+    core.submit(root, "Run a bounded background chain".into())
         .await
         .unwrap();
     for _ in 0..4 {
@@ -3661,8 +3484,8 @@ async fn background_completion_cannot_spawn_an_unbounded_subagent_chain() {
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while core.snapshot(root).await.unwrap().loops[0].state
-                != tickloop_agent_protocol::LoopState::Completed
+            while core.snapshot(root).await.unwrap().chat_loop.state
+                != tickloop_agent_protocol::LoopState::Idle
             {
                 tokio::task::yield_now().await;
             }
@@ -3718,7 +3541,7 @@ async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_n
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let first = core
-        .submit(root, None, "Start one independent question task".into())
+        .submit(root, "Start one independent question task".into())
         .await
         .unwrap();
     completed(&mut events, &first).await;
@@ -3741,7 +3564,7 @@ async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_n
     .await
     .unwrap();
     let stop = core
-        .submit(root, Some(first.loop_id), "Stop the waiting child".into())
+        .submit(root, "Stop the waiting child".into())
         .await
         .unwrap();
     completed(&mut events, &stop).await;
@@ -3796,7 +3619,6 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
         .unwrap();
     core.submit(
         root,
-        None,
         "Create129 bounded result sources and hold the root boundary".into(),
     )
     .await
@@ -3850,8 +3672,8 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
     });
     std::fs::write(directory.path().join("inbox-release"), "release").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while core.snapshot(root).await.unwrap().loops[0].state
-            != tickloop_agent_protocol::LoopState::Completed
+        while core.snapshot(root).await.unwrap().chat_loop.state
+            != tickloop_agent_protocol::LoopState::Idle
         {
             tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
@@ -3936,13 +3758,9 @@ async fn a_failed_background_report_preserves_the_actual_text_separately_from_th
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("evidence.txt"), "bounded evidence").unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
-    core.submit(
-        root,
-        None,
-        "Start a background audit of evidence.txt".into(),
-    )
-    .await
-    .unwrap();
+    core.submit(root, "Start a background audit of evidence.txt".into())
+        .await
+        .unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let snapshot = core.snapshot(root).await.unwrap();
@@ -3989,7 +3807,7 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Start a recoverable background audit".into())
+        .submit(root, "Start a recoverable background audit".into())
         .await
         .unwrap();
     model.entered.notified().await;
@@ -3999,7 +3817,7 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
         loop {
             let snapshot = core.snapshot(root).await.unwrap();
             if snapshot.family_completions.iter().any(|completion| matches!(completion.notification, SubagentNotificationDelivery::Queued))
-                && snapshot.loops.iter().all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
                 && snapshot.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, Content::Text {text} if text.starts_with("<task-notification>")))) {
                 break snapshot;
             }
@@ -4065,7 +3883,7 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
     resumed.resume_chat(child).await.unwrap();
     let mut events = resumed.subscribe();
     let continued = resumed
-        .submit(root, None, "Continue after the recovery window".into())
+        .submit(root, "Continue after the recovery window".into())
         .await
         .unwrap();
     completed(&mut events, &continued).await;
@@ -4092,48 +3910,6 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
     assert!(resumed_model.requests.lock().unwrap().iter().all(|request| request.messages.iter().flat_map(|message| &message.content).filter(|content| matches!(content, Content::Text {text} if text.starts_with("<task-notification>"))).count() == 1));
 }
 
-#[tokio::test]
-async fn a_stopped_parent_receives_a_visible_completion_delivery_refusal() {
-    use tickloop_agent_protocol::{LoopState, SubagentNotificationDelivery};
-    let model = Arc::new(SubagentTimingModel::new(true));
-    let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
-    let directory = tempfile::tempdir().unwrap();
-    let root = core.create_chat(directory.path().into()).await.unwrap();
-    let mut events = core.subscribe();
-    let receipt = core
-        .submit(root, None, "Start an independent background audit".into())
-        .await
-        .unwrap();
-    model.entered.notified().await;
-    completed(&mut events, &receipt).await;
-    core.stop(root, receipt.loop_id).await.unwrap();
-    model.release.notify_one();
-    let updated = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let event = tickloop_agent_test_support::next_event(&mut events).await;
-            if let EventKind::FamilyRunCompleted { completion } = event.kind
-                && matches!(
-                    completion.notification,
-                    SubagentNotificationDelivery::Rejected(_)
-                )
-            {
-                break completion;
-            }
-        }
-    })
-    .await;
-    let snapshot = core.snapshot(root).await.unwrap();
-    core.shutdown().await;
-    let updated = updated.expect("the visible event must contain the permanent delivery refusal");
-    assert_eq!(updated.result, "CHILD-FINAL-REPORT");
-    assert!(matches!(
-        snapshot.family_completions[0].notification,
-        SubagentNotificationDelivery::Rejected(_)
-    ));
-    assert_eq!(snapshot.loops[0].state, LoopState::Stopped);
-    assert!(!snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Text {text} if text.starts_with("<task-notification>"))));
-}
-
 async fn wait_for_snapshot(
     core: &Agent,
     chat: Uuid,
@@ -4148,13 +3924,13 @@ async fn wait_for_snapshot(
                 break snapshot;
             }
             latest = format!(
-                "completions {:?}; loops {:?}; latest events {:?}",
+                "completions {:?}; loop {:?}; latest events {:?}",
                 snapshot
                     .family_completions
                     .iter()
                     .map(|completion| &completion.notification)
                     .collect::<Vec<_>>(),
-                snapshot.loops,
+                snapshot.chat_loop,
                 snapshot.events.iter().rev().take(6).collect::<Vec<_>>()
             );
             tokio::task::yield_now().await;
@@ -4284,7 +4060,7 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
     )
     .await
     .unwrap();
-    core.submit(root, None, human.into()).await.unwrap();
+    core.submit(root, human.into()).await.unwrap();
     let failed = wait_for_snapshot(&core, root, "the failed child's notice", |snapshot| {
         snapshot.family_completions.len() == 1
             && matches!(
@@ -4292,10 +4068,7 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
                 SubagentNotificationDelivery::Queued
             )
             && snapshot.pending_inputs.is_empty()
-            && snapshot
-                .loops
-                .iter()
-                .all(|goal| goal.state == LoopState::Completed)
+            && snapshot.chat_loop.state == LoopState::Idle
             && task_notifications(snapshot).len() == 1
     })
     .await;
@@ -4306,14 +4079,14 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
             .contains("<status>failed</status>")
     );
     let child = failed.family_completions[0].child_chat_id;
-    let child_loop = core.snapshot(child).await.unwrap().loops[0].clone();
+    let child_loop = core.snapshot(child).await.unwrap().chat_loop.clone();
     assert_eq!(child_loop.state, LoopState::Failed);
     core.set_execution_mode(root, tickloop_agent_protocol::ExecutionMode::Auto)
         .await
         .unwrap();
     let mut events = core.subscribe();
     let resumed = core
-        .submit(child, Some(child_loop.id), CHILD_VIEW_CONTINUE.into())
+        .submit(child, CHILD_VIEW_CONTINUE.into())
         .await
         .unwrap();
     completed(&mut events, &resumed).await;
@@ -4324,17 +4097,14 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
                 SubagentNotificationDelivery::Queued
             )
             && snapshot.pending_inputs.is_empty()
-            && snapshot
-                .loops
-                .iter()
-                .all(|goal| goal.state == LoopState::Completed)
+            && snapshot.chat_loop.state == LoopState::Idle
             && tick.executions.load(std::sync::atomic::Ordering::SeqCst) == 1
     })
     .await;
     core.shutdown().await;
     let resumed_completion = &parent.family_completions[1];
     assert_eq!(resumed_completion.child_run_id, resumed.run_id);
-    assert_eq!(resumed_completion.state, LoopState::Completed);
+    assert_eq!(resumed_completion.state, LoopState::Idle);
     assert_eq!(resumed_completion.result, "CHILD-RESUMED-REPORT");
     let notifications = task_notifications(&parent);
     assert_eq!(notifications.len(), 2);
@@ -4429,7 +4199,6 @@ impl ModelClient for FailingRootModel {
 struct HeldCompletion {
     core: Agent,
     root: Uuid,
-    receipt: tickloop_agent_protocol::Receipt,
     events: tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
     _directory: tempfile::TempDir,
 }
@@ -4445,7 +4214,7 @@ async fn failed_root_holding_a_child_completion() -> HeldCompletion {
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
-        .submit(root, None, "Start a background audit".into())
+        .submit(root, "Start a background audit".into())
         .await
         .unwrap();
     tokio::time::timeout(
@@ -4473,10 +4242,10 @@ async fn failed_root_holding_a_child_completion() -> HeldCompletion {
     );
     let waiting = core.snapshot(root).await.unwrap();
     assert_eq!(
-        waiting.loops[0].state,
+        waiting.chat_loop.state,
         tickloop_agent_protocol::LoopState::Failed
     );
-    assert_eq!(waiting.loops[0].run_id, failed.loops[0].run_id);
+    assert_eq!(waiting.chat_loop.run_id, failed.chat_loop.run_id);
     assert_eq!(waiting.messages.len(), failed.messages.len());
     assert!(
         waiting.pending_inputs.is_empty(),
@@ -4485,33 +4254,9 @@ async fn failed_root_holding_a_child_completion() -> HeldCompletion {
     HeldCompletion {
         core,
         root,
-        receipt,
         events,
         _directory: directory,
     }
-}
-
-#[tokio::test]
-async fn a_completion_held_for_a_failed_root_is_refused_once_that_loop_stops() {
-    use tickloop_agent_protocol::SubagentNotificationDelivery;
-    let HeldCompletion {
-        core,
-        root,
-        receipt,
-        _directory,
-        ..
-    } = failed_root_holding_a_child_completion().await;
-    core.stop(root, receipt.loop_id).await.unwrap();
-    let refused = wait_for_snapshot(&core, root, "the refused notice", |snapshot| {
-        matches!(
-            snapshot.family_completions[0].notification,
-            SubagentNotificationDelivery::Rejected(_)
-        )
-    })
-    .await;
-    core.shutdown().await;
-    assert!(task_notifications(&refused).is_empty());
-    assert!(refused.pending_inputs.is_empty());
 }
 
 #[tokio::test]
@@ -4520,21 +4265,18 @@ async fn a_completion_for_a_failed_root_waits_for_its_explicit_continue() {
     let HeldCompletion {
         core,
         root,
-        receipt,
         mut events,
         _directory,
+        ..
     } = failed_root_holding_a_child_completion().await;
-    let continued = core
-        .submit(root, Some(receipt.loop_id), ROOT_CONTINUE.into())
-        .await
-        .unwrap();
+    let continued = core.submit(root, ROOT_CONTINUE.into()).await.unwrap();
     completed(&mut events, &continued).await;
     wait_for_snapshot(&core, root, "the deferred notice", |snapshot| {
         matches!(
             snapshot.family_completions[0].notification,
             SubagentNotificationDelivery::Queued
         ) && snapshot.pending_inputs.is_empty()
-            && snapshot.loops[0].state == LoopState::Completed
+            && snapshot.chat_loop.state == LoopState::Idle
             && task_notifications(snapshot).len() == 1
     })
     .await;
@@ -4556,7 +4298,7 @@ async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_chil
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let parent = core
-        .submit(root, None, "Wait for a bounded foreground audit".into())
+        .submit(root, "Wait for a bounded foreground audit".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
@@ -4582,17 +4324,13 @@ async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_chil
         "no foreground call returns this run: {:?}",
         recorded.family_completions[0].notification
     );
-    assert_eq!(recorded.loops[0].state, LoopState::Interrupted);
+    assert_eq!(recorded.chat_loop.state, LoopState::Interrupted);
     assert_eq!(
         tool_result(&recorded.messages, "launch").unwrap()["status"],
         "interrupted"
     );
     let continued = core
-        .submit(
-            root,
-            Some(parent.loop_id),
-            "Continue after the interruption".into(),
-        )
+        .submit(root, "Continue after the interruption".into())
         .await
         .unwrap();
     completed(&mut events, &continued).await;
@@ -4601,7 +4339,7 @@ async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_chil
             snapshot.family_completions[0].notification,
             SubagentNotificationDelivery::Queued
         ) && snapshot.pending_inputs.is_empty()
-            && snapshot.loops[0].state == LoopState::Completed
+            && snapshot.chat_loop.state == LoopState::Idle
             && task_notifications(snapshot).len() == 1
     })
     .await;

@@ -41,7 +41,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, None, "Use the shell tool".into())
+        .submit(chat, "Use the shell tool".into())
         .await
         .unwrap();
     loop {
@@ -66,10 +66,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
     reopened.install_own_tickhost();
     reopened.resume_chat(chat).await.unwrap();
     let mut events = reopened.subscribe();
-    let second = reopened
-        .submit(chat, None, "Continue".into())
-        .await
-        .unwrap();
+    let second = reopened.submit(chat, "Continue".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -117,7 +114,7 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
     );
     let source = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(source, None, "Start".into()).await.unwrap();
+    let first = agent.submit(source, "Start".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -140,7 +137,6 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: source,
-            source_loop_id: Some(first.loop_id),
             name: Some("Public child".into()),
         })
         .await
@@ -157,7 +153,7 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
             ))
     );
     let child_turn = agent
-        .submit(branch.child_chat_id, None, "Continue child".into())
+        .submit(branch.child_chat_id, "Continue child".into())
         .await
         .unwrap();
     loop {
@@ -169,7 +165,7 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
         }
     }
     let source_turn = agent
-        .submit(source, None, "Continue source".into())
+        .submit(source, "Continue source".into())
         .await
         .unwrap();
     loop {
@@ -403,7 +399,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         let initial_model = agent.snapshot(chat).await.unwrap().model;
         let mut events = agent.subscribe();
         let first = agent
-            .submit(chat, None, "Run the supervised shell probe".into())
+            .submit(chat, "Run the supervised shell probe".into())
             .await
             .unwrap();
         loop {
@@ -470,11 +466,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
                 .all(|(_, body)| body["model"] == original.model)
         );
         let next = agent
-            .submit(
-                chat,
-                Some(first.loop_id),
-                "Continue with selected protocol".into(),
-            )
+            .submit(chat, "Continue with selected protocol".into())
             .await
             .unwrap();
         loop {
@@ -504,7 +496,6 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         assert_eq!(completed.operation_id, command.operation_id);
         assert_eq!(completed.state, CommandState::Completed);
         assert_eq!(completed.exit_code, Some(0));
-        assert_eq!(agent.snapshot(chat).await.unwrap().loops.len(), 1);
         agent.shutdown().await;
     }
 }
@@ -523,7 +514,7 @@ fn signed_messages_reply() -> String {
 
 async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {

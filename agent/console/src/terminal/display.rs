@@ -45,7 +45,7 @@ pub(super) enum Glyph {
     AgentIdle,
     AgentCompleted,
     AgentFailed,
-    /// Stopped, interrupted or expired: ended without completing, not by failure.
+    /// An interrupted turn or a cancelled task: ended without completing, not by failure.
     AgentStopped,
     AgentUnknown,
     AgentEmpty,
@@ -191,7 +191,6 @@ mod tests {
         assert_eq!(animated.glyph(Glyph::Assistant), "⏺");
         assert_eq!(animated.glyph(Glyph::ToolResult), "⎿");
         assert_eq!(animated.glyph(Glyph::AgentNeedsInput), "◆");
-        assert_eq!(animated.glyph(Glyph::AgentWaiting), "◷");
         assert_eq!(animated.spinner_at(0), "⣾");
         assert_eq!(animated.spinner_at(109), "⣾");
         assert_eq!(animated.spinner_at(110), "⣷");

@@ -12,13 +12,6 @@ use tickloop_agent_protocol::{
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";
 pub const STOP_SUBAGENT_TOOL_NAME: &str = "StopSubagent";
 
-/// Told after StopSubagent stopped a direct child, so what the child owns outside this runtime (its
-/// hosted Ticks) ends with it. Embedded runtimes have none.
-#[async_trait::async_trait]
-pub trait StoppedChildHook: Send + Sync {
-    async fn child_stopped(&self, root: ChatId, child: ChatId) -> Result<(), String>;
-}
-
 pub(super) struct PreparedFamilyMessage {
     pub policy_input: Value,
     target: ChatId,
@@ -123,7 +116,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: SEND_AGENT_MESSAGE_TOOL_NAME.into(),
-            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization; an ended root or expired task requires human continuation. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families and broadcast are unavailable.".into(),
+            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization; an interrupted or failed root requires human continuation. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families and broadcast are unavailable.".into(),
             input_schema: json!({"type":"object","properties":{"to":{"type":"string","minLength":1},"message":{"type":"string","minLength":1},"relay_user_message_id":{"type":"string","format":"uuid","description":"Optional reference to genuine human input in your own current chain. Relay stays Agent-origin, never user authorization."}},"required":["to","message"],"additionalProperties":false}),
         },
     ];
@@ -135,13 +128,12 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     definitions
 }
 
-fn requires_human_continuation(snapshot: &ChatSnapshot, state: &LoopState) -> bool {
-    *state == LoopState::Expired
-        || (snapshot.delegation.is_none()
-            && matches!(
-                state,
-                LoopState::Stopped | LoopState::Interrupted | LoopState::Failed
-            ))
+fn requires_human_continuation(snapshot: &ChatSnapshot) -> bool {
+    snapshot.delegation.is_none()
+        && matches!(
+            snapshot.chat_loop.state,
+            LoopState::Interrupted | LoopState::Failed
+        )
 }
 
 fn result(value: Value) -> ToolResult {
@@ -205,12 +197,7 @@ fn peer_target(
             .ok_or("sender has no parent")?;
         return Ok((target_id, delegation.root_loop_id(), "child"));
     }
-    let loop_id = receiver
-        .snapshot
-        .loops
-        .first()
-        .ok_or("child Loop is unavailable")?
-        .id;
+    let loop_id = receiver.snapshot.chat_loop.id;
     Ok((
         target_id,
         loop_id,
@@ -260,10 +247,9 @@ pub(super) fn child_run_result(
 /// has not ended.
 pub(super) fn child_run_status(
     snapshot: &ChatSnapshot,
-    loop_id: LoopId,
     run: RunId,
 ) -> Option<(ChildRunStatus, Option<String>)> {
-    let goal = snapshot.loops.iter().find(|goal| goal.id == loop_id)?;
+    let chat_loop = &snapshot.chat_loop;
     snapshot
         .events
         .iter()
@@ -280,14 +266,16 @@ pub(super) fn child_run_status(
             }
         })
         .or_else(|| {
-            (goal.run_id == Some(run))
-                .then_some(match goal.state {
-                    LoopState::Interrupted | LoopState::Stopped | LoopState::Expired => {
-                        Some((ChildRunStatus::Interrupted, None))
-                    }
+            (chat_loop.run_id == Some(run))
+                .then_some(match chat_loop.state {
+                    LoopState::Interrupted => Some((ChildRunStatus::Interrupted, None)),
                     LoopState::Failed => Some((ChildRunStatus::Failed, None)),
-                    LoopState::Completed => Some((ChildRunStatus::Completed, None)),
-                    _ => None,
+                    LoopState::Idle => Some((ChildRunStatus::Completed, None)),
+                    LoopState::Queued
+                    | LoopState::Running
+                    | LoopState::WaitingPermission
+                    | LoopState::WaitingQuestion
+                    | LoopState::WaitingPlan => None,
                 })
                 .flatten()
         })
@@ -302,18 +290,15 @@ pub(super) fn child_run_result_from_events(
     parent: &Receipt,
     registration: Option<&SubagentRegistration>,
 ) -> Option<ToolResult> {
-    let goal = snapshot
-        .loops
-        .iter()
-        .find(|goal| goal.id == child.loop_id)?;
-    let (status, error) = child_run_status(snapshot, child.loop_id, child.run_id)?;
+    let chat_loop = &snapshot.chat_loop;
+    let (status, error) = child_run_status(snapshot, child.run_id)?;
     let text = crate::handback::completion_text(snapshot, child.run_id);
     let metadata = snapshot.delegation.as_ref()?;
     Some(ToolResult {
         content: json!({"delegation_id":metadata.delegation_id,"child_chat_id":child.chat_id,
             "handle":registration?.handle,"description":registration?.description,"created_at":registration?.created_at,
             "child_loop_id":child.loop_id,"child_run_id":child.run_id,"parent_chat_id":parent.chat_id,
-            "status":status.label(),"child_state":format!("{:?}", goal.state).to_lowercase(),"result":text,"error":error,
+            "status":status.label(),"child_state":format!("{:?}", chat_loop.state).to_lowercase(),"result":text,"error":error,
             "usage":snapshot.request_usage.run_conversation_usage(child.run_id).unwrap_or_default()}).to_string(),
         is_error:status != ChildRunStatus::Completed, output_ref:None,
     })
@@ -413,16 +398,10 @@ impl Agent {
             input["to"].as_str().unwrap_or_default(),
         )
         .map_err(|message| reject(FamilyMessageRejectionCode::InvalidTarget, message))?;
-        if chats[&target]
-            .snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == loop_id)
-            .is_some_and(|goal| requires_human_continuation(&chats[&target].snapshot, &goal.state))
-        {
+        if requires_human_continuation(&chats[&target].snapshot) {
             return Err(reject(
                 FamilyMessageRejectionCode::StaleTarget,
-                "an ended root or expired task requires explicit human continuation".into(),
+                "an interrupted or failed root requires explicit human continuation".into(),
             ));
         }
         let relay = input
@@ -708,26 +687,17 @@ impl Agent {
                 .parked
                 .values()
                 .any(|run| run.receipt.loop_id == loop_id && run.cancel.is_cancelled());
-        let is_child = original.snapshot.delegation.is_some();
-        let goal_index = original
-            .snapshot
-            .loops
-            .iter()
-            .position(|goal| goal.id == loop_id)
-            .ok_or("target Loop is unavailable")?;
-        let target_state = &original.snapshot.loops[goal_index].state;
-        let awaits_continuation =
-            !is_child && matches!(target_state, LoopState::Interrupted | LoopState::Failed);
+        if original.snapshot.chat_loop.id != loop_id {
+            return Err("target Loop is unavailable".into());
+        }
+        let awaits_continuation = requires_human_continuation(&original.snapshot);
         if is_completion && (awaits_continuation || is_target_run_ending) {
             return Err(DispatchRefusal::Deferred);
         }
         if is_target_run_ending {
             return Err("message not dispatched: target run was interrupted".into());
         }
-        if *target_state == LoopState::Expired
-            || awaits_continuation
-            || (!is_child && *target_state == LoopState::Stopped)
-        {
+        if awaits_continuation {
             return Err(ENDED_TARGET_REFUSAL.into());
         }
         let mut candidate = original.clone();
@@ -741,15 +711,15 @@ impl Agent {
         });
         let target_label = family_label(&receiver.snapshot, target_registration);
         drop(registry);
-        let goal = &mut receiver.snapshot.loops[goal_index];
+        let chat_loop = &mut receiver.snapshot.chat_loop;
         if !matches!(
-            goal.state,
+            chat_loop.state,
             LoopState::Running
                 | LoopState::WaitingPermission
                 | LoopState::WaitingQuestion
                 | LoopState::WaitingPlan
         ) {
-            goal.set_state(LoopState::Queued);
+            chat_loop.set_state(LoopState::Queued);
         }
         let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
         let pending_count = receiver
@@ -858,7 +828,7 @@ impl Agent {
         }
         let delivered = result(
             json!({"status":"accepted","message_id":source.message_id,"target_chat_id":target_id,
-            "target_loop_id":loop_id,"target_run_id":receipt.run_id,"target_label":target_label,"target_relationship":match relationship {"parent"=>"child","child"=>"parent",_=>"sibling"},"delivery":"queued_at_tool_boundary"}),
+            "target_run_id":receipt.run_id,"target_label":target_label,"target_relationship":match relationship {"parent"=>"child","child"=>"parent",_=>"sibling"},"delivery":"queued_at_tool_boundary"}),
         );
         mailbox.sent.insert(
             key,
@@ -961,11 +931,6 @@ impl Agent {
             is_error: failed, output_ref: None,
         })
     }
-
-    /// Installs the hook StopSubagent calls once a child is stopped.
-    pub fn install_stopped_child_hook(&self, hook: Arc<dyn StoppedChildHook>) {
-        *self.inner.stopped_child_hook.write().unwrap() = Some(hook);
-    }
 }
 
 #[cfg(test)]
@@ -1044,7 +1009,7 @@ mod child_result_tests {
         let agent = Agent::new_embedded(config(), Arc::new(Family { child_fails }));
         let root = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent.submit(root, None, "delegate".into()).await.unwrap();
+        let receipt = agent.submit(root, "delegate".into()).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.unwrap();

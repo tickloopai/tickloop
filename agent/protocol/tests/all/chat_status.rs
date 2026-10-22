@@ -55,7 +55,7 @@ fn busy_chat() -> ChatSnapshot {
         "message_ids": {"4": id(0x91), "6": id(0x92)},
         "message_contexts": {"0": pasted(3)},
         "agent_message_origins": {id(0x91).to_string(): {"from": "child"}},
-        "loops": [{"id": id(0x10), "goal": "Watch", "state": "Running", "run_id": id(0x20)}],
+        "chat_loop": {"id": id(0x10), "state": "Running", "run_id": id(0x20)},
         "plans": [{"loop_id": id(0x10), "version": 2, "markdown": "Plan", "approved_execution_mode": null, "approval_pending": true}],
     }))
     .unwrap();
@@ -187,6 +187,7 @@ fn a_preview_shows_the_latest_prompt_and_never_a_host_note() {
     let snapshot: ChatSnapshot = serde_json::from_value(json!({
         "id": id(0xc1),
         "folder": "/work",
+        "chat_loop": {"id": id(0x10), "state": "Idle"},
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Build the page"}]},
             {"role": "user", "content": [{"type": "text", "text": "Reference guidance from tickloop active in this Chat"}]},

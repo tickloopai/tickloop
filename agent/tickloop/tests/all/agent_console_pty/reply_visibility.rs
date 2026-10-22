@@ -4,7 +4,6 @@ use tickloop_agent_protocol::{AgentAccess, LoopAction};
 const REPLY: &str = "REPLY-COMMITTED-WITHOUT-NEWLINE";
 const BATCH_PROMPT: &str = "Visibility batch probe";
 const QUESTION: &str = "QUEUED-QUESTION-PREVIEW";
-const PARKED_CALL: &str = "PARKED-CALL-AWAITING-PERMISSION";
 
 async fn short_exchange_has_no_sticky_prompt(fixture: &PrivateFixture, renderer: &str) {
     const PROMPT: &str = "SHORT-EXCHANGE-USER-MESSAGE";
@@ -524,116 +523,6 @@ async fn actual_cli_independent_question_still_activates_and_accepts_one_answer(
     }
 }
 
-async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
-    let marker = fixture.path("parked-marker");
-    let (url,_)=model_http_support::serve_responses(vec![
-        (200,chat_reply(Some(("Bash","parked-call",json!({"command":format!("printf parked > {}",marker.display()),"description":PARKED_CALL}))),"PARKED-REPLY")),
-        (200,chat_reply(None,"INDEPENDENT-LOOP-FINISHED")),
-        (200,chat_reply(None,"PARKED-LOOP-FINISHED")),
-    ]).await;
-    fixture.set_chat_model(&url);
-    let mut view = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
-    view.wait_for("parked Loop View ready", new_input_is_visible)
-        .await;
-    view.resize(120, 50).await;
-    view.send(b"Park this Loop for permission\r");
-    view.wait_for("first call awaits human approval", |frame| {
-        frame.contains(PARKED_CALL) && frame.contains("Queued")
-    })
-    .await;
-    let client = fixture.client().await;
-    let execution = catalog(&client).await[0].execution;
-    let parked = wait_snapshot(
-        &client,
-        execution,
-        "one actionable permission",
-        |snapshot| snapshot.permissions.len() == 1,
-    )
-    .await;
-    let first_run = parked.permissions[0]
-        .execution
-        .run_id()
-        .expect("a model permission has its Run");
-    client
-        .execute(CommandEnvelope {
-            daemon_epoch: client.daemon_epoch(),
-            command_id: uuid::Uuid::new_v4(),
-            command: AgentCommand::Submit {
-                execution,
-                target_loop: None,
-                input: UserInput::Text {
-                    text: "Complete an independent Loop".into(),
-                    contexts: vec![],
-                    paths: vec![],
-                },
-                origin: None,
-            },
-        })
-        .await
-        .unwrap();
-    view.wait_for("independent Loop completes", |frame| {
-        frame.contains("INDEPENDENT-LOOP-FINISHED")
-    })
-    .await;
-    let preserved = view.frame();
-    let row = conversation_body(&preserved)
-        .lines()
-        .find(|line| line.contains(PARKED_CALL))
-        .unwrap()
-        .to_owned();
-    assert!(
-        row.contains("Queued") && !row.contains("Stopped"),
-        "{preserved}"
-    );
-    let still_parked = snapshot(&client, execution).await;
-    assert_eq!(still_parked.permissions.len(), 1);
-    assert_eq!(
-        still_parked.permissions[0]
-            .execution
-            .run_id()
-            .expect("a model permission has its Run"),
-        first_run
-    );
-    assert!(!marker.exists());
-    let request = *still_parked
-        .request_refs
-        .iter()
-        .find(|request| request.kind == PendingRequestKind::Permission)
-        .unwrap();
-    client
-        .execute(CommandEnvelope {
-            daemon_epoch: client.daemon_epoch(),
-            command_id: uuid::Uuid::new_v4(),
-            command: AgentCommand::DecidePermission {
-                request,
-                allow: true,
-                scope: tickloop_agent_protocol::PermissionScope::Once,
-                comment: None,
-                rule: None,
-            },
-        })
-        .await
-        .unwrap();
-    view.wait_for("parked Loop resumes after its own approval", |frame| {
-        frame.contains("PARKED-LOOP-FINISHED")
-    })
-    .await;
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), "parked");
-    view.close().await;
-}
-
-#[tokio::test]
-async fn actual_cli_finishing_one_run_preserves_another_loops_actionable_proposal() {
-    let fixture = PrivateFixture::new();
-    let result = AssertUnwindSafe(parked_loop_survives_other_completion(&fixture))
-        .catch_unwind()
-        .await;
-    fixture.shutdown().await;
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
-}
-
 async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture) {
     let (url, mut requests, _release) = model_http_support::serve_responses_with_gated_response(
         vec![(200, batch_reply()), (200, review_allow_reply())],
@@ -795,7 +684,6 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Roll event log".into(),
                     contexts: vec![],
@@ -811,13 +699,12 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         execution,
         "old Run is evicted after the other Loop completes",
         |snapshot| {
-            snapshot.conversation.loops.iter().any(|goal| {
-                goal.run_id != Some(interrupted_run)
-                    && goal.state == tickloop_agent_protocol::LoopState::Completed
-            }) && !snapshot
-                .events
-                .iter()
-                .any(|event| event.run_id == interrupted_run)
+            snapshot.conversation.chat_loop.run_id != Some(interrupted_run)
+                && snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+                && !snapshot
+                    .events
+                    .iter()
+                    .any(|event| event.run_id == interrupted_run)
         },
     )
     .await;

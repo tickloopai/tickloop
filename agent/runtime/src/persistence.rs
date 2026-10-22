@@ -42,8 +42,7 @@ use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
     CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
     CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
-    FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
-    LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
+    FileHistorySnapshotEntry, ForkedFrom, LOOP_SUBTYPE, LastPromptEntry, Line, LoopRecord,
     MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, SentAgentMessagesEntry,
     SubagentsEntry, SummarizeMetadataEntry,
 };
@@ -92,12 +91,10 @@ struct ChatLog {
     /// 本进程为该文件写出的最后一批链上条目的时间。之后的批次时间严格递增，rewind 后接续的
     /// 条目即使与被放弃分叉写于同一毫秒，也会成为时间更新的叶子。
     last_entry_milliseconds: u64,
-    /// 当前对话链上各 Loop 最后记录的完整状态；快照中的 Loop 与之不同时追加 Loop 条目。
-    recorded_loops: HashMap<LoopId, LoopEntryContent>,
+    /// 当前对话链上 Loop 最后记录的完整状态；快照中的 Loop 与之不同时追加 Loop 条目。
+    recorded_loop: Option<LoopEntryContent>,
     /// The lifecycle and ledger revision written last.
     recorded_lifecycle: u64,
-    /// 在本文件中写过创建条目或从文件加载的 Loop，用于区分创建与之后的状态变化。
-    created_loops: HashSet<LoopId>,
 }
 
 const DENIAL_FILE_VERSION: u32 = 1;
@@ -191,35 +188,26 @@ fn adopted_parent_cursor(links: &[MessageLink], loaded: &LoadedTranscript) -> Op
         .map(|entry| entry.uuid)
 }
 
-/// The Loop records a restored chain already holds, with the plan state actually recorded, and
-/// the Loops it created.
-fn recorded_loop_entries(
+/// The Loop record a restored chain already holds, with the plan state actually recorded; `None`
+/// when the chain holds none, so the next sync records the Loop.
+fn recorded_loop_entry(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
     checkpoints: &[super::plan::PlanCheckpoint],
-) -> (HashMap<LoopId, LoopEntryContent>, HashSet<LoopId>) {
-    let recorded_plans = checkpoints
-        .iter()
-        .filter_map(|checkpoint| {
-            checkpoint
-                .plan_version
-                .map(|version| (checkpoint.loop_id, (version, checkpoint.approval_pending)))
-        })
-        .collect::<HashMap<_, _>>();
-    let records = snapshot
-        .loops
-        .iter()
-        .map(|goal| {
-            let (mut record, run) = loop_entry_content(snapshot, bookkeeping, goal);
-            record.plan_version = recorded_plans.get(&goal.id).map(|(version, _)| *version);
-            record.plan_approval_pending = recorded_plans
-                .get(&goal.id)
-                .is_some_and(|(_, pending)| *pending);
-            (goal.id, (record, run))
-        })
-        .collect();
-    let created = snapshot.loops.iter().map(|goal| goal.id).collect();
-    (records, created)
+    records_loop: bool,
+) -> Option<LoopEntryContent> {
+    if !records_loop {
+        return None;
+    }
+    let recorded_plan = checkpoints.iter().rev().find_map(|checkpoint| {
+        checkpoint
+            .plan_version
+            .map(|version| (version, checkpoint.approval_pending))
+    });
+    let (mut record, run) = loop_entry_content(snapshot, bookkeeping);
+    record.plan_version = recorded_plan.map(|(version, _)| version);
+    record.plan_approval_pending = recorded_plan.is_some_and(|(_, pending)| pending);
+    Some((record, run))
 }
 
 #[derive(Clone)]
@@ -546,8 +534,7 @@ impl ChatRecorder {
                 parent_cursor: None,
                 load_warnings,
                 last_entry_milliseconds: 0,
-                recorded_loops: HashMap::new(),
-                created_loops: HashSet::new(),
+                recorded_loop: None,
                 recorded_lifecycle: 0,
             },
         );
@@ -719,14 +706,14 @@ impl ChatRecorder {
             log.links.truncate(message_count);
             log.meta_messages.retain(|index| *index < message_count);
             log.parent_cursor = log.links.last().and_then(|link| link.uuids.last().copied());
-            // 截断点之后的 Loop 条目不在新的对话链上；下一次同步为截断后仍存在的 Loop 重记完整状态。
-            log.recorded_loops.clear();
+            // 截断点之后的 Loop 条目不在新的对话链上；下一次同步为 Loop 重记完整状态。
+            log.recorded_loop = None;
         }
         self.mark_dirty(chat_id);
     }
 
     /// 压缩与定向摘要提交时、替换内存快照之前调用。先写出压缩前尚未写出的消息，再追加新的
-    /// 边界（父指针为空，逻辑父指针指向压缩前最后一条）与摘要，并为未结束的 Loop 重记状态；
+    /// 边界（父指针为空，逻辑父指针指向压缩前最后一条）与摘要，并为 Loop 重记状态；
     /// 这些条目作为同一批入队，保证大文件跳过边界之前的内容时 Loop、计划与进度不丢失。
     ///
     /// 全量压缩照 Claude Code `recordTranscript`：保留的消息沿用原条目，下一条消息接在摘要之后。
@@ -799,34 +786,17 @@ impl ChatRecorder {
         let git_branch = folder.and_then(current_git_branch);
         let mut lines = Vec::new();
         let mut parent = None;
-        // 压缩边界让对话链断开，边界之前的 Loop 条目不再在链上：为每个未结束的 Loop 重记完整状态。
-        // 全量压缩写在摘要之后；定向摘要按 Loop 在压缩后对话中的创建位置写在对应消息之前。
-        let first_loop_position = if keeps_existing {
+        // 压缩边界让对话链断开，边界之前的 Loop 条目不再在链上：为 Loop 重记完整状态。全量压缩
+        // 写在摘要之后；定向摘要写在保留的消息之后。
+        let loop_position = if keeps_existing {
             layout.sources.len()
         } else {
             layout
                 .position(MessageSource::Boundary)
                 .map_or(0, |index| index + 1)
         };
-        let mut loop_updates = compacted
-            .loops
-            .iter()
-            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-            .map(|goal| {
-                let start = compacted_bookkeeping
-                    .loop_starts
-                    .get(&goal.id)
-                    .copied()
-                    .unwrap_or(0);
-                (
-                    start.max(first_loop_position),
-                    loop_entry_content(compacted, compacted_bookkeeping, goal),
-                )
-            })
-            .collect::<Vec<_>>();
-        loop_updates.sort_by_key(|(position, _)| *position);
-        let mut loop_updates = VecDeque::from(loop_updates);
-        log.recorded_loops.clear();
+        let mut loop_update = Some(loop_entry_content(compacted, compacted_bookkeeping));
+        log.recorded_loop = None;
         for (index, source) in layout.sources.iter().enumerate() {
             if let MessageSource::Existing(original) = source
                 && keeps_existing
@@ -836,11 +806,9 @@ impl ChatRecorder {
                 log.links.push(link);
                 continue;
             }
-            while loop_updates
-                .front()
-                .is_some_and(|(position, _)| *position <= index)
+            if index >= loop_position
+                && let Some(content) = loop_update.take()
             {
-                let (_, content) = loop_updates.pop_front().unwrap();
                 lines.push(record_loop(
                     log,
                     compacted,
@@ -897,7 +865,7 @@ impl ChatRecorder {
             });
             lines.push(Line::chain(role, entry));
         }
-        for (_, content) in loop_updates {
+        if let Some(content) = loop_update {
             lines.push(record_loop(
                 log,
                 compacted,
@@ -910,30 +878,19 @@ impl ChatRecorder {
                 },
             ));
         }
-        // 边界之前的计划与进度工具调用不再在链上：在全部消息之后为这些 Loop 记下当时的计划版本与进度。
-        for goal in compacted
-            .loops
-            .iter()
-            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-        {
-            if let Some(content) = plan_entry_content(compacted, compacted_bookkeeping, goal) {
-                lines.push(record_loop(
-                    log,
-                    compacted,
-                    compacted_bookkeeping,
-                    content,
-                    &mut parent,
-                    EntryStamp {
-                        timestamp: &timestamp,
-                        folder,
-                    },
-                ));
-            }
-        }
-        for goal in &compacted.loops {
-            log.recorded_loops
-                .entry(goal.id)
-                .or_insert_with(|| loop_entry_content(compacted, compacted_bookkeeping, goal));
+        // 边界之前的计划与进度工具调用不再在链上：在全部消息之后记下当时的计划版本与进度。
+        if let Some(content) = plan_entry_content(compacted, compacted_bookkeeping) {
+            lines.push(record_loop(
+                log,
+                compacted,
+                compacted_bookkeeping,
+                content,
+                &mut parent,
+                EntryStamp {
+                    timestamp: &timestamp,
+                    folder,
+                },
+            ));
         }
         log.meta_messages = layout
             .sources
@@ -1032,39 +989,18 @@ impl ChatRecorder {
         let mut lines = Vec::new();
         let mut parent = log.parent_cursor;
         let first_new_message = log.links.len();
-        // 与链上记录不同的 Loop。尚未记录的 Loop 写在它创建时所在的消息之前（已写出的消息之前
-        // 无法插入时写在本批开头）；已记录的 Loop 的变化写在本批末尾。条目位置只会晚于实际发生
-        // 的位置：rewind 截断后会为仍存在的 Loop 重记状态，所以不会让 Loop 在新链上错误地消失。
-        let mut loop_updates = snapshot
-            .loops
-            .iter()
-            .filter_map(|goal| {
-                let content = loop_entry_content(snapshot, bookkeeping, goal);
-                if log.recorded_loops.get(&goal.id) == Some(&content) {
-                    return None;
-                }
-                let position = if log.recorded_loops.contains_key(&goal.id) {
-                    snapshot.messages.len()
-                } else {
-                    bookkeeping
-                        .loop_starts
-                        .get(&goal.id)
-                        .copied()
-                        .unwrap_or(0)
-                        .clamp(first_new_message, snapshot.messages.len())
-                };
-                Some((position, content))
-            })
-            .collect::<Vec<_>>();
-        // 首次写入当前链段的 Loop：链上缺少它之前的计划与进度工具调用（Branch、`--fork-session`、rewind 截断），
-        // 在本批末尾记下当时的计划版本与进度。
-        let first_recorded_loops = loop_updates
-            .iter()
-            .map(|(_, (record, _))| record.loop_id)
-            .filter(|loop_id| !log.recorded_loops.contains_key(loop_id))
-            .collect::<Vec<_>>();
-        loop_updates.sort_by_key(|(position, _)| *position);
-        let mut loop_updates = VecDeque::from(loop_updates);
+        // Loop 与链上记录不同时写出。当前链段尚未记录的 Loop 写在本批第一条新消息之前，已记录的
+        // Loop 的变化写在本批末尾。rewind 截断后会为 Loop 重记状态。
+        let loop_content = loop_entry_content(snapshot, bookkeeping);
+        let first_records_loop = log.recorded_loop.is_none();
+        let mut loop_update = (log.recorded_loop.as_ref() != Some(&loop_content)).then(|| {
+            let position = if first_records_loop {
+                first_new_message
+            } else {
+                snapshot.messages.len()
+            };
+            (position, loop_content)
+        });
         if let Some(index) = log.links.len().checked_sub(1) {
             let message = &snapshot.messages[index];
             let blocks = log.links[index].blocks;
@@ -1107,11 +1043,7 @@ impl ChatRecorder {
             }
         }
         for index in first_new_message..snapshot.messages.len() {
-            while loop_updates
-                .front()
-                .is_some_and(|(position, _)| *position <= index)
-            {
-                let (_, content) = loop_updates.pop_front().unwrap();
+            if let Some((_, content)) = loop_update.take_if(|(position, _)| *position <= index) {
                 lines.push(record_loop(
                     log,
                     snapshot,
@@ -1171,7 +1103,7 @@ impl ChatRecorder {
                 }));
             }
         }
-        for (_, content) in loop_updates {
+        if let Some((_, content)) = loop_update {
             lines.push(record_loop(
                 log,
                 snapshot,
@@ -1184,24 +1116,20 @@ impl ChatRecorder {
                 },
             ));
         }
-        for goal in snapshot
-            .loops
-            .iter()
-            .filter(|goal| first_recorded_loops.contains(&goal.id))
-        {
-            if let Some(content) = plan_entry_content(snapshot, bookkeeping, goal) {
-                lines.push(record_loop(
-                    log,
-                    snapshot,
-                    bookkeeping,
-                    content,
-                    &mut parent,
-                    EntryStamp {
-                        timestamp: &timestamp,
-                        folder,
-                    },
-                ));
-            }
+        // 首次写入当前链段的 Loop：链上缺少它之前的计划与进度工具调用（Branch、`--fork-session`、
+        // rewind 截断），在本批末尾记下当时的计划版本与进度。
+        if first_records_loop && let Some(content) = plan_entry_content(snapshot, bookkeeping) {
+            lines.push(record_loop(
+                log,
+                snapshot,
+                bookkeeping,
+                content,
+                &mut parent,
+                EntryStamp {
+                    timestamp: &timestamp,
+                    folder,
+                },
+            ));
         }
         if !lines.is_empty() {
             log.last_entry_milliseconds = milliseconds;
@@ -1236,8 +1164,7 @@ impl ChatRecorder {
                 parent_cursor,
                 load_warnings: loaded.warnings,
                 last_entry_milliseconds: 0,
-                recorded_loops: HashMap::new(),
-                created_loops: HashSet::new(),
+                recorded_loop: None,
                 recorded_lifecycle: 0,
             },
         );
@@ -1295,8 +1222,7 @@ impl ChatRecorder {
                 parent_cursor: log.parent_cursor,
                 load_warnings: log.load_warnings,
                 last_entry_milliseconds,
-                recorded_loops: log.recorded_loops,
-                created_loops: log.created_loops,
+                recorded_loop: log.recorded_loop,
                 recorded_lifecycle: log.recorded_lifecycle,
             },
         );
@@ -1311,15 +1237,16 @@ impl ChatRecorder {
 
     /// Adopt ordinary recovery state without rewriting it. Keep the actual recorded plan state
     /// as the comparison baseline so plan normalization is checkpointed before the View loads.
-    fn adopt_restored_loops(
+    fn adopt_restored_loop(
         &self,
         snapshot: &ChatSnapshot,
         bookkeeping: &ChatBookkeeping,
         checkpoints: &[super::plan::PlanCheckpoint],
+        records_loop: bool,
     ) {
         if let Some(log) = self.logs.lock().unwrap().get_mut(&snapshot.id) {
-            (log.recorded_loops, log.created_loops) =
-                recorded_loop_entries(snapshot, bookkeeping, checkpoints);
+            log.recorded_loop =
+                recorded_loop_entry(snapshot, bookkeeping, checkpoints, records_loop);
         }
     }
 
@@ -1544,9 +1471,8 @@ fn chain_entry(
         private_source: snapshot.message_sources.get(&index).cloned(),
         loop_id: snapshot
             .message_runs
-            .get(&index)
-            .and_then(|run| bookkeeping.run_loops.get(run))
-            .copied(),
+            .contains_key(&index)
+            .then_some(snapshot.chat_loop.id),
         slug: bookkeeping.plan_slug.clone(),
         response_id: bookkeeping.lifecycle.response_of(
             snapshot,
@@ -1567,65 +1493,55 @@ fn chain_entry(
     }
 }
 
-/// Loop 在对话链上的完整状态。等待手动恢复的 Trigger 一并记录，重启后仍能由用户重新武装。
-fn loop_entry_content(
-    snapshot: &ChatSnapshot,
-    bookkeeping: &ChatBookkeeping,
-    goal: &LoopSnapshot,
-) -> LoopEntryContent {
+/// Loop 在对话链上的完整状态。等待 Chat 继续的 Trigger 一并记录，重启后仍能由用户重新武装。
+fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) -> LoopEntryContent {
+    let chat_loop = &snapshot.chat_loop;
     (
         LoopRecord {
-            subagent_report: goal
+            subagent_report: chat_loop
                 .run_id
                 .and_then(|run| snapshot.subagent_reports.get(&run).cloned()),
             failure_events: snapshot
                 .failure_events
                 .iter()
-                .filter(|event| event.loop_id == goal.id)
                 .filter_map(|event| serde_json::to_value(event).ok())
                 .collect(),
-            loop_id: goal.id,
-            goal: goal.goal.clone(),
-            state: serde_json::to_value(&goal.state).unwrap_or(serde_json::Value::Null),
-            trigger: goal
+            loop_id: chat_loop.id,
+            state: serde_json::to_value(&chat_loop.state).unwrap_or(serde_json::Value::Null),
+            trigger: chat_loop
                 .trigger
                 .as_ref()
                 .and_then(|trigger| serde_json::to_value(trigger).ok()),
-            trigger_awaits_resume: snapshot.resume_triggers.contains(&goal.id),
-            event_sources: goal
+            trigger_awaits_resume: snapshot.trigger_awaits_resume,
+            event_sources: chat_loop
                 .event_sources
                 .iter()
                 .filter_map(|source| serde_json::to_value(source).ok())
                 .collect(),
-            plan_version: super::plan::highest_plan_version(snapshot, bookkeeping, goal.id),
-            plan_approval_pending: snapshot
-                .plans
-                .iter()
-                .any(|plan| plan.loop_id == goal.id && plan.approval_pending),
+            plan_version: super::plan::highest_plan_version(snapshot, bookkeeping),
+            plan_approval_pending: snapshot.plans.iter().any(|plan| plan.approval_pending),
             progress: None,
-            state_since: goal.state_since.map(serde_json::Value::from),
-            run_started_at: goal.run_started_at,
+            state_since: chat_loop.state_since.map(serde_json::Value::from),
+            run_started_at: chat_loop.run_started_at,
         },
-        goal.run_id,
+        chat_loop.run_id,
     )
 }
 
-/// 带计划版本与进度的 Loop 状态；该 Loop 既没有计划也没有进度时返回 `None`。
+/// 带计划版本与进度的 Loop 状态；Loop 既没有计划也没有进度时返回 `None`。
 fn plan_entry_content(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
-    goal: &LoopSnapshot,
 ) -> Option<LoopEntryContent> {
-    let plan_version = super::plan::highest_plan_version(snapshot, bookkeeping, goal.id);
+    let plan_version = super::plan::highest_plan_version(snapshot, bookkeeping);
     let progress = snapshot
         .progress
-        .iter()
-        .find(|progress| progress.loop_id == goal.id)
+        .first()
         .and_then(|progress| serde_json::to_value(&progress.todos).ok());
     if plan_version.is_none() && progress.is_none() {
         return None;
     }
-    let (mut record, run_id) = loop_entry_content(snapshot, bookkeeping, goal);
+    let (mut record, run_id) = loop_entry_content(snapshot, bookkeeping);
     record.plan_version = plan_version;
     record.progress = progress;
     Some((record, run_id))
@@ -1640,27 +1556,6 @@ fn record_loop(
     parent: &mut Option<Uuid>,
     stamp: EntryStamp<'_>,
 ) -> Line {
-    let loop_id = record.loop_id;
-    let is_ended = matches!(
-        serde_json::from_value::<LoopState>(record.state.clone()),
-        Ok(LoopState::Stopped | LoopState::Expired)
-    );
-    let subtype = if !log.created_loops.contains(&loop_id) {
-        LOOP_CREATED_SUBTYPE
-    } else if is_ended {
-        LOOP_ENDED_SUBTYPE
-    } else if log
-        .recorded_loops
-        .get(&loop_id)
-        .is_some_and(|(previous, _)| {
-            previous.trigger != record.trigger
-                || previous.trigger_awaits_resume != record.trigger_awaits_resume
-        })
-    {
-        LOOP_TRIGGER_SUBTYPE
-    } else {
-        LOOP_STATE_SUBTYPE
-    };
     let entry = ChainEntry {
         uuid: Uuid::new_v4(),
         parent_uuid: *parent,
@@ -1689,7 +1584,7 @@ fn record_loop(
         tool_call_recoveries: Vec::new(),
         contexts: None,
         continues_message: false,
-        subtype: Some(subtype.to_owned()),
+        subtype: Some(LOOP_SUBTYPE.to_owned()),
         compact_metadata: None,
         is_compact_summary: false,
         summarize_metadata: None,
@@ -1704,9 +1599,7 @@ fn record_loop(
         loop_record: Some(record.clone()),
     };
     *parent = Some(entry.uuid);
-    log.created_loops.insert(loop_id);
-    log.recorded_loops
-        .insert(loop_id, (record.without_progress(), run_id));
+    log.recorded_loop = Some((record.without_progress(), run_id));
     Line::System(entry)
 }
 
@@ -1828,7 +1721,7 @@ struct RestoredChain {
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
     message_of_entry: HashMap<Uuid, usize>,
-    /// 链上的 Loop 条目，按链上顺序，连同条目之前的消息数。
+    /// 链上当前格式的 Loop 条目，按链上顺序，连同条目之前的消息数。
     loop_records: Vec<(usize, LoopEntryContent)>,
     /// 条目记录的 run 所属 Loop。
     run_loops: BTreeMap<RunId, LoopId>,
@@ -1888,10 +1781,17 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         if let (Some(run_id), Some(loop_id)) = (entry.run_id, entry_loop) {
             restored.run_loops.insert(run_id, loop_id);
         }
-        if let Some(record) = entry.loop_record.clone().filter(|_| entry.is_loop_record()) {
-            restored
-                .loop_records
-                .push((restored.messages.len(), (record, entry.run_id)));
+        if entry.is_loop_record() {
+            // Records of a Chat with several Loops are an earlier format, dropped on load.
+            if let Some(record) = entry
+                .loop_record
+                .clone()
+                .filter(|_| entry.is_current_loop_record())
+            {
+                restored
+                    .loop_records
+                    .push((restored.messages.len(), (record, entry.run_id)));
+            }
             continue;
         }
         let continues_message = entry.continues_message
@@ -2391,9 +2291,18 @@ impl RestoredChain {
         snapshot.message_compactions = self.message_compactions.clone();
         snapshot.host_notes = self.host_notes.clone();
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
-        bookkeeping.run_loops = self.run_loops.clone();
         bookkeeping.plan_slug = self.plan_slug.clone();
-        self.replay_loops(snapshot, bookkeeping);
+        self.replay_loop(snapshot);
+        bookkeeping.run_loops = self
+            .run_loops
+            .keys()
+            .map(|run| (*run, snapshot.chat_loop.id))
+            .collect();
+    }
+
+    /// Whether the chain holds a record of the Loop in the current format.
+    fn records_loop(&self) -> bool {
+        !self.loop_records.is_empty()
     }
 
     /// 链上 Loop 条目携带的计划版本与进度。
@@ -2403,7 +2312,6 @@ impl RestoredChain {
             .filter(|(_, (record, _))| record.plan_version.is_some() || record.progress.is_some())
             .map(|(position, (record, _))| super::plan::PlanCheckpoint {
                 position: *position,
-                loop_id: record.loop_id,
                 plan_version: record.plan_version,
                 approval_pending: record.plan_approval_pending,
                 progress: record
@@ -2414,14 +2322,12 @@ impl RestoredChain {
             .collect()
     }
 
-    /// 沿对话链按顺序重放 Loop 条目：每条以完整状态覆盖同一 Loop，创建位置取第一条的位置。
-    /// 无法解析的条目跳过。
-    fn replay_loops(&self, snapshot: &mut ChatSnapshot, bookkeeping: &mut ChatBookkeeping) {
-        snapshot.loops.clear();
-        bookkeeping.loop_starts.clear();
-        snapshot.resume_triggers.clear();
+    /// 沿对话链按顺序重放 Loop 条目：每条以完整状态覆盖 Loop。无法解析的条目跳过；没有条目时
+    /// 保留新 Chat 的 Loop。
+    fn replay_loop(&self, snapshot: &mut ChatSnapshot) {
+        snapshot.trigger_awaits_resume = false;
         snapshot.failure_events.clear();
-        for (position, (record, run_id)) in &self.loop_records {
+        for (_, (record, run_id)) in &self.loop_records {
             if let (Some(run), Some(report)) = (run_id, &record.subagent_report) {
                 snapshot.subagent_reports.insert(*run, report.clone());
             }
@@ -2450,9 +2356,8 @@ impl RestoredChain {
                     snapshot.failure_events.push(event);
                 }
             }
-            let goal = LoopSnapshot {
+            snapshot.chat_loop = LoopSnapshot {
                 id: record.loop_id,
-                goal: record.goal.clone(),
                 state,
                 run_id: *run_id,
                 run_started_at: record.run_started_at,
@@ -2467,23 +2372,7 @@ impl RestoredChain {
                     .as_ref()
                     .and_then(serde_json::Value::as_u64),
             };
-            match snapshot
-                .loops
-                .iter_mut()
-                .find(|existing| existing.id == goal.id)
-            {
-                Some(existing) => *existing = goal,
-                None => {
-                    bookkeeping.loop_starts.insert(goal.id, *position);
-                    snapshot.loops.push(goal);
-                }
-            }
-            snapshot
-                .resume_triggers
-                .retain(|loop_id| *loop_id != record.loop_id);
-            if record.trigger_awaits_resume {
-                snapshot.resume_triggers.push(record.loop_id);
-            }
+            snapshot.trigger_awaits_resume = record.trigger_awaits_resume;
         }
     }
 }
@@ -2507,14 +2396,11 @@ fn recover_snapshot_for_resume(
             .collect::<HashSet<_>>()
     };
     let rebuilt = rebuilt_runs(&snapshot);
-    let rebuilt_loops = snapshot
-        .loops
-        .iter()
-        .filter(|goal| goal.run_id.is_some_and(|run| rebuilt.contains(&run)))
-        .map(|goal| goal.id)
-        .collect::<HashSet<_>>();
-    super::triggers::recover_loops_keeping(&mut snapshot, &rebuilt_loops, waits);
-    // A kept Loop whose deadline passed meanwhile expired: its Run is not rebuilt after all.
+    let keeps_run = snapshot
+        .chat_loop
+        .run_id
+        .is_some_and(|run| rebuilt.contains(&run));
+    super::triggers::recover_loop_keeping(&mut snapshot, keeps_run, waits);
     let rebuilt = rebuilt_runs(&snapshot);
     // A family call's effect is in the family's records: its result is what they say.
     let message_responses = bookkeeping.message_responses.clone();
@@ -2673,8 +2559,9 @@ impl Agent {
         let loaded = self.load_saved_transcript(snapshot.id).await?;
         let (restored, _) = restore_chain(&loaded.chain);
         let checkpoints = restored.plan_checkpoints();
+        let records_loop = restored.records_loop();
         recorder.adopt(snapshot.id, restored.links, restored.meta_messages, loaded);
-        recorder.adopt_restored_loops(snapshot, bookkeeping, &checkpoints);
+        recorder.adopt_restored_loop(snapshot, bookkeeping, &checkpoints, records_loop);
         recorder.adopt_lifecycle(snapshot.id, &bookkeeping.lifecycle);
         Ok(())
     }
@@ -3351,6 +3238,7 @@ impl Agent {
         Ok(RestoredConversation {
             snapshot: recovered.snapshot,
             bookkeeping,
+            records_loop: restored.records_loop(),
             links: restored.without(&removed).links,
             meta_messages: recovered.meta_messages,
             plan_checkpoints,
@@ -3379,6 +3267,7 @@ impl Agent {
         let RestoredConversation {
             snapshot,
             mut bookkeeping,
+            records_loop,
             links,
             meta_messages,
             plan_checkpoints,
@@ -3392,8 +3281,8 @@ impl Agent {
                 file_history_snapshots(&loaded),
             )
         });
-        let (recorded_loops, created_loops) =
-            recorded_loop_entries(&snapshot, &bookkeeping, &plan_checkpoints);
+        let recorded_loop =
+            recorded_loop_entry(&snapshot, &bookkeeping, &plan_checkpoints, records_loop);
         let recorded_lifecycle = bookkeeping.lifecycle.revision();
         bookkeeping.lifecycle.settle_after_load(
             &snapshot,
@@ -3413,8 +3302,7 @@ impl Agent {
                 parent_cursor,
                 load_warnings: loaded.warnings,
                 uuids: loaded.uuids,
-                recorded_loops,
-                created_loops,
+                recorded_loop,
                 recorded_lifecycle,
                 retained: loaded.retained,
             },
@@ -3458,6 +3346,7 @@ impl Agent {
         let RestoredConversation {
             mut snapshot,
             mut bookkeeping,
+            records_loop,
             links,
             meta_messages,
             plan_checkpoints,
@@ -3479,16 +3368,7 @@ impl Agent {
         }
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
-            for goal in &mut snapshot.loops {
-                if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                    && snapshot
-                        .plans
-                        .iter()
-                        .any(|plan| plan.loop_id == goal.id && plan.approval_pending)
-                {
-                    goal.recover_state(LoopState::WaitingPlan);
-                }
-            }
+            snapshot.chat_loop.recover_state(LoopState::WaitingPlan);
         }
         let mut file_history = folder.as_deref().map(|folder| {
             FileHistory::restore(
@@ -3500,14 +3380,17 @@ impl Agent {
         match target {
             RestoreTarget::Resume => {
                 recorder.adopt(chat_id, links, meta_messages, loaded);
-                recorder.adopt_restored_loops(&snapshot, &bookkeeping, &plan_checkpoints);
+                recorder.adopt_restored_loop(
+                    &snapshot,
+                    &bookkeeping,
+                    &plan_checkpoints,
+                    records_loop,
+                );
                 recorder.adopt_lifecycle(chat_id, &bookkeeping.lifecycle);
                 denial_window = recorder.load_denials(chat_id);
             }
             RestoreTarget::NewChat { .. } => {
-                for goal in &mut snapshot.loops {
-                    goal.event_sources.clear();
-                }
+                snapshot.chat_loop.event_sources.clear();
                 // 照 Claude Code `copyPlanForFork`：以新 chatId 恢复时使用新的 slug 并复制计划文件。
                 super::plan::copy_plans_to_new_slug(
                     &mut snapshot,
@@ -3625,6 +3508,8 @@ impl Agent {
 struct RestoredConversation {
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
+    /// Whether the chain holds a record of the Loop in the current format.
+    records_loop: bool,
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
     plan_checkpoints: Vec<super::plan::PlanCheckpoint>,
@@ -3652,8 +3537,7 @@ pub(super) struct StagedLog {
     parent_cursor: Option<Uuid>,
     load_warnings: Vec<String>,
     uuids: HashSet<Uuid>,
-    recorded_loops: HashMap<LoopId, LoopEntryContent>,
-    created_loops: HashSet<LoopId>,
+    recorded_loop: Option<LoopEntryContent>,
     recorded_lifecycle: u64,
     retained: super::transcript::RetainedFold,
 }

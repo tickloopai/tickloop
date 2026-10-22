@@ -17,8 +17,7 @@ use tick_protocol::InstanceRef;
 
 use super::{Agent, AgentError, Chat};
 use tickloop_agent_protocol::{
-    ChatId, LoopState, MonitorMembership, PendingInput, TICK_MANUAL_SOURCE,
-    TICK_SUBSCRIPTION_SOURCE,
+    ChatId, MonitorMembership, PendingInput, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE,
 };
 use uuid::Uuid;
 
@@ -299,14 +298,10 @@ impl Agent {
         let instance = InstanceRef::shell(task);
         let is_subscribed = chat
             .snapshot
-            .loops
+            .chat_loop
+            .trigger
             .iter()
-            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-            .flat_map(|goal| {
-                goal.trigger
-                    .iter()
-                    .flat_map(|trigger| &trigger.subscriptions)
-            })
+            .flat_map(|trigger| &trigger.subscriptions)
             .any(|subscription| subscription.instance == instance);
         is_subscribed
             || (!chat.snapshot.monitor.is_removed(&instance)

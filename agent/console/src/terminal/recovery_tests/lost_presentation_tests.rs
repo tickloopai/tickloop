@@ -174,13 +174,13 @@ fn lost_presentation_pty_fixture() {
                     .set_execution_mode(chat, ExecutionMode::Auto)
                     .await
                     .unwrap();
-                let receipt = agent.submit(chat, None, LOST_TASK.into()).await.unwrap();
+                let receipt = agent.submit(chat, LOST_TASK.into()).await.unwrap();
                 while model.calls.load(Ordering::SeqCst) == 0 {
                     tokio::task::yield_now().await;
                 }
                 if std::env::var(LOST_COMPLETED_VARIABLE).as_deref() == Ok("1") {
-                    while core.snapshot(chat).await.unwrap().loops[0].state
-                        != tickloop_agent_protocol::LoopState::Completed
+                    while core.snapshot(chat).await.unwrap().chat_loop.state
+                        != tickloop_agent_protocol::LoopState::Idle
                     {
                         tokio::task::yield_now().await;
                     }
@@ -189,7 +189,7 @@ fn lost_presentation_pty_fixture() {
                     std::fs::write(LOST_UNKNOWN_FLAG, "owned fixture").unwrap();
                     assert!(
                         agent
-                            .submit(chat, None, "Unconfirmed follow-up".into())
+                            .submit(chat, "Unconfirmed follow-up".into())
                             .await
                             .is_err()
                     );
@@ -216,7 +216,7 @@ fn lost_presentation_pty_fixture() {
                                 "run": receipt.run_id,
                                 "commands": proof_access.commands.load(Ordering::SeqCst),
                                 "model_calls": proof_model.calls.load(Ordering::SeqCst),
-                                "state": snapshot.loops[0].state,
+                                "state": snapshot.chat_loop.state,
                                 "unknown_input_at_start": unknown_input_at_start,
                                 "live_snapshots_during_daemon_failure": proof_access.live_snapshots_during_daemon_failure.load(Ordering::SeqCst),
                             }))
@@ -461,7 +461,7 @@ fn completed_cached_execution_keeps_its_known_outcome_and_exposes_connection_det
         frame.contains("The controlled investigation completed.") && frame.contains(LOST_MODEL)
     });
     let before = lost_presentation_proof(directory.path());
-    assert_eq!(before["state"], "Completed");
+    assert_eq!(before["state"], "Idle");
     std::fs::write(directory.path().join(LOST_FLAG), "lost").unwrap();
     let frame =
         wait_for_lost_presentation(&mut view, |frame| frame.contains("Lost · cached history"));
@@ -494,7 +494,7 @@ fn completed_cached_execution_keeps_its_known_outcome_and_exposes_connection_det
         "no run loss event was observed: {details}"
     );
     let after = lost_presentation_proof(directory.path());
-    assert_eq!(after["state"], "Completed");
+    assert_eq!(after["state"], "Idle");
     assert_eq!(after["commands"], before["commands"]);
     assert_eq!(after["model_calls"], before["model_calls"]);
 }
@@ -507,7 +507,7 @@ fn an_unknown_input_after_a_completed_run_still_has_an_unknown_outcome_on_loss()
         frame.contains("The controlled investigation completed.") && frame.contains(LOST_MODEL)
     });
     let before = lost_presentation_proof(directory.path());
-    assert_eq!(before["state"], "Completed");
+    assert_eq!(before["state"], "Idle");
     assert_eq!(before["unknown_input_at_start"], true);
     std::fs::write(directory.path().join(LOST_FLAG), "lost").unwrap();
     let frame =
@@ -520,7 +520,7 @@ fn an_unknown_input_after_a_completed_run_still_has_an_unknown_outcome_on_loss()
         "{frame}"
     );
     let after = lost_presentation_proof(directory.path());
-    assert_eq!(after["state"], "Completed");
+    assert_eq!(after["state"], "Idle");
     assert_eq!(after["commands"], before["commands"]);
     assert_eq!(after["model_calls"], before["model_calls"]);
 }

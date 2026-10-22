@@ -125,7 +125,6 @@ fn has_dedicated_projection(tool: &str) -> bool {
             | "TickRead"
             | "TickCall"
             | "TickManage"
-            | "StartGoal"
             | "ListSubagents"
             | "Subagent"
             | "SubagentHandback"
@@ -376,7 +375,6 @@ mod tests {
                 "TickManage",
                 json!({"action":"send_input","tick_instance_id":"herdr:1","text":"all code","keys":["Enter"]}),
             ),
-            ("StartGoal", json!({"goal":"keep watching"})),
             (
                 "Subagent",
                 json!({"task":"all instructions","run_in_background":true,"name":"worker"}),

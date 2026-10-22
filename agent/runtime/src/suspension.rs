@@ -60,25 +60,13 @@ pub(crate) fn rebuilt_waits(
     lifecycle
         .suspended_waits()
         .into_iter()
-        .filter(|wait| {
-            let loop_goes_on = snapshot.loops.iter().any(|goal| {
-                goal.id == wait.loop_id
-                    && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-            });
-            loop_goes_on
-                && match &wait.resume {
-                    ResumePoint::InBatch {
-                        assistant_message,
-                        call_id,
-                    } => tool_batch::locate_batch_call(
-                        snapshot,
-                        wait.run_id,
-                        *assistant_message,
-                        call_id,
-                    )
-                    .is_ok(),
-                    ResumePoint::BeforeModelRequest => true,
-                }
+        .filter(|wait| match &wait.resume {
+            ResumePoint::InBatch {
+                assistant_message,
+                call_id,
+            } => tool_batch::locate_batch_call(snapshot, wait.run_id, *assistant_message, call_id)
+                .is_ok(),
+            ResumePoint::BeforeModelRequest => true,
         })
         .collect()
 }
@@ -376,7 +364,7 @@ impl Agent {
         for (order, wait) in waits.into_iter().enumerate() {
             let receipt = Receipt {
                 chat_id,
-                loop_id: wait.loop_id,
+                loop_id: chat.snapshot.chat_loop.id,
                 run_id: wait.run_id,
             };
             let is_resolved = matches!(wait.state, WaitState::Resolved { .. });
@@ -386,14 +374,9 @@ impl Agent {
                     WaitKind::Subagent { .. } | WaitKind::Children { .. }
                 )
                 && chat.active.is_none();
-            let goal = chat
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == wait.loop_id)
-                .expect("a rebuilt wait's Loop goes on");
-            goal.run_id = Some(wait.run_id);
-            goal.recover_state(match wait.kind {
+            let chat_loop = &mut chat.snapshot.chat_loop;
+            chat_loop.run_id = Some(wait.run_id);
+            chat_loop.recover_state(match wait.kind {
                 WaitKind::Question { .. } => LoopState::WaitingQuestion,
                 _ => LoopState::Running,
             });
@@ -415,7 +398,9 @@ impl Agent {
                 );
             }
             chat.releases.insert(wait.run_id, release.clone());
-            chat.bookkeeping.run_loops.insert(wait.run_id, wait.loop_id);
+            chat.bookkeeping
+                .run_loops
+                .insert(wait.run_id, receipt.loop_id);
             chat.bookkeeping.lifecycle.reactivate(
                 wait.run_id,
                 wait.response_id,

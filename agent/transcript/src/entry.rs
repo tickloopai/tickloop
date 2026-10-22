@@ -362,14 +362,18 @@ impl ChainEntry {
     pub fn is_loop_record(&self) -> bool {
         self.message.role == Role::System && self.loop_record.is_some()
     }
+
+    /// A Loop entry in the current format, as opposed to one of the records a Chat with several
+    /// Loops wrote.
+    pub fn is_current_loop_record(&self) -> bool {
+        self.is_loop_record() && self.subtype.as_deref() == Some(LOOP_SUBTYPE)
+    }
 }
 
 pub const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
-/// Loop 条目的 subtype。恢复时每条都按 Loop id 以完整状态覆盖，subtype 只说明写入原因。
-pub const LOOP_CREATED_SUBTYPE: &str = "loop_created";
-pub const LOOP_STATE_SUBTYPE: &str = "loop_state";
-pub const LOOP_TRIGGER_SUBTYPE: &str = "loop_trigger";
-pub const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
+/// Loop 条目的 subtype。恢复时以链上最后一条的完整状态为准；其他 subtype 的 Loop 条目是一个 Chat
+/// 有多个 Loop 时的旧格式，恢复时丢弃。
+pub const LOOP_SUBTYPE: &str = "chat_loop";
 
 /// Loop 在对话链上的完整状态。状态与 Trigger 按原始 JSON 保存，本模块不解析其结构。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -380,11 +384,10 @@ pub struct LoopRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,
-    pub goal: String,
     pub state: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<serde_json::Value>,
-    /// Trigger 已解除武装、等待用户向该 Loop 提交输入时重新武装（重启恢复或 Branch 复制后）。
+    /// Trigger 已解除武装、等待 Chat 继续时重新武装（`/stop`、重启恢复或 Branch 复制后）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trigger_awaits_resume: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -751,8 +754,6 @@ pub enum InputOp {
     Feedback,
     /// A message from another Agent of the family, such as a completion notification.
     AgentMessage,
-    /// A goal the model registered with StartGoal.
-    Goal,
 }
 
 impl InputOp {
@@ -820,9 +821,9 @@ pub enum SettledOutcome {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DiscardReason {
-    /// Its Loop ended before the input started.
-    LoopEnded,
-    /// Its Loop was stopped while it waited.
+    /// Its Trigger source ended or was replaced before the input started.
+    SourceEnded,
+    /// Its Agent was stopped while it waited.
     Stopped,
 }
 

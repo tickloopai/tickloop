@@ -97,7 +97,7 @@ async fn a_compound_shell_command_waits_for_approval_and_reports_real_output_and
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Run the requested command".into())
+        .submit(chat, "Run the requested command".into())
         .await
         .unwrap();
     let mut result = None;
@@ -153,7 +153,7 @@ async fn a_read_only_command_uses_each_chats_own_directory_without_approval() {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "What is this chat's directory?".into())
+            .submit(chat, "What is this chat's directory?".into())
             .await
             .unwrap();
         loop {
@@ -193,8 +193,8 @@ async fn stopping_a_goal_collects_the_real_shell_cancellation_receipt() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Start the long command".into())
+    agent
+        .submit(chat, "Start the long command".into())
         .await
         .unwrap();
     loop {
@@ -224,7 +224,7 @@ async fn stopping_a_goal_collects_the_real_shell_cancellation_receipt() {
     })
     .await
     .unwrap();
-    let operations = agent.stop(chat, receipt.loop_id).await.unwrap();
+    let operations = agent.stop(chat).await.unwrap();
     assert_eq!(operations.len(), 1);
     loop {
         if let EventKind::ToolCompleted { result, .. } =
@@ -267,7 +267,7 @@ async fn large_shell_output_has_a_bounded_preview_and_complete_output_file() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Produce the output".into())
+        .submit(chat, "Produce the output".into())
         .await
         .unwrap();
     loop {
@@ -317,7 +317,7 @@ async fn a_foreground_command_moves_to_background_without_starting_a_second_proc
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Run the long command".into())
+        .submit(chat, "Run the long command".into())
         .await
         .unwrap();
     loop {
@@ -508,11 +508,7 @@ async fn the_agent_stops_its_own_background_command_by_task_id_or_shell_id() {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(
-                chat,
-                None,
-                "Start a background command, then stop it".into(),
-            )
+            .submit(chat, "Start a background command, then stop it".into())
             .await
             .unwrap();
         let results = run_to_completion(&agent, chat, &mut events).await;
@@ -580,11 +576,7 @@ async fn task_stop_runs_without_approval_even_where_other_tools_ask() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Start a background command, then stop it".into(),
-        )
+        .submit(chat, "Start a background command, then stop it".into())
         .await
         .unwrap();
     let mut asked = Vec::new();
@@ -625,7 +617,7 @@ async fn task_stop_runs_without_approval_even_where_other_tools_ask() {
 }
 
 #[tokio::test]
-async fn stopping_a_goal_after_its_turn_completed_still_stops_its_background_process() {
+async fn stopping_the_chat_leaves_its_background_process_running() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
         config(),
@@ -636,8 +628,8 @@ async fn stopping_a_goal_after_its_turn_completed_still_stops_its_background_pro
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Run the long command in the background".into())
+    agent
+        .submit(chat, "Run the long command in the background".into())
         .await
         .unwrap();
     loop {
@@ -664,17 +656,24 @@ async fn stopping_a_goal_after_its_turn_completed_still_stops_its_background_pro
         .next()
         .unwrap();
     assert!(running.exit_code.is_none() && running.signal.is_none());
-    agent.stop(chat, receipt.loop_id).await.unwrap();
-    let stopped = agent
+    agent.stop(chat).await.unwrap();
+    let kept = agent
         .commands(chat)
         .await
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
+    assert_eq!(
+        kept.state,
+        tickloop_agent_protocol::CommandState::Background
+    );
+    assert_eq!(unsafe { libc::kill(running.pid.unwrap() as i32, 0) }, 0);
+    let stopped = agent
+        .stop_command(chat, running.operation_id)
+        .await
+        .unwrap();
     assert_eq!(stopped.reason.as_deref(), Some("cancelled"));
-    assert!(stopped.exit_code.is_some() || stopped.signal.is_some());
-    assert_eq!(unsafe { libc::kill(running.pid.unwrap() as i32, 0) }, -1);
     agent.shutdown().await;
 }
 
@@ -691,11 +690,7 @@ async fn a_shell_that_leaves_its_process_group_running_has_an_unresolved_result(
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Launch the explicitly requested shell command".into(),
-        )
+        .submit(chat, "Launch the explicitly requested shell command".into())
         .await
         .unwrap();
     let output = loop {
@@ -734,8 +729,8 @@ async fn stopping_a_shell_also_terminates_descendants_that_ignore_sigterm() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Run the test command".into())
+    agent
+        .submit(chat, "Run the test command".into())
         .await
         .unwrap();
     loop {
@@ -760,7 +755,7 @@ async fn stopping_a_shell_also_terminates_descendants_that_ignore_sigterm() {
     })
     .await
     .unwrap();
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     agent.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     assert!(
@@ -890,7 +885,7 @@ async fn bash_runs_commands_with_bash_or_zsh() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Which shell runs commands?".into())
+        .submit(chat, "Which shell runs commands?".into())
         .await
         .unwrap();
     let results = run_to_completion(&agent, chat, &mut events).await;
@@ -976,10 +971,7 @@ async fn task_stop_rejects_unknown_tasks_before_asking_for_permission() {
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Stop the task".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Stop the task".into()).await.unwrap();
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
             .await
@@ -1015,7 +1007,7 @@ async fn task_stop_rejects_unknown_tasks_before_asking_for_permission() {
 }
 
 #[tokio::test]
-async fn task_stop_leaves_another_goals_command_to_the_user() {
+async fn task_stop_stops_a_command_an_earlier_turn_started() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
         config(),
@@ -1027,7 +1019,7 @@ async fn task_stop_leaves_another_goals_command_to_the_user() {
                     name: "Bash".into(),
                     input: json!({"command":"sleep 30","run_in_background":true}),
                 }],
-                ("Stop the other goal's server", 1) => vec![Content::ToolUse {
+                ("Stop the server", 1) => vec![Content::ToolUse {
                     id: "stop".into(),
                     name: "TaskStop".into(),
                     input: json!({"task_id": task_id(&results[0])}),
@@ -1041,30 +1033,17 @@ async fn task_stop_leaves_another_goals_command_to_the_user() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Start the server".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Start the server".into()).await.unwrap();
     run_to_completion(&agent, chat, &mut events).await;
-    agent
-        .submit(chat, None, "Stop the other goal's server".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Stop the server".into()).await.unwrap();
     let results = run_to_completion(&agent, chat, &mut events).await;
     let command = agent.commands(chat).await.unwrap().remove(0);
     assert_eq!(results.len(), 1);
-    assert!(results[0].1.is_error);
-    assert_eq!(
-        results[0].1.content,
-        format!(
-            "Task {} does not belong to this goal; only the user can stop it",
-            command.operation_id
-        )
-    );
-    assert_eq!(
+    assert!(!results[0].1.is_error, "{}", results[0].1.content);
+    assert!(!matches!(
         command.state,
-        tickloop_agent_protocol::CommandState::Background
-    );
-    agent.stop(chat, first.loop_id).await.unwrap();
+        tickloop_agent_protocol::CommandState::Running
+            | tickloop_agent_protocol::CommandState::Background
+    ));
     agent.shutdown().await;
 }

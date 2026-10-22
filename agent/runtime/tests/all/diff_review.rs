@@ -107,7 +107,7 @@ async fn permission_and_operation_share_the_immutable_prepared_review() {
     require_file_change_approval(&agent, chat, "Edit").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Correct the delivery day".into())
+        .submit(chat, "Correct the delivery day".into())
         .await
         .unwrap();
 
@@ -208,7 +208,7 @@ async fn change_journal_contains_only_successful_file_operations() {
     require_file_change_approval(&agent, chat, "Edit").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read and update both files".into())
+        .submit(chat, "Read and update both files".into())
         .await
         .unwrap();
 
@@ -285,7 +285,7 @@ async fn saved_reviews_report_missing_or_corrupt_sidecars_and_are_not_listed_aft
     require_file_change_approval(&agent, chat, "Write").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create the report".into())
+        .submit(chat, "Create the report".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -352,7 +352,7 @@ async fn missing_review_artifact_cannot_be_approved_but_can_still_be_denied() {
     require_file_change_approval(&agent, chat, "Write").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Create a reviewed file".into())
+        .submit(chat, "Create a reviewed file".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;

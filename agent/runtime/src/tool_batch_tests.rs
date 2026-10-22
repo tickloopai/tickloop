@@ -21,8 +21,6 @@ use tickloop_agent_transcript::{ModelVisibleResult, ResumePoint};
 const PROMPT: &str = "Prepare the report.";
 const FOLLOW_UP: &str = "Also keep it brief.";
 const DONE: &str = "Report ready.";
-const OTHER_GOAL: &str = "Check the calendar.";
-const OTHER_GOAL_DONE: &str = "The calendar is clear.";
 
 fn read(id: &str, file: &str) -> Content {
     Content::ToolUse {
@@ -156,29 +154,13 @@ fn without_run_identities(text: String) -> String {
 struct WhileWaiting {
     /// A message for the waiting Run's Loop is queued.
     follow_up: bool,
-    /// Another goal runs to completion in the same Chat.
-    other_goal: bool,
 }
 
 impl WhileWaiting {
-    async fn happen(self, agent: &Agent, events: &mut Receiver<Event>, receipt: &Receipt) {
-        if self.other_goal {
-            let other = agent
-                .submit(receipt.chat_id, None, OTHER_GOAL.into())
-                .await
-                .unwrap();
-            loop {
-                let event = next_event(events).await;
-                match event.kind {
-                    EventKind::Completed { .. } if event.run_id == other.run_id => break,
-                    EventKind::Failed(error) => panic!("{error}"),
-                    _ => {}
-                }
-            }
-        }
+    async fn happen(self, agent: &Agent, receipt: &Receipt) {
         if self.follow_up {
             agent
-                .submit(receipt.chat_id, Some(receipt.loop_id), FOLLOW_UP.into())
+                .submit(receipt.chat_id, FOLLOW_UP.into())
                 .await
                 .unwrap();
         }
@@ -199,7 +181,7 @@ async fn answer_until_completed(
         match event.kind {
             EventKind::QuestionAsked { request } => {
                 if let Some(while_waiting) = while_waiting.take() {
-                    while_waiting.happen(agent, events, receipt).await;
+                    while_waiting.happen(agent, receipt).await;
                 }
                 agent
                     .answer_question(receipt.chat_id, request.id, answer(&request))
@@ -224,11 +206,11 @@ async fn in_process(
     batch: Vec<Content>,
     while_waiting: WhileWaiting,
 ) -> Finished {
-    let model = Arc::new(ScriptedModel::new(script(batch, while_waiting)));
+    let model = Arc::new(ScriptedModel::new(script(batch)));
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, PROMPT.into()).await.unwrap();
+    let receipt = agent.submit(chat, PROMPT.into()).await.unwrap();
     let completed_calls =
         answer_until_completed(&agent, &mut events, &receipt, Some(while_waiting)).await;
     let finished = Finished::of(&agent, &receipt, &model, completed_calls).await;
@@ -259,7 +241,7 @@ impl OwnedRun {
             .get_mut(&chat)
             .unwrap()
             .active = Some(CancellationToken::new());
-        let receipt = agent.submit(chat, None, PROMPT.into()).await.unwrap();
+        let receipt = agent.submit(chat, PROMPT.into()).await.unwrap();
         agent
             .inner
             .chats
@@ -318,12 +300,7 @@ impl OwnedRun {
         chat.snapshot
             .questions
             .retain(|request| request.id != question.id);
-        let goal = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == self.receipt.loop_id)
-            .unwrap();
+        let goal = &mut chat.snapshot.chat_loop;
         assert_eq!(goal.state, LoopState::WaitingQuestion);
         goal.state = LoopState::Running;
         chat.active = Some(cancel.clone());
@@ -401,13 +378,8 @@ fn answered(text: String) -> ModelVisibleResult {
     }
 }
 
-fn script(batch: Vec<Content>, while_waiting: WhileWaiting) -> Vec<Vec<Content>> {
-    let mut script = vec![batch];
-    if while_waiting.other_goal {
-        script.push(text(OTHER_GOAL_DONE));
-    }
-    script.push(text(DONE));
-    script
+fn script(batch: Vec<Content>) -> Vec<Vec<Content>> {
+    vec![batch, text(DONE)]
 }
 
 /// Loses the Run at its first question, then re-enters the batch at that call with the answer
@@ -418,11 +390,9 @@ async fn reentered(
     while_waiting: WhileWaiting,
     reference: &Finished,
 ) -> Finished {
-    let mut run = OwnedRun::start(directory, script(batch, while_waiting)).await;
+    let mut run = OwnedRun::start(directory, script(batch)).await;
     let question = run.lose_task_at_question().await;
-    while_waiting
-        .happen(&run.agent, &mut run.events, &run.receipt)
-        .await;
+    while_waiting.happen(&run.agent, &run.receipt).await;
     let cancel = run.take_slot(&question).await;
     let at = ResumePoint::InBatch {
         assistant_message: run.batch_message(&question.call_id).await,
@@ -501,10 +471,7 @@ async fn a_later_question_in_the_reentered_batch_waits_in_process() {
 async fn a_message_queued_to_the_waiting_loop_joins_once_at_the_end_of_the_batch() {
     let (reference, resumed) = assert_reentry_matches_in_process(
         vec![ask("q"), read("r", "b.txt")],
-        WhileWaiting {
-            follow_up: true,
-            ..WhileWaiting::default()
-        },
+        WhileWaiting { follow_up: true },
     )
     .await;
     assert_eq!(reference.mentions(FOLLOW_UP), 1);
@@ -515,34 +482,6 @@ async fn a_message_queued_to_the_waiting_loop_joins_once_at_the_end_of_the_batch
         FOLLOW_UP,
         "the follow-up follows the batch's results in the next request"
     );
-}
-
-#[tokio::test]
-async fn results_after_another_goal_ran_in_the_wait_start_a_new_message() {
-    let (_, resumed) = assert_reentry_matches_in_process(
-        vec![read("r1", "a.txt"), ask("q"), read("r2", "b.txt")],
-        WhileWaiting {
-            other_goal: true,
-            follow_up: true,
-        },
-    )
-    .await;
-    assert_eq!(resumed.mentions(OTHER_GOAL_DONE), 1);
-    let messages = resumed.messages.as_array().unwrap();
-    let results = |message: &Value| {
-        message["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|content| content["tool_use_id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>()
-    };
-    let result_messages = messages
-        .iter()
-        .map(results)
-        .filter(|calls| !calls.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(result_messages, [vec!["r1"], vec!["q", "r2"]]);
 }
 
 #[tokio::test]
@@ -581,7 +520,7 @@ async fn a_reentered_run_reusing_a_call_id_fails_without_invalidating_the_chat()
     projection::history_calls(&snapshot).expect("the conversation stays valid");
     let next = run
         .agent
-        .submit(run.receipt.chat_id, None, "Try again.".into())
+        .submit(run.receipt.chat_id, "Try again.".into())
         .await
         .unwrap();
     loop {
@@ -618,7 +557,7 @@ async fn a_reentered_declined_question_ends_the_run_as_in_process() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, PROMPT.into()).await.unwrap();
+    let receipt = agent.submit(chat, PROMPT.into()).await.unwrap();
     loop {
         if let EventKind::QuestionAsked { request } = next_event(&mut events).await.kind {
             agent.decline_question(chat, request.id).await.unwrap();
@@ -659,7 +598,12 @@ async fn a_reentered_declined_question_ends_the_run_as_in_process() {
     assert_eq!(finished.messages, reference.messages);
     assert_eq!(finished.requests, reference.requests);
     assert_eq!(
-        run.agent.snapshot(run.receipt.chat_id).await.unwrap().loops[0].state,
+        run.agent
+            .snapshot(run.receipt.chat_id)
+            .await
+            .unwrap()
+            .chat_loop
+            .state,
         LoopState::Interrupted
     );
     run.agent.shutdown().await;

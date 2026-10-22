@@ -80,7 +80,6 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
         (200, chat_reply(None, "DISABLED-MEMBER-DONE")),
         (200, chat_reply(None, "DISABLED-ROOT-DONE")),
         (200, chat_reply(None, "REENABLED-ROOT-DONE")),
-        (200, chat_reply(None, "NEW-GOAL-ENABLED")),
     ])
     .await;
     fixture.set_chat_model(&base_url);
@@ -225,25 +224,6 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
     assert_task_tools(&request, true);
     pty.wait_for_editor("re-enabled work leaves editor ready", Some(""))
         .await;
-    pty.send(b"/loops new\r");
-    pty.wait_for("new goal draft selected", |frame| {
-        frame.contains("The next input will start a new goal")
-    })
-    .await;
-    pty.wait_for_editor("new goal draft is editable", Some(""))
-        .await;
-    pty.send(b"Use the saved global Task tools setting.\r");
-    pty.wait_for("new goal retains the enabled global setting", |frame| {
-        frame.contains("NEW-GOAL-ENABLED")
-    })
-    .await;
-    let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .1;
-    assert_task_tools(&request, true);
-    assert_eq!(snapshot(&client, root).await.conversation.loops.len(), 2);
     pty.close().await;
 }
 

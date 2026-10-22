@@ -315,7 +315,6 @@ fn prompt(text: &str) -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -902,10 +901,9 @@ async fn a_child_stream_past_the_ceiling_reports_once_to_its_waiting_parent_afte
     );
 }
 
-/// The delivery of an @tickloop request for the Loop `target`.
-fn deliver(target: Uuid) -> TurnRequest {
+/// The delivery of an @tickloop request.
+fn deliver() -> TurnRequest {
     TurnRequest::deliver(
-        target,
         ExternalDelivery::from_claim(
             "https://tickloop.ai/artifact",
             "owner",
@@ -1024,7 +1022,7 @@ async fn a_crash_after_every_task_was_acknowledged_is_taken_over_by_the_sweep() 
         cloud.task_state(cloud.root, turn_task) == TaskState::Acknowledged
     })
     .await;
-    let request = deliver(target);
+    let request = deliver();
     let delivery_task = cloud
         .chats
         .enqueue(

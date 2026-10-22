@@ -123,7 +123,7 @@ fn read(path: &std::path::Path, call_id: &str) -> Vec<tickloop_agent_protocol::C
 }
 
 #[tokio::test]
-async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
+async fn session_allowance_follows_the_loop_into_the_child_chat() {
     let workspace = tempfile::tempdir().unwrap();
     let changed_workspace = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
@@ -147,7 +147,7 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
     let source_chat_id = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "read the external source".into())
+        .submit(source_chat_id, "read the external source".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, source.run_id).await;
@@ -176,17 +176,12 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("permission child".into()),
         })
         .await
         .unwrap();
     let continuation = agent
-        .submit(
-            child.child_chat_id,
-            None,
-            "continue the selected session".into(),
-        )
+        .submit(child.child_chat_id, "continue the selected session".into())
         .await
         .unwrap();
     completed_without_permission(&mut events, continuation.run_id).await;
@@ -194,7 +189,6 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
     let changed_input = agent
         .submit(
             child.child_chat_id,
-            Some(continuation.loop_id),
             "read with a different normalized input".into(),
         )
         .await
@@ -207,17 +201,16 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
     wait_for_denial_interruption(&mut events, changed_input.run_id).await;
 
     let independent = agent
-        .submit(child.child_chat_id, None, "start a separate loop".into())
+        .submit(child.child_chat_id, "read again later".into())
         .await
         .unwrap();
-    assert_ne!(independent.loop_id, continuation.loop_id);
+    assert_eq!(independent.loop_id, continuation.loop_id);
     completed_without_permission(&mut events, independent.run_id).await;
 
     let changed_directory_child = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("changed directory child".into()),
         })
         .await
@@ -233,7 +226,6 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
     let changed_directory = agent
         .submit(
             changed_directory_child.child_chat_id,
-            None,
             "read after changing workspace roots".into(),
         )
         .await
@@ -248,7 +240,7 @@ async fn session_allowance_follows_each_new_loop_in_the_child_chat() {
 }
 
 #[tokio::test]
-async fn missing_source_selection_and_restart_do_not_recreate_session_authority() {
+async fn a_restart_does_not_recreate_session_authority() {
     let workspace = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     let source_path = external.path().join("source.txt");
@@ -260,15 +252,13 @@ async fn missing_source_selection_and_restart_do_not_recreate_session_authority(
         Arc::new(ScriptedModel::new(vec![
             read(&source_path, "source-read"),
             text("source complete"),
-            read(&source_path, "unselected-read"),
-            text("unselected denied"),
         ])),
     )
     .unwrap();
     let source_chat_id = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "read the external source".into())
+        .submit(source_chat_id, "read the external source".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, source.run_id).await;
@@ -283,35 +273,10 @@ async fn missing_source_selection_and_restart_do_not_recreate_session_authority(
         .unwrap();
     wait_for_completion(&mut events, source.run_id).await;
 
-    let unselected = agent
-        .branch_chat(BranchRequest {
-            request_id: Uuid::new_v4(),
-            source_chat_id,
-            source_loop_id: None,
-            name: Some("unselected".into()),
-        })
-        .await
-        .unwrap();
-    let unselected_run = agent
-        .submit(
-            unselected.child_chat_id,
-            None,
-            "try without a selected loop".into(),
-        )
-        .await
-        .unwrap();
-    let permission = permission_for_run(&mut events, unselected_run.run_id).await;
-    agent
-        .answer_permission(unselected.child_chat_id, permission.id, false)
-        .await
-        .unwrap();
-    wait_for_denial_interruption(&mut events, unselected_run.run_id).await;
-
     let selected = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("restart child".into()),
         })
         .await
@@ -333,7 +298,6 @@ async fn missing_source_selection_and_restart_do_not_recreate_session_authority(
     let restarted = reopened
         .submit(
             selected.child_chat_id,
-            None,
             "continue after process restart".into(),
         )
         .await
@@ -364,7 +328,7 @@ async fn once_answer_does_not_follow_a_selected_loop_into_its_child() {
     let source_chat_id = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "read once".into())
+        .submit(source_chat_id, "read once".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, source.run_id).await;
@@ -378,13 +342,12 @@ async fn once_answer_does_not_follow_a_selected_loop_into_its_child() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("once child".into()),
         })
         .await
         .unwrap();
     let child_run = agent
-        .submit(child.child_chat_id, None, "read again in child".into())
+        .submit(child.child_chat_id, "read again in child".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, child_run.run_id).await;
@@ -409,7 +372,7 @@ async fn pending_permission_cannot_be_branched_as_session_authority() {
     let source_chat_id = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "wait for permission".into())
+        .submit(source_chat_id, "wait for permission".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, source.run_id).await;
@@ -419,7 +382,6 @@ async fn pending_permission_cannot_be_branched_as_session_authority() {
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id,
-                source_loop_id: Some(source.loop_id),
                 name: Some("pending child".into()),
             })
             .await,
@@ -453,7 +415,7 @@ async fn session_deny_is_process_only_and_follows_the_selected_owner() {
     let source_chat_id = agent.create_chat(workspace.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent
-        .submit(source_chat_id, None, "request denied read".into())
+        .submit(source_chat_id, "request denied read".into())
         .await
         .unwrap();
     let permission = permission_for_run(&mut events, source.run_id).await;
@@ -478,11 +440,7 @@ async fn session_deny_is_process_only_and_follows_the_selected_owner() {
     );
 
     let same_owner = agent
-        .submit(
-            source_chat_id,
-            Some(source.loop_id),
-            "repeat the denied read".into(),
-        )
+        .submit(source_chat_id, "repeat the denied read".into())
         .await
         .unwrap();
     denied_without_permission(&mut events, same_owner.run_id).await;
@@ -491,17 +449,12 @@ async fn session_deny_is_process_only_and_follows_the_selected_owner() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id,
-            source_loop_id: Some(source.loop_id),
             name: Some("denied child".into()),
         })
         .await
         .unwrap();
     let child_run = agent
-        .submit(
-            child.child_chat_id,
-            None,
-            "repeat denied read in child".into(),
-        )
+        .submit(child.child_chat_id, "repeat denied read in child".into())
         .await
         .unwrap();
     denied_without_permission(&mut events, child_run.run_id).await;

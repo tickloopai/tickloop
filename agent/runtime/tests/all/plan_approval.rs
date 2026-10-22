@@ -86,22 +86,16 @@ async fn every_approval_mode_returns_the_reviewed_plan_and_continues_the_same_ru
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "Plan the report".into())
-            .await
-            .unwrap();
+        let receipt = agent.submit(chat, "Plan the report".into()).await.unwrap();
         let (owner, approval) = request(&mut events).await;
         assert_eq!(owner, chat);
         assert_eq!(approval.input["plan_version"], 1);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
-        agent
-            .approve_plan(chat, receipt.loop_id, 1, mode)
-            .await
-            .unwrap();
+        agent.approve_plan(chat, 1, mode).await.unwrap();
         completed(&mut events, &receipt).await;
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(snapshot.policy.mode, mode);
-        assert_eq!(snapshot.loops[0].run_id, Some(receipt.run_id));
+        assert_eq!(snapshot.chat_loop.run_id, Some(receipt.run_id));
         assert_eq!(snapshot.plans[0].approved_execution_mode, Some(mode));
         assert!(!snapshot.plans[0].approval_pending);
         let requests = model.requests.lock().unwrap().clone();
@@ -131,15 +125,10 @@ async fn keep_planning_returns_feedback_as_a_tool_result_and_requires_a_new_deci
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
     agent
-        .decline_plan(
-            chat,
-            receipt.loop_id,
-            1,
-            Some("Include regression tests.".into()),
-        )
+        .decline_plan(chat, 1, Some("Include regression tests.".into()))
         .await
         .unwrap();
     let (_, revised) = request(&mut events).await;
@@ -153,12 +142,12 @@ async fn keep_planning_returns_feedback_as_a_tool_result_and_requires_a_new_deci
     assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult { tool_use_id, content, is_error: true } if tool_use_id == "first" && content.text().contains("Include regression tests."))));
     assert!(
         agent
-            .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::Auto)
+            .approve_plan(chat, 1, ExecutionMode::Auto)
             .await
             .is_err()
     );
     agent
-        .approve_plan(chat, receipt.loop_id, 2, ExecutionMode::AcceptEdits)
+        .approve_plan(chat, 2, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     completed(&mut events, &receipt).await;
@@ -179,11 +168,11 @@ async fn stale_versions_disk_edits_and_generic_allow_cannot_approve_a_plan() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
     let (_, approval) = request(&mut events).await;
     assert!(
         agent
-            .approve_plan(chat, receipt.loop_id, 2, ExecutionMode::Auto)
+            .approve_plan(chat, 2, ExecutionMode::Auto)
             .await
             .is_err()
     );
@@ -197,7 +186,7 @@ async fn stale_versions_disk_edits_and_generic_allow_cannot_approve_a_plan() {
     std::fs::write(path, "Unreviewed disk edit.").unwrap();
     assert!(
         agent
-            .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::Auto)
+            .approve_plan(chat, 1, ExecutionMode::Auto)
             .await
             .unwrap_err()
             .to_string()
@@ -208,10 +197,7 @@ async fn stale_versions_disk_edits_and_generic_allow_cannot_approve_a_plan() {
         ExecutionMode::Plan
     );
     assert_eq!(model.requests.lock().unwrap().len(), 1);
-    agent
-        .decline_plan(chat, receipt.loop_id, 1, None)
-        .await
-        .unwrap();
+    agent.decline_plan(chat, 1, None).await.unwrap();
     loop {
         if matches!(next_event(&mut events).await.kind, EventKind::Interrupted) {
             break;
@@ -241,18 +227,12 @@ async fn approval_decisions_are_isolated_by_agent() {
             .unwrap();
     }
     let mut events = agent.subscribe();
-    let a = agent.submit(first, None, "Plan A".into()).await.unwrap();
+    let a = agent.submit(first, "Plan A".into()).await.unwrap();
     request(&mut events).await;
-    let b = agent.submit(second, None, "Plan B".into()).await.unwrap();
+    let b = agent.submit(second, "Plan B".into()).await.unwrap();
     request(&mut events).await;
-    assert!(
-        agent
-            .approve_plan(second, a.loop_id, 1, ExecutionMode::Auto)
-            .await
-            .is_err()
-    );
     agent
-        .approve_plan(first, a.loop_id, 1, ExecutionMode::Auto)
+        .approve_plan(first, 1, ExecutionMode::Auto)
         .await
         .unwrap();
     completed(&mut events, &a).await;
@@ -262,7 +242,7 @@ async fn approval_decisions_are_isolated_by_agent() {
     );
     assert!(agent.snapshot(second).await.unwrap().plans[0].approval_pending);
     agent
-        .approve_plan(second, b.loop_id, 1, ExecutionMode::AcceptEdits)
+        .approve_plan(second, 1, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     completed(&mut events, &b).await;
@@ -284,7 +264,7 @@ async fn restart_restores_a_pending_approval_without_resuming_execution() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
@@ -298,15 +278,12 @@ async fn restart_restores_a_pending_approval_without_resuming_execution() {
     assert_eq!(snapshot.policy.mode, ExecutionMode::Plan);
     assert!(model.requests.lock().unwrap().is_empty());
     let approval = restarted
-        .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::AcceptEdits)
+        .approve_plan(chat, 1, ExecutionMode::AcceptEdits)
         .await
         .unwrap()
         .unwrap();
     let mut events = restarted.subscribe();
-    let resumed = restarted
-        .submit(chat, Some(receipt.loop_id), approval)
-        .await
-        .unwrap();
+    let resumed = restarted.submit(chat, approval).await.unwrap();
     completed(&mut events, &resumed).await;
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     restarted.shutdown().await;
@@ -327,7 +304,7 @@ async fn recovery_normalization_survives_two_idle_restarts_without_revising_agai
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let run = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    let run = agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
     let path = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
     agent.shutdown().await;
@@ -367,7 +344,7 @@ async fn processed_plans_reject_stale_cancel_feedback_and_approval_after_restart
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let run = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
     agent.shutdown().await;
     let restored = Agent::open_embedded(
@@ -378,15 +355,12 @@ async fn processed_plans_reject_stale_cancel_feedback_and_approval_after_restart
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
     restored
-        .approve_plan(chat, run.loop_id, 1, ExecutionMode::AcceptEdits)
+        .approve_plan(chat, 1, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     for feedback in [None, Some("Stale feedback".into())] {
         assert!(
-            restored
-                .decline_plan(chat, run.loop_id, 1, feedback)
-                .await
-                .is_err(),
+            restored.decline_plan(chat, 1, feedback).await.is_err(),
             "a processed approval must not be re-pended"
         );
     }
@@ -403,15 +377,10 @@ async fn processed_plans_reject_stale_cancel_feedback_and_approval_after_restart
     )
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
+    assert!(restored.decline_plan(chat, 1, None).await.is_err());
     assert!(
         restored
-            .decline_plan(chat, run.loop_id, 1, None)
-            .await
-            .is_err()
-    );
-    assert!(
-        restored
-            .approve_plan(chat, run.loop_id, 1, ExecutionMode::Auto)
+            .approve_plan(chat, 1, ExecutionMode::Auto)
             .await
             .is_err()
     );
@@ -439,7 +408,7 @@ async fn a_mode_change_during_a_run_applies_from_the_next_model_request() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Prepare the report".into())
+        .submit(chat, "Prepare the report".into())
         .await
         .unwrap();
     for mode in [ExecutionMode::Plan, ExecutionMode::Auto] {
@@ -482,12 +451,9 @@ async fn closing_a_plan_review_keeps_the_plan_pending_and_the_chosen_mode() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
-    agent
-        .decline_plan(chat, receipt.loop_id, 1, None)
-        .await
-        .unwrap();
+    agent.decline_plan(chat, 1, None).await.unwrap();
     loop {
         if matches!(next_event(&mut events).await.kind, EventKind::Interrupted) {
             break;
@@ -497,22 +463,16 @@ async fn closing_a_plan_review_keeps_the_plan_pending_and_the_chosen_mode() {
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    agent
-        .decline_plan(chat, receipt.loop_id, 1, None)
-        .await
-        .unwrap();
+    agent.decline_plan(chat, 1, None).await.unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.policy.mode, ExecutionMode::FullAccess);
     assert!(snapshot.plans[0].approval_pending);
     let continuation = agent
-        .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::FullAccess)
+        .approve_plan(chat, 1, ExecutionMode::FullAccess)
         .await
         .unwrap()
         .expect("the ended Run continues explicitly");
-    let resumed = agent
-        .submit(chat, Some(receipt.loop_id), continuation)
-        .await
-        .unwrap();
+    let resumed = agent.submit(chat, continuation).await.unwrap();
     completed(&mut events, &resumed).await;
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
@@ -544,7 +504,7 @@ async fn a_delegated_child_gets_no_plan_mode_tools() {
         .unwrap();
     let mut events = agent.subscribe();
     let parent_run = agent
-        .submit(parent, None, "Delegate the check".into())
+        .submit(parent, "Delegate the check".into())
         .await
         .unwrap();
     completed(&mut events, &parent_run).await;
@@ -569,7 +529,7 @@ async fn a_delegated_child_gets_no_plan_mode_tools() {
     assert_eq!(child.policy.mode, ExecutionMode::FullAccess);
     assert!(child.plans.is_empty());
     let error = agent
-        .approve_plan(child.id, child.loops[0].id, 1, ExecutionMode::AcceptEdits)
+        .approve_plan(child.id, 1, ExecutionMode::AcceptEdits)
         .await
         .expect_err("an approval naming the child cannot replace its delegated mode");
     assert!(
@@ -604,7 +564,7 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Plan with a child".into())
+        .submit(parent, "Plan with a child".into())
         .await
         .unwrap();
     let mut child = None;
@@ -626,12 +586,7 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
     let child = agent.snapshot(child.unwrap()).await.unwrap();
     assert_eq!(child.policy.mode, ExecutionMode::Plan);
     assert!(child.plans.is_empty());
-    assert!(
-        child
-            .loops
-            .iter()
-            .all(|goal| goal.state == LoopState::Completed)
-    );
+    assert_eq!(child.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3);
     assert!(system_prompt(&requests[0]).contains(
@@ -673,12 +628,9 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
     request(&mut events).await;
-    agent
-        .decline_plan(chat, receipt.loop_id, 1, None)
-        .await
-        .unwrap();
+    agent.decline_plan(chat, 1, None).await.unwrap();
     loop {
         if matches!(next_event(&mut events).await.kind, EventKind::Interrupted) {
             break;
@@ -688,20 +640,14 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
         agent.set_execution_mode(chat, mode).await.unwrap();
     }
-    let run = agent
-        .submit(chat, Some(receipt.loop_id), "Keep planning".into())
-        .await
-        .unwrap();
+    let run = agent.submit(chat, "Keep planning".into()).await.unwrap();
     completed(&mut events, &run).await;
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
     for prompt in ["Implement it", "Continue"] {
-        let run = agent
-            .submit(chat, Some(receipt.loop_id), prompt.into())
-            .await
-            .unwrap();
+        let run = agent.submit(chat, prompt.into()).await.unwrap();
         completed(&mut events, &run).await;
     }
     let requests = model.requests.lock().unwrap().clone();
@@ -746,10 +692,7 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
         .draft
         .unwrap();
     let mut events = restarted.subscribe();
-    let run = restarted
-        .submit(chat, Some(draft.loop_id), draft.prompt)
-        .await
-        .unwrap();
+    let run = restarted.submit(chat, draft.prompt).await.unwrap();
     completed(&mut events, &run).await;
     assert_eq!(exit_notices(&model.requests.lock().unwrap()[0]), 1);
     restarted.shutdown().await;

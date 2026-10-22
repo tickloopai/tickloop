@@ -115,7 +115,6 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: "Complete this task.".into(),
                         contexts: vec![],
@@ -138,7 +137,7 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
             if projection
                 .rows
                 .iter()
-                .filter(|row| row.state == LoopState::Completed)
+                .filter(|row| row.state == LoopState::Idle && row.has_work == Some(true))
                 .count()
                 == 2
             {
@@ -155,7 +154,7 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
             .iter()
             .map(|row| row.state.clone())
             .collect::<Vec<_>>(),
-        [LoopState::Completed, LoopState::Completed, LoopState::Idle]
+        [LoopState::Idle, LoopState::Idle, LoopState::Idle]
     );
     assert!(
         projection.rows[2].has_work == Some(false),
@@ -173,7 +172,6 @@ async fn submit(access: &dyn AgentAccess, epoch: Uuid, execution: ExecutionRef, 
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Text {
                     text: text.into(),
                     contexts: vec![],
@@ -218,7 +216,7 @@ async fn overview_completed_families_rank_by_recent_finish() {
     let completed = |execution: ExecutionRef| {
         move |rows: &[AgentSummary]| {
             rows.iter()
-                .any(|row| row.execution == execution && row.state == LoopState::Completed)
+                .any(|row| row.execution == execution && row.state == LoopState::Idle)
         }
     };
     submit(access.as_ref(), epoch, older, "Finish first.").await;
@@ -293,7 +291,6 @@ async fn overview_completed_families_rank_by_recent_finish() {
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: latest,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Describe this chart.".into(),
                     contexts: vec![tickloop_agent_protocol::InputContext::Image(
@@ -373,7 +370,6 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
             },
             AgentCommand::Submit {
                 execution,
-                target_loop: None,
                 input: UserInput::Text {
                     text: "Run the bounded task.".into(),
                     contexts: vec![],
@@ -1100,7 +1096,7 @@ async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() 
     let mut console = AgentConsole::new(access, epoch, directory.path().into(), None);
     let rows = wait_for_overview(&mut console, |rows| {
         rows.iter()
-            .any(|row| row.execution == prompted && row.state == LoopState::Completed)
+            .any(|row| row.execution == prompted && row.state == LoopState::Idle)
     })
     .await;
     let row = |execution| rows.iter().find(|row| row.execution == execution).unwrap();
@@ -1123,65 +1119,6 @@ async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() 
         Some(configured),
         "a session that never worked ranks after every Agent that did"
     );
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
-    let directory = tempfile::tempdir().unwrap();
-    let runtime = Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
-            tickloop_agent_test_support::text("watching"),
-            tickloop_agent_test_support::text("answered"),
-        ])),
-    );
-    let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.daemon_epoch();
-    let execution = create(access.as_ref(), epoch, directory.path().into()).await;
-    let mut console = AgentConsole::new(access.clone(), epoch, directory.path().into(), None);
-    let chat = console.refresh().await.unwrap().rows[0].chat_id;
-    let watching = runtime
-        .submit(chat, None, "Watch the notes when asked".into())
-        .await
-        .unwrap();
-    runtime
-        .configure_trigger(
-            chat,
-            watching.loop_id,
-            Some(tickloop_agent_protocol::Trigger {
-                id: Uuid::new_v4(),
-                prompt: "Check the notes".into(),
-                prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    wait_for_overview(&mut console, |rows| {
-        rows[0].state == LoopState::WaitingTrigger
-    })
-    .await;
-    runtime
-        .submit(chat, None, "Answer one unrelated question".into())
-        .await
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let snapshot = runtime.snapshot(chat).await.unwrap();
-            if snapshot.loops.len() == 2 && snapshot.loops[1].state == LoopState::Completed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let rows = console.refresh().await.unwrap().rows;
-    assert_eq!(rows[0].execution, execution);
-    assert_eq!(rows[0].state, LoopState::WaitingTrigger);
     runtime.shutdown().await;
 }
 
@@ -1245,7 +1182,7 @@ async fn a_lost_execution_stays_an_error_even_before_it_ever_worked() {
     let mut console = AgentConsole::new(access, epoch, directory.path().into(), None);
     let rows = wait_for_overview(&mut console, |rows| {
         rows.iter()
-            .any(|row| row.execution == finished && row.state == LoopState::Completed)
+            .any(|row| row.execution == finished && row.state == LoopState::Idle)
     })
     .await;
     let lost = rows.iter().find(|row| row.execution == configured).unwrap();
@@ -1295,7 +1232,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
     let mut console = AgentConsole::new(access.clone(), epoch, directory.path().into(), None);
     wait_for_overview(&mut console, |rows| {
         rows.iter()
-            .any(|row| row.execution == finished && row.state == LoopState::Completed)
+            .any(|row| row.execution == finished && row.state == LoopState::Idle)
     })
     .await;
     access
@@ -1304,7 +1241,6 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: finished,
-                target_loop: None,
                 input: UserInput::Shell {
                     command: hold("release-foreground"),
                     background: false,
@@ -1372,7 +1308,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
             .state
             .clone()
     };
-    assert_eq!(state(finished), LoopState::Completed);
+    assert_eq!(state(finished), LoopState::Idle);
     assert_eq!(state(background), LoopState::Idle);
     runtime.shutdown().await;
 }
@@ -1408,7 +1344,7 @@ async fn overview_refresh_cost_with_many_long_histories() {
             for _ in 1..turns {
                 wait_for_overview(&mut console, |rows| {
                     rows.iter()
-                        .any(|row| row.execution == execution && row.state == LoopState::Completed)
+                        .any(|row| row.execution == execution && row.state == LoopState::Idle)
                 })
                 .await;
                 let chat = console
@@ -1421,13 +1357,13 @@ async fn overview_refresh_cost_with_many_long_histories() {
                     .unwrap()
                     .chat_id;
                 runtime
-                    .submit(chat, None, "x".repeat(history_bytes))
+                    .submit(chat, "x".repeat(history_bytes))
                     .await
                     .unwrap();
             }
         }
         wait_for_overview(&mut console, |rows| {
-            rows.len() == AGENTS && rows.iter().all(|row| row.state == LoopState::Completed)
+            rows.len() == AGENTS && rows.iter().all(|row| row.state == LoopState::Idle)
         })
         .await;
         let started = std::time::Instant::now();

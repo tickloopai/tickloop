@@ -198,7 +198,7 @@ async fn run_child_config_fixture() {
     )
     .await
     .unwrap();
-    agent.submit(root, None, TASK.into()).await.unwrap();
+    agent.submit(root, TASK.into()).await.unwrap();
     let latest = Mutex::new(String::new());
     let child = tokio::time::timeout(TIMEOUT / 2, async {
         loop {
@@ -220,16 +220,10 @@ async fn run_child_config_fixture() {
                     && if requester {
                         row.waiting_questions == 1
                     } else {
-                        row.state == LoopState::Completed
+                        row.state == LoopState::Idle
                     }
             });
-            let root_done = core
-                .snapshot(root)
-                .await
-                .unwrap()
-                .loops
-                .iter()
-                .all(|goal| goal.state == LoopState::Completed);
+            let root_done = core.snapshot(root).await.unwrap().chat_loop.state == LoopState::Idle;
             if let Some(child) = child
                 && (requester || root_done)
             {

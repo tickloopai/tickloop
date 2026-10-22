@@ -17,8 +17,8 @@ use std::{
 use tick_protocol::InstanceRef;
 use tickloop_agent_artifacts::ArtifactMetadata;
 use tickloop_agent_protocol::{
-    ChatStatus, LoopState, MonitorMember, MonitorMembership, ShellTaskSnapshot,
-    TickSubscriptionFrequency, TickSubscriptionStatus,
+    ChatStatus, MonitorMember, MonitorMembership, ShellTaskSnapshot, TickSubscriptionFrequency,
+    TickSubscriptionStatus,
 };
 use uuid::Uuid;
 
@@ -368,29 +368,24 @@ pub trait MonitorRows: Send + Sync + 'static {
     }
 }
 
-/// Whether the subscription's Loop can still deliver; a stopped or expired one cannot.
-fn can_deliver(row: &TickSubscriptionStatus) -> bool {
-    !matches!(row.loop_state, LoopState::Stopped | LoopState::Expired)
-}
-
-/// The subscriptions on `instance` whose Loops can still deliver.
+/// The subscriptions on `instance`.
 pub fn subscriptions_on(
     subscriptions: &[TickSubscriptionStatus],
     instance: &InstanceRef,
 ) -> Vec<TickSubscriptionStatus> {
     subscriptions
         .iter()
-        .filter(|row| &row.instance == instance && can_deliver(row))
+        .filter(|row| &row.instance == instance)
         .cloned()
         .collect()
 }
 
-/// The subscriptions of Loops that can still deliver, by the instance they watch.
+/// The subscriptions, by the instance they watch.
 fn active_subscriptions(
     context: &MonitorContext,
 ) -> BTreeMap<InstanceRef, Vec<&TickSubscriptionStatus>> {
     let mut subscribed: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for row in context.subscriptions.iter().filter(|row| can_deliver(row)) {
+    for row in &context.subscriptions {
         subscribed
             .entry(row.instance.clone())
             .or_default()

@@ -56,9 +56,7 @@ pub enum DisplayKind {
 pub enum PromptOrigin {
     #[default]
     User,
-    Trigger {
-        r#loop: Uuid,
-    },
+    Trigger,
     Feedback {
         artifact: String,
     },
@@ -67,9 +65,6 @@ pub enum PromptOrigin {
     },
     SubagentNotification {
         child: Uuid,
-    },
-    Goal {
-        r#loop: Uuid,
     },
 }
 
@@ -169,11 +164,10 @@ pub fn project(lines: &[Line]) -> Vec<DisplayNode> {
     projector.nodes().cloned().collect()
 }
 
-/// A Loop's latest recorded state.
+/// The Chat Loop's latest recorded state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayLoop {
     pub id: Uuid,
-    pub goal: String,
     pub state: LoopState,
     pub trigger: Option<Trigger>,
     pub trigger_awaits_resume: bool,
@@ -181,38 +175,32 @@ pub struct DisplayLoop {
     pub run_started_at: Option<u64>,
 }
 
-pub fn loops(lines: &[Line]) -> Vec<DisplayLoop> {
-    let mut records: Vec<LoopRecord> = Vec::new();
+/// The Chat Loop as its latest current-format record on the chain left it; records in the format
+/// of a Chat with several Loops are skipped.
+pub fn chat_loop(lines: &[Line]) -> Option<DisplayLoop> {
+    let mut latest: Option<LoopRecord> = None;
     visit_lines(lines, &mut |line| {
         if let Some(record) = line
             .chain_entry()
+            .filter(|entry| entry.is_current_loop_record())
             .and_then(|entry| entry.loop_record.as_ref())
         {
-            if let Some(previous) = records.iter_mut().find(|old| old.loop_id == record.loop_id) {
-                *previous = record.clone();
-            } else {
-                records.push(record.clone());
-            }
+            latest = Some(record.clone());
         }
     });
-    records
-        .into_iter()
-        .filter_map(|record| {
-            let state = serde_json::from_value(record.state).ok()?;
-            let trigger = record
-                .trigger
-                .and_then(|value| serde_json::from_value::<Trigger>(value).ok());
-            Some(DisplayLoop {
-                id: record.loop_id,
-                goal: record.goal,
-                state,
-                trigger,
-                trigger_awaits_resume: record.trigger_awaits_resume,
-                state_since: record.state_since.and_then(|value| value.as_u64()),
-                run_started_at: record.run_started_at,
-            })
-        })
-        .collect()
+    let record = latest?;
+    let state = serde_json::from_value(record.state).ok()?;
+    let trigger = record
+        .trigger
+        .and_then(|value| serde_json::from_value::<Trigger>(value).ok());
+    Some(DisplayLoop {
+        id: record.loop_id,
+        state,
+        trigger,
+        trigger_awaits_resume: record.trigger_awaits_resume,
+        state_since: record.state_since.and_then(|value| value.as_u64()),
+        run_started_at: record.run_started_at,
+    })
 }
 
 /// Public board state, without mutation receipts. Disabling Tasks hides, rather than clears, it.
@@ -549,10 +537,9 @@ impl DisplayProjector {
             );
         }
         let input = entry.run_id.and_then(|run| self.inputs.get(&run));
-        match input.map(|input| (input.op, input.loop_id)) {
-            Some((InputOp::Trigger, loop_id)) => Some(PromptOrigin::Trigger { r#loop: loop_id }),
-            Some((InputOp::Goal, loop_id)) => Some(PromptOrigin::Goal { r#loop: loop_id }),
-            Some((InputOp::Feedback, _)) => {
+        match input.map(|input| input.op) {
+            Some(InputOp::Trigger) => Some(PromptOrigin::Trigger),
+            Some(InputOp::Feedback) => {
                 let artifact = match LocalMessage::parse(&message_text(&entry.message.content)) {
                     Some(LocalMessage::ArtifactRequest { artifact_id, .. }) => Some(artifact_id),
                     _ => input?

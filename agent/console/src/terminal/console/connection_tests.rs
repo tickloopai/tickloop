@@ -160,7 +160,7 @@ fn lost_diagnostics_follow_the_chat_across_cache_reset_and_details() {
         1
     );
     let snapshot = serde_json::from_value(
-        serde_json::json!({"id":chat,"folder":"/owned","messages":[],"loops":[]}),
+        serde_json::json!({"id":chat,"folder":"/owned","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
     for _ in 0..2 {
@@ -221,7 +221,7 @@ fn a_loss_first_seen_while_hidden_is_replayed_once_when_its_chat_opens() {
     }
     assert!(!console_frame(&console).contains("Execution connection was lost"));
     let snapshot = serde_json::from_value(
-        serde_json::json!({"id":chat,"folder":"/owned","messages":[],"loops":[]}),
+        serde_json::json!({"id":chat,"folder":"/owned","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
     console.select_chat(Some(chat)).unwrap();
@@ -271,7 +271,7 @@ fn a_creation_prefix_history_and_loss_rebuild_in_order_once_and_stay_with_the_ch
         technical:format!("/resume {chat} loads saved history"),
     }).unwrap();
     let snapshot = serde_json::from_value(serde_json::json!({
-        "id":chat,"folder":"/owned","loops":[],
+        "id":chat,"folder":"/owned","chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
         "messages":[
             {"role":"user","content":[{"type":"text","text":"History user"}]},
             {"role":"assistant","content":[{"type":"text","text":"History answer"}]},

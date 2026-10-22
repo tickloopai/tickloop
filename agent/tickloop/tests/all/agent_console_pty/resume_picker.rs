@@ -14,7 +14,7 @@ const FOLLOW_UP_REPLY: &str = "Follow-up reached the selected conversation";
 
 async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         if event.run_id != receipt.run_id {

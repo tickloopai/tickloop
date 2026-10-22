@@ -68,14 +68,14 @@ fn prompt_suggestion_pty_fixture() {
                     if user_case {
                         core.set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::Auto).await.unwrap();
                         let mut events = core.subscribe();
-                        let receipt = core.submit(chat, None, "Complete the fixture family".into()).await.unwrap();
+                        let receipt = core.submit(chat, "Complete the fixture family".into()).await.unwrap();
                         loop {
                             let event = tickloop_agent_test_support::next_event(&mut events).await;
                             assert!(!matches!(event.kind, tickloop_agent_protocol::EventKind::Failed(_)), "{event:?}");
                             if event.run_id == receipt.run_id && matches!(event.kind, tickloop_agent_protocol::EventKind::Completed { .. }) { break; }
                         }
                         let child = agent.catalog().await.unwrap().into_iter().find(|row| row.parent.is_some()).unwrap();
-                        assert_eq!(child.state, tickloop_agent_protocol::LoopState::Completed);
+                        assert_eq!(child.state, tickloop_agent_protocol::LoopState::Idle);
                         if directory.join("delegated-view").exists() { chat = child.chat_id; }
                     }
                     if directory.join("plan-mode").exists() {
@@ -89,7 +89,7 @@ fn prompt_suggestion_pty_fixture() {
                     }
                     if directory.join("running-shell").exists() {
                         agent
-                            .submit_user_shell_for_goal(chat, None, "sleep 30".into(), true)
+                            .submit_user_shell(chat, "sleep 30".into(), true)
                             .await
                             .unwrap();
                     }

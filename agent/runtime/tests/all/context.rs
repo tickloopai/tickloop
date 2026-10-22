@@ -30,7 +30,7 @@ async fn minimax_thinking_toggle_and_on_preference_survive_new_chats() {
     );
     agent.set_thinking_enabled(chat, true).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    agent.submit(chat, "Hello".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     assert_eq!(
         client.requests.lock().unwrap()[0].reasoning_effort,
@@ -113,7 +113,7 @@ async fn manual_compaction_serializes_queued_input_and_interrupt_cancels_the_sum
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "First turn".into()).await.unwrap();
+    agent.submit(chat, "First turn".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let compacting = {
         let agent = agent.clone();
@@ -121,7 +121,7 @@ async fn manual_compaction_serializes_queued_input_and_interrupt_cancels_the_sum
     };
     model.started.notified().await;
     agent
-        .submit(chat, Some(receipt.loop_id), "Queued continuation".into())
+        .submit(chat, "Queued continuation".into())
         .await
         .unwrap();
     tokio::task::yield_now().await;
@@ -158,7 +158,7 @@ async fn shutdown_joins_a_summary_even_when_its_original_caller_is_gone() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "First turn".into()).await.unwrap();
+    agent.submit(chat, "First turn".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let before = agent.snapshot(chat).await.unwrap();
     let compacting = {
@@ -203,7 +203,7 @@ async fn switching_an_idle_chat_keeps_the_goal_and_uses_the_new_model_with_histo
     let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "My goal".into()).await.unwrap();
+    let receipt = agent.submit(chat, "My goal".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let replacement = Arc::new(ScriptedModel::new(vec![text("New answer")]));
     models.choose(replacement.clone());
@@ -215,15 +215,11 @@ async fn switching_an_idle_chat_keeps_the_goal_and_uses_the_new_model_with_histo
         agent.set_model(chat, selected.clone()).await.unwrap(),
         ModelChange::Applied
     );
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.model, selected);
-    assert_eq!(snapshot.loops.len(), 1);
-    assert_eq!(snapshot.loops[0].id, receipt.loop_id);
+    assert_eq!(snapshot.chat_loop.id, receipt.loop_id);
     assert_eq!(original.requests.lock().unwrap().len(), 1);
     assert!(
         replacement.requests.lock().unwrap()[0]
@@ -265,10 +261,7 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Write the result".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write the result".into()).await.unwrap();
     let permission = loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => break request,
@@ -316,10 +309,7 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
     assert_eq!(applied.model, selected);
     assert_eq!(applied.reasoning_effort, Some(ReasoningEffort::High));
     assert!(applied.thinking_enabled);
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     assert_eq!(replacement.requests.lock().unwrap().len(), 1);
     assert_eq!(
@@ -349,7 +339,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "My goal".into()).await.unwrap();
+    agent.submit(chat, "My goal".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let before = agent.snapshot(chat).await.unwrap();
     let mut selected = config();
@@ -365,10 +355,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     selected.base_url = "invalid".into();
     assert!(agent.set_model(chat, selected).await.is_err());
     assert_eq!(agent.snapshot(chat).await.unwrap().model, switched.model);
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue on B".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue on B".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     {
         let requests = replacement.requests.lock().unwrap();
@@ -386,10 +373,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     }
     models.choose(original.clone());
     agent.set_model(chat, config()).await.unwrap();
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue on A".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue on A".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     assert!(original.requests.lock().unwrap()[1].messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Thinking {signature:Some(signature),..} if signature == "signature")));
     agent.shutdown().await;
@@ -415,10 +399,9 @@ async fn compaction_appends_a_boundary_and_restart_loads_only_the_compacted_chai
     let agent = opened_agent(database.clone(), config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
+    agent
         .submit(
             chat,
-            None,
             "Preserve the source. Generate a separate report.".into(),
         )
         .await
@@ -455,7 +438,7 @@ async fn compaction_appends_a_boundary_and_restart_loads_only_the_compacted_chai
     models.choose(replacement.clone());
     agent.set_model(chat, selected.clone()).await.unwrap();
     agent
-        .submit(chat, Some(receipt.loop_id), "Continue carefully".into())
+        .submit(chat, "Continue carefully".into())
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
@@ -493,8 +476,8 @@ async fn failed_compaction_keeps_the_last_valid_context_and_raw_history() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Keep my instructions".into())
+    agent
+        .submit(chat, "Keep my instructions".into())
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
@@ -511,10 +494,7 @@ async fn failed_compaction_keeps_the_last_valid_context_and_raw_history() {
     let after = agent.snapshot(chat).await.unwrap();
     assert_eq!(after.messages, before.messages);
     assert_eq!(after.message_compactions, before.message_compactions);
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     assert!(model.requests.lock().unwrap()[3].messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,Content::Text{text} if text.contains("valid public summary"))));
     agent.shutdown().await;
@@ -539,7 +519,7 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
     agent.set_context_window(chat, 1_000_000).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Collect the material".into())
+        .submit(chat, "Collect the material".into())
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
@@ -695,10 +675,7 @@ async fn conversation_output_budget_is_bounded_on_the_actual_http_request() {
     let agent = Agent::new_embedded(model, client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "source ".repeat(35_000))
-        .await
-        .unwrap();
+    agent.submit(chat, "source ".repeat(35_000)).await.unwrap();
     loop {
         if matches!(next_event(&mut events).await.kind, EventKind::Failed(_)) {
             break;
@@ -741,12 +718,9 @@ async fn large_output_limits_do_not_consume_the_input_compaction_budget() {
         let agent = Agent::new_embedded(model, client.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent.submit(chat, None, "Hello".into()).await.unwrap();
+        agent.submit(chat, "Hello".into()).await.unwrap();
         wait_for_completion(&mut events).await;
-        agent
-            .submit(chat, Some(receipt.loop_id), "source ".repeat(35_000))
-            .await
-            .unwrap();
+        agent.submit(chat, "source ".repeat(35_000)).await.unwrap();
         wait_for_completion(&mut events).await;
         assert!(
             agent
@@ -777,15 +751,9 @@ async fn kimi_k3_context_variants_use_their_own_compaction_thresholds() {
         let agent = Agent::new_embedded(model, client.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "source ".repeat(6_000))
-            .await
-            .unwrap();
+        agent.submit(chat, "source ".repeat(6_000)).await.unwrap();
         wait_for_completion(&mut events).await;
-        agent
-            .submit(chat, Some(receipt.loop_id), "source ".repeat(70_000))
-            .await
-            .unwrap();
+        agent.submit(chat, "source ".repeat(70_000)).await.unwrap();
         wait_for_completion(&mut events).await;
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(
@@ -825,10 +793,7 @@ async fn automatic_compaction_does_not_treat_serialized_bytes_as_tokens() {
     let agent = Agent::new_embedded(model_config, model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "word ".repeat(150_000))
-        .await
-        .unwrap();
+    agent.submit(chat, "word ".repeat(150_000)).await.unwrap();
     wait_for_completion(&mut events).await;
     agent.set_context_window(chat, 1_000_000).await.unwrap();
     assert_eq!(
@@ -843,10 +808,7 @@ async fn automatic_compaction_does_not_treat_serialized_bytes_as_tokens() {
         Some(200_000)
     );
 
-    agent
-        .submit(chat, Some(receipt.loop_id), "Follow-up".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Follow-up".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert!(
@@ -858,10 +820,7 @@ async fn automatic_compaction_does_not_treat_serialized_bytes_as_tokens() {
             .is_none()
     );
 
-    agent
-        .submit(chat, Some(receipt.loop_id), "word ".repeat(400_000))
-        .await
-        .unwrap();
+    agent.submit(chat, "word ".repeat(400_000)).await.unwrap();
     wait_for_completion(&mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 4);
     assert!(
@@ -972,23 +931,17 @@ async fn automatic_compaction_uses_the_configured_window_and_preserves_recent_to
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Keep the source unchanged".into())
+    agent
+        .submit(chat, "Keep the source unchanged".into())
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
     for prompt in ["Second step", "Third step"] {
-        agent
-            .submit(chat, Some(receipt.loop_id), prompt.into())
-            .await
-            .unwrap();
+        agent.submit(chat, prompt.into()).await.unwrap();
         wait_for_completion(&mut events).await;
     }
     agent.set_context_window(chat, 200_000).await.unwrap();
-    agent
-        .submit(chat, Some(receipt.loop_id), "Read note.txt".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Read note.txt".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(
@@ -1020,10 +973,7 @@ async fn a_summary_that_exceeds_capacity_does_not_replace_the_valid_checkpoint()
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "A small goal".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "A small goal".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     agent.set_context_window(chat, 20_000).await.unwrap();
     let before = agent.snapshot(chat).await.unwrap();
@@ -1059,8 +1009,8 @@ async fn compaction_pins_the_approved_plan_even_when_the_model_omits_it() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Prepare my report".into())
+    agent
+        .submit(chat, "Prepare my report".into())
         .await
         .unwrap();
     loop {
@@ -1070,12 +1020,7 @@ async fn compaction_pins_the_approved_plan_even_when_the_model_omits_it() {
         }
     }
     agent
-        .approve_plan(
-            chat,
-            receipt.loop_id,
-            1,
-            tickloop_agent_protocol::ExecutionMode::AcceptEdits,
-        )
+        .approve_plan(chat, 1, tickloop_agent_protocol::ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
@@ -1114,16 +1059,13 @@ async fn automatic_compaction_tells_the_model_to_continue_but_manual_compaction_
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Collect the material".into())
+    agent
+        .submit(chat, "Collect the material".into())
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
     agent.set_context_window(chat, 200_000).await.unwrap();
-    agent
-        .submit(chat, Some(receipt.loop_id), "Keep going".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Keep going".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let requests = model.requests.lock().unwrap().clone();
     assert!(requests[1].tools.is_empty());
@@ -1133,10 +1075,7 @@ async fn automatic_compaction_tells_the_model_to_continue_but_manual_compaction_
     assert!(!automatic.contains("historical data"));
 
     agent.compact(chat).await.unwrap();
-    agent
-        .submit(chat, Some(receipt.loop_id), "Next step".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Next step".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let requests = model.requests.lock().unwrap().clone();
     let manual = summary_message_text(&requests[4]);

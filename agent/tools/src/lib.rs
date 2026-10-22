@@ -197,7 +197,6 @@ pub struct SafetyCheck {
 pub const ENTER_PLAN_MODE_TOOL_NAME: &str = "EnterPlanMode";
 pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "ExitPlanMode";
 pub const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
-pub const START_GOAL_TOOL_NAME: &str = "StartGoal";
 pub const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
 /// The result of an `AskUserQuestion` call the user declined: Claude Code's `REJECT_MESSAGE`,
 /// which its question dialog sends on Esc. The runtime writes it and the Console recognizes it.
@@ -205,13 +204,12 @@ pub const DECLINED_QUESTIONS_RESULT: &str = "The user doesn't want to proceed wi
 
 /// Tools Auto admits without the classifier, mapped from Claude Code's
 /// `SAFE_YOLO_ALLOWLISTED_TOOLS`.
-pub const AUTO_ALLOWLISTED_TOOLS: [&str; 8] = [
+pub const AUTO_ALLOWLISTED_TOOLS: [&str; 7] = [
     READ_TOOL_NAME,
     GLOB_TOOL_NAME,
     GREP_TOOL_NAME,
     ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME,
-    START_GOAL_TOOL_NAME,
     TASK_STOP_TOOL_NAME,
     ASK_USER_QUESTION_TOOL_NAME,
 ];
@@ -700,9 +698,6 @@ impl Tools {
     pub async fn stop_command(&self, id: uuid::Uuid) -> Result<CommandSnapshot, ToolError> {
         self.commands.stop(id).await
     }
-    pub async fn stop_loop(&self, id: uuid::Uuid) -> Vec<CommandSnapshot> {
-        self.commands.stop_loop(id).await
-    }
     pub async fn read_command(
         &self,
         id: uuid::Uuid,
@@ -869,11 +864,7 @@ impl Tools {
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled).into();
             }
-            return self
-                .commands
-                .stop_task(&input.task_id, context.loop_id)
-                .await
-                .into();
+            return self.commands.stop_task(&input.task_id).await.into();
         }
         if let Operation::Shell(input) = &prepared.operation {
             return async {

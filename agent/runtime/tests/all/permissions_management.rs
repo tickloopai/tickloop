@@ -189,7 +189,7 @@ async fn editing_rules_changes_the_next_tool_admission_and_exposes_scope_and_sou
     assert!(displayed.editable);
     assert!(!displayed.rule.persistent);
     let mut events = agent.subscribe();
-    let attempt = agent.submit(chat, None, "write ask".into()).await.unwrap();
+    let attempt = agent.submit(chat, "write ask".into()).await.unwrap();
     let request = requested_permission(&mut events, attempt.run_id).await;
     assert_eq!(
         request.approval_source,
@@ -215,7 +215,7 @@ async fn editing_rules_changes_the_next_tool_admission_and_exposes_scope_and_sou
         )
         .await
         .unwrap();
-    let attempt = agent.submit(chat, None, "write deny".into()).await.unwrap();
+    let attempt = agent.submit(chat, "write deny".into()).await.unwrap();
     assert!(!completed_without_request(&mut events, attempt.run_id).await);
     assert!(!workdir.join("deny.txt").exists());
 
@@ -229,10 +229,7 @@ async fn editing_rules_changes_the_next_tool_admission_and_exposes_scope_and_sou
         )
         .await
         .unwrap();
-    let attempt = agent
-        .submit(chat, None, "write allow".into())
-        .await
-        .unwrap();
+    let attempt = agent.submit(chat, "write allow".into()).await.unwrap();
     assert!(completed_without_request(&mut events, attempt.run_id).await);
     assert_eq!(
         std::fs::read_to_string(workdir.join("allow.txt")).unwrap(),
@@ -244,7 +241,7 @@ async fn editing_rules_changes_the_next_tool_admission_and_exposes_scope_and_sou
         .await
         .unwrap();
     let attempt = agent
-        .submit(chat, None, "write after removal".into())
+        .submit(chat, "write after removal".into())
         .await
         .unwrap();
     assert!(completed_without_request(&mut events, attempt.run_id).await);
@@ -373,7 +370,7 @@ async fn conflicting_project_edits_preserve_unrelated_settings_and_latest_rules(
         .unwrap();
     let mut events = restarted.subscribe();
     let attempt = restarted
-        .submit(restored_chat, None, "write after restart".into())
+        .submit(restored_chat, "write after restart".into())
         .await
         .unwrap();
     let request = requested_permission(&mut events, attempt.run_id).await;
@@ -463,7 +460,7 @@ async fn removed_extra_directory_revokes_a_held_approval() {
         .unwrap();
     let mut events = agent.subscribe();
     let attempt = agent
-        .submit(chat, None, "write in the extra directory".into())
+        .submit(chat, "write in the extra directory".into())
         .await
         .unwrap();
     let request = requested_permission(&mut events, attempt.run_id).await;
@@ -684,10 +681,7 @@ async fn management_ask_rule_requires_human_before_host_tool_execution() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let attempt = agent
-        .submit(chat, None, "change panel".into())
-        .await
-        .unwrap();
+    let attempt = agent.submit(chat, "change panel".into()).await.unwrap();
     let request = requested_permission(&mut events, attempt.run_id).await;
     assert_eq!(
         request.approval_source,

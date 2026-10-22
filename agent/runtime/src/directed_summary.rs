@@ -552,7 +552,7 @@ mod tests {
             )
             .unwrap();
             let id = agent.create_chat(directory.path().into()).await.unwrap();
-            agent.submit(id, None, "Discuss".into()).await.unwrap();
+            agent.submit(id, "Discuss".into()).await.unwrap();
             agent.quiesce(id).await;
             let (plan, sequence) = {
                 let mut chats = agent.inner.chats.lock().await;

@@ -101,10 +101,7 @@ async fn explicit_ask_accepts_only_one_operation_and_keeps_request_pending_after
         .unwrap();
 
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Write the report".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write the report".into()).await.unwrap();
     let request = loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => break request,
@@ -188,10 +185,7 @@ async fn unrestricted_host_still_asks_before_a_local_explicit_ask_operation() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let run = agent
-        .submit(chat, None, "Write the report".into())
-        .await
-        .unwrap();
+    let run = agent.submit(chat, "Write the report".into()).await.unwrap();
     let request = loop {
         let event = next_event(&mut events).await;
         if event.run_id != run.run_id {
@@ -256,7 +250,7 @@ async fn unrestricted_host_still_asks_before_an_automatic_host_tool_explicit_ask
         .unwrap();
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, None, "Change the layout".into())
+        .submit(chat, "Change the layout".into())
         .await
         .unwrap();
     let request = loop {

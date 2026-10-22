@@ -8,7 +8,7 @@ use serde_json::json;
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
     BranchRequest, ChatId, Content, Decision, DirectedSummaryRequest, EventKind, ExecutionMode,
-    LoopId, Message, PermissionRule, Receipt, Role, SummaryDirection,
+    Message, PermissionRule, Receipt, Role, SummaryDirection,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text, transcript_file};
@@ -17,9 +17,9 @@ use uuid::Uuid;
 const PERSISTED_OUTPUT_TAG: &str = "<persisted-output>";
 const PREVIEW_SIZE: usize = 2000;
 
-async fn complete_turn(agent: &Agent, chat: ChatId, goal: Option<LoopId>, prompt: &str) -> Receipt {
+async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, goal, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -148,7 +148,7 @@ async fn a_large_search_result_is_persisted_and_the_next_request_is_identical_af
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "Find the deliveries").await;
+    complete_turn(&agent, chat, "Find the deliveries").await;
     agent.flush_transcripts().await;
 
     let persisted_path = chat_directory(&root, chat).join("tool-results/search-1.txt");
@@ -172,7 +172,7 @@ async fn a_large_search_result_is_persisted_and_the_next_request_is_identical_af
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("Still there.")]));
     let resumed = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
     resumed.resume_chat(chat).await.unwrap();
-    complete_turn(&resumed, chat, None, "Anything else?").await;
+    complete_turn(&resumed, chat, "Anything else?").await;
     let after_restart = conversation(&requests(&resumed_model)[0]);
     assert_eq!(after_restart[..3], conversation(&before_restart)[..]);
     resumed.shutdown().await;
@@ -215,7 +215,7 @@ async fn assert_resumed_request_matches(
     if resume {
         agent.resume_chat(chat).await.unwrap();
     }
-    complete_turn(&agent, chat, None, "Continue after restart").await;
+    complete_turn(&agent, chat, "Continue after restart").await;
     let sent = conversation(&requests(&model)[0]);
     assert!(sent.len() >= expected_prefix.len(), "{sent:?}");
     // 对话可能含数 MB 的提示，只报告第一处不同消息的开头。
@@ -245,7 +245,7 @@ async fn message_budget_replacements_survive_resume_fork_and_branch_byte_for_byt
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&agent, chat, None, "List the directories").await;
+    complete_turn(&agent, chat, "List the directories").await;
 
     let first = requests(&model)[1].clone();
     let results = tool_results(&first);
@@ -276,7 +276,7 @@ async fn message_budget_replacements_survive_resume_fork_and_branch_byte_for_byt
         })
         .unwrap(),
     );
-    complete_turn(&agent, chat, None, "Anything new?").await;
+    complete_turn(&agent, chat, "Anything new?").await;
     assert_eq!(
         conversation(&requests(&model)[2])[..expected_with_answer.len()],
         expected_with_answer[..]
@@ -300,7 +300,7 @@ async fn message_budget_replacements_survive_resume_fork_and_branch_byte_for_byt
     )
     .unwrap();
     let copy = copying.resume_as_new_chat(chat).await.unwrap().id;
-    complete_turn(&copying, copy, None, "Read the saved listing").await;
+    complete_turn(&copying, copy, "Read the saved listing").await;
     copying.shutdown().await;
     drop(copying);
     assert_resumed_request_matches(&root, copy, &expected_with_answer, true).await;
@@ -316,7 +316,6 @@ async fn message_budget_replacements_survive_resume_fork_and_branch_byte_for_byt
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -353,9 +352,9 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
-    complete_turn(&agent, chat, None, "Early prompt").await;
-    complete_turn(&agent, chat, None, "List the directories").await;
-    complete_turn(&agent, chat, None, &large_prompt).await;
+    complete_turn(&agent, chat, "Early prompt").await;
+    complete_turn(&agent, chat, "List the directories").await;
+    complete_turn(&agent, chat, &large_prompt).await;
     let listing_point = agent.snapshot(chat).await.unwrap().rewind_points()[1].clone();
     agent
         .summarize_checkpoint(
@@ -368,7 +367,7 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
         )
         .await
         .unwrap();
-    complete_turn(&agent, chat, None, "Anything new?").await;
+    complete_turn(&agent, chat, "Anything new?").await;
     let summarized_request = requests(&model).last().unwrap().clone();
     let replaced = tool_results(&summarized_request)
         .into_iter()
@@ -424,7 +423,6 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -452,7 +450,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
     for (agent, marker) in [(&first, "first-output"), (&second, "second-output")] {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let receipt = agent
-            .submit_user_shell_for_goal(chat, None, format!("printf {marker}"), true)
+            .submit_user_shell(chat, format!("printf {marker}"), true)
             .await
             .unwrap();
         outputs.push((agent, chat, receipt.command_id, marker));
@@ -550,7 +548,7 @@ async fn file_change_reviews_are_kept_in_the_chat_directory() {
         )
         .await
         .unwrap();
-    complete_turn(&agent, chat, None, "Write the report").await;
+    complete_turn(&agent, chat, "Write the report").await;
     agent.flush_transcripts().await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     let review = snapshot
@@ -603,7 +601,7 @@ async fn large_results_with_repeated_or_unsafe_call_ids_are_still_persisted_afte
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     for prompt in ["List north", "List south", "List north again"] {
-        complete_turn(&agent, chat, None, prompt).await;
+        complete_turn(&agent, chat, prompt).await;
     }
     agent.flush_transcripts().await;
 
@@ -661,7 +659,7 @@ async fn large_results_with_repeated_or_unsafe_call_ids_are_still_persisted_afte
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("Still there.")]));
     let resumed = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
     resumed.resume_chat(chat).await.unwrap();
-    complete_turn(&resumed, chat, None, "Anything else?").await;
+    complete_turn(&resumed, chat, "Anything else?").await;
     let after_restart = conversation(&requests(&resumed_model)[0]);
     assert_eq!(
         after_restart[..before_restart.len() + 1],
@@ -737,10 +735,7 @@ async fn assert_untrusted_family_temp_directory(
     model.enqueue(call("read-secret", "Read", json!({"file_path":secret})));
     model.enqueue(text("Done."));
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Read the secret".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Read the secret".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != receipt.run_id {
@@ -773,7 +768,7 @@ async fn assert_untrusted_family_temp_directory(
     let _shell_cleanup = RemoveOnDrop(shell_temp.clone());
     tamper(&shell_temp, outside.path());
     let shell = agent
-        .submit_user_shell_for_goal(shell_chat, None, "printf leaked".into(), true)
+        .submit_user_shell(shell_chat, "printf leaked".into(), true)
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -846,7 +841,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let shell = agent
-        .submit_user_shell_for_goal(chat, None, "printf visible".into(), true)
+        .submit_user_shell(chat, "printf visible".into(), true)
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -870,7 +865,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
     assert!(output.starts_with(family_temp_directory(chat)));
     model.enqueue(call("read-output", "Read", json!({"file_path":output})));
     model.enqueue(text("Read it."));
-    complete_turn(&agent, chat, None, "Read the output").await;
+    complete_turn(&agent, chat, "Read the output").await;
     assert!(tool_results(&requests(&model)[1])[0].1.contains("visible"));
     let other = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -880,7 +875,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
     model.enqueue(call("other-read", "Read", json!({"file_path":output})));
     let mut events = agent.subscribe();
     agent
-        .submit(other, None, "Read another session output".into())
+        .submit(other, "Read another session output".into())
         .await
         .unwrap();
     loop {
@@ -920,7 +915,7 @@ async fn a_failed_tool_returns_its_error_to_the_model_and_the_turn_continues() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
-    complete_turn(&agent, chat, None, "read both files").await;
+    complete_turn(&agent, chat, "read both files").await;
 
     let requests = requests(&model);
     assert_eq!(requests.len(), 2);
@@ -942,8 +937,8 @@ async fn a_failed_tool_returns_its_error_to_the_model_and_the_turn_continues() {
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(
-        snapshot.loops[0].state,
-        tickloop_agent_protocol::LoopState::Completed
+        snapshot.chat_loop.state,
+        tickloop_agent_protocol::LoopState::Idle
     );
     agent.shutdown().await;
 }

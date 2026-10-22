@@ -71,7 +71,7 @@ async fn an_ended_shell_is_unread_until_a_turn_takes_in_its_notification() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit_user_shell_for_goal(chat, None, "printf done".into(), true)
+        .submit_user_shell(chat, "printf done".into(), true)
         .await
         .unwrap();
     let ended = wait_for_snapshot(&agent, chat, has_notification).await;
@@ -90,10 +90,7 @@ async fn an_ended_shell_is_unread_until_a_turn_takes_in_its_notification() {
 
     model.enqueue(text("noted"));
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "what happened?".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "what happened?".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     let monitor = agent.snapshot(chat).await.unwrap().monitor;
     assert!(
@@ -127,7 +124,7 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     let started = agent.snapshot(chat).await.unwrap();
     let command = &started.commands[0];
@@ -141,10 +138,7 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
         json!({"file_path": command.output_ref}),
     ));
     model.enqueue(text("still waiting"));
-    agent
-        .submit(chat, Some(started.loops[0].id), "check it".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "check it".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     let read = agent.snapshot(chat).await.unwrap().monitor;
     let read_at = read
@@ -255,7 +249,7 @@ async fn every_successful_tick_tool_use_marks_the_instance_used_and_only_a_read_
     let before = tickloop_agent_base::private_fs::unix_time_milliseconds();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "look at the Ticks".into())
+        .submit(chat, "look at the Ticks".into())
         .await
         .unwrap();
     finish_run(&agent, chat, &mut events).await;
@@ -313,7 +307,7 @@ async fn the_user_opening_a_row_handles_it_and_the_mark_survives_resume() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     // A Chat is saved once it has a conversation.
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "hello".into()).await.unwrap();
+    agent.submit(chat, "hello".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     let membership = agent
         .mark_monitor_handled(chat, instance.clone())

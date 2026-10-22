@@ -54,7 +54,6 @@ mod late_receipt_tests;
 mod list_row;
 mod login;
 mod loop_view_text;
-mod loops;
 mod menus;
 #[cfg(test)]
 mod mode_cycle_tests;
@@ -138,9 +137,8 @@ use tickloop_agent_protocol::{
     InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
     QueuedInputKind, ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin,
-    ShellTaskPromptWatchdog, ShellTaskState, TakenBackPrompt, TaskNotification,
-    TaskNotificationStatus, Trigger, TriggerPromptSource, TriggerSource, Usage, UserInput,
-    UserShellRecord, UserShellState, ViewRef,
+    ShellTaskPromptWatchdog, ShellTaskState, TaskNotification, TaskNotificationStatus, Trigger,
+    TriggerPromptSource, TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -167,6 +165,8 @@ const USER_SHELL_PREVIEW_LINES: usize = 5;
 const ANIMATION_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(32);
 /// The activity shown while a run works without an in-progress todo.
 const WORKING_ACTIVITY: &str = "Working";
+const STOPPED_NOTICE: &str =
+    "Stopped. Queued messages were discarded; send your next message to resume receiving Triggers.";
 
 struct RunningActivity {
     chat_id: uuid::Uuid,
@@ -416,7 +416,6 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/websearch"
                 | "/provider"
                 | "/thinking"
-                | "/loops"
                 | "/operations"
                 | "/rules"
                 | "/plan"
@@ -530,7 +529,6 @@ async fn branch_from_terminal(
     console: &Console,
     agent: &Agent,
     source_chat_id: Option<uuid::Uuid>,
-    source_loop_id: Option<uuid::Uuid>,
     command: &str,
     preserve_until_summary_finishes: bool,
 ) -> Result<BranchOutcome, String> {
@@ -555,7 +553,6 @@ async fn branch_from_terminal(
         .branch_chat(BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id,
-            source_loop_id,
             name,
         })
         .await
@@ -885,12 +882,12 @@ enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Her
 The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
-/loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
-/loops trigger [GOAL_ID] reads its trigger.
+esc interrupts the current turn; Tick Subscriptions and Artifact feedback keep arriving.
+/stop interrupts the current turn, discards queued messages and pauses Triggers until your next message.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
-Chats you switch away from keep running their goals in this process.
+Chats you switch away from keep running in this process.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
 /slides [TOPIC] makes new Slides in Tickloop Artifacts; without a topic the Agent asks for one.
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
@@ -917,8 +914,9 @@ ctrl+g edits the draft in $VISUAL or $EDITOR (which may be Vim); saving and quit
 ctrl+v attaches the clipboard image as [Image #N], moved and deleted as one block; the model must accept image input.
 ctrl+r opens history search.
 History search uses ctrl+s for session/project/all scopes; enter/tab fills the draft.
-ctrl+j or alt/shift+enter inserts a real newline; ctrl+c clears a draft before interrupting.
-With an empty prompt, ctrl+c or ctrl+d must be pressed twice within 800ms to exit.
+ctrl+j or alt/shift+enter inserts a real newline.
+ctrl+c first closes candidates, then clears a draft; on an empty prompt it interrupts a running turn as esc does, or leaves this View when the Agent is idle (the Agent keeps running in the daemon).
+With an empty prompt, ctrl+d must be pressed twice within 800ms to exit.
 With a draft, ctrl+d deletes forward instead of exiting.
 On Unix, ctrl+z suspends this Agent process; run fg in the shell to resume it.
 esc twice clears a draft into history, or opens the rewind review when input is empty.
@@ -928,11 +926,11 @@ In transcript: / searches, enter accepts, n/N moves between matches; esc cancels
 j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
-/plan enters Plan mode and opens a saved plan for the selected goal; /plan GOAL views a specific saved plan.
-Monitor lists this Chat's background Shells and the Tick Subscriptions of its Loops: e changes a subscription's frequency, u cancels one, and x on a subscribed row cancels its subscriptions before hiding it.
+/plan enters Plan mode, or opens this Chat's saved plan.
+Monitor lists this Chat's background Shells and the Tick Subscriptions of its Loop: e changes a subscription's frequency, u cancels one, and x on a subscribed row cancels its subscriptions before hiding it.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
 Background Shell completions are added to their Chat as task notifications.
-A completion continues the goal that started the command; commands without a goal only record the notification.
+A completion continues the Loop once it has worked, unless its last turn was interrupted or failed; otherwise it is only recorded.
 /compact [INSTRUCTIONS] summarizes context behind a compaction boundary.
 /help advanced lists advanced commands; /exit closes this View; Agent work continues."#;
     format!(
@@ -1471,7 +1469,7 @@ fn write_banner(
         );
         outln!(
             console,
-            "Service: {}\n/loops new starts a new goal; /help lists commands; /exit closes this View; Agent work continues.",
+            "Service: {}\n/help lists commands; /exit closes this View; Agent work continues.",
             safe_text(&config.base_url)
         );
         return Ok(());
@@ -1536,7 +1534,6 @@ async fn open_current_plan(
     console: &Console,
     menus: &mut Menus,
     chat: Option<uuid::Uuid>,
-    goal: Option<uuid::Uuid>,
 ) -> Result<(), String> {
     if let Some(chat) = chat {
         let snapshot = agent
@@ -1554,15 +1551,14 @@ async fn open_current_plan(
         if let Some(plan) = snapshot
             .plans
             .iter()
-            .find(|plan| Some(plan.loop_id) == goal)
+            .find(|plan| plan.loop_id == snapshot.chat_loop.id)
         {
             if console.is_interactive() || plan.approval_pending {
-                return menus.workflow(console, Workflow::plan(agent, chat, plan.loop_id).await?);
+                return menus.workflow(console, Workflow::plan(agent, chat).await?);
             }
             outln!(
                 console,
-                "Plan: {} · version {} · approved mode {:?}\n{}",
-                plan.loop_id,
+                "Plan version {} · approved mode {:?}\n{}",
                 plan.version,
                 plan.approved_execution_mode,
                 safe_text(&plan.markdown)
@@ -1753,8 +1749,6 @@ async fn interact_with_herdr(
     let mut compaction_chats = HashMap::new();
     let mut directed_summaries = DirectedSummaryTasks::default();
     let mut summary_recovery_required = HashSet::new();
-    let mut goal = None;
-    let mut selected_loops = HashMap::new();
     let mut selected_chat = None;
     let mut global = crate::agent_console::AgentConsole::new(
         agent.access(),
@@ -1813,7 +1807,7 @@ async fn interact_with_herdr(
         StartupChat::New => {}
         StartupChat::Resumed(snapshot, has_history) => {
             learn_agent_colors(console, agent, &snapshot).await?;
-            goal = show_opened_chat(console, agent, &snapshot, has_history)?;
+            show_opened_chat(console, agent, &snapshot, has_history)?;
             selected_chat = Some(snapshot.id);
             displayed_sequences.insert(snapshot.id, snapshot.last_sequence);
             tools.restore(&snapshot.conversation_events());
@@ -1830,8 +1824,6 @@ async fn interact_with_herdr(
     let mut restored_view_path = None;
     if let Some(handoff) = view_handoff {
         global.restore_upgrade_navigation(handoff.selection.navigation);
-        selected_loops = handoff.selection.selected_loops;
-        goal = handoff.selection.goal;
         overview_active = handoff.selection.overview;
         agent.restore_upgrade_configuration(handoff.selection.configuration)?;
         if overview_active {
@@ -1875,9 +1867,6 @@ async fn interact_with_herdr(
     loop {
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
-        if let Some(chat) = selected_chat {
-            selected_loops.insert(chat, goal);
-        }
         menus.set_new_agent_directory(global.projection().dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
             agent
@@ -2024,16 +2013,14 @@ async fn interact_with_herdr(
                 tools.restore(&snapshot.conversation_events());
                 sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
             }
-            if let Some((chat, selected_goal)) = outcome.selection {
+            if let Some(chat) = outcome.selection {
                 if selected_chat != Some(chat) {
                     message_groups = MessageGroups::default();
                 }
                 selected_chat = Some(chat);
-                goal = selected_goal;
             }
             if let Some(receipt) = outcome.receipt {
                 selected_chat = Some(receipt.chat_id);
-                goal = Some(receipt.loop_id);
                 pending.insert(receipt.run_id, receipt);
             }
             if let Some(status) = outcome.status {
@@ -2160,7 +2147,7 @@ async fn interact_with_herdr(
                 } else if status.delegation.is_some() {
                     status.task_board.clone()
                 } else {
-                    goal.and_then(|id| status.task_boards.get(&id).cloned())
+                    status.task_boards.get(&status.chat_loop.id).cloned()
                 };
                 if let Some(cleanup) = completed_task_retention.observe(
                     if eof {
@@ -2184,10 +2171,8 @@ async fn interact_with_herdr(
                     .values()
                     .find(|receipt| {
                         receipt.chat_id == chat
-                            && status.loops.iter().any(|goal| {
-                                goal.run_id == Some(receipt.run_id)
-                                    && goal.state == tickloop_agent_protocol::LoopState::Running
-                            })
+                            && status.chat_loop.run_id == Some(receipt.run_id)
+                            && status.chat_loop.state == tickloop_agent_protocol::LoopState::Running
                     })
                     .or_else(|| pending.values().find(|receipt| receipt.chat_id == chat));
                 let running_loop = running_receipt.map(|receipt| receipt.loop_id);
@@ -2197,10 +2182,8 @@ async fn interact_with_herdr(
                     &global.projection().rows,
                     chat,
                     agent.disconnected().is_some(),
-                    !status.loops.is_empty()
-                        && status.loops.iter().all(|goal| {
-                            goal.state == tickloop_agent_protocol::LoopState::Completed
-                        })
+                    status.chat_loop.run_id.is_some()
+                        && status.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
                         && !pending.values().any(|receipt| receipt.chat_id == chat)
                         && agent.unknown_input(chat).is_none()
                         && status.queued_inputs().is_empty()
@@ -2479,9 +2462,7 @@ async fn interact_with_herdr(
             let selection = view_upgrade::ViewSelection {
                 navigation,
                 chat: selected_chat,
-                goal,
                 overview: overview_active,
-                selected_loops: selected_loops.clone(),
                 configuration,
             };
             // exec replaces this process without running destructors. Release the old
@@ -2829,7 +2810,6 @@ async fn interact_with_herdr(
                         };
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
-                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());
                             displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                             tools.restore(&snapshot.conversation_events());
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -2944,7 +2924,8 @@ async fn interact_with_herdr(
                         status_dirty=true;
                         continue;
                     }
-                    if console.confirm_control_c_exit()? {return Ok(());}
+                    // As in Codex: on an empty input a running turn is interrupted as Esc does, and
+                    // an idle Agent's View is left.
                     if let Some(chat) = selected_chat
                         && pending.values().any(|receipt| receipt.chat_id == chat)
                     {
@@ -2952,6 +2933,8 @@ async fn interact_with_herdr(
                         user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
                         stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
                         status_dirty=true;
+                    } else if console.leave_on_control_c()? {
+                        return Ok(());
                     }
                 },
                 Some(InputEvent::InterruptActivity) => {
@@ -3128,7 +3111,6 @@ async fn interact_with_herdr(
                             match agent.request_denial_retry(chat,record_id).await {
                                 Ok(receipt)=>{
                                     console.close_permissions()?;
-                                    goal=Some(receipt.loop_id);
                                     pending.insert(receipt.run_id,receipt);
                                     status_dirty=true;
                                     outln!(console,"New retry requested; the Agent will prepare the operation and check current permissions.");
@@ -3192,7 +3174,7 @@ async fn interact_with_herdr(
                     let echo=if retry_of.is_none() && queue_entry.is_none() {console.record_input(&history_line)?} else {None};
                     console.record_prompt_history(&history_line)?;
                     let starts_in_background = submission.execution()==shell_input::ShellExecution::Background;
-                    let sent=send_input(agent,chat,retry_of,agent.submit_user_shell_for_goal(chat,goal,submission.command().to_owned(),starts_in_background),|result|match result {
+                    let sent=send_input(agent,chat,retry_of,agent.submit_user_shell(chat,submission.command().to_owned(),starts_in_background),|result|match result {
                         CommandResult::ShellSubmitted(receipt)=>Some(receipt),
                         _=>None,
                     }).await;
@@ -3293,7 +3275,7 @@ async fn interact_with_herdr(
                         if let Some(((generation,session_id),view_id))=parsed {
                             match global.interpret(crate::agent_console::Intent::ChooseLocation {generation,view:ViewRef{session_id,view_id}}) {
                                 Ok(Some(effect))=>{if let Some(snapshot)=navigate_agent(&mut global,agent,console,&mut menus,effect,&displayed_sequences,&mut reply_lines).await? {
-                                    selected_chat=Some(snapshot.id);goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());overview_active=false;
+                                    selected_chat=Some(snapshot.id);overview_active=false;
                                     displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -3319,7 +3301,7 @@ async fn interact_with_herdr(
                         if line.trim()=="/clear" {
                             global.interpret(crate::agent_console::Intent::NewDraft).map_err(|error|error.to_string())?;
                             console.set_global_overview(None)?;console.clear_visible_agent()?;
-                            overview_active=false;selected_chat=None;goal=None;
+                            overview_active=false;selected_chat=None;
                             agent.display_chat(None).await.map_err(|error|error.to_string())?;
                             status_dirty=true;continue;
                         }
@@ -3338,7 +3320,7 @@ async fn interact_with_herdr(
                             match open_chat(agent,line.trim(),None).await {
                                 Ok(snapshot)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;goal=show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
+                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
@@ -3467,9 +3449,9 @@ async fn interact_with_herdr(
                         && let Some(chat) = selected_chat
                     {
                         let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                        let is_busy=status.loops.iter().any(|goal|matches!(goal.state,tickloop_agent_protocol::LoopState::Running|tickloop_agent_protocol::LoopState::WaitingPermission|tickloop_agent_protocol::LoopState::WaitingQuestion));
+                        let is_busy=matches!(status.chat_loop.state,tickloop_agent_protocol::LoopState::Running|tickloop_agent_protocol::LoopState::WaitingPermission|tickloop_agent_protocol::LoopState::WaitingQuestion);
                         if is_busy {
-                            let queued=agent.queue_command(chat,goal,original_input.clone());
+                            let queued=agent.queue_command(chat,original_input.clone());
                             match send_input(agent,chat,retry_of,queued,|result|match result {
                                 CommandResult::Queued { command_id }=>Some(command_id),
                                 _=>None,
@@ -3572,8 +3554,6 @@ async fn interact_with_herdr(
                             console.clear_visible_agent()?;
                             selected_chat=None;
                             agent.display_chat(None).await.map_err(|error|error.to_string())?;
-                            goal=None;
-
                             message_groups=MessageGroups::default();
                             tools.restore(&[]);
                         },
@@ -3593,17 +3573,13 @@ async fn interact_with_herdr(
                             Ok(picker) => menus.conversations(console,picker)?,
                             Err(error) => outln!(console,"{error}"),
                         },
-                        "/loops" if interactive => {
-                            if let Some(chat)=selected_chat {menus.workflow(console,Workflow::goals(agent,chat).await?)?;}
-                            else {outln!(console,"No Chat is selected. Enter a task first.");}
-                        },
                         "/monitor" => {
                             let show = !console.monitor_is_visible()?;
                             if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                         },
                         "/plan" => {
-                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat,goal).await {
+                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat).await {
                                 outln!(console,"Cannot open plan: {}",safe_text(&error));
                             }
                         },
@@ -3681,14 +3657,12 @@ async fn interact_with_herdr(
                         command if is_branch_command(command) => {
                             let preserve_until_summary_finishes=selected_chat
                                 .is_some_and(|chat| directed_summaries.contains(chat));
-                            match branch_from_terminal(console,agent,selected_chat,goal,command,preserve_until_summary_finishes).await {
+                            match branch_from_terminal(console,agent,selected_chat,command,preserve_until_summary_finishes).await {
                                 Ok(outcome) => {
                                     menus.dismiss(console)?;
                                     outln!(console,"Branched conversation \"{}\". You are now in the new Chat {}. Use /resume {} to return to the original.",safe_line(&outcome.name),outcome.child_chat_id,outcome.source_chat_id);
                                     workflows::write_public_history(console, &outcome.snapshot)?;
                                     selected_chat=Some(outcome.child_chat_id);
-                                    goal=None;
-
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(outcome.child_chat_id,outcome.snapshot.last_sequence);
                                     tools.restore(&outcome.snapshot.conversation_events());
@@ -3860,90 +3834,37 @@ async fn interact_with_herdr(
                                 let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 outln!(console, "Operations recorded in this process: {}",snapshot.operations.len());
                                 for operation in snapshot.operations {
-                                    outln!(console, "Operation: {} · {:?} · goal {}\n{} · {}",operation.id,operation.state,operation.loop_id,safe_text(&operation.name),safe_text(&operation.input.to_string()));
+                                    outln!(console, "Operation: {} · {:?}\n{} · {}",operation.id,operation.state,safe_text(&operation.name),safe_text(&operation.input.to_string()));
                                     if let Some(result)=operation.result {outln!(console, "Result: {}",safe_text(&result.content));}
                                 }
                             } else {outln!(console, "No Chat is selected.");}
                         },
                         _ if line=="/clear-trigger" || line.starts_with("/events ") || line.starts_with("/trigger ") => {
-                            if let (Some(chat),Some(selected_goal))=(selected_chat,goal) {
-                                match trigger_control(console, agent,chat,selected_goal,&line).await {
-                                    Ok(Some(receipt))=>{outln!(console, "Accepted: Goal {} · Run {}",receipt.loop_id,receipt.run_id);pending.insert(receipt.run_id,receipt);},
+                            if let Some(chat)=selected_chat {
+                                match trigger_control(console, agent,chat,&line).await {
+                                    Ok(Some(receipt))=>{outln!(console, "Accepted: Run {}",receipt.run_id);pending.insert(receipt.run_id,receipt);},
                                     Ok(None)=>{},
                                     Err(error)=>outln!(console, "Trigger control failed: {}",safe_text(&error)),
                                 }
-                            } else {outln!(console, "Select a Chat and goal first; use /loops.");}
-                        },
-                        "/loops" => {
-                            if let Some(chat) = selected_chat {
-                                let status = agent.status(chat).await.map_err(|error|error.to_string())?;
-                                for goal in status.loops { outln!(console, "Goal: {} · {:?} · {}",goal.id,goal.state,safe_text(&goal.goal)); }
-                            } else { outln!(console, "No Chat is selected."); }
-                        },
-                        _ if line.starts_with("/plan ") => {
-                            if let Some(chat) = selected_chat {
-                                let status = agent.status(chat).await.map_err(|error|error.to_string())?;
-                                let selected_goal = if let Some(value)=line.strip_prefix("/plan ") {value.trim().parse().ok()} else {goal};
-                                if let Some(plan)=status.plans.iter().find(|plan|Some(plan.loop_id)==selected_goal) {
-                                    if interactive || plan.approval_pending { menus.workflow(console, Workflow::plan(agent,chat,plan.loop_id).await?)?; } else { outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown)); }
-                                } else {outln!(console, "The selected goal has no saved plan.");}
-                            } else { outln!(console, "No Chat is selected."); }
+                            } else {outln!(console, "No Chat is selected.");}
                         },
                         "/interrupt" => {
                             if let Some(chat) = selected_chat {
                                 let operations = agent.interrupt(chat).await.map_err(|error|error.to_string())?;
-                                outln!(console, "Interrupt requested for the current run. The goal can continue with a new input.");
+                                outln!(console, "Interrupt requested for the current turn. Tick Subscriptions and Artifact feedback keep arriving.");
                                 for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
                             } else { outln!(console, "No Chat is selected."); }
                         },
-                        _ if line == "/stop" || line.starts_with("/stop ") => {
+                        "/stop" => {
                             if let Some(chat) = selected_chat {
-                                let selected_goal = if let Some(value) = line.strip_prefix("/stop ") { value.trim().parse().ok() } else { goal };
-                                if let Some(selected_goal) = selected_goal {
-                                    match agent.stop(chat, selected_goal).await {
-                                        Ok(operations) => {
-                                            pending.retain(|_,receipt|receipt.loop_id!=selected_goal);
-                                            permissions.retain(|_,request| request.chat_id!=chat || request.loop_id!=selected_goal);
-                                            questions.retain(|_,question|question.chat_id!=chat||question.loop_id!=selected_goal);
-                                            outln!(console, "Stopped goal {selected_goal}. Future inputs require another goal; use /loops new.");
-                                            for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
-                                        },
-                                        Err(error) => outln!(console, "Cannot stop goal: {}",safe_text(&error.to_string())),
-                                    }
-                                } else { outln!(console, "Use /stop GOAL, or select a goal first."); }
+                                match agent.stop(chat).await {
+                                    Ok(operations) => {
+                                        outln!(console, "{STOPPED_NOTICE}");
+                                        for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
+                                    },
+                                    Err(error) => outln!(console, "Cannot stop: {}",safe_text(&error.to_string())),
+                                }
                             } else { outln!(console, "No Chat is selected."); }
-                        },
-                        _ if line.split_whitespace().next() == Some("/loops") => {
-                            match loops::LoopCommand::parse(&line) {
-                                Ok(loops::LoopCommand::New) => {
-                                    goal=None;
-                                    outln!(console, "The next input will start a new goal in this Chat.");
-                                },
-                                Ok(action) => {
-                                    if let Some(chat)=selected_chat {
-                                        let result = async {
-                                            match action {
-                                                loops::LoopCommand::Select(id) => {
-                                                    let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                                                    if !status.loops.iter().any(|item|item.id==id) {return Err("Goal does not belong to the current Chat; use /loops.".to_string());}
-                                                    goal=Some(id);
-                                                    outln!(console,"Selected goal {id}.");
-                                                },
-                                                loops::LoopCommand::Trigger(id) => {
-                                                    let id=id.or(goal).ok_or("Select a goal first; use /loops.")?;
-                                                    let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                                                    let selected=status.loops.iter().find(|item|item.id==id).ok_or("Goal does not belong to the current Chat; use /loops.")?;
-                                                    outln!(console,"Goal: {id}\n{}",loops::trigger_lines(selected.trigger.as_ref()).join("\n"));
-                                                },
-                                                _ => unreachable!(),
-                                            }
-                                            Ok::<_,String>(())
-                                        }.await;
-                                        if let Err(error)=result {outln!(console,"Cannot manage Loop: {}",safe_text(&error));}
-                                    } else {outln!(console,"No Chat is selected.");}
-                                },
-                                Err(error) => outln!(console,"{error}"),
-                            }
                         },
                         _ if line.starts_with("/allow ") || line.starts_with("/deny ") => {
                             match answer_permission(agent,selected_chat,&line).await {
@@ -3974,9 +3895,8 @@ async fn interact_with_herdr(
                             match open_chat(agent, &line, selected_chat).await {
                                 Ok(snapshot) => {
                                     learn_agent_colors(console,agent,&snapshot).await?;
-                                    goal=show_opened_chat(console,agent,&snapshot,true)?;
+                                    show_opened_chat(console,agent,&snapshot,true)?;
                                     selected_chat=Some(snapshot.id);
-
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
@@ -4004,14 +3924,13 @@ async fn interact_with_herdr(
                                 outln!(console, "Unknown command; use /help.");
                                 continue;
                             }
-                            let sent=send_input(agent,chat_id,retry_of,agent.invoke_skill(chat_id, goal, name, arguments),submitted_receipt).await;
+                            let sent=send_input(agent,chat_id,retry_of,agent.invoke_skill(chat_id, name, arguments),submitted_receipt).await;
                             match sent {
                                 InputSend::Accepted { value: receipt, adopted } => {
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     suggestible_runs.insert(receipt.run_id);
-                                    goal = Some(receipt.loop_id);
-                                    if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
+                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id);}
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
                                 },
                                 InputSend::Unknown(id, error) => {
@@ -4058,7 +3977,6 @@ async fn interact_with_herdr(
                                 .collect::<Vec<_>>();
                             let submission = agent.submit_with_input_contexts(
                                 chat_id,
-                                goal,
                                 original_input,
                                 contexts,
                                 file_references,
@@ -4069,8 +3987,7 @@ async fn interact_with_herdr(
                                     suggestible_runs.insert(receipt.run_id);
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
-                                    goal = Some(receipt.loop_id);
-                                    if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
+                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id);}
                                     let run_id=receipt.run_id;
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
                                     if send_now && let Err(error)=agent.send_now(chat_id,run_id).await {
@@ -4433,9 +4350,7 @@ async fn interact_with_herdr(
                                 suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
                             }
                             event_frame.take();
-                            let status=turn_snapshot.status(agent,event.chat_id).await.map_err(|error|error.to_string())?;
-                            let stopped=status.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent_protocol::LoopState::Stopped);
-                            if interactive && !stopped {
+                            if interactive {
                                 // A declined call's result already says the run stopped there.
                                 if !interrupted_by_rejection {
                                     console.write_response(&[(format!("{}\n", presentation::interrupted_notice(console.display_profile()?)), Some(Role::MutedText))])?;
@@ -4445,15 +4360,14 @@ async fn interact_with_herdr(
                                     turn_snapshot.forget();
                                 }
                                 if interrupted_by_user
-                                    && let Some((restored,draft))=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
+                                    && let Some(restored)=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
                                 {
                                     displayed_sequences.insert(restored.id,restored.last_sequence);
                                     tools.restore(&restored.conversation_events());
                                     sync_snapshot(&restored,&mut pending,&mut permissions,&mut questions);
-                                    goal=draft.loop_id;
                                 }
                             } else {
-                                outln!(console, "\n{} goal {} · run {}",if stopped {"Stopped"} else {"Interrupted"},event.loop_id,event.run_id);
+                                outln!(console, "\nInterrupted run {}",event.run_id);
                             }
                         },
                         EventKind::InputMerged { into_run_id } => {
@@ -4463,7 +4377,6 @@ async fn interact_with_herdr(
                         },
                         EventKind::InputTakenBack | EventKind::ResponseStarted { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
-                        EventKind::GoalEnded {reason,operations} => print_goal_end(console, event.loop_id,&reason,&operations)?,
                         EventKind::Started => {
                             pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
                             if interactive {
@@ -4471,13 +4384,13 @@ async fn interact_with_herdr(
                             } else {
                                 event_frame.take();
                                 let status = turn_snapshot.status(agent, event.chat_id).await.map_err(|error|error.to_string())?;
-                                outln!(console, "Goal: {} · Run: {} · Running\nModel: {} · {:?}", event.loop_id, event.run_id,safe_text(&status.model.model),status.model.protocol);
+                                outln!(console, "Run: {} · Running\nModel: {} · {:?}", event.run_id,safe_text(&status.model.model),status.model.protocol);
                             }
                         },
                         // The terminal UI asks in its request dialog, outside the conversation.
                         EventKind::PermissionRequested {request} if !interactive => {
                             event_frame.take();
-                            if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id,request.loop_id).await?)?;}
+                            if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id).await?)?;}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
                             else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
                         },
@@ -4495,7 +4408,7 @@ async fn interact_with_herdr(
                         },
                         EventKind::ProgressUpdated {progress} => {
                             if !interactive {
-                                outln!(console, "\nProgress for goal {}:",progress.loop_id);
+                                outln!(console, "\nProgress:");
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
                         },
@@ -4525,7 +4438,7 @@ async fn interact_with_herdr(
                         let frame_hold=console.hold_frames()?;
                         let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                         drop(frame_hold);
-                        failed |= observation.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
+                        failed |= observation.snapshot.chat_loop.state==tickloop_agent_protocol::LoopState::Failed;
                         displayed_sequences.insert(chat,observation.snapshot.last_sequence);
                         let status=ChatStatus::of(&observation.snapshot);
                         sync_status(&status,&mut pending,&mut permissions,&mut questions);
@@ -4642,7 +4555,6 @@ async fn interact_with_herdr(
                             message_groups=MessageGroups::default();
                             sync_snapshot(&effect.snapshot,&mut pending,&mut permissions,&mut questions);
                             selected_chat=Some(metadata.chat);
-                            if effect.clear_goal {goal=None;}
                         },
                         Err(error) => {
                             let effect=directed_summary::finish_failure(console,&error)?;
@@ -4732,7 +4644,7 @@ async fn interact_with_herdr(
                                         if outcome_pending {
                                             if !overview_active && Some(status.id)==selected_chat {
                                                 let restored=restore_view(console,agent,&mut tools,status.id,*displayed_sequences.get(&status.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
-                                                failed |= restored.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
+                                                failed |= restored.snapshot.chat_loop.state==tickloop_agent_protocol::LoopState::Failed;
                                                 displayed_sequences.insert(status.id,restored.snapshot.last_sequence);
                                                 merged_echoes.close_all();
                                                 sync_snapshot(&restored.snapshot,&mut pending,&mut permissions,&mut questions);
@@ -4894,7 +4806,7 @@ async fn take_back_interrupted_prompt(
     console: &Console,
     chat: uuid::Uuid,
     run: uuid::Uuid,
-) -> Result<Option<(ChatSnapshot, TakenBackPrompt)>, String> {
+) -> Result<Option<ChatSnapshot>, String> {
     if !console.input_is_empty()? {
         return Ok(None);
     }
@@ -4912,7 +4824,7 @@ async fn take_back_interrupted_prompt(
     console.reset_chat(chat)?;
     workflows::write_public_history(console, &snapshot)?;
     console.restore_interrupted_prompt(&draft.prompt, &draft.contexts)?;
-    Ok(Some((snapshot, draft)))
+    Ok(Some(snapshot))
 }
 
 async fn open_rewind(
@@ -5407,8 +5319,8 @@ fn sync_status(
     }
 }
 
-/// The runs `status` still has in progress: each armed queued input and each Loop running or
-/// waiting on the user. A run outside them has ended, whether or not its end event arrived.
+/// The runs `status` still has in progress: each armed queued input and the Loop's run while it
+/// runs or waits on the user. A run outside them has ended, whether or not its end event arrived.
 fn receipts_in_progress(status: &ChatStatus) -> impl Iterator<Item = Receipt> + '_ {
     use tickloop_agent_protocol::LoopState;
     let queued = status
@@ -5416,19 +5328,20 @@ fn receipts_in_progress(status: &ChatStatus) -> impl Iterator<Item = Receipt> + 
         .iter()
         .filter(|input| input.armed)
         .map(|input| input.receipt.clone());
-    let running = status.loops.iter().filter_map(|goal| {
-        let run_id = goal.run_id.filter(|_| {
+    let chat_loop = &status.chat_loop;
+    let running = chat_loop
+        .run_id
+        .filter(|_| {
             matches!(
-                goal.state,
+                chat_loop.state,
                 LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
             )
-        })?;
-        Some(Receipt {
-            chat_id: status.id,
-            loop_id: goal.id,
-            run_id,
         })
-    });
+        .map(|run_id| Receipt {
+            chat_id: status.id,
+            loop_id: chat_loop.id,
+            run_id,
+        });
     queued.chain(running)
 }
 
@@ -5641,14 +5554,9 @@ fn render_restored_observation(
         console.reset_chat(chat)?;
         tools.restore(&conversation_events);
         workflows::write_public_history(console, &observation.snapshot)?;
-        for goal in observation
-            .snapshot
-            .loops
-            .iter()
-            .filter(|goal| goal.state == tickloop_agent_protocol::LoopState::Failed)
-        {
+        if observation.snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Failed {
             let error=observation.snapshot.events.iter().rev().find_map(|event| {
-                if event.loop_id==goal.id && let EventKind::Failed(error)=&event.kind {Some(error.as_str())} else {None}
+                if let EventKind::Failed(error)=&event.kind {Some(error.as_str())} else {None}
             }).unwrap_or("The execution failed before this View received its final update; inspect the saved execution history.");
             outln!(console, "Failed: {}", safe_text(error));
         }
@@ -5790,9 +5698,6 @@ fn render_restored_observation(
                     }
                 }
                 EventKind::Interrupted => outln!(console, "\nInterrupted"),
-                EventKind::GoalEnded { reason, operations } => {
-                    print_goal_end(console, event.loop_id, reason, operations)?
-                }
                 EventKind::ToolStarted { name, input, .. } => outln!(
                     console,
                     "\nTool {} · {}",
@@ -5811,14 +5716,13 @@ fn render_restored_observation(
                 ),
                 EventKind::PlanUpdated { plan } => outln!(
                     console,
-                    "\nPlan version {} for goal {}:\n{}",
+                    "\nPlan version {}:\n{}",
                     plan.version,
-                    plan.loop_id,
                     safe_text(&plan.markdown)
                 ),
                 // The Todo list shows progress; only plain output writes it out.
                 EventKind::ProgressUpdated { progress } if !console.is_interactive() => {
-                    outln!(console, "\nProgress for goal {}:", progress.loop_id);
+                    outln!(console, "\nProgress:");
                     for todo in &progress.todos {
                         outln!(console, "  {:?}: {}", todo.status, safe_text(&todo.content));
                     }
@@ -5844,15 +5748,7 @@ fn render_restored_observation(
     reconcile_consumed_input_echoes(console, &observation.snapshot)?;
     if !console.is_interactive() {
         outln!(console,);
-        for goal in &observation.snapshot.loops {
-            outln!(
-                console,
-                "Goal: {} · {:?} · {}",
-                goal.id,
-                goal.state,
-                safe_text(&goal.goal)
-            );
-        }
+        outln!(console, "Loop: {:?}", observation.snapshot.chat_loop.state);
     }
     for input in observation
         .snapshot
@@ -5869,8 +5765,7 @@ fn render_restored_observation(
         } else {
             outln!(
                 console,
-                "Saved input awaiting manual continuation: Goal {} · Run {}\n{}",
-                input.receipt.loop_id,
+                "Saved input awaiting manual continuation: Run {}\n{}",
                 input.receipt.run_id,
                 safe_text(&input.input)
             );
@@ -5912,12 +5807,7 @@ fn print_question(console: &Console, request: &QuestionRequest) -> Result<(), St
     if console.is_interactive() {
         return Ok(());
     }
-    outln!(
-        console,
-        "\nQuestion: {} · goal {}",
-        request.id,
-        request.loop_id
-    );
+    outln!(console, "\nQuestion: {}", request.id);
     let total = request.questions.len();
     for (index, question) in request.questions.iter().enumerate() {
         for line in questions::question_lines(question, index, total) {
@@ -5957,30 +5847,10 @@ async fn answer_typed_question(
     Ok(())
 }
 
-fn print_goal_end(
-    console: &Console,
-    goal: uuid::Uuid,
-    reason: &str,
-    operations: &[tickloop_agent_protocol::OperationRecord],
-) -> Result<(), String> {
-    outln!(console, "\nGoal {goal} ended: {}", safe_text(reason));
-    for operation in operations {
-        outln!(
-            console,
-            "Operation {} remains {:?}: {}",
-            operation.id,
-            operation.state,
-            safe_text(&operation.name)
-        );
-    }
-    Ok(())
-}
-
 async fn trigger_control(
     console: &Console,
     agent: &Agent,
     chat: uuid::Uuid,
-    goal: uuid::Uuid,
     command: &str,
 ) -> Result<Option<Receipt>, String> {
     if let Some(arguments) = command.strip_prefix("/trigger ") {
@@ -5993,7 +5863,7 @@ async fn trigger_control(
             .map_err(|_| "event payload must be valid JSON")?
             .unwrap_or(serde_json::Value::Null);
         return agent
-            .trigger(chat, goal, TriggerSource { source, payload })
+            .trigger(chat, TriggerSource { source, payload })
             .await
             .map(Some)
             .map_err(|error| error.to_string());
@@ -6002,19 +5872,13 @@ async fn trigger_control(
         .snapshot(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let current = snapshot
-        .loops
-        .iter()
-        .find(|item| item.id == goal)
-        .ok_or("goal does not exist")?
-        .trigger
-        .clone();
+    let current = snapshot.chat_loop.trigger;
     if command == "/clear-trigger" {
         agent
-            .configure_trigger(chat, goal, None)
+            .configure_trigger(chat, None)
             .await
             .map_err(|error| error.to_string())?;
-        outln!(console, "Trigger disabled for goal {goal}.");
+        outln!(console, "Trigger disabled.");
         return Ok(None);
     }
     let mut trigger = current.unwrap_or(Trigger {
@@ -6032,7 +5896,7 @@ async fn trigger_control(
         trigger.accepts_events = true;
     }
     agent
-        .configure_trigger(chat, goal, Some(trigger.clone()))
+        .configure_trigger(chat, Some(trigger.clone()))
         .await
         .map_err(|error| error.to_string())?;
     print_trigger(console, &trigger)?;
@@ -6042,7 +5906,6 @@ async fn trigger_control(
 async fn parse_after_turn(
     agent: &Agent,
     chat: uuid::Uuid,
-    selected_loop: Option<uuid::Uuid>,
     command: &str,
 ) -> Result<AfterTurnAction, AccessError> {
     use tickloop_agent_protocol::{
@@ -6125,10 +5988,7 @@ async fn parse_after_turn(
             })
         }
         "/clear-trigger" => Ok(AfterTurnAction::Loop {
-            action: LoopAction::ConfigureTrigger {
-                loop_id: selected_loop.ok_or_else(|| invalid("select a Loop first"))?,
-                trigger: None,
-            },
+            action: LoopAction::ConfigureTrigger { trigger: None },
         }),
         "/trigger" => {
             let (source, payload) = arguments
@@ -6138,7 +5998,6 @@ async fn parse_after_turn(
                 .map_err(|_| invalid("event payload must be valid JSON"))?;
             Ok(AfterTurnAction::Loop {
                 action: LoopAction::EmitTrigger {
-                    loop_id: selected_loop.ok_or_else(|| invalid("select a Loop first"))?,
                     source: TriggerSource {
                         source: source.into(),
                         payload,
@@ -6147,30 +6006,21 @@ async fn parse_after_turn(
             })
         }
         "/events" => {
-            let loop_id = selected_loop.ok_or_else(|| invalid("select a Loop first"))?;
             let snapshot = agent.snapshot(chat).await?;
-            let mut trigger = snapshot
-                .loops
-                .iter()
-                .find(|item| item.id == loop_id)
-                .ok_or_else(|| AccessError::not_found("Loop does not exist"))?
-                .trigger
-                .clone()
-                .unwrap_or(Trigger {
-                    id: uuid::Uuid::new_v4(),
-                    prompt: String::new(),
-                    prompt_source: TriggerPromptSource::Explicit,
-                    accepts_events: false,
-                    armed: true,
-                    subscriptions: Vec::new(),
-                });
+            let mut trigger = snapshot.chat_loop.trigger.unwrap_or(Trigger {
+                id: uuid::Uuid::new_v4(),
+                prompt: String::new(),
+                prompt_source: TriggerPromptSource::Explicit,
+                accepts_events: false,
+                armed: true,
+                subscriptions: Vec::new(),
+            });
             trigger.id = uuid::Uuid::new_v4();
             trigger.armed = true;
             trigger.accepts_events = true;
             trigger.set_explicit_prompt(arguments.into());
             Ok(AfterTurnAction::Loop {
                 action: LoopAction::ConfigureTrigger {
-                    loop_id,
                     trigger: Some(trigger),
                 },
             })
@@ -6264,11 +6114,10 @@ fn print_command(
 ) -> Result<(), String> {
     outln!(
         console,
-        "\nCommand: {} · {:?} · PID {:?} · goal {}\n{}\nDirectory: {}\nExit code: {:?} · Signal: {:?} · Output bytes: {}\nFull output: {}",
+        "\nCommand: {} · {:?} · PID {:?}\n{}\nDirectory: {}\nExit code: {:?} · Signal: {:?} · Output bytes: {}\nFull output: {}",
         command.operation_id,
         command.state,
         command.pid,
-        command.loop_id,
         safe_text(&command.command),
         safe_text(&command.cwd.to_string_lossy()),
         command.exit_code,
@@ -7007,7 +6856,7 @@ async fn update_rule(agent: &Agent, chat: uuid::Uuid, command: &str) -> Result<S
             Ok(format!("Rule removed: {id}"))
         }
         RuleCommand::Add(rule) => {
-            let message = rule_added_message(&rule, "all goals and inputs in this Chat");
+            let message = rule_added_message(&rule, "all inputs in this Chat");
             agent
                 .apply_permission_change(chat, PermissionChange::UpsertRule { rule }, view.revision)
                 .await
@@ -7220,33 +7069,30 @@ fn write_warning(console: &Console, warning: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 把刚切到前台的 Chat 历史写入视图；只有一个 goal 时自动选中它。
+/// 把刚切到前台的 Chat 历史写入视图。
 fn show_opened_chat(
     console: &Console,
     agent: &Agent,
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
     has_history: bool,
-) -> Result<Option<uuid::Uuid>, String> {
+) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
     console.reset_chat(snapshot.id)?;
-    let goal = snapshot.default_input_loop();
     outln!(console, "Chat: {}", snapshot.id);
     for warning in agent.transcript_load_warnings(snapshot.id) {
         write_warning(console, &warning)?;
     }
     show_settings_warnings(console, agent.user_settings_warnings(snapshot.id))?;
     workflows::write_public_history(console, snapshot)?;
-    let action = if goal.is_some() {
-        "continue the selected goal"
-    } else {
-        "start a new goal in this Chat"
-    };
     if has_history {
-        outln!(console, "\nHistory opened. Enter a message to {action}.");
+        outln!(
+            console,
+            "\nHistory opened. Enter a message to continue this Chat; sending it resumes receiving Triggers."
+        );
     } else {
-        outln!(console, "Enter a message to {action}.");
+        outln!(console, "Enter a message to continue this Chat.");
     }
-    Ok(goal)
+    Ok(())
 }
 
 /// What a background notice calls an Agent before this View has received its snapshot.
@@ -7353,17 +7199,6 @@ fn track_run_requests(
         run_id: event.run_id,
     };
     match &event.kind {
-        EventKind::GoalEnded { .. } => {
-            permissions.retain(|_, request| {
-                request.chat_id != event.chat_id || request.loop_id != event.loop_id
-            });
-            questions.retain(|_, question| {
-                question.chat_id != event.chat_id || question.loop_id != event.loop_id
-            });
-            pending.retain(|_, receipt| {
-                receipt.chat_id != event.chat_id || receipt.loop_id != event.loop_id
-            });
-        }
         EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
             permissions.retain(|_, request| request.run_id != Some(event.run_id));
             questions.retain(|_, question| question.run_id != event.run_id);
@@ -7558,30 +7393,20 @@ fn recover_background_chat(
     let known_questions = questions.keys().copied().collect::<HashSet<_>>();
     sync_status(status, pending, permissions, questions);
     let mut recovery = BackgroundRecovery::default();
-    let mut ended_loops = HashSet::new();
-    for receipt in runs_before {
-        if pending.contains_key(&receipt.run_id) || !ended_loops.insert(receipt.loop_id) {
-            continue;
-        }
-        let state = status
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .map(|goal| goal.state.clone());
-        let outcome = match state {
-            Some(LoopState::Failed) => {
-                recovery.failed = true;
-                "failed"
-            }
-            Some(LoopState::Interrupted | LoopState::Stopped) => "interrupted",
-            Some(
-                LoopState::Running
-                | LoopState::Queued
-                | LoopState::WaitingPermission
-                | LoopState::WaitingQuestion,
-            ) => continue,
-            _ => REPLY_COMPLETED_NOTICE,
-        };
+    let run_ended = runs_before
+        .iter()
+        .any(|receipt| !pending.contains_key(&receipt.run_id));
+    let outcome = match status.chat_loop.state {
+        LoopState::Failed => Some("failed"),
+        LoopState::Interrupted => Some("interrupted"),
+        LoopState::Running
+        | LoopState::Queued
+        | LoopState::WaitingPermission
+        | LoopState::WaitingQuestion => None,
+        LoopState::Idle | LoopState::WaitingPlan => Some(REPLY_COMPLETED_NOTICE),
+    };
+    if run_ended && let Some(outcome) = outcome {
+        recovery.failed = outcome == "failed";
         recovery.run_notices.push(BackgroundRunNotice {
             message: outcome.into(),
             compact_message: None,
@@ -7735,15 +7560,7 @@ fn family_input_targets(
                 .as_ref()
                 .map(|registration| registration.description.clone())
                 .unwrap_or_else(|| row.title.clone()),
-            available: row.execution != viewed
-                && row.availability == ExecutionAvailability::Live
-                && !matches!(
-                    row.state,
-                    tickloop_agent_protocol::LoopState::Stopped
-                        | tickloop_agent_protocol::LoopState::Interrupted
-                        | tickloop_agent_protocol::LoopState::Failed
-                        | tickloop_agent_protocol::LoopState::Expired
-                ),
+            available: row.execution != viewed && row.availability == ExecutionAvailability::Live,
         })
         .collect::<Vec<_>>();
     targets.sort_by_key(|target| {
@@ -7813,14 +7630,11 @@ fn agent_status_label(row: &AgentSummary) -> &'static str {
         LoopState::WaitingPermission => "Needs approval",
         LoopState::WaitingQuestion => "Needs answer",
         LoopState::WaitingPlan => "Plan review",
-        LoopState::WaitingTrigger => "Waiting · trigger",
         LoopState::Idle if row.has_work.is_none() => "Idle · work unknown",
+        LoopState::Idle if row.run_id.is_some() => "Completed",
         LoopState::Idle => "Idle",
-        LoopState::Completed => "Completed",
         LoopState::Failed => "Failed",
         LoopState::Interrupted => "Interrupted",
-        LoopState::Stopped => "Stopped",
-        LoopState::Expired => "Expired",
     }
 }
 
@@ -7845,7 +7659,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 group,
                 glyph: console::status_glyph(
                     group,
-                    row.state == tickloop_agent_protocol::LoopState::Completed,
+                    row.state == tickloop_agent_protocol::LoopState::Idle,
                 ),
                 preview: row.preview.as_deref().map(safe_line),
                 updated_at: row.updated_at,
@@ -7877,7 +7691,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 .unwrap_or(root.group);
             root.glyph = console::status_glyph(
                 root.group,
-                root.state == tickloop_agent_protocol::LoopState::Completed,
+                root.state == tickloop_agent_protocol::LoopState::Idle,
             );
         }
     } else {
@@ -8170,7 +7984,7 @@ mod tests {
                    parent: Option<tickloop_agent_protocol::ExecutionRef>,
                    title: &str,
                    questions: usize| {
-            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"folder":"/test","state":"Completed","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
+            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"folder":"/test","state":"Idle","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
         };
         let projection = crate::agent_console::Projection {
             overview: true,
@@ -8214,7 +8028,7 @@ mod tests {
                 make_row(
                     root,
                     None::<tickloop_agent_protocol::ExecutionRef>,
-                    "Stopped",
+                    "Interrupted",
                     0,
                 ),
                 make_row(child, Some(root), "WaitingQuestion", 1),
@@ -8236,7 +8050,7 @@ mod tests {
             agent_id: uuid::Uuid::new_v4(),
             ..child
         };
-        let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"folder":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
+        let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"folder":"/test","state":"Idle","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
         let display = super::display::DisplayProfile::default();
         let line = super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
@@ -8255,7 +8069,7 @@ mod tests {
             target_run_id: run,
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_agent_protocol::LoopState::Completed),
+            state: Some(tickloop_agent_protocol::LoopState::Idle),
         };
         let completion = tickloop_agent_protocol::FamilyCompletion {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Pending,
@@ -8264,7 +8078,7 @@ mod tests {
             child_loop_id: loop_id,
             child_run_id: run,
             handle: "audit".into(),
-            state: tickloop_agent_protocol::LoopState::Completed,
+            state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8273,7 +8087,7 @@ mod tests {
             run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8357,7 +8171,7 @@ mod tests {
             target_run_id: run,
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_agent_protocol::LoopState::Completed),
+            state: Some(tickloop_agent_protocol::LoopState::Idle),
         };
         let completion = tickloop_agent_protocol::FamilyCompletion {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Foreground,
@@ -8366,7 +8180,7 @@ mod tests {
             child_loop_id: loop_id,
             child_run_id: run,
             handle: "audit".into(),
-            state: tickloop_agent_protocol::LoopState::Completed,
+            state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8375,7 +8189,7 @@ mod tests {
             run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8459,7 +8273,7 @@ mod tests {
             target_run_id: run,
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_agent_protocol::LoopState::Completed),
+            state: Some(tickloop_agent_protocol::LoopState::Idle),
         };
         let completion = tickloop_agent_protocol::FamilyCompletion {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Rejected(
@@ -8473,7 +8287,7 @@ mod tests {
             child_loop_id: loop_id,
             child_run_id: run,
             handle: "audit".into(),
-            state: tickloop_agent_protocol::LoopState::Completed,
+            state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8482,7 +8296,7 @@ mod tests {
             run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8573,7 +8387,7 @@ mod tests {
             child_loop_id: uuid::Uuid::new_v4(),
             child_run_id: child_run,
             handle: "audit".into(),
-            state: tickloop_agent_protocol::LoopState::Completed,
+            state: tickloop_agent_protocol::LoopState::Idle,
             result: tickloop_agent_protocol::SUBAGENT_REPORT_RECEIPT.into(),
             error: None,
             started_at: Some(1_000),
@@ -8587,7 +8401,7 @@ mod tests {
             let chat = uuid::Uuid::new_v4();
             let run = uuid::Uuid::new_v4();
             let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-                "id":chat,"folder":"/work","loops":[],
+                "id":chat,"folder":"/work","chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},
                 "messages":[{"role":"user","content":[{"type":"text","text":text}]}]
             }))
             .unwrap();
@@ -8626,10 +8440,10 @@ mod tests {
         let payload = serde_json::json!({"items":[{"instance":instance,"title":"Stock watcher","seq":"7","updates":1,"data":{"text":"second check"}}]});
         let text = tickloop_agent_protocol::local_messages::tick_delivery(
             &payload,
-            &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
+            &tickloop_agent_protocol::Trigger::for_subscriptions(),
         );
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         })).unwrap();
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
         snapshot.message_runs.insert(0, run);
@@ -8694,9 +8508,9 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let tick = tickloop_agent_protocol::local_messages::tick_delivery(
             &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
-            &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
+            &tickloop_agent_protocol::Trigger::for_subscriptions(),
         );
-        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"loops":[]})).unwrap();
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
         snapshot.message_runs.insert(0, run);
         let console = Console::test_interactive_for_chat(chat);
         for _ in 0..2 {
@@ -8718,7 +8532,7 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let text = "@tickloop request req-1 on artifact doc. Request input JSON:\n{\"message\":\"please update\"}";
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         })).unwrap();
         snapshot.artifact_ticks.push(serde_json::from_value(serde_json::json!({"artifact_id":"doc","origin":"https://docs.example","title":"doc","format":"html","url":"https://docs.example/artifact/doc","access_role":"owner","added_at_ms":1})).unwrap());
         snapshot.monitor.mark_taken_in(
@@ -8806,7 +8620,7 @@ mod tests {
             "<agent-message>{}</agent-message>",
             serde_json::json!({"source":{"sender_relationship":"child","sender_handle":"audit","sender_label":"Report check","is_result":false},"message":"Which year should I use?"})
         );
-        let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]})).unwrap();
+        let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
         snapshot.message_ids.insert(0, source);
         snapshot.message_runs.insert(0, run);
         snapshot
@@ -9176,8 +8990,8 @@ mod tests {
         .unwrap();
         let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        let source = agent
-            .submit(source_chat_id, None, "source prompt".into())
+        agent
+            .submit(source_chat_id, "source prompt".into())
             .await
             .unwrap();
         loop {
@@ -9194,7 +9008,6 @@ mod tests {
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
                 source_chat_id,
-                source_loop_id: Some(source.loop_id),
                 name: Some("recoverable child".into()),
             })
             .await
@@ -9254,11 +9067,7 @@ mod tests {
             .choose(&reopened, &console, Some(child_index))
             .await
             .unwrap();
-        // 子 Chat 带着分出点之前创建的唯一 Loop，选择器随之选中它。
-        assert_eq!(
-            effect.selection,
-            Some((child_chat_id, Some(source.loop_id)))
-        );
+        assert_eq!(effect.selection, Some(child_chat_id));
         // Branch 的创建请求与复制种子只在创建它的进程内有效，恢复时由元数据只还原来源与名称。
         let mut restored_child = durable_child.clone();
         restored_child["branch_origin"]["creation"] = serde_json::Value::Null;
@@ -9375,7 +9184,7 @@ mod tests {
 
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Record this prompt".into())
+            .submit(chat, "Record this prompt".into())
             .await
             .unwrap();
         loop {
@@ -9417,7 +9226,7 @@ mod tests {
         );
 
         agent
-            .submit(chat, None, "Request a file write".into())
+            .submit(chat, "Request a file write".into())
             .await
             .unwrap();
         loop {
@@ -9503,7 +9312,6 @@ mod tests {
         let receipt = agent
             .submit_with_input_contexts(
                 chat,
-                None,
                 prompt.into(),
                 vec![InputContext::Image(image.clone())],
                 Vec::new(),
@@ -9539,13 +9347,11 @@ mod tests {
         let console = Console::test_interactive_for_chat(chat);
         super::workflows::write_public_history(&console, &agent.snapshot(chat).await.unwrap())
             .unwrap();
-        let (snapshot, draft) =
-            super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
-                .await
-                .unwrap()
-                .expect("an empty editor gets the prompt back");
+        let snapshot = super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
+            .await
+            .unwrap()
+            .expect("an empty editor gets the prompt back");
         assert!(snapshot.messages.is_empty());
-        assert_eq!(draft.loop_id, None);
         assert!(!console.test_conversation_text().contains(prompt));
         assert_eq!(console.test_draft(), prompt);
         assert_eq!(console.test_draft_images(), [image]);
@@ -9587,7 +9393,7 @@ mod tests {
             .unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
-            .submit(background_chat, None, "Write in the background".into())
+            .submit(background_chat, "Write in the background".into())
             .await
             .unwrap();
         let request = loop {

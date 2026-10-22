@@ -4,7 +4,7 @@ use tickloop_agent_protocol::{ChatId, DelegationParent, MAX_SUBAGENT_DEPTH};
 
 use crate::Chat;
 use crate::{Agent, AgentError};
-use tickloop_agent_protocol::{CommandState, LoopState, OperationRecord, Receipt, UserShellState};
+use tickloop_agent_protocol::{CommandState, OperationRecord, Receipt, UserShellState};
 use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 use tokio_util::sync::CancellationToken;
 
@@ -143,13 +143,6 @@ impl Agent {
                     },
                 );
                 child.ready_runs.clear();
-                let parent = child.snapshot.delegation.as_ref().unwrap().parent_chat_id;
-                let loops = child
-                    .snapshot
-                    .loops
-                    .iter()
-                    .map(|goal| goal.id)
-                    .collect::<Vec<_>>();
                 let commands = child
                     .snapshot
                     .commands
@@ -182,23 +175,21 @@ impl Agent {
                     })
                     .collect::<Vec<_>>();
                 self.save(&child.snapshot);
-                members.push((id, parent, loops, commands, shells));
+                members.push((id, commands, shells));
             }
             members
         };
         let mut unknown = Vec::new();
         let mut errors = Vec::new();
-        for (id, parent, loops, commands, shells) in &members {
-            for loop_id in loops {
-                match self.end_goal(*id, *loop_id).await {
-                    Ok(operations) => unknown.extend(operations),
-                    Err(error) => errors.push(SubagentStopFailure {
-                        chat_id: *id,
-                        operation_id: Some(*loop_id),
-                        stage: "loop",
-                        error: error.to_string(),
-                    }),
-                }
+        for (id, commands, shells) in &members {
+            match self.stop_loop(*id).await {
+                Ok(operations) => unknown.extend(operations),
+                Err(error) => errors.push(SubagentStopFailure {
+                    chat_id: *id,
+                    operation_id: None,
+                    stage: "loop",
+                    error: error.to_string(),
+                }),
             }
             for command in commands {
                 if let Err(error) = self.stop_command(*id, *command).await {
@@ -223,42 +214,27 @@ impl Agent {
             let settled = {
                 let chats = self.inner.chats.lock().await;
                 let child = &chats[id];
-                child
-                    .snapshot
-                    .loops
-                    .iter()
-                    .filter_map(|goal| {
-                        let run_id = goal.run_id?;
-                        (child.active_run != Some(run_id)
-                            && !child.parked.contains_key(&run_id)
-                            && !child.family_finishing.contains(&run_id)
-                            && matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                        .then(|| {
-                            (
-                                Receipt {
-                                    chat_id: *id,
-                                    loop_id: goal.id,
-                                    run_id,
-                                },
-                                child.snapshot.clone(),
-                            )
-                        })
+                let chat_loop = &child.snapshot.chat_loop;
+                chat_loop
+                    .run_id
+                    .filter(|run_id| {
+                        child.active_run != Some(*run_id)
+                            && !child.parked.contains_key(run_id)
+                            && !child.family_finishing.contains(run_id)
                     })
-                    .collect::<Vec<_>>()
+                    .map(|run_id| {
+                        (
+                            Receipt {
+                                chat_id: *id,
+                                loop_id: chat_loop.id,
+                                run_id,
+                            },
+                            child.snapshot.clone(),
+                        )
+                    })
             };
-            for (receipt, snapshot) in settled {
+            if let Some((receipt, snapshot)) = settled {
                 self.record_family_completion(&receipt, &snapshot).await;
-            }
-            let hook = self.inner.stopped_child_hook.read().unwrap().clone();
-            if let Some(hook) = hook
-                && let Err(error) = hook.child_stopped(*parent, *id).await
-            {
-                errors.push(SubagentStopFailure {
-                    chat_id: *id,
-                    operation_id: None,
-                    stage: "hosted_ticks",
-                    error,
-                });
             }
         }
         let mut chats = self.inner.chats.lock().await;
@@ -325,34 +301,35 @@ impl Agent {
                     children.push(child.snapshot.id);
                     let live = child.active_run.is_some() || !child.parked.is_empty();
                     pending |= live;
-                    for run in child.snapshot.loops.iter().filter_map(|goal| goal.run_id) {
-                        if foreground.contains(&run) {
-                            continue;
+                    if let Some(run) = child
+                        .snapshot
+                        .chat_loop
+                        .run_id
+                        .filter(|run| !foreground.contains(run))
+                    {
+                        let is_reported = parent
+                            .snapshot
+                            .family_completions
+                            .iter()
+                            .find(|completion| {
+                                completion.child_chat_id == child.snapshot.id
+                                    && completion.child_run_id == run
+                            })
+                            .is_some_and(|completion| {
+                                !matches!(
+                                    completion.notification,
+                                    tickloop_agent_protocol::SubagentNotificationDelivery::Pending
+                                )
+                            });
+                        if !is_reported {
+                            if !live && !child.family_finishing.contains(&run) {
+                                return Err(format!(
+                                    "Subagent {} has an interrupted or unknown run without a live executor; explicitly continue or stop that child before reporting completion",
+                                    child.snapshot.id
+                                ));
+                            }
+                            pending = true;
                         }
-                        let completion =
-                            parent
-                                .snapshot
-                                .family_completions
-                                .iter()
-                                .find(|completion| {
-                                    completion.child_chat_id == child.snapshot.id
-                                        && completion.child_run_id == run
-                                });
-                        if completion.is_some_and(|completion| {
-                            !matches!(
-                                completion.notification,
-                                tickloop_agent_protocol::SubagentNotificationDelivery::Pending
-                            )
-                        }) {
-                            continue;
-                        }
-                        if !live && !child.family_finishing.contains(&run) {
-                            return Err(format!(
-                                "Subagent {} has an interrupted or unknown run without a live executor; explicitly continue or stop that child before reporting completion",
-                                child.snapshot.id
-                            ));
-                        }
-                        pending = true;
                     }
                 }
                 children.sort();

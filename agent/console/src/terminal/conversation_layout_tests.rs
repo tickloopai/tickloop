@@ -269,13 +269,10 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Audit the build".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Audit the build".into()).await.unwrap();
     finish_run(&agent, chat, &mut events).await;
     agent
-        .submit(chat, None, "Continue with the edit".into())
+        .submit(chat, "Continue with the edit".into())
         .await
         .unwrap();
     finish_run(&agent, chat, &mut events).await;
@@ -381,7 +378,7 @@ async fn questions_show_only_their_answers_or_decline_alike() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Shorten the report".into())
+        .submit(chat, "Shorten the report".into())
         .await
         .unwrap();
     let mut answered = false;
@@ -571,7 +568,7 @@ async fn settle(agent: &Agent, chat: Uuid, ready: impl Fn(&ChatSnapshot) -> bool
             let snapshot = agent.snapshot(chat).await.unwrap();
             *latest.lock().unwrap() = Some(format!(
                 "{:?}\n{:?}\n{:?}",
-                snapshot.loops,
+                snapshot.chat_loop,
                 snapshot.messages,
                 snapshot
                     .events
@@ -580,13 +577,11 @@ async fn settle(agent: &Agent, chat: Uuid, ready: impl Fn(&ChatSnapshot) -> bool
                     .collect::<Vec<_>>()
             ));
             let idle = snapshot.pending_inputs.is_empty()
-                && snapshot.loops.iter().all(|goal| {
-                    !matches!(
-                        goal.state,
-                        tickloop_agent_protocol::LoopState::Running
-                            | tickloop_agent_protocol::LoopState::Queued
-                    )
-                });
+                && !matches!(
+                    snapshot.chat_loop.state,
+                    tickloop_agent_protocol::LoopState::Running
+                        | tickloop_agent_protocol::LoopState::Queued
+                );
             if idle && ready(&snapshot) {
                 return snapshot;
             }
@@ -651,7 +646,7 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
     let model = Arc::new(FamilyScript::reporting());
     let (core, agent, chat) = family(model.clone(), ExecutionMode::Auto, &workdir).await;
     agent
-        .submit(chat, None, "Check the config, then scan the logs".into())
+        .submit(chat, "Check the config, then scan the logs".into())
         .await
         .unwrap();
     settle(&agent, chat, |snapshot| {
@@ -806,7 +801,7 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
     }));
     let (core, agent, chat) = family(model.clone(), ExecutionMode::FullAccess, &workdir).await;
     agent
-        .submit(chat, None, "Scan in the background".into())
+        .submit(chat, "Scan in the background".into())
         .await
         .unwrap();
     settle(&agent, chat, |snapshot| says(snapshot, "Started.")).await;
@@ -867,7 +862,7 @@ async fn a_finished_user_shell_shows_the_result_the_agent_records() {
         ("printf 'boom\\n'; exit 3", UserShellState::Failed),
     ] {
         let receipt = agent
-            .submit_user_shell_for_goal(chat, None, command.into(), false)
+            .submit_user_shell(chat, command.into(), false)
             .await
             .unwrap();
         let record = loop {

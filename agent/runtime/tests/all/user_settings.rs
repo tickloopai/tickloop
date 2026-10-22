@@ -377,7 +377,7 @@ fn rule(tool: &str, persistent: bool) -> PermissionRule {
 /// 运行一轮对话；遇到权限请求时按 `scope` 批准。返回这一轮是否请求过权限。
 async fn run_turn(agent: &Agent, chat: ChatId, prompt: &str, scope: PermissionScope) -> bool {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut asked = false;
     loop {
         let event = next_event(&mut events).await;
@@ -532,7 +532,7 @@ async fn a_saved_shell_rule_applies_immediately_to_the_current_session() {
 
     let mut events = agent.subscribe();
     let first_run = agent
-        .submit(first, None, "Run the exact command".into())
+        .submit(first, "Run the exact command".into())
         .await
         .unwrap();
     loop {
@@ -558,7 +558,7 @@ async fn a_saved_shell_rule_applies_immediately_to_the_current_session() {
     }
 
     let second_run = agent
-        .submit(second, None, "Run the exact command again".into())
+        .submit(second, "Run the exact command again".into())
         .await
         .unwrap();
     loop {
@@ -608,10 +608,7 @@ async fn a_saved_shell_prefix_rule_applies_in_current_and_future_sessions() {
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
 
-    let first_run = agent
-        .submit(chat, None, "Read one line".into())
-        .await
-        .unwrap();
+    let first_run = agent.submit(chat, "Read one line".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != first_run.run_id {
@@ -635,10 +632,7 @@ async fn a_saved_shell_prefix_rule_applies_in_current_and_future_sessions() {
         }
     }
 
-    let current_session = agent
-        .submit(chat, None, "Read two lines".into())
-        .await
-        .unwrap();
+    let current_session = agent.submit(chat, "Read two lines".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != current_session.run_id {
@@ -977,7 +971,7 @@ async fn persistent_rule_changes_reach_other_loaded_chats_of_the_project() {
 
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(observing, None, "Run the command".into())
+        .submit(observing, "Run the command".into())
         .await
         .unwrap();
     let mut denial_returned = false;

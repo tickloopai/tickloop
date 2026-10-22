@@ -51,8 +51,8 @@ fn row(epoch: Uuid, id: u128, parent: Option<ExecutionRef>, state: &str) -> Agen
 #[tokio::test]
 async fn viewed_finished_children_survive_until_thirty_seconds_after_leaving_and_memory_expires() {
     let epoch = Uuid::new_v4();
-    let main = row(epoch, 1, None, "Completed");
-    let child = row(epoch, 2, Some(main.execution), "Completed");
+    let main = row(epoch, 1, None, "Idle");
+    let child = row(epoch, 2, Some(main.execution), "Idle");
     let other = row(epoch, 3, None, "Idle");
     let clock = Arc::new(AtomicU64::new(100000));
     let injected = clock.clone();
@@ -127,7 +127,7 @@ async fn viewed_finished_children_survive_until_thirty_seconds_after_leaving_and
 async fn family_returns_to_last_member_and_missing_child_falls_back_to_root() {
     let epoch = Uuid::new_v4();
     let main = row(epoch, 1, None, "Running");
-    let child = row(epoch, 2, Some(main.execution), "WaitingTrigger");
+    let child = row(epoch, 2, Some(main.execution), "Idle");
     let other = row(epoch, 3, None, "Idle");
     let catalog = catalog(epoch, vec![main.clone(), child.clone(), other.clone()]);
     let mut console = AgentConsole::new(catalog.clone(), epoch, "/test".into(), None);
@@ -175,8 +175,8 @@ async fn family_returns_to_last_member_and_missing_child_falls_back_to_root() {
 #[tokio::test]
 async fn a_new_draft_starts_the_finished_child_departure_grace() {
     let epoch = Uuid::new_v4();
-    let main = row(epoch, 1, None, "Completed");
-    let child = row(epoch, 2, Some(main.execution), "Completed");
+    let main = row(epoch, 1, None, "Idle");
+    let child = row(epoch, 2, Some(main.execution), "Idle");
     let clock = Arc::new(AtomicU64::new(100_000));
     let injected = clock.clone();
     let catalog = catalog(epoch, vec![main.clone(), child.clone()]);
@@ -207,8 +207,8 @@ async fn a_new_draft_starts_the_finished_child_departure_grace() {
 async fn a_continuation_completed_between_refreshes_gets_a_new_terminal_grace() {
     for second_completion in [110_000, 130_001] {
         let epoch = Uuid::new_v4();
-        let main = row(epoch, 1, None, "Completed");
-        let child = row(epoch, 2, Some(main.execution), "Completed");
+        let main = row(epoch, 1, None, "Idle");
+        let child = row(epoch, 2, Some(main.execution), "Idle");
         let clock = Arc::new(AtomicU64::new(100_000));
         let injected = clock.clone();
         let catalog = catalog(epoch, vec![main.clone(), child]);
@@ -241,8 +241,8 @@ async fn a_continuation_completed_between_refreshes_gets_a_new_terminal_grace() 
 #[tokio::test]
 async fn run_identity_rearms_completion_without_a_reported_timestamp() {
     let epoch = Uuid::new_v4();
-    let main = row(epoch, 1, None, "Completed");
-    let mut child = row(epoch, 2, Some(main.execution), "Completed");
+    let main = row(epoch, 1, None, "Idle");
+    let mut child = row(epoch, 2, Some(main.execution), "Idle");
     child.updated_at = None;
     child.run_id = Some(Uuid::from_u128(100));
     let clock = Arc::new(AtomicU64::new(100_000));
@@ -270,7 +270,7 @@ async fn run_identity_rearms_completion_without_a_reported_timestamp() {
 #[tokio::test]
 async fn departure_grace_survives_an_unobserved_completion() {
     let epoch = Uuid::new_v4();
-    let main = row(epoch, 1, None, "Completed");
+    let main = row(epoch, 1, None, "Idle");
     let child = row(epoch, 2, Some(main.execution), "Running");
     let clock = Arc::new(AtomicU64::new(100_000));
     let injected = clock.clone();
@@ -280,7 +280,7 @@ async fn departure_grace_survives_an_unobserved_completion() {
     console.refresh().await.unwrap();
     console.visible_ready(Some(child.execution));
     clock.store(200_000, Ordering::SeqCst);
-    catalog.rows.lock().unwrap()[1].state = tickloop_agent_protocol::LoopState::Completed;
+    catalog.rows.lock().unwrap()[1].state = tickloop_agent_protocol::LoopState::Idle;
     catalog.rows.lock().unwrap()[1].updated_at = Some(199_000);
     console.interpret(Intent::NewDraft).unwrap();
     clock.store(229_999, Ordering::SeqCst);

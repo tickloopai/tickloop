@@ -13,8 +13,8 @@ use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
     BranchCreation, BranchOrigin, BranchOutcome, BranchPublicItem, BranchPublicSource,
     BranchRequest, BranchSessionPermissionRegistration, ChatId, ChatSnapshot, CommandState,
-    CompactionMarker, Content, LoopId, LoopState, Message, OperationState, PermissionPolicy, Plan,
-    RequestUsageLedger, Role, UserShellState,
+    CompactionMarker, Content, LoopId, LoopSnapshot, LoopState, Message, OperationState,
+    PermissionPolicy, Plan, RequestUsageLedger, Role, UserShellState,
 };
 
 const MAX_BRANCH_NAME_CHARACTERS: usize = 100;
@@ -45,17 +45,7 @@ impl Agent {
         let source = chats
             .get(&request.source_chat_id)
             .ok_or(AgentError::NotFound)?;
-        if request.source_loop_id.is_some_and(|source_loop_id| {
-            !source
-                .snapshot
-                .loops
-                .iter()
-                .any(|source_loop| source_loop.id == source_loop_id)
-        }) {
-            return Err(AgentError::Invalid(
-                "source Loop does not belong to the source Chat".into(),
-            ));
-        }
+        let source_loop_id = source.snapshot.chat_loop.id;
         validate_snapshot(&source.snapshot)?;
         ensure_branchable(source)?;
         let folder = canonical_directory(super::require_folder(&source.snapshot)?)?;
@@ -91,22 +81,18 @@ impl Agent {
                 .filter_map(|chat| chat.snapshot.branch_name())
                 .chain(saved_titles.iter().map(String::as_str)),
         );
-        let source_fingerprint = source_fingerprint(
-            &source.snapshot,
-            &model_seed,
-            &public_seed,
-            request.source_loop_id,
-        )?;
+        let source_fingerprint =
+            source_fingerprint(&source.snapshot, &model_seed, &public_seed, source_loop_id)?;
         let session_permissions = BranchSessionPermissionRegistration {
             source_chat_id: request.source_chat_id,
-            source_loop_id: request.source_loop_id,
+            source_loop_id,
             child_chat_id,
         };
         let origin = BranchOrigin {
             source_chat_id: request.source_chat_id,
             name: name.clone(),
             creation: Some(BranchCreation {
-                source_loop_id: request.source_loop_id,
+                source_loop_id,
                 request_id: request.request_id,
                 requested_name,
                 source_raw_boundary: source.snapshot.messages.len(),
@@ -160,8 +146,8 @@ impl Agent {
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
             message_models: BTreeMap::new(),
-            loops: Vec::new(),
-            resume_triggers: Vec::new(),
+            chat_loop: LoopSnapshot::new(Uuid::new_v4()),
+            trigger_awaits_resume: false,
             last_sequence: 0,
             permissions: Vec::new(),
             questions: Vec::new(),
@@ -200,7 +186,7 @@ impl Agent {
         carry_citation_results(&mut snapshot, &mut bookkeeping, source, &seed)?;
         carry_compaction_summaries(&mut snapshot, &source.snapshot, &seed);
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
-        carry_loops(&mut snapshot, &mut bookkeeping, source, &seed);
+        carry_loop(&mut snapshot, &source.snapshot);
         carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
         // 照 Claude Code `copyPlanForFork`：Branch 使用新的 slug 并复制计划文件，之后双方各自修改。
         let plans_directory = self.plans_directory(&folder);
@@ -225,11 +211,7 @@ impl Agent {
         let mut permission_context = self.inner.session_permissions.lock().await;
         let mut permission_candidate = permission_context.clone();
         permission_candidate
-            .register_branch(
-                request.source_chat_id,
-                request.source_loop_id,
-                child_chat_id,
-            )
+            .register_branch(request.source_chat_id, source_loop_id, child_chat_id)
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         if let Some(recorder) = &self.inner.recorder
             && let Some(source) = chats.get(&request.source_chat_id)
@@ -480,37 +462,12 @@ fn carry_citation_results(
     Ok(())
 }
 
-/// Branch 按当前对话链复制，分出点之前创建的 Loop 就是源 Chat 当前的全部 Loop。它们照重启恢复
-/// 的规则进入子 Chat：运行或等待中的转为已中断，武装中的 Trigger 解除武装，由用户向该 Loop
-/// 提交输入时重新武装。创建位置换算到复制对话中第一条晚于创建位置的消息之前。
-fn carry_loops(
-    child: &mut ChatSnapshot,
-    child_bookkeeping: &mut ChatBookkeeping,
-    source: &Chat,
-    seed: &[(Message, Option<usize>)],
-) {
-    for goal in &source.snapshot.loops {
-        let source_start = source
-            .bookkeeping
-            .loop_starts
-            .get(&goal.id)
-            .copied()
-            .unwrap_or(0);
-        let child_start = seed
-            .iter()
-            .position(|(_, source_index)| source_index.is_some_and(|index| index >= source_start))
-            .unwrap_or(seed.len());
-        child_bookkeeping.loop_starts.insert(goal.id, child_start);
-        child.loops.push(goal.clone());
-    }
-    child.resume_triggers = source
-        .snapshot
-        .resume_triggers
-        .iter()
-        .copied()
-        .filter(|loop_id| child.loops.iter().any(|goal| goal.id == *loop_id))
-        .collect();
-    super::triggers::recover_loops(child);
+/// Branch 复制源 Chat 的 Loop，照重启恢复的规则进入子 Chat：运行或等待中的转为已中断，武装中的
+/// Trigger 解除武装，Chat 继续时重新武装。
+fn carry_loop(child: &mut ChatSnapshot, source: &ChatSnapshot) {
+    child.chat_loop = source.chat_loop.clone();
+    child.trigger_awaits_resume = source.trigger_awaits_resume;
+    super::triggers::recover_loop(child);
 }
 
 /// Copies Loop plans and progress without process-local approvals or execution modes.
@@ -519,7 +476,7 @@ fn carry_plans_and_progress(
     child_bookkeeping: &mut ChatBookkeeping,
     source: &Chat,
 ) {
-    let carries = |loop_id: &LoopId| child.loops.iter().any(|goal| goal.id == *loop_id);
+    let carries = |loop_id: &LoopId| *loop_id == child.chat_loop.id;
     let plans = source
         .snapshot
         .plans
@@ -688,16 +645,14 @@ fn ensure_branchable(chat: &Chat) -> Result<(), AgentError> {
         || !chat.snapshot.pending_commands.is_empty()
         || !chat.snapshot.permissions.is_empty()
         || !chat.snapshot.questions.is_empty();
-    let has_pending_loop = chat.snapshot.loops.iter().any(|source_loop| {
-        matches!(
-            source_loop.state,
-            LoopState::Queued
-                | LoopState::WaitingPermission
-                | LoopState::WaitingQuestion
-                | LoopState::WaitingPlan
-                | LoopState::Running
-        )
-    });
+    let has_pending_loop = matches!(
+        chat.snapshot.chat_loop.state,
+        LoopState::Queued
+            | LoopState::WaitingPermission
+            | LoopState::WaitingQuestion
+            | LoopState::WaitingPlan
+            | LoopState::Running
+    );
     let has_foreground_command = chat.snapshot.commands.iter().any(|command| {
         matches!(
             command.state,
@@ -759,7 +714,6 @@ fn idempotent_branch(
     }
     let (origin, creation) = creation_of(chat).unwrap();
     if origin.source_chat_id != request.source_chat_id
-        || creation.source_loop_id != request.source_loop_id
         || creation.requested_name.as_deref() != requested_name
     {
         return Err(AgentError::Invalid(
@@ -848,7 +802,7 @@ fn source_fingerprint(
     snapshot: &ChatSnapshot,
     model_seed: &[Message],
     public_seed: &[BranchPublicItem],
-    source_loop_id: Option<LoopId>,
+    source_loop_id: LoopId,
 ) -> Result<String, AgentError> {
     let encoded = serde_json::to_vec(&(
         snapshot.id,
@@ -1070,18 +1024,8 @@ mod tests {
                         });
                 }
                 Self::Loop(state) => {
-                    chat.snapshot
-                        .loops
-                        .push(tickloop_agent_protocol::LoopSnapshot {
-                            id: loop_id,
-                            goal: "busy goal".into(),
-                            state: state.clone(),
-                            run_id: Some(run_id),
-                            run_started_at: None,
-                            trigger: None,
-                            event_sources: Vec::new(),
-                            state_since: None,
-                        })
+                    chat.snapshot.chat_loop.state = state.clone();
+                    chat.snapshot.chat_loop.run_id = Some(run_id);
                 }
                 Self::AgentShell(state) => {
                     chat.snapshot
@@ -1243,7 +1187,6 @@ mod tests {
                 .branch_chat(BranchRequest {
                     request_id: Uuid::new_v4(),
                     source_chat_id,
-                    source_loop_id: None,
                     name: Some(format!("busy {label}")),
                 })
                 .await;

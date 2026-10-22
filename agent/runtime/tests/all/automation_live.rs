@@ -41,7 +41,7 @@ async fn live_deepseek_reads_a_temporary_file_through_an_approved_shell_command(
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let result = tokio::time::timeout(LIVE_TIMEOUT, async {
-        agent.submit(chat, None, "Use the Bash tool with exactly the command `cat source.txt` in the current working directory. This temporary file belongs to this validation. Reply with its exact contents. Do not use any other tool or command.".into()).await.map_err(|error|error.to_string())?;
+        agent.submit(chat, "Use the Bash tool with exactly the command `cat source.txt` in the current working directory. This temporary file belongs to this validation. Reply with its exact contents. Do not use any other tool or command.".into()).await.map_err(|error|error.to_string())?;
         let mut approved = false;
         let mut call = None;
         let mut observed_output = false;

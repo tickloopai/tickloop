@@ -873,16 +873,6 @@ impl Registry {
             .cloned()
             .ok_or_else(|| ToolError::InvalidInput("command belongs to another owner".into()))
     }
-    pub(super) async fn stop_loop(&self, id: Uuid) -> Vec<CommandSnapshot> {
-        let commands = self.snapshots().await;
-        let mut results = Vec::new();
-        for command in commands.into_iter().filter(|command| command.loop_id == id) {
-            if let Ok(result) = self.stop(command.operation_id).await {
-                results.push(result);
-            }
-        }
-        results
-    }
     pub(super) async fn read(
         &self,
         id: Uuid,
@@ -944,20 +934,13 @@ impl Registry {
         Ok(snapshot)
     }
 
-    /// Stops one of `loop_id`'s commands for the model; the user's commands and other goals'
-    /// commands are left to the user.
-    pub(super) async fn stop_task(
-        &self,
-        task_id: &str,
-        loop_id: Uuid,
-    ) -> Result<ToolResult, ToolError> {
+    /// Stops one of the Agent's commands for the model; the user's commands are left to the
+    /// user.
+    pub(super) async fn stop_task(&self, task_id: &str) -> Result<ToolResult, ToolError> {
         let snapshot = self.running_task(task_id).await?;
-        let Some(command) = snapshot
-            .agent()
-            .filter(|command| command.loop_id == loop_id)
-        else {
+        let Some(command) = snapshot.agent() else {
             return Err(ToolError::Rejected(format!(
-                "Task {task_id} does not belong to this goal; only the user can stop it"
+                "Task {task_id} was started by the user; only the user can stop it"
             )));
         };
         if let Some(entry) = self.entries.lock().await.get_mut(&command.operation_id) {

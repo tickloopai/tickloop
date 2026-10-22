@@ -87,7 +87,6 @@ impl DirectedSummaryTasks {
 
 pub(super) struct DirectedSummaryEffect {
     pub(super) snapshot: ChatSnapshot,
-    pub(super) clear_goal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,13 +106,11 @@ pub(super) fn finish_success(
         "Conversation summarized {}. ctrl+o opens the detailed transcript.\n",
         direction_phrase(direction)
     ))?;
-    let clear_goal = if let Some(draft) = outcome.draft {
+    if let Some(draft) = outcome.draft {
         console.restore_rewind_draft(&draft.prompt, &draft.contexts)?;
-        true
     } else {
         console.clear_summary_draft()?;
-        false
-    };
+    }
     if let Some(error) = outcome.continuation_error {
         console.write(&format!(
             "Summary completed. Follow-up preparation needs attention: {}\n",
@@ -123,7 +120,6 @@ pub(super) fn finish_success(
     console.scroll_conversation_to_end()?;
     Ok(DirectedSummaryEffect {
         snapshot: outcome.snapshot,
-        clear_goal,
     })
 }
 

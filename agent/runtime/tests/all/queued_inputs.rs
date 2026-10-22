@@ -136,28 +136,17 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             .unwrap();
         let mut events = agent.subscribe();
         let active = agent
-            .submit(chat, None, "inspect the workspace".into())
+            .submit(chat, "inspect the workspace".into())
             .await
             .unwrap();
         wait_for_running_shell(&agent, chat, "slow-shell", &mut events).await;
         let queued = agent
-            .submit(
-                chat,
-                Some(active.loop_id),
-                "include the newly queued correction".into(),
-            )
+            .submit(chat, "include the newly queued correction".into())
             .await
             .unwrap();
-        let command_id = agent
-            .queue_command(chat, Some(active.loop_id), "/compact".into())
-            .await
-            .unwrap();
+        let command_id = agent.queue_command(chat, "/compact".into()).await.unwrap();
         let after_command = agent
-            .submit(
-                chat,
-                Some(active.loop_id),
-                "do not cross the queued command".into(),
-            )
+            .submit(chat, "do not cross the queued command".into())
             .await
             .unwrap();
         std::fs::write(directory.path().join("release-queued-turn"), "ready").unwrap();
@@ -228,16 +217,16 @@ async fn takeback_preserves_typed_order_and_only_restores_an_isolated_shell() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(PendingModel));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let active = agent
-        .submit(chat, None, "hold the execution slot".into())
+    agent
+        .submit(chat, "hold the execution slot".into())
         .await
         .unwrap();
     let queued = agent
-        .submit(chat, Some(active.loop_id), "edit this message".into())
+        .submit(chat, "edit this message".into())
         .await
         .unwrap();
     let shell = agent
-        .submit_user_shell_for_goal(chat, Some(active.loop_id), "printf shell".into(), false)
+        .submit_user_shell(chat, "printf shell".into(), false)
         .await
         .unwrap();
 
@@ -284,20 +273,11 @@ async fn queued_commands_form_a_persistent_barrier_between_model_inputs() {
     });
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let active = agent.submit(chat, None, "active".into()).await.unwrap();
+    agent.submit(chat, "active".into()).await.unwrap();
     model.started.notified().await;
-    let before = agent
-        .submit(chat, Some(active.loop_id), "before command".into())
-        .await
-        .unwrap();
-    let command_id = agent
-        .queue_command(chat, Some(active.loop_id), "/compact".into())
-        .await
-        .unwrap();
-    let after = agent
-        .submit(chat, Some(active.loop_id), "after command".into())
-        .await
-        .unwrap();
+    let before = agent.submit(chat, "before command".into()).await.unwrap();
+    let command_id = agent.queue_command(chat, "/compact".into()).await.unwrap();
+    let after = agent.submit(chat, "after command".into()).await.unwrap();
     let queued = agent.snapshot(chat).await.unwrap().queued_inputs();
     assert_eq!(
         queued.iter().map(|entry| entry.id).collect::<Vec<_>>(),
@@ -330,16 +310,10 @@ async fn interrupt_preserves_waiting_messages_in_one_follow_up_request() {
     });
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let active = agent.submit(chat, None, "active".into()).await.unwrap();
+    let active = agent.submit(chat, "active".into()).await.unwrap();
     model.started.notified().await;
-    let first = agent
-        .submit(chat, Some(active.loop_id), "first queued".into())
-        .await
-        .unwrap();
-    let second = agent
-        .submit(chat, Some(active.loop_id), "second queued".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "first queued".into()).await.unwrap();
+    let second = agent.submit(chat, "second queued".into()).await.unwrap();
 
     assert_ne!(first.run_id, second.run_id);
     assert_eq!(first.loop_id, second.loop_id);
@@ -439,9 +413,9 @@ async fn a_queued_shell_is_not_restored_after_restart() {
     let archive = directory.path().join("archive");
     let agent = Agent::open_embedded(archive.clone(), config(), Arc::new(PendingModel)).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let active = agent.submit(chat, None, "active".into()).await.unwrap();
+    agent.submit(chat, "active".into()).await.unwrap();
     let shell = agent
-        .submit_user_shell_for_goal(chat, Some(active.loop_id), "printf restored".into(), false)
+        .submit_user_shell(chat, "printf restored".into(), false)
         .await
         .unwrap();
     agent.shutdown().await;
@@ -604,14 +578,11 @@ async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the
     allow_bash(&agent, chat).await;
     let mut events = agent.subscribe();
     let active = agent
-        .submit(chat, None, "start the long work".into())
+        .submit(chat, "start the long work".into())
         .await
         .unwrap();
     wait_for_running_shell(&agent, chat, "long-shell", &mut events).await;
-    let queued = agent
-        .submit(chat, Some(active.loop_id), "how is it going".into())
-        .await
-        .unwrap();
+    let queued = agent.submit(chat, "how is it going".into()).await.unwrap();
     assert_eq!(
         agent
             .snapshot(chat)
@@ -682,7 +653,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
     allow_bash(&agent, chat).await;
     let mut events = agent.subscribe();
     let active = agent
-        .submit(chat, None, "start the short work".into())
+        .submit(chat, "start the short work".into())
         .await
         .unwrap();
     assert!(
@@ -693,10 +664,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
             .is_empty()
     );
     wait_for_running_shell(&agent, chat, "short-shell", &mut events).await;
-    let joined = agent
-        .submit(chat, Some(active.loop_id), "fold this in".into())
-        .await
-        .unwrap();
+    let joined = agent.submit(chat, "fold this in".into()).await.unwrap();
     std::fs::write(directory.path().join("release-joined-turn"), "ready").unwrap();
     loop {
         let event = next_event(&mut events).await;
@@ -721,9 +689,10 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
             .any(|event| matches!(event.kind, EventKind::Interrupted)),
         "the run answering a started or joined message keeps going"
     );
-    assert!(snapshot.loops.iter().any(|goal| {
-        goal.run_id == Some(active.run_id)
-            && goal.state == tickloop_agent_protocol::LoopState::Running
-    }));
+    assert_eq!(snapshot.chat_loop.run_id, Some(active.run_id));
+    assert_eq!(
+        snapshot.chat_loop.state,
+        tickloop_agent_protocol::LoopState::Running
+    );
     agent.shutdown().await;
 }

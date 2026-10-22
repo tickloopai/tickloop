@@ -12,7 +12,6 @@ use tickloop_agent_protocol::{
     RunId, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
     SubagentRegistration, TaskBoard, ToolResult, projection::HistoryCall,
 };
-use tickloop_agent_tools::START_GOAL_TOOL_NAME;
 use tickloop_agent_transcript::{Line, ModelVisibleResult, WaitKind};
 use uuid::Uuid;
 
@@ -29,7 +28,6 @@ pub(crate) struct FamilyRecords {
     launched: HashMap<(ChatId, RunId, String), LaunchedChild>,
     /// Every input some member accepted, by its id, with where it was accepted.
     accepted: HashMap<Uuid, Receipt>,
-    run_loops: HashMap<(ChatId, RunId), LoopId>,
     task_boards: HashMap<(ChatId, LoopId), TaskBoard>,
 }
 
@@ -63,7 +61,6 @@ impl FamilyRecords {
                     run_id: entry.run_id,
                 };
                 task.get_or_insert_with(|| receipt.clone());
-                records.run_loops.insert((*id, entry.run_id), entry.loop_id);
                 records.accepted.insert(entry.input_id, receipt);
             }
             let Some(delegation) = transcript
@@ -106,8 +103,8 @@ impl FamilyRecords {
 
     /// The result the family's records give a dangling call of `snapshot`'s Chat: the child a
     /// `Subagent` call delegated, the message a `SendMessage` call's receiver accepted, the Task
-    /// board's receipt of a Task mutation, or the Loop a `StartGoal` call registered. `None` for any other call, and for one whose effect
-    /// the records do not hold.
+    /// board's receipt of a Task mutation. `None` for any other call, and for one whose effect the
+    /// records do not hold.
     pub(crate) fn reconcile(
         &self,
         snapshot: &ChatSnapshot,
@@ -161,7 +158,7 @@ impl FamilyRecords {
                 let target = self.accepted.get(&message_id)?;
                 Some(ToolResult {
                     content: json!({"status":"accepted","message_id":message_id,"target_chat_id":target.chat_id,
-                        "target_loop_id":target.loop_id,"target_run_id":target.run_id,
+                        "target_run_id":target.run_id,
                         "delivery":"accepted_before_interruption"})
                     .to_string(),
                     is_error: false,
@@ -170,10 +167,12 @@ impl FamilyRecords {
             }
             "TaskCreate" | "TaskUpdate" => {
                 let mutation_id = input["mutation_id"].as_str()?.parse::<Uuid>().ok()?;
-                let (root, loop_id) = snapshot.delegation.as_ref().map_or_else(
-                    || Some((snapshot.id, *self.run_loops.get(&(snapshot.id, run))?)),
-                    |delegation| Some((delegation.root_chat_id(), delegation.root_loop_id())),
-                )?;
+                let (root, loop_id) = snapshot
+                    .delegation
+                    .as_ref()
+                    .map_or((snapshot.id, snapshot.chat_loop.id), |delegation| {
+                        (delegation.root_chat_id(), delegation.root_loop_id())
+                    });
                 let board = self.task_boards.get(&(root, loop_id))?;
                 let mutation = board.mutations.get(&mutation_id)?;
                 if mutation.actor != snapshot.id || mutation.input != format!("{name}:{input}") {
@@ -183,31 +182,13 @@ impl FamilyRecords {
                     board, mutation,
                 ))
             }
-            START_GOAL_TOOL_NAME => {
-                let response = message_responses.get(&call.message_index)?;
-                let loop_id = tickloop_agent_transcript::input_ids::started_goal(
-                    snapshot.id,
-                    *response,
-                    &call.call_id,
-                );
-                let goal = snapshot.loops.iter().find(|goal| goal.id == loop_id)?;
-                let queued_run = self
-                    .accepted
-                    .get(&tickloop_agent_transcript::input_ids::goal(loop_id))
-                    .map(|receipt| receipt.run_id);
-                Some(crate::interaction::started_goal_result(
-                    snapshot.id,
-                    goal,
-                    queued_run,
-                ))
-            }
             _ => None,
         }
     }
 }
 
 /// The calls of `messages` whose effect stays inside the family: a delegation, a message, a
-/// subtree stop, a Task mutation or a goal it registered.
+/// subtree stop or a Task mutation.
 pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = String> + '_ {
     messages
         .iter()
@@ -220,7 +201,6 @@ pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = Stri
                     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
                     "TaskCreate",
                     "TaskUpdate",
-                    START_GOAL_TOOL_NAME,
                 ]
                 .contains(&name.as_str()) =>
             {
@@ -418,27 +398,24 @@ impl Agent {
                         .any(|pending| pending.receipt.run_id == run)
                     || chat.bookkeeping.lifecycle.open_input(run).is_some()
             };
-            chat.snapshot
-                .loops
-                .iter()
-                .filter_map(|goal| Some((goal.id, goal.run_id?)))
-                .filter(|(loop_id, run)| {
+            let chat_loop = &chat.snapshot.chat_loop;
+            chat_loop
+                .run_id
+                .filter(|run| {
                     !is_live(*run)
-                        && crate::agent_messages::child_run_status(&chat.snapshot, *loop_id, *run)
-                            .is_some()
+                        && crate::agent_messages::child_run_status(&chat.snapshot, *run).is_some()
                         && !parent.snapshot.family_completions.iter().any(|completion| {
                             completion.child_chat_id == chat_id && completion.child_run_id == *run
                         })
                 })
-                .map(|(loop_id, run_id)| Receipt {
+                .map(|run_id| Receipt {
                     chat_id,
-                    loop_id,
+                    loop_id: chat_loop.id,
                     run_id,
                 })
-                .collect::<Vec<_>>()
         };
         // The family's notifications go out once every member is on its way.
-        for receipt in ended {
+        if let Some(receipt) = ended {
             let Ok(snapshot) = self.snapshot(chat_id).await else {
                 return;
             };

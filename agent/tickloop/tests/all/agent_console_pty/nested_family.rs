@@ -82,7 +82,7 @@ async fn exercise_nested_family(fixture: &PrivateFixture) {
         |snapshot| {
             snapshot
                 .conversation
-                .run_response_text(snapshot.conversation.loops[0].run_id.unwrap())
+                .run_response_text(snapshot.conversation.chat_loop.run_id.unwrap())
                 .as_deref()
                 == Some("GAMMA-DONE")
         },

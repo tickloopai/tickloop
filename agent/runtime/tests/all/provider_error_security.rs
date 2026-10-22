@@ -149,7 +149,7 @@ async fn confirmation_secret_surfaces() {
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "fake-secret probe".into())
+            .submit(chat, "fake-secret probe".into())
             .await
             .unwrap();
         let failed = loop {
@@ -326,7 +326,7 @@ async fn confirmation_shared_http_runtime_blind_retry() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "quota retry probe".into())
+        .submit(chat, "quota retry probe".into())
         .await
         .unwrap();
     let mut retried = false;
@@ -395,7 +395,7 @@ async fn confirmation_bounded_html_credential_prefix() {
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "bound fake-key probe".into())
+            .submit(chat, "bound fake-key probe".into())
             .await
             .unwrap();
         let failed = loop {
@@ -518,7 +518,7 @@ async fn all_64_confirmation_probe_variants_are_safe_on_all_surfaces() {
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "64-case security fixture".into())
+            .submit(chat, "64-case security fixture".into())
             .await
             .unwrap();
         let failed = loop {
@@ -603,7 +603,7 @@ async fn assert_safe_provider_surfaces(cases: Vec<(String, String, String)>) {
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "fake-secret probe".into())
+            .submit(chat, "fake-secret probe".into())
             .await
             .unwrap();
         let failed = loop {
@@ -747,7 +747,7 @@ async fn incomplete_glm_rejections_keep_http_diagnostics_and_do_not_retry() {
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "incomplete GLM fixture".into())
+            .submit(chat, "incomplete GLM fixture".into())
             .await
             .unwrap();
         loop {
@@ -963,7 +963,7 @@ async fn redacted_presentation_ids_do_not_change_connection_retention_or_success
     let chat = agent.create_chat(root.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "connection identity fixture".into())
+        .submit(chat, "connection identity fixture".into())
         .await
         .unwrap();
     loop {
@@ -993,7 +993,7 @@ async fn redacted_presentation_ids_do_not_change_connection_retention_or_success
     ));
     agent.set_model(chat, config).await.unwrap();
     agent
-        .submit(chat, None, "successful connection fixture".into())
+        .submit(chat, "successful connection fixture".into())
         .await
         .unwrap();
     loop {

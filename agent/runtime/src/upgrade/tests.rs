@@ -5,7 +5,7 @@ use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 async fn complete(agent: &Agent, chat: ChatId, input: &str) -> Receipt {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, input.into()).await.unwrap();
+    let receipt = agent.submit(chat, input.into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -43,7 +43,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
     snapshot.policy.mode = ExecutionMode::FullAccess;
     snapshot.thinking_enabled = false;
     snapshot.context_window_tokens = Some(4096);
-    snapshot.resume_triggers.push(receipt.loop_id);
+    snapshot.trigger_awaits_resume = true;
     snapshot.last_queue_sequence = 13;
     let sequence = snapshot
         .request_usage
@@ -135,7 +135,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
     );
     assert!(!actual.thinking_enabled);
     assert_eq!(actual.context_window_tokens, Some(4096));
-    assert_eq!(actual.resume_triggers, vec![receipt.loop_id]);
+    assert!(actual.trigger_awaits_resume);
     assert_eq!(actual.last_queue_sequence, 13);
     assert_eq!(actual.last_sequence, expected.last_sequence);
     assert_eq!(actual.message_compactions, expected.message_compactions);
@@ -163,7 +163,6 @@ async fn planned_restore_preserves_an_armed_trigger_and_session_permissions_with
     original
         .configure_trigger(
             chat,
-            receipt.loop_id,
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "check later".into(),
@@ -249,7 +248,11 @@ async fn planned_restore_preserves_an_armed_trigger_and_session_permissions_with
     original.shutdown_for_upgrade().await;
     successor.release_upgrade().await.unwrap();
     assert!(
-        successor.snapshot(chat).await.unwrap().loops[0]
+        successor
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .chat_loop
             .trigger
             .as_ref()
             .unwrap()
@@ -406,7 +409,7 @@ async fn claimed_task_wait_survives_upgrade_and_finishes_in_the_same_run() {
         .unwrap();
     let mut events = original.subscribe();
     let receipt = original
-        .submit(chat, None, "Track background work".into())
+        .submit(chat, "Track background work".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -500,10 +503,7 @@ async fn parent_answer_does_not_allow_replacement_while_a_child_still_waits_for_
         .await
         .unwrap();
     let mut events = original.subscribe();
-    let receipt = original
-        .submit(chat, None, "Delegate".into())
-        .await
-        .unwrap();
+    let receipt = original.submit(chat, "Delegate".into()).await.unwrap();
     let (child, question) = tokio::time::timeout(Duration::from_secs(10), async {
         let mut parent_finished = false;
         let mut question = None;
@@ -608,8 +608,8 @@ async fn watch_reconnect_delivers_one_latest_update_since_the_original_baseline(
         .install_tick_stream(Arc::new(first_stream.clone()))
         .await;
     let chat = original.create_chat(directory.path().into()).await.unwrap();
-    let receipt = complete(&original, chat, "watch state").await;
-    let mut trigger = Trigger::for_loop_goal("watch state");
+    complete(&original, chat, "watch state").await;
+    let mut trigger = Trigger::for_subscriptions();
     trigger
         .subscriptions
         .push(tickloop_agent_protocol::TickSubscription {
@@ -619,7 +619,7 @@ async fn watch_reconnect_delivers_one_latest_update_since_the_original_baseline(
             authority: None,
         });
     original
-        .configure_trigger(chat, receipt.loop_id, Some(trigger))
+        .configure_trigger(chat, Some(trigger))
         .await
         .unwrap();
     let watch = *first_stream.stream.watches().keys().next().unwrap();
@@ -952,7 +952,7 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
         b"retained legacy output"
     );
     let mut events = original.subscribe();
-    original.submit(chat, None, CONTINUE.into()).await.unwrap();
+    original.submit(chat, CONTINUE.into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();

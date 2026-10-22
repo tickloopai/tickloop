@@ -35,14 +35,14 @@ use uuid::Uuid;
 use crate::DaemonServer;
 use tickloop_agent_protocol::{
     AgentAccess, AgentDetailQuery, ExecutionRef, HostEndpointIdentity, HostToolAuthority,
-    LiveChatSnapshot, LoopState, ObservationRequest, ObservationValue,
+    LiveChatSnapshot, ObservationRequest, ObservationValue,
 };
 use tickloop_agent_runtime::{
     hosted::{
         controller::HostController,
         registry::{
-            LaunchIdentity, LaunchRecord, LaunchState, OwnerState, Registry, RootRegistry,
-            TARGET_GONE, Transition,
+            LaunchIdentity, LaunchRecord, LaunchState, Registry, RootRegistry, TARGET_GONE,
+            Transition,
         },
         worker_control::{
             ENDPOINT_NAME, HostedAdmission, HostedTickPage, IssuedSpawn, LostTick,
@@ -303,10 +303,9 @@ impl WorkerControl {
             }
             _ => {}
         }
-        let snapshot = match envelope.request.admission() {
-            Some(admission) => Some(self.admit(&worker, execution, admission).await?),
-            None => None,
-        };
+        if let Some(admission) = envelope.request.admission() {
+            self.admit(&worker, execution, admission).await?;
+        }
         let (Some(root), Some(config_root)) = (root, config_root) else {
             return Err(HostError::before(
                 "Unsupported",
@@ -326,13 +325,7 @@ impl WorkerControl {
                 ..
             } => {
                 let _lifecycle = registry.lifecycle(chat).await;
-                let owner_revision = opening_revision(
-                    &self.controller,
-                    &registry,
-                    &tick_owner,
-                    snapshot.as_deref(),
-                )
-                .await?;
+                let owner_revision = registry.revision().await?;
                 let record = LaunchRecord::opening(operation, chat, adapter, command, cwd, title)?;
                 let environment =
                     with_package_credentials(environment, &record.command, &config_root);
@@ -451,13 +444,7 @@ impl WorkerControl {
                         "its program or working directory changed since it was opened; open it again",
                     ));
                 }
-                let owner_revision = opening_revision(
-                    &self.controller,
-                    &registry,
-                    &tick_owner,
-                    snapshot.as_deref(),
-                )
-                .await?;
+                let owner_revision = registry.revision().await?;
                 let lost_state = lost.state.clone();
                 let reopened = LaunchState::Reopened {
                     instance: instance.clone(),
@@ -609,51 +596,7 @@ impl WorkerControl {
             WorkerRequest::AllowShellSpawn { .. } | WorkerRequest::AllowShellView { .. } => {
                 unreachable!("Shell spawns and views are granted before a config root is required")
             }
-            WorkerRequest::EndStoppedChild {
-                child, operation, ..
-            } => {
-                self.verify_stopped_child(daemon, &worker, chat, child)
-                    .await?;
-                let child_owner = TickOwner {
-                    root: tick_owner.root,
-                    chat: child,
-                };
-                registry
-                    .end_stopped(&self.controller, &child_owner, operation)
-                    .await?;
-                Ok(json!({"operation":operation,"child":child}))
-            }
         }
-    }
-}
-
-/// The registry revision a new launch of `chat` is fenced with, making the Chat Active again when
-/// that is what its state means.
-async fn opening_revision(
-    controller: &HostController,
-    registry: &RootRegistry,
-    owner: &TickOwner,
-    snapshot: Option<&LiveChatSnapshot>,
-) -> Result<u64, HostError> {
-    let chat = owner.chat;
-    match registry.owner_state(chat).await? {
-        OwnerState::Active => registry.revision().await,
-        // Only an explicit Continue after StopSubagent makes a stopped Chat own Ticks again, under
-        // a revision later than the one its end fenced. An end that never completed finishes
-        // first: the Continue restores the Chat, not its earlier Ticks.
-        stopped @ (OwnerState::Stopping { .. } | OwnerState::Stopped { .. })
-            if snapshot.is_some_and(continued_after_stop) =>
-        {
-            if let OwnerState::Stopping { operation } = stopped {
-                registry.finish_stop(controller, owner, operation).await?;
-            }
-            registry.set_owner_state(chat, &OwnerState::Active).await?;
-            registry.next_revision().await
-        }
-        OwnerState::Stopping { .. } | OwnerState::Stopped { .. } => Err(HostError::before(
-            "OwnerEnded",
-            "this Chat was stopped and owns no hosted Ticks until it continues",
-        )),
     }
 }
 
@@ -686,16 +629,6 @@ fn with_package_credentials(
         environment.extend(credentials.launch_environment(&package.manifest.auth));
     }
     environment
-}
-
-/// A stopped Chat has continued once one of its Loops is live again: StopSubagent leaves every
-/// Loop Stopped or Expired, and only an explicit Continue or new input revives one.
-fn continued_after_stop(snapshot: &LiveChatSnapshot) -> bool {
-    snapshot
-        .conversation
-        .loops
-        .iter()
-        .any(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
 }
 
 impl WorkerControl {
@@ -791,7 +724,7 @@ impl WorkerControl {
         worker: &Arc<dyn AgentAccess>,
         execution: ExecutionRef,
         admission: &HostedAdmission,
-    ) -> Result<Box<LiveChatSnapshot>, HostError> {
+    ) -> Result<(), HostError> {
         let expected = HostToolAuthority::Native {
             endpoint: HostEndpointIdentity::Tickhost {
                 endpoint: self.controller.endpoint(),
@@ -815,34 +748,6 @@ impl WorkerControl {
             return Err(HostError::before(
                 "Forbidden",
                 "this delegated Chat did not inherit hosted Tick lifecycles",
-            ));
-        }
-        Ok(snapshot)
-    }
-
-    /// StopSubagent's end hook is believed only for a direct child of `root` that runs in the same
-    /// worker and whose Loops StopSubagent actually stopped, read through the daemon's own route.
-    async fn verify_stopped_child(
-        &self,
-        daemon: &DaemonServer,
-        worker: &Arc<dyn AgentAccess>,
-        root: Uuid,
-        child: Uuid,
-    ) -> Result<(), HostError> {
-        let execution = daemon
-            .verify_worker_chat(child, worker)
-            .await
-            .map_err(|error| HostError::before("Forbidden", error.message))?;
-        let snapshot = chat_snapshot(worker, execution).await?;
-        let is_direct_child = snapshot
-            .conversation
-            .delegation
-            .as_ref()
-            .is_some_and(|delegation| delegation.parent_chat_id == root);
-        if !is_direct_child || continued_after_stop(&snapshot) {
-            return Err(HostError::before(
-                "Forbidden",
-                "the Chat is not a stopped direct child of this root",
             ));
         }
         Ok(())

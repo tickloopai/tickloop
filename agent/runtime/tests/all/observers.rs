@@ -17,7 +17,7 @@ async fn a_detached_observer_can_replay_completion_from_its_cursor() {
     let original = agent.observe(chat, 0).await.unwrap();
     let mut second = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "continue while detached".into())
+        .submit(chat, "continue while detached".into())
         .await
         .unwrap();
     loop {
@@ -32,8 +32,8 @@ async fn a_detached_observer_can_replay_completion_from_its_cursor() {
         .observe(chat, original.snapshot.last_sequence)
         .await
         .unwrap();
-    assert_eq!(reattached.snapshot.loops[0].id, receipt.loop_id);
-    assert_eq!(reattached.snapshot.loops[0].state, LoopState::Completed);
+    assert_eq!(reattached.snapshot.chat_loop.id, receipt.loop_id);
+    assert_eq!(reattached.snapshot.chat_loop.state, LoopState::Idle);
     assert!(
         reattached
             .events
@@ -63,7 +63,7 @@ async fn conversation_rewind_requires_an_observer_reset_without_replaying_hidden
 
     let mut abandoned_run = None;
     for prompt in ["retained prompt", "abandoned prompt"] {
-        let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         loop {
             let event = next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
@@ -201,7 +201,7 @@ async fn two_slow_observers_recover_the_same_real_command_without_stalling_execu
     let mut first = agent.subscribe();
     let mut second = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "Observe a long command".into())
+        .submit(chat, "Observe a long command".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -214,10 +214,10 @@ async fn two_slow_observers_recover_the_same_real_command_without_stalling_execu
                     .unwrap();
                 continue;
             }
-            if snapshot.loops[0].state == LoopState::Completed {
+            if snapshot.chat_loop.state == LoopState::Idle {
                 break;
             }
-            assert_ne!(snapshot.loops[0].state, LoopState::Failed);
+            assert_ne!(snapshot.chat_loop.state, LoopState::Failed);
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -234,7 +234,7 @@ async fn two_slow_observers_recover_the_same_real_command_without_stalling_execu
     drop(first);
     for _ in 0..2 {
         let observed = agent.observe(chat, cursor).await.unwrap();
-        assert_eq!(observed.snapshot.loops[0].id, receipt.loop_id);
+        assert_eq!(observed.snapshot.chat_loop.id, receipt.loop_id);
         assert!(
             observed
                 .events

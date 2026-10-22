@@ -159,10 +159,7 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
         .unwrap();
     let chat = agent.create_chat(cwd.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Check quotes".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Check quotes".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         match event.kind {

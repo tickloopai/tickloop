@@ -158,14 +158,12 @@ async fn continue_waiting(
     execution: ExecutionRef,
     label: &str,
 ) -> Box<LiveChatSnapshot> {
-    let before = snapshot(client, execution).await;
     let receipt = client
         .execute(CommandEnvelope {
             daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                target_loop: Some(before.conversation.loops[0].id),
                 input: UserInput::Text {
                     text: format!("Continue {label} and wait for bounded context."),
                     contexts: Vec::new(),
@@ -182,7 +180,7 @@ async fn continue_waiting(
         execution,
         "same Agent waits for context",
         |current| {
-            current.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Running
+            current.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Running
                 && current.events.iter().any(|event| {
                     matches!(&event.kind,
                 tickloop_agent_protocol::EventKind::ToolStarted { name, .. }
@@ -294,7 +292,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             if rows.len() == 3
                 && rows
                     .iter()
-                    .all(|row| row.state == tickloop_agent_protocol::LoopState::Completed)
+                    .all(|row| row.state == tickloop_agent_protocol::LoopState::Idle)
             {
                 break rows;
             }
@@ -490,9 +488,9 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         requests.try_recv().unwrap();
     }
     let runs = [
-        (main_execution, main_wait.conversation.loops[0].run_id),
-        (first_execution, first_wait.conversation.loops[0].run_id),
-        (second_execution, second_wait.conversation.loops[0].run_id),
+        (main_execution, main_wait.conversation.chat_loop.run_id),
+        (first_execution, first_wait.conversation.chat_loop.run_id),
+        (second_execution, second_wait.conversation.chat_loop.run_id),
     ];
     for (target, title, reply, draft) in [
         (main_execution, MAIN_TASK, MAIN_REPLY, MAIN_DRAFT),
@@ -599,9 +597,9 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     }
     for (execution, run) in runs {
         let current = snapshot(&client, execution).await;
-        assert_eq!(current.conversation.loops[0].run_id, run);
+        assert_eq!(current.conversation.chat_loop.run_id, run);
         assert_eq!(
-            current.conversation.loops[0].state,
+            current.conversation.chat_loop.state,
             tickloop_agent_protocol::LoopState::Running
         );
     }

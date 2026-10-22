@@ -139,7 +139,7 @@ async fn user_interrupt_cancels_the_retry_wait() {
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Answer".into()).await.unwrap();
+    agent.submit(chat, "Answer".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -179,7 +179,7 @@ async fn run_until_finished(agent: &Agent, model: &Arc<FailingModel>) -> (bool, 
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Answer".into()).await.unwrap();
+    agent.submit(chat, "Answer".into()).await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -247,7 +247,7 @@ async fn transport_timeouts_retry_and_fail_without_leaving_the_run_running() {
         let directory = tempfile::tempdir().unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        agent.submit(chat, None, "Answer".into()).await.unwrap();
+        agent.submit(chat, "Answer".into()).await.unwrap();
 
         let error = tokio::time::timeout(Duration::from_secs(300), async {
             loop {
@@ -264,7 +264,7 @@ async fn transport_timeouts_retry_and_fail_without_leaving_the_run_running() {
         assert!(error.contains("timed out"), "{error}");
         assert_eq!(model.request_count(), 11);
         let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+        assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
         let requests = support::model_script_requests(&snapshot);
         assert_eq!(requests.len(), 11);
         assert!(
@@ -273,7 +273,7 @@ async fn transport_timeouts_retry_and_fail_without_leaving_the_run_running() {
                 .all(|request| request.outcome == RequestOutcome::TimedOut)
         );
 
-        let recovery = agent.submit(chat, None, "Try again".into()).await.unwrap();
+        agent.submit(chat, "Try again".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let event = events.recv().await.unwrap();
@@ -285,15 +285,7 @@ async fn transport_timeouts_retry_and_fail_without_leaving_the_run_running() {
         .await
         .expect("failed request kept the execution slot occupied");
         let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(
-            snapshot
-                .loops
-                .iter()
-                .find(|goal| goal.id == recovery.loop_id)
-                .unwrap()
-                .state,
-            LoopState::Completed
-        );
+        assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
         assert_eq!(model.request_count(), 12);
         assert_eq!(
             support::model_script_requests(&snapshot)
@@ -324,7 +316,7 @@ async fn internal_model_panic_fails_without_retry_and_releases_the_execution_slo
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let failed = agent.submit(chat, None, "Answer".into()).await.unwrap();
+    let failed = agent.submit(chat, "Answer".into()).await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -345,7 +337,7 @@ async fn internal_model_panic_fails_without_retry_and_releases_the_execution_slo
     assert!(!error.contains("fixture-private-panic-payload"));
     assert_eq!(model.request_count(), 1);
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
     assert!(snapshot.pending_thinking.is_empty());
     assert!(
         support::model_script_requests(&snapshot)
@@ -368,10 +360,7 @@ async fn internal_model_panic_fails_without_retry_and_releases_the_execution_slo
         agent.create_chat(directory.path().into()).await.unwrap(),
         chat,
     ] {
-        let recovered = agent
-            .submit(target, None, "Try again".into())
-            .await
-            .unwrap();
+        let recovered = agent.submit(target, "Try again".into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let event = events.recv().await.unwrap();
@@ -420,7 +409,7 @@ async fn a_subagent_model_panic_releases_the_parent_waiter() {
     let directory = tempfile::tempdir().unwrap();
     let root = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(root, None, "Delegate".into()).await.unwrap();
+    let receipt = agent.submit(root, "Delegate".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();
@@ -433,7 +422,7 @@ async fn a_subagent_model_panic_releases_the_parent_waiter() {
     .expect("child panic left the parent waiting");
     let chats = agent.list_chats().await;
     let child = chats.iter().find(|chat| chat.delegation.is_some()).unwrap();
-    assert_eq!(child.loops[0].state, LoopState::Failed);
+    assert_eq!(child.chat_loop.state, LoopState::Failed);
     assert_eq!(
         support::model_script_requests(child)[0].outcome,
         RequestOutcome::Failed(RequestFailure::Internal)
@@ -450,7 +439,7 @@ async fn an_internal_panic_does_not_automatically_run_a_queued_input() {
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Answer".into()).await.unwrap();
+    agent.submit(chat, "Answer".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while model.request_count() == 0 {
             tokio::task::yield_now().await;
@@ -458,7 +447,7 @@ async fn an_internal_panic_does_not_automatically_run_a_queued_input() {
     })
     .await
     .unwrap();
-    agent.submit(chat, None, "Status?".into()).await.unwrap();
+    agent.submit(chat, "Status?".into()).await.unwrap();
     release.cancel();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -473,7 +462,7 @@ async fn an_internal_panic_does_not_automatically_run_a_queued_input() {
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(model.request_count(), 1);
     assert_eq!(snapshot.pending_inputs.len(), 1);
-    assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Failed);
     agent.shutdown().await;
 }
 

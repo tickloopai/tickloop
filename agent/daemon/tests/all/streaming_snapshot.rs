@@ -6,11 +6,8 @@ use std::{
 use async_trait::async_trait;
 use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_protocol::{
-    AgentAccess, Content, Event, EventKind, QuestionAnswer, Role, Usage,
-};
+use tickloop_agent_protocol::{AgentAccess, Content, Event, EventKind, Role, Usage};
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -114,16 +111,14 @@ async fn stream_flood_retains_reply_without_overrunning_live_events(thinking: bo
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "这个项目是做什么的".into())
+        .submit(chat, "这个项目是做什么的".into())
         .await
         .unwrap();
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
-            if snapshot
-                .loops
-                .first()
-                .is_some_and(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)
+            if snapshot.messages.len() > 1
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
             {
                 break snapshot;
             }
@@ -253,7 +248,7 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
                 .await
                 .unwrap();
             agent
-                .submit(chat, None, "Stream the controlled packets".into())
+                .submit(chat, "Stream the controlled packets".into())
                 .await
                 .unwrap();
             let mut text = String::new();
@@ -394,10 +389,7 @@ async fn snapshots_move_each_streamed_reply_into_history_once_across_a_real_tool
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Read notes.txt".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Read notes.txt".into()).await.unwrap();
 
     wait_for(
         &mut events,
@@ -498,10 +490,7 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Please answer".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Please answer".into()).await.unwrap();
     wait_for(
         &mut events,
         |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" reply")),
@@ -517,10 +506,7 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
             .all(|message| message.role != Role::Assistant)
     );
 
-    agent
-        .submit(chat, Some(first.loop_id), "Try again".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Try again".into()).await.unwrap();
     wait_for(&mut events, |kind| matches!(kind, EventKind::Started)).await;
     retry.begin.cancel();
     wait_for(
@@ -546,136 +532,6 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
             .filter(|message| message.role == Role::Assistant)
             .count(),
         1
-    );
-    agent.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_parked_run_does_not_commit_another_runs_failed_reply_when_it_regains_the_chat() {
-    let directory = tempfile::tempdir().unwrap();
-    let ask = ReplyControl::default();
-    let failed = ReplyControl::default();
-    let resumed = ReplyControl::default();
-    ask.begin.cancel();
-    ask.finish.cancel();
-    failed.begin.cancel();
-    let model = Arc::new(StreamingModel {
-        requests: Mutex::new(Vec::new()),
-        replies: Mutex::new(VecDeque::from([
-            ControlledReply {
-                control: ask,
-                deltas: vec!["A needs clarification."],
-                outcome: Ok(vec![
-                    Content::Text {
-                        text: "A needs clarification.".into(),
-                    },
-                    Content::ToolUse {
-                        id: "ask-a".into(),
-                        name: ASK_USER_QUESTION_TOOL_NAME.into(),
-                        input: tickloop_agent_test_support::single_question("Which format?"),
-                    },
-                ]),
-            },
-            ControlledReply {
-                control: failed.clone(),
-                deltas: vec!["B unfinished text"],
-                outcome: Err(ModelError::StreamInterrupted),
-            },
-            ControlledReply {
-                control: resumed.clone(),
-                deltas: vec!["A resumed", " independently."],
-                outcome: Ok(tickloop_agent_test_support::text(
-                    "A resumed independently.",
-                )),
-            },
-        ])),
-    });
-    let agent = Agent::open_embedded(
-        directory.path().join("archive"),
-        tickloop_agent_test_support::config(),
-        model,
-    )
-    .unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Prepare report A".into())
-        .await
-        .unwrap();
-    wait_for(&mut events, |kind| {
-        matches!(kind, EventKind::QuestionAsked { .. })
-    })
-    .await;
-    let question = agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .questions
-        .into_iter()
-        .find(|question| question.run_id == first.run_id)
-        .unwrap();
-
-    let second = agent
-        .submit(chat, None, "Research B while A waits".into())
-        .await
-        .unwrap();
-    wait_for(
-        &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == "B unfinished text"),
-    )
-    .await;
-    failed.finish.cancel();
-    wait_for(&mut events, |kind| matches!(kind, EventKind::Failed(_))).await;
-    agent
-        .answer_question(chat, question.id, vec![QuestionAnswer::other("Markdown")])
-        .await
-        .unwrap();
-    wait_for(
-        &mut events,
-        |kind| matches!(kind, EventKind::ToolCompleted { call_id, .. } if call_id == "ask-a"),
-    )
-    .await;
-    resumed.begin.cancel();
-    wait_for(
-        &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" independently.")),
-    )
-    .await;
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(
-        !serde_json::to_string(&snapshot.messages)
-            .unwrap()
-            .contains("B unfinished text")
-    );
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|event| event.run_id == second.run_id
-                && matches!(&event.kind, EventKind::Text(text) if text == "B unfinished text"))
-    );
-    assert!(
-        snapshot.events.iter().any(
-            |event| event.run_id == second.run_id && matches!(event.kind, EventKind::Failed(_))
-        )
-    );
-    assert_eq!(snapshot.events.iter().filter(|event| event.run_id == first.run_id && matches!(event.kind, EventKind::Started)).count(), 1);
-
-    resumed.finish.cancel();
-    wait_for(&mut events, |kind| {
-        matches!(kind, EventKind::Completed { .. })
-    })
-    .await;
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(
-        serde_json::to_string(&snapshot.messages)
-            .unwrap()
-            .contains("A resumed independently.")
-    );
-    assert!(
-        !serde_json::to_string(&snapshot.messages)
-            .unwrap()
-            .contains("B unfinished text")
     );
     agent.shutdown().await;
 }

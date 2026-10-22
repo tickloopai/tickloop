@@ -1,14 +1,12 @@
-//! Name-based ids of the inputs the Agent queues for itself, and of the Loops its calls
-//! register, and of the host's own rules. The same source names the same id on every host, so a
-//! repeated delivery finds the input's ledger record and a load finds what a call registered.
+//! Name-based ids of the inputs the Agent queues for itself, and of the host's own rules. The
+//! same source names the same id on every host, so a repeated delivery finds the input's ledger
+//! record.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const FEEDBACK: &str = "tickloop.input.feedback";
 const FAMILY_MESSAGE: &str = "tickloop.input.family-message";
-const GOAL: &str = "tickloop.input.goal";
-const STARTED_GOAL: &str = "tickloop.loop.started-goal";
 const HOST_RULE: &str = "tickloop.host-rule";
 
 /// The id named by `parts` within `namespace`, laid out as a name-based UUID.
@@ -44,19 +42,6 @@ pub fn family_message(sender_chat: Uuid, response: Uuid, call_id: &str) -> Uuid 
     )
 }
 
-/// The Loop a StartGoal call of an answer registers.
-pub fn started_goal(chat: Uuid, response: Uuid, call_id: &str) -> Uuid {
-    named(
-        STARTED_GOAL,
-        &[chat.as_bytes(), response.as_bytes(), call_id.as_bytes()],
-    )
-}
-
-/// The goal a StartGoal call registered as the Loop `loop_id`.
-pub fn goal(loop_id: Uuid) -> Uuid {
-    named(GOAL, &[loop_id.as_bytes()])
-}
-
 /// The fixed id of a host rule that allows `tool`, the same on every host.
 pub fn host_rule(tool: &str) -> Uuid {
     named(HOST_RULE, &[tool.as_bytes()])
@@ -68,13 +53,16 @@ mod tests {
 
     #[test]
     fn a_source_names_one_id_and_different_sources_name_different_ones() {
-        let loop_id = Uuid::new_v4();
-        assert_eq!(goal(loop_id), goal(loop_id));
-        assert_ne!(goal(loop_id), goal(Uuid::new_v4()));
-        assert_ne!(
-            family_message(loop_id, loop_id, "a"),
-            family_message(loop_id, loop_id, "b")
+        let chat = Uuid::new_v4();
+        let response = Uuid::new_v4();
+        assert_eq!(
+            family_message(chat, response, "a"),
+            family_message(chat, response, "a")
         );
-        assert_eq!(goal(loop_id).get_version_num(), 5);
+        assert_ne!(
+            family_message(chat, response, "a"),
+            family_message(chat, response, "b")
+        );
+        assert_eq!(family_message(chat, response, "a").get_version_num(), 5);
     }
 }

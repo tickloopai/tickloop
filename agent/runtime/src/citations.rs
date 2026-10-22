@@ -318,7 +318,7 @@ pub(super) fn append_source_index(summary: &str, sources: &[CitationSource]) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::sync::Arc;
 
     use tickloop_agent_protocol::{AgentHostOptions, PromptPolicy};
     use tickloop_agent_test_support::{ScriptedModel, config, harness::ChosenModels, text};
@@ -424,7 +424,7 @@ mod tests {
         let model = Arc::new(ScriptedModel::new(vec![text("done")]));
         let agent = harness(store.clone(), model.clone());
         let chat = agent.create_chat(workdir).await.unwrap();
-        agent.submit(chat, None, "Research".into()).await.unwrap();
+        agent.submit(chat, "Research".into()).await.unwrap();
         agent.quiesce(chat).await;
         assert_eq!(register(&agent, chat, "first").await, 1);
         agent.sync().await.unwrap();
@@ -527,22 +527,15 @@ mod tests {
             chat,
             ..
         } = started().await;
-        let (candidate, bookkeeping, index, first_removed, goal) = {
+        let (candidate, bookkeeping, index, first_removed) = {
             let chats = agent.inner.chats.lock().await;
             let current = chats.get(&chat).unwrap();
             let index = current.snapshot.messages.len() - 1;
-            let goals = current
-                .snapshot
-                .loops
-                .iter()
-                .map(|goal| goal.id)
-                .collect::<HashSet<_>>();
             let (snapshot, bookkeeping) = crate::rewind::conversation_before(
                 &current.snapshot,
                 &current.bookkeeping,
                 index,
                 None,
-                &goals,
             )
             .unwrap();
             (
@@ -550,20 +543,13 @@ mod tests {
                 bookkeeping,
                 index,
                 current.snapshot.message_ids[&index],
-                current.snapshot.loops[0].id,
             )
         };
         assert_eq!(register(&agent, chat, "arrived-during-rewind").await, 2);
         {
             let mut chats = agent.inner.chats.lock().await;
             let current = chats.get_mut(&chat).unwrap();
-            agent.replace_conversation(
-                current,
-                index,
-                first_removed,
-                (candidate, bookkeeping),
-                goal,
-            );
+            agent.replace_conversation(current, index, first_removed, (candidate, bookkeeping));
         }
         assert_eq!(agent.citation_sources(chat).await.unwrap().len(), 2);
         assert_eq!(register(&agent, chat, "next").await, 3);

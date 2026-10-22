@@ -162,9 +162,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     };
     if route == ATTACH_ROUTE {
         let mut events = core.subscribe();
-        core.submit(chat, None, "Plan the change".into())
-            .await
-            .unwrap();
+        core.submit(chat, "Plan the change".into()).await.unwrap();
         wait_for_plan_approval(&mut events).await;
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -200,7 +198,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
                         "pending": plan.approval_pending,
                         "approved": plan.approved_execution_mode,
                     })).collect::<Vec<_>>(),
-                    "loops": snapshot.loops.iter().map(|goal| format!("{:?}", goal.state)).collect::<Vec<_>>(),
+                    "loop": format!("{:?}", snapshot.chat_loop.state),
                     "permissions": snapshot.permissions.iter().map(|request| request.name.clone()).collect::<Vec<_>>(),
                     "requests": request_summaries(&scripted),
                 });
@@ -234,9 +232,7 @@ async fn raise_plan_approval_then_stop(
         .await
         .unwrap();
     let mut events = core.subscribe();
-    core.submit(chat, None, "Plan the change".into())
-        .await
-        .unwrap();
+    core.submit(chat, "Plan the change".into()).await.unwrap();
     wait_for_plan_approval(&mut events).await;
     core.shutdown().await;
     chat
@@ -477,7 +473,7 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
         frame.contains("Implementation complete.")
             && frame.contains("⏵⏵ Ask · fixture")
             && approval_dialog(frame).is_none()
-            && state["loops"] == json!(["Completed"])
+            && state["loop"] == "Idle"
     });
     let requests = state["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 5, "{state}");
@@ -514,7 +510,7 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     let (_, state) = flow.wait("the reply outside Plan", |frame, state| {
         frame.contains("Wrapped up outside Plan.")
             && state["requests"].as_array().map(Vec::len) == Some(6)
-            && state["loops"] == json!(["Completed"])
+            && state["loop"] == "Idle"
     });
     let request = &state["requests"][5];
     assert_eq!(request["plan_mode"], false, "{state}");
@@ -535,7 +531,7 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
     // As in Claude Code's `PermissionRequest`, Ctrl+C rejects the plan as Esc does.
     flow.fixture.send(b"\x03");
     let (_, state) = flow.wait("the cancelled approval", |frame, state| {
-        !frame.contains("Plan approval") && state["loops"] == json!(["Interrupted"])
+        !frame.contains("Plan approval") && state["loop"] == "Interrupted"
     });
     assert_eq!(
         state["plans"],
@@ -584,7 +580,7 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
             frame.contains("Continuing the approved plan.")
                 && frame.contains("⏵⏵ Full Access · fixture")
                 && approval_dialog(frame).is_none()
-                && state["loops"] == json!(["Completed"])
+                && state["loop"] == "Idle"
         },
     );
     let requests = state["requests"].as_array().unwrap();
@@ -620,7 +616,7 @@ fn plan_flow_pty_a_view_attaching_to_a_waiting_approval_resumes_the_same_run() {
         frame.contains("Implementation started.")
             && frame.contains("⏵⏵ Auto · fixture")
             && approval_dialog(frame).is_none()
-            && state["loops"] == json!(["Completed"])
+            && state["loop"] == "Idle"
     });
     let requests = state["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 2, "{state}");
@@ -658,7 +654,7 @@ fn plan_flow_pty_a_restarted_daemon_reopens_the_pending_approval_and_continues_e
         frame.contains("Restored implementation started.")
             && frame.contains("⏵⏵ Ask · DeepSeek Flash")
             && approval_dialog(frame).is_none()
-            && state["loops"] == json!(["Completed"])
+            && state["loop"] == "Idle"
     });
     let requests = state["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 1, "{state}");

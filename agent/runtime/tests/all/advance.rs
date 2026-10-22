@@ -201,7 +201,6 @@ fn prompt(input: Uuid, after: ParentSelection, text: &str, delivery: Delivery) -
         input_id: input,
         op: TurnOp::Continue {
             after,
-            target_loop: None,
             message: UserMessage {
                 text: text.into(),
                 ..Default::default()
@@ -298,7 +297,6 @@ async fn a_root_starts_an_empty_chat_and_repeating_its_input_returns_the_outcome
     let mut changed = request;
     changed.op = TurnOp::Continue {
         after: ParentSelection::Root,
-        target_loop: None,
         message: UserMessage {
             text: "greet someone else".into(),
             ..Default::default()
@@ -499,16 +497,8 @@ async fn a_repeated_regeneration_adds_exactly_one_sibling_answer() {
     let second_take = answer(&agent, &regenerated).await;
     assert!(siblings.iter().any(|answer| answer.id == second_take));
     assert_eq!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .find(|goal| goal.id == regenerated.receipt().loop_id)
-            .unwrap()
-            .state,
-        LoopState::Completed
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Idle
     );
     agent.shutdown().await;
 }
@@ -900,31 +890,59 @@ async fn a_call_needing_approval_waits_when_interactive_and_is_denied_otherwise(
     unattended.shutdown().await;
 }
 
+fn pasted_image() -> tickloop_agent_protocol::InputContext {
+    let pixels =
+        image::RgbImage::from_fn(4, 2, |x, y| image::Rgb([x as u8 * 60, y as u8 * 90, 30]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    tickloop_agent_protocol::InputContext::Image(tickloop_agent_protocol::ImageContext {
+        origin: tickloop_agent_protocol::ImageOrigin::Pasted { id: 1 },
+        image: tickloop_agent_base::image::prepare(&bytes).unwrap(),
+    })
+}
+
 #[tokio::test]
 async fn a_refused_input_at_an_explicit_parent_leaves_the_conversation_uncut() {
     let fixture = fixture();
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::replies(&["answer one", "answer two"]);
-    let agent = agent(store.clone(), model.clone());
+    let mut text_only = config();
+    text_only
+        .input_modalities
+        .retain(|modality| *modality != tickloop_agent_protocol::InputModality::Image);
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts: Some(store.clone()),
+            environment: Some(Arc::new(LocalEnvironment::bare())),
+            models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
+        },
+        HarnessOptions::local(text_only),
+    )
+    .unwrap();
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let one = complete(&agent, chat, after_leaf("prompt one")).await;
     let answer_one = answer(&agent, &one).await;
-    let two = complete(&agent, chat, after_leaf("prompt two")).await;
+    complete(&agent, chat, after_leaf("prompt two")).await;
     let before = agent.snapshot(chat).await.unwrap().messages.len();
 
-    // The Loop of prompt two starts after answer one, so the cut would remove it.
-    let mut request = after(answer_one, "into a removed Loop");
+    // The model takes no image, so the input is refused once the cut is prepared.
+    let mut request = after(answer_one, "with a picture");
     request.op = TurnOp::Continue {
         after: ParentSelection::Message(answer_one),
-        target_loop: Some(two.receipt().loop_id),
         message: UserMessage {
-            text: "into a removed Loop".into(),
+            text: "with a picture".into(),
+            contexts: vec![pasted_image()],
             ..Default::default()
         },
     };
     assert!(matches!(
         agent.advance(chat, request).await,
-        Err(AgentError::NotFound)
+        Err(AgentError::ImageInputUnsupported)
     ));
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.messages.len(), before);
@@ -1283,7 +1301,6 @@ async fn a_refused_input_off_the_current_chain_leaves_the_conversation_where_it_
         input_id: Uuid::new_v4(),
         op: TurnOp::Skill {
             after: ParentSelection::Message(branches.answer_two),
-            target_loop: None,
             skill: tickloop_agent_runtime::SkillInvocation {
                 name: "no-such-skill".into(),
                 arguments: String::new(),
@@ -1296,7 +1313,6 @@ async fn a_refused_input_off_the_current_chain_leaves_the_conversation_where_it_
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::Message(branches.answer_two),
-            target_loop: None,
             message: UserMessage {
                 text: "read @missing.txt".into(),
                 contexts: Vec::new(),

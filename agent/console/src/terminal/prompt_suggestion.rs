@@ -47,12 +47,10 @@ pub(super) fn suppression(status: &ChatStatus) -> Option<&'static str> {
         Some("suppressed: pending permission or question")
     } else if !status.queued_inputs().is_empty() {
         Some("suppressed: queued input")
-    } else if status.loops.iter().any(|goal| {
-        matches!(
-            goal.state,
-            LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
-        )
-    }) {
+    } else if matches!(
+        status.chat_loop.state,
+        LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
+    ) {
         Some("suppressed: running turn")
     } else {
         None

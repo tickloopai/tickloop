@@ -505,7 +505,7 @@ async fn remote_resource_reads_discard_responses_when_account_or_policy_changes(
         let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
-            .submit(chat, None, "Read the reference".into())
+            .submit(chat, "Read the reference".into())
             .await
             .unwrap();
         tokio::time::timeout(WAIT, service.control.skill_response_started.notified())
@@ -981,7 +981,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
                 None,
             )))
             .unwrap();
-        let snapshot = restored.resume_chat(chat).await.unwrap();
+        restored.resume_chat(chat).await.unwrap();
         if change == "policy" {
             restored
                 .set_permission_rules(
@@ -1001,11 +1001,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
         }
 
         restored
-            .submit(
-                chat,
-                Some(snapshot.loops.last().unwrap().id),
-                "Continue the work".into(),
-            )
+            .submit(chat, "Continue the work".into())
             .await
             .unwrap();
         wait_for_completion(&restored, chat).await;
@@ -1050,10 +1046,7 @@ async fn remote_skill_loading_drops_the_old_account_response() {
     ]));
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "Build a page".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Build a page".into()).await.unwrap();
     tokio::time::timeout(WAIT, service.control.skill_response_started.notified())
         .await
         .unwrap();
@@ -1089,10 +1082,7 @@ async fn remote_skill_policy_revocation_during_loading_prevents_activation() {
     ]));
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "Prepare a page".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Prepare a page".into()).await.unwrap();
     tokio::time::timeout(WAIT, service.control.skill_response_started.notified())
         .await
         .unwrap();
@@ -1232,30 +1222,13 @@ async fn eventually(mut condition: impl AsyncFnMut() -> bool) {
     .expect("condition was not reached");
 }
 
-async fn wait_for_loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId, state: LoopState) {
-    eventually(async || {
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .any(|goal| goal.id == loop_id && goal.state == state)
-    })
-    .await;
+async fn wait_for_loop_state(agent: &Agent, chat: ChatId, state: LoopState) {
+    eventually(async || agent.snapshot(chat).await.unwrap().chat_loop.state == state).await;
 }
 
 async fn wait_for_completion(agent: &Agent, chat: ChatId) {
-    eventually(async || {
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .last()
-            .is_some_and(|goal| goal.state == LoopState::Completed)
-    })
-    .await;
+    eventually(async || agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle)
+        .await;
 }
 
 async fn next_permission(
@@ -1290,7 +1263,7 @@ async fn linked_chat(
         )
         .await
         .unwrap();
-    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
+    let loop_id = agent.snapshot(chat).await.unwrap().chat_loop.id;
     (agent, chat, loop_id)
 }
 
@@ -1336,7 +1309,7 @@ async fn directory_presents_exactly_the_three_artifact_tools_and_the_host_upload
         )))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.submit(chat, None, "Inspect".into()).await.unwrap();
+    agent.submit(chat, "Inspect".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
@@ -1470,7 +1443,7 @@ async fn reading_runs_without_approval_while_edits_ask_under_their_own_name() {
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Tighten it".into()).await.unwrap();
+    agent.submit(chat, "Tighten it".into()).await.unwrap();
     let permission = next_permission(&mut events).await;
     assert_eq!(permission.name, "ArtifactEdit");
     assert_eq!(
@@ -1640,7 +1613,7 @@ async fn an_approved_agent_rename_retitles_the_chat_artifact_and_a_refused_one_d
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Rename it to Q3 plan".into())
+        .submit(chat, "Rename it to Q3 plan".into())
         .await
         .unwrap();
     for _ in 0..2 {
@@ -1692,10 +1665,7 @@ async fn plan_mode_denies_artifact_writes_and_keeps_reads() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Plan a reply".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Plan a reply".into()).await.unwrap();
     let reply = loop {
         if let EventKind::ToolCompleted {
             call_id, result, ..
@@ -1735,7 +1705,7 @@ async fn delegated_chat_inherits_the_artifact_tools() {
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit(chat, None, "Delegate tool inspection".into())
+        .submit(chat, "Delegate tool inspection".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -1807,7 +1777,7 @@ async fn delegated_artifact_calls_obey_frozen_allow_ask_and_deny() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(parent, None, "Delegate the reply".into())
+            .submit(parent, "Delegate the reply".into())
             .await
             .unwrap();
         let mut asked = 0;
@@ -1938,7 +1908,7 @@ async fn delegated_artifact_authority_cannot_expand_after_parent_policy_or_accou
         }
         let mut events = agent.subscribe();
         agent
-            .submit(parent, None, "Delegate the edit".into())
+            .submit(parent, "Delegate the edit".into())
             .await
             .unwrap();
         tokio::time::timeout(WAIT, model.entered.notified())
@@ -1991,7 +1961,7 @@ async fn a_feedback_delegation_keeps_the_receiving_account_after_login_changes()
         child_turns: AtomicUsize::new(0),
         parent_turns: AtomicUsize::new(0),
     });
-    let (agent, parent, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, parent, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     tokio::time::timeout(WAIT, model.entered.notified())
         .await
         .unwrap();
@@ -2027,7 +1997,7 @@ async fn a_feedback_delegation_keeps_the_receiving_account_after_login_changes()
     })
     .await
     .unwrap();
-    wait_for_loop_state(&agent, parent, loop_id, LoopState::Failed).await;
+    wait_for_loop_state(&agent, parent, LoopState::Failed).await;
     assert!(service.tool_calls().is_empty());
     agent.shutdown().await;
 }
@@ -2111,7 +2081,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit(chat, None, "Inspect native tool inventory".into())
+        .submit(chat, "Inspect native tool inventory".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -2171,7 +2141,7 @@ async fn login_reveals_the_tools_and_an_approved_edit_is_sent_once() {
         )))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.submit(chat, None, "Check".into()).await.unwrap();
+    agent.submit(chat, "Check".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     assert!(
         !tool_names(&model.requests.lock().unwrap()[0]).contains(&"ArtifactEdit"),
@@ -2180,7 +2150,7 @@ async fn login_reveals_the_tools_and_an_approved_edit_is_sent_once() {
     service.login(directory.path()).await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Replace the document".into())
+        .submit(chat, "Replace the document".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -2231,7 +2201,7 @@ async fn logout_after_an_approval_request_prevents_dispatch_and_hides_the_tools(
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Replace".into()).await.unwrap();
+    agent.submit(chat, "Replace".into()).await.unwrap();
     let permission = next_permission(&mut events).await;
     service.client(directory.path()).logout().await.unwrap();
     agent
@@ -2316,7 +2286,7 @@ async fn a_lost_call_response_is_unknown_and_never_replayed() {
     let agent = signed_in_agent(&service, directory.path(), model).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Replace".into()).await.unwrap();
+    agent.submit(chat, "Replace".into()).await.unwrap();
     let permission = next_permission(&mut events).await;
     agent
         .answer_permission(chat, permission.id, true)
@@ -2741,10 +2711,10 @@ async fn feedback_enters_the_linked_loop_once_without_a_completion_tool_or_priva
         ),
         text("Handled."),
     ]));
-    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     eventually(async || service.finished() == [("request-1".into(), "received".into())]).await;
     eventually(async || service.tool_calls().len() == 1).await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     assert!(service.tool_calls()[0]["_meta"]["tickloop.ai/event-bridge"].is_null());
     let conversations = model
         .requests
@@ -2761,9 +2731,9 @@ async fn feedback_enters_the_linked_loop_once_without_a_completion_tool_or_priva
                 && !conversation.contains("claim_id"))
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(!snapshot.loops[0].event_sources[0].resume_required);
+    assert!(!snapshot.chat_loop.event_sources[0].resume_required);
     assert_eq!(
-        snapshot.loops[0].event_sources[0].last_request_at_ms,
+        snapshot.chat_loop.event_sources[0].last_request_at_ms,
         Some(artifact_service::REQUEST_CREATED_AT_MS)
     );
     assert!(service.releases().is_empty());
@@ -2778,9 +2748,9 @@ async fn base62_feedback_is_claimed_acknowledged_and_delivered_once() {
     service.request_feedback("doc", feedback);
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("Received.")]));
-    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     eventually(async || service.finished() == [(feedback.into(), "received".into())]).await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     assert_eq!(
         service
@@ -2788,7 +2758,7 @@ async fn base62_feedback_is_claimed_acknowledged_and_delivered_once() {
             .len(),
         2
     );
-    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
+    assert!(!agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     agent.shutdown().await;
 }
 
@@ -2817,16 +2787,16 @@ async fn a_normal_run_without_a_comment_keeps_the_feedback_and_link() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     service.request_feedback("doc", "request-1");
-    let (agent, chat, loop_id) = linked_chat(
+    let (agent, chat, _loop_id) = linked_chat(
         &service,
         directory.path(),
         Arc::new(ScriptedModel::new(vec![text("I looked at it.")])),
     )
     .await;
     eventually(async || !service.is_pending("request-1")).await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     assert!(service.releases().is_empty());
-    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
+    assert!(!agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     agent.shutdown().await;
 }
 
@@ -2882,16 +2852,16 @@ async fn esc_then_new_input_keeps_prior_feedback_and_receives_later_feedback_wit
         turns: AtomicUsize::new(0),
         requests: Mutex::new(Vec::new()),
     });
-    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     tokio::time::timeout(WAIT, model.started.notified())
         .await
         .unwrap();
     agent.interrupt(chat).await.unwrap();
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::Interrupted).await;
-    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
+    wait_for_loop_state(&agent, chat, LoopState::Interrupted).await;
+    assert!(!agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     assert!(!service.is_pending("request-1"));
     agent
-        .submit(chat, Some(loop_id), "Please keep going".into())
+        .submit(chat, "Please keep going".into())
         .await
         .unwrap();
     eventually(async || model.turns.load(Ordering::SeqCst) >= 2).await;
@@ -2915,7 +2885,7 @@ async fn esc_then_new_input_keeps_prior_feedback_and_receives_later_feedback_wit
 }
 
 #[tokio::test]
-async fn stopping_the_loop_removes_its_cloud_receiver_without_releasing_received_input() {
+async fn stopping_pauses_the_link_without_releasing_received_input() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     service.request_feedback("doc", "request-1");
@@ -2924,12 +2894,16 @@ async fn stopping_the_loop_removes_its_cloud_receiver_without_releasing_received
         turns: AtomicUsize::new(0),
         requests: Mutex::new(Vec::new()),
     });
-    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     tokio::time::timeout(WAIT, model.started.notified())
         .await
         .unwrap();
-    agent.stop(chat, loop_id).await.unwrap();
-    eventually(async || service.link("doc").is_none()).await;
+    agent.stop(chat).await.unwrap();
+    assert!(
+        service.link("doc").is_some(),
+        "a paused Loop keeps its link"
+    );
+    assert!(agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     assert!(!service.is_pending("request-1"));
     assert!(service.releases().is_empty());
     agent.shutdown().await;
@@ -2945,7 +2919,7 @@ async fn send_now_keeps_received_feedback_and_a_busy_loop_accepts_new_feedback()
         turns: AtomicUsize::new(0),
         requests: Mutex::new(Vec::new()),
     });
-    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     tokio::time::timeout(WAIT, model.started.notified())
         .await
         .unwrap();
@@ -2953,7 +2927,7 @@ async fn send_now_keeps_received_feedback_and_a_busy_loop_accepts_new_feedback()
     eventually(async || service.finished().len() == 2).await;
     assert_eq!(model.turns.load(Ordering::SeqCst), 1);
     let queued = agent
-        .submit(chat, Some(loop_id), "Use the shorter title".into())
+        .submit(chat, "Use the shorter title".into())
         .await
         .unwrap();
     agent.send_now(chat, queued.run_id).await.unwrap();
@@ -2966,7 +2940,7 @@ async fn send_now_keeps_received_feedback_and_a_busy_loop_accepts_new_feedback()
             && messages.contains("Use the shorter title")
     })
     .await;
-    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
+    assert!(!agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     assert!(service.releases().is_empty());
     agent.shutdown().await;
 }
@@ -3010,9 +2984,8 @@ async fn feedback_account_provenance_survives_restart_and_stop_works_after_accou
             service.requests()
         );
     }
-    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
     agent.interrupt(chat).await.unwrap();
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::Interrupted).await;
+    wait_for_loop_state(&agent, chat, LoopState::Interrupted).await;
     agent.shutdown().await;
     drop(agent);
     service.control.other_account.store(true, Ordering::SeqCst);
@@ -3029,14 +3002,18 @@ async fn feedback_account_provenance_survives_restart_and_stop_works_after_accou
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    restored
-        .submit(chat, Some(loop_id), "Continue".into())
-        .await
-        .unwrap();
-    wait_for_loop_state(&restored, chat, loop_id, LoopState::Failed).await;
+    restored.submit(chat, "Continue".into()).await.unwrap();
+    wait_for_loop_state(&restored, chat, LoopState::Failed).await;
     assert!(model.requests.lock().unwrap().is_empty());
-    restored.stop(chat, loop_id).await.unwrap();
-    wait_for_loop_state(&restored, chat, loop_id, LoopState::Stopped).await;
+    restored.stop(chat).await.unwrap();
+    let chat_loop = restored.snapshot(chat).await.unwrap().chat_loop;
+    assert_eq!(chat_loop.state, LoopState::Failed);
+    assert!(
+        chat_loop
+            .event_sources
+            .iter()
+            .all(|source| source.resume_required)
+    );
     restored.shutdown().await;
 }
 
@@ -3084,7 +3061,7 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
             )
             .await
             .unwrap();
-        let goal = agent.snapshot(chat).await.unwrap().loops[0].clone();
+        let goal = agent.snapshot(chat).await.unwrap().chat_loop.clone();
         let source = &goal.event_sources[0];
         let delivery = tickloop_agent_runtime::ExternalDelivery::from_claim(
             &source.origin,
@@ -3102,7 +3079,7 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
         .unwrap();
         if !switch_before_delivery {
             let turn = agent
-                .advance(chat, TurnRequest::deliver(goal.id, delivery.clone()))
+                .advance(chat, TurnRequest::deliver(delivery.clone()))
                 .await
                 .unwrap();
             assert!(matches!(
@@ -3115,16 +3092,13 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
         service.login(directory.path()).await;
         if switch_before_delivery {
             agent
-                .advance(chat, TurnRequest::deliver(goal.id, delivery))
+                .advance(chat, TurnRequest::deliver(delivery))
                 .await
                 .unwrap();
         } else {
-            agent
-                .submit(chat, Some(goal.id), "Continue".into())
-                .await
-                .unwrap();
+            agent.submit(chat, "Continue".into()).await.unwrap();
         }
-        wait_for_loop_state(&agent, chat, goal.id, LoopState::Failed).await;
+        wait_for_loop_state(&agent, chat, LoopState::Failed).await;
         assert_eq!(model.requests.lock().unwrap().len(), requests);
         agent.shutdown().await;
     }
@@ -3153,7 +3127,7 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    agent.submit(chat, None, "Get ready".into()).await.unwrap();
+    agent.submit(chat, "Get ready".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent
         .link_artifact(
@@ -3181,8 +3155,8 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    let goal = &snapshot.loops[0];
-    assert_eq!(goal.state, LoopState::Interrupted);
+    let goal = &snapshot.chat_loop;
+    assert_eq!(goal.state, LoopState::Idle);
     assert!(goal.event_sources[0].resume_required);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
@@ -3198,13 +3172,17 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
         .await
         .unwrap();
     let continued = restored.snapshot(chat).await.unwrap();
-    assert_eq!(continued.loops.len(), 1);
-    assert_eq!(continued.loops[0].id, goal.id);
+    assert_eq!(continued.chat_loop.id, goal.id);
     let renewed = service.link("doc").unwrap();
     assert_ne!(renewed.binding_id, first_binding);
     assert_eq!(renewed.epoch, 2);
     eventually(async || service.finished() == [("request-1".into(), "received".into())]).await;
-    let binding = &restored.snapshot(chat).await.unwrap().loops[0].event_sources[0];
+    let binding = &restored
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .chat_loop
+        .event_sources[0];
     assert_eq!(binding.binding_id.to_string(), renewed.binding_id);
     assert_eq!(binding.epoch, 2);
     restored.shutdown().await;
@@ -3249,7 +3227,6 @@ async fn a_received_request_still_queued_at_a_restart_runs_once_after_continue()
         .unwrap();
     service.request_feedback("doc", "queued-request");
     eventually(async || service.finished().len() == 2).await;
-    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
     agent.shutdown().await;
     drop(agent);
 
@@ -3269,12 +3246,9 @@ async fn a_received_request_still_queued_at_a_restart_runs_once_after_continue()
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    restored
-        .submit(chat, Some(loop_id), "Continue".into())
-        .await
-        .unwrap();
+    restored.submit(chat, "Continue".into()).await.unwrap();
     eventually(async || model.requests.lock().unwrap().len() == 2).await;
-    wait_for_loop_state(&restored, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&restored, chat, LoopState::Idle).await;
     let prompts = |feedback: &str| {
         let heading = format!("@tickloop feedback {feedback} on artifact doc");
         model.requests.lock().unwrap()[1]
@@ -3310,10 +3284,7 @@ async fn a_copied_session_links_its_own_receiver_without_taking_the_original_age
         .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
         .unwrap();
     let original = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(original, None, "Prepare".into())
-        .await
-        .unwrap();
+    agent.submit(original, "Prepare".into()).await.unwrap();
     wait_for_completion(&agent, original).await;
     agent
         .link_artifact(
@@ -3324,14 +3295,9 @@ async fn a_copied_session_links_its_own_receiver_without_taking_the_original_age
         .await
         .unwrap();
     let copied = agent.resume_as_new_chat(original).await.unwrap();
-    assert!(
-        copied
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
-    );
+    assert!(copied.chat_loop.event_sources.is_empty());
     agent
-        .submit(copied.id, None, "Continue the copied context".into())
+        .submit(copied.id, "Continue the copied context".into())
         .await
         .unwrap();
     wait_for_completion(&agent, copied.id).await;
@@ -3392,19 +3358,19 @@ async fn a_copied_session_links_its_own_receiver_without_taking_the_original_age
 async fn a_link_replaced_elsewhere_pauses_listening_until_continue() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
-    let (agent, chat, loop_id) = linked_chat(
+    let (agent, chat, _loop_id) = linked_chat(
         &service,
         directory.path(),
         Arc::new(ScriptedModel::new(vec![])),
     )
     .await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     service.replace_link("doc");
     // The idle watcher checks again within its 15 second interval.
     tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
-            if snapshot.loops[0].event_sources[0].resume_required {
+            if snapshot.chat_loop.event_sources[0].resume_required {
                 break snapshot;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3412,7 +3378,7 @@ async fn a_link_replaced_elsewhere_pauses_listening_until_continue() {
     })
     .await
     .unwrap();
-    assert!(agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
+    assert!(agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required);
     agent.shutdown().await;
 }
 
@@ -3420,22 +3386,22 @@ async fn a_link_replaced_elsewhere_pauses_listening_until_continue() {
 async fn signing_out_pauses_feedback_listening() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
-    let (agent, chat, loop_id) = linked_chat(
+    let (agent, chat, _loop_id) = linked_chat(
         &service,
         directory.path(),
         Arc::new(ScriptedModel::new(vec![])),
     )
     .await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     agent.disable_event_sources().await;
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(snapshot.loops[0].event_sources[0].resume_required);
-    assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+    assert!(snapshot.chat_loop.event_sources[0].resume_required);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     agent.shutdown().await;
 }
 
 #[tokio::test]
-async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
+async fn relinking_an_artifact_replaces_its_link_and_another_artifact_joins_the_loop() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let (agent, chat, loop_id) = linked_chat(
@@ -3445,7 +3411,7 @@ async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
     )
     .await;
     agent
-        .submit(chat, None, "An unrelated goal".into())
+        .submit(chat, "An unrelated goal".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -3458,14 +3424,12 @@ async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
         .await
         .unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops.len(), 2);
-    assert_eq!(snapshot.loops[0].id, loop_id);
-    assert_eq!(snapshot.loops[0].event_sources.len(), 1);
+    assert_eq!(snapshot.chat_loop.id, loop_id);
+    assert_eq!(snapshot.chat_loop.event_sources.len(), 1);
     assert_eq!(
-        snapshot.loops[0].event_sources[0].binding_id.to_string(),
+        snapshot.chat_loop.event_sources[0].binding_id.to_string(),
         service.link("doc").unwrap().binding_id
     );
-    assert!(snapshot.loops[1].event_sources.is_empty());
 
     agent
         .link_artifact(
@@ -3476,11 +3440,18 @@ async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
         .await
         .unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
+    let artifacts = snapshot
+        .chat_loop
+        .event_sources
+        .iter()
+        .map(|source| source.artifact_id.as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        snapshot.loops[1].event_sources[0].artifact_id, "other",
-        "a new link goes to the newest open Loop"
+        artifacts,
+        ["doc", "other"],
+        "a new link joins the Chat's Loop"
     );
-    assert_eq!(snapshot.loops[1].state, LoopState::WaitingTrigger);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     agent.shutdown().await;
 }
 
@@ -3543,14 +3514,10 @@ async fn an_unlinked_artifact_no_longer_brings_its_requests_into_the_loop() {
         .await
         .unwrap();
     // Unlink before any feedback is created; only the remaining receiver gets new input.
-    agent
-        .submit(chat, None, "Write two briefs".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write two briefs".into()).await.unwrap();
     tokio::time::timeout(WAIT, model.started.notified())
         .await
         .unwrap();
-    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
     let doc = artifact_tick(&service, "doc");
     let other = artifact_tick(&service, "other");
     for tick in [&doc, &other] {
@@ -3571,7 +3538,8 @@ async fn an_unlinked_artifact_no_longer_brings_its_requests_into_the_loop() {
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks, std::slice::from_ref(&other));
     assert_eq!(
-        snapshot.loops[0]
+        snapshot
+            .chat_loop
             .event_sources
             .iter()
             .map(|source| source.artifact_id.as_str())
@@ -3616,16 +3584,16 @@ async fn an_unlinked_artifact_no_longer_brings_its_requests_into_the_loop() {
         "an unlinked artifact's request never reaches the Loop"
     );
 
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     agent
         .remove_artifact_tick(chat, &other.instance_id())
         .await
         .unwrap();
-    let goal = agent.snapshot(chat).await.unwrap().loops[0].clone();
+    let goal = agent.snapshot(chat).await.unwrap().chat_loop.clone();
     assert!(goal.event_sources.is_empty());
     assert_eq!(
         goal.state,
-        LoopState::Completed,
+        LoopState::Idle,
         "a Loop left with nothing to wait for completes"
     );
     agent.shutdown().await;
@@ -3649,10 +3617,7 @@ async fn a_creation_answered_with_retired_wire_format_does_not_bind_monitor() {
     ]));
     let agent = signed_in_agent(&service, directory.path(), model).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "Mock up a board".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Mock up a board".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.artifact_ticks.is_empty());
@@ -3682,12 +3647,7 @@ async fn a_read_artifact_joins_monitor_without_linking_to_feedback() {
     assert_eq!(tick.title, "Fixture");
     assert_eq!(tick.format, "markdown");
     assert_eq!(tick.access_role, "owner");
-    assert!(
-        snapshot
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
-    );
+    assert!(snapshot.chat_loop.event_sources.is_empty());
     eventually(async || service.link("doc").is_none()).await;
     assert!(
         service
@@ -3786,7 +3746,7 @@ async fn reading_back_an_unchanged_page_this_chat_wrote_returns_a_note_instead_o
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let turn = async |prompt: &str, requests: usize| {
-        agent.submit(chat, None, prompt.into()).await.unwrap();
+        agent.submit(chat, prompt.into()).await.unwrap();
         eventually(async || model.requests.lock().unwrap().len() >= requests).await;
     };
     turn("Make a page", 2).await;
@@ -3872,12 +3832,7 @@ async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore(
     submit_and_wait(&agent, chat, "Read the next page and reread the document").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks, first.artifact_ticks);
-    assert!(
-        snapshot
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
-    );
+    assert!(snapshot.chat_loop.event_sources.is_empty());
     assert!(
         snapshot
             .monitor
@@ -3953,12 +3908,7 @@ async fn a_read_artifact_preserves_response_roles_and_supported_formats() {
         assert_eq!(snapshot.artifact_ticks.len(), 1);
         assert_eq!(snapshot.artifact_ticks[0].format, stored_format);
         assert_eq!(snapshot.artifact_ticks[0].access_role, stored_role);
-        assert!(
-            snapshot
-                .loops
-                .iter()
-                .all(|goal| goal.event_sources.is_empty())
-        );
+        assert!(snapshot.chat_loop.event_sources.is_empty());
     }
     assert!(
         service
@@ -4040,12 +3990,7 @@ async fn artifact_reads_attach_only_valid_matching_body_receipts() {
     submit_and_wait(&agent, chat, "List artifacts and read comments").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.artifact_ticks.is_empty());
-    assert!(
-        snapshot
-            .loops
-            .iter()
-            .all(|goal| goal.event_sources.is_empty())
-    );
+    assert!(snapshot.chat_loop.event_sources.is_empty());
     assert!(
         service
             .lifecycle_requests("PUT /artifact/api/v1/agent/links/")
@@ -4075,20 +4020,9 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Write a brief".into())
-        .await
-        .unwrap();
-    eventually(async || {
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .last()
-            .is_some_and(|goal| goal.state == LoopState::WaitingTrigger)
-    })
-    .await;
+    agent.submit(chat, "Write a brief".into()).await.unwrap();
+    eventually(async || agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle)
+        .await;
     while let Ok(event) = events.try_recv() {
         assert!(
             !matches!(
@@ -4111,7 +4045,7 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
         snapshot.artifact_ticks[0].format, "markdown",
         "a doc is catalogued under its stored format"
     );
-    let goal = snapshot.loops.last().unwrap();
+    let goal = snapshot.chat_loop;
     assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
     let link = service.link(CREATED_ARTIFACT).unwrap();
     assert_eq!(link.loop_id, goal.id.to_string());
@@ -4139,15 +4073,12 @@ async fn a_failed_creation_link_is_reported_to_the_model_and_monitor_still_shows
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    agent
-        .submit(chat, None, "Write a brief".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write a brief".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks.len(), 1);
     assert_eq!(snapshot.artifact_ticks[0].format, "html");
-    assert!(snapshot.loops[0].event_sources.is_empty());
+    assert!(snapshot.chat_loop.event_sources.is_empty());
     let result = serde_json::to_string(&model.requests.lock().unwrap()[1].messages).unwrap();
     assert!(
         result.contains("linking it for @tickloop requests failed"),
@@ -4166,11 +4097,11 @@ async fn continuing_after_an_account_switch_links_the_artifact_for_the_new_accou
         Arc::new(ScriptedModel::new(vec![])),
     )
     .await;
-    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     service.control.other_account.store(true, Ordering::SeqCst);
     service.login(directory.path()).await;
     tokio::time::timeout(Duration::from_secs(25), async {
-        while !agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required {
+        while !agent.snapshot(chat).await.unwrap().chat_loop.event_sources[0].resume_required {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -4185,8 +4116,8 @@ async fn continuing_after_an_account_switch_links_the_artifact_for_the_new_accou
         .await
         .unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops.len(), 2);
-    let sources = &snapshot.loops[1].event_sources;
+    assert_eq!(snapshot.chat_loop.id, loop_id);
+    let sources = &snapshot.chat_loop.event_sources;
     assert_eq!(
         sources.len(),
         1,
@@ -4194,7 +4125,7 @@ async fn continuing_after_an_account_switch_links_the_artifact_for_the_new_accou
     );
     assert_eq!(sources[0].account_id, "user-two");
     assert!(!sources[0].resume_required);
-    assert_eq!(snapshot.loops[1].state, LoopState::WaitingTrigger);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     agent.shutdown().await;
 }
 
@@ -4229,7 +4160,7 @@ fn tool_result_text(request: &ModelRequest, call_id: &str) -> String {
 }
 
 async fn submit_and_wait(agent: &Agent, chat: ChatId, prompt: &str) {
-    agent.submit(chat, None, prompt.into()).await.unwrap();
+    agent.submit(chat, prompt.into()).await.unwrap();
     wait_for_completion(agent, chat).await;
 }
 
@@ -4548,10 +4479,7 @@ async fn a_sign_in_during_a_turn_reaches_the_next_request_of_that_turn() {
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Write a doc".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write a doc".into()).await.unwrap();
     let question = loop {
         if let EventKind::QuestionAsked { request } =
             tickloop_agent_test_support::next_event(&mut events)
@@ -4614,7 +4542,7 @@ async fn a_child_delegated_before_sign_in_takes_up_the_artifact_tools() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Delegate the draft".into())
+        .submit(chat, "Delegate the draft".into())
         .await
         .unwrap();
     let (child, question) = loop {
@@ -4947,7 +4875,7 @@ async fn remote_skill_source_or_policy_change_during_compaction_refreshes_the_ef
         submit_and_wait(&agent, chat, "Build a page").await;
         agent.set_context_window(chat, 200_000).await.unwrap();
         agent
-            .submit(chat, None, "Continue with the page".into())
+            .submit(chat, "Continue with the page".into())
             .await
             .unwrap();
         tokio::time::timeout(WAIT, model.started.notified())
@@ -5036,8 +4964,8 @@ async fn remote_skill_post_compaction_refresh_can_be_cancelled_while_the_server_
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     submit_and_wait(&agent, chat, "Build a page").await;
     agent.set_context_window(chat, 200_000).await.unwrap();
-    let receipt = agent
-        .submit(chat, None, "Continue with the page".into())
+    agent
+        .submit(chat, "Continue with the page".into())
         .await
         .unwrap();
     tokio::time::timeout(WAIT, model.started.notified())
@@ -5054,7 +4982,7 @@ async fn remote_skill_post_compaction_refresh_can_be_cancelled_while_the_server_
     agent.interrupt(chat).await.unwrap();
     let cancelled = tokio::time::timeout(
         Duration::from_secs(5),
-        wait_for_loop_state(&agent, chat, receipt.loop_id, LoopState::Interrupted),
+        wait_for_loop_state(&agent, chat, LoopState::Interrupted),
     )
     .await;
     service
@@ -5083,19 +5011,11 @@ async fn created_slides_join_monitor_as_slides_and_link_to_the_creating_loop() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "做个 PPT 介绍这次发布".into())
+        .submit(chat, "做个 PPT 介绍这次发布".into())
         .await
         .unwrap();
-    eventually(async || {
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .last()
-            .is_some_and(|goal| goal.state == LoopState::WaitingTrigger)
-    })
-    .await;
+    eventually(async || agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle)
+        .await;
     while let Ok(event) = events.try_recv() {
         assert!(
             !matches!(event.kind, EventKind::PermissionRequested { .. }),
@@ -5106,7 +5026,7 @@ async fn created_slides_join_monitor_as_slides_and_link_to_the_creating_loop() {
     assert_eq!(snapshot.artifact_ticks.len(), 1);
     assert_eq!(snapshot.artifact_ticks[0].artifact_id, CREATED_ARTIFACT);
     assert_eq!(snapshot.artifact_ticks[0].format, "slides");
-    let goal = snapshot.loops.last().unwrap();
+    let goal = snapshot.chat_loop;
     assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
     assert_eq!(
         service.link(CREATED_ARTIFACT).unwrap().loop_id,
@@ -5269,7 +5189,7 @@ async fn an_upload_from_outside_the_workspace_asks_once_with_the_file_facts_but_
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add my photo to the Slides".into())
+        .submit(chat, "Add my photo to the Slides".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -5321,7 +5241,7 @@ async fn plan_mode_asks_for_a_private_slides_upload_as_it_does_for_artifact_edit
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Plan the Slides with the logo".into())
+        .submit(chat, "Plan the Slides with the logo".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -5481,7 +5401,7 @@ async fn an_admitted_slides_write_still_asks_before_sending_a_file_from_outside_
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add the chart and my photo".into())
+        .submit(chat, "Add the chart and my photo".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -5530,7 +5450,7 @@ async fn an_upload_allow_rule_still_asks_before_reading_a_file_from_outside_the_
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add my photo to the Slides".into())
+        .submit(chat, "Add my photo to the Slides".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -5637,7 +5557,7 @@ async fn read_rules_govern_the_file_an_upload_sends() {
         agent.set_permission_rules(chat, vec![rule]).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Put the chart on the Slides".into())
+            .submit(chat, "Put the chart on the Slides".into())
             .await
             .unwrap();
         let mut prompted = 0;
@@ -5716,7 +5636,7 @@ async fn a_parent_read_denial_frozen_into_the_delegation_refuses_a_subagent_uplo
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(parent, None, "Delegate the chart".into())
+        .submit(parent, "Delegate the chart".into())
         .await
         .unwrap();
     let (child, question) = loop {
@@ -5774,23 +5694,20 @@ async fn a_frozen_parent_session_denial_of_reading_the_file_refuses_a_subagent_u
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let denied = agent
-        .submit(parent, None, "Read the photo".into())
-        .await
-        .unwrap();
+    agent.submit(parent, "Read the photo".into()).await.unwrap();
     let request = next_permission(&mut events).await;
     assert_eq!(request.name, "Read");
     agent
         .answer_permission_with_scope(parent, request.id, false, PermissionScope::Session)
         .await
         .unwrap();
-    wait_for_loop_state(&agent, parent, denied.loop_id, LoopState::Interrupted).await;
+    wait_for_loop_state(&agent, parent, LoopState::Interrupted).await;
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
         .await
         .unwrap();
     agent
-        .submit(parent, Some(denied.loop_id), "Delegate the photo".into())
+        .submit(parent, "Delegate the photo".into())
         .await
         .unwrap();
     wait_for_completion(&agent, parent).await;
@@ -5827,7 +5744,7 @@ async fn auto_mode_uploads_a_file_from_outside_the_workspace_to_private_slides_w
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add my photo to the Slides".into())
+        .submit(chat, "Add my photo to the Slides".into())
         .await
         .unwrap();
     loop {
@@ -5867,7 +5784,7 @@ async fn shared_slides_uploads_are_reviewable_and_plan_mode_refuses_them() {
         agent.set_execution_mode(chat, mode).await.unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Add the chart to the team's Slides".into())
+            .submit(chat, "Add the chart to the team's Slides".into())
             .await
             .unwrap();
         let mut prompted = 0;
@@ -5919,7 +5836,7 @@ async fn public_slides_ask_before_the_first_upload_and_continue_without_asking()
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add both images to the public Slides".into())
+        .submit(chat, "Add both images to the public Slides".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -5968,7 +5885,7 @@ async fn an_audience_change_after_approval_stops_the_upload_before_it_is_sent() 
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add my photo to the Slides".into())
+        .submit(chat, "Add my photo to the Slides".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -6005,7 +5922,7 @@ async fn a_read_ask_added_after_approval_stops_the_upload_before_it_is_sent() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Add my photo to the Slides".into())
+        .submit(chat, "Add my photo to the Slides".into())
         .await
         .unwrap();
     let permission = next_permission(&mut events).await;
@@ -6060,15 +5977,12 @@ async fn an_upload_cancelled_after_it_was_sent_is_unknown_and_never_sent_again()
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    let receipt = agent
-        .submit(chat, None, "Add the chart".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Add the chart".into()).await.unwrap();
     tokio::time::timeout(WAIT, service.control.upload_held.notified())
         .await
         .unwrap();
     agent.interrupt(chat).await.unwrap();
-    wait_for_loop_state(&agent, chat, receipt.loop_id, LoopState::Interrupted).await;
+    wait_for_loop_state(&agent, chat, LoopState::Interrupted).await;
     let operation = agent
         .snapshot(chat)
         .await
@@ -6159,7 +6073,7 @@ async fn slides_guidance_continues_into_the_next_run_after_sign_in_and_no_furthe
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let invocation = agent
-        .invoke_skill(chat, None, "slides", "the Q3 review")
+        .invoke_skill(chat, "slides", "the Q3 review")
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -6170,22 +6084,13 @@ async fn slides_guidance_continues_into_the_next_run_after_sign_in_and_no_furthe
     let account = service.client(directory.path());
     eventually(async || matches!(account.credential_snapshot(), Ok(Some(_)))).await;
     for follow_up in ["Signed in", "Thanks"] {
-        agent
-            .submit(chat, Some(invocation.loop_id), follow_up.into())
-            .await
-            .unwrap();
-        // The created Slides keep the Loop waiting for their @tickloop requests.
+        agent.submit(chat, follow_up.into()).await.unwrap();
+        // The created Slides keep the Loop receiving their @tickloop requests.
         eventually(async || {
-            agent
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .loops
-                .iter()
-                .any(|goal| {
-                    goal.id == invocation.loop_id
-                        && matches!(goal.state, LoopState::Completed | LoopState::WaitingTrigger)
-                })
+            let chat_loop = agent.snapshot(chat).await.unwrap().chat_loop;
+            chat_loop.id == invocation.loop_id
+                && chat_loop.state == LoopState::Idle
+                && !chat_loop.event_sources.is_empty()
         })
         .await;
     }
@@ -6539,7 +6444,7 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
         .unwrap();
     let chat = agent.create_chat_without_folder().await.unwrap();
-    assert!(agent.invoke_skill(chat, None, "slides", "").await.is_err());
+    assert!(agent.invoke_skill(chat, "slides", "").await.is_err());
     assert!(agent.snapshot(chat).await.unwrap().messages.is_empty());
     submit_and_wait(&agent, chat, "Prepare slides").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -6571,8 +6476,7 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
     let state: Value =
         serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
     for field in [
-        "goal",
-        "chat_goals",
+        "loop",
         "plan",
         "execution_mode",
         "service_connections",

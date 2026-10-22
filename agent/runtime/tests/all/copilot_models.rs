@@ -781,7 +781,7 @@ async fn finish_turn(
     captured_request_counts: impl Fn() -> (usize, usize),
 ) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     let mut last_event = None;
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())

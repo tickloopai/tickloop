@@ -1,9 +1,9 @@
 //! @tickloop requests a durable host delivers with `TurnOp::Deliver`: the delivery names the
 //! input on every instance, so a repeated delivery runs nothing again, before or after the
-//! conversation is compacted. A delivery queues behind the work its Loop's Chat restored, goes
-//! on with a Loop that was interrupted, failed or completed, loads the family of the member it
-//! targets, and is discarded by a Loop that has ended. A durable load keeps a Loop's artifact
-//! links receiving, for the host to deliver to.
+//! conversation is compacted. A delivery queues behind the work its Chat restored, goes on with a
+//! Loop whose turn was interrupted, failed or completed, loads the family of the member it
+//! targets, and is refused while `/stop` pauses the Loop until the Chat is continued. A durable
+//! load keeps a Loop's artifact links receiving, for the host to deliver to.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result};
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
 use tickloop_agent_test_support::{call, config, text};
-use tickloop_agent_transcript::{DiscardReason, InputOp, InputState, Line, SettledOutcome};
+use tickloop_agent_transcript::{InputOp, InputState, Line, SettledOutcome};
 use uuid::Uuid;
 
 use super::durable_queue::{
@@ -92,18 +92,7 @@ async fn ready_chat(agent: &Agent) -> (ChatId, LoopId) {
     (chat, turn.receipt().loop_id)
 }
 
-fn prompt_for(target: LoopId, text: &str) -> TurnRequest {
-    let mut request = prompt(text, ParentSelection::CurrentLeaf);
-    if let tickloop_agent_runtime::TurnOp::Continue { target_loop, .. } = &mut request.op {
-        *target_loop = Some(target);
-    }
-    request
-}
-
-async fn bound_chat(
-    store: Arc<InMemoryTranscriptStore>,
-    model: Arc<Script>,
-) -> (Agent, ChatId, LoopId) {
+async fn bound_chat(store: Arc<InMemoryTranscriptStore>, model: Arc<Script>) -> (Agent, ChatId) {
     bound_chat_at(store, model, ORIGIN).await
 }
 
@@ -112,7 +101,7 @@ async fn bound_chat_at(
     store: Arc<InMemoryTranscriptStore>,
     model: Arc<Script>,
     origin: &str,
-) -> (Agent, ChatId, LoopId) {
+) -> (Agent, ChatId) {
     let setup = harness(store.clone(), Script::new(Vec::new()), WaitHosting::Durable);
     let (chat, target) = ready_chat(&setup).await;
     setup.sync().await.unwrap();
@@ -124,25 +113,17 @@ async fn bound_chat_at(
             && record.loop_id == target
             && !record.event_sources.is_empty()
         {
-            record.state = serde_json::to_value(LoopState::Completed).unwrap();
+            record.state = serde_json::to_value(LoopState::Idle).unwrap();
         }
     }
     store.seed(chat, lines, StorePosition(1));
     let agent = harness(store, model, WaitHosting::Durable);
     agent.resume_chat(chat).await.unwrap();
-    (agent, chat, target)
+    (agent, chat)
 }
 
-async fn loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId) -> LoopState {
-    agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .loops
-        .into_iter()
-        .find(|goal| goal.id == loop_id)
-        .expect("the Loop is recorded")
-        .state
+async fn loop_state(agent: &Agent, chat: ChatId) -> LoopState {
+    agent.snapshot(chat).await.unwrap().chat_loop.state
 }
 
 fn feedback_inputs(lines: &[Line]) -> HashSet<Uuid> {
@@ -159,9 +140,9 @@ fn feedback_inputs(lines: &[Line]) -> HashSet<Uuid> {
 async fn a_delivery_builds_on_artifact_content_the_chat_already_holds() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());
-    let (agent, chat, target) = bound_chat(store, model.clone()).await;
+    let (agent, chat) = bound_chat(store, model.clone()).await;
     let delivered = agent
-        .advance(chat, TurnRequest::deliver(target, delivery("request-1")))
+        .advance(chat, TurnRequest::deliver(delivery("request-1")))
         .await
         .unwrap();
     tokio::time::timeout(WAIT, delivered.outcome())
@@ -178,8 +159,8 @@ async fn a_delivery_builds_on_artifact_content_the_chat_already_holds() {
 async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());
-    let (first, chat, target) = bound_chat(store.clone(), model.clone()).await;
-    let request = TurnRequest::deliver(target, delivery("request-1"));
+    let (first, chat) = bound_chat(store.clone(), model.clone()).await;
+    let request = TurnRequest::deliver(delivery("request-1"));
     let delivered = first.advance(chat, request.clone()).await.unwrap();
     let delivery_id = request_delivery_id(&request);
     assert!(matches!(
@@ -216,15 +197,12 @@ async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once()
     ));
     assert!(model.requests().is_empty(), "another instance runs nothing");
     // The service hands the delivery out again under a new claim, with the thread grown since.
-    let reclaimed = TurnRequest::deliver(
-        target,
-        claimed(
-            "request-1",
-            delivery_id,
-            "another-fence",
-            "Tighten the title. Done: Tickloop (Agent) replied.",
-        ),
-    );
+    let reclaimed = TurnRequest::deliver(claimed(
+        "request-1",
+        delivery_id,
+        "another-fence",
+        "Tighten the title. Done: Tickloop (Agent) replied.",
+    ));
     assert_eq!(reclaimed.input_id, request.input_id);
     assert!(matches!(
         outcome(&next, chat, reclaimed).await,
@@ -247,24 +225,19 @@ async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once()
 }
 
 #[tokio::test]
-async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_one_discards_it() {
+async fn interrupted_failed_and_completed_turns_take_a_delivery_and_a_paused_loop_refuses_it() {
     // Interrupted by the user.
     let model = Script::new(vec![Step::Hang]);
-    let (agent, chat, target) =
-        bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
+    let (agent, chat) = bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
     let long = agent
-        .advance(chat, prompt_for(target, "a long task"))
+        .advance(chat, prompt("a long task", ParentSelection::CurrentLeaf))
         .await
         .unwrap();
     model.until_holding().await;
     agent.interrupt(chat).await.unwrap();
     settled(&agent, chat, long.input_id()).await;
-    let target = long.receipt().loop_id;
-    assert_eq!(
-        loop_state(&agent, chat, target).await,
-        LoopState::Interrupted
-    );
-    let request = TurnRequest::deliver(target, delivery("after-interrupt"));
+    assert_eq!(loop_state(&agent, chat).await, LoopState::Interrupted);
+    let request = TurnRequest::deliver(delivery("after-interrupt"));
     assert!(matches!(
         outcome(&agent, chat, request).await,
         TurnOutcome::Completed { .. }
@@ -280,17 +253,15 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
 
     // Failed.
     let model = Script::new(vec![Step::Fail]);
-    let (agent, chat, target) =
-        bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
-    let broken = prompt_for(target, "a broken task");
-    let failing = agent.advance(chat, broken.clone()).await.unwrap();
+    let (agent, chat) = bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
+    let broken = prompt("a broken task", ParentSelection::CurrentLeaf);
+    agent.advance(chat, broken.clone()).await.unwrap();
     assert!(matches!(
         settled(&agent, chat, broken.input_id).await,
         SettledOutcome::Failed { .. }
     ));
-    let target = failing.receipt().loop_id;
-    assert_eq!(loop_state(&agent, chat, target).await, LoopState::Failed);
-    let request = TurnRequest::deliver(target, delivery("after-failure"));
+    assert_eq!(loop_state(&agent, chat).await, LoopState::Failed);
+    let request = TurnRequest::deliver(delivery("after-failure"));
     assert!(matches!(
         outcome(&agent, chat, request).await,
         TurnOutcome::Completed { .. }
@@ -304,55 +275,49 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
     );
     agent.shutdown().await;
 
-    // Completed, then stopped.
+    // Completed, then paused by `/stop` until a new user input continues the Chat.
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());
-    let (agent, chat, target) = bound_chat(store.clone(), model.clone()).await;
-    assert_eq!(loop_state(&agent, chat, target).await, LoopState::Completed);
+    let (agent, chat) = bound_chat(store.clone(), model.clone()).await;
+    assert_eq!(loop_state(&agent, chat).await, LoopState::Idle);
     assert!(matches!(
         outcome(
             &agent,
             chat,
-            TurnRequest::deliver(target, delivery("after-completion"))
+            TurnRequest::deliver(delivery("after-completion"))
         )
         .await,
         TurnOutcome::Completed { .. }
     ));
-    agent.stop(chat, target).await.unwrap();
+    agent.stop(chat).await.unwrap();
+    assert_eq!(agent.quiesce(chat).await, Quiescence::Idle);
     let requests = model.requests().len();
-    let late = TurnRequest::deliver(target, delivery("after-stop"));
-    for _ in 0..2 {
-        assert!(matches!(
-            outcome(&agent, chat, late.clone()).await,
-            TurnOutcome::Discarded {
-                reason: DiscardReason::LoopEnded
-            }
-        ));
-    }
+    let late = TurnRequest::deliver(delivery("after-stop"));
+    assert!(matches!(
+        agent.advance(chat, late.clone()).await,
+        Err(AgentError::Invalid(_))
+    ));
     assert_eq!(
         model.requests().len(),
         requests,
-        "a stopped Loop runs nothing"
+        "a paused Loop runs nothing"
     );
     agent.sync().await.unwrap();
-    assert_eq!(
-        input_state(&store.lines(chat), late.input_id),
-        Some(InputState::Settled {
-            outcome: SettledOutcome::Discarded {
-                reason: DiscardReason::LoopEnded
-            }
-        })
-    );
-    // A Loop the Chat never had is a misrouted delivery, not an ended Loop.
+    assert_eq!(input_state(&store.lines(chat), late.input_id), None);
+    let resume = prompt("go on", ParentSelection::CurrentLeaf);
+    agent.advance(chat, resume.clone()).await.unwrap();
+    settled(&agent, chat, resume.input_id).await;
     assert!(matches!(
-        agent
-            .advance(
-                chat,
-                TurnRequest::deliver(Uuid::new_v4(), delivery("to-nowhere"))
-            )
-            .await,
-        Err(AgentError::Invalid(_))
+        outcome(&agent, chat, late).await,
+        TurnOutcome::Completed { .. }
     ));
+    assert!(
+        model
+            .requests()
+            .last()
+            .unwrap()
+            .contains(&heading("after-stop"))
+    );
     agent.shutdown().await;
 }
 
@@ -360,12 +325,11 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
 async fn deliveries_queue_behind_the_work_a_load_restores() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(vec![Step::Hang]);
-    let (first, chat, target) = bound_chat(store.clone(), model.clone()).await;
-    let lost = prompt_for(target, "first prompt");
-    let running = first.advance(chat, lost.clone()).await.unwrap();
+    let (first, chat) = bound_chat(store.clone(), model.clone()).await;
+    let lost = prompt("first prompt", ParentSelection::CurrentLeaf);
+    first.advance(chat, lost.clone()).await.unwrap();
     model.until_holding().await;
-    let target = running.receipt().loop_id;
-    let queued_delivery = TurnRequest::deliver(target, delivery("request-1"));
+    let queued_delivery = TurnRequest::deliver(delivery("request-1"));
     first.advance(chat, queued_delivery.clone()).await.unwrap();
     let queued_prompt = prompt("second prompt", ParentSelection::CurrentLeaf);
     first.advance(chat, queued_prompt.clone()).await.unwrap();
@@ -378,7 +342,7 @@ async fn deliveries_queue_behind_the_work_a_load_restores() {
 
     let model = Script::new(Vec::new());
     let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    let later = TurnRequest::deliver(target, delivery("request-2"));
+    let later = TurnRequest::deliver(delivery("request-2"));
     next.advance(chat, later.clone()).await.unwrap();
     for input in [
         lost.input_id,
@@ -489,7 +453,7 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
         next.snapshot(root).await.is_err(),
         "nothing is loaded before the delivery"
     );
-    let request = TurnRequest::deliver(member.child_loop_id, delivery("for-the-member"));
+    let request = TurnRequest::deliver(delivery("for-the-member"));
     next.advance(member.child_chat_id, request.clone())
         .await
         .unwrap();
@@ -538,7 +502,7 @@ fn linked_at(lines: Vec<Line>, loop_id: LoopId, origin: &str) -> Vec<Line> {
     };
     let record = entry.loop_record.as_mut().unwrap();
     record.event_sources = vec![serde_json::to_value(&binding).unwrap()];
-    record.state = serde_json::to_value(LoopState::WaitingTrigger).unwrap();
+    record.state = serde_json::to_value(LoopState::Idle).unwrap();
     lines
 }
 
@@ -567,15 +531,15 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     let model = Script::new(Vec::new());
     let next = harness(durable, model.clone(), WaitHosting::Durable);
     next.resume_chat(chat).await.unwrap();
-    let goal = next.snapshot(chat).await.unwrap().loops[0].clone();
-    assert_eq!(goal.state, LoopState::WaitingTrigger);
-    assert!(!goal.event_sources[0].resume_required);
+    let chat_loop = next.snapshot(chat).await.unwrap().chat_loop.clone();
+    assert_eq!(chat_loop.state, LoopState::Idle);
+    assert!(!chat_loop.event_sources[0].resume_required);
     assert_eq!(next.quiesce(chat).await, expected);
     assert!(matches!(
         outcome(
             &next,
             chat,
-            TurnRequest::deliver(target, delivery("linked-request"))
+            TurnRequest::deliver(delivery("linked-request"))
         )
         .await,
         TurnOutcome::Completed { .. }
@@ -587,14 +551,14 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     );
     next.shutdown().await;
 
-    // A local Worker's load waits for an explicit Continue, as before.
+    // A local Worker's load pauses receiving until the Chat is continued.
     let local = Arc::new(InMemoryTranscriptStore::new());
     local.seed(chat, lines, StorePosition(1));
     let worker = harness(local, Script::new(Vec::new()), WaitHosting::Process);
     worker.resume_chat(chat).await.unwrap();
-    let goal = worker.snapshot(chat).await.unwrap().loops[0].clone();
-    assert_eq!(goal.state, LoopState::Interrupted);
-    assert!(goal.event_sources[0].resume_required);
+    let chat_loop = worker.snapshot(chat).await.unwrap().chat_loop.clone();
+    assert_eq!(chat_loop.state, LoopState::Idle);
+    assert!(chat_loop.event_sources[0].resume_required);
     assert_eq!(worker.quiesce(chat).await, Quiescence::Idle);
     worker.shutdown().await;
 }
@@ -642,7 +606,7 @@ async fn a_hosted_account_runs_a_delivery_before_anything_warmed_its_credentials
     // Loopback, so the Artifact tools' directory fails fast instead of reaching a service.
     let origin = "http://127.0.0.1:9";
     let model = Script::new(Vec::new());
-    let (agent, chat, target) = bound_chat_at(
+    let (agent, chat) = bound_chat_at(
         Arc::new(InMemoryTranscriptStore::new()),
         model.clone(),
         origin,
@@ -670,7 +634,7 @@ async fn a_hosted_account_runs_a_delivery_before_anything_warmed_its_credentials
         },
     )
     .unwrap();
-    let outcome = outcome(&agent, chat, TurnRequest::deliver(target, delivery)).await;
+    let outcome = outcome(&agent, chat, TurnRequest::deliver(delivery)).await;
     assert!(
         matches!(outcome, TurnOutcome::Completed { .. }),
         "{outcome:?}"

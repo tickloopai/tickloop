@@ -192,7 +192,6 @@ async fn run_agent_until_terminal(
     agent
         .submit(
             chat,
-            None,
             "Write side-effect.txt if a tool call is complete".into(),
         )
         .await

@@ -466,7 +466,7 @@ async fn ended_user_shell(
     background: bool,
 ) -> InstanceRef {
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, command.into(), background)
+        .submit_user_shell(chat, command.into(), background)
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

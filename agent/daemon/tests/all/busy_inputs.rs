@@ -169,7 +169,7 @@ impl Busy {
         (receipt, accepted)
     }
 
-    fn submit_command(&self, text: &str, target_loop: Option<Uuid>) -> CommandEnvelope {
+    fn submit_command(&self, text: &str) -> CommandEnvelope {
         let paths = if text == INPUTS[0] {
             vec![self.source.clone()]
         } else {
@@ -179,7 +179,6 @@ impl Busy {
             &self.access,
             AgentCommand::Submit {
                 execution: self.execution,
-                target_loop,
                 input: text_input(text, &paths),
                 origin: None,
             },
@@ -214,11 +213,10 @@ impl Busy {
             loop {
                 let snapshot = self.snapshot().await;
                 if snapshot.pending_inputs.is_empty()
-                    && snapshot
-                        .conversation
-                        .loops
-                        .iter()
-                        .all(|goal| !matches!(goal.state, LoopState::Running | LoopState::Queued))
+                    && !matches!(
+                        snapshot.conversation.chat_loop.state,
+                        LoopState::Running | LoopState::Queued
+                    )
                 {
                     break snapshot;
                 }
@@ -289,7 +287,7 @@ async fn busy_inputs_accepted_before_a_tool_boundary_join_the_active_run_in_one_
         ],
     )
     .await;
-    let commands = INPUTS.map(|input| busy.submit_command(input, Some(busy.active.loop_id)));
+    let commands = INPUTS.map(|input| busy.submit_command(input));
     let mut accepted = Vec::new();
     for command in &commands {
         accepted.push(busy.submit(command).await);
@@ -376,7 +374,7 @@ async fn assert_text_only_batch(count: usize) {
     .await;
     let commands = INPUTS[..count]
         .iter()
-        .map(|input| busy.submit_command(input, Some(busy.active.loop_id)))
+        .map(|input| busy.submit_command(input))
         .collect::<Vec<_>>();
     let mut accepted = Vec::new();
     for command in &commands {
@@ -496,11 +494,7 @@ async fn a_started_input_batch_is_recoverable_before_its_model_reply() {
     busy.gate.hold_next.store(true, Ordering::SeqCst);
     let mut accepted = Vec::new();
     for input in INPUTS {
-        accepted.push(
-            busy.submit(&busy.submit_command(input, Some(busy.active.loop_id)))
-                .await
-                .1,
-        );
+        accepted.push(busy.submit(&busy.submit_command(input)).await.1);
     }
     let mut events = busy.runtime.subscribe();
     busy.gate.release.notify_one();
@@ -584,15 +578,11 @@ async fn assert_direct_skill_boundary(tool_boundary: bool) {
         ]
     };
     let busy = Busy::start(directory.path(), replies).await;
-    let first = busy
-        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let first = busy.submit(&busy.submit_command(INPUTS[0])).await.1;
     let skill_command = envelope(
         &busy.access,
         AgentCommand::Submit {
             execution: busy.execution,
-            target_loop: Some(busy.active.loop_id),
             input: UserInput::Skill {
                 name: "queued-boundary".into(),
                 arguments: "typed Skill input".into(),
@@ -602,14 +592,8 @@ async fn assert_direct_skill_boundary(tool_boundary: bool) {
     );
     let skill = busy.submit(&skill_command).await.1;
     assert_eq!(busy.submit(&skill_command).await.1.run_id, skill.run_id);
-    let second = busy
-        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
-        .await
-        .1;
-    let last = busy
-        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let second = busy.submit(&busy.submit_command(INPUTS[1])).await.1;
+    let last = busy.submit(&busy.submit_command(INPUTS[2])).await.1;
     assert_eq!(busy.snapshot().await.pending_inputs.len(), 4);
     let settled = busy.release_and_settle().await;
     let skill_request = busy
@@ -685,21 +669,14 @@ async fn a_command_barrier_splits_text_only_input_batches() {
         vec![text("first"), text("before command"), text("after command")],
     )
     .await;
-    let first = busy
-        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
-        .await
-        .1;
-    let second = busy
-        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let first = busy.submit(&busy.submit_command(INPUTS[0])).await.1;
+    let second = busy.submit(&busy.submit_command(INPUTS[1])).await.1;
     let barrier = busy
         .access
         .execute(envelope(
             &busy.access,
             AgentCommand::EnqueueAfterTurn {
                 execution: busy.execution,
-                target_loop: Some(busy.active.loop_id),
                 action: AfterTurnAction::Configure {
                     change: ConfigurationChange::ThinkingEnabled { enabled: true },
                 },
@@ -711,10 +688,7 @@ async fn a_command_barrier_splits_text_only_input_batches() {
         matches!(barrier.state, ReceiptState::Completed),
         "{barrier:?}"
     );
-    let last = busy
-        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let last = busy.submit(&busy.submit_command(INPUTS[2])).await.1;
     let settled = busy.release_and_settle().await;
     assert_eq!(busy.first_requests(), vec![Some(1), Some(1), Some(2)]);
     assert_eq!(busy.sends(), 3);
@@ -747,17 +721,13 @@ async fn a_foreground_shell_barrier_splits_text_only_input_batches() {
         vec![text("first"), text("before shell"), text("after shell")],
     )
     .await;
-    let first = busy
-        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let first = busy.submit(&busy.submit_command(INPUTS[0])).await.1;
     let shell = busy
         .access
         .execute(envelope(
             &busy.access,
             AgentCommand::Submit {
                 execution: busy.execution,
-                target_loop: Some(busy.active.loop_id),
                 input: UserInput::Shell {
                     command: "printf 'NEXT_BATCH_SHELL_MARKER'".into(),
                     background: false,
@@ -770,14 +740,8 @@ async fn a_foreground_shell_barrier_splits_text_only_input_batches() {
     let Some(CommandResult::ShellSubmitted(shell)) = shell.result else {
         panic!("Shell was accepted")
     };
-    let second = busy
-        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
-        .await
-        .1;
-    let last = busy
-        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
-        .await
-        .1;
+    let second = busy.submit(&busy.submit_command(INPUTS[1])).await.1;
+    let last = busy.submit(&busy.submit_command(INPUTS[2])).await.1;
     let settled = busy.release_and_settle().await;
     assert_eq!(busy.first_requests(), vec![Some(1), Some(2), Some(2)]);
     assert_eq!(busy.sends(), 3);
@@ -811,52 +775,7 @@ async fn a_foreground_shell_barrier_splits_text_only_input_batches() {
 }
 
 #[tokio::test]
-async fn another_loop_splits_text_only_input_batches_without_changing_targets() {
-    let directory = tempfile::tempdir().unwrap();
-    let busy = Busy::start(
-        directory.path(),
-        vec![text("first"), text("alpha"), text("bravo"), text("charlie")],
-    )
-    .await;
-    let first = busy
-        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
-        .await
-        .1;
-    let other = busy.submit(&busy.submit_command(INPUTS[1], None)).await.1;
-    let last = busy
-        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
-        .await
-        .1;
-    assert_ne!(other.loop_id, busy.active.loop_id);
-    let settled = busy.release_and_settle().await;
-    assert_eq!(busy.first_requests(), vec![Some(1), Some(2), Some(3)]);
-    assert_eq!(busy.sends(), 4);
-    assert_eq!(
-        runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
-        vec![busy.active.run_id, first.run_id, other.run_id, last.run_id]
-    );
-    assert!(
-        runs_with(&settled, |kind| matches!(
-            kind,
-            EventKind::InputMerged { .. }
-        ))
-        .is_empty()
-    );
-    for receipt in [&first, &other, &last] {
-        assert_eq!(
-            settled
-                .events
-                .iter()
-                .find(|event| event.run_id == receipt.run_id)
-                .map(|event| event.loop_id),
-            Some(receipt.loop_id)
-        );
-    }
-    busy.runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
+async fn a_command_barrier_keeps_an_input_out_of_the_merge() {
     let directory = tempfile::tempdir().unwrap();
     let busy = Busy::start(
         directory.path(),
@@ -869,7 +788,7 @@ async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
     .await;
     let mut runs = Vec::new();
     for input in &INPUTS[..2] {
-        let command = busy.submit_command(input, Some(busy.active.loop_id));
+        let command = busy.submit_command(input);
         runs.push(busy.submit(&command).await.1);
     }
     let barrier = busy
@@ -878,7 +797,6 @@ async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
             &busy.access,
             AgentCommand::EnqueueAfterTurn {
                 execution: busy.execution,
-                target_loop: Some(busy.active.loop_id),
                 action: AfterTurnAction::Configure {
                     change: ConfigurationChange::ThinkingEnabled { enabled: true },
                 },
@@ -890,7 +808,7 @@ async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
         matches!(barrier.state, ReceiptState::Completed),
         "{barrier:?}"
     );
-    let command = busy.submit_command(INPUTS[2], Some(busy.active.loop_id));
+    let command = busy.submit_command(INPUTS[2]);
     runs.push(busy.submit(&command).await.1);
     let settled = busy.release_and_settle().await;
     let first = busy.first_requests();
@@ -904,33 +822,6 @@ async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
     });
     assert_eq!(merged, vec![runs[0].run_id, runs[1].run_id]);
     busy.runtime.shutdown().await;
-
-    let directory = tempfile::tempdir().unwrap();
-    let busy = Busy::start(
-        directory.path(),
-        vec![
-            call("read", "Read", json!({"file_path": "source.txt"})),
-            text("answered alpha"),
-            text("answered the other goal"),
-        ],
-    )
-    .await;
-    let same_loop = busy
-        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
-        .await
-        .1;
-    let other_loop = busy.submit(&busy.submit_command(INPUTS[2], None)).await.1;
-    assert_ne!(other_loop.loop_id, busy.active.loop_id);
-    let settled = busy.release_and_settle().await;
-    let merged = runs_with(&settled, |kind| {
-        matches!(kind, EventKind::InputMerged { .. })
-    });
-    assert_eq!(
-        merged,
-        vec![same_loop.run_id],
-        "an input for another Loop is never merged into this run"
-    );
-    busy.runtime.shutdown().await;
 }
 
 /// Worker submissions go through `advance`: each is a ledger input whose prompt id is its input
@@ -943,7 +834,7 @@ async fn worker_submissions_are_ledger_inputs_settled_by_their_answers() {
         vec![text("started"), text("answered with the attachment")],
     )
     .await;
-    let (_, accepted) = busy.submit(&busy.submit_command(INPUTS[0], None)).await;
+    let (_, accepted) = busy.submit(&busy.submit_command(INPUTS[0])).await;
     busy.release_and_settle().await;
     assert!(
         format!("{:?}", busy.model.requests.lock().unwrap()[1].messages).contains(SOURCE_CONTENT)

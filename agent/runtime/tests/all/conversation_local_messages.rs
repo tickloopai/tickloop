@@ -202,10 +202,7 @@ async fn escape_keeps_the_partial_reply_and_interrupt_marker_for_the_next_reques
     let agent = Agent::open_embedded(archive.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Please answer".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Please answer".into()).await.unwrap();
     wait_for(
         &mut events,
         |kind| matches!(kind, EventKind::Text(text) if text.ends_with("回答")),
@@ -229,10 +226,7 @@ async fn escape_keeps_the_partial_reply_and_interrupt_marker_for_the_next_reques
         interrupted
     );
 
-    agent
-        .submit(chat, Some(receipt.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Continue".into()).await.unwrap();
     wait_for(&mut events, |kind| {
         matches!(kind, EventKind::Completed { .. })
     })
@@ -278,7 +272,7 @@ async fn interrupting_a_tool_call_answers_it_and_records_the_tool_use_marker() {
         Agent::open_embedded(directory.path().join("archive"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Run it".into()).await.unwrap();
+    agent.submit(chat, "Run it".into()).await.unwrap();
     wait_for(&mut events, |kind| {
         matches!(kind, EventKind::PermissionRequested { .. })
     })
@@ -303,10 +297,7 @@ async fn interrupting_a_tool_call_answers_it_and_records_the_tool_use_marker() {
             .contains(&INTERRUPT_MESSAGE.to_string())
     );
 
-    agent
-        .submit(chat, Some(receipt.loop_id), "Do not run it".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Do not run it".into()).await.unwrap();
     wait_for(&mut events, |kind| {
         matches!(kind, EventKind::Completed { .. })
     })
@@ -333,7 +324,7 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit_user_shell_for_goal(chat, None, "printf '<ok>'; printf warn >&2".into(), false)
+        .submit_user_shell(chat, "printf '<ok>'; printf warn >&2".into(), false)
         .await
         .unwrap();
     let expected = vec![
@@ -365,7 +356,7 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
     );
     let mut events = restored.subscribe();
     restored
-        .submit(chat, None, "What happened?".into())
+        .submit(chat, "What happened?".into())
         .await
         .unwrap();
     wait_for(&mut events, |kind| {
@@ -388,7 +379,7 @@ async fn a_failing_user_shell_reports_its_output_as_standard_error() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit_user_shell_for_goal(chat, None, "printf broken; exit 3".into(), false)
+        .submit_user_shell(chat, "printf broken; exit 3".into(), false)
         .await
         .unwrap();
     let expected = vec![
@@ -409,7 +400,7 @@ async fn stopping_a_foreground_user_shell_replaces_its_output_with_the_interrupt
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, "printf started; sleep 30".into(), false)
+        .submit_user_shell(chat, "printf started; sleep 30".into(), false)
         .await
         .unwrap();
     // The command runs once the Tickhost started it and named its process.
@@ -450,7 +441,7 @@ async fn background_user_shell_completion_notifies_its_chat() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut notifications = agent.subscribe_task_notifications();
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, "printf done".into(), true)
+        .submit_user_shell(chat, "printf done".into(), true)
         .await
         .unwrap();
     let snapshot = wait_for_snapshot(&agent, chat, |snapshot| {
@@ -522,7 +513,7 @@ async fn background_agent_command_completion_notifies_with_its_tool_use_id() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "start it".into()).await.unwrap();
+    agent.submit(chat, "start it".into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -608,7 +599,7 @@ async fn a_task_notification_waits_until_the_running_foreground_shell_writes_its
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let background_command = gated_command("background", &background_gate);
     let background = agent
-        .submit_user_shell_for_goal(chat, None, background_command.clone(), true)
+        .submit_user_shell(chat, background_command.clone(), true)
         .await
         .unwrap();
     wait_for_user_shell_state(
@@ -620,7 +611,7 @@ async fn a_task_notification_waits_until_the_running_foreground_shell_writes_its
     .await;
     let foreground_command = gated_command("foreground", &foreground_gate);
     let foreground = agent
-        .submit_user_shell_for_goal(chat, None, foreground_command.clone(), false)
+        .submit_user_shell(chat, foreground_command.clone(), false)
         .await
         .unwrap();
     wait_for_user_shell_state(&agent, chat, foreground.command_id, UserShellState::Running).await;
@@ -667,7 +658,7 @@ async fn compaction_is_rejected_while_a_foreground_shell_is_running() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let command = gated_command("done", &gate);
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, command.clone(), false)
+        .submit_user_shell(chat, command.clone(), false)
         .await
         .unwrap();
     wait_for_user_shell_state(&agent, chat, receipt.command_id, UserShellState::Running).await;
@@ -697,16 +688,13 @@ async fn stopping_a_loop_keeps_the_partial_reply_and_interrupt_marker() {
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Please answer".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Please answer".into()).await.unwrap();
     wait_for(
         &mut events,
         |kind| matches!(kind, EventKind::Text(text) if text == "部分回答"),
     )
     .await;
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     wait_for(&mut events, |kind| matches!(kind, EventKind::Interrupted)).await;
 
     assert_eq!(

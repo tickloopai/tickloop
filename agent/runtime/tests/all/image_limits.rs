@@ -36,7 +36,7 @@ async fn submit_and_wait(
 ) {
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit_with_file_references(chat, None, prompt.into(), paths)
+        .submit_with_file_references(chat, prompt.into(), paths)
         .await
         .unwrap();
     loop {

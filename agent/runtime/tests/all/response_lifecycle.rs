@@ -168,7 +168,6 @@ async fn submit_input(
     agent: &Agent,
     chat: ChatId,
     input: Uuid,
-    goal: Option<Uuid>,
     text: String,
     contexts: Vec<InputContext>,
     paths: Vec<PathBuf>,
@@ -181,7 +180,6 @@ async fn submit_input(
                 input_id: input,
                 op: TurnOp::Continue {
                     after: ParentSelection::CurrentLeaf,
-                    target_loop: goal,
                     message: UserMessage {
                         text,
                         contexts,
@@ -196,12 +194,11 @@ async fn submit_input(
     Ok(turn.receipt().clone())
 }
 
-async fn submit(agent: &Agent, chat: ChatId, input: Uuid, goal: Option<Uuid>, prompt: &str) {
+async fn submit(agent: &Agent, chat: ChatId, input: Uuid, prompt: &str) {
     submit_input(
         agent,
         chat,
         input,
-        goal,
         prompt.into(),
         Vec::new(),
         Vec::new(),
@@ -299,7 +296,7 @@ async fn a_turn_adds_only_response_started_to_its_events_and_records_its_lifecyc
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let mut events = agent.subscribe();
     let input = Uuid::new_v4();
-    submit(&agent, chat, input, None, "greet me").await;
+    submit(&agent, chat, input, "greet me").await;
     let state = agent.input_state(chat, input).await.unwrap().unwrap();
     let seen = until_ended(&mut events, state.entry.run_id).await;
     assert_eq!(
@@ -392,7 +389,7 @@ async fn crash_while_streaming(delta: Option<&str>) {
     let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
     let mut events = first.subscribe();
     let input = Uuid::new_v4();
-    submit(&first, chat, input, None, "a question").await;
+    submit(&first, chat, input, "a question").await;
     if delta.is_some() {
         loop {
             if matches!(next_event(&mut events).await.kind, EventKind::Text(_)) {
@@ -484,7 +481,7 @@ async fn a_crash_after_content_was_committed_keeps_that_content_in_the_interrupt
     let first = agent(store.clone(), model.clone());
     let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
     let input = Uuid::new_v4();
-    submit(&first, chat, input, None, "read the notes").await;
+    submit(&first, chat, input, "read the notes").await;
     model.reached.notified().await;
     first.flush_transcripts().await;
     let crashed = store.lines(chat);
@@ -530,7 +527,7 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
     );
     let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
     let input = Uuid::new_v4();
-    submit(&first, chat, input, None, "do it once").await;
+    submit(&first, chat, input, "do it once").await;
     first.settled_input(chat, input).await.unwrap();
     let original = first.input_state(chat, input).await.unwrap().unwrap();
     first.sync().await.unwrap();
@@ -542,7 +539,6 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
         &next,
         chat,
         input,
-        None,
         "do it once".into(),
         Vec::new(),
         Vec::new(),
@@ -567,7 +563,6 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
             &next,
             chat,
             input,
-            None,
             "something else".into(),
             Vec::new(),
             Vec::new(),
@@ -589,17 +584,10 @@ async fn a_taken_back_input_settles_withdrawn() {
     let agent = agent(store.clone(), model.clone());
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let active = Uuid::new_v4();
-    submit(&agent, chat, active, None, "hold the execution slot").await;
+    submit(&agent, chat, active, "hold the execution slot").await;
     model.reached.notified().await;
-    let loop_id = agent
-        .input_state(chat, active)
-        .await
-        .unwrap()
-        .unwrap()
-        .entry
-        .loop_id;
     let queued = Uuid::new_v4();
-    submit(&agent, chat, queued, Some(loop_id), "edit this message").await;
+    submit(&agent, chat, queued, "edit this message").await;
     let waiting = {
         let agent = agent.clone();
         tokio::spawn(async move { agent.settled_input(chat, queued).await })
@@ -616,7 +604,7 @@ async fn a_taken_back_input_settles_withdrawn() {
         }
     );
     // Submitting the same input again returns the withdrawn outcome instead of queuing it.
-    submit(&agent, chat, queued, Some(loop_id), "edit this message").await;
+    submit(&agent, chat, queued, "edit this message").await;
     assert!(
         agent
             .snapshot(chat)
@@ -637,7 +625,7 @@ async fn stopping_a_loop_discards_its_queue_and_interrupting_settles_the_running
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
 
     let interrupted = Uuid::new_v4();
-    submit(&agent, chat, interrupted, None, "interrupt me").await;
+    submit(&agent, chat, interrupted, "interrupt me").await;
     model.reached.notified().await;
     agent.interrupt(chat).await.unwrap();
     assert_eq!(
@@ -648,18 +636,11 @@ async fn stopping_a_loop_discards_its_queue_and_interrupting_settles_the_running
     );
 
     let running = Uuid::new_v4();
-    submit(&agent, chat, running, None, "stop me").await;
+    submit(&agent, chat, running, "stop me").await;
     model.reached.notified().await;
-    let loop_id = agent
-        .input_state(chat, running)
-        .await
-        .unwrap()
-        .unwrap()
-        .entry
-        .loop_id;
     let queued = Uuid::new_v4();
-    submit(&agent, chat, queued, Some(loop_id), "never runs").await;
-    agent.stop(chat, loop_id).await.unwrap();
+    submit(&agent, chat, queued, "never runs").await;
+    agent.stop(chat).await.unwrap();
     assert_eq!(
         agent.settled_input(chat, queued).await.unwrap(),
         SettledOutcome::Discarded {
@@ -699,19 +680,12 @@ async fn prompts_coalesced_before_a_start_chain_and_the_answer_hangs_under_the_l
     let agent = agent(store.clone(), model.clone());
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let holder = Uuid::new_v4();
-    submit(&agent, chat, holder, None, "hold the slot").await;
+    submit(&agent, chat, holder, "hold the slot").await;
     model.reached.notified().await;
     let first = Uuid::new_v4();
-    submit(&agent, chat, first, None, "first half").await;
-    let loop_id = agent
-        .input_state(chat, first)
-        .await
-        .unwrap()
-        .unwrap()
-        .entry
-        .loop_id;
+    submit(&agent, chat, first, "first half").await;
     let second = Uuid::new_v4();
-    submit(&agent, chat, second, Some(loop_id), "second half").await;
+    submit(&agent, chat, second, "second half").await;
     agent.interrupt(chat).await.unwrap();
     let first_run = agent
         .input_state(chat, first)
@@ -776,7 +750,7 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
     let agent = agent(store.clone(), model.clone());
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let first = Uuid::new_v4();
-    submit(&agent, chat, first, None, "read the notes").await;
+    submit(&agent, chat, first, "read the notes").await;
     model.reached.notified().await;
     let state = agent.input_state(chat, first).await.unwrap().unwrap();
     let follow_up = Uuid::new_v4();
@@ -785,7 +759,6 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
         &agent,
         chat,
         follow_up,
-        Some(state.entry.loop_id),
         "also mention the date".into(),
         vec![image.clone()],
         Vec::new(),
@@ -847,12 +820,12 @@ async fn compaction_keeps_display_ids_stable_and_projects_nothing_twice() {
     let agent = agent(store.clone(), model.clone());
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let prompts = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-    submit(&agent, chat, prompts[0], None, "first prompt").await;
+    submit(&agent, chat, prompts[0], "first prompt").await;
     agent.settled_input(chat, prompts[0]).await.unwrap();
     agent.compact(chat).await.unwrap();
-    submit(&agent, chat, prompts[1], None, "second prompt").await;
+    submit(&agent, chat, prompts[1], "second prompt").await;
     agent.settled_input(chat, prompts[1]).await.unwrap();
-    submit(&agent, chat, prompts[2], None, "third prompt").await;
+    submit(&agent, chat, prompts[2], "third prompt").await;
     agent.settled_input(chat, prompts[2]).await.unwrap();
     agent.sync().await.unwrap();
     let before = project(&store.lines(chat));
@@ -1108,7 +1081,7 @@ async fn a_tail_initialized_projection_aliases_a_later_copy_of_the_same_answer()
         .iter()
         .zip(["first prompt", "second prompt", "third prompt"])
     {
-        submit(&first, chat, *prompt, None, text).await;
+        submit(&first, chat, *prompt, text).await;
         first.settled_input(chat, *prompt).await.unwrap();
     }
     summarize_up_to(&first, chat, "second prompt").await;
@@ -1194,7 +1167,7 @@ async fn summarize_up_to(agent: &Agent, chat: ChatId, prompt: &str) {
 }
 
 #[tokio::test]
-async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() {
+async fn replaying_an_input_after_a_rewind_returns_its_receipt() {
     let fixture = fixture();
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = StagedModel::new(vec![
@@ -1204,7 +1177,7 @@ async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() 
     let agent = agent(store.clone(), model.clone());
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let opening = Uuid::new_v4();
-    submit(&agent, chat, opening, None, "open a loop").await;
+    submit(&agent, chat, opening, "open a loop").await;
     agent.settled_input(chat, opening).await.unwrap();
     let loop_id = agent
         .input_state(chat, opening)
@@ -1214,7 +1187,7 @@ async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() 
         .entry
         .loop_id;
     let continued = Uuid::new_v4();
-    submit(&agent, chat, continued, Some(loop_id), "continue the loop").await;
+    submit(&agent, chat, continued, "continue the loop").await;
     agent.settled_input(chat, continued).await.unwrap();
     let original = agent.input_state(chat, continued).await.unwrap().unwrap();
 
@@ -1222,21 +1195,11 @@ async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() 
         .rewind(chat, opening, RewindMode::Conversation)
         .await
         .unwrap();
-    assert!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .iter()
-            .all(|goal| goal.id != loop_id),
-        "the rewind removed the Loop"
-    );
+    assert_eq!(agent.snapshot(chat).await.unwrap().chat_loop.id, loop_id);
     let receipt = submit_input(
         &agent,
         chat,
         continued,
-        Some(loop_id),
         "continue the loop".into(),
         Vec::new(),
         Vec::new(),
@@ -1253,7 +1216,6 @@ async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() 
             &agent,
             chat,
             continued,
-            Some(loop_id),
             "another payload".into(),
             Vec::new(),
             Vec::new(),
@@ -1281,7 +1243,6 @@ async fn replaying_an_input_after_its_attachment_was_deleted_returns_its_receipt
             &agent,
             chat,
             input,
-            None,
             "summarize @notes.txt".into(),
             Vec::new(),
             vec![attachment.clone()],

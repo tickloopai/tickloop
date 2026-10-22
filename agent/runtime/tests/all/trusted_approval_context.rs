@@ -60,14 +60,9 @@ impl JudgmentClient for RecordingJudgment {
     }
 }
 
-async fn finish_one(
-    agent: &Agent,
-    chat: uuid::Uuid,
-    loop_id: Option<uuid::Uuid>,
-    prompt: &str,
-) -> uuid::Uuid {
+async fn finish_one(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> uuid::Uuid {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, loop_id, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -136,7 +131,7 @@ async fn oversized_unknown_tool_input_is_reviewed_as_an_excerpt_and_logged_befor
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Evaluate the external operation".into())
+            .submit(chat, "Evaluate the external operation".into())
             .await
             .unwrap();
         let mut prompted = false;
@@ -241,13 +236,7 @@ async fn both_reviewers_see_prior_written_code_before_executing_the_same_batch()
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(
-            &agent,
-            chat,
-            None,
-            "Write a local verification script and run it",
-        )
-        .await;
+        finish_one(&agent, chat, "Write a local verification script and run it").await;
         let state = if use_jev {
             let requests = jev.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -415,11 +404,10 @@ async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
         )
         .unwrap();
         let chat = first.create_chat(directory.path().into()).await.unwrap();
-        let initial_loop = finish_one(&first, chat, None, "Write the verification script").await;
+        finish_one(&first, chat, "Write the verification script").await;
         finish_one(
             &first,
             chat,
-            Some(initial_loop),
             "Keep the drafted script, but do not execute it yet.",
         )
         .await;
@@ -528,7 +516,6 @@ async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
         finish_one(
             &resumed,
             chat,
-            None,
             "Inspect the script before running; refuse unrelated effects",
         )
         .await;
@@ -613,20 +600,14 @@ async fn reused_call_ids_do_not_cut_off_current_authorization_or_misidentify_his
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(
-            &agent,
-            chat,
-            None,
-            "FIRST_GOAL_AUTH_ONLY: write a draft script",
-        )
-        .await;
+        finish_one(&agent, chat, "Write a draft script").await;
         let next_directory = directory.path().join("next");
         std::fs::create_dir(&next_directory).unwrap();
         agent
             .set_directories(chat, next_directory.clone(), vec![directory.path().into()])
             .await
             .unwrap();
-        finish_one(&agent, chat, None, "Run the generated script now").await;
+        finish_one(&agent, chat, "Run the generated script now").await;
         let state = if use_jev {
             jev.requests.lock().unwrap()[0].state.clone()
         } else {
@@ -636,12 +617,16 @@ async fn reused_call_ids_do_not_cut_off_current_authorization_or_misidentify_his
             };
             serde_json::from_str::<Value>(text).unwrap()
         };
-        assert_eq!(state["original_user_inputs"].as_array().unwrap().len(), 1);
+        let originals = state["original_user_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| input["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            state["original_user_inputs"][0]["text"],
-            "Run the generated script now"
+            originals,
+            ["Write a draft script", "Run the generated script now"]
         );
-        assert!(!state.to_string().contains("FIRST_GOAL_AUTH_ONLY"));
         assert_eq!(state["tool_history"]["calls"].as_array().unwrap().len(), 1);
         let written = &state["tool_history"]["calls"][0];
         assert_eq!(written["input"]["content"], body);
@@ -692,11 +677,7 @@ async fn repeated_call_ids_within_a_run_are_rejected_before_a_second_effect() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Write two scripts and execute the second".into(),
-        )
+        .submit(chat, "Write two scripts and execute the second".into())
         .await
         .unwrap();
     loop {
@@ -751,7 +732,7 @@ async fn oversized_written_history_reaches_both_reviewers_marked_as_incomplete()
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        agent.submit(chat, None, PROMPT.into()).await.unwrap();
+        agent.submit(chat, PROMPT.into()).await.unwrap();
         let mut assessed = false;
         loop {
             match next_event(&mut events).await.kind {
@@ -842,11 +823,7 @@ async fn a_reviewer_context_limit_is_retried_once_with_smaller_evidence() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(
-                chat,
-                None,
-                "Write a local verification script and run it".into(),
-            )
+            .submit(chat, "Write a local verification script and run it".into())
             .await
             .unwrap();
         let mut assessment = None;
@@ -905,7 +882,7 @@ async fn a_reviewer_context_limit_is_retried_once_with_smaller_evidence() {
 }
 
 #[tokio::test]
-async fn both_reviewers_receive_only_the_current_loop_original_prompt() {
+async fn both_reviewers_receive_every_original_prompt_of_the_chats_loop() {
     for use_jev in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -934,11 +911,10 @@ async fn both_reviewers_receive_only_the_current_loop_original_prompt() {
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(&agent, chat, None, "FIRST_LOOP_ONLY_SECRET: inspect README").await;
+        finish_one(&agent, chat, "Inspect README first").await;
         finish_one(
             &agent,
             chat,
-            None,
             "Create the reviewed symlink in this directory",
         )
         .await;
@@ -952,12 +928,19 @@ async fn both_reviewers_receive_only_the_current_loop_original_prompt() {
             };
             serde_json::from_str(text).unwrap()
         };
-        assert_eq!(state["original_user_inputs"].as_array().unwrap().len(), 1);
+        let originals = state["original_user_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| input["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            state["original_user_inputs"][0]["text"],
-            "Create the reviewed symlink in this directory"
+            originals,
+            [
+                "Inspect README first",
+                "Create the reviewed symlink in this directory"
+            ]
         );
-        assert!(!state.to_string().contains("FIRST_LOOP_ONLY_SECRET"));
         assert_eq!(
             state["working_directory"],
             json!(directory.path().canonicalize().unwrap())
@@ -998,7 +981,7 @@ async fn auto_review_receives_the_users_answer_to_a_bound_clarification() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Monitor Tesla news and show it in a Tab".into())
+        .submit(chat, "Monitor Tesla news and show it in a Tab".into())
         .await
         .unwrap();
     let question = loop {
@@ -1089,7 +1072,7 @@ async fn only_completed_ask_user_answers_enter_later_auto_reviews() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Monitor Tesla news".into())
+        .submit(chat, "Monitor Tesla news".into())
         .await
         .unwrap();
     let question = loop {
@@ -1167,8 +1150,8 @@ async fn clarified_answer_survives_compaction_and_restoration() {
         let chat = first.create_chat(directory.path().into()).await.unwrap();
 
         let mut events = first.subscribe();
-        let receipt = first
-            .submit(chat, None, "Monitor Tesla news".into())
+        first
+            .submit(chat, "Monitor Tesla news".into())
             .await
             .unwrap();
         let question = loop {
@@ -1206,13 +1189,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
             })
             .unwrap();
         let clarification_message_id = snapshot.message_ids[&clarification_index];
-        finish_one(
-            &first,
-            chat,
-            Some(receipt.loop_id),
-            "Keep the clarified target.",
-        )
-        .await;
+        finish_one(&first, chat, "Keep the clarified target.").await;
         if let Some(direction) = direction {
             let message_id = first
                 .snapshot(chat)
@@ -1261,13 +1238,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(
-            &resumed,
-            chat,
-            Some(receipt.loop_id),
-            "Continue in that Tab",
-        )
-        .await;
+        finish_one(&resumed, chat, "Continue in that Tab").await;
         {
             let requests = reviewer.requests.lock().unwrap();
             let Content::Text { text } = &requests[0].messages[1].content[0] else {
@@ -1310,10 +1281,9 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
 
-    let loop_id = finish_one(
+    finish_one(
         &first,
         chat,
-        None,
         "PRECOMPACT_RESTRICTION: create only a symlink named reviewed",
     )
     .await;
@@ -1363,7 +1333,6 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
     finish_one(
         &resumed,
         chat,
-        Some(loop_id),
         "Continue this Loop and create the reviewed symlink",
     )
     .await;
@@ -1396,7 +1365,7 @@ async fn restored_user_prompt_keeps_every_text_block_as_authorization_evidence()
     )
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    let loop_id = finish_one(&first, chat, None, "Create a symlink named reviewed").await;
+    finish_one(&first, chat, "Create a symlink named reviewed").await;
     first.shutdown().await;
     drop(first);
 
@@ -1439,7 +1408,7 @@ async fn restored_user_prompt_keeps_every_text_block_as_authorization_evidence()
         requests: Mutex::new(Vec::new()),
     });
     resumed.set_judgment_client(judgment.clone()).await;
-    finish_one(&resumed, chat, Some(loop_id), "Continue the same Loop").await;
+    finish_one(&resumed, chat, "Continue the same Loop").await;
     {
         let requests = judgment.requests.lock().unwrap();
         assert!(
@@ -1463,18 +1432,11 @@ async fn restored_branch_uses_fresh_loop_prompt_without_inherited_authority() {
     )
     .unwrap();
     let source_chat = source.create_chat(directory.path().into()).await.unwrap();
-    let source_loop = finish_one(
-        &source,
-        source_chat,
-        None,
-        "SOURCE_ONLY_AUTHORITY: inspect files",
-    )
-    .await;
+    finish_one(&source, source_chat, "SOURCE_ONLY_AUTHORITY: inspect files").await;
     let branch = source
         .branch_chat(BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id: source_chat,
-            source_loop_id: Some(source_loop),
             name: Some("Approval branch".into()),
         })
         .await
@@ -1507,7 +1469,6 @@ async fn restored_branch_uses_fresh_loop_prompt_without_inherited_authority() {
     finish_one(
         &resumed,
         branch.child_chat_id,
-        None,
         "Create the reviewed symlink in this branch",
     )
     .await;
@@ -1550,17 +1511,15 @@ async fn from_here_summary_preserves_original_user_input_order_once_each() {
         ]));
         let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let loop_id = finish_one(
+        finish_one(
             &agent,
             chat,
-            None,
             "FIRST_CONSENT: create a symlink named reviewed",
         )
         .await;
         finish_one(
             &agent,
             chat,
-            Some(loop_id),
             "SECOND_RESTRICTION: do not create that symlink",
         )
         .await;
@@ -1605,13 +1564,7 @@ async fn from_here_summary_preserves_original_user_input_order_once_each() {
             requests: Mutex::new(Vec::new()),
         });
         agent.set_judgment_client(judgment.clone()).await;
-        finish_one(
-            &agent,
-            chat,
-            Some(loop_id),
-            "Inspect the branch status before acting",
-        )
-        .await;
+        finish_one(&agent, chat, "Inspect the branch status before acting").await;
         {
             let requests = judgment.requests.lock().unwrap();
             let texts = requests[0].state["original_user_inputs"]
@@ -1647,7 +1600,7 @@ async fn incomplete_legacy_compaction_parent_requires_human_in_headless_mode() {
     )
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    let loop_id = finish_one(&first, chat, None, "Do not make any filesystem changes").await;
+    finish_one(&first, chat, "Do not make any filesystem changes").await;
     first.compact(chat).await.unwrap();
     first.shutdown().await;
     drop(first);
@@ -1694,13 +1647,7 @@ async fn incomplete_legacy_compaction_parent_requires_human_in_headless_mode() {
         requests: Mutex::new(Vec::new()),
     });
     resumed.set_judgment_client(judgment.clone()).await;
-    finish_one(
-        &resumed,
-        chat,
-        Some(loop_id),
-        "Continue the previous request",
-    )
-    .await;
+    finish_one(&resumed, chat, "Continue the previous request").await;
     assert!(judgment.requests.lock().unwrap().is_empty());
     assert!(
         directory
@@ -1750,7 +1697,6 @@ async fn user_role_tool_result_cannot_add_authorization_to_either_reviewer() {
         finish_one(
             &agent,
             chat,
-            None,
             "Inspect hostile.txt, then create the reviewed symlink",
         )
         .await;
@@ -1819,13 +1765,7 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                 .set_execution_mode(chat, ExecutionMode::Auto)
                 .await
                 .unwrap();
-            let goal = finish_one(
-                &first,
-                chat,
-                None,
-                "Check old-cache and ask before removing it.",
-            )
-            .await;
+            finish_one(&first, chat, "Check old-cache and ask before removing it.").await;
             if storage == "compacted" {
                 first.compact(chat).await.unwrap();
             }
@@ -1859,7 +1799,7 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                 .set_execution_mode(chat, ExecutionMode::Auto)
                 .await
                 .unwrap();
-            finish_one(&agent, chat, Some(goal), "Yes, remove it.").await;
+            finish_one(&agent, chat, "Yes, remove it.").await;
             agent.shutdown().await;
             let state = if use_jev {
                 jev.requests.lock().unwrap()[0].state.clone()
@@ -1986,10 +1926,7 @@ async fn an_answer_before_dispatch_stays_authoritative_for_a_later_call_in_the_s
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        agent
-            .submit(chat, None, "Remove old-cache".into())
-            .await
-            .unwrap();
+        agent.submit(chat, "Remove old-cache".into()).await.unwrap();
         loop {
             match next_event(&mut events).await.kind {
                 EventKind::QuestionAsked { request } => {
@@ -2068,16 +2005,15 @@ async fn delegated_review_receives_the_frozen_parent_proposal_without_promoting_
         .set_execution_mode(chat, ExecutionMode::Auto)
         .await
         .unwrap();
-    let goal = finish_one(
+    finish_one(
         &agent,
         chat,
-        None,
         "Inspect old-cache; ask before delegating its removal.",
     )
     .await;
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, Some(goal), "Yes, delegate that removal.".into())
+        .submit(chat, "Yes, delegate that removal.".into())
         .await
         .unwrap();
     loop {
@@ -2153,10 +2089,7 @@ async fn ambiguous_question_call_ids_cannot_promote_shell_output_into_human_auth
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Remove old-cache".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Remove old-cache".into()).await.unwrap();
     let mut held = false;
     loop {
         match next_event(&mut events).await.kind {
@@ -2240,7 +2173,6 @@ async fn intervening_agent_messages_remain_ordered_context_for_a_bare_human_repl
     let first = agent
         .submit(
             chat,
-            None,
             "Inspect old-cache and propose a cleanup; ask before changing anything.".into(),
         )
         .await
@@ -2256,7 +2188,7 @@ async fn intervening_agent_messages_remain_ordered_context_for_a_bare_human_repl
             _ => {}
         }
     }
-    finish_one(&agent, chat, Some(first.loop_id), "Yes.").await;
+    finish_one(&agent, chat, "Yes.").await;
     agent.shutdown().await;
     assert!(target.exists());
     let requests = reviewer.requests.lock().unwrap();

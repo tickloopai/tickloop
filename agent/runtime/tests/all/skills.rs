@@ -194,11 +194,7 @@ async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
-            if snapshot
-                .loops
-                .last()
-                .is_some_and(|goal| goal.state == LoopState::Completed)
-            {
+            if snapshot.chat_loop.state == LoopState::Idle {
                 break;
             }
             tokio::task::yield_now().await;
@@ -223,7 +219,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .submit(chat, None, "Arrange my Workspace".into())
+        .submit(chat, "Arrange my Workspace".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -286,12 +282,12 @@ async fn loaded_skill_guidance_follows_its_call_once_and_keeps_every_request_a_p
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit(chat, None, "Analyze the target".into())
+        .submit(chat, "Analyze the target".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
     agent
-        .submit(chat, None, "Analyze the next one".into())
+        .submit(chat, "Analyze the next one".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -363,7 +359,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .submit(chat, None, "Analyze the report".into())
+        .submit(chat, "Analyze the report".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -426,7 +422,7 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .invoke_skill(chat, None, "/tickloop", "show the current Workspace")
+        .invoke_skill(chat, "/tickloop", "show the current Workspace")
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -466,10 +462,7 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
-    agent
-        .invoke_skill(chat, None, "tickloop", "")
-        .await
-        .unwrap();
+    agent.invoke_skill(chat, "tickloop", "").await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.compact(chat).await.unwrap();
     agent.shutdown().await;
@@ -527,7 +520,7 @@ async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided()
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .submit(chat, None, "Analyze these targets".into())
+        .submit(chat, "Analyze these targets".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -580,16 +573,16 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     for index in 0..6 {
         agent
-            .invoke_skill(chat, None, &format!("guide-{index}"), "")
+            .invoke_skill(chat, &format!("guide-{index}"), "")
             .await
             .unwrap();
         wait_for_completion(&agent, chat).await;
     }
-    agent.invoke_skill(chat, None, "guide-0", "").await.unwrap();
+    agent.invoke_skill(chat, "guide-0", "").await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.compact(chat).await.unwrap();
     agent
-        .submit(chat, None, "Continue with these guides".into())
+        .submit(chat, "Continue with these guides".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -698,15 +691,12 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
 
-    let receipt = agent.submit(chat, None, "Quotes?".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Quotes?".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(!skill_listing(&model, 0).contains("quotes:usage"));
 
     install_package(&root, &packages, "quotes", "1.0.0", "Read quotes");
-    let receipt = agent
-        .submit(chat, None, "Quotes now?".into())
-        .await
-        .unwrap();
+    let receipt = agent.submit(chat, "Quotes now?".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(
         skill_listing(&model, 1).contains("- quotes:usage [Tick package · quotes]: Read quotes"),
@@ -717,23 +707,15 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     assert!(loaded.contains("Launching skill: quotes:usage"), "{loaded}");
     assert!(loaded.contains("Run tick-quotes 1.0.0."), "{loaded}");
 
-    let receipt = agent
-        .invoke_skill(chat, None, "/quotes:usage", "")
-        .await
-        .unwrap();
+    let receipt = agent.invoke_skill(chat, "/quotes:usage", "").await.unwrap();
     finish(&mut events, &receipt).await;
     let invoked = serde_json::to_string(&model.requests.lock().unwrap()[3].messages).unwrap();
     assert!(invoked.contains("/quotes:usage"), "{invoked}");
 
     packages.uninstall("quotes").unwrap();
     assert!(!agent.has_skill(chat, "quotes:usage").await.unwrap());
-    assert!(
-        agent
-            .invoke_skill(chat, None, "/quotes:usage", "")
-            .await
-            .is_err()
-    );
-    let receipt = agent.submit(chat, None, "And now?".into()).await.unwrap();
+    assert!(agent.invoke_skill(chat, "/quotes:usage", "").await.is_err());
+    let receipt = agent.submit(chat, "And now?".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(!skill_listing(&model, 4).contains("quotes:usage"));
     agent.shutdown().await;
@@ -778,7 +760,7 @@ async fn unchanged_skills_send_the_same_skill_tool_definition_so_the_prompt_cach
     let mut events = agent.subscribe();
 
     for prompt in ["One", "Two"] {
-        let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         finish(&mut events, &receipt).await;
     }
 
@@ -812,7 +794,7 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
     let (agent, chat, model) = agent_in(&config_root, &workdir, 2).await;
     let mut events = agent.subscribe();
 
-    let receipt = agent.submit(chat, None, "One".into()).await.unwrap();
+    let receipt = agent.submit(chat, "One".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(skill_listing(&model, 0).contains("- notes [User]: Take notes\n"));
 
@@ -822,7 +804,7 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
         "name: notes\ndescription: Take dated notes",
         "Write dated notes.",
     );
-    let receipt = agent.submit(chat, None, "Two".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Two".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(
         skill_listing(&model, 1).contains("- notes [User]: Take dated notes\n"),
@@ -883,9 +865,21 @@ async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request(
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Delegate".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Delegate".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     let child = agent.subagents(chat).await.unwrap()[0].child_chat_id;
+    // The delegated turn ends first, so the next input starts a turn of its own.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let chat_loop = agent.snapshot(child).await.unwrap().chat_loop;
+            if chat_loop.state == LoopState::Idle && chat_loop.run_id.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let child_requests = || {
         model
             .requests
@@ -898,7 +892,7 @@ async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request(
     };
 
     install_package(&root, &packages, "quotes", "1.0.0", "Read quotes");
-    let receipt = agent.submit(child, None, "Quotes".into()).await.unwrap();
+    let receipt = agent.submit(child, "Quotes".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     let requests = child_requests();
     let installed = requests
@@ -915,7 +909,7 @@ async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request(
     assert!(loaded.contains("Run tick-quotes 1.0.0."), "{loaded}");
 
     packages.uninstall("quotes").unwrap();
-    let receipt = agent.submit(child, None, "Again".into()).await.unwrap();
+    let receipt = agent.submit(child, "Again".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(!lists_skill(
         child_requests().last().unwrap(),
@@ -993,7 +987,7 @@ async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() 
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, "Use notes".into()).await.unwrap();
+    let receipt = agent.submit(chat, "Use notes".into()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), model.entered.notified())
         .await
         .unwrap();
@@ -1062,7 +1056,7 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
 
-    let invocation = agent.invoke_skill(chat, None, "slides", "").await.unwrap();
+    agent.invoke_skill(chat, "slides", "").await.unwrap();
     let question = loop {
         if let EventKind::QuestionAsked { request } = next_event(&mut events).await.kind {
             break request;
@@ -1080,7 +1074,7 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
         .unwrap();
     wait_for_completion(&agent, chat).await;
     agent
-        .submit(chat, Some(invocation.loop_id), "Something unrelated".into())
+        .submit(chat, "Something unrelated".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -1142,7 +1136,7 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
         .unwrap();
     let mut events = agent.subscribe();
     let active = agent
-        .submit(chat, None, "Check the workspace".into())
+        .submit(chat, "Check the workspace".into())
         .await
         .unwrap();
     loop {
@@ -1154,7 +1148,7 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
         }
     }
     let joined = agent
-        .invoke_skill(chat, Some(active.loop_id), "slides", "the Q3 review")
+        .invoke_skill(chat, "slides", "the Q3 review")
         .await
         .unwrap();
     fs::write(directory.path().join("slides-release"), "release").unwrap();
@@ -1172,10 +1166,7 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
         }
     }
     assert!(merged, "the invocation joined the working run");
-    agent
-        .submit(chat, Some(active.loop_id), "Next task".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Next task".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);

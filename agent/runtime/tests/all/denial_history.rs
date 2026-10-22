@@ -120,14 +120,7 @@ impl HostToolProvider for PanelHost {
 async fn wait_for_completion(agent: &Agent, chat: Uuid) {
     tokio::time::timeout(COMPLETION_TIMEOUT, async {
         loop {
-            if agent
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .loops
-                .last()
-                .is_some_and(|loop_| loop_.state == LoopState::Completed)
-            {
+            if agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle {
                 return;
             }
             // Snapshots clone the whole Chat, so polling without a pause starves the run under load.
@@ -162,7 +155,7 @@ async fn final_rule_denial_is_recorded_once_with_private_display_facts() {
     let rule_id = rule.id;
     agent.set_permission_rules(chat, vec![rule]).await.unwrap();
     let attempt = agent
-        .submit(chat, None, "prepare the report".into())
+        .submit(chat, "prepare the report".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -236,7 +229,7 @@ async fn final_rule_denial_is_recorded_once_with_private_display_facts() {
 }
 
 #[tokio::test]
-async fn a_retry_starts_a_new_loop_and_obeys_the_current_ask_rule() {
+async fn a_retry_starts_a_new_run_and_obeys_the_current_ask_rule() {
     let temp = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -262,10 +255,7 @@ async fn a_retry_starts_a_new_loop_and_obeys_the_current_ask_rule() {
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    let original = agent
-        .submit(chat, None, "write held.txt".into())
-        .await
-        .unwrap();
+    let original = agent.submit(chat, "write held.txt".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let record_id = agent.recent_denials(chat).await.unwrap().records[0].id;
     assert_eq!(
@@ -278,7 +268,11 @@ async fn a_retry_starts_a_new_loop_and_obeys_the_current_ask_rule() {
         .unwrap();
     let mut events = agent.subscribe();
     let retry = agent.request_denial_retry(chat, record_id).await.unwrap();
-    assert_ne!(retry.loop_id, original.loop_id);
+    assert_eq!(
+        retry.loop_id, original.loop_id,
+        "the retry runs in the Chat's Loop"
+    );
+    assert_ne!(retry.run_id, original.run_id);
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != retry.run_id {
@@ -332,10 +326,7 @@ async fn the_latest_hundred_denials_are_physically_bounded_and_restore_in_order(
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    agent
-        .submit(chat, None, "try each file".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "try each file".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let view = agent.recent_denials(chat).await.unwrap();
     assert_eq!(view.records.len(), 100);
@@ -391,10 +382,7 @@ async fn mixed_allow_and_deny_history_keeps_the_latest_hundred_results() {
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    agent
-        .submit(chat, None, "read and write".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "read and write".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 100);
@@ -449,7 +437,7 @@ async fn disabled_persistence_keeps_denials_only_in_memory() {
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    agent.submit(chat, None, "write".into()).await.unwrap();
+    agent.submit(chat, "write".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let view = agent.recent_denials(chat).await.unwrap();
     assert_eq!(view.records.len(), 1);
@@ -478,7 +466,7 @@ async fn damaged_history_warns_without_blocking_chat_recovery() {
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    agent.submit(chat, None, "write".into()).await.unwrap();
+    agent.submit(chat, "write".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.shutdown().await;
     let sidecar = transcript_file(&root, chat).with_extension("denials.json");
@@ -523,13 +511,13 @@ async fn failed_history_save_keeps_memory_and_retries_without_losing_records() {
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    agent.submit(chat, None, "first".into()).await.unwrap();
+    agent.submit(chat, "first".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.flush_transcripts().await;
     let sidecar = transcript_file(&root, chat).with_extension("denials.json");
     std::fs::remove_file(&sidecar).unwrap();
     std::fs::create_dir(&sidecar).unwrap();
-    agent.submit(chat, None, "second".into()).await.unwrap();
+    agent.submit(chat, "second".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     agent.flush_transcripts().await;
     let unsaved = agent.recent_denials(chat).await.unwrap();
@@ -573,10 +561,7 @@ async fn host_rule_denial_is_recorded_without_executing_the_host_tool() {
         .set_permission_rules(chat, vec![rule.clone()])
         .await
         .unwrap();
-    agent
-        .submit(chat, None, "change panel".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "change panel".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let records = agent.recent_denials(chat).await.unwrap().records;
     assert_eq!(records.len(), 1);
@@ -609,15 +594,9 @@ async fn direct_read_and_host_admission_each_have_one_allow_record() {
     let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
     agent.install_host_tools(host.clone()).unwrap();
     let chat = agent.create_chat(workdir).await.unwrap();
-    agent
-        .submit(chat, None, "read input.txt".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "read input.txt".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
-    agent
-        .submit(chat, None, "change panel".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "change panel".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 2);
@@ -669,10 +648,7 @@ async fn a_tool_failure_after_admission_keeps_its_allow_result() {
     let agent = Agent::new_embedded(config(), model);
     agent.install_host_tools(host.clone()).unwrap();
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
-    agent
-        .submit(chat, None, "change panel".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "change panel".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 1);
@@ -702,10 +678,7 @@ async fn human_refusal_and_approval_have_distinct_final_results() {
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        let attempt = agent
-            .submit(chat, None, "write human.txt".into())
-            .await
-            .unwrap();
+        let attempt = agent.submit(chat, "write human.txt".into()).await.unwrap();
         let request = loop {
             let event = next_event(&mut events).await;
             if event.run_id != attempt.run_id {
@@ -796,7 +769,7 @@ async fn headless_explicit_ask_is_a_final_no_human_denial() {
         .set_permission_rules(chat, vec![write_rule(Decision::Ask)])
         .await
         .unwrap();
-    agent.submit(chat, None, "write".into()).await.unwrap();
+    agent.submit(chat, "write".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let records = agent.recent_denials(chat).await.unwrap().records;
     assert_eq!(records.len(), 1);
@@ -824,7 +797,7 @@ async fn cancelling_a_held_permission_request_does_not_create_a_denial() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    let attempt = agent.submit(chat, None, "write".into()).await.unwrap();
+    let attempt = agent.submit(chat, "write".into()).await.unwrap();
     loop {
         let event = next_event(&mut events).await;
         if event.run_id != attempt.run_id {
@@ -834,7 +807,7 @@ async fn cancelling_a_held_permission_request_does_not_create_a_denial() {
             break;
         }
     }
-    agent.stop(chat, attempt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
     assert!(
         agent
@@ -865,17 +838,13 @@ async fn branch_starts_without_source_denials_while_source_rewind_retains_histor
         .set_permission_rules(chat, vec![write_rule(Decision::Deny)])
         .await
         .unwrap();
-    let receipt = agent
-        .submit(chat, None, "write past.txt".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "write past.txt".into()).await.unwrap();
     wait_for_completion(&agent, chat).await;
     let record = agent.recent_denials(chat).await.unwrap().records[0].clone();
     let child = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: Some(receipt.loop_id),
             name: Some("alternate".into()),
         })
         .await
@@ -919,7 +888,7 @@ async fn approval_invalidated_by_a_new_deny_is_a_final_admission_refusal() {
         .unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit(chat, None, "write revoked.txt".into())
+        .submit(chat, "write revoked.txt".into())
         .await
         .unwrap();
     let request = loop {
@@ -992,7 +961,7 @@ async fn automatic_hard_deny_keeps_the_frozen_rule_and_reviewer_path_after_polic
         .await
         .unwrap();
     agent
-        .submit(chat, None, "create the protected symlink".into())
+        .submit(chat, "create the protected symlink".into())
         .await
         .unwrap();
     wait_for_completion(&agent, chat).await;
@@ -1067,7 +1036,7 @@ async fn stale_auto_allow_is_reviewed_again_against_the_new_hard_deny() {
         .await
         .unwrap();
     let receipt = agent
-        .submit(chat, None, "create the held symlink".into())
+        .submit(chat, "create the held symlink".into())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), model.review_started.notified())

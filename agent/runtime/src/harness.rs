@@ -128,8 +128,6 @@ pub struct ToolPolicy {
     /// ListSubagents, SendMessage and StopSubagent.
     pub family_messages: bool,
     pub tasks: bool,
-    /// StartGoal.
-    pub goals: bool,
     /// The host's tools, such as the Artifact and Tick tools, and its MCP resources.
     pub artifacts: bool,
     pub tick_subscriptions: bool,
@@ -159,7 +157,6 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
-            goals: true,
             artifacts: true,
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
@@ -169,8 +166,8 @@ impl ToolPolicy {
     }
 
     /// A durable Chat's: WebFetch of URLs and Artifact writes to targets with provenance,
-    /// questions, Subagents and their messages, Task tools, goals and the host's
-    /// tools, with waits the Transcript keeps.
+    /// questions, Subagents and their messages, Task tools and the host's tools, with waits the
+    /// Transcript keeps.
     pub const fn durable_chat() -> Self {
         Self {
             web_fetch: true,
@@ -182,7 +179,6 @@ impl ToolPolicy {
             delegation: true,
             family_messages: true,
             tasks: true,
-            goals: true,
             artifacts: true,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -193,12 +189,7 @@ impl ToolPolicy {
 
     /// Whether a Chat with these tools may wait for a person or keep work past its turn.
     fn waits_or_outlives_the_turn(&self) -> bool {
-        self.questions
-            || self.delegation
-            || self.family_messages
-            || self.tasks
-            || self.goals
-            || self.artifacts
+        self.questions || self.delegation || self.family_messages || self.tasks || self.artifacts
     }
 
     /// WebFetch alone: nothing waits for a person, and nothing outlives the turn.
@@ -213,7 +204,6 @@ impl ToolPolicy {
             delegation: false,
             family_messages: false,
             tasks: false,
-            goals: false,
             artifacts: false,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -261,8 +251,8 @@ fn invalid_composition(has_environment: bool, options: &HarnessOptions) -> Optio
         && tools.waits_or_outlives_the_turn()
     {
         return Some(
-            "Chats without a Folder that ask questions, delegate, keep tasks or goals, or use the \
-             host's tools need durable waits",
+            "Chats without a Folder that ask questions, delegate, keep tasks, or use the host's \
+             tools need durable waits",
         );
     }
     if durable && tools.tick_subscriptions {
@@ -513,41 +503,34 @@ fn has_startable_input(chat: &Chat) -> bool {
             .any(|record| record.state == UserShellState::Queued);
     chat.active.is_none()
         && !is_held_back
+        && !matches!(
+            snapshot.chat_loop.state,
+            LoopState::WaitingPermission | LoopState::WaitingQuestion
+        )
         && snapshot.pending_inputs.iter().any(|pending| {
             pending.armed
-                && snapshot.loops.iter().any(|goal| {
-                    goal.id == pending.receipt.loop_id
-                        && !matches!(
-                            goal.state,
-                            LoopState::WaitingPermission
-                                | LoopState::WaitingQuestion
-                                | LoopState::Stopped
-                                | LoopState::Expired
-                        )
+                && pending.trigger_source.as_ref().is_none_or(|source| {
+                    crate::triggers::takes_trigger_input(&snapshot.chat_loop, source)
                 })
         })
 }
 
-/// The links of the Chat's Loops that have not ended and receive their artifact's requests.
+/// The links of the Chat's Loop that receive their artifact's requests.
 fn deliveries_of(
     chat: ChatId,
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
 ) -> Vec<DeliveryBinding> {
-    snapshot
-        .loops
+    let chat_loop = &snapshot.chat_loop;
+    chat_loop
+        .event_sources
         .iter()
-        .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-        .flat_map(|goal| {
-            goal.event_sources
-                .iter()
-                .filter(|source| !source.resume_required)
-                .map(|source| DeliveryBinding {
-                    chat,
-                    loop_id: goal.id,
-                    origin: source.origin.clone(),
-                    account_id: source.account_id.clone(),
-                    artifact_id: source.artifact_id.clone(),
-                })
+        .filter(|source| !source.resume_required)
+        .map(|source| DeliveryBinding {
+            chat,
+            loop_id: chat_loop.id,
+            origin: source.origin.clone(),
+            account_id: source.account_id.clone(),
+            artifact_id: source.artifact_id.clone(),
         })
         .collect()
 }

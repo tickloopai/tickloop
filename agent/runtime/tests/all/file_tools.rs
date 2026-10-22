@@ -179,11 +179,7 @@ async fn agent_answers_from_a_real_file_in_its_chat_directory() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(
-            chat,
-            None,
-            "Read notes.txt and tell me the delivery date".into(),
-        )
+        .submit(chat, "Read notes.txt and tell me the delivery date".into())
         .await
         .unwrap();
     loop {
@@ -252,7 +248,7 @@ async fn agent_finds_paths_and_matching_lines_in_real_files() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Find the delivery note".into())
+        .submit(chat, "Find the delivery note".into())
         .await
         .unwrap();
     let mut results = Vec::new();
@@ -304,7 +300,7 @@ async fn searching_outside_the_workspace_asks_for_approval_first() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Find the deliveries".into())
+        .submit(chat, "Find the deliveries".into())
         .await
         .unwrap();
 
@@ -348,7 +344,7 @@ async fn an_outside_symlink_requires_the_resolved_path_approval_and_cannot_chang
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Read the linked note".into())
+        .submit(chat, "Read the linked note".into())
         .await
         .unwrap();
     let permission = loop {
@@ -430,10 +426,7 @@ async fn read_results(directory: &std::path::Path, reads: Vec<serde_json::Value>
     );
     let chat = agent.create_chat(directory.into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Read the notes".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Read the notes".into()).await.unwrap();
     let mut results = std::collections::HashMap::new();
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
@@ -539,7 +532,6 @@ async fn approved_file_creation_and_local_edit_change_the_actual_file() {
     agent
         .submit(
             chat,
-            None,
             "Create the report and correct the delivery day".into(),
         )
         .await
@@ -614,7 +606,7 @@ async fn a_file_changed_while_approval_is_pending_is_not_overwritten() {
     require_file_change_approval(&agent, chat, "Edit").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Correct the delivery day".into())
+        .submit(chat, "Correct the delivery day".into())
         .await
         .unwrap();
     let mut file_change_error = None;
@@ -673,7 +665,7 @@ async fn a_large_search_result_is_saved_to_a_file_with_a_preview_for_the_model()
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Find all delivery items".into())
+        .submit(chat, "Find all delivery items".into())
         .await
         .unwrap();
     loop {
@@ -767,7 +759,7 @@ async fn directory_search_does_not_open_every_file_at_once() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Find all delivery records".into())
+        .submit(chat, "Find all delivery records".into())
         .await
         .unwrap();
     loop {
@@ -853,7 +845,7 @@ async fn an_unread_file_is_rejected_before_any_approval_is_requested() {
     require_file_change_approval(&agent, chat, "Write").await;
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Replace the report".into())
+        .submit(chat, "Replace the report".into())
         .await
         .unwrap();
 
@@ -894,7 +886,6 @@ async fn a_file_attached_with_an_at_mention_counts_as_read_when_attached_whole()
     agent
         .submit_with_file_references(
             chat,
-            None,
             "Fix the day in @notes.txt and @large.txt".into(),
             vec![notes.clone(), large.clone()],
         )
@@ -947,7 +938,7 @@ async fn compaction_forgets_which_files_the_chat_read() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let mut turn = async |prompt: &str| {
-        agent.submit(chat, None, prompt.into()).await.unwrap();
+        agent.submit(chat, prompt.into()).await.unwrap();
         finish_turn(&agent, chat, &mut events).await.0
     };
 
@@ -1020,7 +1011,7 @@ async fn write_and_edit_report_success_in_claude_code_words() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Write and revise the report".into())
+        .submit(chat, "Write and revise the report".into())
         .await
         .unwrap();
 

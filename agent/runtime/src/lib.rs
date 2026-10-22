@@ -169,7 +169,7 @@ const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub use agent_messages::{LIST_SUBAGENTS_TOOL_NAME, StoppedChildHook};
+pub use agent_messages::LIST_SUBAGENTS_TOOL_NAME;
 pub use delegation::MAX_SUBAGENT_HANDLE_CHARACTERS;
 
 #[derive(Clone, Debug)]
@@ -190,7 +190,7 @@ pub enum AgentError {
     /// A newer holder owns the Chat's Transcript; this Harness writes nothing more to it.
     #[error("the Chat's Transcript belongs to a newer holder")]
     Fenced,
-    #[error("chat or goal does not exist")]
+    #[error("chat does not exist")]
     NotFound,
     #[error("invalid request: {0}")]
     Invalid(String),
@@ -399,7 +399,6 @@ struct Inner {
     request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
     shells: Arc<crate::hosted::shells::ShellTasks>,
-    stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
     tick_stream_installed: AtomicBool,
@@ -423,11 +422,10 @@ struct ChatBookkeeping {
     citation_sources: tickloop_agent_transcript::CitationSourcesEntry,
     #[serde(default)]
     continued_message_ids: HashMap<Uuid, Vec<Uuid>>,
-    dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
+    /// The dependency files' fingerprints when the Chat was created; a restored Chat has none.
+    dependency_baseline: Option<BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
-    /// 各 Loop 创建时的对话消息数。rewind 截断到这个位置或更早时 Loop 不再存在。
-    loop_starts: BTreeMap<LoopId, usize>,
     /// 规则集中每条持久规则所属的项目分区（规范化的工作目录），删除或修改时写回该分区。
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
     /// 照 Claude Code：Chat 的计划文件名前缀，第一次设置计划时生成，记录在之后的每个链上条目中。
@@ -445,22 +443,6 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_agent_protocol::ResponseId>,
-}
-
-impl ChatBookkeeping {
-    /// 新建 Loop，记下创建时的对话位置。
-    fn add_loop(&mut self, snapshot: &mut ChatSnapshot, goal: LoopSnapshot) {
-        self.dependency_baselines.insert(
-            goal.id,
-            snapshot
-                .folder
-                .as_deref()
-                .map(approval_context::dependency_fingerprints)
-                .unwrap_or_default(),
-        );
-        self.loop_starts.insert(goal.id, snapshot.messages.len());
-        snapshot.loops.push(goal);
-    }
 }
 
 #[derive(Clone)]
@@ -553,7 +535,6 @@ struct SubmissionOptions {
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
-    goal_title: Option<String>,
     ledger: Option<lifecycle::LedgerInput>,
     turn: TurnAdmission,
 }
@@ -779,25 +760,57 @@ impl Chat {
     /// Queued user messages stay armed and start right after it; Agent messages queued for the
     /// interrupted Loop wait for explicit continuation. Returns the operations whose outcome the
     /// interruption may leave admitted or unknown.
+    /// Esc: interrupts the running turn, or else the latest one waiting for a person.
     fn interrupt(&mut self) -> Vec<OperationRecord> {
-        let mut interrupted_loop = None;
+        let mut is_interrupted = false;
         if let Some(cancel) = &self.active {
             cancel.cancel();
             if let Some(run_id) = self.active_run {
                 self.user_cancelled_runs.insert(run_id);
-                interrupted_loop = self.bookkeeping.run_loops.get(&run_id).copied();
+                is_interrupted = true;
             }
         } else if let Some(waiting) = self.parked.values().max_by_key(|run| run.sequence) {
             waiting.cancel.cancel();
             self.user_cancelled_runs.insert(waiting.receipt.run_id);
-            interrupted_loop = Some(waiting.receipt.loop_id);
+            is_interrupted = true;
         }
+        if is_interrupted {
+            self.hold_queued_agent_messages();
+        }
+        self.uncertain_operations()
+    }
+
+    /// `/stop`: interrupts the running turn and every turn waiting for a person.
+    fn interrupt_every_run(&mut self) -> Vec<OperationRecord> {
+        let mut is_interrupted = false;
+        if let Some(cancel) = &self.active {
+            cancel.cancel();
+            if let Some(run_id) = self.active_run {
+                self.user_cancelled_runs.insert(run_id);
+                is_interrupted = true;
+            }
+        }
+        for waiting in self.parked.values() {
+            waiting.cancel.cancel();
+            self.user_cancelled_runs.insert(waiting.receipt.run_id);
+            is_interrupted = true;
+        }
+        if is_interrupted {
+            self.hold_queued_agent_messages();
+        }
+        self.uncertain_operations()
+    }
+
+    /// Agent messages queued for an interrupted turn wait until the Chat is continued.
+    fn hold_queued_agent_messages(&mut self) {
         for pending in &mut self.snapshot.pending_inputs {
-            if pending.agent_message.is_some() && Some(pending.receipt.loop_id) == interrupted_loop
-            {
+            if pending.agent_message.is_some() {
                 pending.armed = false;
             }
         }
+    }
+
+    fn uncertain_operations(&self) -> Vec<OperationRecord> {
         self.snapshot
             .operations
             .iter()
@@ -874,11 +887,8 @@ fn answerable_permission_request(
         PermissionExecution::ToolCall { run_id, .. } => {
             chat.run_cancel(run_id)
                 .is_some_and(|cancel| !cancel.is_cancelled())
-                && chat.snapshot.loops.iter().any(|goal| {
-                    goal.id == request.loop_id
-                        && goal.run_id == Some(run_id)
-                        && goal.state == LoopState::WaitingPermission
-                })
+                && chat.snapshot.chat_loop.run_id == Some(run_id)
+                && chat.snapshot.chat_loop.state == LoopState::WaitingPermission
         }
         PermissionExecution::UserShell { command_id } => {
             chat.snapshot.user_shells.iter().any(|shell| {
@@ -948,8 +958,8 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
         message_models: BTreeMap::new(),
-        loops: Vec::new(),
-        resume_triggers: Vec::new(),
+        chat_loop: LoopSnapshot::new(Uuid::new_v4()),
+        trigger_awaits_resume: false,
         last_sequence: 0,
         permissions: Vec::new(),
         questions: Vec::new(),
@@ -1654,11 +1664,9 @@ impl Agent {
         }
     }
 
-    pub async fn stop(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-    ) -> Result<Vec<OperationRecord>, AgentError> {
+    /// `/stop`: interrupts the current turn and pauses receiving until the Chat is continued.
+    /// On a Subagent it stops the member and its descendants.
+    pub async fn stop(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let is_child = self
             .inner
             .chats
@@ -1670,15 +1678,6 @@ impl Agent {
             .delegation
             .is_some();
         if is_child {
-            if !self
-                .snapshot(chat_id)
-                .await?
-                .loops
-                .iter()
-                .any(|goal| goal.id == loop_id)
-            {
-                return Err(AgentError::NotFound);
-            }
             let stopped = self.stop_subagent_tree(chat_id, None).await?;
             if !stopped.failures.is_empty() {
                 return Err(AgentError::Invalid(format!(
@@ -1688,7 +1687,7 @@ impl Agent {
             }
             Ok(stopped.operations)
         } else {
-            self.end_goal(chat_id, loop_id).await
+            self.stop_loop(chat_id).await
         }
     }
 
@@ -1913,7 +1912,6 @@ impl Agent {
                 host_rules,
                 system_prompt_addition,
                 request_gates,
-                stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
                     tick_subscriptions::TickDeliveries::default(),
@@ -2077,7 +2075,16 @@ impl Agent {
             recorder.register_chat(id, folder.as_deref()).await?;
         }
         let mut snapshot = empty_snapshot(id, folder, ModelConfig::unselected());
-        let mut bookkeeping = ChatBookkeeping::default();
+        let mut bookkeeping = ChatBookkeeping {
+            dependency_baseline: Some(
+                snapshot
+                    .folder
+                    .as_deref()
+                    .map(approval_context::dependency_fingerprints)
+                    .unwrap_or_default(),
+            ),
+            ..Default::default()
+        };
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) =
             if let Some((metadata, parent, client, output_style)) = inherited {
@@ -2167,24 +2174,18 @@ impl Agent {
         Ok(id)
     }
 
-    pub async fn submit(
-        &self,
-        chat_id: ChatId,
-        goal: Option<LoopId>,
-        input: String,
-    ) -> Result<Receipt, AgentError> {
-        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), Vec::new(), None);
+    pub async fn submit(&self, chat_id: ChatId, input: String) -> Result<Receipt, AgentError> {
+        let request = TurnRequest::after_current_leaf(input, Vec::new(), Vec::new(), None);
         Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     pub async fn invoke_skill(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         name: &str,
         arguments: &str,
     ) -> Result<Receipt, AgentError> {
-        self.invoke_skill_in_host_context(chat_id, goal, name, arguments, None)
+        self.invoke_skill_in_host_context(chat_id, name, arguments, None)
             .await
     }
 
@@ -2193,7 +2194,6 @@ impl Agent {
     pub async fn invoke_skill_in_host_context(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         name: &str,
         arguments: &str,
         host_context: Option<HostCallContext>,
@@ -2205,7 +2205,6 @@ impl Agent {
                     input_id: Uuid::new_v4(),
                     op: TurnOp::Skill {
                         after: ParentSelection::CurrentLeaf,
-                        target_loop: goal,
                         skill: SkillInvocation {
                             name: name.into(),
                             arguments: arguments.into(),
@@ -2223,7 +2222,6 @@ impl Agent {
     async fn submit_skill(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         skill: SkillInvocation,
         host_context: Option<HostCallContext>,
         ledger: lifecycle::LedgerInput,
@@ -2254,7 +2252,6 @@ impl Agent {
         };
         self.submit_internal(
             chat_id,
-            goal,
             input,
             SubmissionOptions {
                 invoked_skill: Some(invoked),
@@ -2321,11 +2318,10 @@ impl Agent {
     pub async fn submit_with_file_references(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         input: String,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), paths, None);
+        let request = TurnRequest::after_current_leaf(input, Vec::new(), paths, None);
         Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
@@ -2334,12 +2330,11 @@ impl Agent {
     pub async fn submit_with_input_contexts(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         input: String,
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, None);
+        let request = TurnRequest::after_current_leaf(input, contexts, paths, None);
         Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
@@ -2347,13 +2342,12 @@ impl Agent {
     pub async fn submit_with_input_contexts_in_host_context(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         input: String,
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
-        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, host_context);
+        let request = TurnRequest::after_current_leaf(input, contexts, paths, host_context);
         Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
@@ -2363,7 +2357,6 @@ impl Agent {
     ) -> Result<Receipt, AgentError> {
         let family::ContextSubmission {
             chat_id,
-            goal,
             input,
             mut contexts,
             paths,
@@ -2393,12 +2386,6 @@ impl Agent {
                 return replay;
             }
             let snapshot = &chat.snapshot;
-            // A staged branch holds its own Loops; the input is checked against them on acceptance.
-            if turn.branch.is_none()
-                && goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id))
-            {
-                return Err(AgentError::NotFound);
-            }
             if snapshot.folder.is_none() {
                 if !paths.is_empty() || contexts.iter().any(|context| context.path().is_some()) {
                     return Err(AgentError::Invalid(format!(
@@ -2409,7 +2396,6 @@ impl Agent {
                 return self
                     .submit_internal(
                         chat_id,
-                        goal,
                         input,
                         SubmissionOptions {
                             contexts,
@@ -2442,7 +2428,7 @@ impl Agent {
                 .collect::<Result<Vec<_>, _>>()?;
             let admission = family::AttachmentAdmission { workspace, reads };
             let sessions = self.inner.session_permissions.lock().await;
-            Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, &admission)?;
+            Self::validate_attachment_admission(&chats, &sessions, chat_id, &admission)?;
             admission
         };
         let workspace = admission.workspace.clone();
@@ -2475,7 +2461,6 @@ impl Agent {
         }
         self.submit_internal(
             chat_id,
-            goal,
             input,
             SubmissionOptions {
                 contexts,
@@ -2495,7 +2480,6 @@ impl Agent {
     async fn submit_internal(
         &self,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         input: String,
         options: SubmissionOptions,
     ) -> Result<Receipt, AgentError> {
@@ -2514,20 +2498,20 @@ impl Agent {
             host_context,
             agent_message,
             directed_human,
-            goal_title,
             ledger,
             mut turn,
         } = options;
         let is_feedback = feedback_input.is_some();
-        let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
+        // A user input continues the Chat: its Loop receives Triggers again.
+        let continues_chat = trigger_source.is_none() && agent_message.is_none();
         // Every queued input has its ledger record; one the Agent queues for itself is named by
         // its source where the source names it.
         let ledger = ledger.unwrap_or_else(|| {
             if let Some(identity) = &feedback_input {
-                return turn::delivery_ledger(
-                    identity.loop_id,
-                    event_sources::ExternalDelivery::received(identity, input.clone()),
-                );
+                return turn::delivery_ledger(event_sources::ExternalDelivery::received(
+                    identity,
+                    input.clone(),
+                ));
             }
             let (id, op) = match (&agent_message, &directed_human) {
                 (Some(source), _) => (source.message_id, InputOp::AgentMessage),
@@ -2567,56 +2551,30 @@ impl Agent {
         }
         if let Some(admission) = &attachment_admission {
             let sessions = self.inner.session_permissions.lock().await;
-            Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, admission)?;
+            Self::validate_attachment_admission(&chats, &sessions, chat_id, admission)?;
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if let Some(identity) = &feedback_input
-            && !original.snapshot.loops.iter().any(|existing| {
-                existing.id == identity.loop_id
-                    && !matches!(existing.state, LoopState::Stopped | LoopState::Expired)
-            })
+            && identity.loop_id != original.snapshot.chat_loop.id
         {
-            // A Loop the conversation lost, as a rewind cuts one, has ended; one the Chat never
-            // had is a misrouted delivery.
-            if !original
-                .snapshot
-                .loops
-                .iter()
-                .any(|existing| existing.id == identity.loop_id)
-                && !original.bookkeeping.lifecycle.knows_loop(identity.loop_id)
-            {
-                return Err(AgentError::Invalid("the Chat has no such Loop".into()));
-            }
-            let receipt = Receipt {
-                chat_id,
-                loop_id: identity.loop_id,
-                run_id: identity.delivery_id,
-            };
-            original.bookkeeping.lifecycle.record_settled(
-                &ledger,
-                &receipt,
-                SettledOutcome::Discarded {
-                    reason: DiscardReason::LoopEnded,
-                },
-            );
-            self.save(&original.snapshot);
-            self.inner.ledger_changes.send_replace(());
-            return Ok(receipt);
+            return Err(AgentError::Invalid("the Chat has no such Loop".into()));
         }
         if requires_feedback_binding
             && let Some(identity) = &feedback_input
-            && !original.snapshot.loops.iter().any(|goal| {
-                goal.id == identity.loop_id
-                    && goal.event_sources.iter().any(|source| {
-                        !source.resume_required
-                            && source.origin == identity.origin
-                            && source.account_id == identity.account_id
-                            && tickloop_agent_artifacts::artifact_ids_match(
-                                &source.artifact_id,
-                                &identity.artifact_id,
-                            )
-                    })
-            })
+            && !original
+                .snapshot
+                .chat_loop
+                .event_sources
+                .iter()
+                .any(|source| {
+                    !source.resume_required
+                        && source.origin == identity.origin
+                        && source.account_id == identity.account_id
+                        && tickloop_agent_artifacts::artifact_ids_match(
+                            &source.artifact_id,
+                            &identity.artifact_id,
+                        )
+                })
         {
             return Err(AgentError::Invalid(
                 "the Loop has no active binding for this Artifact delivery".into(),
@@ -2640,57 +2598,18 @@ impl Agent {
             }
             None => None,
         };
-        if family_generation.is_some_and(|expected| {
-            expected != original.family_generation
-                || original
-                    .snapshot
-                    .loops
-                    .iter()
-                    .find(|existing| Some(existing.id) == goal)
-                    .is_some_and(|goal| {
-                        matches!(
-                            goal.state,
-                            LoopState::Stopped
-                                | LoopState::Interrupted
-                                | LoopState::Failed
-                                | LoopState::Expired
-                        )
-                    })
-        }) {
+        if family_generation.is_some_and(|expected| expected != original.family_generation) {
             return Err(AgentError::Invalid(
                 "directed target changed while preparing the input".into(),
             ));
         }
         let base = staged.as_ref().map_or(&*original, |staged| &staged.chat);
-        let inherit_branch_session =
-            goal.is_none() && trigger_source.is_none() && base.snapshot.branch_origin.is_some();
+        let inherit_branch_session = continues_chat && base.snapshot.branch_origin.is_some();
         let mut candidate = base.clone();
-        let loops_at_start = Self::prepare_cut(base, &mut candidate, cut)?;
+        Self::prepare_cut(base, &mut candidate, cut)?;
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
-
-        let loop_id = if let Some(id) = goal {
-            if !chat.snapshot.loops.iter().any(|goal| goal.id == id) {
-                return Err(AgentError::NotFound);
-            }
-            id
-        } else {
-            let id = Uuid::new_v4();
-            chat.bookkeeping.add_loop(
-                &mut chat.snapshot,
-                LoopSnapshot {
-                    id,
-                    goal: goal_title.unwrap_or_else(|| input.clone()),
-                    state: LoopState::Idle,
-                    run_id: None,
-                    run_started_at: None,
-                    trigger: None,
-                    event_sources: Vec::new(),
-                    state_since: None,
-                },
-            );
-            id
-        };
+        let loop_id = chat.snapshot.chat_loop.id;
         let run_id = feedback_input
             .as_ref()
             .map_or_else(Uuid::new_v4, |feedback| feedback.delivery_id);
@@ -2728,32 +2647,12 @@ impl Agent {
         {
             return Err(AgentError::ImageInputUnsupported);
         }
-        let goal = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == loop_id)
-            .unwrap();
-        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-            return Err(AgentError::Invalid(
-                "goal has ended; create a new goal".into(),
-            ));
-        }
-        let resumes_trigger =
-            trigger_source.is_none() && chat.snapshot.resume_triggers.contains(&loop_id);
-        if resumes_trigger {
-            goal.trigger
-                .as_mut()
-                .ok_or_else(|| AgentError::Invalid("restored trigger is unavailable".into()))?
-                .armed = true;
-            chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
-            chat.trigger_cancellations
-                .insert(loop_id, CancellationToken::new());
-        }
+        let resumes_trigger = continues_chat && triggers::rearm_trigger_awaiting_resume(chat)?;
+        let chat_loop = &mut chat.snapshot.chat_loop;
         let is_manual_tick = trigger_source
             .as_ref()
             .is_some_and(|source| source.source == TICK_MANUAL_SOURCE);
-        if is_manual_tick && !tick_subscriptions::can_take_manual_update(goal) {
+        if is_manual_tick && !tick_subscriptions::can_take_manual_update(chat_loop) {
             return Err(AgentError::Invalid(
                 "this Loop cannot take a manual update".into(),
             ));
@@ -2767,14 +2666,13 @@ impl Agent {
                     "trigger configuration was replaced".into(),
                 ));
             }
-            let is_eligible = triggers::can_trigger(goal);
+            let is_eligible = triggers::can_trigger(chat_loop);
             let pending_receipt = chat
                 .snapshot
                 .pending_inputs
                 .iter()
                 .find(|pending| {
                     is_eligible
-                        && pending.receipt.loop_id == loop_id
                         && pending
                             .trigger_source
                             .as_ref()
@@ -2783,7 +2681,7 @@ impl Agent {
                 .map(|pending| pending.receipt.clone());
             if !is_eligible {
                 return Err(AgentError::Invalid(
-                    "goal is not eligible for a trigger".into(),
+                    "the Loop is not receiving Triggers".into(),
                 ));
             }
             if let Some(pending_receipt) = pending_receipt {
@@ -2796,12 +2694,13 @@ impl Agent {
                 return Ok(pending_receipt);
             }
         }
-        let continues_ended_loop = matches!(goal.state, LoopState::Failed | LoopState::Interrupted);
+        let continues_ended_turn =
+            matches!(chat_loop.state, LoopState::Failed | LoopState::Interrupted);
         if !matches!(
-            goal.state,
+            chat_loop.state,
             LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
         ) {
-            goal.set_state(LoopState::Queued);
+            chat_loop.set_state(LoopState::Queued);
         }
         let index = if trigger_source.is_none() {
             chat.snapshot
@@ -2862,12 +2761,8 @@ impl Agent {
         if cut.is_none()
             && let Some(leaf) = selected_leaf
         {
-            self.emit_conversation_rewound(original, Uuid::nil(), leaf);
+            self.emit_conversation_rewound(original, leaf);
         }
-        let removed_loops = match cut {
-            Some(_) => rewind::stop_listening_to_removed_loops(original, loops_at_start),
-            None => Vec::new(),
-        };
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
@@ -2882,10 +2777,6 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
-        if !removed_loops.is_empty() {
-            // Boxed: rarely needed, and every submission path awaits this future inline.
-            Box::pin(self.retire_cut_loops(chat_id, removed_loops)).await;
-        }
         if let Some(parent) = task_delegation {
             self.bind_task_delegate(&parent, &receipt)
                 .await
@@ -2909,13 +2800,13 @@ impl Agent {
         if let Some(next) = next {
             self.run_task(next);
         }
-        // Child completions held for this failed or interrupted Loop arrive once it is continued.
-        if continues_ended_loop {
+        // Child completions held for this failed or interrupted turn arrive once it is continued.
+        if continues_ended_turn {
             self.flush_subagent_notifications(chat_id).await;
         }
 
         self.inner.ledger_changes.send_replace(());
-        if resumes_feedback {
+        if continues_chat {
             Box::pin(self.resume_feedback_sources(chat_id)).await;
         }
         self.start_title_generation(chat_id).await;
@@ -3058,8 +2949,7 @@ impl Agent {
                     "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
                     "name": member.handle, "depth": member.depth, "state": member.availability,
                     })).collect::<Vec<_>>(),
-                "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
-                "chat_goals": chat.snapshot.loops,
+                "loop": chat.snapshot.chat_loop,
                 "execution_mode": chat.snapshot.policy.mode,
                 "web_search": web_search,
                 "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
@@ -3074,21 +2964,9 @@ impl Agent {
                 }).as_object().unwrap().clone());
             }
             if chat.snapshot.folder.is_none() {
-                let stable_goal = |goal: &tickloop_agent_protocol::LoopSnapshot| serde_json::json!({ "id": goal.id, "goal": goal.goal, "trigger": goal.trigger });
-                state["goal"] = chat
-                    .snapshot
-                    .loops
-                    .iter()
-                    .find(|goal| goal.id == receipt.loop_id)
-                    .map(stable_goal)
-                    .into();
-                state["chat_goals"] = chat
-                    .snapshot
-                    .loops
-                    .iter()
-                    .map(stable_goal)
-                    .collect::<Vec<_>>()
-                    .into();
+                let chat_loop = &chat.snapshot.chat_loop;
+                state["loop"] =
+                    serde_json::json!({ "id": chat_loop.id, "trigger": chat_loop.trigger });
             }
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
@@ -3593,6 +3471,10 @@ impl Agent {
     ) -> Option<(Receipt, ModelRequest, CancellationToken)> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
+        debug_assert_eq!(
+            receipt.loop_id, chat.snapshot.chat_loop.id,
+            "every run belongs to its Chat's one Loop"
+        );
         chat.family_finishing.insert(receipt.run_id);
         chat.feedback_inputs.remove(&receipt.run_id);
         run_supervision::clear_run_state(chat, receipt.run_id);
@@ -3617,47 +3499,27 @@ impl Agent {
                 .messages
                 .push(local_messages::interruption(!is_awaiting_model));
         }
-        let goal = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == receipt.loop_id)
-            .unwrap();
-        let event =
-            match result {
-                _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
-                    EventKind::Interrupted
-                }
-                _ if cancel.is_cancelled() && !internal_failure => {
-                    goal.set_state(LoopState::Interrupted);
-                    EventKind::Interrupted
-                }
-                Ok(usage) => {
-                    goal.set_state(
-                        if chat.snapshot.policy.mode == ExecutionMode::Plan
-                            && chat.snapshot.plans.iter().any(|plan| {
-                                plan.loop_id == receipt.loop_id && plan.approval_pending
-                            })
-                        {
-                            LoopState::WaitingPlan
-                        } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                            || goal
-                                .event_sources
-                                .iter()
-                                .any(|source| !source.resume_required)
-                        {
-                            LoopState::WaitingTrigger
-                        } else {
-                            LoopState::Completed
-                        },
-                    );
-                    EventKind::Completed { usage }
-                }
-                Err(error) => {
-                    goal.set_state(LoopState::Failed);
-                    EventKind::Failed(error)
-                }
-            };
+        let awaits_plan_review = chat.snapshot.policy.mode == ExecutionMode::Plan
+            && chat.snapshot.plans.iter().any(|plan| plan.approval_pending);
+        let chat_loop = &mut chat.snapshot.chat_loop;
+        let event = match result {
+            _ if cancel.is_cancelled() && !internal_failure => {
+                chat_loop.set_state(LoopState::Interrupted);
+                EventKind::Interrupted
+            }
+            Ok(usage) => {
+                chat_loop.set_state(if awaits_plan_review {
+                    LoopState::WaitingPlan
+                } else {
+                    LoopState::Idle
+                });
+                EventKind::Completed { usage }
+            }
+            Err(error) => {
+                chat_loop.set_state(LoopState::Failed);
+                EventKind::Failed(error)
+            }
+        };
         let is_closed = self.inner.closed.load(Ordering::SeqCst);
         let (ending, usage) = match &event {
             EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),
@@ -3687,14 +3549,11 @@ impl Agent {
                     by: InterruptedBy::Host,
                 });
         self.end_response(chat, receipt.run_id, ending, usage);
-        let is_deliverable = chat
-            .snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .is_some_and(|goal| {
-                matches!(goal.state, LoopState::WaitingTrigger | LoopState::Completed)
-            });
+        // An interrupted or failed turn does not hold back a Tick delivery that came due.
+        let is_deliverable = matches!(
+            chat.snapshot.chat_loop.state,
+            LoopState::Idle | LoopState::Interrupted | LoopState::Failed
+        );
         self.save(&chat.snapshot);
         self.emit(chat, &receipt, event);
         self.inner
@@ -3996,16 +3855,7 @@ impl Agent {
             if parked.cancel.is_cancelled() {
                 continue;
             }
-            let goal = candidate
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == parked.receipt.loop_id)
-                .ok_or(AgentError::NotFound)?;
-            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                continue;
-            }
-            goal.set_state(LoopState::Running);
+            candidate.snapshot.chat_loop.set_state(LoopState::Running);
             candidate.parked.remove(&run_id);
             candidate.active = Some(parked.cancel.clone());
             candidate.active_run = Some(run_id);
@@ -4037,39 +3887,29 @@ impl Agent {
                     && preceding_model_runs
                         .as_ref()
                         .is_none_or(|runs| runs.contains(&pending.receipt.run_id))
-                    && candidate.snapshot.loops.iter().any(|goal| {
-                        goal.id == pending.receipt.loop_id
-                            && !matches!(
-                                goal.state,
-                                LoopState::WaitingPermission | LoopState::WaitingQuestion
-                            )
+                    && !matches!(
+                        candidate.snapshot.chat_loop.state,
+                        LoopState::WaitingPermission | LoopState::WaitingQuestion
+                    )
+                    // Trigger input queued before receiving paused waits until it resumes.
+                    && pending.trigger_source.as_ref().is_none_or(|source| {
+                        triggers::takes_trigger_input(&candidate.snapshot.chat_loop, source)
                     })
             })
         {
             let pending = candidate.snapshot.pending_inputs[index].clone();
-            let goal = candidate
-                .snapshot
-                .loops
-                .iter()
-                .find(|goal| goal.id == pending.receipt.loop_id)
-                .ok_or(AgentError::NotFound)?;
-            if matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                || (pending
-                    .trigger_source
-                    .as_ref()
-                    .is_some_and(|source| source.source == TICK_MANUAL_SOURCE)
-                    && !tick_subscriptions::can_take_manual_update(goal))
-                || (pending.trigger_source.as_ref().is_some_and(|source| {
-                    source.source != TICK_MANUAL_SOURCE
-                        && source.source != event_sources::ARTIFACT_FEEDBACK_SOURCE
-                }) && !triggers::can_trigger(goal))
+            if pending
+                .trigger_source
+                .as_ref()
+                .is_some_and(|source| source.source == TICK_MANUAL_SOURCE)
+                && !tick_subscriptions::can_take_manual_update(&candidate.snapshot.chat_loop)
             {
                 let discarded = candidate.snapshot.pending_inputs.remove(index);
                 self.settle_removed_inputs(
                     &mut candidate,
                     [&discarded],
                     SettledOutcome::Discarded {
-                        reason: DiscardReason::LoopEnded,
+                        reason: DiscardReason::SourceEnded,
                     },
                 );
                 continue;
@@ -4098,7 +3938,7 @@ impl Agent {
                             pending.receipt.chat_id,
                             pending.receipt.loop_id,
                             &source.payload,
-                            &candidate.snapshot.loops,
+                            &candidate.snapshot,
                         )
                         .is_err()
                 {
@@ -4166,15 +4006,11 @@ impl Agent {
                 }
                 candidate.snapshot.pending_inputs = retained;
             }
-            let goal = candidate
-                .snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == pending.receipt.loop_id)
-                .unwrap();
-            goal.set_state(LoopState::Running);
-            goal.run_id = Some(pending.receipt.run_id);
-            goal.run_started_at = Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
+            let chat_loop = &mut candidate.snapshot.chat_loop;
+            chat_loop.set_state(LoopState::Running);
+            chat_loop.run_id = Some(pending.receipt.run_id);
+            chat_loop.run_started_at =
+                Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
@@ -4301,10 +4137,7 @@ impl Agent {
             }
             if let Some(receipt) = &model_receipt {
                 chat.snapshot
-                    .loops
-                    .iter_mut()
-                    .find(|goal| goal.id == receipt.loop_id)
-                    .ok_or("permission Loop is unavailable")?
+                    .chat_loop
                     .set_state(LoopState::WaitingPermission);
                 let run_cancel = chat
                     .run_cancel(receipt.run_id)
@@ -4817,23 +4650,15 @@ impl Agent {
             candidate.snapshot.user_shells.retain(|record| {
                 record.state != UserShellState::Queued || !ids.contains(&record.id)
             });
-            for entry in &taken {
-                if let Some(loop_id) = entry.loop_id
-                    && candidate.active_run.is_none()
-                    && !candidate
-                        .snapshot
-                        .pending_inputs
-                        .iter()
-                        .any(|pending| pending.receipt.loop_id == loop_id)
-                    && let Some(goal) = candidate
-                        .snapshot
-                        .loops
-                        .iter_mut()
-                        .find(|goal| goal.id == loop_id)
-                    && goal.state == LoopState::Queued
-                {
-                    goal.set_state(LoopState::Interrupted);
-                }
+            if !taken.is_empty()
+                && candidate.active_run.is_none()
+                && candidate.snapshot.pending_inputs.is_empty()
+                && candidate.snapshot.chat_loop.state == LoopState::Queued
+            {
+                candidate
+                    .snapshot
+                    .chat_loop
+                    .set_state(LoopState::Interrupted);
             }
             let mut events = Vec::new();
             for entry in &taken {
@@ -4870,7 +4695,6 @@ impl Agent {
     pub async fn queue_command(
         &self,
         chat_id: ChatId,
-        loop_id: Option<LoopId>,
         command: String,
     ) -> Result<Uuid, AgentError> {
         if command.trim().is_empty() || !command.trim_start().starts_with('/') {
@@ -4880,16 +4704,12 @@ impl Agent {
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if loop_id.is_some_and(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == loop_id))
-        {
-            return Err(AgentError::NotFound);
-        }
         chat.snapshot.last_queue_sequence += 1;
         let id = Uuid::new_v4();
         chat.snapshot.pending_commands.push(PendingCommand {
             id,
             chat_id,
-            loop_id,
+            loop_id: Some(chat.snapshot.chat_loop.id),
             command,
             queued_sequence: chat.snapshot.last_queue_sequence,
             armed: true,
@@ -4997,39 +4817,34 @@ impl Agent {
         Ok(self.queue_task_continuation(chat, loop_id))
     }
 
-    /// Continues the owning Loop without creating one for an unowned Shell result.
-    /// An already queued input absorbs further task notifications into the same run.
+    /// Continues the owning Loop, but not for an unowned Shell result, after an interrupted or
+    /// failed turn, or while the Chat is stopped. An already queued input absorbs further task
+    /// notifications into the same run.
     fn queue_task_continuation(&self, chat: &mut Chat, loop_id: Option<LoopId>) -> bool {
-        let Some(loop_id) = loop_id else {
-            return false;
-        };
-        if chat
-            .snapshot
-            .pending_inputs
-            .iter()
-            .any(|pending| pending.armed && pending.receipt.loop_id == loop_id)
+        let is_being_interrupted = chat
+            .active_run
+            .is_some_and(|run| chat.user_cancelled_runs.contains(&run));
+        if loop_id != Some(chat.snapshot.chat_loop.id)
+            || chat.snapshot.trigger_awaits_resume
+            || is_being_interrupted
+            || chat
+                .snapshot
+                .pending_inputs
+                .iter()
+                .any(|pending| pending.armed)
         {
             return false;
         }
-        let Some(goal) = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == loop_id)
-        else {
-            return false;
-        };
-        if matches!(
-            goal.state,
-            LoopState::Stopped | LoopState::Expired | LoopState::Interrupted | LoopState::Failed
-        ) {
+        let chat_loop = &mut chat.snapshot.chat_loop;
+        let loop_id = chat_loop.id;
+        if matches!(chat_loop.state, LoopState::Interrupted | LoopState::Failed) {
             return false;
         }
         if !matches!(
-            goal.state,
+            chat_loop.state,
             LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
         ) {
-            goal.set_state(LoopState::Queued);
+            chat_loop.set_state(LoopState::Queued);
         }
         let receipt = Receipt {
             chat_id: chat.snapshot.id,
@@ -5146,7 +4961,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_agent_tools::Tools::definitions()
         .into_iter()
         .chain(plan::definitions(false))
-        .chain(interaction::definitions(false))
+        .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())
         .chain(delegation::definitions())
         .chain(agent_messages::definitions())

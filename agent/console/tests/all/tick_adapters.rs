@@ -102,8 +102,8 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     agent.install_tick_stream(adapters).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "watch the earnings calendar".into())
+    agent
+        .submit(chat, "watch the earnings calendar".into())
         .await
         .unwrap();
     complete(&mut events).await;
@@ -195,9 +195,13 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
             "{messages}"
         );
     }
-    agent.stop(chat, receipt.loop_id).await.unwrap();
+    agent.stop(chat).await.unwrap();
     settle().await;
-    assert!(stream.watched().is_empty());
+    assert_eq!(
+        stream.watched().len(),
+        1,
+        "a paused Loop keeps watching for the latest update"
+    );
     agent.shutdown().await;
 }
 
@@ -208,7 +212,7 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let receipt = agent.submit_user_shell_for_goal(chat,None,"printf baseline; while [ ! -f release ]; do sleep 0.02; done; printf ' final-output'; exit 7".into(),true).await.unwrap();
+    let receipt = agent.submit_user_shell(chat,"printf baseline; while [ ! -f release ]; do sleep 0.02; done; printf ' final-output'; exit 7".into(),true).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -240,10 +244,7 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     model.enqueue(text("watching"));
     model.enqueue(text("shell completed"));
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "watch this shell".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "watch this shell".into()).await.unwrap();
     complete(&mut events).await;
     let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0);
     assert_eq!(subscription.frequency, TickSubscriptionFrequency::Immediate);
@@ -313,12 +314,12 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
 fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     let instance = InstanceRef::new("cal", "remote").unwrap();
     let mut chat: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
-        json!({"id":Uuid::new_v4(),"folder":"/fixture","messages":[],"loops":[]}),
+        json!({"id":Uuid::new_v4(),"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
     chat.monitor.remove(instance.clone());
     let subscription = |accumulated: u64| -> tickloop_agent_protocol::TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
     };
     let unread = |rows: &[tickloop_agent_console::monitor_rows::TickDescriptor]| {
         rows[0]
@@ -358,11 +359,12 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert!(rows[0].notes.is_empty(), "{:?}", rows[0].notes);
     assert_eq!(unread(&rows), Some(1));
 
-    let mut stopped = subscription(0);
-    stopped.loop_state = tickloop_agent_protocol::LoopState::Stopped;
-    assert!(
-        listed(vec![stopped]).is_empty(),
-        "a stopped Loop delivers nothing"
+    let mut interrupted = subscription(0);
+    interrupted.loop_state = tickloop_agent_protocol::LoopState::Interrupted;
+    assert_eq!(
+        listed(vec![interrupted]).len(),
+        1,
+        "an interrupted turn leaves the subscription delivering"
     );
 }
 
@@ -403,13 +405,13 @@ fn built_in_rows_describe_their_actions_as_intents() {
     unstoppable.capabilities.can_stop = false;
     finished.updated_at_ms = Some(1_000);
     let subscription = |instance: &str| -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
     };
     let (pane, artifact) = (
         subscription("calendar:pane"),
         subscription("artifact:https://docs.example/a"),
     );
-    let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"folder":"/fixture","messages":[],"loops":[],"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
+    let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(std::sync::Arc::new(
             tickloop_agent_protocol::ChatStatus::of(&snapshot),
@@ -537,7 +539,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
                frequency: &str,
                link: &str|
      -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"hosted:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"hosted:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
     };
     let recent = row(Some(2000), Some("Shared Tick"), "high", "Live");
     let baseline = row(None, None, "low", "Initializing");
@@ -574,9 +576,8 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     let owner = agent.create_chat(directory.path().into()).await.unwrap();
     let observer = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             owner,
-            None,
             "printf baseline; while [ ! -f release ]; do sleep 0.02; done; printf foreign-secret"
                 .into(),
             true,
@@ -620,8 +621,8 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     ));
     model.enqueue(text("watch refused"));
     let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(observer, None, "watch the other Chat's shell".into())
+    agent
+        .submit(observer, "watch the other Chat's shell".into())
         .await
         .unwrap();
     let mut refused = 0;
@@ -643,7 +644,6 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     agent
         .configure_trigger(
             observer,
-            receipt.loop_id,
             Some(tickloop_agent_protocol::Trigger {
                 id: Uuid::new_v4(),
                 prompt: "restored foreign watch".into(),
@@ -731,7 +731,7 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
     let row = |paused: Option<bool>, remote: Option<Uuid>| {
         let mut snapshot = base.clone();
         if let Some(resume_required) = paused {
-            snapshot.loops.push(serde_json::from_value(json!({"id":Uuid::new_v4(),"goal":"Feedback","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":here,"client_instance_id":Uuid::new_v4(),"epoch":2,"resume_required":resume_required,"last_request_at_ms":1_791_453_600_000_u64}]})).unwrap());
+            snapshot.chat_loop.event_sources = serde_json::from_value(json!([{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":here,"client_instance_id":Uuid::new_v4(),"epoch":2,"resume_required":resume_required,"last_request_at_ms":1_791_453_600_000_u64}])).unwrap();
         }
         let mut context = MonitorContext {
             chat: Some(std::sync::Arc::new(

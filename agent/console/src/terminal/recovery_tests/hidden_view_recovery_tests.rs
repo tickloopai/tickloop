@@ -274,10 +274,10 @@ async fn run_hidden_view_fixture() {
     assert_eq!(complete_line, !lagged);
     let running = core.snapshot(chat).await.unwrap();
     assert_eq!(
-        running.loops[0].state,
+        running.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
-    assert_eq!(running.loops[0].run_id, Some(run));
+    assert_eq!(running.chat_loop.run_id, Some(run));
     assert_eq!(model.requests.load(Ordering::SeqCst), 1);
     assert_eq!(access.submits.load(Ordering::SeqCst), 1);
     write_phase(
@@ -298,8 +298,8 @@ async fn run_hidden_view_fixture() {
             .unwrap();
         release_model.take().unwrap().send(()).unwrap();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
-            while core.snapshot(chat).await.unwrap().loops[0].state
-                != tickloop_agent_protocol::LoopState::Completed
+            while core.snapshot(chat).await.unwrap().chat_loop.state
+                != tickloop_agent_protocol::LoopState::Idle
             {
                 tokio::task::yield_now().await;
             }
@@ -312,7 +312,6 @@ async fn run_hidden_view_fixture() {
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution: other_execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: "B bounded traffic".into(),
                         contexts: vec![],
@@ -352,7 +351,7 @@ async fn run_hidden_view_fixture() {
             serde_json::to_vec(&serde_json::json!({
                 "route":route,"execution":execution,"view":view,"run":run,
                 "first_sequence":sequence,"last_sequence":snapshot.last_sequence,
-                "state":snapshot.loops[0].state,
+                "state":snapshot.chat_loop.state,
                 "submits":access.submits.load(Ordering::SeqCst),
                 "model_requests":model.requests.load(Ordering::SeqCst),
                 "interrupts":access.interrupts.load(Ordering::SeqCst),
@@ -398,12 +397,12 @@ async fn run_hidden_view_fixture() {
         _ => unreachable!(),
     };
     let snapshot = core.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.loops[0].run_id, Some(run));
+    assert_eq!(snapshot.chat_loop.run_id, Some(run));
     if route != INTERRUPT_OVERVIEW_ROUTE {
         assert_eq!(
-            snapshot.loops[0].state,
+            snapshot.chat_loop.state,
             if lagged {
-                tickloop_agent_protocol::LoopState::Completed
+                tickloop_agent_protocol::LoopState::Idle
             } else {
                 tickloop_agent_protocol::LoopState::Running
             }
@@ -423,13 +422,13 @@ async fn run_hidden_view_fixture() {
         "route":route,"execution":execution,"other":other_execution,"view":view,"run":run,
         "first_sequence":sequence,"return_after":return_after,"last_sequence":snapshot.last_sequence,
         "forwarded":forwarded,"return_fact":returned,"submits":expected_calls,"model_requests":expected_calls,
-        "state":snapshot.loops[0].state,"overview_restores":overview_restores,
+        "state":snapshot.chat_loop.state,"overview_restores":overview_restores,
         "interrupts":access.interrupts.load(Ordering::SeqCst),
     })).unwrap()).unwrap();
     console.write("\nHidden recovery facts verified\n").unwrap();
     if route == INTERRUPT_OVERVIEW_ROUTE {
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
-            while core.snapshot(chat).await.unwrap().loops[0].state
+            while core.snapshot(chat).await.unwrap().chat_loop.state
                 != tickloop_agent_protocol::LoopState::Interrupted
             {
                 tokio::task::yield_now().await;
@@ -439,7 +438,7 @@ async fn run_hidden_view_fixture() {
         .unwrap();
         let snapshot = core.snapshot(chat).await.unwrap();
         write_phase(serde_json::json!({
-            "phase":"visible-interrupted","state":snapshot.loops[0].state,
+            "phase":"visible-interrupted","state":snapshot.chat_loop.state,
             "interrupts":access.interrupts.load(Ordering::SeqCst),
             "submits":access.submits.load(Ordering::SeqCst),
             "model_requests":model.requests.load(Ordering::SeqCst),
@@ -453,7 +452,7 @@ async fn run_hidden_view_fixture() {
         let path = PathBuf::from(std::env::var_os(PROOF_VARIABLE).unwrap());
         let mut proof: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        proof["view_exit_state"] = serde_json::to_value(&snapshot.loops[0].state).unwrap();
+        proof["view_exit_state"] = serde_json::to_value(&snapshot.chat_loop.state).unwrap();
         proof["view_exit_interrupts"] = access.interrupts.load(Ordering::SeqCst).into();
         std::fs::write(path, serde_json::to_vec(&proof).unwrap()).unwrap();
     }

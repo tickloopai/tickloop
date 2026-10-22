@@ -509,14 +509,7 @@ async fn full_access_chat(agent: &Agent, root: &std::path::Path) -> ChatId {
 
 async fn wait_for_last_loop(agent: &Agent, chat: ChatId, state: LoopState) {
     tokio::time::timeout(WAIT, async {
-        while agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .loops
-            .last()
-            .is_none_or(|goal| goal.state != state)
-        {
+        while agent.snapshot(chat).await.unwrap().chat_loop.state != state {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
@@ -579,15 +572,15 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
     let owner_agent = host_agent(owner_client.clone(), owner_model.clone()).await;
     let owner_chat = full_access_chat(&owner_agent, owner_root.path()).await;
     owner_agent
-        .submit(owner_chat, None, "Write a brief".into())
+        .submit(owner_chat, "Write a brief".into())
         .await
         .unwrap();
-    wait_for_last_loop(&owner_agent, owner_chat, LoopState::WaitingTrigger).await;
+    wait_for_last_loop(&owner_agent, owner_chat, LoopState::Idle).await;
     let snapshot = owner_agent.snapshot(owner_chat).await.unwrap();
     let created = snapshot.artifact_ticks[0].clone();
     assert_eq!(created.title, "Real brief");
     assert!(created.url.starts_with(&relay), "{}", created.url);
-    let goal = snapshot.loops.last().unwrap();
+    let goal = snapshot.chat_loop;
     assert_eq!(goal.event_sources[0].artifact_id, created.artifact_id);
     let metadata = owner
         .request(
@@ -643,7 +636,7 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         .comment(&artifact_id, "@tickloop anything else?", None)
         .await;
     let second_thread = second["thread_id"].as_str().unwrap();
-    wait_for_last_loop(&owner_agent, owner_chat, LoopState::WaitingTrigger).await;
+    wait_for_last_loop(&owner_agent, owner_chat, LoopState::Idle).await;
     assert!(
         owner.thread(&artifact_id, second_thread).await["thread"]
             .get("request")

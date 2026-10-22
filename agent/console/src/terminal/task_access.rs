@@ -282,7 +282,7 @@ mod timestamp_tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = runtime.subscribe_user_shells();
         let receipt = agent
-            .submit_user_shell_for_goal(chat, None, "printf finished; exit 1".into(), false)
+            .submit_user_shell(chat, "printf finished; exit 1".into(), false)
             .await
             .unwrap();
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -334,7 +334,7 @@ mod timestamp_tests {
         let peer = agent.create_chat(directory.path().into()).await.unwrap();
         agent.display_chat(Some(peer)).await.unwrap();
         let peer_task = agent
-            .submit_user_shell_for_goal(peer, None, "printf peer".into(), true)
+            .submit_user_shell(peer, "printf peer".into(), true)
             .await
             .unwrap()
             .command_id;

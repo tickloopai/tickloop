@@ -163,7 +163,7 @@
       "child_loop_id": "00000000-0000-0000-0000-000000000011",
       "child_run_id": "00000000-0000-0000-0000-000000000021",
       "handle": "audit",
-      "state": "Completed",
+      "state": "Idle",
       "result": "Actual child report",
       "error": null,
       "started_at": 1,
@@ -310,24 +310,21 @@
       "provider": "api"
     }
   },
-  "loops": [
-    {
-      "id": "00000000-0000-0000-0000-000000000010",
-      "goal": "Watch the counter",
-      "state": "WaitingTrigger",
-      "run_id": "00000000-0000-0000-0000-000000000020",
-      "run_started_at": 1000,
-      "trigger": {
-        "id": "00000000-0000-0000-0000-000000000030",
-        "prompt": "Report changes",
-        "prompt_source": "LoopGoal",
-        "accepts_events": true,
-        "armed": true,
-        "subscriptions": []
-      },
-      "state_since": 2000
-    }
-  ],
+  "chat_loop": {
+    "id": "00000000-0000-0000-0000-000000000010",
+    "state": "Idle",
+    "run_id": "00000000-0000-0000-0000-000000000020",
+    "run_started_at": 1000,
+    "trigger": {
+      "id": "00000000-0000-0000-0000-000000000030",
+      "prompt": "",
+      "prompt_source": "Subscriptions",
+      "accepts_events": true,
+      "armed": true,
+      "subscriptions": []
+    },
+    "state_since": 2000
+  },
   "plans": [],
   "progress": []
 }

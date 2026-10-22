@@ -771,7 +771,7 @@ fn signed_messages_reply() -> String {
 
 async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {

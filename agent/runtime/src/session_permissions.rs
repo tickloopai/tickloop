@@ -126,7 +126,6 @@ pub(crate) struct SessionPermissionEvaluation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopInheritance {
     Inherited,
-    NoSourceLoop,
     Unregistered,
 }
 
@@ -161,7 +160,7 @@ struct SessionPermissionGrant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BranchRegistration {
     source_chat_id: Uuid,
-    source_loop_id: Option<Uuid>,
+    source_loop_id: Uuid,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -215,13 +214,10 @@ impl SessionPermissionContext {
     pub(crate) fn register_branch(
         &mut self,
         source_chat_id: Uuid,
-        source_loop_id: Option<Uuid>,
+        source_loop_id: Uuid,
         child_chat_id: Uuid,
     ) -> Result<(), SessionPermissionError> {
-        if source_chat_id.is_nil()
-            || child_chat_id.is_nil()
-            || source_loop_id.is_some_and(|loop_id| loop_id.is_nil())
-        {
+        if source_chat_id.is_nil() || child_chat_id.is_nil() || source_loop_id.is_nil() {
             return Err(SessionPermissionError::InvalidOwner);
         }
         if source_chat_id == child_chat_id {
@@ -259,11 +255,9 @@ impl SessionPermissionContext {
         let Some(registration) = self.branches.get(&child_chat_id).copied() else {
             return Ok(LoopInheritance::Unregistered);
         };
-        let Some(source_loop_id) = registration.source_loop_id else {
-            return Ok(LoopInheritance::NoSourceLoop);
-        };
         let child = PermissionOwner::new(child_chat_id, child_loop_id)?;
-        let source = PermissionOwner::new(registration.source_chat_id, source_loop_id)?;
+        let source =
+            PermissionOwner::new(registration.source_chat_id, registration.source_loop_id)?;
         if let Some(existing) = self.owner_parents.get(&child) {
             return if *existing == source {
                 Ok(LoopInheritance::Inherited)

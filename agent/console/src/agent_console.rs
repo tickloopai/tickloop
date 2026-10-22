@@ -547,11 +547,7 @@ impl AgentConsole {
             let retirement = self.retirements.entry(row.execution).or_default();
             let terminal = matches!(
                 row.state,
-                LoopState::Completed
-                    | LoopState::Failed
-                    | LoopState::Stopped
-                    | LoopState::Interrupted
-                    | LoopState::Expired
+                LoopState::Idle | LoopState::Failed | LoopState::Interrupted
             );
             if row.availability == ExecutionAvailability::Live
                 && terminal
@@ -730,7 +726,6 @@ pub enum AttentionGroup {
     NeedsInput,
     Errors,
     Working,
-    Waiting,
     Idle,
     Done,
     /// Idle Agents whose producer did not report whether they ever worked.
@@ -739,11 +734,10 @@ pub enum AttentionGroup {
 }
 
 impl AttentionGroup {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::NeedsInput,
         Self::Errors,
         Self::Working,
-        Self::Waiting,
         Self::Idle,
         Self::Done,
         Self::Unknown,
@@ -768,13 +762,11 @@ impl AttentionGroup {
             }
             LoopState::Failed => Self::Errors,
             LoopState::Running | LoopState::Queued => Self::Working,
-            LoopState::WaitingTrigger => Self::Waiting,
             LoopState::Idle if row.has_work.is_none() => Self::Unknown,
+            // An idle Loop that has run finished its last turn.
+            LoopState::Idle if row.run_id.is_some() => Self::Done,
             LoopState::Idle => Self::Idle,
-            LoopState::Completed
-            | LoopState::Stopped
-            | LoopState::Interrupted
-            | LoopState::Expired => Self::Done,
+            LoopState::Interrupted => Self::Done,
         }
     }
 
@@ -783,7 +775,6 @@ impl AttentionGroup {
             Self::NeedsInput => "Needs input",
             Self::Errors => "Errors",
             Self::Working => "Working",
-            Self::Waiting => "Waiting",
             Self::Idle => "Idle",
             Self::Done => "Done",
             Self::Unknown => "Unknown",

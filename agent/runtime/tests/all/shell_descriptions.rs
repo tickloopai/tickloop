@@ -129,7 +129,7 @@ fn config() -> ModelConfig {
 /// Submits a prompt and approves the Bash call it leads to.
 async fn run_bash_call(agent: &Agent, chat: ChatId) {
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "Run it".into()).await.unwrap();
+    agent.submit(chat, "Run it".into()).await.unwrap();
     tokio::time::timeout(WAIT, async {
         loop {
             match events.recv().await.unwrap().kind {
@@ -269,7 +269,7 @@ async fn a_user_shell_moved_to_background_gets_one_generated_description() {
     let center = ShellTaskCenter::new(agent.clone());
     let command = "while :; do printf x; sleep 0.02; done";
     let receipt = agent
-        .submit_user_shell_for_goal(chat, None, command.into(), false)
+        .submit_user_shell(chat, command.into(), false)
         .await
         .unwrap();
     let running = wait_for_task(&center, chat, |task| {
@@ -338,12 +338,7 @@ async fn a_failed_description_request_leaves_the_task_unnamed_without_retrying()
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     let receipt = agent
-        .submit_user_shell_for_goal(
-            chat,
-            None,
-            "while :; do printf x; sleep 0.02; done".into(),
-            true,
-        )
+        .submit_user_shell(chat, "while :; do printf x; sleep 0.02; done".into(), true)
         .await
         .unwrap();
     let started = wait_for_task(&center, chat, |task| {

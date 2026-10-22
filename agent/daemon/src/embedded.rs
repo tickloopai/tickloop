@@ -36,7 +36,7 @@ pub struct EmbeddedAgentAccess {
     inner: Arc<Inner>,
 }
 
-type QueuedAction = (ExecutionRef, Option<Uuid>, AfterTurnAction);
+type QueuedAction = (ExecutionRef, AfterTurnAction);
 
 struct Inner {
     agent: Agent,
@@ -499,20 +499,17 @@ impl EmbeddedAgentAccess {
     async fn submit(
         &self,
         execution: ExecutionRef,
-        target_loop: Option<Uuid>,
         input: UserInput,
         origin: Option<InteractionSource>,
     ) -> Result<CommandResult, AccessError> {
         let chat = self.chat(execution).await?;
         let context = self.host_context(execution, chat, origin, true).await?;
-        self.submit_in_context(execution, target_loop, input, context)
-            .await
+        self.submit_in_context(execution, input, context).await
     }
 
     async fn submit_in_context(
         &self,
         execution: ExecutionRef,
-        target_loop: Option<Uuid>,
         input: UserInput,
         context: Option<HostCallContext>,
     ) -> Result<CommandResult, AccessError> {
@@ -526,19 +523,14 @@ impl EmbeddedAgentAccess {
                 self.inner
                     .agent
                     .submit_with_input_contexts_in_host_context(
-                        chat,
-                        target_loop,
-                        text,
-                        contexts,
-                        paths,
-                        context,
+                        chat, text, contexts, paths, context,
                     )
                     .await?,
             )),
             UserInput::Skill { name, arguments } => Ok(CommandResult::Submitted(
                 self.inner
                     .agent
-                    .invoke_skill_in_host_context(chat, target_loop, &name, &arguments, context)
+                    .invoke_skill_in_host_context(chat, &name, &arguments, context)
                     .await?,
             )),
             UserInput::Shell {
@@ -547,7 +539,7 @@ impl EmbeddedAgentAccess {
             } => Ok(CommandResult::ShellSubmitted(
                 self.inner
                     .agent
-                    .submit_user_shell_for_goal(chat, target_loop, command, background)
+                    .submit_user_shell(chat, command, background)
                     .await?,
             )),
         }
@@ -739,17 +731,15 @@ impl EmbeddedAgentAccess {
                         })?;
                 }
                 let initial = match initial {
-                    Some(input) => Some(
-                        self.submit(execution, None, input, origin)
-                            .await
-                            .map_err(|mut error| {
-                                error.message = format!(
-                                    "Agent {} was created, but its first input was not submitted: {}",
-                                    execution.agent_id, error.message
-                                );
-                                error
-                            })?,
-                    ),
+                    Some(input) => Some(self.submit(execution, input, origin).await.map_err(
+                        |mut error| {
+                            error.message = format!(
+                                "Agent {} was created, but its first input was not submitted: {}",
+                                execution.agent_id, error.message
+                            );
+                            error
+                        },
+                    )?),
                     None => None,
                 };
                 let (submitted, shell) = match initial {
@@ -806,7 +796,6 @@ impl EmbeddedAgentAccess {
             AgentCommand::SendFamilyInput {
                 source_execution,
                 target_execution,
-                target_loop,
                 origin,
                 input,
             } => {
@@ -858,14 +847,7 @@ impl EmbeddedAgentAccess {
                 let receipt = self
                     .inner
                     .agent
-                    .submit_family_input(
-                        target_chat,
-                        target_loop,
-                        directed,
-                        contexts,
-                        paths,
-                        context,
-                    )
+                    .submit_family_input(target_chat, directed, contexts, paths, context)
                     .await?;
                 Ok(CommandResult::FamilyInputSent {
                     source_execution,
@@ -877,16 +859,14 @@ impl EmbeddedAgentAccess {
             }
             AgentCommand::Submit {
                 execution,
-                target_loop,
                 input,
                 origin,
-            } => Box::pin(self.submit(execution, target_loop, input, origin)).await,
-            AgentCommand::ContinueLoop {
-                execution,
-                loop_id,
-                input,
-                origin,
-            } => Box::pin(self.submit(execution, Some(loop_id), input, origin)).await,
+            } => Box::pin(self.submit(execution, input, origin)).await,
+            AgentCommand::ContinueLoop { execution, .. } => {
+                let chat = self.chat(execution).await?;
+                self.inner.agent.continue_loop(chat).await?;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::DecidePermission {
                 request,
                 allow,
@@ -989,11 +969,7 @@ impl EmbeddedAgentAccess {
                     .await?;
                 Ok(CommandResult::Done)
             }
-            AgentCommand::EnqueueAfterTurn {
-                execution,
-                target_loop,
-                action,
-            } => {
+            AgentCommand::EnqueueAfterTurn { execution, action } => {
                 let chat = self.chat(execution).await?;
                 if let AfterTurnAction::Submit {
                     origin: Some(origin),
@@ -1004,16 +980,12 @@ impl EmbeddedAgentAccess {
                         .await?;
                 }
                 let label = action_label(&action);
-                let command_id = self
-                    .inner
-                    .agent
-                    .queue_command(chat, target_loop, label)
-                    .await?;
+                let command_id = self.inner.agent.queue_command(chat, label).await?;
                 self.inner
                     .queue
                     .lock()
                     .await
-                    .insert(command_id, (execution, target_loop, action));
+                    .insert(command_id, (execution, action));
                 Ok(CommandResult::Queued { command_id })
             }
             AgentCommand::RefreshConfiguration { execution } => {
@@ -1217,12 +1189,11 @@ impl EmbeddedAgentAccess {
         let chat = self.chat(execution).await?;
         let agent = &self.inner.agent;
         match action {
-            HistoryAction::Branch { target_loop, name } => {
+            HistoryAction::Branch { name } => {
                 let result = agent
                     .branch_chat(BranchRequest {
                         request_id: command_id,
                         source_chat_id: chat,
-                        source_loop_id: target_loop,
                         name,
                     })
                     .await?;
@@ -1296,40 +1267,34 @@ impl EmbeddedAgentAccess {
         let chat = self.chat(execution).await?;
         let agent = &self.inner.agent;
         match action {
-            LoopAction::Stop { loop_id } => {
-                Ok(CommandResult::Operations(agent.stop(chat, loop_id).await?))
-            }
+            LoopAction::Stop => Ok(CommandResult::Operations(agent.stop(chat).await?)),
             LoopAction::Interrupt => Ok(CommandResult::Operations(agent.interrupt(chat).await?)),
             LoopAction::SendNow { run_id } => Ok(CommandResult::Operations(
                 agent.send_now(chat, run_id).await?,
             )),
-            LoopAction::DisableEventSources { loop_id } => {
-                agent.disable_event_sources_for_loop(chat, loop_id).await;
+            LoopAction::DisableEventSources => {
+                agent.disable_event_sources_for_chat(chat).await;
                 Ok(CommandResult::Done)
             }
-            LoopAction::ConfigureTrigger { loop_id, trigger } => {
-                agent.configure_trigger(chat, loop_id, trigger).await?;
+            LoopAction::ConfigureTrigger { trigger } => {
+                agent.configure_trigger(chat, trigger).await?;
                 Ok(CommandResult::Done)
             }
-            LoopAction::EmitTrigger { loop_id, source } => Ok(CommandResult::Submitted(
-                agent.trigger(chat, loop_id, source).await?,
-            )),
-            LoopAction::ApprovePlan {
-                loop_id,
-                version,
-                mode,
-            } => match agent.approve_plan(chat, loop_id, version, mode).await? {
-                Some(continuation) => Ok(CommandResult::Text(continuation)),
-                None => Ok(CommandResult::Done),
-            },
-            LoopAction::DeclinePlan {
-                loop_id,
-                version,
-                feedback,
-            } => match agent.decline_plan(chat, loop_id, version, feedback).await? {
-                Some(receipt) => Ok(CommandResult::Submitted(receipt)),
-                None => Ok(CommandResult::Done),
-            },
+            LoopAction::EmitTrigger { source } => {
+                Ok(CommandResult::Submitted(agent.trigger(chat, source).await?))
+            }
+            LoopAction::ApprovePlan { version, mode } => {
+                match agent.approve_plan(chat, version, mode).await? {
+                    Some(continuation) => Ok(CommandResult::Text(continuation)),
+                    None => Ok(CommandResult::Done),
+                }
+            }
+            LoopAction::DeclinePlan { version, feedback } => {
+                match agent.decline_plan(chat, version, feedback).await? {
+                    Some(receipt) => Ok(CommandResult::Submitted(receipt)),
+                    None => Ok(CommandResult::Done),
+                }
+            }
             LoopAction::UpdateSubscription {
                 subscription_id,
                 change,
@@ -1360,13 +1325,12 @@ impl EmbeddedAgentAccess {
         let chat = self.chat(execution).await?;
         match action {
             TaskAction::SubmitShell {
-                target_loop,
                 command,
                 background,
             } => Ok(CommandResult::ShellSubmitted(
                 self.inner
                     .agent
-                    .submit_user_shell_for_goal(chat, target_loop, command, background)
+                    .submit_user_shell(chat, command, background)
                     .await?,
             )),
             TaskAction::Background { task } | TaskAction::Stop { task } => {
@@ -1807,8 +1771,10 @@ impl AgentAccess for EmbeddedAgentAccess {
                     {
                         continue;
                     }
-                    let state =
-                        tickloop_agent_runtime::summary_state(&summary.loops, &summary.user_shells);
+                    let state = tickloop_agent_runtime::summary_state(
+                        &summary.chat_loop,
+                        &summary.user_shells,
+                    );
                     let launch = self.inner.launches.lock().await.get(&execution).cloned();
                     let workspace = launch
                         .as_ref()
@@ -1836,12 +1802,12 @@ impl AgentAccess for EmbeddedAgentAccess {
                         chat_id: chat,
                         preview: summary.preview,
                         updated_at: super::summary::updated_at(
-                            &summary.loops,
+                            &summary.chat_loop,
                             &summary.user_shells,
                         ),
                         folder: summary.folder,
-                        run_id: super::summary::summary_run_id(&summary.loops, &state),
-                        run_started_at: super::summary::run_started_at(&summary.loops, &state),
+                        run_id: super::summary::summary_run_id(&summary.chat_loop, &state),
+                        run_started_at: super::summary::run_started_at(&summary.chat_loop, &state),
                         state,
                         title: summary.title,
                         subagent: registration,
@@ -2138,7 +2104,7 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
                 continue;
             };
             let queued = access.inner.queue.lock().await.remove(&command.id);
-            if let Some((_, target_loop, action)) = queued {
+            if let Some((_, action)) = queued {
                 let access = access.clone();
                 tokio::spawn(async move {
                     let _admission = admission;
@@ -2147,9 +2113,7 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
                         AfterTurnAction::Submit { input, origin } => {
                             match access.host_context(execution, chat, origin, false).await {
                                 Ok(context) => {
-                                    access
-                                        .submit_in_context(execution, target_loop, input, context)
-                                        .await
+                                    access.submit_in_context(execution, input, context).await
                                 }
                                 Err(error) => Err(error),
                             }

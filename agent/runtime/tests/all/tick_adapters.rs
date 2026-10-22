@@ -26,7 +26,7 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
-        .submit_user_shell_for_goal(chat, None, "sleep 0.1; printf shell-body".into(), true)
+        .submit_user_shell(chat, "sleep 0.1; printf shell-body".into(), true)
         .await
         .unwrap();
     let instance = InstanceRef::shell(task.command_id);
@@ -129,9 +129,8 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             chat,
-            None,
             "printf baseline; while [ ! -f output ]; do sleep 0.02; done; printf ' live-output'; while [ ! -f finish ]; do sleep 0.02; done; exit 7".into(),
             true,
         )
@@ -206,9 +205,8 @@ async fn a_shells_exit_update_is_the_end_its_record_tells() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             chat,
-            None,
             "printf ran; while [ ! -f finish ]; do sleep 0.02; done; exit 3".into(),
             true,
         )

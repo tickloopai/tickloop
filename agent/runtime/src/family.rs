@@ -2,19 +2,18 @@ use super::*;
 use crate::agent_messages::DispatchRefusal;
 use tickloop_agent_protocol::{
     ChatSnapshot, DirectedHumanSource, EventKind, FamilyCompletion, FamilyInputRecord,
-    FamilyMessageRejection, FamilyMessageRejectionCode, HostCallContext, InputContext, LoopId,
+    FamilyMessageRejection, FamilyMessageRejectionCode, HostCallContext, InputContext,
     LoopSnapshot, LoopState, Receipt, SubagentNotificationDelivery, UserShellRecord,
     UserShellState, chat_display_title,
 };
 use tickloop_agent_tools::permissions::PermissionPolicyExt;
 
-/// The Loop state an Agent row reports: the goal most in need of attention, so a later completed
-/// Loop cannot mask an earlier goal that still waits for input, plan review or its Trigger, and an
-/// active user Shell keeps the Agent working. Without Loops, the latest user Shell decides between
-/// a confirmed failure and Idle; an unknown Shell outcome is not reported as a failure.
-pub fn summary_state(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> LoopState {
-    use tickloop_agent_protocol::{LoopState, UserShellState};
-    let any_loop = |state: LoopState| loops.iter().any(|goal| goal.state == state);
+/// The Loop state an Agent row reports: a user Shell waiting for permission or still working
+/// keeps the Agent in need of input or working, as the Loop's own waits and runs do. A Loop that
+/// never ran reports its latest user Shell: a confirmed failure, or Idle; an unknown Shell outcome
+/// is not reported as a failure.
+pub fn summary_state(chat_loop: &LoopSnapshot, user_shells: &[UserShellRecord]) -> LoopState {
+    use tickloop_agent_protocol::UserShellState;
     let any_shell = |states: &[UserShellState]| {
         user_shells
             .iter()
@@ -23,33 +22,25 @@ pub fn summary_state(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) ->
     if any_shell(&[UserShellState::WaitingPermission]) {
         return LoopState::WaitingPermission;
     }
-    if let Some(state) = [
-        LoopState::WaitingPermission,
-        LoopState::WaitingQuestion,
-        LoopState::WaitingPlan,
-    ]
-    .into_iter()
-    .find(|state| any_loop(state.clone()))
-    {
-        return state;
+    match chat_loop.state {
+        LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan => {
+            return chat_loop.state.clone();
+        }
+        LoopState::Running => return LoopState::Running,
+        LoopState::Idle | LoopState::Queued | LoopState::Failed | LoopState::Interrupted => {}
     }
-    if any_loop(LoopState::Running)
-        || any_shell(&[
-            UserShellState::Running,
-            UserShellState::Background,
-            UserShellState::Cancelling,
-        ])
-    {
+    if any_shell(&[
+        UserShellState::Running,
+        UserShellState::Background,
+        UserShellState::Cancelling,
+    ]) {
         return LoopState::Running;
     }
-    if any_loop(LoopState::Queued) || any_shell(&[UserShellState::Queued]) {
+    if chat_loop.state == LoopState::Queued || any_shell(&[UserShellState::Queued]) {
         return LoopState::Queued;
     }
-    if any_loop(LoopState::WaitingTrigger) {
-        return LoopState::WaitingTrigger;
-    }
-    if let Some(goal) = loops.last() {
-        return goal.state.clone();
+    if chat_loop.state != LoopState::Idle || chat_loop.run_id.is_some() {
+        return chat_loop.state.clone();
     }
     match user_shells.last().map(|shell| &shell.state) {
         Some(UserShellState::Failed) => LoopState::Failed,
@@ -69,9 +60,7 @@ pub enum FamilyRole {
 pub enum FamilyAvailability {
     Working,
     NeedsInput,
-    Waiting,
     Idle,
-    Stopped,
     Interrupted,
     Failed,
     Unloaded,
@@ -113,15 +102,12 @@ impl Agent {
             .into_iter()
             .map(|(id, registration)| {
                 let chat = chats.get(&id);
-                let state = chat
-                    .map(|chat| summary_state(&chat.snapshot.loops, &chat.snapshot.user_shells));
-                let goal = chat.and_then(|chat| {
-                    chat.snapshot
-                        .loops
-                        .iter()
-                        .rev()
-                        .find(|goal| Some(&goal.state) == state.as_ref())
+                let state = chat.map(|chat| {
+                    summary_state(&chat.snapshot.chat_loop, &chat.snapshot.user_shells)
                 });
+                let chat_loop = chat
+                    .map(|chat| &chat.snapshot.chat_loop)
+                    .filter(|chat_loop| Some(&chat_loop.state) == state.as_ref());
                 let shell_started_at = chat.and_then(|chat| {
                     chat.snapshot.user_shells.iter().rev().find_map(|shell| {
                         let matches_state = match state.as_ref() {
@@ -139,17 +125,15 @@ impl Agent {
                 });
                 let availability = match state.as_ref() {
                     None if chat.is_none() => FamilyAvailability::Unloaded,
+                    None | Some(LoopState::Idle) => FamilyAvailability::Idle,
                     Some(LoopState::Failed) => FamilyAvailability::Failed,
-                    Some(LoopState::Stopped | LoopState::Expired) => FamilyAvailability::Stopped,
                     Some(LoopState::Interrupted) => FamilyAvailability::Interrupted,
                     Some(
                         LoopState::WaitingPermission
                         | LoopState::WaitingQuestion
                         | LoopState::WaitingPlan,
                     ) => FamilyAvailability::NeedsInput,
-                    Some(LoopState::WaitingTrigger) => FamilyAvailability::Waiting,
                     Some(LoopState::Running | LoopState::Queued) => FamilyAvailability::Working,
-                    _ => FamilyAvailability::Idle,
                 };
                 let display_name = registration
                     .map(|registration| registration.description.clone())
@@ -183,17 +167,12 @@ impl Agent {
                     availability,
                     run_state: state,
                     created_at: registration.map(|registration| registration.created_at),
-                    run_started_at: goal
-                        .and_then(|goal| goal.run_started_at)
+                    run_started_at: chat_loop
+                        .and_then(|chat_loop| chat_loop.run_started_at)
                         .or(shell_started_at),
-                    idle_since: goal
-                        .filter(|goal| {
-                            matches!(
-                                goal.state,
-                                LoopState::Completed | LoopState::Idle | LoopState::WaitingTrigger
-                            )
-                        })
-                        .and_then(|goal| goal.state_since),
+                    idle_since: chat_loop
+                        .filter(|chat_loop| chat_loop.state == LoopState::Idle)
+                        .and_then(|chat_loop| chat_loop.state_since),
                 }
             })
             .collect())
@@ -327,10 +306,7 @@ impl Agent {
         let Ok(Some(registration)) = self.subagent_registration(child.chat_id).await else {
             return None;
         };
-        let goal = snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == child.loop_id)?;
+        let chat_loop = &snapshot.chat_loop;
         let result = crate::handback::completion_text(snapshot, child.run_id);
         let error = snapshot.events.iter().rev().find_map(|event| {
             if event.run_id == child.run_id
@@ -341,8 +317,8 @@ impl Agent {
                 None
             }
         });
-        let run_status = agent_messages::child_run_status(snapshot, child.loop_id, child.run_id)
-            .map(|(status, _)| status);
+        let run_status =
+            agent_messages::child_run_status(snapshot, child.run_id).map(|(status, _)| status);
         // Held until the record is in place, so an interrupted foreground observation either
         // returns this ended run or releases its call before the run is classified.
         let invocations = self.inner.subagent_invocations.lock().await;
@@ -363,10 +339,10 @@ impl Agent {
             child_loop_id: child.loop_id,
             child_run_id: child.run_id,
             handle: registration.handle.clone(),
-            state: goal.state.clone(),
+            state: chat_loop.state.clone(),
             result,
             error,
-            started_at: goal.run_started_at,
+            started_at: chat_loop.run_started_at,
             finished_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
             triggering_message_ids: snapshot
                 .message_runs
@@ -614,7 +590,6 @@ impl Agent {
         chats: &HashMap<ChatId, Chat>,
         sessions: &session_permissions::SessionPermissionContext,
         chat_id: ChatId,
-        goal: Option<LoopId>,
         admission: &AttachmentAdmission,
     ) -> Result<(), AgentError> {
         let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
@@ -629,15 +604,13 @@ impl Agent {
                 "recipient workspace changed before attachment admission".into(),
             ));
         }
-        let loop_id = goal.unwrap_or(Uuid::nil());
+        let loop_id = snapshot.chat_loop.id;
         let receipt = Receipt {
             chat_id,
             loop_id,
             run_id: Uuid::nil(),
         };
-        let owner = goal
-            .map(|id| PermissionOwner::new(chat_id, id))
-            .transpose()
+        let owner = PermissionOwner::new(chat_id, loop_id)
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         for prepared in &admission.reads {
             if !prepared.in_workspace {
@@ -655,13 +628,9 @@ impl Agent {
                 None,
             )
             .map_err(AgentError::Invalid)?;
-            let decision = if let Some(owner) = owner {
-                let operation = SessionPermissionOperation::from_prepared(prepared, &workspace)
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                sessions.evaluate(owner, &operation).decision
-            } else {
-                None
-            };
+            let operation = SessionPermissionOperation::from_prepared(prepared, &workspace)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let decision = sessions.evaluate(owner, &operation).decision;
             if snapshot
                 .policy
                 .decide_with_session(prepared, &workspace, loop_id, decision)
@@ -678,7 +647,6 @@ impl Agent {
 
 pub(super) struct ContextSubmission {
     pub chat_id: ChatId,
-    pub goal: Option<LoopId>,
     pub input: String,
     pub contexts: Vec<InputContext>,
     pub paths: Vec<PathBuf>,
@@ -693,7 +661,6 @@ impl Agent {
     pub async fn submit_family_input(
         &self,
         target: ChatId,
-        target_loop: Option<LoopId>,
         source: DirectedHumanSource,
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
@@ -728,25 +695,6 @@ impl Agent {
                 "directed target token changed or body is empty".into(),
             ));
         }
-        let target_goal = target_loop.or_else(|| target_snapshot.default_input_loop());
-        if target_snapshot
-            .loops
-            .iter()
-            .find(|goal| Some(goal.id) == target_goal)
-            .is_some_and(|goal| {
-                matches!(
-                    goal.state,
-                    LoopState::Stopped
-                        | LoopState::Interrupted
-                        | LoopState::Failed
-                        | LoopState::Expired
-                )
-            })
-        {
-            return Err(AgentError::Invalid(
-                "target requires explicit human Continue".into(),
-            ));
-        }
         let body = body.to_owned();
         let target_generation = self
             .inner
@@ -758,7 +706,6 @@ impl Agent {
             .family_generation;
         self.submit_contexts(ContextSubmission {
             chat_id: target,
-            goal: target_goal,
             input: body,
             contexts,
             paths,
@@ -818,11 +765,7 @@ impl Agent {
             .filter_map(|(index, _)| snapshot.message_ids.get(index))
             .filter_map(|id| snapshot.human_family_origins.get(id));
         let response = snapshot.run_response_text(receipt.run_id);
-        let state = snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == receipt.loop_id)
-            .map(|goal| goal.state.clone());
+        let state = Some(snapshot.chat_loop.state.clone());
         let mut chats = self.inner.chats.lock().await;
         for source in sources {
             let Some(origin) = chats.get_mut(&source.source_chat_id) else {
@@ -848,11 +791,10 @@ impl Agent {
 }
 
 fn notification_receipt(snapshot: &ChatSnapshot) -> Receipt {
-    let goal = snapshot.loops.last();
     Receipt {
         chat_id: snapshot.id,
-        loop_id: goal.map_or(Uuid::nil(), |goal| goal.id),
-        run_id: goal.and_then(|goal| goal.run_id).unwrap_or(Uuid::nil()),
+        loop_id: snapshot.chat_loop.id,
+        run_id: snapshot.chat_loop.run_id.unwrap_or(Uuid::nil()),
     }
 }
 
@@ -860,37 +802,65 @@ fn notification_receipt(snapshot: &ChatSnapshot) -> Receipt {
 mod state_tests {
     use super::*;
 
-    fn goal(state: LoopState) -> LoopSnapshot {
+    fn chat_loop(state: LoopState, run_id: Option<RunId>) -> LoopSnapshot {
         LoopSnapshot {
-            id: Uuid::new_v4(),
-            goal: "State fixture".into(),
             state,
-            run_id: None,
+            run_id,
             run_started_at: Some(100),
-            trigger: None,
             state_since: Some(200),
-            event_sources: Vec::new(),
+            ..LoopSnapshot::new(Uuid::new_v4())
         }
     }
 
+    fn shell(state: UserShellState) -> UserShellRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "chat_id": Uuid::new_v4(), "command": "true", "cwd": "/",
+            "state": state, "pid": null, "exit_code": null, "signal": null, "reason": null,
+            "output_ref": null, "output_bytes": 0, "submitted_at_message": 0,
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn older_actionable_loops_survive_a_newer_completed_loop() {
+    fn the_loops_own_waits_and_runs_come_before_its_shells() {
         for state in [
             LoopState::WaitingPermission,
             LoopState::WaitingQuestion,
             LoopState::WaitingPlan,
             LoopState::Running,
-            LoopState::Queued,
-            LoopState::WaitingTrigger,
         ] {
-            let loops = [goal(state.clone()), goal(LoopState::Completed)];
-            assert_eq!(summary_state(&loops, &[]), state);
+            let shells = [shell(UserShellState::Queued)];
+            assert_eq!(
+                summary_state(&chat_loop(state.clone(), None), &shells),
+                state
+            );
         }
+        let shells = [shell(UserShellState::WaitingPermission)];
+        assert_eq!(
+            summary_state(&chat_loop(LoopState::Running, None), &shells),
+            LoopState::WaitingPermission
+        );
     }
 
     #[test]
-    fn input_attention_precedes_other_running_loops() {
-        let loops = [goal(LoopState::WaitingQuestion), goal(LoopState::Running)];
-        assert_eq!(summary_state(&loops, &[]), LoopState::WaitingQuestion);
+    fn a_loop_that_never_ran_reports_its_latest_shell() {
+        let idle = chat_loop(LoopState::Idle, None);
+        assert_eq!(
+            summary_state(&idle, &[shell(UserShellState::Failed)]),
+            LoopState::Failed
+        );
+        assert_eq!(
+            summary_state(&idle, &[shell(UserShellState::Unknown)]),
+            LoopState::Idle
+        );
+        assert_eq!(
+            summary_state(&idle, &[shell(UserShellState::Running)]),
+            LoopState::Running
+        );
+        let ran = chat_loop(LoopState::Idle, Some(Uuid::new_v4()));
+        assert_eq!(
+            summary_state(&ran, &[shell(UserShellState::Failed)]),
+            LoopState::Idle
+        );
     }
 }

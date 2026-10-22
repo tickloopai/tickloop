@@ -26,7 +26,8 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         }),
     ] {
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":execution.agent_id, "folder":"/test", "messages":[], "loops":[],
+            "id":execution.agent_id, "folder":"/test", "messages":[],
+            "chat_loop": {"id": Uuid::new_v4(), "state": "Idle"},
         }))
         .unwrap();
         snapshot.monitor.members.push(MonitorMember {
@@ -45,7 +46,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
             child_loop_id: Uuid::new_v4(),
             child_run_id: Uuid::new_v4(),
             handle: "audit".into(),
-            state: LoopState::Completed,
+            state: LoopState::Idle,
             result: "Actual child report".into(),
             error: None,
             started_at: Some(1),

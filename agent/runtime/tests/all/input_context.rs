@@ -50,7 +50,7 @@ async fn submit_contexts_and_wait(
 ) {
     let mut events = agent.subscribe();
     let receipt = agent
-        .submit_with_input_contexts(chat, None, prompt.into(), contexts, paths)
+        .submit_with_input_contexts(chat, prompt.into(), contexts, paths)
         .await
         .unwrap();
     loop {
@@ -119,7 +119,7 @@ async fn accepted_file_references_reach_the_model_without_changing_the_public_pr
     let mut events = agent.subscribe();
 
     agent
-        .submit_with_file_references(chat, None, "Summarize @notes.txt".into(), vec![path])
+        .submit_with_file_references(chat, "Summarize @notes.txt".into(), vec![path])
         .await
         .unwrap();
     while !matches!(
@@ -164,7 +164,6 @@ async fn file_references_outside_configured_directories_are_rejected_before_a_ru
     let error = agent
         .submit_with_file_references(
             chat,
-            None,
             "Read the attachment".into(),
             vec![outside.path().into()],
         )
@@ -205,7 +204,7 @@ async fn explicit_file_deny_rules_cannot_be_bypassed_by_an_accepted_reference() 
         .unwrap();
 
     let error = agent
-        .submit_with_file_references(chat, None, "Read it".into(), vec![path])
+        .submit_with_file_references(chat, "Read it".into(), vec![path])
         .await
         .unwrap_err();
 
@@ -257,7 +256,7 @@ async fn unsupported_image_formats_are_rejected_with_the_reason_before_a_run_sta
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     let error = agent
-        .submit_with_file_references(chat, None, "Read @scan.bmp".into(), vec![path])
+        .submit_with_file_references(chat, "Read @scan.bmp".into(), vec![path])
         .await
         .unwrap_err()
         .to_string();
@@ -293,7 +292,7 @@ async fn image_references_follow_the_file_permission_rules() {
         .unwrap();
 
     let error = agent
-        .submit_with_file_references(chat, None, "Look @private.png".into(), vec![path])
+        .submit_with_file_references(chat, "Look @private.png".into(), vec![path])
         .await
         .unwrap_err();
 
@@ -341,7 +340,6 @@ async fn attached_images_survive_reopening_rewind_and_branching() {
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
             source_chat_id: chat,
-            source_loop_id: None,
             name: None,
         })
         .await
@@ -456,12 +454,7 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
     assert!(!agent.accepts_images(chat).await.unwrap());
 
     let error = agent
-        .submit_with_file_references(
-            chat,
-            None,
-            "Describe @chart.png".into(),
-            vec![image.clone()],
-        )
+        .submit_with_file_references(chat, "Describe @chart.png".into(), vec![image.clone()])
         .await
         .unwrap_err();
 
@@ -475,7 +468,7 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
     assert!(message.contains("switch"), "{message}");
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.messages.is_empty());
-    assert!(snapshot.loops.is_empty());
+    assert!(snapshot.chat_loop.run_id.is_none());
     assert!(snapshot.pending_inputs.is_empty());
     assert!(model.requests.lock().unwrap().is_empty());
 
@@ -521,10 +514,7 @@ async fn a_pending_switch_to_a_text_only_model_refuses_image_prompts() {
         .await
         .unwrap();
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Write the file".into())
-        .await
-        .unwrap();
+    agent.submit(chat, "Write the file".into()).await.unwrap();
     while !matches!(
         next_event(&mut events).await.kind,
         EventKind::PermissionRequested { .. }
@@ -535,7 +525,7 @@ async fn a_pending_switch_to_a_text_only_model_refuses_image_prompts() {
     assert_eq!(change, ModelChange::Pending);
     assert!(!agent.accepts_images(chat).await.unwrap());
     let error = agent
-        .submit_with_file_references(chat, None, "Describe @chart.png".into(), vec![image])
+        .submit_with_file_references(chat, "Describe @chart.png".into(), vec![image])
         .await
         .unwrap_err();
     assert!(matches!(error, AgentError::ImageInputUnsupported));

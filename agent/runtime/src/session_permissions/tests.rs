@@ -163,7 +163,7 @@ fn frozen_denials_preserve_normalized_host_and_workspace_without_copying_allowan
     let delegating_chat = Uuid::new_v4();
     let delegating_loop = Uuid::new_v4();
     context
-        .register_branch(source_chat, Some(source_loop), delegating_chat)
+        .register_branch(source_chat, source_loop, delegating_chat)
         .unwrap();
     context
         .inherit_loop(delegating_chat, delegating_loop)
@@ -210,7 +210,7 @@ fn branch_inheritance_maps_each_child_loop_to_the_selected_source() {
         .unwrap();
 
     context
-        .register_branch(source_chat, Some(source_loop), child_chat)
+        .register_branch(source_chat, source_loop, child_chat)
         .unwrap();
     assert_eq!(
         context
@@ -236,7 +236,7 @@ fn branch_inheritance_maps_each_child_loop_to_the_selected_source() {
     );
     let revision = context.revision();
     context
-        .register_branch(source_chat, Some(source_loop), child_chat)
+        .register_branch(source_chat, source_loop, child_chat)
         .unwrap();
     assert_eq!(context.revision(), revision);
     assert_eq!(
@@ -255,39 +255,6 @@ fn branch_inheritance_maps_each_child_loop_to_the_selected_source() {
             .evaluate(owner(child_chat, unrelated_child_loop), &permitted)
             .decision,
         Some(SessionPermissionDecision::Allow)
-    );
-}
-
-#[test]
-fn absent_source_loop_never_widens_a_grant_to_the_child_chat() {
-    let root = tempfile::tempdir().unwrap();
-    let workspace = make_workspace(root.path(), Vec::new());
-    let source_chat = Uuid::new_v4();
-    let source_loop = Uuid::new_v4();
-    let child_chat = Uuid::new_v4();
-    let child_loop = Uuid::new_v4();
-    let permitted = operation(&workspace, &root.path().join("report.txt"), "approved");
-    let mut context = SessionPermissionContext::default();
-    context
-        .record(
-            owner(source_chat, source_loop),
-            permitted.clone(),
-            SessionPermissionDecision::Allow,
-        )
-        .unwrap();
-    context
-        .register_branch(source_chat, None, child_chat)
-        .unwrap();
-
-    assert_eq!(
-        context.inherit_loop(child_chat, child_loop).unwrap(),
-        LoopInheritance::NoSourceLoop
-    );
-    assert_eq!(
-        context
-            .evaluate(owner(child_chat, child_loop), &permitted)
-            .decision,
-        None
     );
 }
 
@@ -311,11 +278,11 @@ fn branch_of_branch_inherits_only_explicit_owner_lineage() {
         )
         .unwrap();
     context
-        .register_branch(source_chat, Some(source_loop), child_chat)
+        .register_branch(source_chat, source_loop, child_chat)
         .unwrap();
     context.inherit_loop(child_chat, child_loop).unwrap();
     context
-        .register_branch(child_chat, Some(child_loop), grandchild_chat)
+        .register_branch(child_chat, child_loop, grandchild_chat)
         .unwrap();
     context
         .inherit_loop(grandchild_chat, grandchild_loop)
@@ -360,25 +327,32 @@ fn branch_registration_is_idempotent_but_reparenting_and_cycles_are_rejected() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let grandchild = Uuid::new_v4();
+    let root_loop = Uuid::new_v4();
     let mut context = SessionPermissionContext::default();
 
-    context.register_branch(root, None, child).unwrap();
+    context.register_branch(root, root_loop, child).unwrap();
     let revision = context.revision();
-    context.register_branch(root, None, child).unwrap();
+    context.register_branch(root, root_loop, child).unwrap();
     assert_eq!(context.revision(), revision);
     assert_eq!(
         context
-            .register_branch(Uuid::new_v4(), None, child)
+            .register_branch(Uuid::new_v4(), Uuid::new_v4(), child)
             .unwrap_err(),
         SessionPermissionError::ChildAlreadyRegistered
     );
-    context.register_branch(child, None, grandchild).unwrap();
+    context
+        .register_branch(child, Uuid::new_v4(), grandchild)
+        .unwrap();
     assert_eq!(
-        context.register_branch(grandchild, None, root).unwrap_err(),
+        context
+            .register_branch(grandchild, Uuid::new_v4(), root)
+            .unwrap_err(),
         SessionPermissionError::BranchCycle
     );
     assert_eq!(
-        context.register_branch(root, None, root).unwrap_err(),
+        context
+            .register_branch(root, Uuid::new_v4(), root)
+            .unwrap_err(),
         SessionPermissionError::SelfBranch
     );
     assert_eq!(
@@ -459,7 +433,7 @@ fn cloned_context_can_stage_branch_lineage_without_mutating_the_live_context() {
     let mut candidate = live.clone();
 
     candidate
-        .register_branch(source_chat, Some(source_loop), child_chat)
+        .register_branch(source_chat, source_loop, child_chat)
         .unwrap();
     candidate.inherit_loop(child_chat, child_loop).unwrap();
 

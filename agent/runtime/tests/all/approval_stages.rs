@@ -101,7 +101,7 @@ async fn both_backends_review_authorization_only_after_a_potential_risk() {
                 .unwrap();
             let mut events = agent.subscribe();
             agent
-                .submit(chat, None, "Create exactly the reviewed symlink".into())
+                .submit(chat, "Create exactly the reviewed symlink".into())
                 .await
                 .unwrap();
             let mut assessments = Vec::new();
@@ -214,7 +214,7 @@ async fn twenty_screening_hits_cleared_by_authorization_never_trigger_denial_esc
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create exactly twenty reviewed symlinks".into())
+            .submit(chat, "Create exactly twenty reviewed symlinks".into())
             .await
             .unwrap();
         let mut assessments = 0;
@@ -312,7 +312,7 @@ async fn cancellation_during_authorization_does_not_execute_or_record_a_screenin
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Create the reviewed link".into())
+            .submit(chat, "Create the reviewed link".into())
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
@@ -431,7 +431,7 @@ async fn malformed_risk_screen_can_recover_through_authorization_with_identical_
                 .unwrap();
             let mut events = agent.subscribe();
             agent
-                .submit(chat, None, "Create the recovered symlink".into())
+                .submit(chat, "Create the recovered symlink".into())
                 .await
                 .unwrap();
             let mut assessment = None;

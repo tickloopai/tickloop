@@ -127,14 +127,9 @@ impl Agent {
         self.clear_run_interactions(chat, receipt.run_id).await;
         let history_recovered =
             recovery::close_dangling_tool_calls(&mut chat.snapshot, Some(receipt.run_id)).is_ok();
-        if let Some(goal) = chat
-            .snapshot
-            .loops
-            .iter_mut()
-            .find(|goal| goal.id == receipt.loop_id && goal.run_id == Some(receipt.run_id))
-            && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-        {
-            goal.set_state(LoopState::Failed);
+        let chat_loop = &mut chat.snapshot.chat_loop;
+        if chat_loop.run_id == Some(receipt.run_id) {
+            chat_loop.set_state(LoopState::Failed);
         }
         chat.feedback_inputs.remove(&receipt.run_id);
         chat.family_finishing.remove(&receipt.run_id);
@@ -222,7 +217,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        // A missing Loop simulates an invariant failure inside completion, after execution has ended.
+        // A receipt for another Loop breaks the one-Loop invariant inside completion, after
+        // execution has ended.
         let request = ModelRequest {
             history_sources: vec![],
             messages: vec![],

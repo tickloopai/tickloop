@@ -392,7 +392,7 @@ fn terminal_explains_how_to_start_without_credentials() {
     assert!(!text.contains("--config"));
     assert!(!text.contains("/model FILE"));
     assert!(text.contains("--cwd"));
-    assert!(text.contains("/loops new"));
+    assert!(text.contains("/stop interrupts the current turn"));
     assert!(
         !text.contains("/ack-"),
         "removed acknowledgement commands must not be documented: {text}"
@@ -492,7 +492,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
             && transcript.contains("Model selection: Applied · DeepSeek-V4.1-Flash · Effort auto"),
         "{transcript}"
     );
-    assert!(!transcript.contains("Accepted: Goal"), "{transcript}");
+    assert!(!transcript.contains("Accepted: Run"), "{transcript}");
     assert!(!transcript.contains("Cannot"), "{transcript}");
     assert!(
         !transcript.contains('\u{1b}'),
@@ -1110,7 +1110,7 @@ async fn assert_piped_creation_refused(piped_input: &str) {
         "{piped_input:?}: {transcript}\n{stderr}"
     );
     assert!(!transcript.contains("Chat: "), "{transcript}");
-    assert!(!transcript.contains("Accepted: Goal"), "{transcript}");
+    assert!(!transcript.contains("Accepted: Run"), "{transcript}");
 }
 
 #[test]
@@ -1166,13 +1166,6 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
         .lines()
         .find_map(|line| line.strip_prefix("Chat: "))
         .unwrap();
-    let goal = first_text
-        .lines()
-        .find_map(|line| line.strip_prefix("Goal: "))
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap();
     let second = run_with_config(directory.path(), &[], "/resume\ncancel\n").await;
     assert!(second.status.success());
     let second_text = String::from_utf8(second.stdout).unwrap();
@@ -1184,8 +1177,7 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
         "{second_text}"
     );
     assert!(!second_text.contains("Running"));
-    let rejected =
-        run_with_config(directory.path(), &[], &format!("/resume {chat} {goal}\n")).await;
+    let rejected = run_with_config(directory.path(), &[], &format!("/resume {chat} extra\n")).await;
     assert!(rejected.status.success());
     assert!(
         String::from_utf8(rejected.stdout)
@@ -1205,7 +1197,6 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
     );
     let third_text = String::from_utf8(third.stdout).unwrap();
     assert!(third_text.contains("The word was cedar."));
-    assert!(third_text.contains(&format!("Goal: {goal}")));
     let requests = tokio::time::timeout(INTERACTION_TIMEOUT, server)
         .await
         .unwrap()
@@ -1263,7 +1254,7 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         .await
         .unwrap();
     wait_for_line(&mut output, &mut transcript, |line| {
-        line.starts_with("Accepted: Goal")
+        line.starts_with("Accepted: Run")
     })
     .await;
     let _held = tokio::time::timeout(INTERACTION_TIMEOUT, request)
@@ -1314,7 +1305,7 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
     assert!(
         transcript
             .iter()
-            .filter(|line| line.starts_with("Accepted: Goal"))
+            .filter(|line| line.starts_with("Accepted: Run"))
             .nth(1)
             .is_none(),
         "nothing is resent: {transcript:?}"
@@ -1551,7 +1542,7 @@ async fn terminal_waits_for_explicit_permission_before_reading_an_external_file(
 }
 
 #[tokio::test]
-async fn terminal_can_stop_a_running_goal_and_show_its_stopped_state() {
+async fn terminal_can_stop_a_running_turn_and_show_the_paused_loop() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (started, started_rx) = tokio::sync::oneshot::channel();
@@ -1581,7 +1572,7 @@ async fn terminal_can_stop_a_running_goal_and_show_its_stopped_state() {
         .await
         .unwrap()
         .unwrap();
-    input.write_all(b"/stop\n/loops\n").await.unwrap();
+    input.write_all(b"/stop\n/status\n").await.unwrap();
     drop(input);
     let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
         .await
@@ -1590,8 +1581,11 @@ async fn terminal_can_stop_a_running_goal_and_show_its_stopped_state() {
     server.abort();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Stopped goal"));
-    assert!(text.contains("Stopped"));
+    assert!(
+        text.contains("Stopped. Queued messages were discarded"),
+        "{text}"
+    );
+    assert!(text.contains("Interrupted run"), "{text}");
     assert!(!text.contains("Reply completed"));
 }
 
@@ -2101,12 +2095,12 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
 }
 
 #[tokio::test]
-async fn terminal_can_enable_and_deliver_an_explicit_goal_trigger() {
+async fn terminal_can_enable_and_deliver_an_explicit_trigger() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for answer in ["The goal is ready.", "Event processed."] {
+        for answer in ["The task is ready.", "Event processed."] {
             let (mut socket, _) = listener.accept().await.unwrap();
             requests.push(read_request(&mut socket).await);
             let body = messages_stream(answer);
@@ -2463,7 +2457,6 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
         .unwrap();
     read_request(&mut socket).await;
     let mut chat = String::new();
-    let mut goal = String::new();
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         let mut accepted = 0;
         while accepted < 2 {
@@ -2471,8 +2464,7 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
             if let Some(value) = line.strip_prefix("Chat: ") {
                 chat = value.to_owned();
             }
-            if let Some(value) = line.strip_prefix("Accepted: Goal ") {
-                goal = value.split_whitespace().next().unwrap().to_owned();
+            if line.starts_with("Accepted: Run ") {
                 accepted += 1;
             }
         }
@@ -2503,7 +2495,6 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     assert!(text.contains(&format!("Chat: {chat}")));
     assert!(text.contains("Start a report"), "{text}");
     assert!(text.contains("History opened"), "{text}");
-    assert!(!goal.is_empty());
     assert!(!text.contains("Accepted:"));
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
@@ -2548,15 +2539,11 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
         .await
         .unwrap();
     let mut chat = String::new();
-    let mut goal = String::new();
     let operation = tokio::time::timeout(INTERACTION_TIMEOUT, async {
         loop {
             let line = output.next_line().await.unwrap().unwrap();
             if let Some(value) = line.strip_prefix("Chat: ") {
                 chat = value.to_owned();
-            }
-            if let Some(value) = line.strip_prefix("Goal: ") {
-                goal = value.split_whitespace().next().unwrap().to_owned();
             }
             if let Some(value) = line.strip_prefix("Command: ") {
                 break value.split_whitespace().next().unwrap().to_owned();
@@ -2578,7 +2565,6 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
         .await
         .unwrap();
     server.await.unwrap();
-    assert!(!goal.is_empty());
     let result = run_with_config(
         directory.path(),
         &[],

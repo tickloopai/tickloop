@@ -517,9 +517,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
         let client = fixture.client().await;
         let execution = catalog(&client).await[0].execution;
         wait_snapshot(&client, execution, "the opening turn finished", |snapshot| {
-            snapshot.conversation.loops.iter().all(|goal| {
-                goal.state == tickloop_agent_protocol::LoopState::Completed
-            })
+            snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         })
         .await;
         let attached_output_start = view.output.lock().unwrap().len();
@@ -529,7 +527,6 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
                 command_id: uuid::Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,
-                    target_loop: None,
                     input: UserInput::Text {
                         text: "Think while the Tick owns the terminal.".into(),
                         contexts: Vec::new(),
@@ -545,9 +542,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
         wait_snapshot(&client, execution, "the attached stream completed", |snapshot| {
             snapshot.events.iter().any(|event| {
                 matches!(&event.kind, tickloop_agent_protocol::EventKind::Text(text) if text.contains(ATTACHED_REPLY))
-            }) && snapshot.conversation.loops.iter().all(|goal| {
-                goal.state == tickloop_agent_protocol::LoopState::Completed
-            })
+            }) && snapshot.conversation.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
         })
         .await;
         let attached_output = view.output.lock().unwrap()[attached_output_start..].to_vec();

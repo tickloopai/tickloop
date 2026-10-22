@@ -145,16 +145,11 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
     {
         let mut chats = agent.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).unwrap();
-        chat.snapshot.loops.push(LoopSnapshot {
-            id: receipt.loop_id,
-            goal: "inspect the fixture directory".into(),
+        chat.snapshot.chat_loop = LoopSnapshot {
             state: LoopState::Running,
             run_id: Some(receipt.run_id),
-            run_started_at: None,
-            trigger: None,
-            event_sources: Vec::new(),
-            state_since: None,
-        });
+            ..LoopSnapshot::new(receipt.loop_id)
+        };
         chat.snapshot.message_runs.insert(0, receipt.run_id);
         chat.bookkeeping
             .run_loops

@@ -37,7 +37,7 @@ fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
         "id": chat,
         "folder": "/fixture",
         "messages": [],
-        "loops": []
+        "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
     }))
     .unwrap()
 }
@@ -987,7 +987,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     let mut state = State::new(true, 140, 30);
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"calendar:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"calendar:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
     let console = tests::console_with_state(state);
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1072,7 +1072,7 @@ fn an_artifact_tick_subscription_brings_no_row() {
     let chat = Uuid::new_v4();
     state.chat = Some(chat);
     let console = tests::console_with_state(state);
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"Idle","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     assert!(console.state.lock().unwrap().monitor.entries().is_empty());
 }
@@ -2183,7 +2183,7 @@ fn subscribed_fixture(subscriptions: usize) -> State {
         })
         .collect();
     let mut snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
-        serde_json::json!({"id":Uuid::from_u128(77),"folder":"/fixture","messages":[],"loops":[]}),
+        serde_json::json!({"id":Uuid::from_u128(77),"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
     snapshot.monitor.record_opened(
@@ -2362,7 +2362,7 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(chat, None, "watch the calendar".into())
+    core.submit(chat, "watch the calendar".into())
         .await
         .unwrap();
     loop {
@@ -2586,9 +2586,8 @@ async fn a_running_shell_is_stopped_from_its_row_once_confirmed() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let gate = directory.path().join("release");
     let receipt = agent
-        .submit_user_shell_for_goal(
+        .submit_user_shell(
             chat,
-            None,
             format!("while [ ! -e '{}' ]; do sleep 0.02; done", gate.display()),
             true,
         )
@@ -2738,7 +2737,7 @@ fn linked_artifact_fixture(resume_required: bool) -> (State, tick_protocol::Inst
         "folder": "/fixture",
         "messages": [],
         "artifact_ticks": [{"artifact_id":"doc","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a/doc","access_role":"owner","added_at_ms":1}],
-        "loops": [{"id":Uuid::from_u128(900),"goal":"Write a brief","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":Uuid::from_u128(5),"client_instance_id":Uuid::from_u128(6),"epoch":1,"resume_required":resume_required,"last_request_at_ms":null}]}]
+        "chat_loop": {"id":Uuid::from_u128(900),"state":"Idle","event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":Uuid::from_u128(5),"client_instance_id":Uuid::from_u128(6),"epoch":1,"resume_required":resume_required,"last_request_at_ms":null}]}
     }))
     .unwrap();
     state.monitor.chat_status = Some(Arc::new(ChatStatus::of(&snapshot)));
@@ -3041,7 +3040,7 @@ async fn subscribed_calendar_chat(
     );
     let chat = agent.create_chat(directory.into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(chat, None, "watch the calendar".into())
+    core.submit(chat, "watch the calendar".into())
         .await
         .unwrap();
     loop {
@@ -3202,17 +3201,21 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
     );
     assert!(status().is_empty());
 
-    let without_loop = agent.create_chat(directory.path().into()).await.unwrap();
-    let refused = run_intent(
+    let fresh = agent.create_chat(directory.path().into()).await.unwrap();
+    run_intent(
         crate::terminal::tick_actions::TickActionContext {
-            chat: without_loop,
+            chat: fresh,
             ..context
         },
         TickIntent::Subscribe(tick_protocol::InstanceRef::new("cal", "unsubscribed").unwrap()),
     )
     .await
-    .unwrap_err();
-    assert!(refused.contains("no Loop"), "{refused}");
+    .unwrap();
+    assert_eq!(
+        agent.tick_subscriptions(fresh).await.unwrap().len(),
+        1,
+        "a new Chat's Loop subscribes before any input"
+    );
     core.shutdown().await;
 }
 

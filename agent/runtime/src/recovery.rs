@@ -87,7 +87,7 @@ fn close_calls(
         {
             operation.state = OperationState::Failed;
             operation.result = Some(ToolResult {
-                content: "User clarification was interrupted before an answer was received. Ask again if needed after the user manually resumes this goal.".into(),
+                content: "User clarification was interrupted before an answer was received. Ask again if needed after the user continues the Chat.".into(),
                 is_error: true,
                 output_ref: None,
             });

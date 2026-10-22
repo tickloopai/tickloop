@@ -839,7 +839,6 @@ impl Agent {
             reference.ok_or_else(|| AgentError::Invalid("denial record is unavailable".into()))?;
         self.submit_internal(
             chat_id,
-            None,
             "Please reconsider my previously denied task under the current rules. Treat the historical denial only as reference, and prepare any operation again.".into(),
             super::SubmissionOptions { denial_reference: Some(reference), ..Default::default() },
         ).await

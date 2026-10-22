@@ -42,7 +42,6 @@ fn prompt() -> TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop: None,
             message: UserMessage {
                 text: "Prepare the report.".into(),
                 ..Default::default()

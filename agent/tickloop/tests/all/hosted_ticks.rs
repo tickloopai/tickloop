@@ -292,7 +292,6 @@ mod channel {
         host_tools::{HostCallResult, HostToolProvider},
         hosted::{
             controller::HostController,
-            lifecycle::DaemonLifecycle,
             tools::HostedTickTools,
             worker_control::{
                 DaemonControl, HostedAdmission, WorkerControlGrant, WorkerRequest, root_identity,
@@ -393,8 +392,6 @@ mod channel {
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
-                    runtime
-                        .install_stopped_child_hook(Arc::new(DaemonLifecycle::new(grant.clone())));
                     runtime.install_host_tools(tools.clone()).unwrap();
                     runtime
                         .install_tick_stream(Arc::new(TickAdapters::builtin(
@@ -585,27 +582,6 @@ mod channel {
             }
         }
 
-        /// Opens a counter Tick for `chat` directly through the daemon's host controller, after
-        /// the daemon's first-use reconcile of the root so the Tick is not taken for an orphan.
-        async fn open_counter(&self, chat: Uuid) -> tickhost::host::OpenedTick {
-            self.controller
-                .open(counter_request(self.tick_owner(chat), &self.root))
-                .await
-                .unwrap()
-        }
-
-        /// The owner state file of `chat`, if the registry keeps one.
-        fn owner_state(&self, chat: Uuid) -> Option<Value> {
-            let path = self
-                .config_root
-                .join("tickhost/chats")
-                .join(chat.to_string())
-                .join("owner.json");
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-        }
-
         /// Hosted Tick tools of the first worker, as a separate client of its grant.
         fn tools(&self) -> HostedTickTools {
             HostedTickTools::new(
@@ -688,7 +664,7 @@ mod channel {
     /// of that run and of any child it delegated to in the foreground.
     async fn run_turn(runtime: &Agent, chat: Uuid, text: &str) -> BTreeMap<String, ToolResult> {
         let mut events = runtime.subscribe();
-        let receipt = runtime.submit(chat, None, text.into()).await.unwrap();
+        let receipt = runtime.submit(chat, text.into()).await.unwrap();
         let mut results = BTreeMap::new();
         loop {
             let event =
@@ -1367,309 +1343,88 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_cleanup_supplies_the_creation_exception_only_for_the_same_loop() {
+    async fn auto_cleanup_supplies_the_creation_exception_for_the_chats_own_tick() {
         use tickloop_agent_protocol::ExecutionMode;
         use tickloop_agent_test_support::{
             ScriptedModel, auto_classification, call, next_event, text,
         };
-        for same_loop in [true, false] {
-            let model = Arc::new(ScriptedModel::new(Vec::new()));
-            let daemon =
-                Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
-            let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
-            runtime
-                .set_execution_mode(chat, ExecutionMode::Auto)
-                .await
-                .unwrap();
-            let cleanup = if same_loop {
-                auto_classification(false)
-            } else {
-                json!({"decision":"block_soft","rule_id":"builtin.soft_deny.irreversible_local_destruction","reason":"Fixture review requires a same-Loop creation receipt for this cleanup exception"})
-            };
-            let reviewer = Arc::new(ScriptedModel::new(vec![
-                text(&auto_classification(false).to_string()),
-                text(&cleanup.to_string()),
-                text(&cleanup.to_string()),
-            ]));
-            runtime.set_auto_reviewer(reviewer.clone()).await;
-            model.enqueue(call("open", "TickManage", counter_command(&daemon)));
-            model.enqueue(text("opened"));
-            let results = run_turn(
-                &runtime,
-                chat,
-                "Open the task counter and close it after checking it",
-            )
-            .await;
-            let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
-            assert!(!results["open"].is_error, "{opened}");
-            let instance = opened["tick_instance_id"].clone();
-            let loop_id = runtime
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .loops
-                .last()
-                .unwrap()
-                .id;
-            model.enqueue(call(
-                "close",
-                "TickManage",
-                json!({"action":"close","tick_instance_id":instance}),
-            ));
-            model.enqueue(text("closed"));
-            let mut events = runtime.subscribe();
-            let receipt = runtime
-                .submit(
-                    chat,
-                    same_loop.then_some(loop_id),
-                    "Close the task counter".into(),
-                )
-                .await
-                .unwrap();
-            let mut prompted = false;
-            loop {
-                let event = next_event(&mut events).await;
-                match event.kind {
-                    EventKind::PermissionRequested { request } => {
-                        prompted = true;
-                        runtime
-                            .answer_permission(chat, request.id, false)
-                            .await
-                            .unwrap();
-                    }
-                    EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted
-                        if event.run_id == receipt.run_id =>
-                    {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            assert!(!prompted);
-            {
-                let requests = reviewer.requests.lock().unwrap();
-                let tickloop_agent_protocol::Content::Text { text } =
-                    &requests[1].messages[1].content[0]
-                else {
-                    panic!()
-                };
-                let snapshot: Value = serde_json::from_str(text).unwrap();
-                assert_eq!(snapshot["creation_receipt"].is_object(), same_loop);
-                assert!(
-                    snapshot["auto_policy"]["rules"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|rule| rule["id"] == "builtin.soft_allow.session_created_job_cleanup")
-                );
-                assert_eq!(snapshot["prepared_facts"]["tick_instance"], instance);
-                assert_eq!(snapshot["prepared_facts"]["closes_tick"], true);
-            }
-            if same_loop {
-                assert!(super::gone(opened["business_pid"].as_u64().unwrap() as u32).await);
-            } else {
-                assert_eq!(
-                    run_tool(
-                        &daemon.tools(),
-                        chat,
-                        "TickRead",
-                        json!({"tick_instance_id":instance})
-                    )
-                    .await["data"]["value"],
-                    0
-                );
-            }
-        }
-    }
-
-    /// A real root stops its direct child with StopSubagent; the worker's hook tells the daemon, which
-    /// checks the family itself and ends only the child's Ticks.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_root_stopping_its_direct_child_ends_only_the_childs_ticks() {
-        use tickloop_agent_protocol::{Event, Receipt};
-        use tickloop_agent_test_support::routed::{
-            RoutedModel, has_tool_result, history_text, state, tool_result,
-        };
-        const STOP_PROMPT: &str = "Stop the waiter now";
-        async fn finished(events: &mut tokio::sync::broadcast::Receiver<Event>, receipt: &Receipt) {
-            loop {
-                let event = tickloop_agent_test_support::next_event(events).await;
-                if event.run_id == receipt.run_id {
-                    match event.kind {
-                        EventKind::Completed { .. } => return,
-                        EventKind::Failed(error) => panic!("run failed: {error}"),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        let model = Arc::new(RoutedModel::new(|request| {
-            if !state(request)["delegation"].is_null() {
-                if !has_tool_result(request, "ready") {
-                    tickloop_agent_test_support::call(
-                        "ready",
-                        "SendMessage",
-                        json!({"to":"parent","message":"Child is ready to wait"}),
-                    )
-                } else {
-                    tickloop_agent_test_support::text("Awaiting family context.")
-                }
-            } else if !has_tool_result(request, "delegate") {
-                tickloop_agent_test_support::call(
-                    "delegate",
-                    "Subagent",
-                    json!({"task":"Wait to be stopped","name":"waiter"}),
-                )
-            } else if history_text(request).contains(STOP_PROMPT)
-                && !has_tool_result(request, "stop")
-            {
-                tickloop_agent_test_support::call("stop", "StopSubagent", json!({"to":"waiter"}))
-            } else {
-                tickloop_agent_test_support::text("Done")
-            }
-        }));
-        let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
-        let (runtime, root) = (daemon.runtimes[0].clone(), daemon.chats[0]);
-        DaemonControl::new(daemon.grants[0].clone())
-            .request(list(root))
-            .await
-            .unwrap();
-        let mut events = runtime.subscribe();
-        let receipt = runtime
-            .submit(root, None, "Delegate a waiter".into())
-            .await
-            .unwrap();
-        finished(&mut events, &receipt).await;
-        let child = runtime.subagents(root).await.unwrap()[0].child_chat_id;
-        let child_tick = daemon.open_counter(child).await;
-        let root_tick = daemon.open_counter(root).await;
-        for (claimed_root, claimed_child) in [(root, child), (root, root)] {
-            let refused = DaemonControl::new(daemon.grants[0].clone())
-                .request(WorkerRequest::EndStoppedChild {
-                    chat: claimed_root,
-                    child: claimed_child,
-                    operation: Uuid::new_v4(),
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(
-                refused.code, "Forbidden",
-                "only a stopped direct child is ended"
-            );
-        }
-        assert!(super::alive(child_tick.business_pid));
-
-        let receipt = runtime
-            .submit(root, None, STOP_PROMPT.into())
-            .await
-            .unwrap();
-        finished(&mut events, &receipt).await;
-
-        let stopped = tool_result(&runtime.snapshot(root).await.unwrap().messages, "stop").unwrap();
-        assert_eq!(stopped["status"], "stopped");
-        assert!(stopped.get("hosted_ticks_error").is_none(), "{stopped}");
-        assert!(
-            super::gone(child_tick.business_pid).await,
-            "the child's Tick ends"
-        );
-        assert!(
-            super::alive(root_tick.business_pid),
-            "the root keeps its Tick"
-        );
-        assert_eq!(daemon.owner_state(child).unwrap()["state"], "stopped");
-        assert_eq!(daemon.owner_state(root), None);
-        let tools = daemon.tools();
-        let HostCallResult::NotDispatched(refused) =
-            call_tool(&tools, child, "TickManage", counter_command(&daemon)).await
-        else {
-            panic!("a stopped child opens nothing before it continues");
-        };
-        assert!(refused.contains("OwnerEnded"), "{refused}");
-    }
-
-    /// A stop whose end never reached the host leaves the Chat Stopping while its Tick runs on.
-    /// Continuing the Chat restores only the Chat: the earlier Tick ends before it owns a new one.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn continuing_a_chat_whose_stop_never_reached_the_host_ends_its_earlier_ticks_first() {
-        async fn open_at_step(
-            daemon: &Daemon,
-            tools: &HostedTickTools,
-            chat: Uuid,
-            step: &str,
-        ) -> Value {
-            match call_tool(tools, chat, "TickManage", counter_command(daemon)).await {
-                HostCallResult::Completed(result)
-                | HostCallResult::CompletedWithEffect(result, _) => {
-                    serde_json::from_str(&result.content).unwrap()
-                }
-                HostCallResult::NotDispatched(error) | HostCallResult::OutcomeUnknown(error) => {
-                    let owner = daemon.owner_state(chat);
-                    let host = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        daemon.controller.host_epoch(),
-                    )
-                    .await;
-                    let socket_exists = tickhost::paths::HostPaths {
-                        runtime: daemon.root.join("h"),
-                    }
-                    .socket()
-                    .exists();
-                    panic!(
-                        "TickManage open failed during {step}: {error}; owner={owner:?}; host={host:?}; socket_exists={socket_exists}"
-                    );
-                }
-            }
-        }
-
-        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
-            tickloop_agent_test_support::text("Continued"),
-        ]));
-        let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let model = Arc::new(ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
-        let tools = daemon.tools();
-        let earlier = open_at_step(&daemon, &tools, chat, "initial open").await;
-        let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
-        std::fs::write(
-            daemon
-                .config_root
-                .join("tickhost/chats")
-                .join(chat.to_string())
-                .join("owner.json"),
-            serde_json::to_vec(&json!({"state":"stopping","operation":Uuid::new_v4()})).unwrap(),
+        runtime
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let cleanup = auto_classification(false);
+        let reviewer = Arc::new(ScriptedModel::new(vec![
+            text(&auto_classification(false).to_string()),
+            text(&cleanup.to_string()),
+            text(&cleanup.to_string()),
+        ]));
+        runtime.set_auto_reviewer(reviewer.clone()).await;
+        model.enqueue(call("open", "TickManage", counter_command(&daemon)));
+        model.enqueue(text("opened"));
+        let results = run_turn(
+            &runtime,
+            chat,
+            "Open the task counter and close it after checking it",
         )
-        .unwrap();
-        let HostCallResult::NotDispatched(refused) =
-            call_tool(&tools, chat, "TickManage", counter_command(&daemon)).await
-        else {
-            panic!("a stopped Chat opens nothing before it continues");
-        };
-        assert!(refused.contains("OwnerEnded"), "{refused}");
-        assert!(super::alive(earlier_pid), "the end never reached the host");
-
+        .await;
+        let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
+        assert!(!results["open"].is_error, "{opened}");
+        let instance = opened["tick_instance_id"].clone();
+        model.enqueue(call(
+            "close",
+            "TickManage",
+            json!({"action":"close","tick_instance_id":instance}),
+        ));
+        model.enqueue(text("closed"));
         let mut events = runtime.subscribe();
-        runtime.submit(chat, None, "Continue".into()).await.unwrap();
+        let receipt = runtime
+            .submit(chat, "Close the task counter".into())
+            .await
+            .unwrap();
+        let mut prompted = false;
         loop {
-            match tickloop_agent_test_support::next_event(&mut events)
-                .await
-                .kind
-            {
-                EventKind::Completed { .. } => break,
-                EventKind::Failed(error) => panic!("{error}"),
+            let event = next_event(&mut events).await;
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    prompted = true;
+                    runtime
+                        .answer_permission(chat, request.id, false)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted
+                    if event.run_id == receipt.run_id =>
+                {
+                    break;
+                }
                 _ => {}
             }
         }
-        let reopened = open_at_step(&daemon, &tools, chat, "open after Continue").await;
-        assert!(
-            super::gone(earlier_pid).await,
-            "the Tick of the stopped Chat ends"
-        );
-        assert!(super::alive(
-            reopened["business_pid"].as_u64().unwrap() as u32
-        ));
-        let records = launch_records(&daemon.root, chat);
-        assert_eq!(records.len(), 1, "{records:?}");
-        assert_eq!(records[0]["instance"], reopened["tick_instance_id"]);
-        assert_eq!(daemon.owner_state(chat).unwrap()["state"], "active");
+        assert!(!prompted);
+        {
+            let requests = reviewer.requests.lock().unwrap();
+            let tickloop_agent_protocol::Content::Text { text } =
+                &requests[1].messages[1].content[0]
+            else {
+                panic!()
+            };
+            let snapshot: Value = serde_json::from_str(text).unwrap();
+            assert!(snapshot["creation_receipt"].is_object());
+            assert!(
+                snapshot["auto_policy"]["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|rule| rule["id"] == "builtin.soft_allow.session_created_job_cleanup")
+            );
+            assert_eq!(snapshot["prepared_facts"]["tick_instance"], instance);
+            assert_eq!(snapshot["prepared_facts"]["closes_tick"], true);
+        }
+        assert!(super::gone(opened["business_pid"].as_u64().unwrap() as u32).await);
     }
 
     /// A Tick never ends for idling: an extension Tick nobody watches, views or uses, and a terminal
@@ -1748,7 +1503,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, None, "Watch the counter".into())
+            .submit(chat, "Watch the counter".into())
             .await
             .unwrap();
         loop {
@@ -1800,12 +1555,16 @@ for line in sys.stdin:
             );
         }
 
-        runtime.stop(chat, subscriptions[0].loop_id).await.unwrap();
-        assert!(runtime.tick_subscriptions(chat).await.unwrap().is_empty());
+        runtime.stop(chat).await.unwrap();
+        assert_eq!(
+            runtime.tick_subscriptions(chat).await.unwrap().len(),
+            1,
+            "stopping pauses the subscription and keeps it"
+        );
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(
             super::alive(business_pid),
-            "stopping the Loop ends its subscription, not the Tick"
+            "stopping the Loop leaves the Tick running"
         );
     }
 
@@ -1889,7 +1648,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, None, "Watch the candles".into())
+            .submit(chat, "Watch the candles".into())
             .await
             .unwrap();
         loop {
@@ -2226,7 +1985,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, None, "Watch this terminal".into())
+            .submit(chat, "Watch this terminal".into())
             .await
             .unwrap();
         loop {
@@ -2298,7 +2057,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, None, "Watch the terminal".into())
+            .submit(chat, "Watch the terminal".into())
             .await
             .unwrap();
         loop {
@@ -2375,7 +2134,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, None, "Watch the quote script".into())
+            .submit(chat, "Watch the quote script".into())
             .await
             .unwrap();
         loop {
@@ -3062,7 +2821,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("reopened"));
         let mut events = runtime.subscribe();
         let receipt = runtime
-            .submit(chat, None, "Reopen the counter".into())
+            .submit(chat, "Reopen the counter".into())
             .await
             .unwrap();
         let mut result = None;
@@ -3125,11 +2884,10 @@ for line in sys.stdin:
         .await;
     }
 
-    /// Two Loops watch one hosted Tick: cancelling one keeps the other's Watch and deliveries,
-    /// and once the Tick's host dies the remaining Watch fails closed as gone, calling no model
-    /// and never rebinding to a later host.
+    /// A Watch of a hosted Tick delivers its updates, and once the Tick's host dies it fails
+    /// closed as gone, calling no model and never rebinding to a later host.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cancelling_one_hosted_watch_keeps_the_other_and_a_dead_host_fails_closed() {
+    async fn a_hosted_watch_delivers_and_fails_closed_once_its_host_dies() {
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
@@ -3138,43 +2896,21 @@ for line in sys.stdin:
         let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut events = runtime.subscribe();
-        let run = |name: &'static str| {
-            model.enqueue(tickloop_agent_test_support::call(
-                name,
-                "TickManage",
-                json!({"action":"subscribe","tick_instance_id":instance}),
-            ));
-            model.enqueue(tickloop_agent_test_support::text("watching"));
-        };
-        for (name, prompt) in [("a", "Watch it as A"), ("b", "Watch it as B")] {
-            run(name);
-            let receipt = runtime.submit(chat, None, prompt.into()).await.unwrap();
-            loop {
-                let event = tickloop_agent_test_support::next_event(&mut events).await;
-                if event.run_id == receipt.run_id
-                    && matches!(event.kind, EventKind::Completed { .. })
-                {
-                    break;
-                }
+        model.enqueue(tickloop_agent_test_support::call(
+            "watch",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
+        ));
+        model.enqueue(tickloop_agent_test_support::text("watching"));
+        let receipt = runtime.submit(chat, "Watch it".into()).await.unwrap();
+        loop {
+            let event = tickloop_agent_test_support::next_event(&mut events).await;
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
             }
         }
         let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
-        assert_eq!(subscriptions.len(), 2, "{subscriptions:?}");
-        runtime
-            .update_tick_subscription(chat, subscriptions[0].id, TickSubscriptionChange::Cancel)
-            .await
-            .unwrap();
-        assert_eq!(
-            runtime
-                .tick_subscriptions(chat)
-                .await
-                .unwrap()
-                .iter()
-                .map(|subscription| subscription.id)
-                .collect::<Vec<_>>(),
-            [subscriptions[1].id],
-            "only the cancelled Watch ended"
-        );
+        assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
 
         let before = model.requests.lock().unwrap().len();
         model.enqueue(tickloop_agent_test_support::text("update observed"));
@@ -3188,7 +2924,7 @@ for line in sys.stdin:
         loop {
             let event = tokio::time::timeout(high_delivery_wait(), events.recv())
                 .await
-                .expect("the remaining Watch is delivered")
+                .expect("the Watch is delivered")
                 .unwrap();
             if matches!(event.kind, EventKind::Completed { .. }) {
                 break;
@@ -3201,7 +2937,7 @@ for line in sys.stdin:
         let host = tickhost::process::sample(launcher).unwrap().parent;
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
         assert!(super::gone(business_pid).await);
-        let remaining = subscriptions[1].id;
+        let remaining = subscriptions[0].id;
         let mut is_gone = false;
         for _ in 0..120 {
             let link = runtime
@@ -3787,7 +3523,7 @@ for line in sys.stdin:
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
-        runtime.submit(chat, None, "Watch it".into()).await.unwrap();
+        runtime.submit(chat, "Watch it".into()).await.unwrap();
         loop {
             if matches!(
                 tickloop_agent_test_support::next_event(&mut events)
@@ -4120,9 +3856,7 @@ for line in sys.stdin:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_daemon_reconciles_its_registry_with_the_running_host() {
-        use tickloop_agent_runtime::hosted::registry::{
-            LaunchRecord, LaunchState, OwnerState, Registry,
-        };
+        use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
         let fixture = Fixture::new();
         let controller = fixture.controller();
         let config_root = fixture.directory.path().join("state");
@@ -4150,15 +3884,8 @@ for line in sys.stdin:
             host_epoch: kept.terminal.epoch,
         };
         root.record_launch(&kept_record).await.unwrap();
-        // A Tick whose Chat the registry no longer lists, and one whose StopSubagent end was
-        // decided but not carried out when the previous daemon stopped.
+        // A Tick whose Chat the registry no longer lists.
         let orphan = controller.open(open_for(Uuid::new_v4())).await.unwrap();
-        let stopping_chat = Uuid::new_v4();
-        let stopping = controller.open(open_for(stopping_chat)).await.unwrap();
-        let stop = Uuid::new_v4();
-        root.set_owner_state(stopping_chat, &OwnerState::Stopping { operation: stop })
-            .await
-            .unwrap();
 
         root.reconcile_with_host(&controller, &fixture.owner.root)
             .await
@@ -4167,14 +3894,6 @@ for line in sys.stdin:
         assert!(
             gone(orphan.business_pid).await,
             "a Tick of no listed Chat is reaped"
-        );
-        assert!(
-            gone(stopping.business_pid).await,
-            "a decided end is carried out"
-        );
-        assert_eq!(
-            root.owner_state(stopping_chat).await.unwrap(),
-            OwnerState::Stopped { operation: stop }
         );
         assert!(alive(kept.business_pid), "a listed Chat keeps its Tick");
 

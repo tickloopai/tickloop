@@ -84,10 +84,7 @@ async fn a_followup_keeps_chat_goal_and_shared_history_while_creating_a_new_run(
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "My name is Sam".into())
-        .await
-        .unwrap();
+    let first = agent.submit(chat, "My name is Sam".into()).await.unwrap();
     let mut streamed = String::new();
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
@@ -105,10 +102,7 @@ async fn a_followup_keeps_chat_goal_and_shared_history_while_creating_a_new_run(
         }
     }
     assert_eq!(streamed, "Hello Sam");
-    let second = agent
-        .submit(chat, Some(first.loop_id), "What is my name?".into())
-        .await
-        .unwrap();
+    let second = agent.submit(chat, "What is my name?".into()).await.unwrap();
     assert_eq!(first.loop_id, second.loop_id);
     assert_ne!(first.run_id, second.run_id);
     while !matches!(
@@ -117,8 +111,8 @@ async fn a_followup_keeps_chat_goal_and_shared_history_while_creating_a_new_run(
     ) {}
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.messages.len(), 4);
-    assert_eq!(snapshot.loops.len(), 1);
-    assert_eq!(snapshot.loops[0].state, LoopState::Completed);
+    assert_eq!(snapshot.chat_loop.id, first.loop_id);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests[1].messages.len(), 4);
     assert_eq!(
@@ -130,17 +124,14 @@ async fn a_followup_keeps_chat_goal_and_shared_history_while_creating_a_new_run(
 }
 
 #[tokio::test]
-async fn opening_an_archive_is_read_only_until_the_user_continues_a_selected_goal() {
+async fn opening_an_archive_is_read_only_until_the_user_continues() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("archive");
     let model = Arc::new(ConversationModel::default());
     let agent = Agent::open_embedded(path.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let original = agent
-        .submit(chat, None, "Remember Sam".into())
-        .await
-        .unwrap();
+    let original = agent.submit(chat, "Remember Sam".into()).await.unwrap();
     while !matches!(
         events.recv().await.unwrap().kind,
         EventKind::Completed { .. }
@@ -153,10 +144,7 @@ async fn opening_an_archive_is_read_only_until_the_user_continues_a_selected_goa
     assert_eq!(resumed.list_chats().await.len(), 1);
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     let mut events = resumed.subscribe();
-    let continued = resumed
-        .submit(chat, Some(original.loop_id), "Continue".into())
-        .await
-        .unwrap();
+    let continued = resumed.submit(chat, "Continue".into()).await.unwrap();
     assert_ne!(continued.run_id, original.run_id);
     while !matches!(
         events.recv().await.unwrap().kind,
@@ -167,7 +155,7 @@ async fn opening_an_archive_is_read_only_until_the_user_continues_a_selected_goa
 }
 
 #[tokio::test]
-async fn inputs_accepted_while_busy_run_in_order_and_keep_goals_independent() {
+async fn inputs_accepted_while_busy_run_in_order_in_the_one_loop() {
     struct SlowModel(Arc<ConversationModel>);
     #[async_trait]
     impl ModelClient for SlowModel {
@@ -199,41 +187,30 @@ async fn inputs_accepted_while_busy_run_in_order_and_keep_goals_independent() {
     let agent = Agent::new_embedded(config(), Arc::new(SlowModel(responses.clone())));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(chat, None, "First goal".into()).await.unwrap();
-    let second = agent
-        .submit(chat, None, "Independent goal".into())
+    let first = agent.submit(chat, "First request".into()).await.unwrap();
+    let second = agent.submit(chat, "Another request".into()).await.unwrap();
+    let third = agent
+        .submit(chat, "First request addition".into())
         .await
         .unwrap();
-    agent
-        .submit(chat, Some(first.loop_id), "First goal addition".into())
-        .await
-        .unwrap();
-    let mut completed = 0;
-    while completed < 3 {
-        if matches!(
-            events.recv().await.unwrap().kind,
-            EventKind::Completed { .. }
-        ) {
-            completed += 1;
+    assert_eq!(first.loop_id, second.loop_id);
+    assert_eq!(second.loop_id, third.loop_id);
+    loop {
+        let event = events.recv().await.unwrap();
+        if event.run_id == second.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
         }
     }
-    assert_ne!(first.loop_id, second.loop_id);
-    assert_eq!(agent.snapshot(chat).await.unwrap().loops.len(), 2);
     let requests = responses.requests.lock().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .map(|request| request.messages.len())
-            .collect::<Vec<_>>(),
-        vec![2, 4, 6]
-    );
-    assert!(
-        matches!(&requests[2].messages[5].content[0],Content::Text{text} if text=="First goal addition")
-    );
+    assert_eq!(requests.len(), 2, "the queued inputs join one turn");
+    let later = serde_json::to_string(&requests[1].messages).unwrap();
+    let another = later.find("Another request").unwrap();
+    let addition = later.find("First request addition").unwrap();
+    assert!(another < addition, "{later}");
 }
 
 #[tokio::test]
-async fn stopping_a_goal_cancels_its_run_and_queue_but_other_goals_continue() {
+async fn stop_interrupts_the_turn_and_a_new_input_continues_the_loop() {
     struct CancellableModel;
     #[async_trait]
     impl ModelClient for CancellableModel {
@@ -279,42 +256,43 @@ async fn stopping_a_goal_cancels_its_run_and_queue_but_other_goals_continue() {
     let agent = Agent::new_embedded(config(), Arc::new(CancellableModel));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let first = agent.submit(chat, None, "cancel me".into()).await.unwrap();
-    agent
-        .submit(chat, Some(first.loop_id), "queued addition".into())
-        .await
-        .unwrap();
-    let second = agent.submit(chat, None, "keep me".into()).await.unwrap();
-    agent.stop(chat, first.loop_id).await.unwrap();
+    let first = agent.submit(chat, "cancel me".into()).await.unwrap();
+    loop {
+        let event = events.recv().await.unwrap();
+        if event.run_id == first.run_id && matches!(event.kind, EventKind::Started) {
+            break;
+        }
+    }
+    agent.stop(chat).await.unwrap();
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
             .await
             .unwrap()
             .unwrap();
-        if event.loop_id == second.loop_id && matches!(event.kind, EventKind::Completed { .. }) {
+        if event.run_id == first.run_id && matches!(event.kind, EventKind::Interrupted) {
             break;
         }
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(
-        snapshot
-            .loops
-            .iter()
-            .find(|goal| goal.id == first.loop_id)
-            .unwrap()
-            .state,
-        LoopState::Stopped
-    );
-    assert_eq!(snapshot.messages.len(), 4);
+    assert_eq!(snapshot.chat_loop.state, LoopState::Interrupted);
     assert!(matches!(
         &snapshot.messages[1].content[..],
         [Content::Text { text }] if text == INTERRUPT_MESSAGE
     ));
-    assert!(
-        agent
-            .submit(chat, Some(first.loop_id), "accidental wake".into())
+    let next = agent.submit(chat, "keep going".into()).await.unwrap();
+    assert_eq!(next.loop_id, first.loop_id);
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
             .await
-            .is_err()
+            .unwrap()
+            .unwrap();
+        if event.run_id == next.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        LoopState::Idle
     );
     agent.shutdown().await;
 }
