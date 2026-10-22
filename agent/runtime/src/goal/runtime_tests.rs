@@ -185,3 +185,39 @@ async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor()
     .expect("the successor continued the goal");
     successor.shutdown().await;
 }
+
+/// A planned upgrade can move a turn that already settled part of its running time; the
+/// successor settles only what came after, so it takes the clock over with the turn.
+#[tokio::test]
+async fn a_planned_upgrade_hands_the_goal_clock_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    let settled_at = unix_time_milliseconds() - 1_000;
+    {
+        let mut chats = original.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat).unwrap();
+        chat.goal_clock_ms = settled_at;
+        chat.goal_recorded_tokens = 42;
+    }
+    let checkpoint = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(checkpoint) = original.prepare_upgrade().await.unwrap() {
+                break checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let successor = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    successor
+        .restore_upgrade(serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap())
+        .await
+        .unwrap();
+    let chats = successor.inner.chats.lock().await;
+    assert_eq!(chats[&chat].goal_clock_ms, settled_at);
+    assert_eq!(chats[&chat].goal_recorded_tokens, 42);
+    drop(chats);
+    original.shutdown_for_upgrade().await;
+}
