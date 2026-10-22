@@ -787,3 +787,176 @@ fn a_new_wakeup_takes_its_own_instruction() {
     assert!(!created.ignored_prompt);
     assert_eq!(created.task.prompt, "check the build");
 }
+
+#[test]
+fn resuming_deletes_a_one_shot_task_whose_early_fire_time_passed() {
+    let created = local(22, 10, 0, 0);
+    let mut tasks = ScheduledTasks::default();
+    create(&mut tasks, HALF_ID, one_shot("0 15 * * *"), USER, created);
+    let mut before_lead = tasks.clone();
+    assert_eq!(
+        tasks.get(HALF_ID).unwrap().next_fire_at_ms,
+        Some(ms(local(22, 14, 59, 15)))
+    );
+
+    assert!(before_lead.resume(&local(22, 14, 59, 0)).is_empty());
+    let removed = tasks.resume(&local(22, 14, 59, 30));
+    assert_eq!(ids(&removed), [HALF_ID]);
+    assert!(tasks.take_due(&local(22, 14, 59, 30)).fired.is_empty());
+}
+
+#[test]
+fn resuming_skips_a_five_minute_run_whose_early_fire_time_passed() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        HALF_ID,
+        recurring("*/5 * * * *"),
+        USER,
+        local(22, 10, 0, 0),
+    );
+    let resumed_at = local(22, 10, 4, 50);
+    assert!(tasks.resume(&resumed_at).is_empty());
+    let task = tasks.get(HALF_ID).unwrap();
+    assert_eq!(task.scheduled_for_ms, Some(ms(local(22, 10, 10, 0))));
+    assert_eq!(task.next_fire_at_ms, Some(ms(local(22, 10, 9, 45))));
+    assert!(tasks.take_due(&resumed_at).fired.is_empty());
+}
+
+#[test]
+fn rescheduling_a_pending_self_paced_task_keeps_it_pending_with_its_instruction() {
+    let mut tasks = ScheduledTasks::default();
+    tasks
+        .schedule_wakeup(
+            HALF_ID.into(),
+            wakeup(600),
+            AGENT_NEEDING_CONFIRMATION,
+            &local(22, 10, 0, 0),
+        )
+        .unwrap();
+    let other_prompt = Wakeup {
+        prompt: "do something else".into(),
+        ..wakeup(1200)
+    };
+    let rescheduled = tasks
+        .schedule_wakeup(
+            NO_JITTER_ID.into(),
+            other_prompt,
+            AGENT_NEEDING_CONFIRMATION,
+            &local(22, 10, 5, 0),
+        )
+        .unwrap();
+    assert!(rescheduled.ignored_prompt);
+    let task = rescheduled.task;
+    assert_eq!(task.id, HALF_ID);
+    assert_eq!(task.prompt, "check the build");
+    assert_eq!(task.confirmation, Some(ScheduledTaskConfirmation::Pending));
+    assert_eq!(task.next_fire_at_ms, None);
+    assert_eq!(tasks.next_wake_at_ms(true), None);
+
+    let confirmed = confirmed(tasks.decide(
+        HALF_ID,
+        ScheduledTaskDecision::Confirm,
+        &local(22, 11, 0, 0),
+    ));
+    assert_eq!(confirmed.next_fire_at_ms, Some(ms(local(22, 11, 20, 0))));
+}
+
+#[test]
+fn tasks_follow_the_local_clock_through_a_fall_back_overlap() {
+    use chrono_tz::America::New_York;
+
+    let new_york = |day: u32, hour: u32, minute: u32| {
+        New_York
+            .with_ymd_and_hms(2026, 11, day, hour, minute, 0)
+            .earliest()
+            .unwrap()
+    };
+    let utc_ms = |day: u32, hour: u32, minute: u32| {
+        u64::try_from(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 11, day, hour, minute, 0)
+                .unwrap()
+                .timestamp_millis(),
+        )
+        .unwrap()
+    };
+    let mut tasks = ScheduledTasks::default();
+    tasks
+        .create_cron(
+            NO_JITTER_ID.into(),
+            recurring("30 1,3 * * *"),
+            "check".into(),
+            USER,
+            &new_york(1, 0, 0),
+        )
+        .unwrap();
+    // 01:30 EDT is 05:30 UTC; the repeated 01:30 EST (06:30 UTC) does not run again.
+    let first = tasks.take_due(&new_york(1, 1, 30));
+    assert_eq!(first.fired[0].scheduled_for_ms, utc_ms(1, 5, 30));
+    let second_pass = chrono::Utc
+        .with_ymd_and_hms(2026, 11, 1, 6, 30, 0)
+        .unwrap()
+        .with_timezone(&New_York);
+    assert!(tasks.take_due(&second_pass).fired.is_empty());
+    assert_eq!(
+        tasks.get(NO_JITTER_ID).unwrap().next_fire_at_ms,
+        Some(utc_ms(1, 8, 30))
+    );
+    assert_eq!(
+        tasks.get(NO_JITTER_ID).unwrap().expires_at_ms,
+        Some(utc_ms(8, 4, 0))
+    );
+}
+
+#[test]
+fn extreme_times_do_not_overflow() {
+    let latest = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+    let mut tasks = ScheduledTasks::default();
+    assert_eq!(
+        tasks
+            .create_cron(
+                NO_JITTER_ID.into(),
+                recurring("* * * * *"),
+                "check".into(),
+                USER,
+                &latest,
+            )
+            .unwrap_err(),
+        ScheduledTaskError::NeverRuns("* * * * *".into())
+    );
+
+    let wakeup_at_end = tasks
+        .schedule_wakeup(HALF_ID.into(), wakeup(3600), USER, &latest)
+        .unwrap()
+        .task
+        .clone();
+    assert!(wakeup_at_end.next_fire_at_ms > Some(ms_utc(&latest)));
+    assert!(tasks.take_due(&latest).fired.is_empty());
+    assert!(tasks.resume(&latest).is_empty());
+
+    let corrupt = ScheduledTask {
+        id: "11111111".into(),
+        scheduled_for_ms: Some(u64::MAX),
+        next_fire_at_ms: Some(0),
+        expires_at_ms: Some(u64::MAX),
+        ..tasks
+            .create_cron(
+                "11111111".into(),
+                recurring("0 * * * *"),
+                "check".into(),
+                USER,
+                &local(22, 10, 0, 0),
+            )
+            .unwrap()
+            .clone()
+    };
+    let mut stored = ScheduledTasks::new(vec![corrupt]);
+    let due = stored.take_due(&local(22, 11, 0, 0));
+    assert!(due.fired.is_empty());
+    assert_eq!(ids(&due.removed), ["11111111"]);
+}
+
+fn ms_utc(time: &chrono::DateTime<chrono::Utc>) -> u64 {
+    u64::try_from(time.timestamp_millis()).unwrap()
+}

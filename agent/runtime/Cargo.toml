@@ -47,6 +47,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 base64 = "0.22"
+chrono-tz = "0.10"
 percent-encoding = "2"
 serde_yaml_ng = "0.10"
 tempfile = "3"

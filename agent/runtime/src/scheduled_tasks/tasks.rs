@@ -344,9 +344,9 @@ impl ScheduledTasks {
         due
     }
 
-    /// Receiving resumed: every task waits for its next scheduled time strictly after `now`,
-    /// so nothing missed while paused runs late. One-shot and self-paced tasks whose time
-    /// passed are deleted. Returns the deleted tasks.
+    /// Receiving resumed: every task waits for its next fire time strictly after `now`, so
+    /// nothing missed while paused runs late. One-shot and self-paced tasks whose fire time
+    /// passed, jitter included, are deleted. Returns the deleted tasks.
     pub(crate) fn resume<Tz: TimeZone>(&mut self, now: &DateTime<Tz>) -> Vec<ScheduledTask> {
         let now_ms = millis(now);
         let mut removed = Vec::new();
@@ -362,8 +362,7 @@ impl ScheduledTasks {
                     Timing::Wake(_) | Timing::AwaitingTurn | Timing::Never => false,
                 },
                 (ScheduledTaskKind::OneShot { .. } | ScheduledTaskKind::SelfPaced { .. }, true) => {
-                    task.scheduled_for_ms
-                        .is_some_and(|scheduled_for| scheduled_for > now_ms)
+                    task.next_fire_at_ms.is_some_and(|fire_at| fire_at > now_ms)
                 }
             };
             if keep {
@@ -440,10 +439,18 @@ fn timing_after<Tz: TimeZone>(task: &ScheduledTask, after: &DateTime<Tz>) -> Tim
             ..
         } => return Timing::AwaitingTurn,
     };
-    Schedule::parse(cron)
-        .ok()
-        .and_then(|schedule| next_run(&schedule, task_kind, &task.id, after))
-        .map_or(Timing::Never, Timing::Run)
+    let Ok(schedule) = Schedule::parse(cron) else {
+        return Timing::Never;
+    };
+    let mut run = next_run(&schedule, task_kind, &task.id, after);
+    // A recurring run jittered early can fire no later than `after` (it is then clamped to
+    // it); starting the task then would run a time that passed, so it waits for the next.
+    if task_kind == TaskKind::Recurring {
+        while let Some(early) = run.take_if(|run| run.fire_at <= *after) {
+            run = next_run(&schedule, task_kind, &task.id, &early.scheduled_for);
+        }
+    }
+    run.map_or(Timing::Never, Timing::Run)
 }
 
 /// Runs a due task: records the run and sets its next one. `None` when the stored schedule
