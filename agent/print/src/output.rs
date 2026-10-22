@@ -5,79 +5,91 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// An unbuffered command-output sink. Each write_all allows at most 250ms of
-/// backpressure, rather than indefinitely blocking cancellation. Dropping restores flags.
-/// A reader must drain output continuously; output failure can leave a partial record.
-pub struct NonblockingOutput {
+const WRITE_BUDGET: Duration = Duration::from_millis(250);
+
+/// An unbuffered command-output sink. Each write_all allows at most 250ms of backpressure,
+/// rather than indefinitely blocking cancellation. The descriptor's flags are never changed: a
+/// dup shares its open file description with the caller's terminal or pipe, which a set
+/// O_NONBLOCK would outlive (concurrent invocations, SIGKILL). Instead each write waits for
+/// POLLOUT and writes at most PIPE_BUF bytes, which a pipe or socket then accepts without
+/// blocking. A reader must drain output continuously; output failure can leave a partial record.
+pub struct BoundedOutput {
     file: File,
-    original_flags: i32,
 }
 
-impl NonblockingOutput {
-    pub fn new(fd: OwnedFd) -> io::Result<Self> {
-        let original_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        if original_flags == -1
-            || unsafe {
-                libc::fcntl(
-                    fd.as_raw_fd(),
-                    libc::F_SETFL,
-                    original_flags | libc::O_NONBLOCK,
-                )
-            } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
+impl BoundedOutput {
+    pub fn new(fd: OwnedFd) -> Self {
+        Self {
             file: File::from(fd),
-            original_flags,
-        })
-    }
-}
-
-impl Write for NonblockingOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.file.write(bytes)
+        }
     }
 
-    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        // One absolute budget per record, not a fresh timeout for every partial write.
-        // poll accommodates normally draining pipelines without unbounded queue growth.
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while !bytes.is_empty() {
-            match self.file.write(bytes) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(written) => bytes = &bytes[written..],
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
+    /// Only time spent waiting for the reader is charged to `budget`, not the writes themselves.
+    fn write_within(&mut self, bytes: &[u8], budget: &mut Duration) -> io::Result<usize> {
+        loop {
+            if !self.writable(Duration::ZERO)? {
+                let started = Instant::now();
+                let writable = !budget.is_zero() && self.writable(*budget)?;
+                *budget = budget.saturating_sub(started.elapsed());
+                if !writable {
+                    if budget.is_zero() {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "stdout backpressure exceeded the 250ms write budget",
                         ));
                     }
-                    let mut descriptor = libc::pollfd {
-                        fd: self.file.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    let ready = unsafe {
-                        libc::poll(&mut descriptor, 1, remaining.as_millis().max(1) as i32)
-                    };
-                    if ready < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() != io::ErrorKind::Interrupted {
-                            return Err(error);
-                        }
-                    }
+                    continue;
                 }
-                Err(error) => return Err(error),
             }
-            if !bytes.is_empty() && Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "stdout backpressure exceeded the 250ms write budget",
-                ));
+            match self.file.write(&bytes[..bytes.len().min(libc::PIPE_BUF)]) {
+                // The inherited descriptor may already be nonblocking; wait for POLLOUT again.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Ready also covers POLLERR/POLLHUP/POLLNVAL; the following write reports that error.
+    fn writable(&self, timeout: Duration) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // Round up so that a sub-millisecond remainder still waits.
+        let milliseconds = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+        match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            ready => Ok(ready > 0),
+        }
+    }
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut budget = WRITE_BUDGET;
+        self.write_within(bytes, &mut budget)
+    }
+
+    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        // One budget per record, not a fresh timeout for every partial write.
+        // poll accommodates normally draining pipelines without unbounded queue growth.
+        let mut budget = WRITE_BUDGET;
+        while !bytes.is_empty() {
+            match self.write_within(bytes, &mut budget)? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                written => bytes = &bytes[written..],
             }
         }
         Ok(())
@@ -86,13 +98,6 @@ impl Write for NonblockingOutput {
     fn flush(&mut self) -> io::Result<()> {
         // File is unbuffered; never introduce a blocking fsync on an inherited sink.
         Ok(())
-    }
-}
-
-impl Drop for NonblockingOutput {
-    fn drop(&mut self) {
-        // dup shares the open-file description with the inherited stdout descriptor.
-        unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.original_flags) };
     }
 }
 
@@ -230,9 +235,7 @@ pub(crate) fn report(message: &str) {
     let Ok(fd) = std::io::stderr().as_fd().try_clone_to_owned() else {
         return;
     };
-    let Ok(mut writer) = NonblockingOutput::new(fd) else {
-        return;
-    };
+    let mut writer = BoundedOutput::new(fd);
     let mut line: String = diagnostic(message).chars().take(16 * 1024).collect();
     line.push('\n');
     let _ = writer.write_all(line.as_bytes());

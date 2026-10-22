@@ -1,4 +1,4 @@
-use std::{future::Future, io::Write, time::Duration};
+use std::{io::Write, time::Duration};
 
 use serde_json::json;
 use tickloop_agent_client::managed::{ManagedClient, ManagedSession};
@@ -7,6 +7,7 @@ use tickloop_agent_protocol::{
     Observation, ObservationChange, ObservationValue, OperationState, Receipt, ResetReason,
     UserInput,
 };
+use tokio::sync::mpsc;
 
 use crate::{Options, PrintResult, output::Output};
 
@@ -15,15 +16,16 @@ use crate::{Options, PrintResult, output::Output};
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Injectable adapter entry. All mutations go through the managed client, never a model/runtime.
-/// `shutdown` resolves to 130 (SIGINT) or 143 (SIGTERM); a pending future disables signals in tests.
-/// The injected writer must be bounded/nonblocking; production uses `NonblockingOutput`.
-pub async fn run_with_client<W: Write, F: Future<Output = i32>>(
+/// `shutdown` yields 130 (SIGINT) or 143 (SIGTERM) per signal: the first cancels the run, the next
+/// skips the remaining cleanup. A closed channel disables signals in tests.
+/// The injected writer must be bounded; production uses `BoundedOutput`.
+pub async fn run_with_client<W: Write>(
     options: &Options,
     launch: LaunchSpec,
     prompt: String,
     client: &ManagedClient,
     writer: &mut W,
-    shutdown: F,
+    mut shutdown: mpsc::Receiver<i32>,
 ) -> PrintResult {
     let mut output = Output::new(writer, options.format);
     let mut managed = None;
@@ -48,39 +50,63 @@ pub async fn run_with_client<W: Write, F: Future<Output = i32>>(
             output
                 .event("run.started", None, json!({}))
                 .map_err(write_failure)?;
-            consume(&session, observation, &receipt, &mut output).await
+            // The feed keeps reconnecting while the daemon is unreachable; the lease bounds that.
+            tokio::select! {
+                biased;
+                error = session.lease_lost() => Err(access_failure(error)),
+                result = consume(&session, observation, &receipt, &mut output) => result,
+            }
         };
-        tokio::pin!(shutdown);
         tokio::select! {
             biased;
-            code = &mut shutdown => PrintResult::failure(code, "print invocation cancelled"),
+            code = next_signal(&mut shutdown) => PrintResult::failure(code, "print invocation cancelled"),
             result = tokio::time::timeout(options.timeout, work) => match result {
                 Ok(Ok(result)) | Ok(Err(result)) => result,
                 Err(_) => PrintResult::failure(124, "print invocation timed out"),
             },
         }
     };
-    if let Some(session) = managed {
+    if let Some(session) = &managed {
         result.identify(session.execution(), output.receipt.as_ref());
+    }
+    // A lost lease leaves nothing to settle or release; the daemon's expiry owns that cleanup.
+    if let Some(session) = managed.filter(|session| session.lease_error().is_none()) {
         // Cancellation and BrokenPipe must not leave a worker, shell, or subscription running.
         // The lease is the final fallback if even this bounded cleanup cannot reach the daemon.
-        let mut failures = Vec::new();
-        if result.exit_code != 0 {
-            match tokio::time::timeout(CLEANUP_TIMEOUT, session.settle(true)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => failures.push(format!("cancellation failed: {error}")),
-                Err(_) => failures.push("cancellation timed out".into()),
+        let cancel = result.exit_code != 0;
+        let cleanup = async {
+            let mut failures = Vec::new();
+            if cancel {
+                match tokio::time::timeout(CLEANUP_TIMEOUT, session.settle(true)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => failures.push(format!("cancellation failed: {error}")),
+                    Err(_) => failures.push("cancellation timed out".into()),
+                }
             }
-        }
-        // Release is attempted once even after cancellation fails. An unknown mutation is not
-        // replayed; the daemon's lease remains responsible when this request cannot be observed.
-        match tokio::time::timeout(CLEANUP_TIMEOUT, session.release()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(format!("release failed: {error}")),
-            Err(_) => failures.push("release timed out; lease expiry remains active".into()),
-        }
-        if !failures.is_empty() {
-            result = cleanup_failure(result, failures.join("; "));
+            // Release is attempted once even after cancellation fails. An unknown mutation is not
+            // replayed; the daemon's lease remains responsible when this request cannot be observed.
+            match tokio::time::timeout(CLEANUP_TIMEOUT, session.release()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("release failed: {error}")),
+                Err(_) => failures.push("release timed out; lease expiry remains active".into()),
+            }
+            failures
+        };
+        // Signal handlers replace the default disposition, so another signal must end the wait.
+        tokio::select! {
+            biased;
+            code = next_signal(&mut shutdown) => {
+                let skipped = "cleanup skipped after another signal; lease expiry remains active";
+                result.error = Some(match result.error.take() {
+                    Some(original) => format!("{original}; {skipped}"),
+                    None => skipped.into(),
+                });
+                result.exit_code = code;
+                result.status = "cancelled".into();
+            }
+            failures = cleanup => if !failures.is_empty() {
+                result = cleanup_failure(result, failures.join("; "));
+            },
         }
     }
     if let Err(error) = output.finish(&result) {
@@ -89,6 +115,14 @@ pub async fn run_with_client<W: Write, F: Future<Output = i32>>(
         result.error = Some(format!("cannot write stdout: {error}"));
     }
     result
+}
+
+/// A closed channel never yields a signal.
+pub(crate) async fn next_signal(shutdown: &mut mpsc::Receiver<i32>) -> i32 {
+    match shutdown.recv().await {
+        Some(code) => code,
+        None => std::future::pending().await,
+    }
 }
 
 fn cleanup_failure(mut result: PrintResult, message: String) -> PrintResult {
@@ -157,7 +191,7 @@ async fn consume<W: Write>(
                 output
                     .event("stream.reset", None, json!({"reason": reason}))
                     .map_err(write_failure)?;
-                let text = snapshot.conversation.run_response_text(receipt.run_id);
+                let text = snapshot.conversation.run_streamed_text(receipt.run_id);
                 output
                     .event("response.snapshot", None, json!({"text": text}))
                     .map_err(write_failure)?;
@@ -334,7 +368,7 @@ async fn finish(
             result.error = None;
             result.text = snapshot
                 .conversation
-                .run_response_text(receipt.run_id)
+                .run_streamed_text(receipt.run_id)
                 .unwrap_or_default();
             result.usage = Some(usage);
             Ok(result)

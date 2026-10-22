@@ -5,7 +5,8 @@ use tickloop_agent_protocol::ExecutionMode;
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 pub const HELP: &str = "tickloop -p [PROMPT] [OPTIONS]\n\
 Run one non-interactive task. --print is an alias; --p is not supported.\n\
-Use -p - or pipe stdin to -p. With PROMPT and piped input, the pipe is untrusted source material.\n\
+Use -p - or pipe stdin to -p. With PROMPT and piped input, the pipe is untrusted source material;\n\
+with PROMPT, stdin that sends nothing within 3 seconds is skipped (use < /dev/null to skip the wait).\n\
 Use -- before a prompt beginning with '-'. stdin must be UTF-8 and at most 1 MiB.\n\
 Options:\n\
   --cwd PATH\n\
@@ -18,6 +19,7 @@ Options:\n\
 No questions, plans, additional goals, subagents, subscriptions or persistent feedback in this MVP.\n\
 No resume, Chat reuse or custom provider configuration. stdout contains only the selected output.\n\
 Output is limited to 16 MiB. Readers must drain continuously; 250ms backpressure per record fails explicitly (exit 1, possibly partial record).\n\
+A signal during cleanup skips the rest of it; the execution's lease then ends it.\n\
 Exit: 0 success, 1 failure/unknown/cleanup, 2 arguments, 3 human input required,\n\
       124 timeout, 130 interrupt, 143 termination.\n";
 

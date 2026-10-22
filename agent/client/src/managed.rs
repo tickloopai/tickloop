@@ -14,9 +14,9 @@ use std::{
 use tickloop_agent_protocol::{
     AccessCapability, AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery,
     CommandEnvelope, CommandResult, ExecutionProfile, ExecutionRef, LaunchSpec, LiveChatSnapshot,
-    ManagedConfiguration, ManagedConfigurationChange, ManagedHistoryPage, ManagedSessionPage,
-    ManagedToken, Observation, ObservationRequest, ObservationValue, PermissionScope, Receipt,
-    RequestRef, UserInput,
+    MANAGED_LEASE_SECONDS, ManagedConfiguration, ManagedConfigurationChange, ManagedHistoryPage,
+    ManagedSessionPage, ManagedToken, Observation, ObservationRequest, ObservationValue,
+    PermissionScope, Receipt, RequestRef, UserInput,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -29,6 +29,7 @@ mod tests;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const LEASE: Duration = Duration::from_secs(MANAGED_LEASE_SECONDS);
 
 #[derive(Clone)]
 pub struct ManagedClient {
@@ -182,6 +183,7 @@ impl ManagedClient {
             token,
             released: AtomicBool::new(false),
             stop: CancellationToken::new(),
+            lost: CancellationToken::new(),
             lease_error: std::sync::Mutex::new(None),
             release_result: tokio::sync::Mutex::new(None),
         });
@@ -200,6 +202,7 @@ struct SessionInner {
     token: ManagedToken,
     released: AtomicBool,
     stop: CancellationToken,
+    lost: CancellationToken,
     lease_error: std::sync::Mutex<Option<AccessError>>,
     release_result: tokio::sync::Mutex<Option<Result<(), AccessError>>>,
 }
@@ -212,6 +215,18 @@ impl ManagedSession {
         self.inner.access.clone()
     }
 
+    /// Resolves once the lease is lost: the daemon rejected a renewal, or none succeeded within
+    /// the lease (the daemon stopped or stopped answering). Observation feeds keep reconnecting
+    /// while the daemon is unreachable, so select on this alongside `Observation::recv`.
+    pub async fn lease_lost(&self) -> AccessError {
+        self.inner.lost.cancelled().await;
+        self.lease_error().unwrap_or_else(lease_expired)
+    }
+    /// The error that ended the lease; the daemon then owns the execution's cleanup.
+    pub fn lease_error(&self) -> Option<AccessError> {
+        self.inner.lease_error.lock().unwrap().clone()
+    }
+
     fn active(&self) -> Result<(), AccessError> {
         if self.inner.released.load(Ordering::Acquire) {
             return Err(AccessError::new(
@@ -219,7 +234,7 @@ impl ManagedSession {
                 "managed execution was released",
             ));
         }
-        if let Some(error) = self.inner.lease_error.lock().unwrap().clone() {
+        if let Some(error) = self.lease_error() {
             return Err(error);
         }
         Ok(())
@@ -422,7 +437,8 @@ impl Drop for StopHeartbeatOnDrop {
 impl Drop for SessionInner {
     fn drop(&mut self) {
         self.stop.cancel();
-        if self.released.load(Ordering::Acquire) {
+        // A lost lease is the daemon's to clean up when it expires.
+        if self.released.load(Ordering::Acquire) || self.lease_error.lock().unwrap().is_some() {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -441,7 +457,18 @@ impl Drop for SessionInner {
     }
 }
 
+fn lease_expired() -> AccessError {
+    AccessError::new(
+        AccessErrorCode::StaleExecution,
+        "Agent daemon stopped; managed execution lost",
+    )
+}
+
 async fn heartbeat(inner: Weak<SessionInner>, stop: CancellationToken) {
+    // The daemon expires a lease it has not renewed for MANAGED_LEASE_SECONDS. Counted from each
+    // acknowledgement, this deadline is never earlier than the daemon's; past it the execution is
+    // gone even if a reconnect succeeds later, as it does within the lease in a daemon handoff.
+    let mut expires = tokio::time::Instant::now() + LEASE;
     loop {
         tokio::select! {
             () = stop.cancelled() => return,
@@ -454,23 +481,39 @@ async fn heartbeat(inner: Weak<SessionInner>, stop: CancellationToken) {
         let execution = session.execution;
         let token = session.token.clone();
         drop(session);
-        let result = dispatch(
-            &access,
-            execution.daemon_epoch,
-            AgentCommand::ManagedHeartbeat { execution, token },
-        )
-        .await;
-        if let Err(error) = result {
-            // Transport failures can recover before lease expiry. An explicit rejection is final.
-            if !matches!(
-                error.code,
-                AccessErrorCode::Unavailable | AccessErrorCode::OutcomeUnknown
-            ) && let Some(session) = inner.upgrade()
-            {
-                *session.lease_error.lock().unwrap() = Some(error);
-                return;
+        let result = tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep_until(expires) => Err(lease_expired()),
+            result = dispatch(
+                &access,
+                execution.daemon_epoch,
+                AgentCommand::ManagedHeartbeat { execution, token },
+            ) => result,
+        };
+        let error = match result {
+            Ok(_) => {
+                expires = tokio::time::Instant::now() + LEASE;
+                continue;
             }
+            // Transport failures can recover before lease expiry. An explicit rejection is final.
+            Err(error)
+                if matches!(
+                    error.code,
+                    AccessErrorCode::Unavailable | AccessErrorCode::OutcomeUnknown
+                ) =>
+            {
+                if tokio::time::Instant::now() < expires {
+                    continue;
+                }
+                lease_expired()
+            }
+            Err(error) => error,
+        };
+        if let Some(session) = inner.upgrade() {
+            *session.lease_error.lock().unwrap() = Some(error);
+            session.lost.cancel();
         }
+        return;
     }
 }
 

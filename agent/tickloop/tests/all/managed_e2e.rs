@@ -242,6 +242,73 @@ async fn print_long_alias_reads_pipe_to_eof() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn print_prompt_skips_an_idle_stdin_pipe_and_never_changes_inherited_flags() {
+    use std::{
+        io::Read as _,
+        os::fd::{AsRawFd, OwnedFd},
+    };
+    let fixture = Fixture::new(Some(json!({"type":"text","text":"fixture final"}))).await;
+    // Like ssh or a parent process's default stdio: the writer stays open and sends nothing.
+    // std pipes are close-on-exec, so the daemon this invocation starts cannot inherit them.
+    let (stdin, idle_writer) = std::io::pipe().unwrap();
+    let (mut stdout_reader, stdout) = std::io::pipe().unwrap();
+    let shared = [
+        OwnedFd::from(stdin.try_clone().unwrap()),
+        OwnedFd::from(stdout.try_clone().unwrap()),
+    ];
+    let started = std::time::Instant::now();
+    let mut child = fixture
+        .command("-p", "finish", "text")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .spawn()
+        .unwrap();
+    let nonblocking = |descriptor: &OwnedFd| {
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+        flags & libc::O_NONBLOCK != 0
+    };
+    // The child shares these open file descriptions with its caller; a flag it set would leak.
+    let status = tokio::time::timeout(LIMIT, async {
+        loop {
+            assert!(
+                !shared.iter().any(nonblocking),
+                "print marked an inherited descriptor nonblocking"
+            );
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    drop(shared);
+    drop(idle_writer);
+    let mut stdout = String::new();
+    stdout_reader.read_to_string(&mut stdout).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    fixture.finish().await;
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout, "fixture final\n");
+    assert!(stderr.contains("< /dev/null"), "{stderr}");
+    assert!(elapsed >= Duration::from_secs(3), "{elapsed:?}");
+    let requests = fixture.requests.lock().unwrap();
+    assert!(
+        !requests[0]["messages"]
+            .to_string()
+            .contains("Untrusted stdin")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn print_background_shell_is_stopped_before_success() {
     let fixture = Fixture::new(Some(json!({"type":"tool_use","id":"shell","name":"Bash","input":{"command":"printf '%s' $$ > background.pid; exec sleep 60","run_in_background":true,"description":"Wait in print test"}}))).await;
     let output = tokio::time::timeout(

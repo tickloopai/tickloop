@@ -26,7 +26,7 @@ pub fn client_entry(arguments: &[OsString]) -> ClientEntry {
         Some("update" | "daemon" | "worker" | "monitor" | "tick") => return ClientEntry::Internal,
         _ => {}
     }
-    let mut arguments = arguments.iter();
+    let mut arguments = arguments.iter().peekable();
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("-p" | "--print" | "--p") => return ClientEntry::Print,
@@ -45,7 +45,8 @@ pub fn client_entry(arguments: &[OsString]) -> ClientEntry {
                 arguments.next();
             }
             Some("-r" | "--resume") => {
-                // Resume has an optional non-option Chat ID. It cannot contain a print flag.
+                // Resume has an optional non-option Chat ID, read as the Console parser reads it.
+                arguments.next_if(|value| !value.as_encoded_bytes().starts_with(b"-"));
             }
             Some(value) if value.starts_with('-') => {}
             _ => break,

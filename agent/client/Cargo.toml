@@ -23,3 +23,6 @@ tickloop-agent-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -89,6 +89,7 @@ fn session(access: Arc<dyn AgentAccess>) -> ManagedSession {
             token: ManagedToken::new(),
             released: AtomicBool::new(false),
             stop: CancellationToken::new(),
+            lost: CancellationToken::new(),
             lease_error: std::sync::Mutex::new(None),
             release_result: tokio::sync::Mutex::new(None),
         }),
@@ -202,4 +203,97 @@ async fn explicit_release_is_once_and_blocks_further_commands() {
         session.settle(false).await.unwrap_err().code,
         AccessErrorCode::AccessDenied
     );
+}
+
+/// Renewals fail with `failure` until `recovers_after` attempts (a daemon handoff), or forever.
+struct Renewals {
+    calls: AtomicUsize,
+    failure: Option<AccessErrorCode>,
+    recovers_after: usize,
+}
+#[async_trait]
+impl AgentAccess for Renewals {
+    async fn observe(&self, _: ObservationRequest) -> Result<Observation, AccessError> {
+        Err(AccessError::unavailable("Agent daemon is not running"))
+    }
+    async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        assert!(matches!(
+            command.command,
+            AgentCommand::ManagedHeartbeat { .. }
+        ));
+        if self.calls.fetch_add(1, Ordering::Relaxed) >= self.recovers_after {
+            return Ok(receipt(command.daemon_epoch, command.command_id, false));
+        }
+        match self.failure {
+            Some(code) => Err(AccessError::new(code, "renewal failed")),
+            None => std::future::pending().await,
+        }
+    }
+    async fn show_view(&self, _: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        panic!("no View")
+    }
+}
+fn renewing(failure: Option<AccessErrorCode>, recovers_after: usize) -> ManagedSession {
+    let session = session(Arc::new(Renewals {
+        calls: AtomicUsize::new(0),
+        failure,
+        recovers_after,
+    }));
+    tokio::spawn(heartbeat(
+        Arc::downgrade(&session.inner),
+        session.inner.stop.clone(),
+    ));
+    session
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreachable_or_unanswering_daemon_loses_the_lease_only_after_it_expires() {
+    for failure in [
+        Some(AccessErrorCode::OutcomeUnknown),
+        Some(AccessErrorCode::Unavailable),
+        None,
+    ] {
+        let session = renewing(failure, usize::MAX);
+        assert!(
+            tokio::time::timeout(LEASE - Duration::from_secs(1), session.lease_lost())
+                .await
+                .is_err(),
+            "{failure:?}"
+        );
+        let error = tokio::time::timeout(HEARTBEAT_INTERVAL * 2, session.lease_lost())
+            .await
+            .expect("an unrenewed lease must end the managed execution");
+        assert_eq!(error.code, AccessErrorCode::StaleExecution);
+        assert_eq!(
+            error.message,
+            "Agent daemon stopped; managed execution lost"
+        );
+        assert_eq!(
+            session.observe().await.unwrap_err().code,
+            AccessErrorCode::StaleExecution
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn renewal_recovered_within_the_lease_keeps_the_execution() {
+    let session = renewing(Some(AccessErrorCode::OutcomeUnknown), 3);
+    assert!(
+        tokio::time::timeout(LEASE * 4, session.lease_lost())
+            .await
+            .is_err()
+    );
+    assert!(session.lease_error().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejected_renewal_loses_the_lease_at_once() {
+    let session = renewing(Some(AccessErrorCode::AccessDenied), usize::MAX);
+    let error = tokio::time::timeout(
+        HEARTBEAT_INTERVAL + Duration::from_secs(1),
+        session.lease_lost(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(error.code, AccessErrorCode::AccessDenied);
 }

@@ -1,5 +1,4 @@
 use std::{
-    future::pending,
     io::{self, Write},
     sync::{Arc, Mutex},
     time::Duration,
@@ -8,9 +7,7 @@ use std::{
 use async_trait::async_trait;
 use serde_json::json;
 use tickloop_agent_client::managed::ManagedClient;
-use tickloop_agent_print::{
-    MAX_OUTPUT_BYTES, NonblockingOutput, OutputFormat, parse, run_with_client,
-};
+use tickloop_agent_print::{BoundedOutput, MAX_OUTPUT_BYTES, OutputFormat, parse, run_with_client};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, ChatSnapshot, CommandEnvelope,
     CommandReceipt, CommandResult, Content, Cursor, DisplayReceipt, DisplayUpdate, Event,
@@ -37,6 +34,8 @@ enum Behavior {
     Disconnected,
     UnknownSettle,
     OversizedFinal,
+    DaemonLost,
+    HangingCancel,
 }
 
 struct Fake {
@@ -180,7 +179,13 @@ impl AgentAccess for Fake {
                 if matches!(self.behavior, Behavior::Disconnected) {
                     self.sender.lock().unwrap().take();
                 }
-                if !matches!(self.behavior, Behavior::Wait | Behavior::Disconnected) {
+                if !matches!(
+                    self.behavior,
+                    Behavior::Wait
+                        | Behavior::Disconnected
+                        | Behavior::DaemonLost
+                        | Behavior::HangingCancel
+                ) {
                     let wrong = Event {
                         run_id: Uuid::new_v4(),
                         ..self.event(
@@ -254,15 +259,24 @@ impl AgentAccess for Fake {
                                 event_sources: vec![],
                             });
                         }
+                        // Providers such as Gemini stream one Text block per chunk; the
+                        // final answer is their concatenation, as the deltas streamed it.
                         snapshot.conversation.messages.push(Message {
                             role: Role::Assistant,
-                            content: vec![Content::Text {
-                                text: if matches!(self.behavior, Behavior::OversizedFinal) {
-                                    "x".repeat(MAX_OUTPUT_BYTES + 1)
-                                } else {
-                                    "final answer".into()
-                                },
-                            }],
+                            content: if matches!(self.behavior, Behavior::OversizedFinal) {
+                                vec![Content::Text {
+                                    text: "x".repeat(MAX_OUTPUT_BYTES + 1),
+                                }]
+                            } else {
+                                vec![
+                                    Content::Text {
+                                        text: "final ".into(),
+                                    },
+                                    Content::Text {
+                                        text: "answer".into(),
+                                    },
+                                ]
+                            },
                         });
                         snapshot
                             .conversation
@@ -290,12 +304,23 @@ impl AgentAccess for Fake {
                 }
                 CommandResult::Submitted(self.receipt.clone())
             }
-            AgentCommand::ManagedHeartbeat { .. } => CommandResult::Done,
+            AgentCommand::ManagedHeartbeat { .. } => {
+                if matches!(self.behavior, Behavior::DaemonLost) {
+                    return Err(AccessError::new(
+                        AccessErrorCode::OutcomeUnknown,
+                        "daemon disconnected",
+                    ));
+                }
+                CommandResult::Done
+            }
             AgentCommand::ManagedSettle { cancel, .. } => {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(if cancel { "cancel" } else { "settle" });
+                if cancel && matches!(self.behavior, Behavior::HangingCancel) {
+                    std::future::pending::<()>().await;
+                }
                 if !cancel && matches!(self.behavior, Behavior::UnknownSettle) {
                     return Err(AccessError::new(
                         AccessErrorCode::OutcomeUnknown,
@@ -331,6 +356,11 @@ impl AgentAccess for Fake {
     }
 }
 
+/// A closed channel never delivers a signal.
+fn no_signals() -> mpsc::Receiver<i32> {
+    mpsc::channel(1).1
+}
+
 fn options(format: OutputFormat) -> tickloop_agent_print::Options {
     let mut options = parse(&["-p".into(), "hello".into()]).unwrap();
     options.format = format;
@@ -354,7 +384,7 @@ async fn text_uses_authoritative_final_reply_not_stream_deltas() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 0, "{result:?}");
@@ -374,7 +404,7 @@ async fn json_is_one_versioned_result_with_ids() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 0);
@@ -395,7 +425,7 @@ async fn stream_replays_deduplicate_and_reset_snapshot_is_reconciled() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 0);
@@ -442,6 +472,13 @@ async fn stream_replays_deduplicate_and_reset_snapshot_is_reconciled() {
             .unwrap()["data"]["reason"],
         "lagged"
     );
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record["type"] == "response.snapshot")
+            .unwrap()["data"]["text"],
+        "final answer"
+    );
     for (index, record) in records.iter().enumerate() {
         assert_eq!(record["schema_version"], 1);
         assert_eq!(record["sequence"], index + 1);
@@ -457,7 +494,7 @@ async fn unknown_submit_is_never_replayed_and_is_cancelled_and_released() {
         "hello".into(),
         &fake.client(),
         &mut Vec::new(),
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 1);
@@ -475,7 +512,7 @@ async fn actual_question_is_human_required_not_a_success() {
         "hello".into(),
         &fake.client(),
         &mut Vec::new(),
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 3);
@@ -494,7 +531,7 @@ async fn timeout_cancels_and_releases_its_execution() {
         "hello".into(),
         &fake.client(),
         &mut Vec::new(),
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 124, "{result:?}");
@@ -506,10 +543,11 @@ async fn timeout_cancels_and_releases_its_execution() {
 async fn signals_cancel_and_release() {
     for code in [130, 143] {
         let fake = Fake::new(Behavior::Wait);
-        let shutdown = async move {
+        let (sender, shutdown) = mpsc::channel(1);
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            code
-        };
+            sender.send(code).await.unwrap();
+        });
         let result = run_with_client(
             &options(OutputFormat::Text),
             launch(),
@@ -536,7 +574,7 @@ async fn denied_tool_can_finish_successfully_and_expired_events_reconcile() {
             "hello".into(),
             &fake.client(),
             &mut output,
-            pending(),
+            no_signals(),
         )
         .await;
         assert_eq!(result.exit_code, 0, "{result:?}");
@@ -556,7 +594,7 @@ async fn tool_stream_uses_explicit_public_fields() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 0);
@@ -588,7 +626,7 @@ async fn unknown_operations_or_settlement_or_disconnection_never_succeed() {
             "hello".into(),
             &fake.client(),
             &mut Vec::new(),
-            pending(),
+            no_signals(),
         )
         .await;
         assert_eq!(result.exit_code, 1, "{result:?}");
@@ -617,7 +655,7 @@ async fn broken_pipe_stops_owned_execution() {
         "hello".into(),
         &fake.client(),
         &mut BrokenPipe,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 1);
@@ -636,7 +674,7 @@ async fn full_unread_open_pipe_fails_without_blocking_and_cleans_up() {
     let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
     let inspect = writer.try_clone().unwrap();
     let flags = unsafe { libc::fcntl(inspect.as_raw_fd(), libc::F_GETFL) };
-    let mut output = NonblockingOutput::new(writer).unwrap();
+    let mut output = BoundedOutput::new(writer);
     let started = std::time::Instant::now();
     // Keep the read end open, but never consume bytes. This is not BrokenPipe.
     let mut filled = 0;
@@ -660,7 +698,7 @@ async fn full_unread_open_pipe_fails_without_blocking_and_cleans_up() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 1, "{result:?}");
@@ -668,12 +706,14 @@ async fn full_unread_open_pipe_fails_without_blocking_and_cleans_up() {
     assert_eq!(fake.called("cancel"), 1);
     assert_eq!(fake.called("release"), 1);
     assert!(started.elapsed() < Duration::from_secs(2));
-    drop(output);
-    // macOS std::fs::File may also set O_NOSIGPIPE. Verify our changed flag only.
+    // The open file description is shared with the caller: never mark it nonblocking, even
+    // while the writer is alive (a concurrent invocation or SIGKILL would inherit the change).
     assert_eq!(
         unsafe { libc::fcntl(inspect.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-        flags & libc::O_NONBLOCK
+        0
     );
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    drop(output);
 }
 
 #[test]
@@ -694,7 +734,7 @@ fn large_output_succeeds_with_a_concurrently_draining_pipe() {
         File::from(reader).read_to_end(&mut bytes).unwrap();
         bytes
     });
-    let mut output = NonblockingOutput::new(writer).unwrap();
+    let mut output = BoundedOutput::new(writer);
     output.write_all(&bytes).unwrap();
     drop(output);
     assert_eq!(draining.join().unwrap(), bytes);
@@ -710,7 +750,7 @@ async fn final_output_limit_fails_after_releasing_execution() {
         "hello".into(),
         &fake.client(),
         &mut output,
-        pending(),
+        no_signals(),
     )
     .await;
     assert_eq!(result.exit_code, 1);
@@ -730,7 +770,7 @@ async fn run_failure_or_cleanup_failure_never_reports_success() {
             "hello".into(),
             &fake.client(),
             &mut output,
-            pending(),
+            no_signals(),
         )
         .await;
         assert_eq!(result.exit_code, 1);
@@ -739,5 +779,67 @@ async fn run_failure_or_cleanup_failure_never_reports_success() {
             serde_json::from_slice::<serde_json::Value>(&output).unwrap()["status"],
             "failed"
         );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_daemon_ends_the_run_once_the_lease_expires() {
+    let fake = Fake::new(Behavior::DaemonLost);
+    let mut options = options(OutputFormat::Json);
+    options.timeout = Duration::from_secs(86_400);
+    let started = tokio::time::Instant::now();
+    let mut output = Vec::new();
+    let result = run_with_client(
+        &options,
+        launch(),
+        "hello".into(),
+        &fake.client(),
+        &mut output,
+        no_signals(),
+    )
+    .await;
+    assert_eq!(result.exit_code, 1, "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Agent daemon stopped; managed execution lost")
+    );
+    assert!(started.elapsed() < Duration::from_secs(120));
+    // The daemon already owns the execution's cleanup.
+    assert_eq!(fake.called("cancel"), 0);
+    assert_eq!(fake.called("release"), 0);
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["run_id"], fake.receipt.run_id.to_string());
+}
+
+#[tokio::test]
+async fn another_signal_skips_cleanup_and_exits_with_its_code() {
+    for code in [130, 143] {
+        let fake = Fake::new(Behavior::HangingCancel);
+        let (sender, shutdown) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sender.send(130).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sender.send(code).await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        let mut options = options(OutputFormat::Text);
+        options.timeout = Duration::from_secs(600);
+        let result = run_with_client(
+            &options,
+            launch(),
+            "hello".into(),
+            &fake.client(),
+            &mut Vec::new(),
+            shutdown,
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(result.exit_code, code, "{result:?}");
+        assert_eq!(result.status, "cancelled");
+        assert!(result.error.unwrap().contains("cleanup skipped"));
+        assert_eq!(fake.called("cancel"), 1);
+        assert_eq!(fake.called("release"), 0);
     }
 }

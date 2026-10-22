@@ -25,6 +25,18 @@ fn managed_dispatch_respects_option_values_and_prompt_boundaries() {
     assert_eq!(entry(&["tick", "install", "-p"]), ClientEntry::Internal);
 }
 
+#[test]
+fn resume_chat_id_is_an_option_value_not_a_console_prompt() {
+    const CHAT: &str = "0190a5b2-7c1e-7000-8000-000000000001";
+    assert_eq!(entry(&["-r", CHAT, "-p", "hi"]), ClientEntry::Print);
+    assert_eq!(
+        entry(&["--resume", CHAT, "--print", "hi"]),
+        ClientEntry::Print
+    );
+    assert_eq!(entry(&["-r", "-p", "hi"]), ClientEntry::Print);
+    assert_eq!(entry(&["-r", CHAT, "prompt", "-p"]), ClientEntry::Console);
+}
+
 #[tokio::test]
 async fn print_missing_provider_fails_without_interactive_login() {
     let root = tempfile::tempdir().unwrap();
@@ -87,6 +99,13 @@ fn print_parameter_errors_do_not_open_console_or_write_stdout() {
         vec!["--p", "hello"],
         vec!["-p", "--output-format", "bad"],
         vec!["-p", "--resume"],
+        vec!["-r", "0190a5b2-7c1e-7000-8000-000000000001", "-p", "hi"],
+        vec![
+            "--resume",
+            "0190a5b2-7c1e-7000-8000-000000000001",
+            "--print",
+            "hi",
+        ],
     ] {
         let output = command().args(args).output().unwrap();
         assert_eq!(
