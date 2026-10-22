@@ -289,6 +289,13 @@ impl LaunchSpec {
 pub struct ManagedConfigurationChange {
     pub model_id: Option<String>,
     pub mode: Option<ExecutionMode>,
+    /// Omitted keeps the effort; null selects the model's automatic effort.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::model_card::deserialize_nullable"
+    )]
+    pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -309,6 +316,12 @@ pub struct ManagedConfiguration {
     pub mode: ExecutionMode,
     pub models: Vec<ManagedModelInfo>,
     pub modes: Vec<ExecutionMode>,
+    /// `None` is the model's automatic effort.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The effort levels the current model's card offers.
+    #[serde(default)]
+    pub efforts: Vec<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

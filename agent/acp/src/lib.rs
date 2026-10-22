@@ -31,10 +31,11 @@ use agent_client_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tickloop_agent_client::managed::{ManagedClient, ManagedSession};
+use tickloop_agent_model::ModelConfigExt;
 use tickloop_agent_protocol::{
-    AccessError, DirectoryTrustPolicy, Event, EventKind, ExecutionProfile, LaunchSpec,
-    LiveChatSnapshot, ObservationChange, PermissionRequest, Receipt, SessionMcpServer, UserInput,
-    validate_session_mcp_servers,
+    AccessError, ChatStatus, DirectoryTrustPolicy, Event, EventKind, ExecutionMode,
+    ExecutionProfile, LaunchSpec, LiveChatSnapshot, ObservationChange, PermissionRequest, Receipt,
+    SessionMcpServer, UserInput, validate_session_mcp_servers,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -46,6 +47,7 @@ use uuid::Uuid;
 const MAX_SESSIONS: usize = 16;
 const MAX_PROMPT: usize = 256 * 1024;
 const MAX_TURN_OUTPUT: usize = 2 * 1024 * 1024;
+const MAX_TURN_THOUGHT: usize = 1024 * 1024;
 const MAX_TOOL_CONTENT: usize = 32 * 1024;
 const TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -55,7 +57,7 @@ pub async fn run(arguments: Vec<String>) -> Result<(), String> {
     let options = Options::parse(arguments)?;
     if options.help {
         eprintln!(
-            "Usage: tickloop acp [--working-directory-is-trusted]\n\nUses existing provider settings. Configure/sign in with /provider in the Console."
+            "Usage: tickloop acp [--working-directory-is-trusted] [--mode auto|ask|fullAccess]\n\nUses existing provider settings. Configure/sign in with /provider in the Console.\n--mode sets each session's starting mode and the highest mode it may select; default auto."
         );
         return Ok(());
     }
@@ -66,6 +68,7 @@ pub async fn run(arguments: Vec<String>) -> Result<(), String> {
     let mut launch = LaunchSpec::embedded(options.startup_folder.clone());
     launch.profile = ExecutionProfile::Acp;
     launch.host_options = tickloop_agent_protocol::AgentHostOptions::product_defaults();
+    launch.host_options.execution_mode_override = Some(options.mode);
     launch.config_root = tickloop_agent_config::config_root_directory();
     if let Some(root) = &launch.config_root {
         launch.model = tickloop_agent_config::UserSettings::in_root(root)
@@ -108,6 +111,7 @@ pub async fn run(arguments: Vec<String>) -> Result<(), String> {
 struct Options {
     startup_folder: PathBuf,
     trust_startup: bool,
+    mode: ExecutionMode,
     help: bool,
 }
 impl Options {
@@ -117,11 +121,23 @@ impl Options {
                 .and_then(|path| path.canonicalize())
                 .map_err(|error| error.to_string())?,
             trust_startup: false,
+            mode: ExecutionMode::Auto,
             help: false,
         };
-        for argument in arguments {
+        let mut arguments = arguments.into_iter();
+        while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--working-directory-is-trusted" => options.trust_startup = true,
+                "--mode" => {
+                    options.mode = match arguments.next().as_deref() {
+                        Some("auto") => ExecutionMode::Auto,
+                        Some("ask" | "acceptEdits" | "accept-edits") => ExecutionMode::AcceptEdits,
+                        Some("fullAccess" | "full-access") => ExecutionMode::FullAccess,
+                        _ => {
+                            return Err("--mode requires auto, ask or fullAccess (not plan)".into());
+                        }
+                    };
+                }
                 "--help" | "-h" => options.help = true,
                 _ => return Err(format!("unknown ACP argument: {argument}")),
             }
@@ -135,8 +151,56 @@ struct Session {
     active: Mutex<Option<CancellationToken>>,
     mcp_servers: Vec<SessionMcpServer>,
     commands: Mutex<Vec<Value>>,
+    published: Mutex<Published>,
     output_budget: transport::OutputBudget,
     _slot: OwnedSemaphorePermit,
+}
+/// The session title and context usage last sent to the editor.
+#[derive(Default)]
+struct Published {
+    title: Option<String>,
+    usage: Option<(u64, u64)>,
+}
+impl Session {
+    /// Title and context usage outlive any one turn; each is sent only when it changed.
+    fn publish_status(
+        &self,
+        connection: &ConnectionTo<Client>,
+        id: &str,
+        snapshot: &LiveChatSnapshot,
+    ) -> Result<(), Error> {
+        let status = snapshot.status().chat;
+        let usage = context_usage(&status);
+        let mut published = self.published.lock().expect("ACP status");
+        if status.generated_title.is_some() && status.generated_title != published.title {
+            self.output_budget.send(
+                connection,
+                id,
+                json!({"sessionUpdate":"session_info_update", "title":status.generated_title}),
+            )?;
+            published.title = status.generated_title;
+        }
+        if let Some((used, size)) = usage
+            && usage != published.usage
+        {
+            self.output_budget.send(
+                connection,
+                id,
+                json!({"sessionUpdate":"usage_update", "used":used, "size":size}),
+            )?;
+            published.usage = usage;
+        }
+        Ok(())
+    }
+}
+/// Console's context meter: estimated active-context tokens against the model's window.
+fn context_usage(status: &ChatStatus) -> Option<(u64, u64)> {
+    let size = status
+        .model
+        .maximum_context_window_tokens()
+        .or(status.context_window_tokens)
+        .filter(|size| *size > 0)?;
+    Some((status.context_tokens?, size as u64))
 }
 struct State {
     client: ManagedClient,
@@ -244,21 +308,38 @@ where
                     connection.spawn(async move {
                         let result = async {
                             let value = state.new_session(request, slot).await?;
-                            let id = value["sessionId"].as_str().ok_or_else(|| invalid("invalid session identity"))?;
-                            let session = state.session(id)?;
-                            let result = state.commands(&session, id, &output_connection).await;
+                            let id = value["sessionId"].as_str().ok_or_else(|| invalid("invalid session identity"))?.to_owned();
+                            let session = state.session(&id)?;
+                            let prepared = async {
+                                let commands = configuration::available_commands(&session.managed).await?;
+                                let snapshot = session.managed.snapshot().await.map_err(access_error)?;
+                                Ok::<_, Error>((commands, snapshot))
+                            }.await;
                             session.active.lock().expect("ACP active").take();
-                            if let Err(error) = result {
-                                state.sessions.lock().expect("ACP sessions").remove(id);
-                                session.managed.release().await.map_err(access_error)?;
-                                return Err(error);
+                            match prepared {
+                                Ok((commands, snapshot)) => {
+                                    *session.commands.lock().expect("ACP commands") = commands.clone();
+                                    Ok((value, id, session, commands, snapshot))
+                                }
+                                Err(error) => {
+                                    state.sessions.lock().expect("ACP sessions").remove(&id);
+                                    session.managed.release().await.map_err(access_error)?;
+                                    Err(error)
+                                }
                             }
-                            Ok::<_, Error>(value)
                         }.await;
-                        match result {
-                            Ok(value) => responder.respond(value),
-                            Err(error) => responder.respond_with_error(error),
-                        }
+                        let (value, id, session, commands, snapshot) = match result {
+                            Ok(created) => created,
+                            Err(error) => return responder.respond_with_error(error),
+                        };
+                        responder.respond(value)?;
+                        // Editors register a session from this response and drop earlier updates.
+                        state.output_budget.send(
+                            &output_connection,
+                            &id,
+                            json!({"sessionUpdate":"available_commands_update","availableCommands":commands}),
+                        )?;
+                        session.publish_status(&output_connection, &id, &snapshot)
                     })
                 }
                 ClientRequest::LoadSessionRequest(request) => {
@@ -501,6 +582,8 @@ impl State {
             )
             .await?;
             self.commands(&session, &id, connection).await?;
+            let snapshot = session.managed.snapshot().await.map_err(access_error)?;
+            session.publish_status(connection, &id, &snapshot)?;
             if cancel.is_cancelled() {
                 return Err(invalid("session history replay cancelled"));
             }
@@ -564,6 +647,7 @@ impl State {
             active: Mutex::new(Some(CancellationToken::new())),
             mcp_servers,
             commands: Mutex::new(Vec::new()),
+            published: Mutex::default(),
             output_budget: self.output_budget.clone(),
             _slot: slot,
         });
@@ -624,6 +708,7 @@ struct Projection {
     emitted: String,
     committed_text: String,
     output_bytes: usize,
+    thought_bytes: usize,
     tools: HashMap<String, bool>,
     terminal: Option<Result<bool, String>>,
     output_budget: transport::OutputBudget,
@@ -691,6 +776,8 @@ async fn prompt_inner(
         tickloop_agent_protocol::ObservationValue::Agent(snapshot)
             if snapshot.execution == session.managed.execution() =>
         {
+            // A title generated after the previous turn ended arrives here.
+            session.publish_status(connection, &session_id, snapshot)?;
             snapshot.last_sequence
         }
         _ => return Err(invalid("invalid managed observation snapshot")),
@@ -710,6 +797,7 @@ async fn prompt_inner(
         emitted: String::new(),
         committed_text: String::new(),
         output_bytes: 0,
+        thought_bytes: 0,
         tools: HashMap::new(),
         terminal: None,
         output_budget: session.output_budget.clone(),
@@ -723,6 +811,7 @@ async fn prompt_inner(
                 .replay(&snapshot, session, cancel, connection)
                 .await?;
             projection.cancel_tools(connection)?;
+            session.publish_status(connection, &projection.session_id, &snapshot)?;
             return Ok(json!({"stopReason":"cancelled"}));
         }
         if projection.terminal.is_some() {
@@ -742,6 +831,7 @@ async fn prompt_inner(
             if matches!(projection.terminal, Some(Ok(true))) {
                 projection.cancel_tools(connection)?;
             }
+            session.publish_status(connection, &projection.session_id, &snapshot)?;
             return match projection.terminal.take().expect("terminal state") {
                 Ok(true) => Ok(json!({"stopReason":"cancelled"})),
                 Ok(false) => Ok(json!({"stopReason":"end_turn"})),
@@ -965,6 +1055,21 @@ impl Projection {
                 }
                 self.emitted.push_str(&text);
                 self.notify(connection, json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":text}}))?;
+            }
+            // Reasoning is supplementary: past its own bound it ends with a marker instead of
+            // failing the answer, so it is not counted against the turn output limit.
+            EventKind::Thinking(text) if self.thought_bytes <= MAX_TURN_THOUGHT => {
+                self.thought_bytes = self.thought_bytes.saturating_add(text.len());
+                let text = if self.thought_bytes > MAX_TURN_THOUGHT {
+                    "\n[Further thinking omitted]".to_owned()
+                } else {
+                    text
+                };
+                self.output_budget.send(
+                    connection,
+                    &self.session_id,
+                    json!({"sessionUpdate":"agent_thought_chunk", "content":{"type":"text", "text":text}}),
+                )?;
             }
             EventKind::ToolStarted {
                 call_id,
@@ -1244,5 +1349,34 @@ fn bounded_value(value: Value) -> Value {
         value
     } else {
         json!({"truncated":true, "preview":bounded_text(&serialized)})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_defaults_to_auto_and_full_access_is_explicit() {
+        let parse = |arguments: &[&str]| {
+            Options::parse(
+                arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().mode, ExecutionMode::Auto);
+        assert_eq!(
+            parse(&["--mode", "fullAccess"]).unwrap().mode,
+            ExecutionMode::FullAccess
+        );
+        assert_eq!(
+            parse(&["--mode", "ask"]).unwrap().mode,
+            ExecutionMode::AcceptEdits
+        );
+        for invalid in [&["--mode", "plan"][..], &["--mode"]] {
+            assert!(parse(invalid).is_err());
+        }
     }
 }

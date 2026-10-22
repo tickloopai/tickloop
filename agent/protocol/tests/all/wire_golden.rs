@@ -74,6 +74,7 @@ fn managed_execution_commands_keep_their_recorded_wire_and_legacy_local_default(
             change: tickloop_agent_protocol::ManagedConfigurationChange {
                 model_id: Some("example-large".into()),
                 mode: Some(ExecutionMode::AcceptEdits),
+                reasoning_effort: None,
             },
         },
         AgentCommand::ManagedFinalizeRelease {

@@ -606,7 +606,7 @@ impl EmbeddedAgentAccess {
                             let model = self.builtin_config(model)?;
                             self.inner
                                 .agent
-                                .configure_managed_session(chat, Some(model), None)
+                                .configure_managed_session(chat, Some(model), None, None)
                                 .await?;
                         }
                         if let Some(root) = root {
@@ -769,7 +769,7 @@ impl EmbeddedAgentAccess {
                 };
                 self.inner
                     .agent
-                    .configure_managed_session(chat, model, change.mode)
+                    .configure_managed_session(chat, model, change.mode, change.reasoning_effort)
                     .await?;
                 Ok(CommandResult::ManagedConfigured(
                     self.managed_configuration(execution, &entry).await?,
@@ -1745,7 +1745,10 @@ impl EmbeddedAgentAccess {
         execution: ExecutionRef,
         entry: &super::managed::ManagedEntry,
     ) -> Result<tickloop_agent_protocol::ManagedConfiguration, AccessError> {
-        use tickloop_agent_protocol::{ExecutionMode, ManagedConfiguration, ManagedModelInfo};
+        use tickloop_agent_model::ReasoningEffortExt;
+        use tickloop_agent_protocol::{
+            ExecutionMode, ManagedConfiguration, ManagedModelInfo, ReasoningEffort,
+        };
         if entry.launch.profile != tickloop_agent_protocol::ExecutionProfile::Acp {
             return Err(AccessError::new(
                 AccessErrorCode::AccessDenied,
@@ -1796,10 +1799,14 @@ impl EmbeddedAgentAccess {
                     .execution_mode_override
                     .unwrap_or(ExecutionMode::Auto)
             };
-        let modes = if ceiling == ExecutionMode::AcceptEdits {
-            vec![ExecutionMode::AcceptEdits]
-        } else {
-            vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits]
+        let modes = match ceiling {
+            ExecutionMode::AcceptEdits => vec![ExecutionMode::AcceptEdits],
+            ExecutionMode::FullAccess => vec![
+                ExecutionMode::Auto,
+                ExecutionMode::AcceptEdits,
+                ExecutionMode::FullAccess,
+            ],
+            _ => vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits],
         };
         let _ = execution;
         Ok(ManagedConfiguration {
@@ -1807,6 +1814,8 @@ impl EmbeddedAgentAccess {
             mode: snapshot.policy.mode,
             models,
             modes,
+            reasoning_effort: snapshot.reasoning_effort,
+            efforts: ReasoningEffort::choices(current).to_vec(),
         })
     }
 

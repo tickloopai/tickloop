@@ -180,10 +180,18 @@ impl Peer {
                 json!({"cwd":std::env::current_dir().unwrap(),"mcpServers":[]}),
             )
             .await;
-        value["result"]["sessionId"]
+        let session = value["result"]["sessionId"]
             .as_str()
             .unwrap_or_else(|| panic!("new session: {value}"))
-            .to_owned()
+            .to_owned();
+        // Editors register the session from the response, so its commands must follow it.
+        let commands = self.next().await;
+        assert_eq!(commands["params"]["sessionId"], session.as_str());
+        assert_eq!(
+            commands["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
+        session
     }
     async fn prompt(&mut self, id: usize, session: &str, text: &str) -> (Value, Vec<Value>) {
         self.request(
@@ -231,7 +239,9 @@ async fn finish(peer: Peer, server: tokio::task::JoinHandle<Result<(), String>>)
 fn text(updates: &[Value]) -> String {
     updates
         .iter()
-        .filter_map(|update| update["params"]["update"]["content"]["text"].as_str())
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|update| update["content"]["text"].as_str())
         .collect()
 }
 
@@ -933,5 +943,61 @@ async fn announced_tool_kinds_and_only_absolute_locations_match_official_schema(
             assert!(locations.is_empty());
         }
     }
+    finish(peer, server).await;
+}
+
+#[tokio::test]
+async fn thinking_title_and_context_usage_reach_the_editor() {
+    let (_, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    let (response, updates) = peer.prompt(3, &session, "status").await;
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    for wire in &updates {
+        let _: SessionNotification = decoded(wire["params"].clone());
+    }
+    let of = |updates: &[Value], kind: &str| {
+        updates
+            .iter()
+            .map(|wire| wire["params"]["update"].clone())
+            .filter(|update| update["sessionUpdate"] == kind)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of(&updates, "agent_thought_chunk")[0]["content"]["text"],
+        "weighing options"
+    );
+    assert_eq!(
+        of(&updates, "session_info_update"),
+        vec![json!({"sessionUpdate":"session_info_update", "title":"Fixture title"})]
+    );
+    let usage = of(&updates, "usage_update");
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["size"], 100_000);
+    assert!(usage[0]["used"].as_u64().unwrap() > 0);
+    // An unchanged title is not sent again.
+    let (_, updates) = peer.prompt(4, &session, "again").await;
+    assert!(of(&updates, "session_info_update").is_empty());
+    finish(peer, server).await;
+}
+
+#[tokio::test]
+async fn excess_thinking_is_cut_off_without_failing_the_answer() {
+    let (_, mut peer, server) = setup().await;
+    let session = peer.new_session(2).await;
+    let (response, updates) = peer.prompt(3, &session, "thought-flood").await;
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let thoughts: Vec<_> = updates
+        .iter()
+        .filter(|wire| wire["params"]["update"]["sessionUpdate"] == "agent_thought_chunk")
+        .map(|wire| {
+            wire["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(thoughts.len(), 65);
+    assert_eq!(thoughts.last().unwrap(), "\n[Further thinking omitted]");
+    assert_eq!(text(&updates), "answered");
     finish(peer, server).await;
 }

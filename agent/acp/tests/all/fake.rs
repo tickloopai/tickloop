@@ -51,6 +51,8 @@ fn configuration() -> ManagedConfiguration {
             },
         ],
         modes: vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits],
+        reasoning_effort: None,
+        efforts: Vec::new(),
     }
 }
 impl Fake {
@@ -557,6 +559,18 @@ impl AgentAccess for Fake {
                         for feed in &entry.feeds {
                             let _ = feed.try_send(update.clone());
                         }
+                    }
+                    "status" => {
+                        entry.emit(EventKind::Thinking("weighing options".into()));
+                        entry.snapshot.conversation.generated_title = Some("Fixture title".into());
+                        entry.snapshot.context_window_tokens = Some(100_000);
+                        entry.finish("done");
+                    }
+                    "thought-flood" => {
+                        for _ in 0..80 {
+                            entry.emit(EventKind::Thinking("x".repeat(16 * 1024)));
+                        }
+                        entry.finish("answered");
                     }
                     _ => entry.finish("hello"),
                 }

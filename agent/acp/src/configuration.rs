@@ -7,7 +7,7 @@ use agent_client_protocol::Error;
 use serde_json::{Value, json};
 use tickloop_agent_client::managed::ManagedSession;
 use tickloop_agent_protocol::{
-    ExecutionMode, ManagedConfiguration, ManagedConfigurationChange, UserInput,
+    ExecutionMode, ManagedConfiguration, ManagedConfigurationChange, ReasoningEffort, UserInput,
 };
 
 use super::{access_error, invalid};
@@ -49,13 +49,29 @@ fn mode_id(mode: ExecutionMode) -> &'static str {
 fn supported_modes(config: &ManagedConfiguration) -> Vec<ExecutionMode> {
     let mut modes = Vec::new();
     for mode in &config.modes {
-        // Managed ACP does not support the Plan approval workflow.
-        if matches!(mode, ExecutionMode::Auto | ExecutionMode::AcceptEdits) && !modes.contains(mode)
-        {
+        // Managed ACP does not support the Plan approval workflow. Full Access is offered only
+        // when the launch granted it as the ceiling.
+        if *mode != ExecutionMode::Plan && !modes.contains(mode) {
             modes.push(*mode);
         }
     }
     modes
+}
+
+fn effort_id(effort: Option<ReasoningEffort>) -> &'static str {
+    effort.map_or("auto", ReasoningEffort::label)
+}
+
+/// Like Console `/thinking LEVEL`: automatic plus the model's levels, and the current value even
+/// when it came from a default outside those levels.
+fn effort_values(config: &ManagedConfiguration) -> Vec<Option<ReasoningEffort>> {
+    let mut values: Vec<_> = std::iter::once(None)
+        .chain(config.efforts.iter().copied().map(Some))
+        .collect();
+    if !values.contains(&config.reasoning_effort) {
+        values.push(config.reasoning_effort);
+    }
+    values
 }
 
 fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
@@ -86,13 +102,25 @@ fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
         .iter()
         .map(|mode| json!({"value": mode_id(*mode), "name": mode.label()}))
         .collect();
+    let mut config_options = vec![
+        json!({"id": "model", "name": "Model", "category": "model", "type": "select",
+               "currentValue": config.model_id, "options": models}),
+        json!({"id": "mode", "name": "Execution Mode", "category": "mode", "type": "select",
+               "currentValue": mode_id(config.mode), "options": options}),
+    ];
+    let efforts = effort_values(config);
+    if efforts.len() > 1 {
+        let efforts: Vec<Value> = efforts
+            .into_iter()
+            .map(|effort| json!({"value": effort_id(effort), "name": effort_id(effort)}))
+            .collect();
+        config_options.push(json!({
+            "id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
+            "currentValue": effort_id(config.reasoning_effort), "options": efforts
+        }));
+    }
     Ok(json!({
-        "configOptions": [
-            {"id": "model", "name": "Model", "category": "model", "type": "select",
-             "currentValue": config.model_id, "options": models},
-            {"id": "mode", "name": "Execution Mode", "category": "mode", "type": "select",
-             "currentValue": mode_id(config.mode), "options": options}
-        ],
+        "configOptions": config_options,
         "modes": {
             "currentModeId": mode_id(config.mode),
             "availableModes": modes.iter().map(|mode| json!({
@@ -119,7 +147,7 @@ fn change(
         {
             Ok(ManagedConfigurationChange {
                 model_id: Some(value.to_owned()),
-                mode: None,
+                ..Default::default()
             })
         }
         "model" => Err(invalid("model was not offered by this session")),
@@ -129,8 +157,18 @@ fn change(
                 .find(|mode| mode_id(*mode) == value)
                 .ok_or_else(|| invalid("mode was not offered by this session"))?;
             Ok(ManagedConfigurationChange {
-                model_id: None,
                 mode: Some(mode),
+                ..Default::default()
+            })
+        }
+        "effort" => {
+            let effort = effort_values(config)
+                .into_iter()
+                .find(|effort| effort_id(*effort) == value)
+                .ok_or_else(|| invalid("effort was not offered by this session"))?;
+            Ok(ManagedConfigurationChange {
+                reasoning_effort: Some(effort),
+                ..Default::default()
             })
         }
         _ => Err(invalid("unknown configuration option")),
@@ -255,6 +293,8 @@ mod tests {
                 ExecutionMode::FullAccess,
                 ExecutionMode::Plan,
             ],
+            reasoning_effort: None,
+            efforts: vec![ReasoningEffort::Medium, ReasoningEffort::High],
         }
     }
 
@@ -266,7 +306,7 @@ mod tests {
         let decoded: NewSessionResponse = serde_json::from_value(new).unwrap();
         let wire = serde_json::to_value(decoded).unwrap();
         assert_eq!(wire["configOptions"][0]["type"], "select");
-        assert_eq!(wire["modes"]["availableModes"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["modes"]["availableModes"].as_array().unwrap().len(), 3);
         let _: SetSessionConfigOptionResponse = serde_json::from_value(json!({
             "configOptions": projected["configOptions"]
         }))
@@ -286,10 +326,76 @@ mod tests {
             change(&config, "mode", &json!("ask")).unwrap().mode,
             Some(ExecutionMode::AcceptEdits)
         );
+        assert_eq!(
+            change(&config, "mode", &json!("full-access")).unwrap().mode,
+            Some(ExecutionMode::FullAccess)
+        );
         assert!(change(&config, "mode", &json!("plan")).is_err());
         assert!(change(&config, "model", &json!("missing")).is_err());
         assert!(change(&config, "unknown", &json!("auto")).is_err());
         assert!(change(&config, "mode", &json!(true)).is_err());
+        assert_eq!(
+            change(&config, "effort", &json!("high"))
+                .unwrap()
+                .reasoning_effort,
+            Some(Some(ReasoningEffort::High))
+        );
+        assert_eq!(
+            change(&config, "effort", &json!("auto"))
+                .unwrap()
+                .reasoning_effort,
+            Some(None)
+        );
+        assert!(change(&config, "effort", &json!("max")).is_err());
+    }
+
+    #[test]
+    fn effort_lists_auto_model_levels_and_an_outside_current_value() {
+        let mut config = config();
+        let projected = project(&config).unwrap();
+        let effort = &projected["configOptions"][2];
+        assert_eq!(effort["category"], "thought_level");
+        assert_eq!(effort["currentValue"], "auto");
+        let values = |option: &Value| {
+            option["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value["value"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(effort), ["auto", "medium", "high"]);
+        config.reasoning_effort = Some(ReasoningEffort::Off);
+        let projected = project(&config).unwrap();
+        assert_eq!(projected["configOptions"][2]["currentValue"], "off");
+        assert_eq!(
+            values(&projected["configOptions"][2]),
+            ["auto", "medium", "high", "off"]
+        );
+        config.efforts.clear();
+        config.reasoning_effort = None;
+        assert_eq!(
+            project(&config).unwrap()["configOptions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn effort_change_distinguishes_unchanged_from_automatic() {
+        let wire = |effort| {
+            serde_json::to_value(ManagedConfigurationChange {
+                reasoning_effort: effort,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        for effort in [None, Some(None), Some(Some(ReasoningEffort::High))] {
+            let decoded: ManagedConfigurationChange = serde_json::from_value(wire(effort)).unwrap();
+            assert_eq!(decoded.reasoning_effort, effort);
+        }
     }
 
     fn text(value: &str) -> UserInput {

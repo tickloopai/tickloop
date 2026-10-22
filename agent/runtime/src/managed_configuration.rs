@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 
 use tickloop_agent_model::{validate_model_config, validate_reasoning_effort};
 use tickloop_agent_protocol::{
-    ChatId, CommandState, ExecutionMode, LoopState, ModelConfig, OperationState, UserShellState,
+    ChatId, CommandState, ExecutionMode, LoopState, ModelConfig, OperationState, ReasoningEffort,
+    UserShellState,
 };
 
 use crate::{Agent, AgentError, Chat};
@@ -60,12 +61,14 @@ impl Agent {
     }
 
     /// Changes only this managed session, atomically with its idle check. Invalid requests and
-    /// busy Chats leave both the model and the execution mode unchanged. Ask is `AcceptEdits`.
+    /// busy Chats leave the model, execution mode and effort unchanged. Ask is `AcceptEdits`.
+    /// `effort` is checked against the resulting model; `Some(None)` is the automatic effort.
     pub async fn configure_managed_session(
         &self,
         chat_id: ChatId,
         model: Option<ModelConfig>,
         mode: Option<ExecutionMode>,
+        effort: Option<Option<ReasoningEffort>>,
     ) -> Result<(), AgentError> {
         self.require_managed_configuration()?;
         if let Some(mode) = mode {
@@ -102,6 +105,10 @@ impl Agent {
             .as_ref()
             .map_or(&chat.snapshot.model, |(config, _)| config);
         let next_mode = mode.unwrap_or(chat.snapshot.policy.mode);
+        if let Some(effort) = effort {
+            validate_reasoning_effort(next_model, effort)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        }
         // ACP metadata is recorded by the persistence adapter before the infallible in-memory
         // application. Its helper must not acquire the Chat lock or flush Chat snapshots.
         if let Some(recorder) = &self.inner.recorder {
@@ -126,6 +133,9 @@ impl Agent {
             chat.snapshot.pending_model = None;
             chat.pending_client = None;
             chat.pending_model_thinking = None;
+        }
+        if let Some(effort) = effort {
+            chat.snapshot.reasoning_effort = effort;
         }
         if let Some(mode) = mode
             && chat.snapshot.policy.mode != mode
@@ -164,14 +174,16 @@ fn require_managed_root(chat: &Chat) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Full Access is selectable only below a Full Access ceiling, which the host granted at launch.
 fn validate_managed_mode(mode: ExecutionMode, ceiling: ExecutionMode) -> Result<(), AgentError> {
-    if !matches!(mode, ExecutionMode::AcceptEdits | ExecutionMode::Auto) {
+    if mode == ExecutionMode::Plan {
         return Err(AgentError::Invalid(
-            "managed sessions support only Ask or Auto mode".into(),
+            "managed sessions support only Ask, Auto or Full Access mode".into(),
         ));
     }
     if ceiling == ExecutionMode::Plan
-        || (ceiling == ExecutionMode::AcceptEdits && mode == ExecutionMode::Auto)
+        || (ceiling == ExecutionMode::AcceptEdits && mode != ExecutionMode::AcceptEdits)
+        || (mode == ExecutionMode::FullAccess && ceiling != ExecutionMode::FullAccess)
     {
         return Err(AgentError::Invalid(
             "execution mode exceeds the managed startup ceiling".into(),
@@ -296,7 +308,7 @@ mod tests {
         let mut selected = config();
         selected.model = "session-only".into();
         agent
-            .configure_managed_session(chat, Some(selected), Some(ExecutionMode::AcceptEdits))
+            .configure_managed_session(chat, Some(selected), Some(ExecutionMode::AcceptEdits), None)
             .await
             .unwrap();
         let snapshot = agent.snapshot(chat).await.unwrap();
@@ -328,7 +340,12 @@ mod tests {
         assert!(!agent.managed_session_idle(chat).await.unwrap());
         assert!(matches!(
             agent
-                .configure_managed_session(chat, Some(selected), Some(ExecutionMode::AcceptEdits))
+                .configure_managed_session(
+                    chat,
+                    Some(selected),
+                    Some(ExecutionMode::AcceptEdits),
+                    None
+                )
                 .await,
             Err(AgentError::Busy)
         ));
@@ -355,13 +372,42 @@ mod tests {
         selected.model = "not-applied".into();
         assert!(
             agent
-                .configure_managed_session(chat, Some(selected), Some(ExecutionMode::Auto))
+                .configure_managed_session(chat, Some(selected), Some(ExecutionMode::Auto), None)
                 .await
                 .is_err()
         );
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(snapshot.model.model, config().model);
         assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_effort_changes_nothing() {
+        let agent = managed_agent(ExecutionMode::Auto);
+        let directory = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut selected = config();
+        selected.model = "not-applied".into();
+        assert!(matches!(
+            agent
+                .configure_managed_session(
+                    chat,
+                    Some(selected),
+                    Some(ExecutionMode::AcceptEdits),
+                    Some(Some(ReasoningEffort::Max)),
+                )
+                .await,
+            Err(AgentError::Invalid(_))
+        ));
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.model.model, config().model);
+        assert_eq!(snapshot.policy.mode, ExecutionMode::Auto);
+        agent
+            .configure_managed_session(chat, None, None, Some(None))
+            .await
+            .unwrap();
+        assert_eq!(agent.snapshot(chat).await.unwrap().reasoning_effort, None);
         agent.shutdown().await;
     }
 
@@ -373,9 +419,13 @@ mod tests {
             ExecutionMode::FullAccess,
         ] {
             assert!(validate_managed_mode(ExecutionMode::AcceptEdits, ceiling).is_ok());
-            assert!(validate_managed_mode(ExecutionMode::FullAccess, ceiling).is_err());
+            assert_eq!(
+                validate_managed_mode(ExecutionMode::FullAccess, ceiling).is_ok(),
+                ceiling == ExecutionMode::FullAccess
+            );
             assert!(validate_managed_mode(ExecutionMode::Plan, ceiling).is_err());
         }
+        assert!(validate_managed_mode(ExecutionMode::FullAccess, ExecutionMode::Plan).is_err());
         assert!(validate_managed_mode(ExecutionMode::Auto, ExecutionMode::AcceptEdits).is_err());
         assert!(validate_managed_mode(ExecutionMode::Auto, ExecutionMode::Auto).is_ok());
         assert!(validate_managed_mode(ExecutionMode::Auto, ExecutionMode::FullAccess).is_ok());
