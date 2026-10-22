@@ -293,10 +293,16 @@ async fn a_due_task_runs_once_and_a_busy_loop_merges_later_times_as_skipped() {
     turn(&agent, chat, "schedule it").await;
     let task_id = tasks(&agent, chat).await[0].id.clone();
 
-    agent.run_due_scheduled_tasks(chat, at(10, 9, 59)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 9, 59))
+        .await
+        .unwrap();
     assert_eq!(model.seen("check the build"), 0);
     model.scripted.enqueue(text("Checked."));
-    agent.run_due_scheduled_tasks(chat, at(10, 25, 0)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 25, 0))
+        .await
+        .unwrap();
     wait_seen(&model, "check the build", 1).await;
     wait_idle(&agent, chat).await;
     let task = tasks(&agent, chat).await.remove(0);
@@ -310,8 +316,14 @@ async fn a_due_task_runs_once_and_a_busy_loop_merges_later_times_as_skipped() {
     let held = agent.submit(chat, HOLD.into()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     // The task's jitter delays each run by less than five minutes.
-    agent.run_due_scheduled_tasks(chat, at(10, 35, 0)).await;
-    agent.run_due_scheduled_tasks(chat, at(10, 46, 0)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 35, 0))
+        .await
+        .unwrap();
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 46, 0))
+        .await
+        .unwrap();
     let waiting = agent.snapshot(chat).await.unwrap().pending_inputs;
     assert_eq!(waiting.len(), 1, "one run of the task waits");
     assert_eq!(tasks(&agent, chat).await[0].skipped, 2);
@@ -338,7 +350,10 @@ async fn a_one_shot_task_runs_once_and_is_deleted() {
     turn(&agent, chat, "a reminder in a quarter of an hour").await;
     let task_id = tasks(&agent, chat).await[0].id.clone();
     let mut events = agent.subscribe();
-    let receipts = agent.run_due_scheduled_tasks(chat, at(10, 15, 0)).await;
+    let receipts = agent
+        .run_due_scheduled_tasks(chat, at(10, 15, 0))
+        .await
+        .unwrap();
     assert_eq!(receipts.len(), 1);
     wait_seen(&model, "remind me", 1).await;
     wait_idle(&agent, chat).await;
@@ -397,7 +412,10 @@ async fn a_self_paced_loop_gets_one_fallback_wakeup_and_then_ends() {
     // Its turn neither reschedules nor stops: one fallback wakeup 20 minutes later.
     model.scripted.enqueue(text("Still building."));
     agent.set_scheduled_now(at(10, 1, 0));
-    agent.run_due_scheduled_tasks(chat, at(10, 1, 0)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 1, 0))
+        .await
+        .unwrap();
     wait_seen(&model, "watch the build", 1).await;
     wait_idle(&agent, chat).await;
     let task = tasks(&agent, chat).await.remove(0);
@@ -410,7 +428,10 @@ async fn a_self_paced_loop_gets_one_fallback_wakeup_and_then_ends() {
     // The fallback turn does not reschedule either: the loop ends.
     model.scripted.enqueue(text("Nothing to do."));
     agent.set_scheduled_now(at(10, 21, 0));
-    agent.run_due_scheduled_tasks(chat, at(10, 21, 0)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 21, 0))
+        .await
+        .unwrap();
     wait_seen(&model, "watch the build", 2).await;
     wait_idle(&agent, chat).await;
     assert!(tasks(&agent, chat).await.is_empty());
@@ -460,7 +481,10 @@ async fn stop_pauses_timing_and_continuing_waits_for_the_next_time() {
         Agent::next_scheduled_wake(&chat_of(&agent, chat).await),
         None
     );
-    agent.run_due_scheduled_tasks(chat, at(10, 30, 0)).await;
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 30, 0))
+        .await
+        .unwrap();
     assert_eq!(model.seen("check the build"), 0);
 
     model.scripted.enqueue(text("Continuing."));
@@ -968,4 +992,67 @@ async fn the_agent_ending_its_self_paced_loop_is_shown_to_the_user() {
         notice,
         ScheduledTaskNotice::SelfPacedEnded { task_id: task.id }
     );
+}
+
+/// Another process holds the Chat's Trigger lease: the one-shot run is refused, the task keeps
+/// its time and the caller gets the refusal, and once the lease is free the run is taken once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = HoldingModel::new(vec![
+        call(
+            "create",
+            tools::CRON_CREATE_TOOL_NAME,
+            json!({"cron": "*/15 * * * *", "prompt": "remind me", "recurring": false}),
+        ),
+        text("Reminder set."),
+        text("Reminded."),
+    ]);
+    let holder = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    holder.set_scheduled_now(at(10, 0, 0));
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    turn(&holder, chat, "a reminder in a quarter of an hour").await;
+    let task = tasks(&holder, chat).await.remove(0);
+    holder.flush_transcripts().await;
+
+    let other = Agent::open_embedded(root, config(), HoldingModel::new(vec![text("ok")])).unwrap();
+    other.resume_chat(chat).await.unwrap();
+    turn(&other, chat, "carry on").await;
+    other
+        .deliver_trigger_for_tests(
+            chat,
+            TriggerSource::ScheduledTask {
+                task_id: "elsewhere".into(),
+                scheduled_for_ms: 1,
+            },
+            "the other process takes the lease",
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        holder
+            .run_due_scheduled_tasks(chat, at(10, 15, 0))
+            .await
+            .is_err(),
+        "the refusal reaches the caller"
+    );
+    assert_eq!(
+        tasks(&holder, chat).await,
+        [task.clone()],
+        "the task keeps its time"
+    );
+    assert_eq!(model.seen("remind me"), 0);
+
+    other.shutdown().await;
+    let receipts = holder
+        .run_due_scheduled_tasks(chat, at(10, 15, 0))
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    wait_seen(&model, "remind me", 1).await;
+    wait_idle(&holder, chat).await;
+    assert!(tasks(&holder, chat).await.is_empty());
+    holder.shutdown().await;
 }

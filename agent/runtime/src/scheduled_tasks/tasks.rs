@@ -276,13 +276,6 @@ impl ScheduledTasks {
         SelfPacedTurnEnd::FallbackScheduled
     }
 
-    /// A run of the task merged into one already waiting: its time is passed over.
-    pub(crate) fn add_skipped(&mut self, id: &str) {
-        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-            task.skipped += 1;
-        }
-    }
-
     pub(crate) fn delete(&mut self, id: &str) -> Option<ScheduledTask> {
         let index = self.tasks.iter().position(|task| task.id == id)?;
         Some(self.tasks.remove(index))

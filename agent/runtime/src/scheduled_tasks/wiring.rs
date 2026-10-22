@@ -16,8 +16,8 @@ use tickloop_agent_protocol::{
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
 use super::tasks::{
-    Creation, CronTask, DecisionOutcome, ScheduledTaskError, ScheduledTasks, SelfPacedTurnEnd,
-    Wakeup,
+    Creation, CronTask, DecisionOutcome, FiredTask, ScheduledTaskError, ScheduledTasks,
+    SelfPacedTurnEnd, Wakeup,
 };
 use super::tools::{self, ScheduledTaskCall};
 use crate::wakeup::TriggerDelivery;
@@ -27,6 +27,8 @@ use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, 
 /// The longest a Worker's timer sleeps before it looks at the clock again, so a machine that
 /// slept or a wall clock that moved does not delay a run for long.
 const TIMER_RECHECK: Duration = Duration::from_secs(60);
+/// How long a Worker's timer waits before it hands a refused run over again.
+const RETRY_DELAY_MS: u64 = 10_000;
 
 /// The time zone scheduled tasks read cron expressions in, and the clock they run by.
 pub(crate) struct ScheduleClock {
@@ -156,6 +158,14 @@ fn tool_error(message: String) -> ToolResult {
         is_error: true,
         output_ref: None,
     }
+}
+
+/// A due run of a task, prepared for the base: the task before it ran and as it is after.
+struct DueRun {
+    before: ScheduledTask,
+    fired: FiredTask,
+    /// A run of the task already waits, so this one merges into it.
+    merges: bool,
 }
 
 /// The scheduled task that started the run `run`: the latest run of the self-paced task is
@@ -527,7 +537,8 @@ impl Agent {
 
     /// A stateless host's wake-up at `due_at_ms`, the time the Harness reported last: every
     /// task due by then, or by now when the host's clock is ahead, runs once. Returns the
-    /// receipts the runs were handed over under.
+    /// receipts the runs were handed over under, or the error of a run the base did not take,
+    /// whose task keeps its time so that the next wake-up hands it over again.
     pub async fn wake_scheduled_tasks(
         &self,
         chat_id: ChatId,
@@ -540,74 +551,123 @@ impl Agent {
             .ok()
             .and_then(DateTime::from_timestamp_millis)
             .ok_or_else(|| AgentError::Invalid("the wake-up time is out of range".into()))?;
-        Ok(self
-            .run_due_scheduled_tasks(chat_id, due_at.max(self.scheduled_now()))
-            .await)
+        self.run_due_scheduled_tasks(chat_id, due_at.max(self.scheduled_now()))
+            .await
     }
 
-    /// Hands the Loop each task due by `now`, at most once each, while it receives. The tasks'
-    /// next times are recorded only after their runs were handed over: a host that goes down in
-    /// between finds the same runs due again, and their ledger records answer them.
+    /// Hands the Loop each task due by `now`, at most once each, while it receives. A task moves
+    /// on to its next time only once the base took its run: a run the base refuses leaves the
+    /// task as it was, due again.
     pub(crate) async fn run_due_scheduled_tasks(
         &self,
         chat_id: ChatId,
         now: DateTime<Utc>,
-    ) -> Vec<Receipt> {
-        let (deliveries, notices) = {
+    ) -> Result<Vec<Receipt>, AgentError> {
+        let runs = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
-                return Vec::new();
+                return Err(AgentError::NotFound);
             };
             if !chat.snapshot.chat_loop.receiving.is_receiving() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-            let due = tasks.take_due(&now);
-            if due.fired.is_empty() && due.removed.is_empty() {
-                return Vec::new();
+            let mut prepared = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let due = prepared.take_due(&now);
+            // A task whose stored schedule no longer reads is dropped without a run.
+            let unreadable: Vec<ScheduledTask> = due
+                .removed
+                .into_iter()
+                .filter(|task| !due.fired.iter().any(|fired| fired.task.id == task.id))
+                .collect();
+            if !unreadable.is_empty() {
+                self.delete_scheduled(chat, unreadable, Vec::new());
             }
-            let mut deliveries = Vec::new();
-            let mut notices = Vec::new();
-            for fired in &due.fired {
-                // A run of the task already waits: this one merges into it, so its time is
-                // passed over like one the Loop was too busy for.
-                let waits = chat.snapshot.pending_inputs.iter().any(|pending| {
-                    matches!(
-                        &pending.trigger_source,
-                        Some(TriggerSource::ScheduledTask { task_id, .. }) if *task_id == fired.task.id
-                    )
-                });
-                if waits {
-                    tasks.add_skipped(&fired.task.id);
-                }
-                notices.push(ScheduledTaskNotice::Fired {
-                    task_id: fired.task.id.clone(),
-                });
-                deliveries.push(TriggerDelivery {
-                    source: TriggerSource::ScheduledTask {
-                        task_id: fired.task.id.clone(),
-                        scheduled_for_ms: fired.scheduled_for_ms,
-                    },
-                    input: run_input(chat, &fired.task, self.inner.config_root.as_deref()),
-                    ledger: None,
-                });
-            }
-            chat.snapshot.scheduled_tasks = tasks.into_tasks();
-            (deliveries, notices)
+            due.fired
+                .into_iter()
+                .filter_map(|fired| {
+                    let before = chat
+                        .snapshot
+                        .scheduled_tasks
+                        .iter()
+                        .find(|task| task.id == fired.task.id)?
+                        .clone();
+                    // A run of the task already waits: this one merges into it, so its time is
+                    // passed over like one the Loop was too busy for.
+                    let merges = chat.snapshot.pending_inputs.iter().any(|pending| {
+                        matches!(
+                            &pending.trigger_source,
+                            Some(TriggerSource::ScheduledTask { task_id, .. }) if *task_id == before.id
+                        )
+                    });
+                    let delivery = TriggerDelivery {
+                        source: TriggerSource::ScheduledTask {
+                            task_id: before.id.clone(),
+                            scheduled_for_ms: fired.scheduled_for_ms,
+                        },
+                        input: run_input(chat, &fired.task, self.inner.config_root.as_deref()),
+                        ledger: None,
+                    };
+                    Some((
+                        DueRun {
+                            before,
+                            fired,
+                            merges,
+                        },
+                        delivery,
+                    ))
+                })
+                .collect::<Vec<_>>()
         };
-        let mut receipts = Vec::new();
-        for delivery in deliveries {
+        let mut taken = Vec::new();
+        let mut refusal = None;
+        for (run, delivery) in runs {
             match self.deliver_trigger(chat_id, delivery).await {
-                Ok(receipt) => receipts.push(receipt),
+                Ok(receipt) => taken.push((run, receipt)),
                 Err(error) => {
-                    tracing::debug!(%chat_id, %error, "a scheduled run was not delivered");
+                    tracing::debug!(%chat_id, %error, "a scheduled run was not taken");
+                    refusal.get_or_insert(error);
                 }
             }
         }
-        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+        if !taken.is_empty() {
+            let mut chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get_mut(&chat_id) {
+                self.commit_taken_runs(chat, &taken);
+            }
+        }
+        match refusal {
+            Some(error) => Err(error),
+            None => Ok(taken.into_iter().map(|(_, receipt)| receipt).collect()),
+        }
+    }
+
+    /// Moves each task whose run the base took on to its next time, unless the task changed
+    /// meanwhile, such as by a reschedule or a deletion that withdrew the run.
+    fn commit_taken_runs(&self, chat: &mut Chat, taken: &[(DueRun, Receipt)]) {
+        let mut notices = Vec::new();
+        for (run, _) in taken {
+            let Some(index) = chat
+                .snapshot
+                .scheduled_tasks
+                .iter()
+                .position(|task| *task == run.before)
+            else {
+                continue;
+            };
+            if run.fired.is_last {
+                chat.snapshot.scheduled_tasks.remove(index);
+            } else {
+                let mut after = run.fired.task.clone();
+                after.skipped += u64::from(run.merges);
+                chat.snapshot.scheduled_tasks[index] = after;
+            }
+            notices.push(ScheduledTaskNotice::Fired {
+                task_id: run.before.id.clone(),
+            });
+        }
+        if !notices.is_empty() {
             self.persist_scheduled_tasks(chat, notices);
         }
-        receipts
     }
 
     /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it
@@ -712,18 +772,21 @@ impl Agent {
             self.inner.scheduled_wake.clone(),
         );
         self.inner.tasks.spawn(async move {
+            let mut retries: std::collections::HashMap<ChatId, u64> = Default::default();
             loop {
                 let Some(agent) = agent.upgrade() else {
                     return;
                 };
                 let now = agent.scheduled_now();
+                let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
                 let (next, due): (Option<u64>, Vec<ChatId>) = {
                     let chats = agent.inner.chats.lock().await;
-                    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+                    retries.retain(|id, _| chats.contains_key(id));
                     let wakes: Vec<(ChatId, u64)> = chats
                         .iter()
                         .filter_map(|(id, chat)| {
-                            Self::next_scheduled_wake(chat).map(|at| (*id, at))
+                            let at = Self::next_scheduled_wake(chat)?;
+                            Some((*id, at.max(retries.get(id).copied().unwrap_or(0))))
                         })
                         .collect();
                     (
@@ -742,15 +805,19 @@ impl Agent {
                 if !due.is_empty() {
                     let _upgrade = agent.inner.upgrade_gate.read().await;
                     for chat_id in due {
-                        agent.run_due_scheduled_tasks(chat_id, now).await;
+                        // A run the base refused, as while another process holds the Chat,
+                        // stays due; the timer tries it again a little later.
+                        match agent.run_due_scheduled_tasks(chat_id, now).await {
+                            Ok(_) => retries.remove(&chat_id),
+                            Err(_) => {
+                                retries.insert(chat_id, now_ms.saturating_add(RETRY_DELAY_MS))
+                            }
+                        };
                     }
                     continue;
                 }
                 let sleep = next
-                    .map(|at| {
-                        let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
-                        Duration::from_millis(at.saturating_sub(now_ms))
-                    })
+                    .map(|at| Duration::from_millis(at.saturating_sub(now_ms)))
                     .unwrap_or(TIMER_RECHECK)
                     .min(TIMER_RECHECK);
                 drop(agent);
