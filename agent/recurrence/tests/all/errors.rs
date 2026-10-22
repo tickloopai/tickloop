@@ -163,12 +163,13 @@ fn messages_explain_the_problem_and_shorten_long_input() {
     );
     assert_eq!(
         error("daily 09:00 +15:00").to_string(),
-        "`+15:00` is not a UTC offset between -14:00 and +14:00 like +08:00"
+        "`+15:00` is not a UTC offset between -14:00 and +14:00 like +08:00 or an IANA time zone \
+         like Asia/Shanghai"
     );
     assert!(
         error("hourly")
             .to_string()
-            .contains("weekly mon,fri 09:00 +08:00")
+            .contains("weekly mon,fri 09:00 America/New_York")
     );
 
     let long_word = "界".repeat(1000);

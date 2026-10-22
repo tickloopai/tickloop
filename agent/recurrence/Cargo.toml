@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 serde = "1"
 thiserror = "2"
 
