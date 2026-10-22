@@ -1162,6 +1162,50 @@ async fn trigger_input_stopped_before_its_start_is_recorded_never_runs() {
     processes.second.shutdown().await;
 }
 
+/// A Continue whose caller stops waiting after the switch turned here still records it: the
+/// switch here and the recorded one end alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_dropped_midway_still_records_the_switch() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent.stop(chat).await.unwrap();
+    assert!(!recorded_receiving(&root));
+
+    let changed = agent.pause_next_for_tests(chat, PausePoint::ReceivingChanged);
+    let continued = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.continue_loop(chat).await }
+    });
+    tokio::time::timeout(WAIT, changed.entered)
+        .await
+        .expect("the switch turned here")
+        .unwrap();
+    continued.abort();
+    assert!(continued.await.unwrap_err().is_cancelled());
+    drop(changed.release);
+    tokio::time::timeout(WAIT, async {
+        while !recorded_receiving(&root) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the switch is recorded");
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .chat_loop
+            .receiving
+            .is_receiving()
+    );
+    agent.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]

@@ -551,10 +551,8 @@ impl Agent {
     /// Trigger input queued while it was paused may start. A Loop already receiving only looks
     /// again at its artifact links, whose account may be back.
     pub(super) async fn continue_receiving(&self, chat_id: ChatId) {
-        if let Some(loop_id) = self
-            .change_receiving(chat_id, ReceivingChange::Resumed)
-            .await
-        {
+        let change = self.change_receiving(chat_id, ReceivingChange::Resumed);
+        if let Ok(Some(loop_id)) = change.await {
             self.flush_due_tick_delivery(chat_id, loop_id);
             // A turn that ended while the switch was off left the input waiting for it.
             self.inner
@@ -568,7 +566,31 @@ impl Agent {
     /// the Chat's Trigger boundary, so the switch here and the recorded one never part: a pause
     /// also releases the lease, after whatever the boundary was doing. The Loop's id when the
     /// switch turned; a resume of a Loop already receiving changes and records nothing.
-    async fn change_receiving(&self, chat_id: ChatId, change: ReceivingChange) -> Option<LoopId> {
+    /// Started at once on a task of the Agent's own, which a caller that stops waiting does not
+    /// stop: the switch here is never left turned without its record.
+    fn change_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> tokio::task::JoinHandle<Option<LoopId>> {
+        self.inner
+            .tasks
+            .spawn(self.clone().change_receiving_whole(chat_id, change))
+    }
+
+    fn change_receiving_whole(
+        self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> futures_util::future::BoxFuture<'static, Option<LoopId>> {
+        Box::pin(async move { self.change_and_record_receiving(chat_id, change).await })
+    }
+
+    async fn change_and_record_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> Option<LoopId> {
         let boundary = self.enter_trigger_boundary(chat_id).await;
         let changed = {
             let mut chats = self.inner.chats.lock().await;
@@ -638,8 +660,10 @@ impl Agent {
             operations
         };
         // Paused here at once, so no Trigger input starts meanwhile, and again with the record,
-        // before the lease is returned: a process taking it over sees the pause.
-        self.change_receiving(chat_id, ReceivingChange::Paused)
+        // before the lease is returned: a process taking it over sees the pause. The record is
+        // started with the pause, so a stop that stops waiting still records it.
+        let _ = self
+            .change_receiving(chat_id, ReceivingChange::Paused)
             .await;
         Ok(operations)
     }
