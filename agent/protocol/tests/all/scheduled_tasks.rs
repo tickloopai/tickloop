@@ -1,6 +1,6 @@
 use serde_json::json;
 use tickloop_agent_protocol::{
-    ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskKind, ScheduledTaskPromptSource,
+    ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskKind,
 };
 
 fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>) -> ScheduledTask {
@@ -8,7 +8,7 @@ fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>
         id: "0a1b2c3d".into(),
         kind,
         prompt: "check the deploy".into(),
-        prompt_source: ScheduledTaskPromptSource::User,
+        creator: ScheduledTaskCreator::User,
         confirmation,
         created_at_ms: 1_000,
         expires_at_ms: Some(605_801_000),
@@ -33,7 +33,7 @@ fn scheduled_tasks_serialize_with_tagged_kinds() {
         value["kind"],
         json!({"type": "recurring", "cron": "*/5 * * * *"})
     );
-    assert_eq!(value["prompt_source"], "user");
+    assert_eq!(value["creator"], "user");
     assert_eq!(value["confirmation"], json!(null));
     assert_eq!(
         serde_json::from_value::<ScheduledTask>(value).unwrap(),

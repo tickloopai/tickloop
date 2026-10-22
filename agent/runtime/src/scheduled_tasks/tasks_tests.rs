@@ -3,23 +3,23 @@ use std::time::Duration;
 use chrono::{DateTime, FixedOffset, TimeZone};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
-    MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskDecision,
-    ScheduledTaskKind, ScheduledTaskPromptSource,
+    MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
+    ScheduledTaskDecision, ScheduledTaskKind,
 };
 
 use super::tasks::{
-    Creation, CronTask, FALLBACK_WAKEUP_DELAY, ScheduledTaskError, ScheduledTasks,
+    Creation, CronTask, DecisionOutcome, FALLBACK_WAKEUP_DELAY, ScheduledTaskError, ScheduledTasks,
     SelfPacedTurnEnd, Wakeup,
 };
 
 const NO_JITTER_ID: &str = "00000000";
 const HALF_ID: &str = "80000000";
 const USER: Creation = Creation {
-    prompt_source: ScheduledTaskPromptSource::User,
+    creator: ScheduledTaskCreator::User,
     needs_confirmation: false,
 };
 const AGENT_NEEDING_CONFIRMATION: Creation = Creation {
-    prompt_source: ScheduledTaskPromptSource::Agent,
+    creator: ScheduledTaskCreator::Agent,
     needs_confirmation: true,
 };
 
@@ -60,6 +60,13 @@ fn wakeup(delay_seconds: u64) -> Wakeup {
         delay: Duration::from_secs(delay_seconds),
         reason: "build running".into(),
         prompt: "check the build".into(),
+    }
+}
+
+fn confirmed(outcome: Result<DecisionOutcome<'_>, ScheduledTaskError>) -> ScheduledTask {
+    match outcome {
+        Ok(DecisionOutcome::Confirmed(task)) => task.clone(),
+        other => panic!("expected a confirmed task, got {other:?}"),
     }
 }
 
@@ -203,10 +210,8 @@ fn pending_tasks_do_not_time_until_confirmed() {
     assert!(tasks.take_due(&local(23, 10, 0, 0)).fired.is_empty());
 
     let confirmed_at = local(22, 10, 33, 0);
-    let confirmed = tasks
-        .decide(NO_JITTER_ID, ScheduledTaskDecision::Confirm, &confirmed_at)
-        .unwrap()
-        .unwrap();
+    let confirmed =
+        confirmed(tasks.decide(NO_JITTER_ID, ScheduledTaskDecision::Confirm, &confirmed_at));
     assert_eq!(
         confirmed.confirmation,
         Some(ScheduledTaskConfirmation::Confirmed)
@@ -231,10 +236,10 @@ fn rejecting_a_pending_task_deletes_it() {
         AGENT_NEEDING_CONFIRMATION,
         now,
     );
-    assert_eq!(
+    assert!(matches!(
         tasks.decide(HALF_ID, ScheduledTaskDecision::Reject, &now),
-        Ok(None)
-    );
+        Ok(DecisionOutcome::Rejected(task)) if task.id == HALF_ID
+    ));
     assert!(tasks.tasks().is_empty());
     assert_eq!(
         tasks.decide(HALF_ID, ScheduledTaskDecision::Reject, &now),
@@ -254,14 +259,11 @@ fn a_pending_wakeup_starts_its_delay_when_confirmed() {
         )
         .unwrap();
     assert_eq!(tasks.next_wake_at_ms(true), None);
-    let confirmed = tasks
-        .decide(
-            HALF_ID,
-            ScheduledTaskDecision::Confirm,
-            &local(22, 11, 0, 0),
-        )
-        .unwrap()
-        .unwrap();
+    let confirmed = confirmed(tasks.decide(
+        HALF_ID,
+        ScheduledTaskDecision::Confirm,
+        &local(22, 11, 0, 0),
+    ));
     assert_eq!(confirmed.next_fire_at_ms, Some(ms(local(22, 11, 10, 0))));
 }
 
@@ -683,4 +685,60 @@ fn stored_tasks_keep_timing_where_they_left_off() {
     assert_eq!(restored, tasks);
     let due = restored.take_due(&local(22, 10, 10, 0));
     assert_eq!(due.fired[0].scheduled_for_ms, ms(local(22, 10, 10, 0)));
+}
+
+#[test]
+fn confirming_a_one_shot_task_after_its_time_deletes_it_unrun() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        HALF_ID,
+        one_shot("0 15 * * *"),
+        AGENT_NEEDING_CONFIRMATION,
+        local(22, 10, 0, 0),
+    );
+    let outcome = tasks.decide(
+        HALF_ID,
+        ScheduledTaskDecision::Confirm,
+        &local(22, 15, 0, 0),
+    );
+    assert!(matches!(outcome, Ok(DecisionOutcome::ExpiredUnrun(task)) if task.id == HALF_ID));
+    assert!(tasks.tasks().is_empty());
+}
+
+#[test]
+fn confirming_a_recurring_task_after_its_seven_days_deletes_it_unrun() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        HALF_ID,
+        recurring("0 9 * * *"),
+        AGENT_NEEDING_CONFIRMATION,
+        local(15, 10, 0, 0),
+    );
+    let outcome = tasks.decide(
+        HALF_ID,
+        ScheduledTaskDecision::Confirm,
+        &local(22, 10, 0, 0),
+    );
+    assert!(matches!(outcome, Ok(DecisionOutcome::ExpiredUnrun(task)) if task.id == HALF_ID));
+    assert!(tasks.tasks().is_empty());
+}
+
+#[test]
+fn confirming_a_one_shot_task_before_its_time_keeps_that_time() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        NO_JITTER_ID,
+        one_shot("0 15 * * *"),
+        AGENT_NEEDING_CONFIRMATION,
+        local(22, 10, 0, 0),
+    );
+    let confirmed = confirmed(tasks.decide(
+        NO_JITTER_ID,
+        ScheduledTaskDecision::Confirm,
+        &local(22, 14, 0, 0),
+    ));
+    assert_eq!(confirmed.scheduled_for_ms, Some(ms(local(22, 15, 0, 0))));
 }

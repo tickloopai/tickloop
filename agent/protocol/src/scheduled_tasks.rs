@@ -10,8 +10,10 @@ pub struct ScheduledTask {
     /// Eight lowercase hexadecimal characters; jitter is derived from it.
     pub id: String,
     pub kind: ScheduledTaskKind,
+    /// The instruction to run, or a placeholder the host replaces with `loop.md` or the
+    /// built-in maintenance instructions each time the task runs.
     pub prompt: String,
-    pub prompt_source: ScheduledTaskPromptSource,
+    pub creator: ScheduledTaskCreator,
     /// `None` when the task never needed confirming.
     pub confirmation: Option<ScheduledTaskConfirmation>,
     pub created_at_ms: u64,
@@ -54,13 +56,14 @@ pub enum ScheduledTaskKind {
     },
 }
 
-/// Who wrote the instruction the task runs.
+/// Who created the task, which decides whether a host without permission requests asks the
+/// user to confirm it first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ScheduledTaskPromptSource {
-    /// The user, through `/loop`.
+pub enum ScheduledTaskCreator {
+    /// The user: CronCreate or ScheduleWakeup in the turn the user's `/loop` started.
     User,
-    /// The Agent, through CronCreate or ScheduleWakeup.
+    /// The Agent on its own: every other CronCreate or ScheduleWakeup.
     Agent,
 }
 

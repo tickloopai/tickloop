@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone};
 use tickloop_agent_cron::{Run, Schedule, TaskKind, generate_task_id, next_run};
 use tickloop_agent_protocol::{
-    MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskDecision,
-    ScheduledTaskKind, ScheduledTaskPromptSource,
+    MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
+    ScheduledTaskDecision, ScheduledTaskKind,
 };
 
 /// Recurring and self-paced tasks run one last time this long after creation.
@@ -36,10 +36,10 @@ pub(crate) enum CronTask {
 }
 
 /// Who creates a task and whether the host must ask the user before it starts timing: the
-/// Agent creating one on a host without permission requests.
+/// Agent creating one on a host without permission requests. The caller decides both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Creation {
-    pub prompt_source: ScheduledTaskPromptSource,
+    pub creator: ScheduledTaskCreator,
     pub needs_confirmation: bool,
 }
 
@@ -49,6 +49,16 @@ pub(crate) struct Wakeup {
     pub delay: Duration,
     pub reason: String,
     pub prompt: String,
+}
+
+/// The result of the user's answer to a pending task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecisionOutcome<'a> {
+    Confirmed(&'a ScheduledTask),
+    Rejected(ScheduledTask),
+    /// Confirmed too late: its one-shot time or its seven days had passed, so it was deleted
+    /// without running.
+    ExpiredUnrun(ScheduledTask),
 }
 
 /// What became of the self-paced task when one of its turns ended.
@@ -246,14 +256,14 @@ impl ScheduledTasks {
         Some(self.tasks.remove(index))
     }
 
-    /// The user's answer to a pending task: confirming starts its timing from `now`,
-    /// rejecting deletes it. Returns the confirmed task, or `None` once rejected.
+    /// The user's answer to a pending task: confirming starts its timing from `now`, unless
+    /// the task already expired, and rejecting deletes it.
     pub(crate) fn decide<Tz: TimeZone>(
         &mut self,
         id: &str,
         decision: ScheduledTaskDecision,
         now: &DateTime<Tz>,
-    ) -> Result<Option<&ScheduledTask>, ScheduledTaskError> {
+    ) -> Result<DecisionOutcome<'_>, ScheduledTaskError> {
         let index = self
             .tasks
             .iter()
@@ -264,10 +274,12 @@ impl ScheduledTasks {
         }
         match decision {
             ScheduledTaskDecision::Reject => {
-                self.tasks.remove(index);
-                Ok(None)
+                Ok(DecisionOutcome::Rejected(self.tasks.remove(index)))
             }
             ScheduledTaskDecision::Confirm => {
+                if has_expired(&self.tasks[index], now) {
+                    return Ok(DecisionOutcome::ExpiredUnrun(self.tasks.remove(index)));
+                }
                 let task = &mut self.tasks[index];
                 task.confirmation = Some(ScheduledTaskConfirmation::Confirmed);
                 match timing_after(task, now) {
@@ -279,7 +291,7 @@ impl ScheduledTasks {
                         return Err(ScheduledTaskError::NeverRuns(id.to_string()));
                     }
                 }
-                Ok(Some(&self.tasks[index]))
+                Ok(DecisionOutcome::Confirmed(&self.tasks[index]))
             }
         }
     }
@@ -356,17 +368,9 @@ impl ScheduledTasks {
         &mut self,
         now: &DateTime<Tz>,
     ) -> Vec<ScheduledTask> {
-        let now_ms = millis(now);
         let (kept, removed) = std::mem::take(&mut self.tasks)
             .into_iter()
-            .partition(|task| match &task.kind {
-                ScheduledTaskKind::SelfPaced { .. } => false,
-                ScheduledTaskKind::Recurring { .. } => task
-                    .expires_at_ms
-                    .is_none_or(|expires_at| expires_at > now_ms),
-                ScheduledTaskKind::OneShot { cron } => one_shot_time(task, cron, now)
-                    .is_some_and(|scheduled_for| scheduled_for > now_ms),
-            });
+            .partition(|task| !is_self_paced(task) && !has_expired(task, now));
         self.tasks = kept;
         removed
     }
@@ -478,6 +482,19 @@ fn fire<Tz: TimeZone>(task: &mut ScheduledTask, now: &DateTime<Tz>) -> Option<Fi
     })
 }
 
+/// Whether a one-shot task's time or a recurring or self-paced task's seven days have passed.
+fn has_expired<Tz: TimeZone>(task: &ScheduledTask, now: &DateTime<Tz>) -> bool {
+    let now_ms = millis(now);
+    match &task.kind {
+        ScheduledTaskKind::Recurring { .. } | ScheduledTaskKind::SelfPaced { .. } => task
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at <= now_ms),
+        ScheduledTaskKind::OneShot { cron } => {
+            one_shot_time(task, cron, now).is_none_or(|scheduled_for| scheduled_for <= now_ms)
+        }
+    }
+}
+
 /// The scheduled time of a one-shot task: the stored one, or for a pending task the first
 /// time its cron names after creation.
 fn one_shot_time<Tz: TimeZone>(
@@ -505,7 +522,7 @@ fn new_task<Tz: TimeZone>(
         id,
         kind,
         prompt,
-        prompt_source: creation.prompt_source,
+        creator: creation.creator,
         confirmation: creation
             .needs_confirmation
             .then_some(ScheduledTaskConfirmation::Pending),
