@@ -499,8 +499,11 @@ struct Chat {
     /// Another stored branch of the Chat is being restored to replace its conversation: until the
     /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
     branch_reservation: Option<Uuid>,
-    /// The stored goal's generation this process last adopted or wrote.
-    goal_generation: u64,
+    /// The goal's usage when its record was last written.
+    goal_recorded_tokens: u64,
+    /// Restored from history by this process and not yet taken over: the history-load rule
+    /// applies to its goal once it takes the Trigger lease.
+    loaded_from_history: bool,
     /// When the goal's running time was last settled.
     goal_clock_ms: u64,
 }
@@ -2184,7 +2187,8 @@ impl Agent {
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
                 branch_reservation: None,
-                goal_generation: 0,
+                goal_recorded_tokens: 0,
+                loaded_from_history: false,
                 goal_clock_ms: 0,
             },
         );

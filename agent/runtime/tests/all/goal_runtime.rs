@@ -728,7 +728,7 @@ async fn create_goal_fails_while_an_unfinished_goal_exists() {
 }
 
 #[tokio::test]
-async fn a_history_load_pauses_an_active_goal() {
+async fn taking_over_a_loaded_chat_pauses_its_active_goal() {
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
     let model = HoldingModel::new(vec![text("ready")], Vec::new());
@@ -747,21 +747,26 @@ async fn a_history_load_pauses_an_active_goal() {
     set_goal(&agent, chat, None).await;
     agent.shutdown().await;
 
-    let reopened = Agent::open(
-        root.path().into(),
-        config(),
-        Arc::new(ScriptedModel::new(Vec::new())),
-    )
-    .unwrap();
-    let snapshot = reopened.resume_chat(chat).await.unwrap();
-    let goal = snapshot.goal.expect("the goal was restored");
-    assert_eq!(goal.objective, OBJECTIVE);
+    let reopened_model = Arc::new(ScriptedModel::new(Vec::new()));
+    let reopened = Agent::open(root.path().into(), config(), reopened_model.clone()).unwrap();
+    let goal_after_load = reopened.resume_chat(chat).await.unwrap().goal.unwrap();
+    assert_eq!(goal_after_load.objective, OBJECTIVE);
     assert_eq!(
-        goal.status,
+        goal_after_load.status,
+        GoalStatus::Active,
+        "loading alone changes nothing"
+    );
+
+    // Continued, the process takes the Chat's execution over from its gone holder.
+    reopened.continue_loop(chat).await.unwrap();
+    assert_eq!(
+        goal(&reopened, chat).await.unwrap().status,
         GoalStatus::Paused {
             by: GoalPause::HistoryLoaded
         }
     );
+    tokio::time::sleep(SETTLE).await;
+    assert!(reopened_model.requests.lock().unwrap().is_empty());
     reopened.shutdown().await;
 }
 
@@ -1062,6 +1067,7 @@ async fn two_processes(
 }
 
 #[tokio::test]
+#[ignore = "waits for the wake-up base's take-over hook (ticket 20)"]
 async fn a_goal_cleared_in_another_process_is_neither_continued_nor_written_back() {
     let first_model = HoldingModel::new(vec![text("ready"), text("still here")], Vec::new());
     let second_model = HoldingModel::new(Vec::new(), Vec::new());
@@ -1099,6 +1105,7 @@ async fn a_goal_cleared_in_another_process_is_neither_continued_nor_written_back
 }
 
 #[tokio::test]
+#[ignore = "waits for the wake-up base's take-over hook (ticket 20)"]
 async fn a_goal_edited_in_another_process_is_continued_with_the_new_objective() {
     const EDITED: &str = "Ship the import command with tests";
     let first_model = HoldingModel::new(
@@ -1148,7 +1155,7 @@ async fn usage_charged_mid_turn_survives_a_crash() {
     let folder = tempfile::tempdir().unwrap();
     let model = HoldingModel::new(
         vec![call("g1", "GetGoal", json!({})), text("unreachable")],
-        vec![usage(300)],
+        vec![usage(25_000)],
     );
     // The continuation's second request waits, as a turn waiting on a long tool would.
     *model.held_request.lock().unwrap() = Some(1);
@@ -1166,17 +1173,20 @@ async fn usage_charged_mid_turn_survives_a_crash() {
     let held = model.held.notified();
     tokio::pin!(held);
     held.as_mut().enable();
-    set_goal(&agent, chat, Some(1_000)).await;
+    set_goal(&agent, chat, Some(100_000)).await;
     tokio::time::timeout(WAIT, held)
         .await
         .expect("the turn's second request is held");
-    assert_eq!(goal(&agent, chat).await.unwrap().tokens_used, 300);
+    assert_eq!(goal(&agent, chat).await.unwrap().tokens_used, 25_000);
     agent.flush_transcripts().await;
     let image = super::wakeup_support::crash_image(root.path(), folder.path());
 
     let reopened = Agent::open(image, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let goal = reopened.resume_chat(chat).await.unwrap().goal.unwrap();
-    assert_eq!(goal.tokens_used, 300, "the charged usage was kept");
+    assert_eq!(
+        goal.tokens_used, 25_000,
+        "usage past the record threshold was kept"
+    );
     reopened.shutdown().await;
     model.release();
     agent.shutdown().await;

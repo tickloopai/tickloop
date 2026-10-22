@@ -1181,7 +1181,6 @@ impl Source for GoalSource {
         Self::with_goal(process, hand_overs).await
     }
 
-    /// Its load paused the goal for every process; the user resumes it there.
     async fn another_host(&self, model: Arc<ContractModel>) -> Self {
         let process = self
             .process
@@ -1189,11 +1188,6 @@ impl Source for GoalSource {
                 agent.hold_goal_continuations_for_tests()
             })
             .await;
-        process
-            .agent
-            .manage_goal(process.chat, GoalAction::Resume)
-            .await
-            .unwrap();
         Self::with_goal(process, HandOvers::default()).await
     }
 }

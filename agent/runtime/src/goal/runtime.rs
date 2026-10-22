@@ -23,7 +23,6 @@ use super::prompts::{self, GoalPromptContext};
 use super::state::{
     self, ContinuationConditions, GoalEffect, GoalError, GoalEvent, GoalTransition, TurnSummary,
 };
-use super::store::GoalStore;
 use super::tools::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GoalReport, NewGoal, UPDATE_GOAL_TOOL_NAME,
 };
@@ -31,6 +30,9 @@ use crate::model_request::RequestContext;
 use crate::wakeup::TriggerDelivery;
 use crate::{Agent, AgentError, Chat};
 
+/// The usage a goal may gain before it is recorded again between turn ends: at most this much
+/// goes uncounted when the process crashes.
+const USAGE_RECORD_TOKENS: u64 = 20_000;
 /// Assumed when the check model's card names no context window, as for the approval reviewer.
 const DEFAULT_CHECK_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 /// The approval reviewer's bound on one request's payload, which the check shares.
@@ -133,8 +135,6 @@ pub(crate) enum GoalUpdateError {
     Goal(#[from] GoalError),
     #[error("the Chat is no longer loaded")]
     NotLoaded,
-    #[error("the goal could not be stored: {0}")]
-    Storage(String),
 }
 
 impl From<GoalUpdateError> for AgentError {
@@ -142,7 +142,6 @@ impl From<GoalUpdateError> for AgentError {
         match error {
             GoalUpdateError::Goal(error) => invalid(error),
             GoalUpdateError::NotLoaded => AgentError::NotFound,
-            GoalUpdateError::Storage(error) => AgentError::Storage(error),
         }
     }
 }
@@ -206,17 +205,9 @@ pub(crate) fn background_work_runs(chats: &HashMap<ChatId, Chat>, chat_id: ChatI
             .is_some_and(|chat| background_shells_run(&chat.snapshot))
 }
 
-fn goal_store(chat: &Chat) -> Option<GoalStore> {
-    chat.tools
-        .chat_directory()
-        .map(GoalStore::in_chat_directory)
-}
-
 impl Agent {
-    /// Applies `events` to the Chat's goal as the store keeps it, then carries out what they ask
-    /// for. The goal first gets the running time since it was last settled, while a turn runs or
-    /// as `turn_ends`. A goal record is written when anything but the running usage changed, and
-    /// whenever a turn ends with an unfinished goal; the store keeps the usage meanwhile.
+    /// Applies `events` to the Chat's goal, then carries out what they ask for. The goal first
+    /// gets the running time since it was last settled, while a turn runs or as `turn_ends`.
     pub(crate) async fn update_goal(
         &self,
         chat_id: ChatId,
@@ -224,62 +215,40 @@ impl Agent {
         turn_ends: bool,
     ) -> Result<(), GoalUpdateError> {
         let now_ms = unix_time_milliseconds();
-        let (store, unstored, events) = {
-            let chats = self.inner.chats.lock().await;
-            let chat = chats.get(&chat_id).ok_or(GoalUpdateError::NotLoaded)?;
-            let is_running = turn_ends || chat.active.is_some() || !chat.parked.is_empty();
-            let started_ms = chat
-                .snapshot
-                .chat_loop
-                .run_started_at
-                .unwrap_or(now_ms)
-                .max(chat.goal_clock_ms);
-            let mut settled = Vec::new();
-            if is_running && now_ms > started_ms {
-                settled.push(GoalEvent::TimeElapsed {
-                    ms: now_ms - started_ms,
-                });
-            }
-            settled.extend(events);
-            (goal_store(chat), chat.snapshot.goal.clone(), settled)
-        };
-        let (generation, goal, effects) = match store {
-            Some(store) => {
-                let (stored, effects) = tokio::task::spawn_blocking(move || {
-                    store.update(unstored, |base| apply_events(base, events, now_ms))
-                })
-                .await
-                .map_err(|error| GoalUpdateError::Storage(error.to_string()))?
-                .map_err(|error| GoalUpdateError::Storage(error.to_string()))??;
-                (Some(stored.generation), stored.goal, effects)
-            }
-            None => {
-                let (goal, effects) = apply_events(unstored.as_ref(), events, now_ms)?;
-                (None, goal, effects)
-            }
-        };
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(GoalUpdateError::NotLoaded)?;
-        chat.goal_clock_ms = chat.goal_clock_ms.max(now_ms);
-        self.adopt_goal(chat, generation, goal, effects, turn_ends);
+        let is_running = turn_ends || chat.active.is_some() || !chat.parked.is_empty();
+        let started_ms = chat
+            .snapshot
+            .chat_loop
+            .run_started_at
+            .unwrap_or(now_ms)
+            .max(chat.goal_clock_ms);
+        let mut settled = Vec::new();
+        if is_running && now_ms > started_ms {
+            settled.push(GoalEvent::TimeElapsed {
+                ms: now_ms - started_ms,
+            });
+        }
+        settled.extend(events);
+        let (goal, effects) = apply_events(chat.snapshot.goal.as_ref(), settled, now_ms)?;
+        chat.goal_clock_ms = now_ms;
+        self.adopt_goal(chat, goal, effects, turn_ends);
         Ok(())
     }
 
-    /// Takes on a change of the goal: the goal itself unless a newer stored one was adopted
-    /// already, then its effects and its record.
+    /// Takes on a change of the goal, then its effects and its record. A record is written when
+    /// anything but the running usage changed, when a turn ends with an unfinished goal, and
+    /// once the usage grew by [`USAGE_RECORD_TOKENS`] since the last record, which bounds what a
+    /// crash leaves uncounted.
     fn adopt_goal(
         &self,
         chat: &mut Chat,
-        generation: Option<u64>,
         goal: Option<GoalSnapshot>,
         effects: Vec<GoalEffect>,
         turn_ends: bool,
     ) {
-        let previous = chat.snapshot.goal.clone();
-        if generation.is_none_or(|generation| generation > chat.goal_generation) {
-            chat.snapshot.goal = goal;
-            chat.goal_generation = generation.unwrap_or(chat.goal_generation);
-        }
+        let previous = std::mem::replace(&mut chat.snapshot.goal, goal);
         let mut notices = Vec::new();
         for effect in effects {
             match effect {
@@ -304,74 +273,18 @@ impl Agent {
                 ),
             }
         }
-        let is_recorded = without_usage(chat.snapshot.goal.as_ref())
-            != without_usage(previous.as_ref())
-            || (turn_ends
-                && chat
-                    .snapshot
-                    .goal
-                    .as_ref()
-                    .is_some_and(|goal| !goal.status.is_finished()));
+        let goal = chat.snapshot.goal.as_ref();
+        let is_unfinished = goal.is_some_and(|goal| !goal.status.is_finished());
+        let unrecorded_tokens = goal.map_or(0, |goal| {
+            goal.tokens_used.saturating_sub(chat.goal_recorded_tokens)
+        });
+        let is_recorded = without_usage(goal) != without_usage(previous.as_ref())
+            || (turn_ends && is_unfinished)
+            || unrecorded_tokens >= USAGE_RECORD_TOKENS;
         if is_recorded || !notices.is_empty() {
-            let subject = chat.snapshot.goal.as_ref().or(previous.as_ref());
-            self.record_goal(
-                chat,
-                subject.map(|goal| (goal.id, goal.objective.clone())),
-                notices,
-            );
-        }
-    }
-
-    /// Adopts the goal another process stored since this one last did: it may have cleared,
-    /// paused or edited it. What waits for a goal no longer active is withdrawn.
-    pub(crate) async fn sync_goal_from_store(&self, chat_id: ChatId) {
-        let Some(store) = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .and_then(goal_store)
-        else {
-            return;
-        };
-        let stored = match tokio::task::spawn_blocking(move || store.read()).await {
-            Ok(Ok(Some(stored))) => stored,
-            Ok(Ok(None)) => return,
-            Ok(Err(error)) => {
-                tracing::warn!(chat = %chat_id, %error, "could not read the stored goal");
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(chat = %chat_id, %error, "could not read the stored goal");
-                return;
-            }
-        };
-        let mut chats = self.inner.chats.lock().await;
-        let Some(chat) = chats.get_mut(&chat_id) else {
-            return;
-        };
-        if stored.generation <= chat.goal_generation {
-            return;
-        }
-        let changed =
-            without_usage(stored.goal.as_ref()) != without_usage(chat.snapshot.goal.as_ref());
-        chat.snapshot.goal = stored.goal;
-        chat.goal_generation = stored.generation;
-        self.withdraw_ended_inputs(chat);
-        self.save(&chat.snapshot);
-        if changed {
-            let receipt = Receipt {
-                chat_id,
-                loop_id: chat.snapshot.chat_loop.id,
-                run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
-            };
-            let goal = chat.snapshot.goal.clone();
-            self.publish_event(
-                chat,
-                &receipt,
-                EventKind::GoalUpdated { goal, notice: None },
-            );
+            let subject = goal.or(previous.as_ref());
+            let subject = subject.map(|goal| (goal.id, goal.objective.clone()));
+            self.record_goal(chat, subject, notices);
         }
     }
 
@@ -383,6 +296,11 @@ impl Agent {
         notices: Vec<GoalNotice>,
     ) {
         let chat_id = chat.snapshot.id;
+        chat.goal_recorded_tokens = chat
+            .snapshot
+            .goal
+            .as_ref()
+            .map_or(0, |goal| goal.tokens_used);
         self.record_chat_metadata(
             chat_id,
             Line::Goal(GoalEntry {
@@ -466,18 +384,15 @@ impl Agent {
             GoalAction::Clear => GoalEvent::Clear,
             GoalAction::SetBudget { token_budget } => GoalEvent::SetBudget { token_budget },
         };
-        if self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .snapshot
-            .delegation
-            .is_some()
         {
-            return Err(AgentError::Invalid(SUBAGENT_HAS_NO_GOAL.into()));
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            if chat.snapshot.delegation.is_some() {
+                return Err(AgentError::Invalid(SUBAGENT_HAS_NO_GOAL.into()));
+            }
+            // The user's own command here decides the goal; the history-load rule no longer
+            // applies to it.
+            chat.loaded_from_history = false;
         }
         self.update_goal(chat_id, vec![event], false).await?;
         if starts_work {
@@ -508,11 +423,20 @@ impl Agent {
         }
     }
 
-    /// An ordinary history load pauses the active goal of a root Chat it brought in, as the
-    /// store keeps it.
-    pub(crate) async fn pause_goal_after_history_load(&self, chat_id: ChatId) {
-        self.sync_goal_from_store(chat_id).await;
-        self.pause_goal(chat_id, GoalEvent::HistoryLoaded).await;
+    /// The history-load rule, when a process that loaded the Chat from its history takes its
+    /// Trigger lease over and so its execution: a goal still active, whose holder is gone, is
+    /// paused. Loading alone, while another process holds the Chat, changes nothing.
+    pub(crate) async fn pause_goal_on_takeover(&self, chat_id: ChatId) {
+        let loaded_from_history = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get_mut(&chat_id)
+            .is_some_and(|chat| std::mem::take(&mut chat.loaded_from_history));
+        if loaded_from_history {
+            self.pause_goal(chat_id, GoalEvent::HistoryLoaded).await;
+        }
     }
 
     /// Charges the tokens a model reported for any member of the family to its root's goal.
@@ -589,7 +513,6 @@ impl Agent {
         {
             return;
         }
-        self.sync_goal_from_store(chat_id).await;
         let delivery = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
@@ -673,7 +596,6 @@ impl Agent {
         match operation.name.as_str() {
             GET_GOAL_TOOL_NAME => {
                 super::tools::parse_get_goal(&operation.input)?;
-                self.sync_goal_from_store(receipt.chat_id).await;
                 let chats = self.inner.chats.lock().await;
                 let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
                 Ok(tool_result(
@@ -763,7 +685,6 @@ impl Agent {
                 checker,
             )
         };
-        self.sync_goal_from_store(receipt.chat_id).await;
         let check_cancel = cancel.clone();
         let checked = match checker {
             Ok((client, model)) => {

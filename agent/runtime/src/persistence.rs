@@ -3158,7 +3158,6 @@ impl Agent {
         }
         super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
             .map_err(AgentError::Invalid)?;
-        self.pause_goal_after_history_load(chat_id).await;
         self.snapshot(chat_id).await
     }
 
@@ -3521,7 +3520,8 @@ impl Agent {
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
                 branch_reservation: None,
-                goal_generation: 0,
+                goal_recorded_tokens: snapshot.goal.as_ref().map_or(0, |goal| goal.tokens_used),
+                loaded_from_history: waits == WaitHosting::Process,
                 goal_clock_ms: 0,
             },
         );

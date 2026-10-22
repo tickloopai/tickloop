@@ -393,12 +393,9 @@ impl Agent {
                 self.revalidate_manual_tick_source(chat_id, instance, authority)
                     .await
             }
-            // Another process may have cleared, paused or edited the goal since.
-            TriggerSource::GoalContinuation { .. } => {
-                self.sync_goal_from_store(chat_id).await;
-                Ok(())
-            }
-            TriggerSource::ArtifactFeedback { .. } | TriggerSource::ScheduledTask { .. } => Ok(()),
+            TriggerSource::ArtifactFeedback { .. }
+            | TriggerSource::GoalContinuation { .. }
+            | TriggerSource::ScheduledTask { .. } => Ok(()),
         }
     }
 
@@ -525,7 +522,7 @@ impl Agent {
             )
         };
         self.refresh_tick_watermarks(chat_id, delivered).await;
-        self.sync_goal_from_store(chat_id).await;
+        self.pause_goal_on_takeover(chat_id).await;
         if takes_waiting_input {
             self.inner
                 .tasks
