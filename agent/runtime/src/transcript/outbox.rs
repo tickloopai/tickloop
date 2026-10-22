@@ -23,9 +23,6 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
     pub task_boards: Option<TaskBoardsEntry>,
-    /// 只供装载读取，不重新追加：Goal 只由持有 Chat 租约的进程写，重新追加缓存会让未持有的
-    /// 进程写回旧 Goal。
-    pub goal: Option<tickloop_agent_transcript::GoalEntry>,
     pub artifact_ticks: Option<ArtifactTicksEntry>,
     pub monitor_members: Option<MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
@@ -51,7 +48,6 @@ impl CachedMetadata {
             Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
             Line::TaskBoards(entry) => self.task_boards = Some(entry.clone()),
-            Line::Goal(entry) => self.goal = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::FamilyMessageHold(entry) => self.family_message_hold = Some(entry.clone()),

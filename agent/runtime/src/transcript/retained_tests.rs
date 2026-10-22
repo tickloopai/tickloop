@@ -701,3 +701,24 @@ fn goal_events_survive_every_snapshot_in_order() {
         ]
     );
 }
+
+#[test]
+fn a_snapshot_leaves_the_goal_to_its_own_records() {
+    let chat = Uuid::new_v4();
+    let mut fold = RetainedFold::default();
+    fold.apply(&Line::Goal(tickloop_agent_transcript::GoalEntry {
+        chat_id: chat,
+        cwd: Some("/project".into()),
+        goal: None,
+    }));
+    let snapshot = fold.snapshot(chat);
+    let Line::RetainedSnapshot(snapshot) = snapshot else {
+        panic!("a retained snapshot")
+    };
+    assert!(
+        !snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::Goal(_)))
+    );
+}

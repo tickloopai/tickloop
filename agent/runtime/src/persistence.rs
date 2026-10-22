@@ -2127,13 +2127,7 @@ fn recover_transcript(
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
             })
-            .or_else(|| {
-                loaded
-                    .metadata
-                    .goal
-                    .as_ref()
-                    .and_then(|entry| entry.cwd.clone())
-            }),
+            .or_else(|| loaded.goal.as_ref().and_then(|entry| entry.cwd.clone())),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());
     snapshot.generated_title = loaded
@@ -2165,7 +2159,6 @@ fn recover_transcript(
         .unwrap_or_default();
     if chat_id == source_chat_id {
         snapshot.goal = loaded
-            .metadata
             .goal
             .as_ref()
             .filter(|entry| entry.chat_id == chat_id)

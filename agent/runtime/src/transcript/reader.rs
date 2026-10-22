@@ -5,7 +5,7 @@ use uuid::Uuid;
 use tickloop_agent_base::timestamp::parse_timestamp_ms;
 use tickloop_agent_protocol::{Content, OriginalUserInput, Role, Usage};
 use tickloop_agent_transcript::{
-    ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line,
+    ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, GoalEntry, Line,
 };
 
 use super::outbox::CachedMetadata;
@@ -16,6 +16,9 @@ pub(crate) struct LoadedTranscript {
     /// 从根到叶子的当前对话链。
     pub chain: Vec<ChainEntry>,
     pub metadata: CachedMetadata,
+    /// The latest record of the Chat's goal, the state of a Trigger source, which is not cached
+    /// as metadata.
+    pub goal: Option<GoalEntry>,
     /// 照 Claude Code：按条目 `messageId` 保存的文件回滚快照，同一键以最后一条为准。
     pub file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
     /// 文件顺序中全部内容替换条目；调用方按 chatId 取用（照 Claude Code 按 sessionId 取用）。
@@ -37,6 +40,7 @@ pub(crate) struct LoadedTranscript {
 #[derive(Default)]
 struct RetainedState {
     metadata: CachedMetadata,
+    goal: Option<GoalEntry>,
     file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
     content_replacements: Vec<ContentReplacementEntry>,
     lifecycle: Vec<Line>,
@@ -60,7 +64,7 @@ impl RetainedState {
                 self.metadata.family_message_hold = Some(entry.clone())
             }
             Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
-            Line::Goal(entry) => self.metadata.goal = Some(entry.clone()),
+            Line::Goal(entry) => self.goal = Some(entry.clone()),
             Line::FamilyCompletions(entry) => {
                 self.metadata.family_completions = Some(entry.clone())
             }
@@ -210,6 +214,7 @@ pub(crate) fn assemble(
     }
     let RetainedState {
         metadata,
+        goal,
         file_history_snapshots,
         content_replacements,
         lifecycle,
@@ -264,14 +269,14 @@ pub(crate) fn assemble(
                 .monitor_members
                 .as_ref()
                 .is_some_and(|entry| entry.materializes_chat())
-            || metadata
-                .goal
+            || goal
                 .as_ref()
                 .is_some_and(|entry| entry.cwd.is_some() && entry.goal.is_some());
         let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
             chain: Vec::new(),
             metadata,
+            goal,
             file_history_snapshots,
             content_replacements,
             warnings,
@@ -316,6 +321,7 @@ pub(crate) fn assemble(
         uuids,
         chain,
         metadata,
+        goal,
         file_history_snapshots,
         content_replacements,
         warnings,
