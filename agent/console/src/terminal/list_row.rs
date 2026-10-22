@@ -6,11 +6,12 @@
 //! takes the update colour over its state colour while the row holds an unhandled update; while a
 //! periodic subscription holds the update, a bar runs from the first column across the row.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
-    conversation_picker::ellipsize,
     display::{DisplayProfile, Glyph},
+    loop_view_text::ellipsize,
     style::{Role, RoleLine},
 };
 use crate::monitor_rows::{StatusTone, SubscriptionMark};
@@ -129,7 +130,9 @@ impl ListRow<'_> {
     /// Selection takes priority over a flash, with the progress bar over the selection.
     /// Progress and flashes start at the name; the subscription mark keeps its own background.
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
-        line.truncate(width);
+        if line.text().width() > width {
+            line.truncate(width);
+        }
         let name_start = name_column(self.glyph).min(width);
         let bar = self
             .bar_columns
@@ -153,16 +156,16 @@ impl ListRow<'_> {
 fn split_at_columns(text: &str, columns: usize) -> (&str, &str) {
     let mut used = 0;
     let mut last_space = None;
-    for (index, character) in text.char_indices() {
-        let character_columns = character.width().unwrap_or(0);
-        if used + character_columns > columns {
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let grapheme_columns = grapheme.width();
+        if used + grapheme_columns > columns {
             let cut = last_space.filter(|space| *space > 0).unwrap_or(index);
             return (text[..cut].trim_end(), text[cut..].trim_start());
         }
-        if character == ' ' {
+        if grapheme == " " {
             last_space = Some(index);
         }
-        used += character_columns;
+        used += grapheme_columns;
     }
     (text, "")
 }
@@ -358,6 +361,37 @@ mod tests {
             lines[1].width(),
             "details share one right edge"
         );
+    }
+
+    #[test]
+    fn splitting_and_rendering_names_preserve_whole_graphemes() {
+        for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
+            let name = format!("{grapheme}abc");
+            assert_eq!(split_at_columns(&name, 1), ("", name.as_str()));
+            assert_eq!(split_at_columns(&name, 2), (grapheme, "abc"));
+            assert_eq!(
+                split_at_columns(&name, 3),
+                (format!("{grapheme}a").as_str(), "bc")
+            );
+            let spaced = format!("go {grapheme}abc");
+            assert_eq!(split_at_columns(&spaced, 5), ("go", name.as_str()));
+            assert_eq!(
+                row(&name, "")
+                    .lines(6)
+                    .iter()
+                    .map(RoleLine::text)
+                    .collect::<Vec<_>>(),
+                [format!("  $ {grapheme}"), "    a…".into()]
+            );
+            assert_eq!(
+                row(&format!("abcd{grapheme}abc"), "")
+                    .lines(8)
+                    .iter()
+                    .map(RoleLine::text)
+                    .collect::<Vec<_>>(),
+                ["  $ abcd".into(), format!("    {grapheme}a…")]
+            );
+        }
     }
 
     #[test]
