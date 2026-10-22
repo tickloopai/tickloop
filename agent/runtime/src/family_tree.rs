@@ -202,6 +202,9 @@ impl Agent {
             }
             members
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.wait_family_pause(target, crate::family_pauses::Point::StopAdmitted)
+            .await;
         let mut unknown = Vec::new();
         let mut errors = Vec::new();
         for (id, commands, shells) in &members {

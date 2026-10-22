@@ -14,6 +14,7 @@ pub mod routed;
 pub mod screen;
 pub mod shell_ticks;
 pub mod stateless_host;
+pub mod subagents;
 pub mod transcripts;
 
 /// A short canonical directory for test sockets, whose paths are limited to about 100 bytes;

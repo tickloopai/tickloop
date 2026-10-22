@@ -1392,6 +1392,7 @@ async fn host_rules_reach_a_child_live_and_are_never_recorded_with_its_delegatio
 }
 
 const HELD_FAMILY_MESSAGE: &str = "Message retained across the stop";
+const OUTSIDE_FAMILY_MESSAGE: &str = "Outside family message";
 
 /// Stops either the root or, through StopSubagent, a middle member with a child. The receiver
 /// holds a model request so the ordinary message remains queued until the stop disarms it.
@@ -1407,6 +1408,17 @@ async fn stopped_message_family(
     let store = Arc::new(InMemoryTranscriptStore::new());
     let receiver_holding = Arc::new(Notify::new());
     let model = FamilyModel::new(move |request| match task_of(request).as_deref() {
+        None if subtree
+            && tickloop_agent_test_support::routed::history_text(request)
+                .contains(OUTSIDE_FAMILY_MESSAGE)
+            && !has_tool_result(request, "outside-send") =>
+        {
+            Reply::Says(call(
+                "outside-send",
+                "SendMessage",
+                json!({"to":"middle", "message":OUTSIDE_FAMILY_MESSAGE}),
+            ))
+        }
         Some("leaf") if !has_tool_result(request, "send") => Reply::After(
             receiver_holding.clone(),
             call(
@@ -1679,4 +1691,54 @@ async fn process_restart_preserves_family_inputs_from_both_stop_entries() {
     for subtree in [false, true] {
         assert_stopped_family_recovery(subtree, WaitHosting::Process, false).await;
     }
+}
+
+#[tokio::test]
+async fn ordinary_family_messages_follow_the_stopped_subtree_exception_independently_of_receiving()
+{
+    use tickloop_agent_protocol::Receiving;
+    let (_, agent, root, target, _) = stopped_message_family(true).await;
+    let held = agent.snapshot(target).await.unwrap();
+    let ordinary = held
+        .pending_inputs
+        .iter()
+        .find(|pending| {
+            pending
+                .agent_message
+                .as_ref()
+                .is_some_and(|source| !source.is_result)
+        })
+        .unwrap();
+    assert!(!ordinary.armed);
+    let message_id = ordinary.agent_message.as_ref().unwrap().message_id;
+    assert!(!held.agent_message_origins.contains_key(&message_id));
+    let outside = agent
+        .advance(root, prompt(OUTSIDE_FAMILY_MESSAGE))
+        .await
+        .unwrap();
+    assert!(matches!(
+        settled(&agent, root, outside.input_id()).await,
+        SettledOutcome::Completed { .. }
+    ));
+    let awakened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = agent.snapshot(target).await.unwrap();
+            if snapshot
+                .agent_message_origins
+                .values()
+                .any(|source| source["message_id"] == message_id.to_string())
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a message from outside the stopped subtree releases held family messages");
+    assert!(matches!(
+        awakened.chat_loop.receiving,
+        Receiving::Paused { .. }
+    ));
+    assert!(awakened.pending_inputs.iter().all(|pending| pending.armed));
+    agent.shutdown().await;
 }

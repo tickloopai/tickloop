@@ -58,6 +58,9 @@ pub mod tick_tools;
 pub mod transcript;
 pub use family::summary_state;
 mod family_mailbox;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod family_pauses;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
 mod chat_reads;

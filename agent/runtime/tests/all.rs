@@ -31,6 +31,8 @@ mod approval_stages;
 
 #[path = "all/subagent_handback.rs"]
 mod subagent_handback;
+#[path = "all/subagent_notifications.rs"]
+mod subagent_notifications;
 
 #[path = "all/auto_review_improvements.rs"]
 mod auto_review_improvements;

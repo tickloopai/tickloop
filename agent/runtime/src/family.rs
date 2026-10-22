@@ -424,6 +424,9 @@ impl Agent {
             self.save(&parent.snapshot);
         }
         drop(invocations);
+        #[cfg(any(test, feature = "test-support"))]
+        self.wait_family_pause(child.chat_id, family_pauses::Point::CompletionRecorded)
+            .await;
         completion
             .notification
             .is_background()
