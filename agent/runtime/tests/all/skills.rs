@@ -61,7 +61,14 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
 
     assert_eq!(
         names,
-        ["nearest", "personal", "root-skill", "slides", "tickloop"]
+        [
+            "loop",
+            "nearest",
+            "personal",
+            "root-skill",
+            "slides",
+            "tickloop"
+        ]
     );
     assert!(registry.warnings().is_empty());
     assert!(matches!(

@@ -275,6 +275,7 @@ impl Agent {
                 feedback_watcher: None,
                 feedback_inputs: Default::default(),
                 feedback_cleanup_started: false,
+                user_loops: std::collections::HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,

@@ -486,6 +486,9 @@ struct Chat {
     feedback_watcher: Option<CancellationToken>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     feedback_cleanup_started: bool,
+    /// What the user's `/loop` of each turn schedules, as the host read it: the one task the
+    /// Agent may create for the user in that turn.
+    user_loops: HashMap<RunId, tickloop_agent_config::loop_skill::LoopSchedule>,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
     deferred_messages: Vec<Message>,
     /// 由用户中断或停止而取消的 Run；只有这些 Run 保留部分回复并写中断标记。
@@ -532,6 +535,8 @@ struct SubmissionOptions {
     /// Set only by [`Agent::deliver_trigger`], the wake-up base's one entry.
     trigger_source: Option<TriggerSource>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
+    /// What the user's `/loop` schedules, when the input is one.
+    user_loop: Option<tickloop_agent_config::loop_skill::LoopSchedule>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
@@ -2176,6 +2181,7 @@ impl Agent {
                 feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
+                user_loops: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -2263,18 +2269,38 @@ impl Agent {
         } else {
             format!("/{} {}", invoked.name, skill.arguments.trim())
         };
-        self.submit_internal(
-            chat_id,
-            input,
-            SubmissionOptions {
-                invoked_skill: Some(invoked),
-                host_context,
-                ledger: Some(ledger),
-                turn,
-                ..Default::default()
-            },
-        )
-        .await
+        // The host's reading of the user's /loop: the one task the turn creates for the user.
+        let user_loop = (invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
+            && invoked.name == tickloop_agent_config::skills::LOOP_SKILL_NAME)
+            .then(|| tickloop_agent_config::loop_skill::LoopSchedule::of(&skill.arguments).ok())
+            .flatten();
+        let started_loop = match &user_loop {
+            Some(tickloop_agent_config::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
+                self.start_users_self_paced_loop(chat_id, prompt.clone())
+                    .await?
+            }
+            Some(tickloop_agent_config::loop_skill::LoopSchedule::Cron { .. }) | None => None,
+        };
+        let submitted = self
+            .submit_internal(
+                chat_id,
+                input,
+                SubmissionOptions {
+                    invoked_skill: Some(invoked),
+                    user_loop,
+                    host_context,
+                    ledger: Some(ledger),
+                    turn,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if submitted.is_err()
+            && let Some(task_id) = started_loop
+        {
+            let _ = self.delete_scheduled_task(chat_id, &task_id).await;
+        }
+        submitted
     }
 
     pub async fn skill_warnings(&self, chat_id: ChatId) -> Result<Vec<String>, AgentError> {
@@ -2505,6 +2531,7 @@ impl Agent {
             denial_reference,
             trigger_source,
             invoked_skill,
+            user_loop,
             host_context,
             agent_message,
             directed_human,
@@ -2600,6 +2627,9 @@ impl Agent {
             loop_id,
             run_id,
         };
+        if let Some(user_loop) = user_loop {
+            chat.user_loops.insert(run_id, user_loop);
+        }
         if let Some(mut invoked_skill) = invoked_skill {
             if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
                 && chat.skills.is_user_only(&invoked_skill.name)

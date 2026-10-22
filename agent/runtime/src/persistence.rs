@@ -3508,6 +3508,7 @@ impl Agent {
                 feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
+                user_loops: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,

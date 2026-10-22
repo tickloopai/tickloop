@@ -3,7 +3,7 @@ use std::path::Path;
 
 use tickloop_agent_config::loop_skill::{
     DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopInstructions, LoopInstructionsSource, LoopRequest,
-    MAINTENANCE_INSTRUCTIONS, MAX_LOOP_FILE_BYTES,
+    LoopSchedule, MAINTENANCE_INSTRUCTIONS, MAX_LOOP_FILE_BYTES,
 };
 use tickloop_agent_config::skills::{LOOP_SKILL, SkillCaller, SkillError, SkillRegistry};
 use tickloop_agent_cron::{Interval, IntervalError};
@@ -399,4 +399,42 @@ fn the_loop_skill_teaches_the_three_forms_with_the_scheduling_tools() {
         assert!(!LOOP_SKILL.contains(foreign), "{foreign}");
         assert!(!MAINTENANCE_INSTRUCTIONS.contains(foreign), "{foreign}");
     }
+}
+
+#[test]
+fn a_loop_schedules_one_task_as_the_host_reads_it() {
+    assert_eq!(
+        LoopSchedule::of("5m check the deploy").unwrap(),
+        LoopSchedule::Cron {
+            cron: "*/5 * * * *".into(),
+            prompt: "check the deploy".into(),
+        }
+    );
+    assert_eq!(
+        LoopSchedule::of("check the deploy every 90m").unwrap(),
+        LoopSchedule::Cron {
+            cron: "0 */2 * * *".into(),
+            prompt: "check the deploy".into(),
+        }
+    );
+    assert_eq!(
+        LoopSchedule::of("15m").unwrap(),
+        LoopSchedule::Cron {
+            cron: "*/15 * * * *".into(),
+            prompt: DEFAULT_INSTRUCTIONS_PROMPT.into(),
+        }
+    );
+    assert_eq!(
+        LoopSchedule::of("  check the deploy ").unwrap(),
+        LoopSchedule::SelfPaced {
+            prompt: "/loop check the deploy".into(),
+        }
+    );
+    assert_eq!(
+        LoopSchedule::of("").unwrap(),
+        LoopSchedule::SelfPaced {
+            prompt: "/loop".into(),
+        }
+    );
+    assert!(LoopSchedule::of("0m check").is_err());
 }

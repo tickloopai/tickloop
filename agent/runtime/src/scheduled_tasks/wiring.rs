@@ -15,7 +15,6 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
-use super::LOOP_SKILL_NAME;
 use super::tasks::{
     Creation, CronTask, DecisionOutcome, ScheduledTaskError, ScheduledTasks, SelfPacedTurnEnd,
     Wakeup,
@@ -23,6 +22,7 @@ use super::tasks::{
 use super::tools::{self, ScheduledTaskCall};
 use crate::wakeup::TriggerDelivery;
 use crate::{Agent, AgentError, Chat};
+use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopSchedule};
 
 /// The longest a Worker's timer sleeps before it looks at the clock again, so a machine that
 /// slept or a wall clock that moved does not delay a run for long.
@@ -76,10 +76,20 @@ pub(crate) fn resolve_zone(name: Option<&str>) -> Result<Zone, String> {
     }
 }
 
-/// The scheduled run's input: the task's instruction, a Skill the Agent may invoke on its own
-/// when it names one with `/`, and anything else as plain text.
-fn run_input(chat: &Chat, task: &ScheduledTask) -> String {
+/// The scheduled run's input: the Chat's loop instructions, read again now, for a `/loop`
+/// without a prompt; a Skill the Agent may invoke on its own when the instruction names one with
+/// `/`; and anything else as plain text.
+fn run_input(chat: &Chat, task: &ScheduledTask, config_root: Option<&std::path::Path>) -> String {
     let prompt = task.prompt.trim();
+    if prompt == DEFAULT_INSTRUCTIONS_PROMPT {
+        return match LoopFiles::new(chat.snapshot.folder.as_deref(), config_root).instructions() {
+            Ok(instructions) => instructions.prompt(),
+            Err(error) => format!(
+                "Scheduled task {}: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place.",
+                task.id
+            ),
+        };
+    }
     if let Some(command) = prompt.strip_prefix('/') {
         let (name, arguments) = command
             .split_once(char::is_whitespace)
@@ -253,14 +263,20 @@ impl Agent {
         self.persist_scheduled_tasks(chat, notices);
     }
 
-    /// Who creates a task in the turn `receipt`: the user in the turn of their own `/loop`, the
-    /// Agent otherwise; only the Agent's need confirming, and only where nobody is asked.
-    fn creation(&self, chat: &Chat, receipt: &Receipt) -> Creation {
-        let is_users_loop = chat
-            .snapshot
-            .invoked_skills
-            .iter()
-            .any(|skill| skill.name == LOOP_SKILL_NAME && skill.run_id == Some(receipt.run_id));
+    /// Who creates a task in the turn `receipt`: the user only for the one task their own
+    /// `/loop` of that turn schedules, exactly as the host read it; the Agent for every other.
+    /// Only the Agent's need confirming, and only where nobody is asked.
+    fn creation(
+        &self,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        created: Option<&LoopSchedule>,
+    ) -> Creation {
+        let is_users_loop =
+            created.is_some_and(|created| chat.user_loops.get(&receipt.run_id) == Some(created));
+        if is_users_loop {
+            chat.user_loops.remove(&receipt.run_id);
+        }
         let creator = if is_users_loop {
             ScheduledTaskCreator::User
         } else {
@@ -294,7 +310,6 @@ impl Agent {
                 "Only the root Agent schedules tasks; a Subagent has none.".into(),
             ));
         }
-        let creation = self.creation(chat, receipt);
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
         let id = tasks.unused_id();
         let outcome = match call {
@@ -305,6 +320,11 @@ impl Agent {
             } => match Schedule::parse(&cron) {
                 Err(error) => Err(error.to_string()),
                 Ok(schedule) => {
+                    let users_loop = recurring.then(|| LoopSchedule::Cron {
+                        cron: schedule.expression().to_owned(),
+                        prompt: prompt.clone(),
+                    });
+                    let creation = self.creation(chat, receipt, users_loop.as_ref());
                     let cron_task = if recurring {
                         CronTask::Recurring(schedule)
                     } else {
@@ -336,7 +356,9 @@ impl Agent {
                         reason,
                         prompt,
                     },
-                    creation,
+                    // The user's self-paced loop was started with their /loop; a new one is
+                    // the Agent's.
+                    self.creation(chat, receipt, None),
                     zone,
                     &now,
                 )
@@ -412,6 +434,47 @@ impl Agent {
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
         self.persist_scheduled_tasks(chat, Vec::new());
         Ok(task)
+    }
+
+    /// The user's `/loop` without an interval starts the self-paced loop with its turn, so that
+    /// turn gets the fallback wake-up too; a self-paced loop running already is replaced.
+    pub(crate) async fn start_users_self_paced_loop(
+        &self,
+        chat_id: ChatId,
+        prompt: String,
+    ) -> Result<Option<String>, AgentError> {
+        if !self.inner.tool_policy.scheduled_tasks {
+            return Ok(None);
+        }
+        let now = self.scheduled_now();
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if chat.snapshot.delegation.is_some() {
+            return Ok(None);
+        }
+        let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+        let replaced = tasks
+            .tasks()
+            .iter()
+            .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+            .cloned();
+        let id = tasks.unused_id();
+        tasks
+            .start_self_paced(
+                id.clone(),
+                prompt,
+                Creation {
+                    creator: ScheduledTaskCreator::User,
+                    needs_confirmation: false,
+                },
+                self.inner.schedule_clock.zone(),
+                &now,
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        chat.snapshot.scheduled_tasks = tasks.into_tasks();
+        self.withdraw_deleted_task_runs(chat, replaced.as_slice());
+        self.persist_scheduled_tasks(chat, Vec::new());
+        Ok(Some(id))
     }
 
     /// Cancels one of the Chat's scheduled tasks at the user's request.
@@ -513,7 +576,7 @@ impl Agent {
                         task_id: fired.task.id.clone(),
                         scheduled_for_ms: fired.scheduled_for_ms,
                     },
-                    input: run_input(chat, &fired.task),
+                    input: run_input(chat, &fired.task, self.inner.config_root.as_deref()),
                     ledger: None,
                 });
             }
@@ -528,10 +591,14 @@ impl Agent {
         }
     }
 
-    /// A turn ended: when the self-paced task started it and it neither rescheduled nor
-    /// stopped the loop, the host wakes it once more later, and after a fallback turn that did
-    /// not reschedule either the loop ends.
+    /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it
+    /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
+    /// fallback turn that did not reschedule either the loop ends.
     pub(crate) fn end_self_paced_turn(&self, chat: &mut Chat, run: tickloop_agent_protocol::RunId) {
+        let started_by_users_loop = matches!(
+            chat.user_loops.remove(&run),
+            Some(LoopSchedule::SelfPaced { .. })
+        );
         let Some(task) = chat
             .snapshot
             .scheduled_tasks
@@ -540,7 +607,9 @@ impl Agent {
         else {
             return;
         };
-        if task.scheduled_for_ms.is_some() || !started_run(chat, task, run) {
+        if task.scheduled_for_ms.is_some()
+            || !(started_by_users_loop || started_run(chat, task, run))
+        {
             return;
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());

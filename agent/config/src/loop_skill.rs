@@ -60,6 +60,54 @@ impl LoopRequest {
     }
 }
 
+/// The one task a `/loop` schedules, as the host reads its arguments: the Agent's CronCreate or
+/// ScheduleWakeup creating exactly this task in the turn of the user's `/loop` creates it for
+/// the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoopSchedule {
+    /// A recurring task on `cron`, in local time.
+    Cron { cron: String, prompt: String },
+    /// The self-paced task; each wake-up runs `prompt`, which brings the run back into `/loop`.
+    SelfPaced { prompt: String },
+}
+
+impl LoopSchedule {
+    /// What `/loop <arguments>` schedules.
+    pub fn of(arguments: &str) -> Result<Self, IntervalError> {
+        let input = arguments.trim();
+        let self_paced_prompt = || {
+            if input.is_empty() {
+                LOOP_COMMAND.to_owned()
+            } else {
+                format!("{LOOP_COMMAND} {input}")
+            }
+        };
+        Ok(match LoopRequest::parse(input)? {
+            LoopRequest::FixedInterval { interval, prompt } => Self::Cron {
+                cron: interval.expression,
+                prompt,
+            },
+            LoopRequest::DefaultInstructions {
+                interval: Some(interval),
+            } => Self::Cron {
+                cron: interval.expression,
+                prompt: DEFAULT_INSTRUCTIONS_PROMPT.to_owned(),
+            },
+            LoopRequest::SelfPaced { .. } | LoopRequest::DefaultInstructions { interval: None } => {
+                Self::SelfPaced {
+                    prompt: self_paced_prompt(),
+                }
+            }
+        })
+    }
+
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::Cron { prompt, .. } | Self::SelfPaced { prompt } => prompt,
+        }
+    }
+}
+
 /// Where the loop instructions of a Chat come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoopInstructionsSource {
@@ -225,34 +273,27 @@ fn read_loop_file(path: &Path) -> io::Result<Option<(String, bool)>> {
 /// and the scheduled prompt for CronCreate or ScheduleWakeup.
 pub(crate) fn expand(body: &str, arguments: &str, files: &LoopFiles) -> Result<String, SkillError> {
     let input = arguments.trim();
-    let self_paced_prompt = if input.is_empty() {
-        LOOP_COMMAND.to_owned()
-    } else {
-        format!("{LOOP_COMMAND} {input}")
-    };
     let request = LoopRequest::parse(input).map_err(SkillError::InvalidLoopInterval)?;
+    let scheduled = LoopSchedule::of(input).map_err(SkillError::InvalidLoopInterval)?;
+    let scheduled_prompt = scheduled.prompt();
     let (instructions, invocation) = match request {
         LoopRequest::FixedInterval { interval, prompt } => (
             None,
             format!(
-                "Form: fixed interval\n{}\nRun now: {prompt}\nScheduled prompt: {prompt}",
+                "Form: fixed interval\n{}\nRun now: {prompt}\nScheduled prompt: {scheduled_prompt}",
                 interval_lines(&interval)
             ),
         ),
         LoopRequest::SelfPaced { prompt } => (
             None,
-            format!("Form: self-paced\nRun now: {prompt}\nScheduled prompt: {self_paced_prompt}"),
+            format!("Form: self-paced\nRun now: {prompt}\nScheduled prompt: {scheduled_prompt}"),
         ),
         LoopRequest::DefaultInstructions { interval } => {
-            let (form, scheduled_prompt) = match interval {
-                Some(interval) => (
-                    format!("no prompt, fixed interval\n{}", interval_lines(&interval)),
-                    DEFAULT_INSTRUCTIONS_PROMPT,
-                ),
-                None => (
-                    "no prompt, self-paced".to_owned(),
-                    self_paced_prompt.as_str(),
-                ),
+            let form = match interval {
+                Some(interval) => {
+                    format!("no prompt, fixed interval\n{}", interval_lines(&interval))
+                }
+                None => "no prompt, self-paced".to_owned(),
             };
             let instructions = files
                 .instructions()

@@ -353,6 +353,7 @@ impl Agent {
                     feedback_watcher: None,
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
+                    user_loops: HashMap::new(),
                     deferred_messages: saved.deferred_messages.clone(),
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,

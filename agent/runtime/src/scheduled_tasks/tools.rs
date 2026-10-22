@@ -7,9 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tickloop_agent_protocol::ToolDefinition;
 
-use super::LOOP_INSTRUCTIONS_PLACEHOLDER;
 use super::tasks::{MAX_WAKEUP_DELAY, MIN_WAKEUP_DELAY, TASK_LIFETIME};
 use crate::host_tools::HostToolPermission;
+use tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTRUCTIONS_PLACEHOLDER;
 
 pub(crate) const CRON_CREATE_TOOL_NAME: &str = "CronCreate";
 pub(crate) const CRON_LIST_TOOL_NAME: &str = "CronList";
@@ -179,7 +179,7 @@ A task runs only between turns: when it comes due while a turn is running, it wa
 
 Recurring tasks expire {LIFETIME_DAYS} days after creation: they run one final time, then are deleted. Tell the user about the {LIFETIME_DAYS}-day limit when scheduling recurring tasks. A Chat holds at most {max} scheduled tasks.
 
-On a host without permission requests, a task you create on your own waits for the user to confirm it before it starts timing; tasks created in the turn of the user's /loop do not.
+On a host without permission requests, a task you create waits for the user to confirm it before it starts timing; only the one task the user's /loop schedules, created exactly as its \"This /loop\" section gives it, does not.
 
 Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
                 max = tickloop_agent_protocol::MAX_SCHEDULED_TASKS_PER_CHAT,

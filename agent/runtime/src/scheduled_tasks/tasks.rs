@@ -178,13 +178,6 @@ impl ScheduledTasks {
 
     /// `/loop` without an interval: replaces any self-paced task with one whose first turn is
     /// the one running now, so it waits for that turn to reschedule it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "ticket 14 starts the self-paced task when the user runs /loop without an interval"
-        )
-    )]
     pub(crate) fn start_self_paced(
         &mut self,
         id: String,
