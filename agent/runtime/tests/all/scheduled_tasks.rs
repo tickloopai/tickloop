@@ -140,3 +140,77 @@ async fn a_crash_between_the_ledger_and_the_next_time_runs_nothing_twice() {
         next.shutdown().await;
     }
 }
+
+/// A stateless host whose Chats have a Folder and take the user's Skills, as `/loop` needs.
+fn stateless_host_with_a_folder(
+    store: Arc<dyn TranscriptStore>,
+    model: Arc<ContractModel>,
+) -> Agent {
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts: Some(store),
+            environment: Some(Arc::new(
+                tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+            )),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions {
+            host: AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                directory_trust: tickloop_agent_protocol::DirectoryTrustPolicy::CallerManaged,
+                ..AgentHostOptions::product_defaults()
+            },
+            tools: ToolPolicy {
+                scheduled_tasks: true,
+                skills: true,
+                user_skills: true,
+                ..ToolPolicy::web_fetch_only()
+            },
+            waits: WaitHosting::Durable,
+            time_zone: Some("UTC".into()),
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0));
+    agent
+}
+
+/// The first turn of the user's self-paced `/loop` is still running when its host goes away;
+/// the next host goes on with it from the Transcript alone, and when it ends without a
+/// reschedule the loop still gets its fallback wake-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_loop_turn_continued_by_another_host_still_falls_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = ContractModel::new();
+    let agent = stateless_host_with_a_folder(store.clone(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent
+        .invoke_skill(chat, "loop", "watch the build, HOLD:turn")
+        .await
+        .unwrap();
+    model.wait_seen("watch the build", 1).await;
+    let task = tasks(&agent, chat).await.remove(0);
+    assert!(task.started_by_run.is_some());
+    assert_eq!(task.next_fire_at_ms, None, "{:?}", model.prompts());
+    agent.sync().await.unwrap();
+    let image = Arc::new(InMemoryTranscriptStore::new());
+    image.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    agent.shutdown().await;
+
+    let next_model = ContractModel::new();
+    next_model.release_held_turn();
+    let next = stateless_host_with_a_folder(image, next_model.clone());
+    next.resume_chat(chat).await.unwrap();
+    next_model.wait_seen("watch the build", 1).await;
+    next.quiesce(chat).await;
+    let fallback = tasks(&next, chat).await.remove(0);
+    assert_eq!(fallback.id, task.id);
+    assert_eq!(
+        fallback.next_fire_at_ms,
+        Some(u64::try_from(at(10, 20).timestamp_millis()).unwrap())
+    );
+    next.shutdown().await;
+}

@@ -260,6 +260,13 @@ impl Agent {
         self.withdraw_deleted_task_runs(chat, cancelled);
     }
 
+    /// Records the Chat's scheduled tasks as they are now.
+    pub(crate) async fn record_scheduled_tasks(&self, chat_id: ChatId) {
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+            self.persist_scheduled_tasks(chat, Vec::new());
+        }
+    }
+
     /// Withdraws the queued run of each deleted task: a task's input waits only while the task
     /// does.
     fn withdraw_deleted_task_runs(&self, chat: &mut Chat, deleted: &[ScheduledTask]) {
@@ -713,10 +720,7 @@ impl Agent {
     /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
     /// fallback turn that did not reschedule either the loop ends.
     pub(crate) fn end_self_paced_turn(&self, chat: &mut Chat, run: tickloop_agent_protocol::RunId) {
-        let started_by_users_loop = matches!(
-            chat.user_loops.remove(&run),
-            Some(LoopSchedule::SelfPaced { .. })
-        );
+        chat.user_loops.remove(&run);
         let Some(task) = chat
             .snapshot
             .scheduled_tasks
@@ -725,6 +729,7 @@ impl Agent {
         else {
             return;
         };
+        let started_by_users_loop = task.started_by_run == Some(run);
         if task.scheduled_for_ms.is_some()
             || !(started_by_users_loop || started_run(chat, task, run))
         {

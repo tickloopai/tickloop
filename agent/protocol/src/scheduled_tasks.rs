@@ -33,6 +33,10 @@ pub struct ScheduledTask {
     /// delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for_ms: Option<u64>,
+    /// The turn of the user's `/loop` that started a self-paced task; that turn's end
+    /// reschedules it or falls back like the turns its wake-ups start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by_run: Option<uuid::Uuid>,
     /// Scheduled times passed over without running because the Loop was busy or the host woke
     /// late, summed over the task's life.
     pub skipped: u64,

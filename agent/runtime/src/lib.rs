@@ -543,6 +543,8 @@ struct SubmissionOptions {
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     /// What the user's `/loop` schedules, when the input is one.
     user_loop: Option<tickloop_agent_config::loop_skill::LoopSchedule>,
+    /// The self-paced task the user's `/loop` started, which the input's turn belongs to.
+    started_loop: Option<String>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
@@ -2295,6 +2297,7 @@ impl Agent {
                 SubmissionOptions {
                     invoked_skill: Some(invoked),
                     user_loop,
+                    started_loop: started_loop.clone(),
                     host_context,
                     ledger: Some(ledger),
                     turn,
@@ -2302,10 +2305,14 @@ impl Agent {
                 },
             )
             .await;
-        if submitted.is_err()
-            && let Some(task_id) = started_loop
-        {
-            let _ = self.delete_scheduled_task(chat_id, &task_id).await;
+        if let Some(task_id) = started_loop {
+            match &submitted {
+                // The task now names its first turn; that is recorded with it.
+                Ok(_) => self.record_scheduled_tasks(chat_id).await,
+                Err(_) => {
+                    let _ = self.delete_scheduled_task(chat_id, &task_id).await;
+                }
+            }
         }
         submitted
     }
@@ -2540,6 +2547,7 @@ impl Agent {
             trigger_lease,
             invoked_skill,
             user_loop,
+            started_loop,
             host_context,
             agent_message,
             directed_human,
@@ -2637,6 +2645,14 @@ impl Agent {
         };
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id, user_loop);
+        }
+        if let Some(task) = started_loop.and_then(|id| {
+            chat.snapshot
+                .scheduled_tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+        }) {
+            task.started_by_run = Some(run_id);
         }
         if let Some(mut invoked_skill) = invoked_skill {
             if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn

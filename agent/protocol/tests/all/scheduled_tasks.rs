@@ -18,6 +18,7 @@ fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>
         jitter_ms: -15_000,
         last_fired_at_ms: None,
         last_scheduled_for_ms: None,
+        started_by_run: None,
         skipped: 0,
     }
 }

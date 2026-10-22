@@ -555,6 +555,7 @@ fn new_task(
         jitter_ms: 0,
         last_fired_at_ms: None,
         last_scheduled_for_ms: None,
+        started_by_run: None,
         skipped: 0,
     }
 }
