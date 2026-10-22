@@ -10,5 +10,7 @@ mod goal;
 mod local_messages;
 #[path = "all/scheduled_tasks.rs"]
 mod scheduled_tasks;
+#[path = "all/trigger_sources.rs"]
+mod trigger_sources;
 #[path = "all/wire_golden.rs"]
 mod wire_golden;

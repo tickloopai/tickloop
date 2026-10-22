@@ -169,9 +169,9 @@ impl Agent {
                     .take_while(|queued| queued.task_continuation)
                     .count(),
             );
-            if let Some(identity) =
-                event_sources::queued_feedback_identity(chat.snapshot.id, &pending)
-            {
+            if let Some(identity) = pending.trigger_source.as_ref().and_then(|source| {
+                event_sources::feedback_identity(chat.snapshot.id, pending.receipt.loop_id, source)
+            }) {
                 chat.feedback_inputs
                     .insert(pending.receipt.run_id, identity);
             }

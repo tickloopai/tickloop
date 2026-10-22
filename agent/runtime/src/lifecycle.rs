@@ -164,6 +164,10 @@ impl Lifecycle {
                     queued: Some(
                         serde_json::to_value(queued).expect("a queued input is serializable"),
                     ),
+                    trigger: queued
+                        .trigger_source
+                        .as_ref()
+                        .map(tickloop_agent_transcript::TriggerRecord::of),
                 },
                 revision,
             },
@@ -250,6 +254,7 @@ impl Lifecycle {
                     timestamp: now(),
                     state: InputState::Settled { outcome },
                     queued: None,
+                    trigger: None,
                 },
                 revision,
             },

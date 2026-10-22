@@ -13,8 +13,8 @@ const ACTIVITY_EXECUTIONS: &str = "activity-executions.json";
 const ACTIVITY_CREATED: &str = "activity-created.json";
 const ACTIVITY_OBSERVED_START: &str = "activity-observed-start.json";
 const ACTIVITY_LOST_END: &str = "activity-lost-end.json";
-/// A route whose Agent feeds lose every Completed event to a lagged Reset, while an armed
-/// trigger keeps the Loop waiting after its run ends.
+/// A route whose Agent feeds lose every Completed event to a lagged Reset; the Loop keeps
+/// receiving after its run ends.
 const LOST_END_ROUTE: &str = "lost-end";
 
 struct ActivityModel(AtomicUsize);
@@ -120,25 +120,6 @@ impl AgentAccess for ActivityAccess {
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
         let receipt = self.daemon.execute(command).await?;
-        if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok(LOST_END_ROUTE)
-            && let Some(CommandResult::Submitted(submitted)) = &receipt.result
-        {
-            self.daemon
-                .runtime()
-                .configure_trigger(
-                    submitted.chat_id,
-                    Some(Trigger {
-                        id: Uuid::new_v4(),
-                        prompt: "Check for updates".into(),
-                        prompt_source: TriggerPromptSource::Explicit,
-                        accepts_events: true,
-                        armed: true,
-                        subscriptions: Vec::new(),
-                    }),
-                )
-                .await
-                .unwrap();
-        }
         if let Some(CommandResult::Created {
             execution,
             snapshot,

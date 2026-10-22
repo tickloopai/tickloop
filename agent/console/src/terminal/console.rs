@@ -13599,7 +13599,6 @@ mod tests {
             updated_at_ms: None,
             kind: None,
             id: Uuid::from_u128(u128::from(instance)),
-            loop_id: Uuid::from_u128(900),
             loop_state: tickloop_agent_protocol::LoopState::Idle,
             instance: tick_protocol::InstanceRef::new(
                 "calendar",

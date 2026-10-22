@@ -20,7 +20,7 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::{
     BranchRequest, Content, Event, EventKind, ExecutionMode, LoopState, ModelConfig,
-    ModelRequestKind, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
+    ModelRequestKind, RewindMode,
 };
 use tickloop_agent_test_support::harness::ChosenModels;
 
@@ -86,24 +86,9 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
         .await
         .unwrap();
     agent
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "Check fresh evidence".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
+        .deliver_test_trigger(chat, "evidence", 1, "Check fresh evidence")
         .await
         .unwrap();
-    let source = || TriggerSource {
-        source: "test-tick".into(),
-        payload: json!({"sequence": 1}),
-    };
-    agent.trigger(chat, source()).await.unwrap();
     loop {
         if let EventKind::Failed(error) =
             tokio::time::timeout(Duration::from_secs(8), events.recv())

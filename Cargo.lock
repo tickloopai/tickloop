@@ -4253,6 +4253,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-runtime",
  "tickloop-agent-transcript",
+ "tickloop-tick-protocol",
  "tokio",
  "tokio-util",
  "unicode-width",

@@ -332,7 +332,15 @@ fn input(response: &ResponseEntry, op: InputOp) -> Line {
         timestamp: response.timestamp.clone(),
         state: InputState::Started,
         queued: None,
+        trigger: (op == InputOp::Trigger).then(|| crate::TriggerRecord::of(&scheduled_run())),
     })
+}
+
+fn scheduled_run() -> tickloop_agent_protocol::TriggerSource {
+    tickloop_agent_protocol::TriggerSource::ScheduledTask {
+        task_id: "0a1b2c3d".into(),
+        scheduled_for_ms: 1_000,
+    }
 }
 
 #[test]
@@ -368,7 +376,11 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
             }));
         }
         let expected = match op {
-            InputOp::Trigger => PromptOrigin::Trigger,
+            InputOp::Trigger => PromptOrigin::Trigger {
+                source: tickloop_agent_protocol::TriggerKind::ScheduledTask,
+                authority: tickloop_agent_protocol::Authority::Instruction,
+                merged: 1,
+            },
             InputOp::Feedback => PromptOrigin::Feedback {
                 artifact: "doc".into(),
             },
@@ -412,9 +424,11 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
 #[test]
 fn loop_projection_uses_the_latest_current_record_and_skips_the_old_format() {
     let id = Uuid::new_v4();
-    let trigger = Trigger::for_subscriptions();
+    let receiving = tickloop_agent_protocol::Receiving::Paused {
+        reason: tickloop_agent_protocol::PauseReason::Stopped,
+    };
     let mut record: LoopRecord = serde_json::from_value(json!({
-        "loopId": id, "state": "Running", "trigger": trigger,
+        "loopId": id, "state": "Running", "receiving": receiving,
         "stateSince": 2000, "runStartedAt": null,
     }))
     .unwrap();
@@ -442,7 +456,7 @@ fn loop_projection_uses_the_latest_current_record_and_skips_the_old_format() {
     let projected = chat_loop(&[snapshot, latest, old_format]).unwrap();
     assert_eq!(projected.id, id);
     assert_eq!(projected.state, tickloop_agent_protocol::LoopState::Idle);
-    assert!(projected.trigger.is_some());
+    assert_eq!(projected.receiving, receiving);
     assert_eq!(projected.state_since, Some(2000));
     assert!(chat_loop(&[line(&record, "loop_created")]).is_none());
 }
@@ -545,5 +559,63 @@ fn human_prompt_parents_and_followups_keep_the_recorded_lifecycle() {
     assert_eq!(nodes[0].blocks.len(), 1);
     assert!(
         matches!(&nodes[0].blocks[0], DisplayBlock::FollowUp { prompt_id, .. } if *prompt_id == follow_up_id)
+    );
+}
+
+#[test]
+fn trigger_deliveries_show_each_delivery_as_its_ledger_last_recorded_it() {
+    let tick = tickloop_agent_protocol::TriggerSource::TickUpdate {
+        items: vec![tickloop_agent_protocol::TickDeliveryItem {
+            subscription: Uuid::from_u128(1),
+            watch: Uuid::from_u128(2),
+            instance: "calendar:fixture".parse().unwrap(),
+            sequence: 9,
+            updates: 4,
+        }],
+    };
+    let record = |input: u128, source, state| {
+        Line::Input(InputEntry {
+            input_id: Uuid::from_u128(input),
+            op: InputOp::Trigger,
+            digest: String::new(),
+            display_parent: None,
+            loop_id: Uuid::nil(),
+            run_id: Uuid::from_u128(input + 100),
+            timestamp: "2026-10-22T00:00:00.000Z".into(),
+            state,
+            queued: None,
+            trigger: Some(crate::TriggerRecord::of(&source)),
+        })
+    };
+    let withdrawn = InputState::Settled {
+        outcome: crate::SettledOutcome::Discarded {
+            reason: crate::DiscardReason::Unsubscribed,
+        },
+    };
+    let merged = InputState::Settled {
+        outcome: crate::SettledOutcome::Merged {
+            into: Uuid::from_u128(103),
+        },
+    };
+    let lines = vec![
+        Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
+            chat_id: Uuid::nil(),
+            lines: vec![record(3, scheduled_run(), InputState::Accepted)],
+        }),
+        record(4, tick.clone(), InputState::Accepted),
+        record(5, scheduled_run(), merged.clone()),
+        record(4, tick, withdrawn.clone()),
+    ];
+    let deliveries = trigger_deliveries(&lines);
+    assert_eq!(
+        deliveries
+            .iter()
+            .map(|delivery| (delivery.input_id, delivery.merged, delivery.state.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (Uuid::from_u128(3), 1, InputState::Accepted),
+            (Uuid::from_u128(4), 4, withdrawn),
+            (Uuid::from_u128(5), 1, merged),
+        ]
     );
 }

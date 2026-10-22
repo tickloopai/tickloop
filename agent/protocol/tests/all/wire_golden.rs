@@ -397,13 +397,13 @@ fn chat_snapshot() -> ChatSnapshot {
             "run_id": id(0x20),
             "run_started_at": 1_000,
             "state_since": 2_000,
-            "trigger": {
-                "id": id(0x30),
-                "prompt": "",
-                "prompt_source": "Subscriptions",
-                "accepts_events": true,
-                "armed": true,
-            },
+            "receiving": {"state": "paused", "reason": "stopped"},
+            "subscriptions": [{
+                "id": id(0x31),
+                "instance": hosted_instance(),
+                "frequency": "medium",
+                "authority": null,
+            }],
         },
     }))
     .unwrap();
@@ -575,26 +575,6 @@ fn agent_commands_keep_their_recorded_wire() {
                 scope: PermissionScope::Session,
                 comment: None,
                 rule: Some("Bash(git status)".into()),
-            },
-            AgentCommand::ManageLoop {
-                execution: execution(),
-                action: LoopAction::ConfigureTrigger {
-                    trigger: Some(
-                        serde_json::from_value(json!({
-                            "id": id(0x30),
-                            "prompt": "Report changes",
-                            "accepts_events": true,
-                            "armed": true,
-                            "subscriptions": [{
-                                "id": id(0x31),
-                                "instance": hosted_instance(),
-                                "frequency": "medium",
-                                "authority": null,
-                            }],
-                        }))
-                        .unwrap(),
-                    ),
-                },
             },
             AgentCommand::ManageLoop {
                 execution: execution(),
@@ -783,7 +763,6 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::RewindFiles(None),
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
                 id: id(0x31),
-                loop_id: id(0x10),
                 loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: hosted_instance(),
                 frequency: TickSubscriptionFrequency::High,

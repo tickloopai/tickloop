@@ -195,7 +195,7 @@ enum Admission {
     Known(Receipt),
     /// Its answer lost its host: another attempt continues it, under `answer_parent`.
     Continuation {
-        entry: InputEntry,
+        entry: Box<InputEntry>,
         answer_parent: Option<Uuid>,
     },
     /// It runs, replacing an acceptance lost before it started.
@@ -388,26 +388,6 @@ impl Agent {
     /// with its outcome, a live one is attached to, and one whose answer lost its host is
     /// continued by another attempt. The same id with another payload is refused.
     pub async fn advance(&self, chat_id: ChatId, request: TurnRequest) -> Result<Turn, AgentError> {
-        self.advance_with_delivery_binding(chat_id, request, true)
-            .await
-    }
-
-    /// The local inbox already received this input; unlinking does not revoke its admission.
-    pub(super) async fn advance_received_delivery(
-        &self,
-        chat_id: ChatId,
-        delivery: ExternalDelivery,
-    ) -> Result<Turn, AgentError> {
-        self.advance_with_delivery_binding(chat_id, TurnRequest::deliver(delivery), false)
-            .await
-    }
-
-    async fn advance_with_delivery_binding(
-        &self,
-        chat_id: ChatId,
-        request: TurnRequest,
-        requires_binding: bool,
-    ) -> Result<Turn, AgentError> {
         // Held through restoring the Chat and every task the input starts: `shutdown` either
         // refuses this or waits for all of it.
         let _admission = self.inner.tasks.token();
@@ -441,20 +421,12 @@ impl Agent {
             } => {
                 // Boxed: a submission is a large future, and hosts await `advance` on small
                 // stacks.
-                Box::pin(self.continue_input(chat_id, &ledger, entry, answer_parent, delivery))
+                Box::pin(self.continue_input(chat_id, &ledger, *entry, answer_parent, delivery))
                     .await?
             }
             Admission::Run { replaces } => {
                 ledger.replaces = replaces;
-                Box::pin(self.run_op(
-                    chat_id,
-                    op,
-                    ledger,
-                    delivery,
-                    host_context,
-                    requires_binding,
-                ))
-                .await?
+                Box::pin(self.run_op(chat_id, op, ledger, delivery, host_context)).await?
             }
         };
         Ok(Turn {
@@ -473,7 +445,6 @@ impl Agent {
         mut ledger: LedgerInput,
         delivery: Delivery,
         host_context: Option<HostCallContext>,
-        requires_binding: bool,
     ) -> Result<Receipt, AgentError> {
         let placement = match op {
             TurnOp::Continue { after, .. } | TurnOp::Skill { after, .. } => placement(after),
@@ -487,11 +458,6 @@ impl Agent {
                     .await;
             }
             TurnOp::Deliver { delivery } => {
-                if !requires_binding {
-                    return self
-                        .take_received_delivery(chat_id, delivery, ledger, false)
-                        .await;
-                }
                 return self.take_delivery(chat_id, delivery, ledger).await;
             }
         };
@@ -708,10 +674,9 @@ impl Agent {
                 "a Subagent's conversation cannot switch branches".into(),
             ));
         }
-        if !chat.trigger_cancellations.is_empty() || !chat.event_cancellations.is_empty() {
+        if super::wakeup::listens(&chat.snapshot.chat_loop) {
             return Err(AgentError::Invalid(
-                "a Loop of this Chat waits for its Trigger; stop it before switching branches"
-                    .into(),
+                "this Chat's Loop receives Triggers; stop it before switching branches".into(),
             ));
         }
         let id = Uuid::new_v4();
@@ -1076,14 +1041,14 @@ fn classify(chat: &Chat, ledger: &LedgerInput) -> Result<Admission, AgentError> 
         {
             Admission::Continuation {
                 answer_parent: last.display_parent,
-                entry,
+                entry: Box::new(entry),
             }
         }
         Some(_) => Admission::Known(receipt),
         None if entry.op != InputOp::RegenerateAnswer && state.prompt_in_conversation => {
             Admission::Continuation {
                 answer_parent: Some(entry.input_id),
-                entry,
+                entry: Box::new(entry),
             }
         }
         None => Admission::Run {

@@ -1711,7 +1711,6 @@ mod signal_tests {
     ) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
             id: uuid::Uuid::from_u128(frequency as u128 + 2),
-            loop_id: uuid::Uuid::from_u128(9),
             loop_state: LoopState::Idle,
             instance: quotes(),
             frequency,

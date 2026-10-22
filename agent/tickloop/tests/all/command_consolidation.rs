@@ -3,10 +3,7 @@ use crate::support;
 use std::{
     io::Write,
     process::{Command, Stdio},
-    sync::Arc,
 };
-use tickloop_agent_protocol::EventKind;
-use tickloop_agent_runtime::Agent;
 
 #[test]
 fn retired_commands_do_not_execute_or_become_prompts() {
@@ -29,6 +26,9 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         "/quit",
         "/loops",
         "/loops new",
+        "/events check",
+        "/trigger feed {}",
+        "/clear-trigger",
     ];
     let runtime_directory = support::cli_runtime::directory();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
@@ -89,96 +89,4 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         panic!("expected the daemon catalog");
     };
     assert!(agents.is_empty(), "{agents:?}");
-}
-
-#[tokio::test]
-async fn pipe_trigger_controls_preserve_history_and_stay_in_their_chat() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let archive = root.join("state");
-    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
-        tickloop_agent_test_support::text("First answer"),
-        tickloop_agent_test_support::text("Other answer"),
-    ]));
-    let agent = Agent::open_embedded(
-        archive.clone(),
-        tickloop_agent_test_support::config(),
-        model,
-    )
-    .unwrap();
-    let chat = agent.create_chat(root.clone()).await.unwrap();
-    let other_chat = agent.create_chat(root.clone()).await.unwrap();
-    let mut events = agent.subscribe();
-    for chat in [chat, other_chat] {
-        agent.submit(chat, "Keep this task".into()).await.unwrap();
-        loop {
-            match tickloop_agent_test_support::next_event(&mut events)
-                .await
-                .kind
-            {
-                EventKind::Completed { .. } => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
-            }
-        }
-    }
-    let before = agent.snapshot(chat).await.unwrap();
-    agent.shutdown().await;
-    drop(agent);
-    let commands = "/events keep explicit events\n/exit\n";
-    let runtime_directory = support::cli_runtime::directory();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
-        .args([
-            "--working-directory-is-trusted",
-            "--chat-id",
-            &chat.to_string(),
-        ])
-        .current_dir(&root)
-        .env("TICKLOOP_CONFIG_DIR", &archive)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut child.stdin.take().unwrap(), commands.as_bytes())
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        output.status.success(),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("explicit events true"), "{stdout}");
-    assert!(!stdout.contains("Accepted:"), "{stdout}");
-    support::cli_runtime::flush_transcripts(&runtime_directory)
-        .await
-        .unwrap();
-    let agent = Agent::open_embedded(
-        archive,
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
-    )
-    .unwrap();
-    let after = agent.resume_chat(chat).await.unwrap();
-    assert_eq!(after.messages.len(), before.messages.len());
-    let trigger = after.chat_loop.trigger.as_ref().unwrap();
-    assert!(trigger.accepts_events);
-    assert_eq!(trigger.prompt, "keep explicit events");
-    assert!(
-        agent
-            .resume_chat(other_chat)
-            .await
-            .unwrap()
-            .chat_loop
-            .trigger
-            .is_none()
-    );
-    agent.shutdown().await;
 }

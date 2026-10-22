@@ -6,8 +6,8 @@ use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{
-    ChatSnapshot, CommandState, Content, EventKind, InputModality, ModelConfig, PendingInput,
-    Protocol, Receipt, Trigger, TriggerPromptSource, TriggerSource, Usage, UserShellState,
+    ChatId, ChatSnapshot, CommandState, Content, EventKind, InputModality, ModelConfig,
+    PauseReason, PendingInput, Protocol, Receipt, Receiving, TriggerSource, Usage, UserShellState,
 };
 use tickloop_agent_tools::UserCommandSnapshot;
 
@@ -121,7 +121,7 @@ fn config() -> ModelConfig {
 }
 
 #[tokio::test(start_paused = true)]
-async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_events_again() {
+async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receiving() {
     let directory = tempfile::tempdir().unwrap();
     let archive = directory.path().join("archive");
     let source = Agent::open_embedded(
@@ -132,19 +132,10 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     .unwrap();
     let chat_id = source.create_chat(directory.path().into()).await.unwrap();
     let loop_id;
-    let trigger = Trigger {
-        id: uuid::Uuid::new_v4(),
-        prompt: "check after restart".into(),
-        prompt_source: TriggerPromptSource::Explicit,
-        accepts_events: true,
-        armed: true,
-        subscriptions: Vec::new(),
-    };
     {
         let mut chats = source.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).unwrap();
         loop_id = chat.snapshot.chat_loop.id;
-        chat.snapshot.chat_loop.trigger = Some(trigger.clone());
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [
             (tickloop_agent_protocol::Role::User, "watch for events"),
@@ -164,14 +155,14 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
                 loop_id,
                 run_id: uuid::Uuid::new_v4(),
             },
-            input: trigger.prompt.clone(),
+            input: "check after restart".into(),
             contexts: Vec::new(),
             agent_message: None,
             directed_human: None,
             denial_reference: None,
-            trigger_source: Some(TriggerSource {
-                source: "manual".into(),
-                payload: serde_json::json!({"trigger_id": trigger.id}),
+            trigger_source: Some(TriggerSource::ScheduledTask {
+                task_id: "restart".into(),
+                scheduled_for_ms: 1,
             }),
             armed: true,
             queued_sequence: 1,
@@ -188,8 +179,19 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     let reopened = Agent::open_embedded(archive, config(), model.clone()).unwrap();
     let recovered = reopened.resume_chat(chat_id).await.unwrap();
     assert!(recovered.pending_inputs.is_empty());
-    assert!(recovered.trigger_awaits_resume);
-    assert!(!recovered.chat_loop.trigger.as_ref().unwrap().armed);
+    assert_eq!(
+        recovered.chat_loop.receiving,
+        Receiving::Paused {
+            reason: PauseReason::HistoryLoaded
+        }
+    );
+    assert!(
+        reopened
+            .deliver_test_trigger(chat_id, "restart", 2, "check after restart")
+            .await
+            .is_err(),
+        "a paused Loop takes no Trigger"
+    );
 
     let mut events = reopened.subscribe();
     let manual = reopened
@@ -203,14 +205,9 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
         }
     }
     assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert!(recovered_receiving(&reopened, chat_id).await);
     reopened
-        .trigger(
-            chat_id,
-            TriggerSource {
-                source: "manual".into(),
-                payload: serde_json::json!({"note": "changed"}),
-            },
-        )
+        .deliver_test_trigger(chat_id, "restart", 3, "check after resuming")
         .await
         .unwrap();
     loop {
@@ -221,6 +218,16 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_trigger_takes_even
     }
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     reopened.shutdown().await;
+}
+
+async fn recovered_receiving(agent: &Agent, chat_id: ChatId) -> bool {
+    agent
+        .snapshot(chat_id)
+        .await
+        .unwrap()
+        .chat_loop
+        .receiving
+        .is_receiving()
 }
 
 #[tokio::test]

@@ -1007,7 +1007,6 @@ mod tests {
             chat: Some(Arc::new(chat)),
             subscriptions: vec![TickSubscriptionStatus {
                 id: Uuid::from_u128(2),
-                loop_id: Uuid::from_u128(3),
                 loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: quote.clone(),
                 frequency: TickSubscriptionFrequency::High,
@@ -1054,7 +1053,6 @@ mod tests {
     ) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
             id: Uuid::new_v4(),
-            loop_id: Uuid::from_u128(3),
             loop_state: tickloop_agent_protocol::LoopState::Idle,
             instance: instance.clone(),
             frequency: TickSubscriptionFrequency::High,

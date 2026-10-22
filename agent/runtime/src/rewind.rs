@@ -728,21 +728,6 @@ mod tests {
             .into_iter()
             .find(|point| point.prompt == "write watching agent")
             .unwrap();
-        agent
-            .configure_trigger(
-                first,
-                Some(tickloop_agent_protocol::Trigger {
-                    id: Uuid::new_v4(),
-                    prompt: "event check".into(),
-                    prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                    accepts_events: true,
-                    armed: true,
-                    subscriptions: Vec::new(),
-                }),
-            )
-            .await
-            .unwrap();
-
         let pause = test_pause::pause_next(&first_tracked);
         let rewinding = tokio::spawn({
             let agent = agent.clone();
@@ -758,13 +743,7 @@ mod tests {
             .await
             .unwrap();
         let triggered = agent
-            .trigger(
-                first,
-                tickloop_agent_protocol::TriggerSource {
-                    source: "manual".into(),
-                    payload: serde_json::json!({"note": "changed"}),
-                },
-            )
+            .deliver_test_trigger(first, "rewind", 1, "event check")
             .await
             .unwrap();
         assert!(
@@ -784,7 +763,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.snapshot.chat_loop.id, loop_id);
-        assert!(outcome.snapshot.chat_loop.trigger.is_some());
+        assert!(outcome.snapshot.chat_loop.receiving.is_receiving());
         for receipt in [&queued, &triggered] {
             tokio::time::timeout(
                 STEP_TIMEOUT,

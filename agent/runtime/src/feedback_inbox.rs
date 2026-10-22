@@ -75,15 +75,16 @@ impl FeedbackInbox {
             Self::new(chat.tools.chat_directory(), chat.snapshot.id).identities()?;
         identities.extend(chat.feedback_inputs.values().cloned());
         let ledger_inputs = chat.bookkeeping.lifecycle.queued_inputs();
-        for input in chat
-            .snapshot
-            .pending_inputs
-            .iter()
-            .chain(&ledger_inputs)
-            .filter(|input| super::event_sources::is_feedback_input(input))
-        {
-            let identity = super::event_sources::queued_feedback_identity(chat.snapshot.id, input)
-                .ok_or_else(|| io::Error::other("Feedback account identity is unavailable"))?;
+        for input in chat.snapshot.pending_inputs.iter().chain(&ledger_inputs) {
+            let Some(identity) = input.trigger_source.as_ref().and_then(|source| {
+                super::event_sources::feedback_identity(
+                    chat.snapshot.id,
+                    input.receipt.loop_id,
+                    source,
+                )
+            }) else {
+                continue;
+            };
             if !identities.contains(&identity) {
                 identities.push(identity);
             }

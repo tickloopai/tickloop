@@ -36,7 +36,7 @@ const ACCOUNT: &str = "owner";
 const ARTIFACT: &str = "doc";
 
 /// The delivery of the request `feedback` that the service handed this receiver.
-fn delivery(feedback: &str) -> ExternalDelivery {
+pub(super) fn delivery(feedback: &str) -> ExternalDelivery {
     claimed(
         feedback,
         Uuid::new_v4(),
@@ -47,7 +47,12 @@ fn delivery(feedback: &str) -> ExternalDelivery {
 
 /// One claim of the delivery `delivery_id`, under its own fencing token, with the thread as it
 /// stood then.
-fn claimed(feedback: &str, delivery_id: Uuid, fence: &str, thread: &str) -> ExternalDelivery {
+pub(super) fn claimed(
+    feedback: &str,
+    delivery_id: Uuid,
+    fence: &str,
+    thread: &str,
+) -> ExternalDelivery {
     ExternalDelivery::from_claim(
         ORIGIN,
         ACCOUNT,
@@ -477,7 +482,7 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
 
 /// The Lines with the Loop `loop_id` linked to the artifact for the account's requests, waiting
 /// for them, as linking it records the Loop.
-fn linked(lines: Vec<Line>, loop_id: LoopId) -> Vec<Line> {
+pub(super) fn linked(lines: Vec<Line>, loop_id: LoopId) -> Vec<Line> {
     linked_at(lines, loop_id, ORIGIN)
 }
 
@@ -558,7 +563,16 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     worker.resume_chat(chat).await.unwrap();
     let chat_loop = worker.snapshot(chat).await.unwrap().chat_loop.clone();
     assert_eq!(chat_loop.state, LoopState::Idle);
-    assert!(chat_loop.event_sources[0].resume_required);
+    assert_eq!(
+        chat_loop.receiving,
+        tickloop_agent_protocol::Receiving::Paused {
+            reason: tickloop_agent_protocol::PauseReason::HistoryLoaded
+        }
+    );
+    assert!(
+        !chat_loop.event_sources[0].resume_required,
+        "the link itself stays available"
+    );
     assert_eq!(worker.quiesce(chat).await, Quiescence::Idle);
     worker.shutdown().await;
 }

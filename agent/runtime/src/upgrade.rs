@@ -350,8 +350,7 @@ impl Agent {
                     watching_commands: false,
                     watching_user_shells: false,
                     user_shell_queue: Arc::new(Notify::new()),
-                    trigger_cancellations: HashMap::new(),
-                    event_cancellations: HashMap::new(),
+                    feedback_watcher: None,
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
                     deferred_messages: saved.deferred_messages.clone(),
@@ -434,27 +433,8 @@ impl Agent {
             for command in tools.user_commands().await {
                 self.record_user_shell(id, command).await?;
             }
-            {
-                let chat_loop = saved.snapshot.chat_loop;
-                if chat_loop.trigger.is_some_and(|trigger| trigger.armed) {
-                    let cancel = self.inner.shutdown.child_token();
-                    self.inner
-                        .chats
-                        .lock()
-                        .await
-                        .get_mut(&id)
-                        .unwrap()
-                        .trigger_cancellations
-                        .insert(chat_loop.id, cancel);
-                }
-                if chat_loop
-                    .event_sources
-                    .iter()
-                    .any(|source| !source.resume_required)
-                {
-                    self.start_event_source_watcher(id, chat_loop.id).await;
-                }
-            }
+            self.start_event_source_watcher(id, saved.snapshot.chat_loop.id)
+                .await;
             self.start_feedback_cleanup(id).await;
             self.start_user_shell_queue(id).await?;
             if let Some(receipt) = saved.waiting {
@@ -499,7 +479,7 @@ impl Agent {
         self.inner.tasks.abort_all();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
-        self.inner.loop_leases.release_all();
+        self.inner.chat_leases.release_all();
         self.close_transcripts().await;
         self.inner.upgrade_guard.lock().await.take();
     }

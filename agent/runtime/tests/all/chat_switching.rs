@@ -2,10 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
-    BranchRequest, ChatId, EventKind, Receipt, ShellTaskState, Trigger, TriggerPromptSource,
-    TriggerSource,
+    BranchRequest, ChatId, EventKind, Receipt, ShellTaskState, TickSubscriptionChange,
 };
 use tickloop_agent_runtime::{Agent, AgentError, ShellTaskCenter};
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::{ScriptedModel, config, next_event, text, transcript_file};
 use uuid::Uuid;
 
@@ -113,37 +113,17 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         text("BACKGROUND-TICK-TWO"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let market = ShellTick::new(Uuid::new_v4());
+    market.install(&agent).await;
     let background = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, background, "Watch the market.").await;
 
     let foreground = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent
-        .configure_trigger(
-            background,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "triggered market check".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
+    market.subscribe(&agent, background).await;
     complete_turn(&agent, foreground, "Foreground question.").await;
     for sequence in 1..=2 {
-        agent
-            .trigger(
-                background,
-                TriggerSource {
-                    source: "market".into(),
-                    payload: serde_json::json!({ "sequence": sequence }),
-                },
-            )
-            .await
-            .unwrap();
+        market.update(sequence, "triggered market check");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.unwrap();
@@ -156,7 +136,11 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
         .await
         .expect("the background Chat's triggered Loop stopped running");
     }
-    agent.configure_trigger(background, None).await.unwrap();
+    let subscription = agent.tick_subscriptions(background).await.unwrap()[0].id;
+    agent
+        .update_tick_subscription(background, subscription, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
 
     let background_text = conversation_text(&agent.snapshot(background).await.unwrap());
     let foreground_text = conversation_text(&agent.snapshot(foreground).await.unwrap());

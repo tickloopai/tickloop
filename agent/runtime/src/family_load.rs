@@ -341,8 +341,7 @@ impl Agent {
     /// After a durable load of the family whose members are `order`, root first: each member's
     /// lost answers go on and its queue comes back; suspended Runs wait again, a foreground call
     /// before its child goes on; the ends the load decided reach the parents; then the members
-    /// start, the deepest first so a waiting member finds its children holding their slots; and
-    /// last the armed Triggers go on taking events.
+    /// start, the deepest first so a waiting member finds its children holding their slots.
     pub(crate) async fn restore_family_after_load(&self, order: &[ChatId], lost: Vec<LostMember>) {
         for id in order {
             self.queue_after_load(*id).await;
@@ -366,9 +365,6 @@ impl Agent {
         self.start_rebuilt_runs(rebuilt);
         for id in order {
             self.flush_subagent_notifications(*id).await;
-        }
-        for id in order {
-            self.register_armed_triggers_after_load(*id).await;
         }
     }
 

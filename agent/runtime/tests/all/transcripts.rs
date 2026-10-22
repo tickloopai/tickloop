@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     AgentHostOptions, BranchRequest, ChatId, Content, Decision, EventKind, ExecutionMode, LoopId,
-    LoopState, Message, ModelIdentity, PermissionRule, PromptPolicy, Protocol, Receipt, RewindMode,
-    Role, ToolResultBlock, ToolResultContent, Trigger, TriggerPromptSource, Usage,
+    LoopState, Message, ModelIdentity, PauseReason, PermissionRule, PromptPolicy, Protocol,
+    Receipt, Receiving, RewindMode, Role, ToolResultBlock, ToolResultContent, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{
@@ -534,20 +534,6 @@ async fn a_restored_loop_is_interrupted_and_paused_until_a_new_input() {
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&original, chat, "watch for events").await;
     original
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "event check".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    original
         .submit(chat, "long running work".into())
         .await
         .unwrap();
@@ -565,15 +551,18 @@ async fn a_restored_loop_is_interrupted_and_paused_until_a_new_input() {
         restored.chat_loop.state_since, None,
         "a recovery conversion does not reuse the running state's time"
     );
-    assert!(!restored.chat_loop.trigger.unwrap().armed);
-    assert!(restored.trigger_awaits_resume);
+    assert_eq!(
+        restored.chat_loop.receiving,
+        Receiving::Paused {
+            reason: PauseReason::HistoryLoaded
+        }
+    );
     assert!(resumed_model.requests.lock().unwrap().is_empty());
 
-    complete_turn(&other, chat, "resume the trigger").await;
-    let rearmed = other.snapshot(chat).await.unwrap();
-    assert!(rearmed.chat_loop.trigger.unwrap().armed);
-    assert!(!rearmed.trigger_awaits_resume);
-    assert_eq!(rearmed.chat_loop.state, LoopState::Idle);
+    complete_turn(&other, chat, "resume receiving").await;
+    let resumed = other.snapshot(chat).await.unwrap();
+    assert!(resumed.chat_loop.receiving.is_receiving());
+    assert_eq!(resumed.chat_loop.state, LoopState::Idle);
     other.shutdown().await;
     original.shutdown().await;
 }

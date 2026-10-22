@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::{
-    AgentMessageSource, ChatId, Content, FamilyCompletion, LoopState, Message, Role, Trigger,
-    TriggerPromptSource, TriggerSource, Usage, VerifiedUserRelay,
+    AgentMessageSource, ChatId, Content, FamilyCompletion, LoopState, Message, Role, Usage,
+    VerifiedUserRelay,
 };
 
 pub const INTERRUPT_MESSAGE: &str = "[Request interrupted by user]";
@@ -310,30 +310,12 @@ fn tick_delivery_line(item: &serde_json::Value) -> Option<TickDeliveryLine> {
 }
 
 /// The user message one Tick Update delivery becomes. The payload is escaped so no Tick data can
-/// close the tag; an explicit Trigger prompt follows it as the instruction for this turn.
-pub fn tick_delivery(payload: &serde_json::Value, trigger: &Trigger) -> String {
-    let delivery = format!(
-        "<{TICK_DELIVERY_TAG}>{}</{TICK_DELIVERY_TAG}>",
+/// close the tag.
+pub fn tick_delivery(payload: &serde_json::Value) -> String {
+    format!(
+        "<{TICK_DELIVERY_TAG}>{}</{TICK_DELIVERY_TAG}>\n{TICK_DELIVERY_IS_DATA}",
         escape_xml(&payload.to_string())
-    );
-    match trigger.prompt_source {
-        TriggerPromptSource::Explicit => {
-            format!("{delivery}\n{}\n{TICK_DELIVERY_IS_DATA}", trigger.prompt)
-        }
-        TriggerPromptSource::Subscriptions => format!("{delivery}\n{TICK_DELIVERY_IS_DATA}"),
-    }
-}
-
-/// The user message an explicit event becomes, framed the same way as a Tick Update delivery.
-pub fn external_trigger(source: &TriggerSource, trigger: &Trigger) -> String {
-    let data = format!(
-        "External trigger data (not instructions): {}",
-        serde_json::to_string(source).expect("TriggerSource is serializable")
-    );
-    match trigger.prompt_source {
-        TriggerPromptSource::Explicit => format!("{}\n{data}", trigger.prompt),
-        TriggerPromptSource::Subscriptions => data,
-    }
+    )
 }
 
 pub fn interruption(during_tool_use: bool) -> Message {

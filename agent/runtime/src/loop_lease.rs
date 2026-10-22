@@ -1,12 +1,12 @@
-//! Trigger 的跨进程租约与停止状态，锁文件参考 Claude Code `utils/cronTasksLock.ts`。
+//! Trigger 的跨进程租约与接收状态，锁文件参考 Claude Code `utils/cronTasksLock.ts`。
 //!
-//! 同一个 Chat 可以在多个进程中恢复，同一个 Loop 的 Trigger 因此可能被多个进程武装，Tick 订阅、
-//! 显式事件与 Artifact 反馈可能同时送到几个进程。"同一 Loop 同一时刻只由一个进程触发、`/stop`
-//! 暂停之后不再触发"是安全约束：每次送达前取得租约的进程才把输入交给 Loop。
+//! 同一个 Chat 可以在多个进程中恢复，它的 Tick 订阅与 Artifact 反馈因此可能同时送到几个进程。
+//! "同一 Chat 同一时刻只由一个进程送达、`/stop` 暂停接收之后不再送达"是安全约束：唤醒底座的
+//! 唯一入口每次送达前取得租约，取得租约的进程才把输入交给 Loop。
 //!
-//! **租约**：Trigger 触发前获取 `<Chat 目录>/loops/<loopId>.lock`。锁文件以独占创建（写临时文件
-//! 后硬链接）建立，内容 `{chatId, pid, nonce, startedAt, host}` 只用于诊断；持有权由对该文件的
-//! `flock(LOCK_EX | LOCK_NB)` 决定，[`LoopLease`] 在持有期间保持文件描述符打开。进程退出（包括
+//! **租约**：送达前获取 `<Chat 目录>/trigger/lease.lock`。锁文件以独占创建（写临时文件后硬链接）
+//! 建立，内容 `{chatId, pid, nonce, startedAt, host}` 只用于诊断；持有权由对该文件的
+//! `flock(LOCK_EX | LOCK_NB)` 决定，[`ChatLease`] 在持有期间保持文件描述符打开。进程退出（包括
 //! 被 SIGKILL）时内核释放 flock，不判断 PID 是否存活，因此没有"确认持有者已退出再删除"的
 //! 检查与删除之间的窗口，也不受 PID 复用影响。flock 属于打开的文件描述：同一进程内两个 Agent
 //! 实例各自打开文件，同样互斥；Rust 打开的文件带 close-on-exec，工具启动的子进程不会继承锁。
@@ -17,15 +17,15 @@
 //! 锁内容记录的主机与本机不同时拒绝接管并报告：锁目录可能位于多台机器共享的文件系统上，flock
 //! 不一定跨主机生效。
 //!
-//! **停止状态**：`<loopId>.state` 记录 `{generation, armed, updatedAt, pid}`，以临时文件加
-//! rename 原子替换，读改写在 `loops/.state.lock` 的 flock 内完成。解除武装（含 `/stop` 暂停接收）
-//! 与重新武装都递增 generation。持锁进程每次触发前读取：已解除武装且 generation 新于本进程所知，
-//! 就同步本地 Loop（暂停接收、取消事件派发令牌、归还租约）且不触发。仅删除锁文件的旧做法会让
-//! 另一实例接手后继续触发。
+//! **接收状态**：`trigger/receiving.state` 记录 `{generation, receiving, updatedAt, pid}`，以临时
+//! 文件加 rename 原子替换，读改写在 `trigger/.receiving.lock` 的 flock 内完成。暂停与恢复接收都
+//! 递增 generation。持锁进程每次送达前读取：已暂停且 generation 新于本进程所知，就同步本地接收
+//! 开关（暂停接收、停止 Artifact 监听、归还租约）且不送达。仅删除锁文件的旧做法会让另一实例接手
+//! 后继续送达。
 //!
 //! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
-//! 恢复，不使用租约与停止状态。
+//! 恢复，不使用租约与接收状态。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -41,10 +41,12 @@ use super::Agent;
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically,
 };
-use tickloop_agent_protocol::{ChatId, LoopId, LoopTriggerNotice, LoopTriggerNoticeKind};
+use tickloop_agent_protocol::{ChatId, LoopTriggerNotice, LoopTriggerNoticeKind};
 
-const LEASE_DIRECTORY: &str = "loops";
-const STATE_WRITE_LOCK_FILE: &str = ".state.lock";
+const LEASE_DIRECTORY: &str = "trigger";
+const LEASE_FILE: &str = "lease.lock";
+const STATE_FILE: &str = "receiving.state";
+const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
 const HELD_ELSEWHERE_MESSAGE: &str =
@@ -67,18 +69,18 @@ struct RecordedHost {
 }
 
 /// 本进程持有的一份租约：持有期间保持锁文件的描述符与 flock。析构即归还。
-pub(super) struct LoopLease {
+pub(super) struct ChatLease {
     path: PathBuf,
     file: File,
 }
 
-impl LoopLease {
+impl ChatLease {
     fn is_still_at_path(&self) -> bool {
         refers_to_same_file(&self.file, &self.path).unwrap_or(false)
     }
 }
 
-impl Drop for LoopLease {
+impl Drop for ChatLease {
     fn drop(&mut self) {
         // 仍持有 flock 时删除；随后 `file` 关闭，内核释放 flock。
         if self.is_still_at_path() {
@@ -89,61 +91,56 @@ impl Drop for LoopLease {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoopRunState {
+struct ReceivingRecord {
     generation: u64,
-    armed: bool,
+    receiving: bool,
     updated_at: u64,
     pid: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RunStateChange {
-    Armed,
-    Disarmed,
+pub(super) enum ReceivingChange {
+    Resumed,
+    Paused,
 }
 
 enum LeaseAttempt {
-    Acquired(LoopLease),
+    Acquired(ChatLease),
     HeldElsewhere,
     ForeignHost(String),
 }
 
-/// 持有租约后读取停止状态得到的结论。
+/// 持有租约后读取接收状态得到的结论。
 enum LeaseCheck {
     Held,
     HeldElsewhere,
     ForeignHost(String),
-    DisarmedElsewhere(u64),
+    PausedElsewhere(u64),
 }
 
-/// 一次触发前的判断结果。
+/// 一次送达前的判断结果。
 pub(super) enum TriggerPermit {
     Fire,
-    /// 暂不能触发（被其他进程持有、锁来自另一台主机、Loop 暂不可触发），稍后重试。
+    /// 暂不能送达（被其他进程持有、锁来自另一台主机、Loop 未在接收），稍后重试。
     Wait(String),
-    /// 停止状态显示 Loop 已在其他进程解除武装，本地已同步。
+    /// 接收状态显示已在其他进程暂停，本地已同步。
     Withdrawn,
     Failed(String),
 }
 
-/// 本进程持有的全部租约、已知的停止状态 generation 与待显示的提示。
+/// 本进程持有的全部租约、已知的接收状态 generation 与待显示的提示，都按 Chat。
 #[derive(Default)]
-pub(super) struct LoopLeases {
-    held: Mutex<HashMap<(ChatId, LoopId), LoopLease>>,
-    known_generations: Mutex<HashMap<(ChatId, LoopId), u64>>,
-    notices: Mutex<HashMap<(ChatId, LoopId), LoopTriggerNotice>>,
+pub(super) struct ChatLeases {
+    held: Mutex<HashMap<ChatId, ChatLease>>,
+    known_generations: Mutex<HashMap<ChatId, u64>>,
+    notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
 }
 
-impl LoopLeases {
-    /// 确保持有租约并读取停止状态。持有同一把 `held` 锁完成获取，本进程内的并发触发不会
+impl ChatLeases {
+    /// 确保持有租约并读取接收状态。持有同一把 `held` 锁完成获取，本进程内的并发送达不会
     /// 因为自己的 flock 而误判为被其他进程持有。
-    fn check(
-        &self,
-        directory: &PrivateDirectory,
-        chat_id: ChatId,
-        loop_id: LoopId,
-    ) -> io::Result<LeaseCheck> {
-        let key = (chat_id, loop_id);
+    fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
+        let key = chat_id;
         {
             let mut held = self.held.lock().unwrap();
             // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
@@ -154,7 +151,7 @@ impl LoopLeases {
                 held.remove(&key);
             }
             if let std::collections::hash_map::Entry::Vacant(vacant) = held.entry(key) {
-                match try_acquire(directory, chat_id, loop_id)? {
+                match try_acquire(directory, chat_id)? {
                     LeaseAttempt::Acquired(lease) => {
                         vacant.insert(lease);
                     }
@@ -164,15 +161,15 @@ impl LoopLeases {
             }
         }
         let known = self.known_generation(key);
-        Ok(match read_run_state(directory, loop_id)? {
-            Some(state) if !state.armed && state.generation > known => {
-                LeaseCheck::DisarmedElsewhere(state.generation)
+        Ok(match read_receiving(directory)? {
+            Some(state) if !state.receiving && state.generation > known => {
+                LeaseCheck::PausedElsewhere(state.generation)
             }
-            _ => LeaseCheck::Held,
+            Some(_) | None => LeaseCheck::Held,
         })
     }
 
-    fn known_generation(&self, key: (ChatId, LoopId)) -> u64 {
+    fn known_generation(&self, key: ChatId) -> u64 {
         self.known_generations
             .lock()
             .unwrap()
@@ -181,38 +178,31 @@ impl LoopLeases {
             .unwrap_or(0)
     }
 
-    fn remember_generation(&self, key: (ChatId, LoopId), generation: u64) {
+    fn remember_generation(&self, key: ChatId, generation: u64) {
         let mut known = self.known_generations.lock().unwrap();
         let entry = known.entry(key).or_insert(0);
         *entry = (*entry).max(generation);
     }
 
-    pub(super) fn set_notice(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        kind: LoopTriggerNoticeKind,
-        message: String,
-    ) {
+    pub(super) fn set_notice(&self, chat_id: ChatId, kind: LoopTriggerNoticeKind, message: String) {
         self.notices.lock().unwrap().insert(
-            (chat_id, loop_id),
+            chat_id,
             LoopTriggerNotice {
                 chat_id,
-                loop_id,
                 kind,
                 message,
             },
         );
     }
 
-    pub(super) fn clear_notice(&self, chat_id: ChatId, loop_id: LoopId) {
-        self.notices.lock().unwrap().remove(&(chat_id, loop_id));
+    pub(super) fn clear_notice(&self, chat_id: ChatId) {
+        self.notices.lock().unwrap().remove(&chat_id);
     }
 
-    pub(super) fn release(&self, chat_id: ChatId, loop_id: LoopId) {
-        let released = self.held.lock().unwrap().remove(&(chat_id, loop_id));
+    pub(super) fn release(&self, chat_id: ChatId) {
+        let released = self.held.lock().unwrap().remove(&chat_id);
         drop(released);
-        self.clear_notice(chat_id, loop_id);
+        self.clear_notice(chat_id);
     }
 
     pub(super) fn release_all(&self) {
@@ -223,13 +213,9 @@ impl LoopLeases {
 }
 
 /// 尝试获取租约：打开锁文件（不存在时独占创建）并尝试 flock。
-fn try_acquire(
-    directory: &PrivateDirectory,
-    chat_id: ChatId,
-    loop_id: LoopId,
-) -> io::Result<LeaseAttempt> {
+fn try_acquire(directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseAttempt> {
     directory.create()?;
-    let path = directory.path().join(format!("{loop_id}.lock"));
+    let path = directory.path().join(LEASE_FILE);
     let holder = LeaseHolder {
         chat_id,
         pid: std::process::id(),
@@ -271,7 +257,7 @@ fn try_acquire(
         }
         file.set_len(0)?;
         file.write_all_at(&content, 0)?;
-        return Ok(LeaseAttempt::Acquired(LoopLease { path, file }));
+        return Ok(LeaseAttempt::Acquired(ChatLease { path, file }));
     }
     Ok(LeaseAttempt::HeldElsewhere)
 }
@@ -323,15 +309,12 @@ fn local_host_name() -> String {
     String::from_utf8_lossy(&buffer[..length]).into_owned()
 }
 
-fn run_state_path(directory: &PrivateDirectory, loop_id: LoopId) -> PathBuf {
-    directory.path().join(format!("{loop_id}.state"))
+fn receiving_path(directory: &PrivateDirectory) -> PathBuf {
+    directory.path().join(STATE_FILE)
 }
 
-fn read_run_state(
-    directory: &PrivateDirectory,
-    loop_id: LoopId,
-) -> io::Result<Option<LoopRunState>> {
-    let path = run_state_path(directory, loop_id);
+fn read_receiving(directory: &PrivateDirectory) -> io::Result<Option<ReceivingRecord>> {
+    let path = receiving_path(directory);
     match std::fs::read(&path) {
         Ok(content) => serde_json::from_slice(&content).map(Some).map_err(|error| {
             io::Error::new(
@@ -344,12 +327,11 @@ fn read_run_state(
     }
 }
 
-/// 在状态写锁内读取、递增并原子替换停止状态，返回写入后文件中的状态。
-fn write_run_state(
+/// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态。
+fn write_receiving(
     directory: &PrivateDirectory,
-    loop_id: LoopId,
-    change: RunStateChange,
-) -> io::Result<LoopRunState> {
+    change: ReceivingChange,
+) -> io::Result<ReceivingRecord> {
     directory.create()?;
     let guard = OpenOptions::new()
         .read(true)
@@ -360,19 +342,18 @@ fn write_run_state(
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.path().join(STATE_WRITE_LOCK_FILE))?;
     guard.lock()?;
-    let current = read_run_state(directory, loop_id)?;
-    let next = LoopRunState {
+    let current = read_receiving(directory)?;
+    let next = ReceivingRecord {
         generation: current.map_or(0, |current| current.generation) + 1,
-        armed: change == RunStateChange::Armed,
+        receiving: match change {
+            ReceivingChange::Resumed => true,
+            ReceivingChange::Paused => false,
+        },
         updated_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         pid: std::process::id(),
     };
     let contents = serde_json::to_vec(&next).map_err(io::Error::other)?;
-    replace_file_atomically(
-        &run_state_path(directory, loop_id),
-        &contents,
-        PRIVATE_FILE_MODE,
-    )?;
+    replace_file_atomically(&receiving_path(directory), &contents, PRIVATE_FILE_MODE)?;
     Ok(next)
 }
 
@@ -386,32 +367,11 @@ impl Agent {
             .and_then(|chat| Some(chat.tools.chat_directory()?.join(LEASE_DIRECTORY)))
     }
 
-    /// Trigger 触发前调用：持有租约、读取停止状态，并确认 Loop 仍可触发。停止状态显示已在其他
-    /// 进程解除武装时同步本地 Loop 并返回 `Withdrawn`。
-    pub(super) async fn acquire_trigger_permit(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-    ) -> TriggerPermit {
-        self.acquire_loop_permit(chat_id, loop_id, false).await
-    }
-
-    pub(super) async fn acquire_feedback_replay_permit(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-    ) -> TriggerPermit {
-        self.acquire_loop_permit(chat_id, loop_id, true).await
-    }
-
-    async fn acquire_loop_permit(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        feedback_replay: bool,
-    ) -> TriggerPermit {
+    /// 每次送达前调用：持有该 Chat 的租约、读取接收状态，并确认 Loop 仍在接收。接收状态显示已在
+    /// 其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    pub(super) async fn acquire_trigger_permit(&self, chat_id: ChatId) -> TriggerPermit {
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
-        // other process fires its Triggers.
+        // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
             return TriggerPermit::Fire;
         }
@@ -419,40 +379,21 @@ impl Agent {
             return TriggerPermit::Wait("chat is no longer loaded".into());
         };
         let agent = self.clone();
-        let checked = tokio::task::spawn_blocking(move || {
-            agent.inner.loop_leases.check(&directory, chat_id, loop_id)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|checked| checked.map_err(|error| error.to_string()));
-        let leases = &self.inner.loop_leases;
-        if let Ok(LeaseCheck::DisarmedElsewhere(generation)) = &checked
-            && feedback_replay
-        {
-            leases.remember_generation((chat_id, loop_id), *generation);
-            if let Err(error) = self
-                .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
+        let checked =
+            tokio::task::spawn_blocking(move || agent.inner.chat_leases.check(&directory, chat_id))
                 .await
-            {
-                return TriggerPermit::Failed(error);
-            }
-            return Box::pin(self.acquire_loop_permit(chat_id, loop_id, true)).await;
-        }
+                .map_err(|error| error.to_string())
+                .and_then(|checked| checked.map_err(|error| error.to_string()));
+        let leases = &self.inner.chat_leases;
         match checked {
             Err(error) => {
                 let message = format!("could not take this Chat's Trigger lease: {error}");
-                leases.set_notice(
-                    chat_id,
-                    loop_id,
-                    LoopTriggerNoticeKind::Warning,
-                    message.clone(),
-                );
+                leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
                 TriggerPermit::Failed(message)
             }
             Ok(LeaseCheck::HeldElsewhere) => {
                 leases.set_notice(
                     chat_id,
-                    loop_id,
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
                     "another Tickloop process holds this Chat's Trigger".into(),
                 );
@@ -460,140 +401,81 @@ impl Agent {
             }
             Ok(LeaseCheck::ForeignHost(host)) => {
                 let message = format!(
-                    "this Chat's Trigger lock was written on host {host}; the loops directory may \
-                     be shared between machines, so this process will not take it over. Remove \
-                     the lock file if that host no longer runs Tickloop"
+                    "this Chat's Trigger lock was written on host {host}; the trigger directory \
+                     may be shared between machines, so this process will not take it over. \
+                     Remove the lock file if that host no longer runs Tickloop"
                 );
-                leases.set_notice(
-                    chat_id,
-                    loop_id,
-                    LoopTriggerNoticeKind::Warning,
-                    message.clone(),
-                );
+                leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
                 TriggerPermit::Wait(message)
             }
-            Ok(LeaseCheck::DisarmedElsewhere(generation)) => {
-                leases.remember_generation((chat_id, loop_id), generation);
-                self.disarm_trigger_disarmed_elsewhere(chat_id, loop_id)
-                    .await;
+            Ok(LeaseCheck::PausedElsewhere(generation)) => {
+                leases.remember_generation(chat_id, generation);
+                self.pause_receiving_paused_elsewhere(chat_id).await;
                 TriggerPermit::Withdrawn
             }
             Ok(LeaseCheck::Held) => {
-                let is_still_armed =
-                    self.inner
-                        .chats
-                        .lock()
-                        .await
-                        .get(&chat_id)
-                        .is_some_and(|chat| {
-                            let chat_loop = &chat.snapshot.chat_loop;
-                            chat_loop.id == loop_id
-                                && if feedback_replay {
-                                    chat.snapshot.policy.mode != crate::ExecutionMode::Plan
-                                        && super::feedback_inbox::FeedbackInbox::new(
-                                            chat.tools.chat_directory(),
-                                            chat_id,
-                                        )
-                                        .pending()
-                                        .is_ok_and(
-                                            |inputs| {
-                                                inputs
-                                                    .iter()
-                                                    .any(|input| input.identity.loop_id == loop_id)
-                                            },
-                                        )
-                                } else {
-                                    (chat.trigger_cancellations.contains_key(&loop_id)
-                                        || chat.event_cancellations.contains_key(&loop_id))
-                                        && (super::triggers::can_trigger(chat_loop)
-                                            || (chat.event_cancellations.contains_key(&loop_id)
-                                                && chat_loop
-                                                    .event_sources
-                                                    .iter()
-                                                    .any(|source| !source.resume_required)))
-                                }
-                        });
-                if !is_still_armed {
-                    leases.release(chat_id, loop_id);
-                    return TriggerPermit::Wait("the Loop is not eligible for a Trigger".into());
+                let is_receiving = self
+                    .inner
+                    .chats
+                    .lock()
+                    .await
+                    .get(&chat_id)
+                    .is_some_and(|chat| chat.snapshot.chat_loop.receiving.is_receiving());
+                if !is_receiving {
+                    leases.release(chat_id);
+                    return TriggerPermit::Wait("this Chat's Loop is not receiving".into());
                 }
-                leases.clear_notice(chat_id, loop_id);
+                leases.clear_notice(chat_id);
                 TriggerPermit::Fire
             }
         }
     }
 
-    /// 记录解除武装或重新武装，让其他进程在下一次触发前看到。解除武装应在归还租约之前写入，
-    /// 避免接手的进程在写入前读到旧状态。失败时返回说明，由调用方在归还租约后通过
-    /// [`Agent::warn_loop_run_state_failure`] 显示，不影响本地操作。
-    pub(super) async fn record_loop_run_state(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        change: RunStateChange,
-    ) -> Result<(), String> {
-        if self.inner.recorder.is_none() {
-            return Ok(());
-        }
-        let Some(directory) = self.lease_directory(chat_id).await else {
-            return Ok(());
+    /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的
+    /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。
+    pub(super) async fn record_receiving(&self, chat_id: ChatId, change: ReceivingChange) {
+        let recorded = match self.lease_directory(chat_id).await {
+            Some(directory) if self.inner.recorder.is_some() => {
+                tokio::task::spawn_blocking(move || write_receiving(&directory, change))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|written| written.map_err(|error| error.to_string()))
+                    .map(|state| {
+                        self.inner
+                            .chat_leases
+                            .remember_generation(chat_id, state.generation)
+                    })
+            }
+            Some(_) | None => Ok(()),
         };
-        self.record_loop_run_state_in(chat_id, loop_id, change, directory)
-            .await
-    }
-
-    pub(super) async fn record_loop_run_state_in(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        change: RunStateChange,
-        directory: PrivateDirectory,
-    ) -> Result<(), String> {
-        if self.inner.recorder.is_none() {
-            return Ok(());
+        match change {
+            ReceivingChange::Paused => self.inner.chat_leases.release(chat_id),
+            ReceivingChange::Resumed => {}
         }
-        let state =
-            tokio::task::spawn_blocking(move || write_run_state(&directory, loop_id, change))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|written| written.map_err(|error| error.to_string()))?;
-        self.inner
-            .loop_leases
-            .remember_generation((chat_id, loop_id), state.generation);
-        Ok(())
-    }
-
-    pub(super) fn warn_loop_run_state_failure(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        recorded: Result<(), String>,
-    ) {
         if let Err(error) = recorded {
-            self.inner.loop_leases.set_notice(
+            self.inner.chat_leases.set_notice(
                 chat_id,
-                loop_id,
                 LoopTriggerNoticeKind::Warning,
                 format!(
-                    "could not record this Chat's Trigger state ({error}); other Tickloop \
+                    "could not record this Chat's receiving state ({error}); other Tickloop \
                      processes may not see the change"
                 ),
             );
         }
     }
 
-    /// 需要让用户看到的 Trigger 租约提示，按 Chat 与 Loop 排列。
+    /// 需要让用户看到的 Trigger 租约提示，按 Chat 排列。
     pub fn loop_trigger_notices(&self) -> Vec<LoopTriggerNotice> {
         let mut notices = self
             .inner
-            .loop_leases
+            .chat_leases
             .notices
             .lock()
             .unwrap()
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        notices.sort_by_key(|notice| (notice.chat_id, notice.loop_id));
+        notices.sort_by_key(|notice| notice.chat_id);
         notices
     }
 }
@@ -608,7 +490,7 @@ mod tests {
         (root, directory)
     }
 
-    fn acquired(attempt: LeaseAttempt) -> LoopLease {
+    fn acquired(attempt: LeaseAttempt) -> ChatLease {
         match attempt {
             LeaseAttempt::Acquired(lease) => lease,
             LeaseAttempt::HeldElsewhere => panic!("the lease is held elsewhere"),
@@ -619,43 +501,43 @@ mod tests {
     #[test]
     fn separate_opens_in_one_process_exclude_each_other_until_release() {
         let (_root, directory) = lease_directory();
-        let (chat_id, loop_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let lease = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let chat_id = Uuid::new_v4();
+        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
         assert!(matches!(
-            try_acquire(&directory, chat_id, loop_id).unwrap(),
+            try_acquire(&directory, chat_id).unwrap(),
             LeaseAttempt::HeldElsewhere
         ));
         assert!(lease.path.exists());
         let path = lease.path.clone();
         drop(lease);
         assert!(!path.exists());
-        let again = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let again = acquired(try_acquire(&directory, chat_id).unwrap());
         assert!(again.path.exists());
     }
 
     #[test]
     fn a_descriptor_opened_before_the_holder_deleted_the_lock_is_not_a_lease() {
         let (_root, directory) = lease_directory();
-        let (chat_id, loop_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let lease = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let chat_id = Uuid::new_v4();
+        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
         let stale = File::open(&lease.path).unwrap();
         let path = lease.path.clone();
         drop(lease);
         // 旧描述符上的 flock 可以拿到，但路径已不指向它；新获取者创建新文件。
         stale.try_lock().unwrap();
         assert!(!refers_to_same_file(&stale, &path).unwrap());
-        let current = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let current = acquired(try_acquire(&directory, chat_id).unwrap());
         assert!(refers_to_same_file(&current.file, &path).unwrap());
     }
 
     #[test]
     fn a_failed_attempt_leaves_the_holders_lock_in_place() {
         let (_root, directory) = lease_directory();
-        let (chat_id, loop_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let lease = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let chat_id = Uuid::new_v4();
+        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
         for _ in 0..10 {
             assert!(matches!(
-                try_acquire(&directory, chat_id, loop_id).unwrap(),
+                try_acquire(&directory, chat_id).unwrap(),
                 LeaseAttempt::HeldElsewhere
             ));
         }
@@ -669,54 +551,53 @@ mod tests {
     #[test]
     fn every_change_increases_the_generation() {
         let (_root, directory) = lease_directory();
-        let loop_id = Uuid::new_v4();
-        let armed = write_run_state(&directory, loop_id, RunStateChange::Armed).unwrap();
-        let disarmed = write_run_state(&directory, loop_id, RunStateChange::Disarmed).unwrap();
-        assert!(armed.armed && !disarmed.armed);
-        assert_eq!(disarmed.generation, armed.generation + 1);
-        let rearmed = write_run_state(&directory, loop_id, RunStateChange::Armed).unwrap();
-        assert!(rearmed.armed);
-        assert_eq!(rearmed.generation, disarmed.generation + 1);
-        assert!(read_run_state(&directory, loop_id).unwrap().unwrap().armed);
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        let paused = write_receiving(&directory, ReceivingChange::Paused).unwrap();
+        assert!(resumed.receiving && !paused.receiving);
+        assert_eq!(paused.generation, resumed.generation + 1);
+        let again = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        assert!(again.receiving);
+        assert_eq!(again.generation, paused.generation + 1);
+        assert!(read_receiving(&directory).unwrap().unwrap().receiving);
     }
 
     #[test]
-    fn a_state_file_disarmed_after_the_known_generation_withdraws_the_holder() {
+    fn a_pause_recorded_after_the_known_generation_withdraws_the_holder() {
         let (_root, directory) = lease_directory();
-        let leases = LoopLeases::default();
-        let (chat_id, loop_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let armed = write_run_state(&directory, loop_id, RunStateChange::Armed).unwrap();
-        leases.remember_generation((chat_id, loop_id), armed.generation);
+        let leases = ChatLeases::default();
+        let chat_id = Uuid::new_v4();
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        leases.remember_generation(chat_id, resumed.generation);
         assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
+            leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::Held
         ));
-        write_run_state(&directory, loop_id, RunStateChange::Disarmed).unwrap();
+        write_receiving(&directory, ReceivingChange::Paused).unwrap();
         assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
-            LeaseCheck::DisarmedElsewhere(generation) if generation == armed.generation + 1
+            leases.check(&directory, chat_id).unwrap(),
+            LeaseCheck::PausedElsewhere(generation) if generation == resumed.generation + 1
         ));
     }
 
     #[test]
     fn a_lock_deleted_under_the_holder_is_reacquired_on_the_next_check() {
         let (_root, directory) = lease_directory();
-        let leases = LoopLeases::default();
-        let (chat_id, loop_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let leases = ChatLeases::default();
+        let chat_id = Uuid::new_v4();
         assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
+            leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::Held
         ));
-        let path = directory.path().join(format!("{loop_id}.lock"));
+        let path = directory.path().join(LEASE_FILE);
         std::fs::remove_file(&path).unwrap();
-        let intruder = acquired(try_acquire(&directory, chat_id, loop_id).unwrap());
+        let intruder = acquired(try_acquire(&directory, chat_id).unwrap());
         assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
+            leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::HeldElsewhere
         ));
         drop(intruder);
         assert!(matches!(
-            leases.check(&directory, chat_id, loop_id).unwrap(),
+            leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::Held
         ));
     }

@@ -24,8 +24,8 @@ use crate::{
     QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
     RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult,
     ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
-    TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger,
-    TriggerSource, UserShellReceipt, UserShellRecord, chat_status::ProcessState,
+    TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery,
+    UserShellReceipt, UserShellRecord, chat_status::ProcessState,
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
@@ -58,7 +58,10 @@ use crate::{
 /// receiving instead of ending a Loop, `ContinueLoop` resumes it, and the ended Loop states are
 /// gone. Older business majors are refused before dispatch; the frozen daemon management
 /// protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 27;
+/// 28.0 puts every Trigger on one wake-up base: the Loop carries its receiving switch, with why
+/// it paused, and its Tick Subscriptions; a delivery names its source by type; the explicit
+/// Trigger commands are gone.
+pub const PROTOCOL_MAJOR: u16 = 28;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -511,12 +514,6 @@ pub enum LoopAction {
         run_id: Uuid,
     },
     DisableEventSources,
-    ConfigureTrigger {
-        trigger: Option<Trigger>,
-    },
-    EmitTrigger {
-        source: TriggerSource,
-    },
     ApprovePlan {
         version: u64,
         mode: ExecutionMode,
@@ -788,7 +785,6 @@ pub struct LiveChatSnapshot {
     pub last_model_run: Option<Uuid>,
     pub warnings: Vec<String>,
     pub request_refs: Vec<RequestRef>,
-    pub trigger_awaits_resume: bool,
     pub last_queue_sequence: u64,
     pub transcript_write_error: Option<String>,
     pub loop_trigger_notices: Vec<LoopTriggerNotice>,
@@ -804,7 +800,6 @@ impl LiveChatSnapshot {
         Self {
             execution,
             subagent: None,
-            trigger_awaits_resume: snapshot.trigger_awaits_resume,
             last_queue_sequence: snapshot.last_queue_sequence,
             transcript_write_error: None,
             loop_trigger_notices: Vec::new(),
@@ -874,7 +869,6 @@ impl LiveChatSnapshot {
 
     pub fn into_snapshot(self) -> ChatSnapshot {
         let mut snapshot = self.conversation;
-        snapshot.trigger_awaits_resume = self.trigger_awaits_resume;
         snapshot.last_queue_sequence = self.last_queue_sequence;
         snapshot.model = self.model;
         snapshot.reasoning_effort = self.reasoning_effort;

@@ -106,8 +106,8 @@ mod shared_tasks;
 mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
-mod triggers;
 mod turn;
+mod wakeup;
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{
@@ -153,8 +153,8 @@ use tickloop_agent_protocol::{
     PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
     PermissionRule, PermissionScope, PromptPolicy, QueuedInput, QueuedInputKind, ReasoningEffort,
     Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
-    SubagentRegistration, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE, TaskNotification,
-    TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence, projection,
+    SubagentRegistration, TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState,
+    VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -375,7 +375,7 @@ struct Inner {
     tasks: agent_tasks::AgentTasks,
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
-    loop_leases: loop_lease::LoopLeases,
+    chat_leases: loop_lease::ChatLeases,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -481,8 +481,8 @@ struct Chat {
     watching_commands: bool,
     watching_user_shells: bool,
     user_shell_queue: Arc<Notify>,
-    trigger_cancellations: HashMap<LoopId, CancellationToken>,
-    event_cancellations: HashMap<LoopId, CancellationToken>,
+    /// Polls the Loop's artifact links for @tickloop requests while it receives.
+    feedback_watcher: Option<CancellationToken>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     feedback_cleanup_started: bool,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
@@ -502,7 +502,8 @@ struct Chat {
 enum RunAdmission {
     Idle,
     Ready(Receipt, ModelRequest, CancellationToken),
-    ValidateTick(Box<PendingInput>),
+    /// The first takeable input is a Trigger's whose source proves it again outside the lock.
+    ValidateTrigger(Box<PendingInput>),
 }
 
 #[derive(Clone, Copy)]
@@ -527,10 +528,8 @@ struct SubmissionOptions {
     contexts: Vec<InputContext>,
     attached_file_reads: Vec<(PathBuf, tickloop_agent_protocol::FileReadRecord)>,
     denial_reference: Option<DenialReference>,
+    /// Set only by [`Agent::deliver_trigger`], the wake-up base's one entry.
     trigger_source: Option<TriggerSource>,
-    trigger_cancel: Option<CancellationToken>,
-    feedback_input: Option<feedback_inbox::FeedbackIdentity>,
-    requires_feedback_binding: bool,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -959,7 +958,6 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         message_sources: BTreeMap::new(),
         message_models: BTreeMap::new(),
         chat_loop: LoopSnapshot::new(Uuid::new_v4()),
-        trigger_awaits_resume: false,
         last_sequence: 0,
         permissions: Vec::new(),
         questions: Vec::new(),
@@ -1885,7 +1883,7 @@ impl Agent {
                 task_notifications: broadcast::channel(256).0,
                 tasks: agent_tasks::AgentTasks::default(),
                 recorder,
-                loop_leases: loop_lease::LoopLeases::default(),
+                chat_leases: loop_lease::ChatLeases::default(),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2159,8 +2157,7 @@ impl Agent {
                 watching_commands: false,
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
-                trigger_cancellations: HashMap::new(),
-                event_cancellations: HashMap::new(),
+                feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
                 deferred_messages: Vec::new(),
@@ -2491,9 +2488,6 @@ impl Agent {
             attached_file_reads,
             denial_reference,
             trigger_source,
-            trigger_cancel,
-            feedback_input,
-            requires_feedback_binding,
             invoked_skill,
             host_context,
             agent_message,
@@ -2501,23 +2495,18 @@ impl Agent {
             ledger,
             mut turn,
         } = options;
-        let is_feedback = feedback_input.is_some();
         // A user input continues the Chat: its Loop receives Triggers again.
         let continues_chat = trigger_source.is_none() && agent_message.is_none();
         // Every queued input has its ledger record; one the Agent queues for itself is named by
         // its source where the source names it.
         let ledger = ledger.unwrap_or_else(|| {
-            if let Some(identity) = &feedback_input {
-                return turn::delivery_ledger(event_sources::ExternalDelivery::received(
-                    identity,
-                    input.clone(),
-                ));
+            if let Some(source) = &trigger_source {
+                return wakeup::trigger_ledger(chat_id, source, &input);
             }
             let (id, op) = match (&agent_message, &directed_human) {
                 (Some(source), _) => (source.message_id, InputOp::AgentMessage),
                 (_, Some(source)) => (source.message_id, InputOp::AgentMessage),
-                _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
-                _ => (Uuid::new_v4(), InputOp::Continue),
+                (None, None) => (Uuid::new_v4(), InputOp::Continue),
             };
             lifecycle::LedgerInput::new(id, op, &input)
         });
@@ -2554,32 +2543,6 @@ impl Agent {
             Self::validate_attachment_admission(&chats, &sessions, chat_id, admission)?;
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if let Some(identity) = &feedback_input
-            && identity.loop_id != original.snapshot.chat_loop.id
-        {
-            return Err(AgentError::Invalid("the Chat has no such Loop".into()));
-        }
-        if requires_feedback_binding
-            && let Some(identity) = &feedback_input
-            && !original
-                .snapshot
-                .chat_loop
-                .event_sources
-                .iter()
-                .any(|source| {
-                    !source.resume_required
-                        && source.origin == identity.origin
-                        && source.account_id == identity.account_id
-                        && tickloop_agent_artifacts::artifact_ids_match(
-                            &source.artifact_id,
-                            &identity.artifact_id,
-                        )
-                })
-        {
-            return Err(AgentError::Invalid(
-                "the Loop has no active binding for this Artifact delivery".into(),
-            ));
-        }
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
         }
@@ -2610,6 +2573,9 @@ impl Agent {
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         let loop_id = chat.snapshot.chat_loop.id;
+        let feedback_input = trigger_source
+            .as_ref()
+            .and_then(|source| event_sources::feedback_identity(chat_id, loop_id, source));
         let run_id = feedback_input
             .as_ref()
             .map_or_else(Uuid::new_v4, |feedback| feedback.delivery_id);
@@ -2647,53 +2613,15 @@ impl Agent {
         {
             return Err(AgentError::ImageInputUnsupported);
         }
-        let resumes_trigger = continues_chat && triggers::rearm_trigger_awaiting_resume(chat)?;
+        if let Some(source) = &trigger_source
+            && let Some(waiting) = self.admit_trigger(chat, source)?
+        {
+            self.record_merged_trigger(chat, &ledger, source, &input, &waiting);
+            *original = candidate;
+            self.inner.ledger_changes.send_replace(());
+            return Ok(waiting);
+        }
         let chat_loop = &mut chat.snapshot.chat_loop;
-        let is_manual_tick = trigger_source
-            .as_ref()
-            .is_some_and(|source| source.source == TICK_MANUAL_SOURCE);
-        if is_manual_tick && !tick_subscriptions::can_take_manual_update(chat_loop) {
-            return Err(AgentError::Invalid(
-                "this Loop cannot take a manual update".into(),
-            ));
-        }
-        if trigger_source.is_some() && !is_manual_tick && !is_feedback {
-            if trigger_cancel
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
-                return Err(AgentError::Invalid(
-                    "trigger configuration was replaced".into(),
-                ));
-            }
-            let is_eligible = triggers::can_trigger(chat_loop);
-            let pending_receipt = chat
-                .snapshot
-                .pending_inputs
-                .iter()
-                .find(|pending| {
-                    is_eligible
-                        && pending
-                            .trigger_source
-                            .as_ref()
-                            .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
-                })
-                .map(|pending| pending.receipt.clone());
-            if !is_eligible {
-                return Err(AgentError::Invalid(
-                    "the Loop is not receiving Triggers".into(),
-                ));
-            }
-            if let Some(pending_receipt) = pending_receipt {
-                *original = candidate;
-                drop(chats);
-                let next = self.next_run(chat_id).await?;
-                if let Some(next) = next {
-                    self.run_task(next);
-                }
-                return Ok(pending_receipt);
-            }
-        }
         let continues_ended_turn =
             matches!(chat_loop.state, LoopState::Failed | LoopState::Interrupted);
         if !matches!(
@@ -2788,10 +2716,6 @@ impl Agent {
                 return Err(error);
             }
         };
-        if resumes_trigger {
-            self.record_armed_trigger(chat_id, loop_id).await;
-            self.sync_tick_subscriptions().await;
-        }
         if let Some(tools) = watch {
             self.watch_commands(chat_id, tools).await;
         }
@@ -2807,7 +2731,7 @@ impl Agent {
 
         self.inner.ledger_changes.send_replace(());
         if continues_chat {
-            Box::pin(self.resume_feedback_sources(chat_id)).await;
+            Box::pin(self.continue_receiving(chat_id)).await;
         }
         self.start_title_generation(chat_id).await;
         Ok(requested_receipt)
@@ -2965,8 +2889,11 @@ impl Agent {
             }
             if chat.snapshot.folder.is_none() {
                 let chat_loop = &chat.snapshot.chat_loop;
-                state["loop"] =
-                    serde_json::json!({ "id": chat_loop.id, "trigger": chat_loop.trigger });
+                state["loop"] = serde_json::json!({
+                    "id": chat_loop.id,
+                    "receiving": chat_loop.receiving,
+                    "subscriptions": chat_loop.subscriptions,
+                });
             }
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
@@ -3139,21 +3066,10 @@ impl Agent {
                 .iter()
                 .enumerate()
                 .filter(|(_, pending)| {
+                    // Trigger input waits for the turn to end.
                     pending.armed
-                        && (pending.trigger_source.is_none()
-                            || event_sources::is_feedback_input(pending))
+                        && pending.trigger_source.is_none()
                         && pending.receipt.loop_id == active.loop_id
-                        && candidate
-                            .feedback_inputs
-                            .get(&pending.receipt.run_id)
-                            .is_none_or(|queued| {
-                                candidate.feedback_inputs.get(&active.run_id).is_none_or(
-                                    |running| {
-                                        queued.origin == running.origin
-                                            && queued.account_id == running.account_id
-                                    },
-                                )
-                            })
                         && (pending.agent_message.is_some()
                             || queue_barrier
                                 .is_none_or(|sequence| pending.queued_sequence < sequence))
@@ -3787,24 +3703,14 @@ impl Agent {
                 RunAdmission::Ready(receipt, request, cancel) => {
                     return Ok(Some((receipt, request, cancel)));
                 }
-                RunAdmission::ValidateTick(pending) => {
-                    let source = pending.trigger_source.as_ref().unwrap();
-                    let validation = if source.source == TICK_MANUAL_SOURCE {
-                        // Read admission must not enlarge every run's shared async stack.
-                        Box::pin(self.revalidate_manual_tick_source(
-                            chat_id,
-                            pending.receipt.loop_id,
-                            &source.payload,
-                        ))
-                        .await
-                    } else {
-                        self.revalidate_tick_source(
-                            chat_id,
-                            pending.receipt.loop_id,
-                            &source.payload,
-                        )
-                        .await
-                    };
+                RunAdmission::ValidateTrigger(pending) => {
+                    let source = pending
+                        .trigger_source
+                        .as_ref()
+                        .expect("only Trigger input is validated");
+                    // Boxed: proving a source must not enlarge every run's shared async stack.
+                    let validation =
+                        Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
                     if validation.is_ok() {
                         if let Ok(mut chats) = self.inner.chats.try_lock() {
                             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
@@ -3813,17 +3719,18 @@ impl Agent {
                                 RunAdmission::Ready(receipt, request, cancel) => {
                                     return Ok(Some((receipt, request, cancel)));
                                 }
-                                RunAdmission::ValidateTick(_) => {}
+                                RunAdmission::ValidateTrigger(_) => {}
                             }
                         }
                     } else {
                         let mut chats = self.inner.chats.lock().await;
                         if let Some(chat) = chats.get_mut(&chat_id) {
-                            chat.snapshot
-                                .pending_inputs
-                                .retain(|queued| queued.receipt.run_id != pending.receipt.run_id);
-                            self.finish_discarded_trigger_input(chat, &pending.receipt);
-                            self.discard_invalid_tick_inputs(chat);
+                            self.withdraw_trigger_input(
+                                chat,
+                                &pending.receipt,
+                                DiscardReason::SourceEnded,
+                            );
+                            self.withdraw_ended_inputs(chat);
                             self.save(&chat.snapshot);
                         }
                     }
@@ -3835,7 +3742,7 @@ impl Agent {
     fn select_next_run(
         &self,
         chat: &mut Chat,
-        validated_tick: Option<&PendingInput>,
+        validated_trigger: Option<&PendingInput>,
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
@@ -3877,7 +3784,8 @@ impl Agent {
             .map(|command| command.queued_sequence)
             .min();
         self.apply_pending_model(&mut candidate)?;
-        while let Some(index) = candidate
+        self.withdraw_ended_inputs(&mut candidate);
+        if let Some(index) = candidate
             .snapshot
             .pending_inputs
             .iter()
@@ -3891,61 +3799,23 @@ impl Agent {
                         candidate.snapshot.chat_loop.state,
                         LoopState::WaitingPermission | LoopState::WaitingQuestion
                     )
-                    // Trigger input queued before receiving paused waits until it resumes.
+                    // Trigger input waits while its Loop pauses receiving or its source holds it.
                     && pending.trigger_source.as_ref().is_none_or(|source| {
-                        triggers::takes_trigger_input(&candidate.snapshot.chat_loop, source)
+                        self.takes_trigger_input(&candidate, source) == wakeup::Eligibility::Eligible
                     })
             })
         {
             let pending = candidate.snapshot.pending_inputs[index].clone();
-            if pending
-                .trigger_source
-                .as_ref()
-                .is_some_and(|source| source.source == TICK_MANUAL_SOURCE)
-                && !tick_subscriptions::can_take_manual_update(&candidate.snapshot.chat_loop)
-            {
-                let discarded = candidate.snapshot.pending_inputs.remove(index);
-                self.settle_removed_inputs(
-                    &mut candidate,
-                    [&discarded],
-                    SettledOutcome::Discarded {
-                        reason: DiscardReason::SourceEnded,
-                    },
-                );
-                continue;
-            }
-            if let Some(source) = &pending.trigger_source
-                && matches!(
-                    source.source.as_str(),
-                    TICK_SUBSCRIPTION_SOURCE | TICK_MANUAL_SOURCE
-                )
-            {
-                let validated = validated_tick.is_some_and(|validated| {
+            if let Some(source) = &pending.trigger_source {
+                let validated = validated_trigger.is_some_and(|validated| {
                     validated.receipt.run_id == pending.receipt.run_id
                         && validated.input == pending.input
-                        && validated.trigger_source.as_ref().is_some_and(|previous| {
-                            previous.source == source.source && previous.payload == source.payload
-                        })
+                        && validated.trigger_source.as_ref() == Some(source)
                 });
                 if !validated {
                     self.save(&candidate.snapshot);
                     *chat = candidate;
-                    return Ok(RunAdmission::ValidateTick(Box::new(pending)));
-                }
-                if source.source == TICK_SUBSCRIPTION_SOURCE
-                    && self
-                        .validate_tick_source_bindings(
-                            pending.receipt.chat_id,
-                            pending.receipt.loop_id,
-                            &source.payload,
-                            &candidate.snapshot,
-                        )
-                        .is_err()
-                {
-                    candidate.snapshot.pending_inputs.remove(index);
-                    self.finish_discarded_trigger_input(&mut candidate, &pending.receipt);
-                    self.discard_invalid_tick_inputs(&mut candidate);
-                    continue;
+                    return Ok(RunAdmission::ValidateTrigger(Box::new(pending)));
                 }
             }
             recovery::before_resume(
@@ -4825,7 +4695,7 @@ impl Agent {
             .active_run
             .is_some_and(|run| chat.user_cancelled_runs.contains(&run));
         if loop_id != Some(chat.snapshot.chat_loop.id)
-            || chat.snapshot.trigger_awaits_resume
+            || !chat.snapshot.chat_loop.receiving.is_receiving()
             || is_being_interrupted
             || chat
                 .snapshot
@@ -4914,7 +4784,7 @@ impl Agent {
         }
         for chat in self.inner.chats.lock().await.values() {
             self.stop_runs_at_shutdown(chat);
-            for cancel in chat.event_cancellations.values() {
+            if let Some(cancel) = &chat.feedback_watcher {
                 cancel.cancel();
             }
         }
@@ -4943,7 +4813,7 @@ impl Agent {
                 reviewer.close_chat(chat_id).await;
             }
         }
-        self.inner.loop_leases.release_all();
+        self.inner.chat_leases.release_all();
         self.close_transcripts().await;
     }
 }

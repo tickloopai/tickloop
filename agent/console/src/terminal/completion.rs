@@ -340,24 +340,6 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
-        command: "/events",
-        arguments: "PROMPT",
-        description: "Enables explicit events for this Chat's Loop.",
-        menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
-        command: "/trigger",
-        arguments: "SOURCE [JSON]",
-        description: "Delivers an event to this Chat's Loop.",
-        menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
-        command: "/clear-trigger",
-        arguments: "",
-        description: "Removes this Chat's Trigger.",
-        menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
         command: "/acknowledge-input",
         arguments: "COMMAND_ID",
         description: "Stops waiting on an input whose acceptance is unknown; nothing is resent.",
@@ -614,13 +596,13 @@ mod tests {
         let mut completion = Completion::default();
         completion.update("/");
         assert_eq!(completion.candidates().len(), 24);
-        assert_eq!(builtin_commands().len(), 43);
+        assert_eq!(builtin_commands().len(), 40);
         assert_eq!(
             builtin_commands()
                 .iter()
                 .filter(|spec| spec.menu_group == Some(CommandGroup::Advanced))
                 .count(),
-            19
+            16
         );
         assert_eq!(completion.selected_index(), None);
         for command in [
@@ -656,6 +638,9 @@ mod tests {
             "/theme",
             "/logout",
             "/triggers",
+            "/events",
+            "/trigger",
+            "/clear-trigger",
             "/schedule",
             "/checkpoint",
             "/undo",

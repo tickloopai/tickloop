@@ -128,11 +128,6 @@ pub struct ChatSnapshot {
     pub message_models: BTreeMap<usize, ModelIdentity>,
     /// The Chat's one Loop, there from the Chat's creation. 链上字段：由对话链上的 Loop 条目重放得到。
     pub chat_loop: LoopSnapshot,
-    /// Receiving is paused until the Chat is continued (after `/stop`, or a history load or Branch
-    /// copy of an armed Trigger); the Loop's Trigger stays disarmed meanwhile. Recorded with the
-    /// Loop on the conversation chain.
-    #[serde(skip)]
-    pub trigger_awaits_resume: bool,
     /// The fields through `pending_model` are process-local state and are not persisted with the
     /// Chat. Recovery starts them from defaults; persistent rules and context limits come from
     /// user settings.

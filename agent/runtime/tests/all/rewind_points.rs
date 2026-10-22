@@ -14,10 +14,10 @@ use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, Content, Event, EventKind, ExecutionMode, InputContext, ModelIdentity, PermissionScope,
-    RewindPoint, Role, RunId, TextContext, Trigger, TriggerPromptSource, TriggerSource,
-    UserShellState,
+    RewindPoint, Role, RunId, TextContext, UserShellState,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -394,13 +394,15 @@ async fn compaction_commands_and_direct_shell_do_not_capture_points_but_later_pr
 }
 
 #[tokio::test(start_paused = true)]
-async fn explicit_events_preserve_the_single_real_user_checkpoint() {
+async fn trigger_deliveries_preserve_the_single_real_user_checkpoint() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         text("Initial observation"),
         text("Triggered observation"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    let shell = ShellTick::new(Uuid::new_v4());
+    shell.install(&agent).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -409,34 +411,10 @@ async fn explicit_events_preserve_the_single_real_user_checkpoint() {
         .unwrap();
     completion(&mut events, Some(first.run_id)).await;
     let before = checkpoints(&agent, chat).await;
-    agent
-        .configure_trigger(
-            chat,
-            Some(Trigger {
-                id: Uuid::new_v4(),
-                prompt: "External observation".into(),
-                prompt_source: TriggerPromptSource::Explicit,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-    let expected_run = agent
-        .trigger(
-            chat,
-            TriggerSource {
-                source: "fixture-event".into(),
-                payload: json!({"changed":true}),
-            },
-        )
-        .await
-        .unwrap()
-        .run_id;
-    let completed = completion(&mut events, Some(expected_run)).await;
+    shell.subscribe(&agent, chat).await;
+    shell.update(1, "External observation");
+    let completed = completion(&mut events, None).await;
     assert_ne!(completed.run_id, first.run_id);
-    agent.configure_trigger(chat, None).await.unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, before);
     assert_eq!(snapshot.rewind_points().len(), 1);

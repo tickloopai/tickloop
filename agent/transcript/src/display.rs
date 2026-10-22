@@ -12,13 +12,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
-    AgentColor, AgentMessageSource, Content, ImageContext, InputContext, LocalMessage, LoopState,
-    Protocol, Question, Role, SharedTask, SubagentRegistration, TaskBoard, Trigger,
+    AgentColor, AgentMessageSource, Authority, Content, ImageContext, InputContext, LocalMessage,
+    LoopState, Protocol, Question, Receiving, Role, SharedTask, SubagentRegistration, TaskBoard,
+    TickSubscription, TriggerKind,
 };
 use uuid::Uuid;
 
 use crate::entry::{
-    ChainEntry, InputEntry, InputOp, InterruptedBy, Line, LoopRecord, ResponseEnding,
+    ChainEntry, InputEntry, InputOp, InputState, InterruptedBy, Line, LoopRecord, ResponseEnding,
     ResponseEntry, ResponseState, WaitEntry, WaitKind, WaitState,
 };
 
@@ -56,7 +57,12 @@ pub enum DisplayKind {
 pub enum PromptOrigin {
     #[default]
     User,
-    Trigger,
+    /// A Trigger delivery, with how many source events it merges.
+    Trigger {
+        source: TriggerKind,
+        authority: Authority,
+        merged: u64,
+    },
     Feedback {
         artifact: String,
     },
@@ -169,8 +175,8 @@ pub fn project(lines: &[Line]) -> Vec<DisplayNode> {
 pub struct DisplayLoop {
     pub id: Uuid,
     pub state: LoopState,
-    pub trigger: Option<Trigger>,
-    pub trigger_awaits_resume: bool,
+    pub receiving: Receiving,
+    pub subscriptions: Vec<TickSubscription>,
     pub state_since: Option<u64>,
     pub run_started_at: Option<u64>,
 }
@@ -190,14 +196,20 @@ pub fn chat_loop(lines: &[Line]) -> Option<DisplayLoop> {
     });
     let record = latest?;
     let state = serde_json::from_value(record.state).ok()?;
-    let trigger = record
-        .trigger
-        .and_then(|value| serde_json::from_value::<Trigger>(value).ok());
+    let receiving = record
+        .receiving
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let subscriptions = record
+        .subscriptions
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect();
     Some(DisplayLoop {
         id: record.loop_id,
         state,
-        trigger,
-        trigger_awaits_resume: record.trigger_awaits_resume,
+        receiving,
+        subscriptions,
         state_since: record.state_since.and_then(|value| value.as_u64()),
         run_started_at: record.run_started_at,
     })
@@ -236,6 +248,48 @@ pub fn task_boards(lines: &[Line], enabled: bool) -> Vec<DisplayTaskBoard> {
             tasks: board.tasks,
         })
         .collect()
+}
+
+/// One Trigger delivery as the ledger last recorded it: its source, how many source events it
+/// merges, and where it went: waiting, taken into a turn, merged into another delivery, or
+/// withdrawn with the reason.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayTriggerDelivery {
+    pub input_id: Uuid,
+    pub run_id: Uuid,
+    pub source: TriggerKind,
+    pub merged: u64,
+    pub state: InputState,
+    pub timestamp: String,
+}
+
+/// Every Trigger delivery the Chat's ledger records, in the order they were first accepted.
+pub fn trigger_deliveries(lines: &[Line]) -> Vec<DisplayTriggerDelivery> {
+    let mut deliveries: Vec<DisplayTriggerDelivery> = Vec::new();
+    visit_lines(lines, &mut |line| {
+        let Line::Input(entry) = line else {
+            return;
+        };
+        let Some(trigger) = entry.trigger else {
+            return;
+        };
+        let delivery = DisplayTriggerDelivery {
+            input_id: entry.input_id,
+            run_id: entry.run_id,
+            source: trigger.source,
+            merged: trigger.merged,
+            state: entry.state.clone(),
+            timestamp: entry.timestamp.clone(),
+        };
+        match deliveries
+            .iter_mut()
+            .find(|known| known.input_id == entry.input_id)
+        {
+            Some(known) => *known = delivery,
+            None => deliveries.push(delivery),
+        }
+    });
+    deliveries
 }
 
 fn visit_lines(lines: &[Line], visit: &mut impl FnMut(&Line)) {
@@ -538,16 +592,21 @@ impl DisplayProjector {
         }
         let input = entry.run_id.and_then(|run| self.inputs.get(&run));
         match input.map(|input| input.op) {
-            Some(InputOp::Trigger) => Some(PromptOrigin::Trigger),
+            Some(InputOp::Trigger) => {
+                let trigger = input?.trigger?;
+                Some(PromptOrigin::Trigger {
+                    source: trigger.source,
+                    authority: trigger.source.authority(),
+                    merged: trigger.merged,
+                })
+            }
             Some(InputOp::Feedback) => {
                 let artifact = match LocalMessage::parse(&message_text(&entry.message.content)) {
                     Some(LocalMessage::ArtifactRequest { artifact_id, .. }) => Some(artifact_id),
                     _ => input?
                         .queued
                         .as_ref()
-                        .and_then(|queued| {
-                            queued["trigger_source"]["payload"]["artifact_id"].as_str()
-                        })
+                        .and_then(|queued| queued["trigger_source"]["artifact_id"].as_str())
                         .map(str::to_owned),
                 }?;
                 Some(PromptOrigin::Feedback { artifact })
