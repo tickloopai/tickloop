@@ -22,7 +22,9 @@ const MIN_ENTRY_BYTES: usize = 2 * 1024;
 /// Strings this short are never cut, and a cut string keeps at least this much text.
 const MIN_CUT_STRING_BYTES: usize = 512;
 
-/// One piece of conversation evidence, in the order the Chat recorded it.
+/// One piece of conversation evidence, in the order the Chat recorded it. A tool result keeps
+/// its call's id, because concurrent calls' results are recorded in completion order and the
+/// call itself may be omitted to fit the check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum EvidenceEntry {
@@ -33,10 +35,12 @@ pub(crate) enum EvidenceEntry {
         text: String,
     },
     ToolCall {
+        call_id: String,
         tool: String,
         input: String,
     },
     ToolResult {
+        call_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
         is_error: bool,
@@ -115,6 +119,7 @@ pub(crate) fn conversation_evidence(messages: &[Message]) -> Vec<EvidenceEntry> 
                 Content::ToolUse { id, name, input } => {
                     tool_names.insert(id, name);
                     entries.push(EvidenceEntry::ToolCall {
+                        call_id: id.clone(),
                         tool: name.clone(),
                         input: input.to_string(),
                     });
@@ -124,6 +129,7 @@ pub(crate) fn conversation_evidence(messages: &[Message]) -> Vec<EvidenceEntry> 
                     content,
                     is_error,
                 } => entries.push(EvidenceEntry::ToolResult {
+                    call_id: tool_use_id.clone(),
                     tool: tool_names
                         .get(tool_use_id.as_str())
                         .map(|name| (*name).to_owned()),

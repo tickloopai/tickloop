@@ -79,10 +79,12 @@ fn conversation_evidence_keeps_text_tool_calls_and_named_results() {
                 text: "Add an export command".into(),
             },
             EvidenceEntry::ToolCall {
+                call_id: "call-1".into(),
                 tool: "Bash".into(),
                 input: r#"{"command":"cargo test export"}"#.into(),
             },
             EvidenceEntry::ToolResult {
+                call_id: "call-1".into(),
                 tool: Some("Bash".into()),
                 is_error: false,
                 output: "test result: ok".into(),
@@ -252,5 +254,92 @@ fn malformed_replies_are_errors() {
     assert_eq!(
         parse_check_reply(&tool_call),
         Err("completion check returned a tool operation")
+    );
+}
+
+fn read_call(id: &str, path: &str) -> Content {
+    Content::ToolUse {
+        id: id.into(),
+        name: "Read".into(),
+        input: json!({"file_path": path}),
+    }
+}
+
+fn read_result(id: &str, output: String) -> Content {
+    Content::ToolResult {
+        tool_use_id: id.into(),
+        content: ToolResultContent::Text(output),
+        is_error: false,
+    }
+}
+
+#[test]
+fn results_of_same_named_calls_keep_their_call_ids_when_out_of_order() {
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![read_call("read-a", "a.rs"), read_call("read-b", "b.rs")],
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                read_result("read-b", "contents of b".into()),
+                read_result("read-a", "contents of a".into()),
+            ],
+        },
+    ];
+
+    let evidence = conversation_evidence(&messages);
+    let call_ids = evidence
+        .iter()
+        .map(|entry| match entry {
+            EvidenceEntry::ToolCall { call_id, .. } | EvidenceEntry::ToolResult { call_id, .. } => {
+                call_id.as_str()
+            }
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_ids, ["read-a", "read-b", "read-b", "read-a"]);
+    assert_eq!(
+        evidence[2],
+        EvidenceEntry::ToolResult {
+            call_id: "read-b".into(),
+            tool: Some("Read".into()),
+            is_error: false,
+            output: "contents of b".into(),
+        }
+    );
+}
+
+#[test]
+fn a_result_whose_call_was_omitted_still_names_its_call() {
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![read_call("read-a", &"a/".repeat(3000))],
+        },
+        Message {
+            role: Role::User,
+            content: vec![read_result("read-a", "contents of a".into())],
+        },
+    ];
+    let request = check_request(
+        OBJECTIVE,
+        REPORT,
+        conversation_evidence(&messages),
+        2 * 1024,
+    );
+
+    let payload = payload(&request);
+    assert_eq!(payload["conversation_truncation"]["omitted_oldest"], 1);
+    assert_eq!(
+        payload["conversation"],
+        json!([{
+            "kind": "tool_result",
+            "call_id": "read-a",
+            "tool": "Read",
+            "is_error": false,
+            "output": "contents of a",
+        }])
     );
 }

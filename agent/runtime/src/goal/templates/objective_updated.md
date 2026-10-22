@@ -11,4 +11,4 @@ Usage:
 
 Adjust the current turn to pursue the updated objective. Avoid continuing work that only served the previous objective unless it also helps the updated objective. Earlier completion checks and blocked audits concerned the previous objective; judge the updated one afresh.
 
-Do not call UpdateGoal unless the updated objective is actually complete, or the same blocking condition has repeated for at least three consecutive goal turns under it.
+Do not call UpdateGoal unless the updated objective is actually complete, or the same blocking condition has persisted through at least three consecutive automatic goal continuations under it.

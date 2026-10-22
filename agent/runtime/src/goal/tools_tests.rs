@@ -38,6 +38,14 @@ fn update_goal_schema_offers_only_complete_and_blocked() {
 }
 
 #[test]
+fn update_goal_does_not_count_the_user_turn_toward_the_blocked_threshold() {
+    let description = definition(UPDATE_GOAL_TOOL_NAME).description;
+    assert!(description.contains("at least three consecutive automatic goal continuations"));
+    assert!(description.contains("not counting the user-triggered turn"));
+    assert!(!description.contains("counting the original user-triggered turn"));
+}
+
+#[test]
 fn create_goal_schema_and_description_state_its_limits() {
     let create = definition(CREATE_GOAL_TOOL_NAME);
     assert_eq!(
