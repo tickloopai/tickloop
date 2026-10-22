@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::{Agent, AgentError, Chat};
 use tickloop_agent_transcript::{
     AbandonReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ModelVisibleResult,
-    ResponseEnding, ResponseEntry, ResponseState, ResumePoint, SettledOutcome, WaitEntry, WaitKind,
-    WaitState,
+    ResponseEnding, ResponseEntry, ResponseState, ResumePoint, SettledOutcome, TriggerRecord,
+    WaitEntry, WaitKind, WaitState,
 };
 
 /// A ledger input a submission carries: its id, operation and payload digest.
@@ -164,10 +164,7 @@ impl Lifecycle {
                     queued: Some(
                         serde_json::to_value(queued).expect("a queued input is serializable"),
                     ),
-                    trigger: queued
-                        .trigger_source
-                        .as_ref()
-                        .map(tickloop_agent_transcript::TriggerRecord::of),
+                    trigger: queued.trigger_source.as_ref().map(TriggerRecord::of),
                 },
                 revision,
             },
@@ -230,13 +227,14 @@ impl Lifecycle {
     }
 
     /// Records the ledger input `input` settled as `outcome` from the start, without a Run of its
-    /// own: a reply that ended a wait merged into the waiting Run, or a delivery its ended Loop
-    /// discarded. `receipt`'s Run is only its identity.
+    /// own: a reply that ended a wait merged into the waiting Run, or a Trigger delivery merged
+    /// into the one of its key that waits, `trigger`. `receipt` is what a replay answers.
     pub(crate) fn record_settled(
         &mut self,
         input: &LedgerInput,
         receipt: &Receipt,
         outcome: SettledOutcome,
+        trigger: Option<TriggerRecord>,
     ) {
         let revision = self.next_revision();
         // An earlier acceptance of the input that was lost before it started is settled too.
@@ -254,7 +252,7 @@ impl Lifecycle {
                     timestamp: now(),
                     state: InputState::Settled { outcome },
                     queued: None,
-                    trigger: None,
+                    trigger,
                 },
                 revision,
             },

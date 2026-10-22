@@ -2616,7 +2616,7 @@ impl Agent {
         if let Some(source) = &trigger_source
             && let Some(waiting) = self.admit_trigger(chat, source)?
         {
-            self.record_merged_trigger(chat, &ledger, source, &input, &waiting);
+            self.record_merged_trigger(chat, &ledger, source, &waiting);
             *original = candidate;
             self.save(&original.snapshot);
             self.inner.ledger_changes.send_replace(());

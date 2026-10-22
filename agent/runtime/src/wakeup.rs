@@ -300,37 +300,20 @@ impl Agent {
     }
 
     /// A delivery that merged into the waiting input `into` keeps its own ledger record, which
-    /// names its source and what it merged into.
+    /// names its source and what it merged into. Its receipt is `into`'s, the run that answers
+    /// it, on its first acceptance and on every replay.
     pub(super) fn record_merged_trigger(
         &self,
         chat: &mut Chat,
         ledger: &lifecycle::LedgerInput,
         source: &TriggerSource,
-        input: &str,
         into: &Receipt,
     ) {
-        let merged = PendingInput {
-            receipt: Receipt {
-                run_id: Uuid::new_v4(),
-                ..into.clone()
-            },
-            input: input.to_owned(),
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: Some(source.clone()),
-            armed: true,
-            queued_sequence: chat.snapshot.last_queue_sequence,
-            task_continuation: false,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
-        };
-        chat.bookkeeping.lifecycle.accept(ledger, &merged);
-        self.settle_input(
-            chat,
-            merged.receipt.run_id,
+        chat.bookkeeping.lifecycle.record_settled(
+            ledger,
+            into,
             SettledOutcome::Merged { into: into.run_id },
+            Some(tickloop_agent_transcript::TriggerRecord::of(source)),
         );
     }
 

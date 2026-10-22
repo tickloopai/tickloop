@@ -205,3 +205,35 @@ async fn a_merged_delivery_is_recorded_durably() {
     model.release_held_turn();
     agent.shutdown().await;
 }
+
+/// A delivery merged into the one of its key that waits answers with that one's receipt, the
+/// run that takes both, on its first acceptance and when it is handed over again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_delivery_answers_with_the_receipt_it_merged_into() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    let waiting = agent
+        .deliver_trigger_for_tests(chat, scheduled("same-key", 1), "waits")
+        .await
+        .unwrap();
+    let merged = agent
+        .deliver_trigger_for_tests(chat, scheduled("same-key", 2), "merges")
+        .await
+        .unwrap();
+    let replayed = agent
+        .deliver_trigger_for_tests(chat, scheduled("same-key", 2), "merges")
+        .await
+        .unwrap();
+    assert_eq!(merged.run_id, waiting.run_id);
+    assert_eq!(replayed.run_id, waiting.run_id);
+    model.release_held_turn();
+    model.wait_seen("waits", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("merges"), 0, "{:?}", model.prompts());
+    agent.shutdown().await;
+}
