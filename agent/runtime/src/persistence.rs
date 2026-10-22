@@ -350,17 +350,26 @@ impl ChatRecorder {
         );
     }
 
-    pub(super) fn record_family_message_hold(&self, chat_id: ChatId, stopped_runs: HashSet<RunId>) {
-        self.outbox.enqueue(
-            chat_id,
-            vec![Line::FamilyMessageHold(
-                tickloop_agent_transcript::FamilyMessageHoldEntry {
-                    chat_id,
-                    stopped_runs,
-                },
-            )],
-            None,
+    pub(super) fn record_family_message_hold(&self, chat: &Chat, stopped_runs: HashSet<RunId>) {
+        // Sync advances the lifecycle revision baseline with the records queued alongside the
+        // hold. An append already in progress may drain this group before the next dirty flush.
+        let Some(mut lines) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
+            return;
+        };
+        lines.push(Line::FamilyMessageHold(
+            tickloop_agent_transcript::FamilyMessageHoldEntry {
+                chat_id: chat.snapshot.id,
+                stopped_runs,
+            },
+        ));
+        self.outbox.set_display_leaf(
+            chat.snapshot.id,
+            chat.bookkeeping
+                .lifecycle
+                .display_leaf(&chat.snapshot, &chat.bookkeeping.message_responses),
         );
+        self.outbox
+            .enqueue(chat.snapshot.id, lines, Some(chat.snapshot.last_sequence));
     }
 
     pub(super) fn record_family_inputs(

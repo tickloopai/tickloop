@@ -95,15 +95,15 @@ pub(super) fn resume_messages(chat: &mut Chat) {
 impl Agent {
     pub(super) fn persist_family_message_hold(
         &self,
-        chat_id: ChatId,
+        chat: &Chat,
         mailbox: &family_mailbox::FamilyMailbox,
     ) {
         if let Some(recorder) = &self.inner.recorder {
             recorder.record_family_message_hold(
-                chat_id,
+                chat,
                 mailbox
                     .stopped_runs
-                    .get(&chat_id)
+                    .get(&chat.snapshot.id)
                     .cloned()
                     .unwrap_or_default(),
             );
@@ -114,9 +114,9 @@ impl Agent {
         let mut mailbox = self.inner.family_mailbox.lock().await;
         let mut chats = self.inner.chats.lock().await;
         mailbox.stopped_runs.remove(&chat_id);
-        self.persist_family_message_hold(chat_id, &mailbox);
         if let Some(chat) = chats.get_mut(&chat_id) {
             resume_messages(chat);
+            self.persist_family_message_hold(chat, &mailbox);
             self.save(&chat.snapshot);
         }
     }

@@ -741,15 +741,15 @@ impl Agent {
                 source: source.clone(),
             },
         );
+        if !held {
+            mailbox.stopped_runs.remove(&target_id);
+            self.persist_family_message_hold(receiver, &mailbox);
+        }
         if is_handback {
             self.checkpoint_transcript(&receiver.snapshot, &receiver.bookkeeping)
                 .await?;
         } else {
             self.save(&receiver.snapshot);
-        }
-        if !held {
-            mailbox.stopped_runs.remove(&target_id);
-            self.persist_family_message_hold(target_id, &mailbox);
         }
         *original = candidate;
         if !is_result {

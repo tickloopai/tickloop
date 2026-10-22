@@ -2679,8 +2679,8 @@ impl Agent {
         }
         if let Some(mailbox) = family_mailbox.as_mut() {
             mailbox.stopped_runs.remove(&chat_id);
-            self.persist_family_message_hold(chat_id, mailbox);
             family::resume_messages(&mut candidate);
+            self.persist_family_message_hold(&candidate, mailbox);
         }
         *original = candidate;
         if cut.is_none()

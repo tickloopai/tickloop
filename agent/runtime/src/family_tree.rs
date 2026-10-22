@@ -172,7 +172,7 @@ impl Agent {
                             .set_queued_armed(pending.receipt.run_id, false);
                     }
                 }
-                self.persist_family_message_hold(id, &mailbox);
+                self.persist_family_message_hold(child, &mailbox);
                 child.snapshot.pending_commands.clear();
                 child.ready_runs.clear();
                 let commands = child

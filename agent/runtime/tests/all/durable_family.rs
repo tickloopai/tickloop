@@ -13,7 +13,10 @@ use tickloop_agent_protocol::{
     QuestionAnswer, QuestionRequest, Role, SearchConfig, SearchProviderKind,
     SubagentNotificationDelivery,
 };
-use tickloop_agent_runtime::transcript::{LoadRange, StorePosition, TranscriptStore};
+use tickloop_agent_runtime::transcript::{
+    AppendAck, AppendBatch, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
+    TranscriptError, TranscriptStore,
+};
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, PersonWait, PersonWaitKind,
     QuestionReply, Quiescence, SearchDefaults, ToolPolicy, Turn, TurnOp, TurnOutcome, TurnRequest,
@@ -28,8 +31,8 @@ use tickloop_agent_transcript::{
     FamilyCompletionsEntry, InterruptedBy, Line, ResponseEnding, ResponseState, SettledOutcome,
     WaitKind, WaitState,
 };
-use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -1394,18 +1397,10 @@ async fn host_rules_reach_a_child_live_and_are_never_recorded_with_its_delegatio
 const HELD_FAMILY_MESSAGE: &str = "Message retained across the stop";
 const OUTSIDE_FAMILY_MESSAGE: &str = "Outside family message";
 
-/// Stops either the root or, through StopSubagent, a middle member with a child. The receiver
-/// holds a model request so the ordinary message remains queued until the stop disarms it.
-async fn stopped_message_family(
+async fn queued_message_family(
     subtree: bool,
-) -> (
-    Arc<InMemoryTranscriptStore>,
-    Agent,
-    ChatId,
-    ChatId,
-    Vec<ChatId>,
-) {
-    let store = Arc::new(InMemoryTranscriptStore::new());
+    store: Arc<dyn TranscriptStore>,
+) -> (Agent, ChatId, ChatId, Turn) {
     let receiver_holding = Arc::new(Notify::new());
     let model = FamilyModel::new(move |request| match task_of(request).as_deref() {
         None if subtree
@@ -1488,6 +1483,22 @@ async fn stopped_message_family(
     })
     .await
     .expect("ordinary family message queued before stop");
+    (agent, root, target, turn)
+}
+
+/// Stops either the root or, through StopSubagent, a middle member with a child. The receiver
+/// holds a model request so the ordinary message remains queued until the stop disarms it.
+async fn stopped_message_family(
+    subtree: bool,
+) -> (
+    Arc<InMemoryTranscriptStore>,
+    Agent,
+    ChatId,
+    ChatId,
+    Vec<ChatId>,
+) {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let (agent, root, target, turn) = queued_message_family(subtree, store.clone()).await;
     if subtree {
         let TurnOutcome::Waiting(TurnWait::Question(question)) = outcome(&turn).await else {
             panic!("root asks before stopping the subtree");
@@ -1741,4 +1752,208 @@ async fn ordinary_family_messages_follow_the_stopped_subtree_exception_independe
     ));
     assert!(awakened.pending_inputs.iter().all(|pending| pending.armed));
     agent.shutdown().await;
+}
+
+struct FamilyAppendGate {
+    chat: ChatId,
+    old_entered: Option<oneshot::Sender<()>>,
+    old_release: oneshot::Receiver<()>,
+    hold_committed: oneshot::Sender<()>,
+    hold_release: oneshot::Receiver<()>,
+}
+
+#[derive(Default)]
+struct FamilyAppendStore {
+    stored: InMemoryTranscriptStore,
+    gate: Mutex<Option<FamilyAppendGate>>,
+    hold_gate: Mutex<Option<FamilyAppendGate>>,
+}
+
+#[async_trait::async_trait]
+impl TranscriptStore for FamilyAppendStore {
+    async fn register(
+        &self,
+        chat: ChatId,
+        placement: &ChatPlacement,
+    ) -> Result<StorePosition, TranscriptError> {
+        self.stored.register(chat, placement).await
+    }
+
+    async fn load(
+        &self,
+        chat: ChatId,
+        range: LoadRange,
+    ) -> Result<Option<StoredTranscript>, TranscriptError> {
+        self.stored.load(chat, range).await
+    }
+
+    async fn append(
+        &self,
+        chat: ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
+        let old = {
+            let mut gate = self.gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|gate| gate.chat == chat) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut gate) = old {
+            let _ = gate.old_entered.take().unwrap().send(());
+            let _ = (&mut gate.old_release).await;
+            // Only the old batch has been snapshotted. The same flush must append the hold
+            // without another snapshot of the Chat or its ledger.
+            let ack = self.stored.append(chat, batch).await?;
+            *self.hold_gate.lock().unwrap() = Some(gate);
+            return Ok(ack);
+        }
+        let hold = {
+            let mut gate = self.hold_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|gate| gate.chat == chat)
+                && batch
+                    .lines
+                    .iter()
+                    .any(|line| matches!(line, Line::FamilyMessageHold(_)))
+            {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        let ack = self.stored.append(chat, batch).await?;
+        if let Some(gate) = hold {
+            let _ = gate.hold_committed.send(());
+            let _ = gate.hold_release.await;
+        }
+        Ok(ack)
+    }
+
+    fn append_blocking(
+        &self,
+        chat: ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
+        self.stored.append_blocking(chat, batch)
+    }
+}
+
+async fn assert_family_hold_crash_during_append(continuing: bool) {
+    let store = Arc::new(FamilyAppendStore::default());
+    let (original, root, _, _) = queued_message_family(false, store.clone()).await;
+    if continuing {
+        original.stop(root).await.unwrap();
+    }
+    original.sync().await.unwrap();
+    let before = original.snapshot(root).await.unwrap();
+    let pending = before
+        .pending_inputs
+        .iter()
+        .find(|pending| pending.input.contains(HELD_FAMILY_MESSAGE))
+        .unwrap();
+    let message_id = pending.agent_message.as_ref().unwrap().message_id;
+    let members = original.family_agents(root).await.unwrap();
+    let (old_entered, old_waiting) = oneshot::channel();
+    let (old_release, old_released) = oneshot::channel();
+    let (hold_committed, hold_waiting) = oneshot::channel();
+    let (hold_release, hold_released) = oneshot::channel();
+    *store.gate.lock().unwrap() = Some(FamilyAppendGate {
+        chat: root,
+        old_entered: Some(old_entered),
+        old_release: old_released,
+        hold_committed,
+        hold_release: hold_released,
+    });
+    original
+        .mark_monitor_handled(root, tick_protocol::InstanceRef::shell(Uuid::new_v4()))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), old_waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let pause = original.pause_next_for_tests(
+        root,
+        tickloop_agent_runtime::trigger_pauses::PausePoint::ReceivingRecorded,
+    );
+    let changing = tokio::spawn({
+        let original = original.clone();
+        async move {
+            if continuing {
+                original.continue_loop(root).await.unwrap();
+            } else {
+                original.stop(root).await.unwrap();
+            }
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.entered)
+        .await
+        .unwrap()
+        .unwrap();
+    old_release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), hold_waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    // Crash at the committed hold append, before the flush can snapshot the changed ledger.
+    let crashed = Arc::new(InMemoryTranscriptStore::new());
+    for member in members {
+        crashed.seed(
+            member.chat_id,
+            store.stored.lines(member.chat_id),
+            StorePosition(1),
+        );
+    }
+    let model = FamilyModel::new(|_| Reply::Says(text("Recovered after append")));
+    let restarted = harness(crashed, model, WaitHosting::Durable);
+    restarted.resume_chat(root).await.unwrap();
+    assert_eq!(restarted.quiesce(root).await, Quiescence::Idle);
+    let recovered = restarted.snapshot(root).await.unwrap();
+    let delivered = recovered
+        .agent_message_origins
+        .values()
+        .any(|source| source["message_id"] == message_id.to_string());
+    assert_eq!(
+        delivered, continuing,
+        "delivery must match the committed stop batch"
+    );
+    if !continuing {
+        assert!(
+            recovered.pending_inputs.iter().any(|pending| {
+                pending
+                    .agent_message
+                    .as_ref()
+                    .is_some_and(|source| source.message_id == message_id)
+                    && !pending.armed
+            }),
+            "Stop must recover the message held until Continue"
+        );
+        restarted.continue_loop(root).await.unwrap();
+        assert_eq!(restarted.quiesce(root).await, Quiescence::Idle);
+        assert!(
+            restarted
+                .snapshot(root)
+                .await
+                .unwrap()
+                .agent_message_origins
+                .values()
+                .any(|source| { source["message_id"] == message_id.to_string() })
+        );
+    }
+    drop(hold_release);
+    drop(pause.release);
+    changing.await.unwrap();
+    restarted.shutdown().await;
+    original.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_stop_hold_and_ledger_survive_crash_during_append() {
+    assert_family_hold_crash_during_append(false).await;
+}
+
+#[tokio::test]
+async fn durable_continue_hold_and_ledger_survive_crash_during_append() {
+    assert_family_hold_crash_during_append(true).await;
 }
