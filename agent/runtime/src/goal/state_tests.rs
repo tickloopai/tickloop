@@ -66,6 +66,15 @@ fn paused(by: GoalPause) -> GoalStatus {
     GoalStatus::Paused { by }
 }
 
+/// The completion check's verdict for `goal` as it was when its completion was reported.
+fn checked(goal: &GoalSnapshot, verdict: GoalVerdict) -> GoalEvent {
+    GoalEvent::Checked {
+        goal_id: goal.id,
+        objective_revision: goal.objective_revision,
+        verdict,
+    }
+}
+
 #[test]
 fn setting_a_goal_starts_it_active_with_fresh_usage() {
     let id = Uuid::new_v4();
@@ -86,6 +95,7 @@ fn setting_a_goal_starts_it_active_with_fresh_usage() {
         Some(GoalSnapshot {
             id,
             objective: "Ship the export command".into(),
+            objective_revision: 1,
             status: GoalStatus::Active,
             token_budget: Some(5_000),
             tokens_used: 0,
@@ -197,7 +207,6 @@ fn user_actions_and_reports_need_a_goal() {
         GoalEvent::Resume,
         GoalEvent::Clear,
         GoalEvent::SetBudget { token_budget: None },
-        GoalEvent::Checked(GoalVerdict::Met),
         GoalEvent::ReportedBlocked { reason: "x".into() },
     ] {
         assert_eq!(apply(None, event, NOW), Err(GoalError::NoGoal));
@@ -245,20 +254,11 @@ fn editing_replaces_the_objective_and_forgets_the_last_check() {
     assert_eq!(goal.last_check, None);
     assert_eq!(goal.quiet_turns, 0);
     assert_eq!(goal.id, current.id);
+    assert_eq!(goal.objective_revision, current.objective_revision + 1);
     assert_eq!(
         transition.effects,
         [GoalEffect::InsertObjectiveUpdatedPrompt]
     );
-
-    let paused_goal = with_status(paused(GoalPause::User));
-    let transition = step(
-        &paused_goal,
-        GoalEvent::Edit {
-            objective: "Ship the import command".into(),
-        },
-    );
-    assert_eq!(transition.goal.unwrap().status, paused(GoalPause::User));
-    assert!(transition.effects.is_empty());
 
     assert_eq!(
         apply(
@@ -272,6 +272,24 @@ fn editing_replaces_the_objective_and_forgets_the_last_check() {
             action: "edit",
             status: "complete"
         })
+    );
+}
+
+#[test]
+fn editing_a_paused_goal_still_tells_the_running_turn() {
+    // `/goal pause` leaves the current turn running on the old objective.
+    let running = goal_with(None);
+    let paused_goal = next(&running, GoalEvent::Pause);
+    let transition = step(
+        &paused_goal,
+        GoalEvent::Edit {
+            objective: "Ship the import command".into(),
+        },
+    );
+    assert_eq!(transition.goal.unwrap().status, paused(GoalPause::User));
+    assert_eq!(
+        transition.effects,
+        [GoalEffect::InsertObjectiveUpdatedPrompt]
     );
 }
 
@@ -546,7 +564,10 @@ fn turns_ending_while_not_active_change_nothing() {
 
 #[test]
 fn check_verdicts_complete_keep_or_block_the_goal() {
-    let met = step(&goal_with(None), GoalEvent::Checked(GoalVerdict::Met));
+    let met = {
+        let goal = goal_with(None);
+        step(&goal, checked(&goal, GoalVerdict::Met))
+    };
     let goal = met.goal.unwrap();
     assert_eq!(goal.status, GoalStatus::Complete);
     assert_eq!(
@@ -561,17 +582,24 @@ fn check_verdicts_complete_keep_or_block_the_goal() {
     let not_met = GoalVerdict::NotMet {
         reason: "no test output".into(),
     };
-    let transition = step(&goal_with(None), GoalEvent::Checked(not_met.clone()));
+    let transition = {
+        let goal = goal_with(None);
+        step(&goal, checked(&goal, not_met.clone()))
+    };
     let goal = transition.goal.unwrap();
     assert_eq!(goal.status, GoalStatus::Active);
     assert_eq!(goal.last_check.unwrap().verdict, not_met);
     assert!(transition.effects.is_empty());
 
+    let goal = goal_with(None);
     let impossible = step(
-        &goal_with(None),
-        GoalEvent::Checked(GoalVerdict::Impossible {
-            reason: "the API was removed".into(),
-        }),
+        &goal,
+        checked(
+            &goal,
+            GoalVerdict::Impossible {
+                reason: "the API was removed".into(),
+            },
+        ),
     );
     let by = GoalBlock::CheckImpossible {
         reason: "the API was removed".into(),
@@ -586,15 +614,13 @@ fn check_verdicts_complete_keep_or_block_the_goal() {
 #[test]
 fn a_completion_verified_after_pausing_or_running_out_of_budget_still_counts() {
     for status in [paused(GoalPause::User), GoalStatus::BudgetLimited] {
-        let goal = next(&with_status(status), GoalEvent::Checked(GoalVerdict::Met));
+        let goal = with_status(status);
+        let goal = next(&goal, checked(&goal, GoalVerdict::Met));
         assert_eq!(goal.status, GoalStatus::Complete);
     }
+    let complete = with_status(GoalStatus::Complete);
     assert_eq!(
-        apply(
-            Some(&with_status(GoalStatus::Complete)),
-            GoalEvent::Checked(GoalVerdict::Met),
-            NOW
-        ),
+        apply(Some(&complete), checked(&complete, GoalVerdict::Met), NOW),
         Err(GoalError::Inapplicable {
             action: "check",
             status: "complete"
@@ -761,4 +787,97 @@ fn each_condition_alone_prevents_a_continuation() {
             Err(NoContinuation::NotActive)
         );
     }
+}
+
+#[test]
+fn a_check_for_an_edited_objective_is_discarded() {
+    let reported = goal_with(None);
+    let edited = next(
+        &reported,
+        GoalEvent::Edit {
+            objective: "Ship the import command".into(),
+        },
+    );
+    for verdict in [
+        GoalVerdict::Met,
+        GoalVerdict::Impossible { reason: "x".into() },
+    ] {
+        let transition = step(&edited, checked(&reported, verdict));
+        assert_eq!(transition.goal, Some(edited.clone()));
+        assert_eq!(
+            transition.effects,
+            [GoalEffect::StaleCheckDiscarded {
+                goal_id: reported.id,
+                objective_revision: reported.objective_revision,
+            }]
+        );
+    }
+}
+
+#[test]
+fn a_check_for_a_replaced_or_cleared_goal_is_discarded() {
+    let reported = goal_with(None);
+    let replacement = next(
+        &reported,
+        GoalEvent::Set {
+            id: Uuid::new_v4(),
+            objective: "Write the migration guide".into(),
+            token_budget: None,
+            replace: true,
+        },
+    );
+    assert!(replacement.objective_revision > reported.objective_revision);
+    let stale = GoalEffect::StaleCheckDiscarded {
+        goal_id: reported.id,
+        objective_revision: reported.objective_revision,
+    };
+
+    let transition = step(&replacement, checked(&reported, GoalVerdict::Met));
+    assert_eq!(transition.goal, Some(replacement.clone()));
+    assert_eq!(transition.effects, std::slice::from_ref(&stale));
+
+    // A replacement that reuses the id is still told apart by its revision.
+    let same_id = GoalSnapshot {
+        id: reported.id,
+        ..replacement
+    };
+    let transition = step(&same_id, checked(&reported, GoalVerdict::Met));
+    assert_eq!(transition.goal.unwrap().status, GoalStatus::Active);
+    assert_eq!(transition.effects, std::slice::from_ref(&stale));
+
+    assert_eq!(
+        apply(None, checked(&reported, GoalVerdict::Met), NOW),
+        Ok(GoalTransition {
+            goal: None,
+            effects: vec![stale],
+        })
+    );
+}
+
+#[test]
+fn usage_saturates_instead_of_overflowing() {
+    let mut goal = goal_with(None);
+    goal.tokens_used = u64::MAX - 1;
+    goal.time_used_ms = u64::MAX - 1;
+    let goal = next(&goal, GoalEvent::TokensUsed(10));
+    let goal = next(&goal, GoalEvent::TimeElapsed { ms: 10 });
+    assert_eq!((goal.tokens_used, goal.time_used_ms), (u64::MAX, u64::MAX));
+    assert_eq!(goal.status, GoalStatus::Active);
+
+    let mut budgeted = goal_with(Some(u64::MAX));
+    budgeted.tokens_used = u64::MAX - 1;
+    let transition = step(&budgeted, GoalEvent::TokensUsed(u64::MAX));
+    let limited = transition.goal.unwrap();
+    assert_eq!(limited.tokens_used, u64::MAX);
+    assert_eq!(limited.status, GoalStatus::BudgetLimited);
+
+    let mut revised = goal_with(None);
+    revised.objective_revision = u64::MAX;
+    let edited = next(
+        &revised,
+        GoalEvent::Edit {
+            objective: "Ship the import command".into(),
+        },
+    );
+    assert_eq!(edited.objective_revision, u64::MAX);
 }

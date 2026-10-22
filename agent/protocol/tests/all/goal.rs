@@ -10,6 +10,7 @@ fn goal(status: GoalStatus) -> GoalSnapshot {
     GoalSnapshot {
         id: Uuid::nil(),
         objective: "Ship the export command".into(),
+        objective_revision: 1,
         status,
         token_budget: None,
         tokens_used: 1_200,
@@ -30,6 +31,7 @@ fn a_goal_snapshot_round_trips_and_omits_what_it_lacks() {
         json!({
             "id": Uuid::nil(),
             "objective": "Ship the export command",
+            "objective_revision": 1,
             "status": {"state": "active"},
             "tokens_used": 1_200,
             "time_used_ms": 30_000,
@@ -184,10 +186,31 @@ fn goal_actions_use_their_kind_and_default_optional_fields() {
         assert_eq!(serde_json::to_value(&action).unwrap(), wire);
         assert_eq!(serde_json::from_value::<GoalAction>(wire).unwrap(), action);
     }
-    assert!(
-        serde_json::from_value::<GoalAction>(
-            json!({"kind": "edit", "objective": "Ship it", "goal_id": Uuid::nil()})
-        )
-        .is_err()
+}
+
+#[test]
+fn unknown_fields_are_ignored_in_snapshots_and_rejected_in_actions_with_fields() {
+    let snapshot = goal(GoalStatus::Paused {
+        by: GoalPause::User,
+    });
+    let mut value = serde_json::to_value(&snapshot).unwrap();
+    value["future_field"] = json!(true);
+    value["status"]["since_ms"] = json!(7);
+    assert_eq!(
+        serde_json::from_value::<GoalSnapshot>(value).unwrap(),
+        snapshot
+    );
+
+    for action in [
+        json!({"kind": "edit", "objective": "Ship it", "goal_id": Uuid::nil()}),
+        json!({"kind": "set_budget", "token_budget": 5, "replace": true}),
+    ] {
+        assert!(serde_json::from_value::<GoalAction>(action).is_err());
+    }
+    // Like LoopAction, a variant without fields is internally tagged and tolerates extra ones.
+    assert_eq!(
+        serde_json::from_value::<GoalAction>(json!({"kind": "pause", "goal_id": Uuid::nil()}))
+            .unwrap(),
+        GoalAction::Pause
     );
 }

@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub struct GoalSnapshot {
     pub id: Uuid,
     pub objective: String,
+    /// Grows whenever the objective is set, replaced or edited, so a completion check started
+    /// for an earlier objective can be recognized and ignored.
+    pub objective_revision: u64,
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,

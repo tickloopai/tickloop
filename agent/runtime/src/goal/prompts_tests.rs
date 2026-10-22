@@ -91,7 +91,8 @@ fn user_text_is_escaped_and_never_expanded_as_a_placeholder() {
 #[test]
 fn objective_updated_and_budget_limit_state_their_situation() {
     let updated = objective_updated_prompt(&goal(None));
-    assert!(updated.starts_with("The user edited the objective"));
+    assert!(updated.starts_with("The user edited the objective of this Chat's goal."));
+    assert!(!updated.contains("active goal"));
     assert!(updated.contains("<objective>\nShip the export command with tests\n</objective>"));
 
     let limited = budget_limit_prompt(&goal(Some(12_000)));

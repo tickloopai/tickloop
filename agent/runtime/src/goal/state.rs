@@ -38,8 +38,13 @@ pub(crate) enum GoalEvent {
     TimeElapsed {
         ms: u64,
     },
-    /// The completion check's verdict on an UpdateGoal `complete` report.
-    Checked(GoalVerdict),
+    /// The completion check's verdict on an UpdateGoal `complete` report, for the goal and
+    /// objective revision the report was made under.
+    Checked {
+        goal_id: Uuid,
+        objective_revision: u64,
+        verdict: GoalVerdict,
+    },
     /// UpdateGoal `blocked`.
     ReportedBlocked {
         reason: String,
@@ -74,6 +79,12 @@ pub(crate) enum GoalEffect {
     InsertObjectiveUpdatedPrompt,
     /// Withdraws a goal continuation that is queued but not yet taken.
     WithdrawContinuation,
+    /// Records that a completion check finished after its objective was edited, replaced or
+    /// cleared, and was ignored.
+    StaleCheckDiscarded {
+        goal_id: Uuid,
+        objective_revision: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,12 +190,22 @@ pub(crate) fn apply(
                 token_budget,
                 replace,
             } => set(None, id, &objective, token_budget, replace, now_ms),
+            GoalEvent::Checked {
+                goal_id,
+                objective_revision,
+                ..
+            } => Ok(GoalTransition {
+                goal: None,
+                effects: vec![GoalEffect::StaleCheckDiscarded {
+                    goal_id,
+                    objective_revision,
+                }],
+            }),
             GoalEvent::Edit { .. }
             | GoalEvent::Pause
             | GoalEvent::Resume
             | GoalEvent::Clear
             | GoalEvent::SetBudget { .. }
-            | GoalEvent::Checked(_)
             | GoalEvent::ReportedBlocked { .. } => Err(GoalError::NoGoal),
             GoalEvent::TurnEnded(_)
             | GoalEvent::TokensUsed(_)
@@ -215,11 +236,13 @@ pub(crate) fn apply(
                 return Err(inapplicable("edit"));
             }
             next.objective = valid_objective(&objective)?;
+            next.objective_revision = next.objective_revision.saturating_add(1);
             next.last_check = None;
             next.quiet_turns = 0;
-            if next.status == GoalStatus::Active {
-                effects.push(GoalEffect::InsertObjectiveUpdatedPrompt);
-            }
+            // `/goal pause` does not interrupt the current turn, so a paused goal's turn may
+            // still be working on the old objective; the runtime inserts this only into a
+            // running turn.
+            effects.push(GoalEffect::InsertObjectiveUpdatedPrompt);
         }
         GoalEvent::Pause => {
             if current.status != GoalStatus::Active {
@@ -269,7 +292,21 @@ pub(crate) fn apply(
                 next.time_used_ms = next.time_used_ms.saturating_add(ms);
             }
         }
-        GoalEvent::Checked(verdict) => {
+        GoalEvent::Checked {
+            goal_id,
+            objective_revision,
+            verdict,
+        } => {
+            if (goal_id, objective_revision) != (current.id, current.objective_revision) {
+                effects.push(GoalEffect::StaleCheckDiscarded {
+                    goal_id,
+                    objective_revision,
+                });
+                return Ok(GoalTransition {
+                    goal: Some(next),
+                    effects,
+                });
+            }
             if current.status.is_finished() {
                 return Err(inapplicable("check"));
             }
@@ -341,6 +378,7 @@ fn set(
         goal: Some(GoalSnapshot {
             id,
             objective,
+            objective_revision: current.map_or(1, |goal| goal.objective_revision.saturating_add(1)),
             status: GoalStatus::Active,
             token_budget,
             tokens_used: 0,
