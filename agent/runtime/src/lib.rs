@@ -3749,13 +3749,17 @@ impl Agent {
         let boundary = self.enter_trigger_boundary(chat_id).await;
         let holding = match self.acquire_trigger_permit(chat_id, &boundary).await {
             loop_lease::TriggerPermit::Fire(holding) => holding,
-            loop_lease::TriggerPermit::Failed(_) => {
+            loop_lease::TriggerPermit::Wait {
+                recoverable: true, ..
+            }
+            | loop_lease::TriggerPermit::Failed(_) => {
                 self.retry_waiting_trigger_input(chat_id);
                 return Ok(Some(None));
             }
-            loop_lease::TriggerPermit::Wait { .. } | loop_lease::TriggerPermit::Withdrawn => {
-                return Ok(Some(None));
+            loop_lease::TriggerPermit::Wait {
+                recoverable: false, ..
             }
+            | loop_lease::TriggerPermit::Withdrawn => return Ok(Some(None)),
         };
         // Boxed: proving a source must not enlarge every run's shared async stack.
         let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
@@ -3770,6 +3774,8 @@ impl Agent {
         // Within the boundary nothing releases the lease, but the input waits rather than
         // start under a holding that is gone.
         if !self.inner.chat_leases.stands(chat_id, holding) {
+            drop(chats);
+            self.retry_waiting_trigger_input(chat_id);
             return Ok(Some(None));
         }
         #[cfg(any(test, feature = "test-support"))]

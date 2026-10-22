@@ -843,6 +843,43 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     setup.ran_once().await;
 }
 
+/// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
+/// once the lease can be taken, with nothing else delivered or submitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_trigger_input_runs_once_the_lease_can_be_taken() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), "waits-for-the-lease")
+        .await
+        .unwrap();
+    let lease = files_under(&root, "trigger")
+        .into_iter()
+        .find(|path| path.ends_with("lease.lock"))
+        .unwrap();
+    std::fs::remove_file(&lease).unwrap();
+    std::fs::write(
+        &lease,
+        serde_json::json!({"chatId": chat, "pid": 1, "nonce": Uuid::new_v4(), "startedAt": 1, "host": "another-host.invalid"})
+            .to_string(),
+    )
+    .unwrap();
+    model.release_held_turn();
+    wait_for_notice(&agent, chat, LoopTriggerNoticeKind::Warning).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("waits-for-the-lease"), 0);
+    std::fs::remove_file(&lease).unwrap();
+    model.wait_seen("waits-for-the-lease", 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("waits-for-the-lease"), 1);
+    agent.shutdown().await;
+}
+
 /// Trigger input waiting on a takeover that could not read the store runs once the store can be
 /// read again, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
