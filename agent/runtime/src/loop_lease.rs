@@ -52,6 +52,9 @@ const LEASE_DIRECTORY: &str = "trigger";
 const LEASE_FILE: &str = "lease.lock";
 const STATE_FILE: &str = "receiving.state";
 const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
+/// How long a write of the receiving switch waits for another process's write before it tries
+/// again.
+const RECEIVING_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
 const HELD_ELSEWHERE_MESSAGE: &str =
@@ -201,38 +204,42 @@ impl ChatLeases {
     /// 因为自己的 flock 而误判为被其他进程持有。
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
-        let (epoch, synced) = {
+        // The holding is taken out of `held` while its files are looked at, so no file work is
+        // done under the lock every Chat shares; the Chat's boundary keeps anyone else of this
+        // process from its holding meanwhile, and a shutdown that closes meanwhile finds it
+        // closing below.
+        let taken = {
             let mut held = self.held.lock().unwrap();
             if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(LeaseCheck::Closing);
             }
-            // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
-            if held
-                .get(&key)
-                .is_some_and(|holding| !holding.lease.is_still_at_path())
-            {
-                held.remove(&key);
-            }
-            let holding = match held.entry(key) {
-                std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
-                std::collections::hash_map::Entry::Vacant(vacant) => {
-                    match try_acquire(directory, chat_id)? {
-                        LeaseAttempt::Acquired(lease) => vacant.insert(HeldLease {
-                            lease,
-                            epoch: self
-                                .epochs
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                            synced: false,
-                        }),
-                        LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
-                        LeaseAttempt::ForeignHost(host) => {
-                            return Ok(LeaseCheck::ForeignHost(host));
-                        }
-                    }
-                }
-            };
-            (holding.epoch, holding.synced)
+            held.remove(&key)
         };
+        // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
+        let holding = match taken.filter(|holding| holding.lease.is_still_at_path()) {
+            Some(holding) => holding,
+            None => match try_acquire(directory, chat_id)? {
+                LeaseAttempt::Acquired(lease) => HeldLease {
+                    lease,
+                    epoch: self
+                        .epochs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    synced: false,
+                },
+                LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
+                LeaseAttempt::ForeignHost(host) => return Ok(LeaseCheck::ForeignHost(host)),
+            },
+        };
+        let (epoch, synced) = (holding.epoch, holding.synced);
+        {
+            let mut held = self.held.lock().unwrap();
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(held);
+                drop(holding);
+                return Ok(LeaseCheck::Closing);
+            }
+            held.insert(key, holding);
+        }
         let known = self.known_generation(key);
         Ok(match read_receiving(directory)? {
             Some(state) if !state.receiving && state.generation > known => {
@@ -367,8 +374,8 @@ impl ChatLeases {
         self.clear_notice(chat_id);
     }
 
-    /// No lease is taken from now on; taken under `held`, so a check in progress either took
-    /// its lease before, for `release_all` to release, or takes none.
+    /// No lease is taken from now on; set under `held`, so a check in progress either put its
+    /// lease back before, for `release_all` to release, or drops it.
     pub(super) fn close(&self) {
         let _held = self.held.lock().unwrap();
         self.closing
@@ -530,20 +537,30 @@ fn read_receiving(directory: &PrivateDirectory) -> io::Result<Option<ReceivingRe
 }
 
 /// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态。
-fn write_receiving(
-    directory: &PrivateDirectory,
-    change: ReceivingChange,
-) -> io::Result<ReceivingRecord> {
+fn open_receiving_write_lock(directory: &PrivateDirectory) -> io::Result<File> {
     directory.create()?;
-    let guard = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(PRIVATE_FILE_MODE)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.path().join(STATE_WRITE_LOCK_FILE))?;
-    guard.lock()?;
+        .open(directory.path().join(STATE_WRITE_LOCK_FILE))
+}
+
+/// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态；写锁正被别的进程持有时返回
+/// `None`，由调用方稍后再试。
+fn write_receiving(
+    directory: &PrivateDirectory,
+    change: ReceivingChange,
+) -> io::Result<Option<ReceivingRecord>> {
+    let guard = open_receiving_write_lock(directory)?;
+    match guard.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
     let current = read_receiving(directory)?;
     let next = ReceivingRecord {
         generation: current.map_or(0, |current| current.generation) + 1,
@@ -556,7 +573,7 @@ fn write_receiving(
     };
     let contents = serde_json::to_vec(&next).map_err(io::Error::other)?;
     replace_file_atomically(&receiving_path(directory), &contents, PRIVATE_FILE_MODE)?;
-    Ok(next)
+    Ok(Some(next))
 }
 
 impl Agent {
@@ -613,8 +630,9 @@ impl Agent {
             chat_id,
             super::wakeup::trigger_pauses::PausePoint::LeaseChecking,
         );
-        // Done here, not on the blocking pool: a few small local files, and nothing of it may
-        // outlive the boundary, as work handed to the pool would once its waiter is dropped.
+        // Done here, not on the blocking pool: a few small local files and a lock it only tries,
+        // and nothing of it may outlive the boundary, as work handed to the pool would once its
+        // waiter is dropped.
         let checked = self
             .inner
             .chat_leases
@@ -732,10 +750,10 @@ impl Agent {
         change: ReceivingChange,
         _within: TriggerBoundary,
     ) {
-        // Written here, not on the blocking pool, for the same reason as the lease check.
         let recorded = match self.lease_directory(chat_id).await {
-            Some(directory) if self.inner.recorder.is_some() => write_receiving(&directory, change)
-                .map_err(|error| error.to_string())
+            Some(directory) if self.inner.recorder.is_some() => self
+                .write_receiving_when_free(&directory, change)
+                .await
                 .map(|state| {
                     self.inner
                         .chat_leases
@@ -762,6 +780,28 @@ impl Agent {
                      processes may not see the change"
                 ),
             );
+        }
+    }
+
+    /// Writes the receiving switch once no other process holds its write lock, waiting between
+    /// tries without holding a thread; a shutdown ends the wait unwritten.
+    async fn write_receiving_when_free(
+        &self,
+        directory: &PrivateDirectory,
+        change: ReceivingChange,
+    ) -> Result<ReceivingRecord, String> {
+        loop {
+            match write_receiving(directory, change) {
+                Ok(Some(state)) => return Ok(state),
+                Ok(None) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            tokio::select! {
+                _ = self.inner.shutdown.cancelled() => {
+                    return Err("the Agent shut down before it could be written".into());
+                }
+                _ = tokio::time::sleep(RECEIVING_WRITE_RETRY) => {}
+            }
         }
     }
 
@@ -873,11 +913,17 @@ mod tests {
     #[test]
     fn every_change_increases_the_generation() {
         let (_root, directory) = lease_directory();
-        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
-        let paused = write_receiving(&directory, ReceivingChange::Paused).unwrap();
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
+        let paused = write_receiving(&directory, ReceivingChange::Paused)
+            .unwrap()
+            .unwrap();
         assert!(resumed.receiving && !paused.receiving);
         assert_eq!(paused.generation, resumed.generation + 1);
-        let again = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        let again = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
         assert!(again.receiving);
         assert_eq!(again.generation, paused.generation + 1);
         assert!(read_receiving(&directory).unwrap().unwrap().receiving);
@@ -888,13 +934,17 @@ mod tests {
         let (_root, directory) = lease_directory();
         let leases = ChatLeases::default();
         let chat_id = Uuid::new_v4();
-        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
         leases.remember_generation(chat_id, resumed.generation);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::Held { .. }
         ));
-        write_receiving(&directory, ReceivingChange::Paused).unwrap();
+        write_receiving(&directory, ReceivingChange::Paused)
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::PausedElsewhere(generation) if generation == resumed.generation + 1

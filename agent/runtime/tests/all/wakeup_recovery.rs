@@ -1206,6 +1206,41 @@ async fn a_continue_dropped_midway_still_records_the_switch() {
     agent.shutdown().await;
 }
 
+/// A record of the switch waiting for another process's write holds no thread: on a runtime of
+/// one thread, time goes on meanwhile and the Agent shuts down.
+#[tokio::test]
+async fn a_switch_record_waiting_for_another_writer_holds_no_thread() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent.stop(chat).await.unwrap();
+    agent.continue_loop(chat).await.unwrap();
+    let write_lock = files_under(&root, "trigger")
+        .into_iter()
+        .find(|path| path.ends_with(".receiving.lock"))
+        .expect("the switch was recorded under its write lock");
+    let other_writer = std::fs::File::open(write_lock).unwrap();
+    other_writer.lock().unwrap();
+
+    let stop = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.stop(chat).await.unwrap() }
+    });
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        recorded_receiving(&root),
+        "the pause waits for the other writer"
+    );
+    tokio::time::timeout(WAIT, agent.shutdown())
+        .await
+        .expect("the Agent shuts down while the record waits");
+    stop.await.unwrap();
+    drop(other_writer);
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]
