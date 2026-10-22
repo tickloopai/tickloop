@@ -221,3 +221,43 @@ async fn a_planned_upgrade_hands_the_goal_clock_over() {
     drop(chats);
     original.shutdown_for_upgrade().await;
 }
+
+/// Taking the lease over keeps what this process counted for the goal but had not written, and
+/// still counts it as unwritten, so the next record writes it.
+#[tokio::test]
+async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
+    use crate::wakeup::TriggerSourceState;
+
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .update_goal(
+            chat_id,
+            vec![GoalEvent::Set {
+                id: Uuid::new_v4(),
+                objective: "Ship the export command".into(),
+                token_budget: None,
+                replace: false,
+                set_by: GoalAuthor::User,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+    let mut chats = agent.inner.chats.lock().await;
+    let chat = chats.get_mut(&chat_id).unwrap();
+    let mut stored_goal = chat.snapshot.goal.clone().unwrap();
+    stored_goal.tokens_used = 5_000;
+    let stored = [Line::Goal(GoalEntry {
+        chat_id,
+        cwd: chat.snapshot.folder.clone(),
+        goal: Some(stored_goal),
+    })];
+    chat.snapshot.goal.as_mut().unwrap().tokens_used = 30_000;
+    GoalSourceState.take_over(&agent, chat, &stored);
+    assert_eq!(chat.snapshot.goal.as_ref().unwrap().tokens_used, 30_000);
+    assert_eq!(chat.goal_recorded_tokens, 5_000);
+    drop(chats);
+    agent.shutdown().await;
+}

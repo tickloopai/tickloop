@@ -501,7 +501,7 @@ struct Chat {
     /// Another stored branch of the Chat is being restored to replace its conversation: until the
     /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
     branch_reservation: Option<Uuid>,
-    /// The goal's usage when its record was last written.
+    /// The goal's usage its last record holds that the Transcript took.
     goal_recorded_tokens: u64,
     /// Restored from history by this process and not yet taken over: the history-load rule
     /// applies to its goal once it takes the Trigger lease.

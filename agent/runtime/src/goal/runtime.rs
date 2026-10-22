@@ -240,7 +240,10 @@ impl Agent {
     }
 
     /// Applies `events` to the Chat's goal, then carries out what they ask for. The goal first
-    /// gets the running time since it was last settled, while a turn runs or as `turn_ends`.
+    /// gets the running time since it was last settled, while a turn runs or as `turn_ends`. A
+    /// record it writes reaches the Transcript before the Chat is let go, and only then counts
+    /// its usage as recorded: a failed write leaves it unrecorded, so the next charge writes it
+    /// again.
     pub(crate) async fn update_goal(
         &self,
         chat_id: ChatId,
@@ -266,21 +269,36 @@ impl Agent {
         settled.extend(events);
         let (goal, effects) = apply_events(chat.snapshot.goal.as_ref(), settled, now_ms)?;
         chat.goal_clock_ms = now_ms;
-        self.adopt_goal(chat, goal, effects, turn_ends);
+        if self.adopt_goal(chat, goal, effects, turn_ends) {
+            let recorded_tokens = chat
+                .snapshot
+                .goal
+                .as_ref()
+                .map_or(0, |goal| goal.tokens_used);
+            match self
+                .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await
+            {
+                Ok(()) => chat.goal_recorded_tokens = recorded_tokens,
+                Err(error) => {
+                    tracing::warn!(chat = %chat_id, %error, "could not write the goal record")
+                }
+            }
+        }
         Ok(())
     }
 
     /// Takes on a change of the goal, then its effects and its record. A record is written when
     /// anything but the running usage changed, when a turn ends with an unfinished goal, and
     /// once the usage grew by [`USAGE_RECORD_TOKENS`] since the last record, which bounds what a
-    /// crash leaves uncounted.
+    /// crash leaves uncounted. `true` when it queued a record.
     fn adopt_goal(
         &self,
         chat: &mut Chat,
         goal: Option<GoalSnapshot>,
         effects: Vec<GoalEffect>,
         turn_ends: bool,
-    ) {
+    ) -> bool {
         let previous = std::mem::replace(&mut chat.snapshot.goal, goal);
         let mut notices = Vec::new();
         for effect in effects {
@@ -314,14 +332,17 @@ impl Agent {
         let is_recorded = without_usage(goal) != without_usage(previous.as_ref())
             || (turn_ends && is_unfinished)
             || unrecorded_tokens >= USAGE_RECORD_TOKENS;
-        if is_recorded || !notices.is_empty() {
-            let subject = goal.or(previous.as_ref());
-            let subject = subject.map(|goal| (goal.id, goal.objective.clone()));
-            self.record_goal(chat, subject, notices);
+        if !is_recorded && notices.is_empty() {
+            return false;
         }
+        let subject = goal.or(previous.as_ref());
+        let subject = subject.map(|goal| (goal.id, goal.objective.clone()));
+        self.record_goal(chat, subject, notices);
+        true
     }
 
-    /// Writes the goal as it is now, one line for each notice, and tells every View.
+    /// Queues the goal as it is now for the Transcript, one line for each notice, and tells every
+    /// View.
     fn record_goal(
         &self,
         chat: &mut Chat,
@@ -329,11 +350,6 @@ impl Agent {
         notices: Vec<GoalNotice>,
     ) {
         let chat_id = chat.snapshot.id;
-        chat.goal_recorded_tokens = chat
-            .snapshot
-            .goal
-            .as_ref()
-            .map_or(0, |goal| goal.tokens_used);
         self.record_chat_metadata(
             chat_id,
             Line::Goal(GoalEntry {
@@ -821,6 +837,7 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
             return;
         }
         let mut goal = tickloop_agent_transcript::display::goal(stored);
+        chat.goal_recorded_tokens = goal.as_ref().map_or(0, |goal| goal.tokens_used);
         // What this process counted for the same goal and has not recorded yet still counts.
         if let (Some(goal), Some(held)) = (goal.as_mut(), chat.snapshot.goal.as_ref())
             && goal.id == held.id
@@ -829,7 +846,6 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
             goal.time_used_ms = goal.time_used_ms.max(held.time_used_ms);
         }
         let changed = goal != chat.snapshot.goal;
-        chat.goal_recorded_tokens = goal.as_ref().map_or(0, |goal| goal.tokens_used);
         chat.snapshot.goal = goal;
         agent.withdraw_ended_inputs(chat);
         // The history-load rule: the holder that left an active goal is gone, and this process
@@ -846,7 +862,9 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
                 vec![GoalEvent::HistoryLoaded],
                 unix_time_milliseconds(),
             ) {
-                Ok((goal, effects)) => agent.adopt_goal(chat, goal, effects, false),
+                Ok((goal, effects)) => {
+                    agent.adopt_goal(chat, goal, effects, false);
+                }
                 Err(error) => {
                     tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal")
                 }

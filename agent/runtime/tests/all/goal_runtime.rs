@@ -1205,7 +1205,7 @@ async fn usage_charged_mid_turn_survives_a_crash() {
         .await
         .expect("the turn's second request is held");
     assert_eq!(goal(&agent, chat).await.unwrap().tokens_used, 25_000);
-    agent.flush_transcripts().await;
+    // No flush: the record past the threshold was written before the usage counted as recorded.
     let image = super::wakeup_support::crash_image(root.path(), folder.path());
 
     let reopened = Agent::open(image, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
