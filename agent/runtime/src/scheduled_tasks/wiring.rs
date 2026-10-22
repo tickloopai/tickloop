@@ -362,13 +362,6 @@ impl Agent {
         self.withdraw_deleted_task_runs(chat, cancelled);
     }
 
-    /// Records the Chat's scheduled tasks as they are now.
-    pub(crate) async fn record_scheduled_tasks(&self, chat_id: ChatId) {
-        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
-            self.persist_scheduled_tasks(chat, Vec::new());
-        }
-    }
-
     /// Withdraws the queued run of each deleted task: a task's input waits only while the task
     /// does.
     fn withdraw_deleted_task_runs(&self, chat: &mut Chat, deleted: &[ScheduledTask]) {

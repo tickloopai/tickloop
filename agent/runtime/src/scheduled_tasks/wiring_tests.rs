@@ -917,6 +917,66 @@ async fn the_users_self_paced_loop_starts_with_its_turn_and_falls_back_when_not_
     ));
 }
 
+/// The task names the `/loop` turn it started in the Transcript before that turn can run, so a
+/// host that goes on with the turn from the Transcript alone still knows it is the loop's first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loops_first_turn_is_recorded_with_its_task_before_it_runs() {
+    let model = HoldingModel::new(vec![text("Ready."), text("Checked once.")]);
+    let state = tempfile::tempdir().unwrap();
+    let store: Arc<dyn crate::transcript::TranscriptStore> = Arc::new(
+        crate::transcript::JsonlTranscriptStore::open(state.path().join("transcripts")).unwrap(),
+    );
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts: Some(store.clone()),
+            environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions {
+            host: AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                ..AgentHostOptions::embedded_defaults()
+            },
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    turn(&agent, chat, "get ready").await;
+
+    let pause = crate::turn::admission_pause::pause_next(chat);
+    let invoking = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.invoke_skill(chat, "loop", "watch the build").await }
+    });
+    pause.entered.await.unwrap();
+    agent.sync().await.unwrap();
+    let stored = store
+        .load(chat, crate::transcript::LoadRange::Full)
+        .await
+        .unwrap()
+        .unwrap();
+    let recorded = stored
+        .retained
+        .iter()
+        .chain(&stored.lines)
+        .filter_map(|line| match line {
+            Line::ScheduledTasks(entry) => Some(entry.tasks.clone()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(recorded[0].started_by_run.is_some(), "{recorded:?}");
+
+    pause.release.send(()).unwrap();
+    let receipt = invoking.await.unwrap().unwrap();
+    assert_eq!(recorded[0].started_by_run, Some(receipt.run_id));
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_reschedules() {
     let model = HoldingModel::new(vec![

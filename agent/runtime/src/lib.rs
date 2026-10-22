@@ -2305,14 +2305,10 @@ impl Agent {
                 },
             )
             .await;
-        if let Some(task_id) = started_loop {
-            match &submitted {
-                // The task now names its first turn; that is recorded with it.
-                Ok(_) => self.record_scheduled_tasks(chat_id).await,
-                Err(_) => {
-                    let _ = self.delete_scheduled_task(chat_id, &task_id).await;
-                }
-            }
+        if let Some(task_id) = started_loop
+            && submitted.is_err()
+        {
+            let _ = self.delete_scheduled_task(chat_id, &task_id).await;
         }
         submitted
     }
@@ -2646,6 +2642,7 @@ impl Agent {
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id, user_loop);
         }
+        let starts_loop = started_loop.is_some();
         if let Some(task) = started_loop.and_then(|id| {
             chat.snapshot
                 .scheduled_tasks
@@ -2766,6 +2763,11 @@ impl Agent {
             self.commit_cut(original, &mut candidate, index);
         }
         *original = candidate;
+        if starts_loop {
+            // Recorded before the Run can start: a host that goes on with the turn from the
+            // Transcript knows it is the loop's first.
+            self.persist_scheduled_tasks(original, Vec::new());
+        }
         if cut.is_none()
             && let Some(leaf) = selected_leaf
         {
