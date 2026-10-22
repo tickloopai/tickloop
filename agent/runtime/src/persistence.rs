@@ -3599,6 +3599,8 @@ impl StagedBranch {
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();
         snapshot.pending_commands = previous.pending_commands.clone();
+        // Choosing another stored branch changes the conversation alone, as a rewind does.
+        snapshot.scheduled_tasks = previous.scheduled_tasks.clone();
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }
