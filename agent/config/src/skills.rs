@@ -5,10 +5,15 @@ use std::path::{Path, PathBuf};
 use tick_packages::{InstalledPackage, PackageStore};
 use tickloop_agent_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
+use crate::loop_skill::{self, LoopFiles};
+
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
 /// `/slides`: only the user invokes it, and its body guides only the run it starts.
 pub const SLIDES_SKILL: &str = include_str!("../skills/slides/SKILL.md");
-pub const BUILTIN_SKILLS: [&str; 2] = [TICKLOOP_SKILL, SLIDES_SKILL];
+/// `/loop`: its expansion carries the host's reading of the arguments, see [`loop_skill`].
+pub const LOOP_SKILL: &str = include_str!("../skills/loop/SKILL.md");
+pub const LOOP_SKILL_NAME: &str = "loop";
+pub const BUILTIN_SKILLS: [&str; 3] = [TICKLOOP_SKILL, SLIDES_SKILL, LOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 /// In the body of a Tick package's Skill, the directory the package is installed in.
 pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
@@ -89,6 +94,7 @@ pub struct SkillRegistry {
     skills: BTreeMap<String, SkillDefinition>,
     remote: BTreeMap<String, SkillDefinition>,
     warnings: Vec<String>,
+    loop_files: LoopFiles,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +120,8 @@ pub enum SkillError {
     AllowedToolsUnsupported(String),
     #[error("invalid skill: {0}")]
     Invalid(String),
+    #[error("the loop instructions are unavailable: {0}")]
+    LoopInstructionsUnavailable(String),
 }
 
 struct Frontmatter {
@@ -156,6 +164,7 @@ impl SkillRegistry {
         builtins: impl IntoIterator<Item = &'a str>,
     ) -> Self {
         let mut registry = Self::with_builtins(builtins);
+        registry.loop_files = LoopFiles::new(Some(folder), config_root);
         let mut seen_files = HashSet::new();
         if let Some(root) = config_root {
             registry.load_directory(
@@ -377,7 +386,10 @@ Available Skills:
             return Err(SkillError::ForkUnsupported(name.to_owned()));
         }
         let arguments = arguments.trim();
-        let content = if skill.body.contains("$ARGUMENTS") {
+        let content = if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
+            loop_skill::expand(&skill.body, arguments, &self.loop_files)
+                .map_err(|error| SkillError::LoopInstructionsUnavailable(error.to_string()))?
+        } else if skill.body.contains("$ARGUMENTS") {
             skill.body.replace("$ARGUMENTS", arguments)
         } else if arguments.is_empty() {
             skill.body.clone()

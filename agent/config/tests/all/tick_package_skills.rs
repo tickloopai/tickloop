@@ -97,6 +97,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
             .collect::<Vec<_>>(),
         [
             "guide",
+            "loop",
             "sample:guide",
             "sample:tickloop",
             "slides",
