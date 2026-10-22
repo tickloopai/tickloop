@@ -704,3 +704,60 @@ async fn an_accepted_tick_update_runs_after_a_crash_through_the_new_watch() {
     assert_eq!(model.seen("accepted-not-started"), 0);
     restarted.shutdown().await;
 }
+
+/// A takeover whose holding was released while it read the store keeps nothing of what it read:
+/// stopped here, taken over and run elsewhere, then continued here, this process does not run
+/// what it read as waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_released_while_it_read_gives_no_permit() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let here = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = here.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&here, chat, "get ready").await;
+    here.flush_transcripts().await;
+    let elsewhere_model = ContractModel::new();
+    let elsewhere = Agent::open_embedded(root.clone(), config(), elsewhere_model.clone()).unwrap();
+    elsewhere.resume_chat(chat).await.unwrap();
+    complete_turn(&elsewhere, chat, "resume elsewhere").await;
+
+    hold_a_turn(&here, chat, &model).await;
+    here.deliver_trigger_for_tests(chat, scheduled("task", 1), "waits-behind-the-turn")
+        .await
+        .unwrap();
+    here.flush_transcripts().await;
+    // The next permit here takes the lease anew, reads the store and stops before applying it.
+    take_the_lease_away(&root);
+    let pause = here.pause_next_takeover_for_tests(chat);
+    model.release_held_turn();
+    tokio::time::timeout(WAIT, pause.entered)
+        .await
+        .expect("the takeover read the store")
+        .unwrap();
+
+    here.stop(chat).await.unwrap();
+    // Elsewhere learns of the stop, is continued by its user and takes the lease over.
+    let _ = elsewhere
+        .deliver_trigger_for_tests(chat, scheduled("other", 1), "delivered-elsewhere")
+        .await;
+    complete_turn(&elsewhere, chat, "continue elsewhere").await;
+    elsewhere
+        .deliver_trigger_for_tests(chat, scheduled("other", 1), "delivered-elsewhere")
+        .await
+        .unwrap();
+    elsewhere_model.wait_seen("waits-behind-the-turn", 1).await;
+
+    complete_turn(&here, chat, "continue here").await;
+    drop(pause.release);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        model.seen("waits-behind-the-turn"),
+        0,
+        "{:?}",
+        model.prompts()
+    );
+    assert_eq!(elsewhere_model.seen("waits-behind-the-turn"), 1);
+    elsewhere.shutdown().await;
+    here.shutdown().await;
+}

@@ -2104,7 +2104,7 @@ impl Agent {
         // What was delivered is known only under the lease, once what another process holding it
         // delivered is taken over: the items are sorted out and batched after that.
         match self.acquire_trigger_permit(chat_id).await {
-            TriggerPermit::Fire => {}
+            TriggerPermit::Fire(_) => {}
             TriggerPermit::Wait(_) | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
                 self.tick_deliveries().restore(owner, items);
                 self.inner.tick_wake.notify_one();

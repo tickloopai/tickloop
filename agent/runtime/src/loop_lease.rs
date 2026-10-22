@@ -54,6 +54,9 @@ const STATE_FILE: &str = "receiving.state";
 const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
+/// How many holdings a permit takes, each released before it took the Chat's Trigger state
+/// over, before it waits for a later delivery.
+const TAKEOVER_ATTEMPTS: usize = 3;
 const HELD_ELSEWHERE_MESSAGE: &str =
     "another Tickloop process holds this Chat's Trigger; the event was not delivered";
 
@@ -130,12 +133,26 @@ enum LeaseCheck {
 
 /// 一次送达前的判断结果。
 pub(super) enum TriggerPermit {
-    Fire,
+    /// Deliver under `holding`, which the acceptance or the start checks again under the Chats
+    /// lock: a lease released meanwhile no longer stands behind it.
+    Fire(LeaseHolding),
     /// 暂不能送达（被其他进程持有、锁来自另一台主机、Loop 未在接收），稍后重试。
     Wait(String),
     /// 接收状态显示已在其他进程暂停，本地已同步。
     Withdrawn,
     Failed(String),
+}
+
+/// The lease holding a permit was given under; `None` where a host needs no lease, as one that
+/// keeps waits durably or saves no Chats.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LeaseHolding(Option<u64>);
+
+/// What taking a Chat's Trigger state over came to.
+enum TakeOver {
+    Taken,
+    /// The holding was released meanwhile; what was read is not applied, or no longer stands.
+    Released,
 }
 
 /// One holding of a Chat's lease. Taken, it is not synced: no Trigger is accepted or started
@@ -208,16 +225,35 @@ impl ChatLeases {
             .is_some_and(|holding| holding.epoch == epoch && holding.synced)
     }
 
-    /// The holding `epoch` took the Chat's Trigger state over; a later holding takes it again.
-    fn mark_synced(&self, chat_id: ChatId, epoch: u64) {
-        if let Some(holding) = self
-            .held
+    /// Whether the holding `epoch` still holds the Chat's lease, synced or not.
+    fn holds_epoch(&self, chat_id: ChatId, epoch: u64) -> bool {
+        self.held
             .lock()
             .unwrap()
+            .get(&chat_id)
+            .is_some_and(|holding| holding.epoch == epoch)
+    }
+
+    /// The holding `epoch` took the Chat's Trigger state over; whether it still held the lease
+    /// to be marked. A later holding takes it over again.
+    fn mark_synced(&self, chat_id: ChatId, epoch: u64) -> bool {
+        let mut held = self.held.lock().unwrap();
+        let Some(holding) = held
             .get_mut(&chat_id)
             .filter(|holding| holding.epoch == epoch)
-        {
-            holding.synced = true;
+        else {
+            return false;
+        };
+        holding.synced = true;
+        true
+    }
+
+    /// Whether a permit given under `holding` still stands: the lease it was given under is still
+    /// held and synced.
+    pub(super) fn stands(&self, chat_id: ChatId, holding: LeaseHolding) -> bool {
+        match holding.0 {
+            None => true,
+            Some(epoch) => self.is_synced(chat_id, epoch),
         }
     }
 
@@ -429,15 +465,28 @@ impl Agent {
     }
 
     /// 每次送达前调用：持有该 Chat 的租约、读取接收状态，并确认 Loop 仍在接收。接收状态显示已在
-    /// 其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    /// 其他进程暂停时同步本地接收开关并返回 `Withdrawn`。A holding released while it took the
+    /// Chat's Trigger state over gave nothing: the lease is asked for again.
     pub(super) async fn acquire_trigger_permit(&self, chat_id: ChatId) -> TriggerPermit {
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
-            return TriggerPermit::Fire;
+            return TriggerPermit::Fire(LeaseHolding(None));
         }
+        for _ in 0..TAKEOVER_ATTEMPTS {
+            match self.check_trigger_permit(chat_id).await {
+                Some(permit) => return permit,
+                None => continue,
+            }
+        }
+        TriggerPermit::Wait("this Chat's Trigger lease kept changing hands".into())
+    }
+
+    /// One attempt at a permit; `None` when the holding it took was released before it took the
+    /// Chat's Trigger state over.
+    async fn check_trigger_permit(&self, chat_id: ChatId) -> Option<TriggerPermit> {
         let Some(directory) = self.lease_directory(chat_id).await else {
-            return TriggerPermit::Wait("chat is no longer loaded".into());
+            return Some(TriggerPermit::Wait("chat is no longer loaded".into()));
         };
         let agent = self.clone();
         let checked =
@@ -446,7 +495,7 @@ impl Agent {
                 .map_err(|error| error.to_string())
                 .and_then(|checked| checked.map_err(|error| error.to_string()));
         let leases = &self.inner.chat_leases;
-        match checked {
+        Some(match checked {
             Err(error) => {
                 let message = format!("could not take this Chat's Trigger lease: {error}");
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
@@ -475,13 +524,23 @@ impl Agent {
                 TriggerPermit::Withdrawn
             }
             Ok(LeaseCheck::Held { epoch, synced }) => {
-                if !synced && let Err(error) = self.take_trigger_state_over(chat_id, epoch).await {
-                    let message = format!(
-                        "could not take over this Chat's Trigger state from its Transcript: \
-                         {error}; no Trigger is delivered until it can"
-                    );
-                    leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                    return TriggerPermit::Failed(message);
+                if !synced {
+                    match self.take_trigger_state_over(chat_id, epoch).await {
+                        Ok(TakeOver::Taken) => {}
+                        Ok(TakeOver::Released) => return None,
+                        Err(error) => {
+                            let message = format!(
+                                "could not take over this Chat's Trigger state from its \
+                                 Transcript: {error}; no Trigger is delivered until it can"
+                            );
+                            leases.set_notice(
+                                chat_id,
+                                LoopTriggerNoticeKind::Warning,
+                                message.clone(),
+                            );
+                            return Some(TriggerPermit::Failed(message));
+                        }
+                    }
                 }
                 let is_receiving = self
                     .inner
@@ -492,27 +551,43 @@ impl Agent {
                     .is_some_and(|chat| chat.snapshot.chat_loop.receiving.is_receiving());
                 if !is_receiving {
                     leases.release(chat_id);
-                    return TriggerPermit::Wait("this Chat's Loop is not receiving".into());
+                    return Some(TriggerPermit::Wait(
+                        "this Chat's Loop is not receiving".into(),
+                    ));
                 }
                 leases.clear_notice(chat_id);
-                TriggerPermit::Fire
+                TriggerPermit::Fire(LeaseHolding(Some(epoch)))
             }
-        }
+        })
     }
 
     /// Under a newly taken lease, before anything is accepted or started under it: the Chat's
     /// Trigger state rebuilt from the store, once for the holding however many permits ask for
-    /// it at the same time. A failure leaves the holding not synced, to be tried again.
-    async fn take_trigger_state_over(&self, chat_id: ChatId, epoch: u64) -> Result<(), String> {
+    /// it at the same time. A failure leaves the holding not synced, to be tried again; a
+    /// holding released meanwhile keeps nothing of what it read.
+    async fn take_trigger_state_over(
+        &self,
+        chat_id: ChatId,
+        epoch: u64,
+    ) -> Result<TakeOver, String> {
         let leases = &self.inner.chat_leases;
         let gate = leases.sync_gate(chat_id);
         let _taking_over = gate.lock().await;
         if leases.is_synced(chat_id, epoch) {
-            return Ok(());
+            return Ok(TakeOver::Taken);
         }
-        self.reload_trigger_state(chat_id).await?;
-        leases.mark_synced(chat_id, epoch);
-        Ok(())
+        let taken = self.reload_trigger_state(chat_id, epoch).await?;
+        Ok(if taken && leases.mark_synced(chat_id, epoch) {
+            TakeOver::Taken
+        } else {
+            TakeOver::Released
+        })
+    }
+
+    /// Whether the holding `epoch` still holds the Chat's lease, as the takeover applies what it
+    /// read under the Chats lock.
+    pub(super) fn still_holds_epoch(&self, chat_id: ChatId, epoch: u64) -> bool {
+        self.inner.chat_leases.holds_epoch(chat_id, epoch)
     }
 
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的

@@ -216,7 +216,8 @@ impl FaultyTranscriptStore {
         }
     }
 
-    /// Every later load waits until `release_loads`.
+    /// Every later load reads what the store holds now, then waits until `release_loads` to
+    /// return it.
     pub fn hold_loads(&self) {
         self.faults.lock().unwrap().holds_loads = true;
     }
@@ -309,6 +310,7 @@ impl TranscriptStore for FaultyTranscriptStore {
         chat: ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
+        let loaded = self.inner.load(chat, range).await;
         loop {
             let released = self.loads_released.notified();
             tokio::pin!(released);
@@ -323,7 +325,7 @@ impl TranscriptStore for FaultyTranscriptStore {
             released.await;
             self.faults.lock().unwrap().waiting_loads -= 1;
         }
-        self.inner.load(chat, range).await
+        loaded
     }
 
     async fn append(

@@ -339,8 +339,8 @@ impl Agent {
         chat_id: ChatId,
         delivery: TriggerDelivery,
     ) -> Result<Receipt, AgentError> {
-        match self.acquire_trigger_permit(chat_id).await {
-            TriggerPermit::Fire => {}
+        let holding = match self.acquire_trigger_permit(chat_id).await {
+            TriggerPermit::Fire(holding) => holding,
             TriggerPermit::Wait(reason) => return Err(AgentError::Invalid(reason)),
             TriggerPermit::Withdrawn => {
                 return Err(AgentError::Invalid(
@@ -348,7 +348,7 @@ impl Agent {
                 ));
             }
             TriggerPermit::Failed(error) => return Err(AgentError::Storage(error)),
-        }
+        };
         // Boxed: proving a source reads its Tick, which must not enlarge every caller's stack.
         Box::pin(self.revalidate_trigger_source(chat_id, &delivery.source)).await?;
         let TriggerDelivery {
@@ -361,6 +361,7 @@ impl Agent {
             input,
             SubmissionOptions {
                 trigger_source: Some(source),
+                trigger_lease: Some(holding),
                 ledger,
                 ..Default::default()
             },
@@ -454,10 +455,16 @@ impl Agent {
     /// Tick sequences delivered. What another process accepted, ran or settled while it held the
     /// lease is known here as it is there. The user's input and Agent messages are this
     /// process's own and stay as they are.
-    pub(super) async fn reload_trigger_state(&self, chat_id: ChatId) -> Result<(), String> {
+    /// Whether it applied: a holding `epoch` released while the store was read keeps nothing of
+    /// it.
+    pub(super) async fn reload_trigger_state(
+        &self,
+        chat_id: ChatId,
+        epoch: u64,
+    ) -> Result<bool, String> {
         // Nothing of the Chat is stored yet, so no other process took anything of it.
         if !self.transcript_materialized(chat_id) {
-            return Ok(());
+            return Ok(true);
         }
         {
             let chats = self.inner.chats.lock().await;
@@ -470,11 +477,16 @@ impl Agent {
             Err(AgentError::NotFound) => Vec::new(),
             Err(error) => return Err(error.to_string()),
         };
+        #[cfg(any(test, feature = "test-support"))]
+        takeover_pause::wait_if_paused(chat_id).await;
         let (delivered, takes_waiting_input) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&chat_id)
                 .ok_or("the Chat is no longer loaded")?;
+            if !self.still_holds_epoch(chat_id, epoch) {
+                return Ok(false);
+            }
             chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
             let lifecycle = &chat.bookkeeping.lifecycle;
             let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
@@ -518,7 +530,7 @@ impl Agent {
                 .tasks
                 .spawn(self.clone().start_waiting_input(chat_id));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Starts what waits in an idle Loop. Its future is named, not inferred: starting a run asks
@@ -673,6 +685,55 @@ impl Agent {
             self.withdraw_trigger_input(chat, &receipt, DiscardReason::SourceEnded);
         }
         self.save(&chat.snapshot);
+    }
+
+    /// Pauses the Chat's next takeover once it read the store and before it applies what it
+    /// read; dropping `release` lets it go on.
+    #[doc(hidden)]
+    pub fn pause_next_takeover_for_tests(&self, chat_id: ChatId) -> takeover_pause::Pause {
+        takeover_pause::pause_next(chat_id)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod takeover_pause {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use tickloop_agent_protocol::ChatId;
+    use tokio::sync::oneshot;
+
+    type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static GATES: Mutex<Option<HashMap<ChatId, Gate>>> = Mutex::new(None);
+
+    pub struct Pause {
+        pub entered: oneshot::Receiver<()>,
+        pub release: oneshot::Sender<()>,
+    }
+
+    pub(crate) fn pause_next(chat: ChatId) -> Pause {
+        let (entered_sender, entered) = oneshot::channel();
+        let (release, release_receiver) = oneshot::channel();
+        GATES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(chat, (entered_sender, release_receiver));
+        Pause { entered, release }
+    }
+
+    pub(crate) async fn wait_if_paused(chat: ChatId) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|gates| gates.remove(&chat));
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 }
 

@@ -530,6 +530,9 @@ struct SubmissionOptions {
     denial_reference: Option<DenialReference>,
     /// Set only by [`Agent::deliver_trigger`], the wake-up base's one entry.
     trigger_source: Option<TriggerSource>,
+    /// The lease holding the delivery was let in under; it must still stand when the delivery is
+    /// accepted.
+    trigger_lease: Option<loop_lease::LeaseHolding>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -2488,6 +2491,7 @@ impl Agent {
             attached_file_reads,
             denial_reference,
             trigger_source,
+            trigger_lease,
             invoked_skill,
             host_context,
             agent_message,
@@ -2612,6 +2616,12 @@ impl Agent {
                 .any(|context| matches!(context, InputContext::Image(_)))
         {
             return Err(AgentError::ImageInputUnsupported);
+        }
+        if trigger_lease.is_some_and(|holding| !self.inner.chat_leases.stands(chat_id, holding)) {
+            return Err(AgentError::Invalid(
+                "this Chat's Trigger lease changed hands; the delivery waits with its source"
+                    .into(),
+            ));
         }
         if let Some(source) = &trigger_source
             && let Some(waiting) = self.admit_trigger(chat, source)?
@@ -3711,17 +3721,24 @@ impl Agent {
                         .expect("only Trigger input is validated");
                     // Queued Trigger input starts only under the Chat's lease and while no
                     // other process paused receiving; otherwise it waits.
-                    match Box::pin(self.acquire_trigger_permit(chat_id)).await {
-                        loop_lease::TriggerPermit::Fire => {}
+                    let holding = match Box::pin(self.acquire_trigger_permit(chat_id)).await {
+                        loop_lease::TriggerPermit::Fire(holding) => holding,
                         loop_lease::TriggerPermit::Wait(_)
-                        | loop_lease::TriggerPermit::Withdrawn
-                        | loop_lease::TriggerPermit::Failed(_) => return Ok(None),
-                    }
+                        | loop_lease::TriggerPermit::Withdrawn => {
+                            return Ok(None);
+                        }
+                        loop_lease::TriggerPermit::Failed(_) => return Ok(None),
+                    };
                     // Boxed: proving a source must not enlarge every run's shared async stack.
                     let validation =
                         Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
                     if validation.is_ok() {
                         if let Ok(mut chats) = self.inner.chats.try_lock() {
+                            // The lease the permit was given under still stands as the input
+                            // starts.
+                            if !self.inner.chat_leases.stands(chat_id, holding) {
+                                return Ok(None);
+                            }
                             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                             match self.select_next_run(chat, Some(&pending))? {
                                 RunAdmission::Idle => return Ok(None),

@@ -646,7 +646,7 @@ impl Agent {
             return EventPollOutcome::Stop;
         }
         match self.acquire_trigger_permit(chat_id).await {
-            super::loop_lease::TriggerPermit::Fire => {}
+            super::loop_lease::TriggerPermit::Fire(_) => {}
             super::loop_lease::TriggerPermit::Withdrawn => return EventPollOutcome::Stop,
             super::loop_lease::TriggerPermit::Wait(_)
             | super::loop_lease::TriggerPermit::Failed(_) => return EventPollOutcome::Skipped,
@@ -1436,7 +1436,7 @@ mod feedback_admission_tests {
         second.continue_loop(chat_id).await.unwrap();
         assert!(matches!(
             first.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Fire
+            super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         assert!(matches!(
             second.acquire_trigger_permit(chat_id).await,
@@ -1445,7 +1445,7 @@ mod feedback_admission_tests {
         first.shutdown().await;
         assert!(matches!(
             second.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Fire
+            super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         second.shutdown().await;
     }
