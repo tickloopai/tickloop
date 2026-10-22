@@ -7,4 +7,6 @@ mod tasks_tests;
 pub(crate) mod tools;
 mod wiring;
 
-pub(crate) use wiring::{ScheduleClock, after_history_load, is_current_run, resolve_zone};
+pub(crate) use wiring::{
+    ScheduleClock, ScheduledTasksState, after_history_load, is_current_run, resolve_zone,
+};

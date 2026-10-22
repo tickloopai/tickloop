@@ -213,3 +213,66 @@ async fn the_first_loop_turn_continued_by_another_host_still_falls_back() {
     );
     next.shutdown().await;
 }
+
+/// A process that loaded a task takes the Chat's lease over after another process deleted the
+/// task and left: it goes on from what the other recorded, so the task's run is neither taken
+/// nor run, and the task is not written back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_taking_the_chat_over_does_not_run_a_task_deleted_elsewhere() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let holder = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    holder.set_scheduled_now_for_tests(at(10, 0));
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&holder, chat, "get ready").await;
+    let task = holder
+        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .await
+        .unwrap();
+    // The holder runs the task once, so the Chat's Trigger lease is its own.
+    holder
+        .wake_scheduled_tasks(chat, task.next_fire_at_ms.unwrap())
+        .await
+        .unwrap();
+    model.wait_seen("check the build", 1).await;
+    holder.flush_transcripts().await;
+
+    let taker_model = ContractModel::new();
+    let taker = Agent::open_embedded(root.clone(), config(), taker_model.clone()).unwrap();
+    taker.set_scheduled_now_for_tests(at(10, 25));
+    taker.resume_chat(chat).await.unwrap();
+    complete_turn(&taker, chat, "resume here").await;
+    let loaded = tasks(&taker, chat).await;
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+
+    holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+    holder.shutdown().await;
+
+    taker.set_scheduled_now_for_tests(at(10, 35));
+    let woken = taker
+        .wake_scheduled_tasks(chat, loaded[0].next_fire_at_ms.unwrap())
+        .await;
+    assert!(
+        woken.is_err(),
+        "the run of the deleted task is refused: {woken:?}"
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        taker_model.seen("check the build"),
+        0,
+        "{:?}",
+        taker_model.prompts()
+    );
+    assert!(tasks(&taker, chat).await.is_empty());
+    taker.flush_transcripts().await;
+    taker.shutdown().await;
+
+    let reader = Agent::open_embedded(root, config(), ContractModel::new()).unwrap();
+    reader.resume_chat(chat).await.unwrap();
+    assert!(
+        tasks(&reader, chat).await.is_empty(),
+        "the task is not written back"
+    );
+    reader.shutdown().await;
+}

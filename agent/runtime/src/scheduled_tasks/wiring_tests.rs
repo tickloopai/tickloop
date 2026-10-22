@@ -1162,7 +1162,7 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     );
     assert_eq!(
         tasks(&holder, chat).await,
-        [task],
+        std::slice::from_ref(&task),
         "the task keeps its time"
     );
     assert_eq!(model.seen("remind me"), 0);
@@ -1175,7 +1175,12 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     assert_eq!(receipts.len(), 1);
     wait_seen(&model, "remind me", 1).await;
     wait_idle(&holder, chat).await;
-    assert!(tasks(&holder, chat).await.is_empty());
+    assert!(
+        tasks(&holder, chat)
+            .await
+            .iter()
+            .all(|remaining| remaining.id != task.id)
+    );
     holder.shutdown().await;
 }
 

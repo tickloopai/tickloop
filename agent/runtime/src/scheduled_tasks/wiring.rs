@@ -181,6 +181,30 @@ fn started_by_scheduled_run(chat: &Chat, run: tickloop_agent_protocol::RunId) ->
         })
 }
 
+/// The scheduled tasks and their revocations as the Chat's Transcript keeps them. A process
+/// taking the Chat over goes on from what the previous holder recorded, so a task deleted there
+/// is neither run nor written back here.
+pub(crate) struct ScheduledTasksState;
+
+impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
+    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+        let Some(recorded) = stored.iter().rev().find_map(|line| match line {
+            Line::ScheduledTasks(entry) if entry.chat_id == chat.snapshot.id => Some(entry),
+            _ => None,
+        }) else {
+            return;
+        };
+        if chat.snapshot.scheduled_tasks == recorded.tasks
+            && chat.snapshot.scheduled_task_revocations == recorded.revoked
+        {
+            return;
+        }
+        chat.snapshot.scheduled_tasks = recorded.tasks.clone();
+        chat.snapshot.scheduled_task_revocations = recorded.revoked.clone();
+        agent.persist_scheduled_tasks(chat, Vec::new());
+    }
+}
+
 /// A due run of a task, prepared for the base: the task before it ran and as it is after.
 struct DueRun {
     before: ScheduledTask,
@@ -293,6 +317,16 @@ impl Agent {
                 started_by_run: None,
                 skipped: 0,
             });
+            // Recorded, so a process taking the Chat over finds the task its run belongs to;
+            // the timer is left alone, as the task does not time on its own.
+            self.record_chat_metadata(
+                chat_id,
+                Line::ScheduledTasks(ScheduledTasksEntry {
+                    chat_id,
+                    tasks: snapshot.scheduled_tasks.clone(),
+                    revoked: snapshot.scheduled_task_revocations.clone(),
+                }),
+            );
         }
     }
 
