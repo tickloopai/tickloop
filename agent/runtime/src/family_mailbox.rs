@@ -15,6 +15,7 @@ const SENDER_RATE_WINDOW_MS: u64 = 60_000;
 pub(super) struct FamilyMailbox {
     #[serde(with = "crate::upgrade::map_entries")]
     pub sent: HashMap<(RunId, String), agent_messages::SentMessage>,
+    #[serde(default)]
     pub stopped_runs: HashMap<ChatId, HashSet<RunId>>,
     chains: HashMap<Uuid, usize>,
     seen: HashSet<Uuid>,

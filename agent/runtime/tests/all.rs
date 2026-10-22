@@ -197,6 +197,8 @@ mod transcripts;
 mod trusted_approval_context;
 #[path = "all/unpersisted_state.rs"]
 mod unpersisted_state;
+#[path = "all/upgrade.rs"]
+mod upgrade;
 #[path = "all/user_settings.rs"]
 mod user_settings;
 #[path = "all/waiting_runs.rs"]
