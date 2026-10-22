@@ -419,6 +419,14 @@ impl TranscriptOutbox {
         }
     }
 
+    /// Drops what the Chat has queued and not committed, a failed batch included, and writes
+    /// nothing more of it: what this holder could not record of it is left unrecorded.
+    pub(crate) fn withhold(&self, chat: ChatId, reason: &str) {
+        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
+            outbox.refuse(TranscriptError::Storage(reason.into()));
+        }
+    }
+
     pub(crate) fn refusal(&self, chat: ChatId) -> Option<TranscriptError> {
         self.chats
             .lock()

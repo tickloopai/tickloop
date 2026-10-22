@@ -898,6 +898,7 @@ impl Agent {
                 source,
                 input: delivery.prompt,
                 ledger: Some(ledger),
+                on_accept: None,
             },
         )
         .await

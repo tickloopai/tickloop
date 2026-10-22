@@ -546,6 +546,7 @@ impl Agent {
                 },
                 input: prompts::continuation_prompt(&prompt_context(goal)),
                 ledger: None,
+                on_accept: None,
             }
         };
         if let Err(error) = Box::pin(self.deliver_trigger(chat_id, delivery)).await {

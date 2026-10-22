@@ -1495,6 +1495,7 @@ impl Agent {
                 source,
                 input,
                 ledger: None,
+                on_accept: None,
             },
         )
         .await
@@ -2222,6 +2223,7 @@ impl Agent {
                     source,
                     input,
                     ledger: None,
+                    on_accept: None,
                 },
             )
             .await;
