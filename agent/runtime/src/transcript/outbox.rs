@@ -216,6 +216,23 @@ impl TranscriptOutbox {
     }
 
     pub(crate) fn enqueue(&self, chat: ChatId, lines: Vec<Line>, events_through: Option<u64>) {
+        self.enqueue_lines(chat, lines, events_through, true);
+    }
+
+    /// Queues the record of a Trigger source's own state, which its lease holder writes: never
+    /// kept to be written again as metadata, nor folded into a retained snapshot, so no stale
+    /// copy of it is written by a process that does not hold the lease.
+    pub(crate) fn enqueue_source_state(&self, chat: ChatId, line: Line) {
+        self.enqueue_lines(chat, vec![line], None, false);
+    }
+
+    fn enqueue_lines(
+        &self,
+        chat: ChatId,
+        lines: Vec<Line>,
+        events_through: Option<u64>,
+        kept: bool,
+    ) {
         let mut chats = self.chats.lock().unwrap();
         let Some(outbox) = chats.get_mut(&chat) else {
             return;
@@ -236,8 +253,10 @@ impl TranscriptOutbox {
             {
                 continue;
             }
-            outbox.metadata.remember(&line);
-            outbox.retained.apply(&line);
+            if kept {
+                outbox.metadata.remember(&line);
+                outbox.retained.apply(&line);
+            }
             accepted.push(line);
         }
         // A new start of the chain, or enough retained Lines since the last snapshot, are folded

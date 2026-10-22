@@ -110,7 +110,7 @@ mod turn;
 mod wakeup;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use wakeup::trigger_pauses;
+pub use wakeup::{TestSourceState, trigger_pauses};
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{

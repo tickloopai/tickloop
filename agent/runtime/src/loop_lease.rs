@@ -130,7 +130,12 @@ enum LeaseCheck {
     },
     HeldElsewhere,
     ForeignHost(String),
-    PausedElsewhere(u64),
+    /// Held, while another process recorded a pause newer than this one knows.
+    PausedElsewhere {
+        generation: u64,
+        epoch: u64,
+        synced: bool,
+    },
     /// The Agent is shutting down or handing over: no lease is taken any more.
     Closing,
 }
@@ -148,6 +153,26 @@ pub(super) enum TriggerPermit {
     },
     /// 接收状态显示已在其他进程暂停，本地已同步。
     Withdrawn,
+    Failed(String),
+}
+
+/// What taking a Chat's lease came to.
+pub(super) enum LeaseTaken {
+    /// Held, the Chat's Trigger state taken over.
+    Held(LeaseHolding),
+    /// Held, while another process paused receiving: this one pauses too.
+    PausedElsewhere(LeaseHolding),
+}
+
+/// Why a Chat's lease could not be taken.
+pub(super) enum LeaseRefused {
+    NotLoaded,
+    /// Another live process holds it.
+    HeldElsewhere,
+    /// A lock written on another host holds it.
+    ForeignHost(String),
+    Closing,
+    /// The lease files, or the Transcript the takeover reads, could not be used.
     Failed(String),
 }
 
@@ -245,7 +270,11 @@ impl ChatLeases {
         let known = self.known_generation(key);
         Ok(match read_receiving(directory)? {
             Some(state) if !state.receiving && state.generation > known => {
-                LeaseCheck::PausedElsewhere(state.generation)
+                LeaseCheck::PausedElsewhere {
+                    generation: state.generation,
+                    epoch,
+                    synced,
+                }
             }
             Some(_) | None => LeaseCheck::Held { epoch, synced },
         })
@@ -272,6 +301,15 @@ impl ChatLeases {
             holding.synced = true;
         }
         self.cancel_retry(chat_id);
+    }
+
+    /// The holding this process has of the Chat's lease, synced or not.
+    pub(super) fn holding(&self, chat_id: ChatId) -> Option<LeaseHolding> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .map(|holding| LeaseHolding(Some(holding.epoch)))
     }
 
     /// Whether a permit given under `holding` still stands: the lease it was given under is still
@@ -609,23 +647,20 @@ impl Agent {
             .unwrap_or(0)
     }
 
-    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
-    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
-    pub(super) async fn acquire_trigger_permit(
+    /// Takes the Chat's lease within its boundary, whether the Loop receives or not: a holding
+    /// newly taken takes the Chat's Trigger state over first.
+    pub(super) async fn take_lease(
         &self,
         chat_id: ChatId,
         _within: &TriggerBoundary,
-    ) -> TriggerPermit {
+    ) -> Result<LeaseTaken, LeaseRefused> {
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
-            return TriggerPermit::Fire(LeaseHolding(None));
+            return Ok(LeaseTaken::Held(LeaseHolding(None)));
         }
         let Some(directory) = self.lease_directory(chat_id).await else {
-            return TriggerPermit::Wait {
-                reason: "chat is no longer loaded".into(),
-                recoverable: false,
-            };
+            return Err(LeaseRefused::NotLoaded);
         };
         #[cfg(any(test, feature = "test-support"))]
         self.pause_point_blocking(
@@ -641,11 +676,11 @@ impl Agent {
             .check(&directory, chat_id)
             .map_err(|error| error.to_string());
         let leases = &self.inner.chat_leases;
-        match checked {
+        let (epoch, synced, paused_elsewhere) = match checked {
             Err(error) => {
                 let message = format!("could not take this Chat's Trigger lease: {error}");
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                TriggerPermit::Failed(message)
+                return Err(LeaseRefused::Failed(message));
             }
             Ok(LeaseCheck::HeldElsewhere) => {
                 leases.set_notice(
@@ -653,10 +688,7 @@ impl Agent {
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
                     "another Tickloop process holds this Chat's Trigger".into(),
                 );
-                TriggerPermit::Wait {
-                    reason: HELD_ELSEWHERE_MESSAGE.into(),
-                    recoverable: true,
-                }
+                return Err(LeaseRefused::HeldElsewhere);
             }
             Ok(LeaseCheck::ForeignHost(host)) => {
                 let message = format!(
@@ -665,67 +697,113 @@ impl Agent {
                      Remove the lock file if that host no longer runs Tickloop"
                 );
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                TriggerPermit::Wait {
+                return Err(LeaseRefused::ForeignHost(message));
+            }
+            Ok(LeaseCheck::Closing) => return Err(LeaseRefused::Closing),
+            Ok(LeaseCheck::PausedElsewhere {
+                generation,
+                epoch,
+                synced,
+            }) => {
+                leases.remember_generation(chat_id, generation);
+                (epoch, synced, true)
+            }
+            Ok(LeaseCheck::Held { epoch, synced }) => (epoch, synced, false),
+        };
+        if !synced {
+            if let Err(error) = self.reload_trigger_state(chat_id).await {
+                let message = format!(
+                    "could not take over this Chat's Trigger state from its Transcript: {error}; \
+                     no Trigger is delivered until it can"
+                );
+                leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
+                return Err(LeaseRefused::Failed(message));
+            }
+            leases.mark_synced(chat_id, epoch);
+        }
+        let holding = LeaseHolding(Some(epoch));
+        Ok(if paused_elsewhere {
+            LeaseTaken::PausedElsewhere(holding)
+        } else {
+            LeaseTaken::Held(holding)
+        })
+    }
+
+    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
+    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    pub(super) async fn acquire_trigger_permit(
+        &self,
+        chat_id: ChatId,
+        within: &TriggerBoundary,
+    ) -> TriggerPermit {
+        let holding = match self.take_lease(chat_id, within).await {
+            Ok(LeaseTaken::Held(holding)) => holding,
+            Ok(LeaseTaken::PausedElsewhere(_)) => {
+                self.pause_receiving_paused_elsewhere(chat_id).await;
+                return TriggerPermit::Withdrawn;
+            }
+            Err(LeaseRefused::NotLoaded) => {
+                return TriggerPermit::Wait {
+                    reason: "chat is no longer loaded".into(),
+                    recoverable: false,
+                };
+            }
+            Err(LeaseRefused::HeldElsewhere) => {
+                return TriggerPermit::Wait {
+                    reason: HELD_ELSEWHERE_MESSAGE.into(),
+                    recoverable: true,
+                };
+            }
+            Err(LeaseRefused::ForeignHost(message)) => {
+                return TriggerPermit::Wait {
                     reason: message,
                     recoverable: true,
-                }
+                };
             }
-            Ok(LeaseCheck::Closing) => TriggerPermit::Wait {
-                reason: "this Agent is shutting down".into(),
-                recoverable: false,
-            },
-            Ok(LeaseCheck::PausedElsewhere(generation)) => {
-                leases.remember_generation(chat_id, generation);
-                self.pause_receiving_paused_elsewhere(chat_id).await;
-                TriggerPermit::Withdrawn
+            Err(LeaseRefused::Closing) => {
+                return TriggerPermit::Wait {
+                    reason: "this Agent is shutting down".into(),
+                    recoverable: false,
+                };
             }
-            Ok(LeaseCheck::Held { epoch, synced }) => {
-                if !synced {
-                    if let Err(error) = self.reload_trigger_state(chat_id).await {
-                        let message = format!(
-                            "could not take over this Chat's Trigger state from its \
-                             Transcript: {error}; no Trigger is delivered until it can"
-                        );
-                        leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                        return TriggerPermit::Failed(message);
-                    }
-                    leases.mark_synced(chat_id, epoch);
-                }
-                let receiving = self
-                    .inner
-                    .chats
-                    .lock()
-                    .await
-                    .get(&chat_id)
-                    .map(|chat| chat.snapshot.chat_loop.receiving);
-                match receiving {
-                    Some(Receiving::Receiving) => {}
-                    // The process keeps the lease while its Transcript cannot take a start: no
-                    // other process runs what it may have started.
-                    Some(Receiving::Paused {
-                        reason: PauseReason::TranscriptUnavailable,
-                    }) => {
-                        return TriggerPermit::Wait {
-                            reason: "this Chat's Loop paused: its Transcript cannot be written"
-                                .into(),
-                            recoverable: false,
-                        };
-                    }
-                    Some(Receiving::Paused {
-                        reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
-                    })
-                    | None => {
-                        leases.release(chat_id);
-                        return TriggerPermit::Wait {
-                            reason: "this Chat's Loop is not receiving".into(),
-                            recoverable: false,
-                        };
-                    }
-                }
-                leases.clear_notice(chat_id);
-                TriggerPermit::Fire(LeaseHolding(Some(epoch)))
+            Err(LeaseRefused::Failed(message)) => return TriggerPermit::Failed(message),
+        };
+        if holding.0.is_none() {
+            return TriggerPermit::Fire(holding);
+        }
+        let leases = &self.inner.chat_leases;
+        let receiving = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .map(|chat| chat.snapshot.chat_loop.receiving);
+        match receiving {
+            Some(Receiving::Receiving) => {}
+            // The process keeps the lease while its Transcript cannot take a start: no other
+            // process runs what it may have started.
+            Some(Receiving::Paused {
+                reason: PauseReason::TranscriptUnavailable,
+            }) => {
+                return TriggerPermit::Wait {
+                    reason: "this Chat's Loop paused: its Transcript cannot be written".into(),
+                    recoverable: false,
+                };
+            }
+            Some(Receiving::Paused {
+                reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
+            })
+            | None => {
+                leases.release(chat_id);
+                return TriggerPermit::Wait {
+                    reason: "this Chat's Loop is not receiving".into(),
+                    recoverable: false,
+                };
             }
         }
+        leases.clear_notice(chat_id);
+        TriggerPermit::Fire(holding)
     }
 
     /// A permit for the Chat's waiting Trigger input failed: it is tried again after a delay
@@ -767,7 +845,7 @@ impl Agent {
         &self,
         chat_id: ChatId,
         change: ReceivingChange,
-        _within: TriggerBoundary,
+        within: TriggerBoundary,
     ) {
         let recorded = match self.lease_directory(chat_id).await {
             Some(directory) if self.inner.recorder.is_some() => self
@@ -787,7 +865,16 @@ impl Agent {
         )
         .await;
         match change {
-            ReceivingChange::Paused => self.inner.chat_leases.release(chat_id),
+            ReceivingChange::Paused => {
+                // The sources stop with the Loop where the lease is, before it goes back.
+                if let Ok(taken) = self.take_lease(chat_id, &within).await {
+                    let holding = match taken {
+                        LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding) => holding,
+                    };
+                    self.stop_sources(chat_id, holding).await;
+                }
+                self.inner.chat_leases.release(chat_id);
+            }
             ReceivingChange::Resumed => {}
         }
         if let Err(error) = recorded {
@@ -966,7 +1053,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::PausedElsewhere(generation) if generation == resumed.generation + 1
+            LeaseCheck::PausedElsewhere { generation, .. } if generation == resumed.generation + 1
         ));
     }
 

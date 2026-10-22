@@ -2578,6 +2578,19 @@ impl Agent {
         Ok(())
     }
 
+    /// Queues a record of a Trigger source's own state, for its lease holder.
+    pub(super) fn queue_source_state(&self, chat_id: ChatId, line: Line) {
+        let Some(recorder) = &self.inner.recorder else {
+            return;
+        };
+        if !recorder.logs.lock().unwrap().contains_key(&chat_id) {
+            return;
+        }
+        recorder.outbox.enqueue_source_state(chat_id, line);
+        recorder.notify.notify_one();
+        self.ensure_flush_loop(recorder);
+    }
+
     /// Queues for the Chat's Transcript what it changed so far, ahead of whatever is recorded of
     /// it next.
     pub(super) fn queue_for_transcript(&self, chat: &Chat) {

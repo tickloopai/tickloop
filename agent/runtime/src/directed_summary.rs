@@ -257,6 +257,7 @@ impl Agent {
                 &layout,
                 &renamed_snapshots,
             );
+            self.rewrite_source_records_after_compaction(chat.snapshot.id);
         }
         self.save(&candidate);
         chat.snapshot = candidate;
