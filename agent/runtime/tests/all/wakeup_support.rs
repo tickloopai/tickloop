@@ -25,13 +25,15 @@ pub(crate) const WAIT: Duration = Duration::from_secs(10);
 pub(crate) const SETTLE: Duration = Duration::from_millis(500);
 /// A prompt containing `HOLD:<key>` holds its turn until the test releases `key`.
 const HOLD: &str = "HOLD:";
+/// What closes a turn interrupted before it was answered, ahead of the next prompt.
+const INTERRUPTED_MARKER: &str = "[Request interrupted by user]";
 /// The key of the turn [`hold_a_turn`] holds.
 const HELD_TURN: &str = "turn";
 /// A prompt containing it starts a background Subagent whose task holds it under `child`.
 pub(crate) const SPAWN_HELD_CHILD: &str = "SPAWN a held child";
 pub(crate) const HELD_CHILD: &str = "child";
 
-/// Answers every turn at once, except a turn its prompt holds, which waits for its key to be
+/// Answers every turn at once, except a turn its own prompt holds, which waits for its key to be
 /// released, and a turn asked to start a held child, which calls Subagent for it.
 #[derive(Default)]
 pub(crate) struct ContractModel {
@@ -217,6 +219,8 @@ impl ModelClient for ContractModel {
                 .any(|content| matches!(content, Content::ToolResult { .. }))
         });
         let prompt = last_user_text(&request).unwrap_or_default();
+        // The turn's own prompt follows what an interrupted turn left unanswered before it.
+        let held = hold_key(prompt.rsplit(INTERRUPTED_MARKER).next().unwrap_or_default());
         self.requests.lock().unwrap().push(request);
         if is_turn && !answers_a_tool && prompt.contains(SPAWN_HELD_CHILD) {
             return Ok(ModelOutput {
@@ -236,7 +240,7 @@ impl ModelClient for ContractModel {
         }
         if is_turn
             && !answers_a_tool
-            && let Some(key) = hold_key(&prompt)
+            && let Some(key) = held
         {
             self.entered.lock().unwrap().push(key.clone());
             self.changed.notify_waiters();

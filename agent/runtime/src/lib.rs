@@ -108,6 +108,9 @@ mod tick_subscriptions;
 mod tick_trim;
 mod turn;
 mod wakeup;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use wakeup::trigger_pauses;
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{
@@ -530,9 +533,9 @@ struct SubmissionOptions {
     denial_reference: Option<DenialReference>,
     /// Set only by [`Agent::deliver_trigger`], the wake-up base's one entry.
     trigger_source: Option<TriggerSource>,
-    /// The lease holding the delivery was let in under; it must still stand when the delivery is
-    /// accepted.
-    trigger_lease: Option<loop_lease::LeaseHolding>,
+    /// The lease holding the delivery was let in under, which must still stand when it is
+    /// accepted, and the Chat's Trigger boundary it is accepted within, left once it is.
+    trigger_lease: Option<(loop_lease::LeaseHolding, loop_lease::TriggerBoundary)>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -2617,7 +2620,10 @@ impl Agent {
         {
             return Err(AgentError::ImageInputUnsupported);
         }
-        if trigger_lease.is_some_and(|holding| !self.inner.chat_leases.stands(chat_id, holding)) {
+        if trigger_lease
+            .as_ref()
+            .is_some_and(|(holding, _)| !self.inner.chat_leases.stands(chat_id, *holding))
+        {
             return Err(AgentError::Invalid(
                 "this Chat's Trigger lease changed hands; the delivery waits with its source"
                     .into(),
@@ -2716,6 +2722,8 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        // Accepted: the run it may start enters the boundary again to take it.
+        drop(trigger_lease);
         if let Some(parent) = task_delegation {
             self.bind_task_delegate(&parent, &receipt)
                 .await
@@ -3715,55 +3723,86 @@ impl Agent {
                     return Ok(Some((receipt, request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
-                    let source = pending
-                        .trigger_source
-                        .as_ref()
-                        .expect("only Trigger input is validated");
-                    // Queued Trigger input starts only under the Chat's lease and while no
-                    // other process paused receiving; otherwise it waits.
-                    let holding = match Box::pin(self.acquire_trigger_permit(chat_id)).await {
-                        loop_lease::TriggerPermit::Fire(holding) => holding,
-                        loop_lease::TriggerPermit::Wait(_)
-                        | loop_lease::TriggerPermit::Withdrawn => {
-                            return Ok(None);
-                        }
-                        loop_lease::TriggerPermit::Failed(_) => {
-                            self.retry_waiting_trigger_input(chat_id);
-                            return Ok(None);
-                        }
-                    };
-                    // Boxed: proving a source must not enlarge every run's shared async stack.
-                    let validation =
-                        Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
-                    if validation.is_ok() {
-                        if let Ok(mut chats) = self.inner.chats.try_lock() {
-                            // The lease the permit was given under still stands as the input
-                            // starts.
-                            if !self.inner.chat_leases.stands(chat_id, holding) {
-                                return Ok(None);
-                            }
-                            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-                            match self.select_next_run(chat, Some(&pending))? {
-                                RunAdmission::Idle => return Ok(None),
-                                RunAdmission::Ready(receipt, request, cancel) => {
-                                    return Ok(Some((receipt, request, cancel)));
-                                }
-                                RunAdmission::ValidateTrigger(_) => {}
-                            }
-                        }
-                    } else {
-                        let mut chats = self.inner.chats.lock().await;
-                        if let Some(chat) = chats.get_mut(&chat_id) {
-                            self.withdraw_trigger_input(
-                                chat,
-                                &pending.receipt,
-                                DiscardReason::SourceEnded,
-                            );
-                            self.withdraw_ended_inputs(chat);
-                            self.save(&chat.snapshot);
-                        }
+                    if let Some(taken) =
+                        Box::pin(self.take_trigger_input(chat_id, &pending)).await?
+                    {
+                        return Ok(taken);
                     }
                 }
+            }
+        }
+    }
+
+    /// Takes the queued Trigger input `pending` within the Chat's Trigger boundary: under the
+    /// Chat's lease, while no other process paused receiving, once its source proved it again;
+    /// its start is recorded durably before the boundary is left. `Some(None)` when nothing
+    /// starts, as it waits or is withdrawn; `None` to look at the queue again.
+    async fn take_trigger_input(
+        &self,
+        chat_id: ChatId,
+        pending: &PendingInput,
+    ) -> Result<Option<Option<(Receipt, ModelRequest, CancellationToken)>>, AgentError> {
+        let source = pending
+            .trigger_source
+            .as_ref()
+            .expect("only Trigger input is validated");
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let holding = match self.acquire_trigger_permit(chat_id, &boundary).await {
+            loop_lease::TriggerPermit::Fire(holding) => holding,
+            loop_lease::TriggerPermit::Failed(_) => {
+                self.retry_waiting_trigger_input(chat_id);
+                return Ok(Some(None));
+            }
+            loop_lease::TriggerPermit::Wait { .. } | loop_lease::TriggerPermit::Withdrawn => {
+                return Ok(Some(None));
+            }
+        };
+        // Boxed: proving a source must not enlarge every run's shared async stack.
+        let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if validation.is_err() {
+            self.withdraw_trigger_input(chat, &pending.receipt, DiscardReason::SourceEnded);
+            self.withdraw_ended_inputs(chat);
+            self.save(&chat.snapshot);
+            return Ok(None);
+        }
+        // Within the boundary nothing releases the lease, but the input waits rather than
+        // start under a holding that is gone.
+        if !self.inner.chat_leases.stands(chat_id, holding) {
+            return Ok(Some(None));
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        let chat = {
+            drop(chats);
+            self.pause_point(chat_id, wakeup::trigger_pauses::PausePoint::TriggerChecked)
+                .await;
+            chats = self.inner.chats.lock().await;
+            chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?
+        };
+        match self.select_next_run(chat, Some(pending))? {
+            RunAdmission::Idle => Ok(Some(None)),
+            RunAdmission::ValidateTrigger(_) => Ok(None),
+            RunAdmission::Ready(receipt, request, cancel) => {
+                // Another process taking the lease over after this boundary finds it started.
+                if let Some(chat) = chats.get(&chat_id)
+                    && let Err(error) = self
+                        .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                        .await
+                {
+                    self.inner.chat_leases.set_notice(
+                        chat_id,
+                        tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                        format!(
+                            "the start of a Trigger input could not be recorded durably \
+                             ({error}); another Tickloop process taking this Chat over may \
+                             run it again"
+                        ),
+                    );
+                }
+                drop(chats);
+                drop(boundary);
+                Ok(Some(Some((receipt, request, cancel))))
             }
         }
     }

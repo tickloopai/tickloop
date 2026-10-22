@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tickloop_agent_protocol::LoopTriggerNoticeKind;
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_runtime::trigger_pauses::PausePoint;
 use tickloop_agent_test_support::config;
 use tickloop_agent_test_support::shell_ticks::ShellTick;
 use tickloop_agent_test_support::transcripts::FaultyTranscriptStore;
@@ -704,61 +705,142 @@ async fn an_accepted_tick_update_runs_after_a_crash_through_the_new_watch() {
     restarted.shutdown().await;
 }
 
-/// A takeover whose holding was released while it read the store keeps nothing of what it read:
-/// stopped here, taken over and run elsewhere, then continued here, this process does not run
-/// what it read as waiting.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_takeover_released_while_it_read_gives_no_permit() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("state");
-    let model = ContractModel::new();
-    let here = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    let chat = here.create_chat(directory.path().into()).await.unwrap();
-    complete_turn(&here, chat, "get ready").await;
-    here.flush_transcripts().await;
-    let elsewhere_model = ContractModel::new();
-    let elsewhere = Agent::open_embedded(root.clone(), config(), elsewhere_model.clone()).unwrap();
-    elsewhere.resume_chat(chat).await.unwrap();
-    complete_turn(&elsewhere, chat, "resume elsewhere").await;
+/// Two processes holding a Chat, one of which has Trigger input waiting behind a turn.
+struct WaitingInput {
+    _directory: tempfile::TempDir,
+    root: std::path::PathBuf,
+    chat: Uuid,
+    here: Agent,
+    model: Arc<ContractModel>,
+    elsewhere: Agent,
+    elsewhere_model: Arc<ContractModel>,
+}
 
-    hold_a_turn(&here, chat, &model).await;
-    here.deliver_trigger_for_tests(chat, scheduled("task", 1), "waits-behind-the-turn")
+impl WaitingInput {
+    const MARKER: &str = "waits-behind-the-turn";
+
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let model = ContractModel::new();
+        let here = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+        let chat = here.create_chat(directory.path().into()).await.unwrap();
+        complete_turn(&here, chat, "get ready").await;
+        here.flush_transcripts().await;
+        let elsewhere_model = ContractModel::new();
+        let elsewhere =
+            Agent::open_embedded(root.clone(), config(), elsewhere_model.clone()).unwrap();
+        elsewhere.resume_chat(chat).await.unwrap();
+        complete_turn(&elsewhere, chat, "resume elsewhere").await;
+        hold_a_turn(&here, chat, &model).await;
+        here.deliver_trigger_for_tests(chat, scheduled("task", 1), Self::MARKER)
+            .await
+            .unwrap();
+        here.flush_transcripts().await;
+        Self {
+            _directory: directory,
+            root,
+            chat,
+            here,
+            model,
+            elsewhere,
+            elsewhere_model,
+        }
+    }
+
+    /// The other process learns of a pause, is continued by its user and asks for the lease;
+    /// it may get it or not.
+    async fn continue_elsewhere(&self) {
+        let _ = self
+            .elsewhere
+            .deliver_trigger_for_tests(self.chat, scheduled("other", 1), "delivered-elsewhere")
+            .await;
+        complete_turn(&self.elsewhere, self.chat, "continue elsewhere").await;
+        let _ = self
+            .elsewhere
+            .deliver_trigger_for_tests(self.chat, scheduled("other", 1), "delivered-elsewhere")
+            .await;
+    }
+
+    /// The waiting input ran in one of the two processes, and in only one, once.
+    async fn ran_once(self) {
+        tokio::time::timeout(WAIT, async {
+            while self.model.seen(Self::MARKER) + self.elsewhere_model.seen(Self::MARKER) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
         .await
-        .unwrap();
-    here.flush_transcripts().await;
+        .expect("the waiting input runs");
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            self.model.seen(Self::MARKER) + self.elsewhere_model.seen(Self::MARKER),
+            1,
+            "here: {:?} elsewhere: {:?}",
+            self.model.prompts(),
+            self.elsewhere_model.prompts()
+        );
+        self.elsewhere.shutdown().await;
+        self.here.shutdown().await;
+    }
+}
+
+/// A takeover that read the store before a `/stop` here and a takeover elsewhere: the stop
+/// waits for it, and the waiting input runs once, wherever it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
     // The next permit here takes the lease anew, reads the store and stops before applying it.
-    take_the_lease_away(&root);
-    let pause = here.pause_next_takeover_for_tests(chat);
-    model.release_held_turn();
-    tokio::time::timeout(WAIT, pause.entered)
+    take_the_lease_away(&setup.root);
+    let takeover = here.pause_next_for_tests(chat, PausePoint::TakeoverRead);
+    setup.model.release_held_turn();
+    tokio::time::timeout(WAIT, takeover.entered)
         .await
         .expect("the takeover read the store")
         .unwrap();
 
-    here.stop(chat).await.unwrap();
-    // Elsewhere learns of the stop, is continued by its user and takes the lease over.
-    let _ = elsewhere
-        .deliver_trigger_for_tests(chat, scheduled("other", 1), "delivered-elsewhere")
-        .await;
-    complete_turn(&elsewhere, chat, "continue elsewhere").await;
-    elsewhere
-        .deliver_trigger_for_tests(chat, scheduled("other", 1), "delivered-elsewhere")
-        .await
-        .unwrap();
-    elsewhere_model.wait_seen("waits-behind-the-turn", 1).await;
-
-    complete_turn(&here, chat, "continue here").await;
-    drop(pause.release);
+    let stop = tokio::spawn({
+        let here = here.clone();
+        async move { here.stop(chat).await.unwrap() }
+    });
     tokio::time::sleep(SETTLE).await;
-    assert_eq!(
-        model.seen("waits-behind-the-turn"),
-        0,
-        "{:?}",
-        model.prompts()
-    );
-    assert_eq!(elsewhere_model.seen("waits-behind-the-turn"), 1);
-    elsewhere.shutdown().await;
-    here.shutdown().await;
+    drop(takeover.release);
+    stop.await.unwrap();
+    setup.continue_elsewhere().await;
+    complete_turn(&here, chat, "continue here").await;
+    setup.ran_once().await;
+}
+
+/// Taking queued Trigger input and a pause's release of its holding do not interleave: an old
+/// `/stop` finishing after a Continue, while the input here passed its checks, and a takeover
+/// elsewhere run the waiting input once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let stop_tail = here.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
+    let mut checked = here.pause_next_for_tests(chat, PausePoint::TriggerChecked);
+    let stop = tokio::spawn({
+        let here = here.clone();
+        async move { here.stop(chat).await.unwrap() }
+    });
+    tokio::time::timeout(WAIT, stop_tail.entered)
+        .await
+        .expect("the stop recorded the pause")
+        .unwrap();
+    // Continued here while the stop has not released its holding.
+    let continued = tokio::spawn({
+        let here = here.clone();
+        async move { here.submit(chat, "continue here".into()).await.unwrap() }
+    });
+    // Without one boundary, the waiting input passes its checks here now.
+    let _ = tokio::time::timeout(SETTLE, &mut checked.entered).await;
+    drop(stop_tail.release);
+    stop.await.unwrap();
+    setup.continue_elsewhere().await;
+    drop(checked.release);
+    continued.await.unwrap();
+    setup.ran_once().await;
 }
 
 /// Trigger input waiting on a takeover that could not read the store runs once the store can be

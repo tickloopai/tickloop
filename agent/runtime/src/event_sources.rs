@@ -645,12 +645,14 @@ impl Agent {
         if sources.is_empty() {
             return EventPollOutcome::Stop;
         }
-        match self.acquire_trigger_permit(chat_id).await {
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        match self.acquire_trigger_permit(chat_id, &boundary).await {
             super::loop_lease::TriggerPermit::Fire(_) => {}
             super::loop_lease::TriggerPermit::Withdrawn => return EventPollOutcome::Stop,
-            super::loop_lease::TriggerPermit::Wait(_)
+            super::loop_lease::TriggerPermit::Wait { .. }
             | super::loop_lease::TriggerPermit::Failed(_) => return EventPollOutcome::Skipped,
         }
+        drop(boundary);
         let Ok(client) = artifact_client(self) else {
             return EventPollOutcome::Stop;
         };
@@ -1428,23 +1430,31 @@ mod feedback_admission_tests {
         second.resume_chat(chat_id).await.unwrap();
         assert!(
             matches!(
-                second.acquire_trigger_permit(chat_id).await,
-                super::super::loop_lease::TriggerPermit::Wait(_)
+                second
+                    .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                    .await,
+                super::super::loop_lease::TriggerPermit::Wait { .. }
             ),
             "a loaded Chat pauses receiving"
         );
         second.continue_loop(chat_id).await.unwrap();
         assert!(matches!(
-            first.acquire_trigger_permit(chat_id).await,
+            first
+                .acquire_trigger_permit(chat_id, &first.enter_trigger_boundary(chat_id).await)
+                .await,
             super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         assert!(matches!(
-            second.acquire_trigger_permit(chat_id).await,
-            super::super::loop_lease::TriggerPermit::Wait(_)
+            second
+                .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                .await,
+            super::super::loop_lease::TriggerPermit::Wait { .. }
         ));
         first.shutdown().await;
         assert!(matches!(
-            second.acquire_trigger_permit(chat_id).await,
+            second
+                .acquire_trigger_permit(chat_id, &second.enter_trigger_boundary(chat_id).await)
+                .await,
             super::super::loop_lease::TriggerPermit::Fire(_)
         ));
         second.shutdown().await;

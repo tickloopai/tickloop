@@ -2117,15 +2117,18 @@ impl Agent {
             items.push(item);
         }
         // What was delivered is known only under the lease, once what another process holding it
-        // delivered is taken over: the items are sorted out and batched after that.
-        match self.acquire_trigger_permit(chat_id).await {
+        // delivered is taken over: the items are sorted out and batched after that. The entry
+        // holds back a batch that a later takeover finds delivered.
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        match self.acquire_trigger_permit(chat_id, &boundary).await {
             TriggerPermit::Fire(_) => {}
-            TriggerPermit::Wait(_) | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
+            TriggerPermit::Wait { .. } | TriggerPermit::Withdrawn | TriggerPermit::Failed(_) => {
                 self.tick_deliveries().restore(owner, items);
                 self.inner.tick_wake.notify_one();
                 return;
             }
         }
+        drop(boundary);
         {
             let mut deliveries = self.tick_deliveries();
             let (fresh, delivered): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
