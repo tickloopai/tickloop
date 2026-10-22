@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tickloop_agent_model::{ModelOutput, ModelRequest, StructuredOutput};
-use tickloop_agent_protocol::{ChatSnapshot, Content, GoalVerdict, Message, Role};
+use tickloop_agent_protocol::{ChatSnapshot, Content, GoalVerdict, LocalMessage, Message, Role};
 
 pub(crate) const CHECK_RESULT_NAME: &str = "goal_check_result";
 const CHECK_SYSTEM_PROMPT: &str = include_str!("templates/completion_check.md");
@@ -97,22 +97,26 @@ enum ReplyVerdict {
 }
 
 /// The Chat's conversation as check evidence: user and Agent text, tool calls and their text
-/// results. Only a prompt the user submitted counts as the user's; whatever else entered as a
-/// user message is host input. Reasoning, images and provider data are not evidence the check
+/// results. Only a prompt the user submitted counts as the user's, recognized by its recorded
+/// execution mode and never by its wording; whatever else entered as a user message is host
+/// input. Reasoning, images and provider data are not evidence the check
 /// can weigh.
 pub(crate) fn conversation_evidence(snapshot: &ChatSnapshot) -> Vec<EvidenceEntry> {
     let mut tool_names = HashMap::<&str, &str>::new();
     let mut entries = Vec::new();
     for (index, message) in snapshot.messages.iter().enumerate() {
-        let is_users_prompt = snapshot
-            .message_ids
-            .get(&index)
-            .is_some_and(|id| !snapshot.agent_message_origins.contains_key(id));
+        // A prompt the user submitted carries its execution mode, which the Transcript keeps
+        // with it; Trigger input, notifications, deliveries and steering never do.
+        let is_users_prompt = snapshot.prompt_execution_modes.contains_key(&index)
+            && !snapshot
+                .message_ids
+                .get(&index)
+                .is_some_and(|id| snapshot.agent_message_origins.contains_key(id));
         for content in &message.content {
             match content {
                 Content::Text { text } if text.trim().is_empty() => {}
                 Content::Text { text } => match message.role {
-                    Role::User if is_users_prompt => {
+                    Role::User if is_users_prompt && LocalMessage::parse(text).is_none() => {
                         entries.push(EvidenceEntry::User { text: text.clone() })
                     }
                     Role::User => entries.push(EvidenceEntry::HostInput { text: text.clone() }),
