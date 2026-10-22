@@ -433,32 +433,84 @@ impl Agent {
         }
     }
 
-    /// Takes in what another process delivered to the Chat while it held the lease: the ledger
-    /// records it wrote, so a delivery it already took is replayed rather than run again, and
-    /// queued input here that it already ran is dropped; and the Tick watermarks it advanced.
-    pub(super) async fn catch_up_with_store(&self, chat_id: ChatId) {
-        let Ok(lines) = self.read_stored_lines(chat_id).await else {
-            return;
-        };
-        {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&chat_id) else {
-                return;
-            };
-            let ran_elsewhere = chat.bookkeeping.lifecycle.learn_inputs(&lines);
-            if !ran_elsewhere.is_empty() {
-                chat.snapshot
-                    .pending_inputs
-                    .retain(|pending| !ran_elsewhere.contains(&pending.receipt.run_id));
-                if chat.snapshot.pending_inputs.is_empty()
-                    && chat.snapshot.chat_loop.state == LoopState::Queued
-                {
-                    chat.snapshot.chat_loop.set_state(LoopState::Idle);
-                }
-                self.save(&chat.snapshot);
-            }
+    /// The Chat's Trigger state as a load would build it from the store, taken over under a
+    /// newly held lease: the ledger's Trigger records, the Trigger input that waits, and the
+    /// Tick sequences delivered. What another process accepted, ran or settled while it held the
+    /// lease is known here as it is there. The user's input and Agent messages are this
+    /// process's own and stay as they are.
+    pub(super) async fn reload_trigger_state(&self, chat_id: ChatId) -> Result<(), String> {
+        // Nothing of the Chat is stored yet, so no other process took anything of it.
+        if !self.transcript_materialized(chat_id) {
+            return Ok(());
         }
-        self.refresh_tick_watermarks(chat_id).await;
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or("the Chat is no longer loaded")?;
+            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await?;
+        }
+        let lines = match self.read_stored_lines(chat_id).await {
+            Ok(lines) => lines,
+            Err(AgentError::NotFound) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let (delivered, takes_waiting_input) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&chat_id)
+                .ok_or("the Chat is no longer loaded")?;
+            chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
+            let lifecycle = &chat.bookkeeping.lifecycle;
+            let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut chat.snapshot.pending_inputs)
+                    .into_iter()
+                    .partition(|pending| {
+                        pending.trigger_source.is_none()
+                            || lifecycle.waits_to_start(pending.receipt.run_id)
+                    });
+            chat.snapshot.pending_inputs = kept;
+            for pending in &taken_elsewhere {
+                chat.feedback_inputs.remove(&pending.receipt.run_id);
+                self.inner
+                    .host_contexts
+                    .lock()
+                    .unwrap()
+                    .runs
+                    .remove(&pending.receipt.run_id);
+            }
+            self.requeue_inputs(chat, durable_queue::is_trigger_input);
+            if chat.snapshot.pending_inputs.is_empty()
+                && chat.snapshot.chat_loop.state == LoopState::Queued
+            {
+                chat.snapshot.chat_loop.set_state(LoopState::Idle);
+            }
+            self.save(&chat.snapshot);
+            let takes_waiting_input = chat.active.is_none()
+                && chat
+                    .snapshot
+                    .pending_inputs
+                    .iter()
+                    .any(|pending| pending.trigger_source.is_some());
+            (
+                chat.bookkeeping.lifecycle.delivered_tick_sequences(),
+                takes_waiting_input,
+            )
+        };
+        self.refresh_tick_watermarks(chat_id, delivered).await;
+        if takes_waiting_input {
+            self.inner
+                .tasks
+                .spawn(self.clone().start_waiting_input(chat_id));
+        }
+        Ok(())
+    }
+
+    /// Starts what waits in an idle Loop. Its future is named, not inferred: starting a run asks
+    /// for the lease, whose taking over may start this again.
+    fn start_waiting_input(self, chat_id: ChatId) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = self.start_next_agent_run(chat_id).await;
+        })
     }
 
     /// The pause another process recorded: this process pauses too, without recording it again.

@@ -188,10 +188,11 @@ impl TranscriptStore for InMemoryTranscriptStore {
     }
 }
 
-/// Wraps a store and makes its appends fail on request.
+/// Wraps a store and makes its appends fail, or its loads wait, on request.
 pub struct FaultyTranscriptStore {
     inner: Arc<dyn TranscriptStore>,
     faults: Mutex<Faults>,
+    loads_released: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -202,6 +203,8 @@ struct Faults {
     appends: usize,
     registrations: usize,
     batches: Vec<BatchId>,
+    holds_loads: bool,
+    waiting_loads: usize,
 }
 
 impl FaultyTranscriptStore {
@@ -209,7 +212,23 @@ impl FaultyTranscriptStore {
         Self {
             inner,
             faults: Mutex::default(),
+            loads_released: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Every later load waits until `release_loads`.
+    pub fn hold_loads(&self) {
+        self.faults.lock().unwrap().holds_loads = true;
+    }
+
+    pub fn release_loads(&self) {
+        self.faults.lock().unwrap().holds_loads = false;
+        self.loads_released.notify_waiters();
+    }
+
+    /// How many loads wait for `release_loads`.
+    pub fn waiting_loads(&self) -> usize {
+        self.faults.lock().unwrap().waiting_loads
     }
 
     /// The next append commits, then reports a storage error.
@@ -290,6 +309,20 @@ impl TranscriptStore for FaultyTranscriptStore {
         chat: ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
+        loop {
+            let released = self.loads_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            {
+                let mut faults = self.faults.lock().unwrap();
+                if !faults.holds_loads {
+                    break;
+                }
+                faults.waiting_loads += 1;
+            }
+            released.await;
+            self.faults.lock().unwrap().waiting_loads -= 1;
+        }
         self.inner.load(chat, range).await
     }
 

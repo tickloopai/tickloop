@@ -2578,6 +2578,15 @@ impl Agent {
         Ok(())
     }
 
+    /// Whether the store holds anything of the Chat yet: a process host records nothing ahead of
+    /// its conversation.
+    pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {
+        self.inner
+            .recorder
+            .as_ref()
+            .is_some_and(|recorder| recorder.outbox.is_materialized(chat_id))
+    }
+
     pub(super) async fn checkpoint_transcript(
         &self,
         snapshot: &ChatSnapshot,

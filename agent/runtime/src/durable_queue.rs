@@ -9,7 +9,7 @@ use tickloop_agent_transcript::{
 
 use super::{Agent, Chat, LoopSnapshotExt, WaitHosting, event_sources, turn};
 
-fn is_trigger_input(pending: &PendingInput) -> bool {
+pub(super) fn is_trigger_input(pending: &PendingInput) -> bool {
     pending.trigger_source.is_some()
 }
 
@@ -141,7 +141,7 @@ impl Agent {
 
     /// Queues again the inputs accepted and not started that `requeued` selects, behind the
     /// continuations, in the order they were queued, each to the Chat's Loop.
-    fn requeue_inputs(&self, chat: &mut Chat, requeued: impl Fn(&PendingInput) -> bool) {
+    pub(super) fn requeue_inputs(&self, chat: &mut Chat, requeued: impl Fn(&PendingInput) -> bool) {
         for mut pending in chat
             .bookkeeping
             .lifecycle

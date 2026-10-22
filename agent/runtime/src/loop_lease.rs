@@ -23,6 +23,11 @@
 //! 开关（暂停接收、停止 Artifact 监听、归还租约）且不送达。仅删除锁文件的旧做法会让另一实例接手
 //! 后继续送达。
 //!
+//! **接手**：每次新取得租约都先从存储整份重建该 Chat 的 Trigger 状态（账本中的 Trigger 记录、
+//! 等待执行的 Trigger 输入、Tick 已送达的序号），完成之前同一 Chat 的所有送达与取用都在同一道
+//! 屏障上等待；重建失败时不送达，下一次送达重试。上一个持有者在租约期间送达、执行或结算的内容
+//! 因此和一次干净装载看到的一致。用户输入与 Agent 消息不需要租约，属于各自的进程，不随接手改变。
+//!
 //! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
 //! 恢复，不使用租约与接收状态。
@@ -32,7 +37,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -112,10 +117,11 @@ enum LeaseAttempt {
 
 /// 持有租约后读取接收状态得到的结论。
 enum LeaseCheck {
-    /// Held; `acquired` when this check took it, so another process may have delivered to the
-    /// Chat since this one last held it.
+    /// Held as the holding `epoch`; until `synced`, this process has not taken over what another
+    /// process delivered to the Chat while it held the lease.
     Held {
-        acquired: bool,
+        epoch: u64,
+        synced: bool,
     },
     HeldElsewhere,
     ForeignHost(String),
@@ -132,10 +138,21 @@ pub(super) enum TriggerPermit {
     Failed(String),
 }
 
+/// One holding of a Chat's lease. Taken, it is not synced: no Trigger is accepted or started
+/// under it until the Chat's Trigger state is taken over from the store.
+struct HeldLease {
+    lease: ChatLease,
+    epoch: u64,
+    synced: bool,
+}
+
 /// 本进程持有的全部租约、已知的接收状态 generation 与待显示的提示，都按 Chat。
 #[derive(Default)]
 pub(super) struct ChatLeases {
-    held: Mutex<HashMap<ChatId, ChatLease>>,
+    held: Mutex<HashMap<ChatId, HeldLease>>,
+    epochs: std::sync::atomic::AtomicU64,
+    /// One taking-over at a time per Chat; every permit waits for it.
+    sync_gates: Mutex<HashMap<ChatId, Arc<tokio::sync::Mutex<()>>>>,
     known_generations: Mutex<HashMap<ChatId, u64>>,
     notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
 }
@@ -145,34 +162,72 @@ impl ChatLeases {
     /// 因为自己的 flock 而误判为被其他进程持有。
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
-        let mut acquired = false;
-        {
+        let (epoch, synced) = {
             let mut held = self.held.lock().unwrap();
             // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
             if held
                 .get(&key)
-                .is_some_and(|lease| !lease.is_still_at_path())
+                .is_some_and(|holding| !holding.lease.is_still_at_path())
             {
                 held.remove(&key);
             }
-            if let std::collections::hash_map::Entry::Vacant(vacant) = held.entry(key) {
-                match try_acquire(directory, chat_id)? {
-                    LeaseAttempt::Acquired(lease) => {
-                        vacant.insert(lease);
-                        acquired = true;
+            let holding = match held.entry(key) {
+                std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    match try_acquire(directory, chat_id)? {
+                        LeaseAttempt::Acquired(lease) => vacant.insert(HeldLease {
+                            lease,
+                            epoch: self
+                                .epochs
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            synced: false,
+                        }),
+                        LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
+                        LeaseAttempt::ForeignHost(host) => {
+                            return Ok(LeaseCheck::ForeignHost(host));
+                        }
                     }
-                    LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
-                    LeaseAttempt::ForeignHost(host) => return Ok(LeaseCheck::ForeignHost(host)),
                 }
-            }
-        }
+            };
+            (holding.epoch, holding.synced)
+        };
         let known = self.known_generation(key);
         Ok(match read_receiving(directory)? {
             Some(state) if !state.receiving && state.generation > known => {
                 LeaseCheck::PausedElsewhere(state.generation)
             }
-            Some(_) | None => LeaseCheck::Held { acquired },
+            Some(_) | None => LeaseCheck::Held { epoch, synced },
         })
+    }
+
+    fn is_synced(&self, chat_id: ChatId, epoch: u64) -> bool {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .is_some_and(|holding| holding.epoch == epoch && holding.synced)
+    }
+
+    /// The holding `epoch` took the Chat's Trigger state over; a later holding takes it again.
+    fn mark_synced(&self, chat_id: ChatId, epoch: u64) {
+        if let Some(holding) = self
+            .held
+            .lock()
+            .unwrap()
+            .get_mut(&chat_id)
+            .filter(|holding| holding.epoch == epoch)
+        {
+            holding.synced = true;
+        }
+    }
+
+    fn sync_gate(&self, chat_id: ChatId) -> Arc<tokio::sync::Mutex<()>> {
+        self.sync_gates
+            .lock()
+            .unwrap()
+            .entry(chat_id)
+            .or_default()
+            .clone()
     }
 
     fn known_generation(&self, key: ChatId) -> u64 {
@@ -419,10 +474,14 @@ impl Agent {
                 self.pause_receiving_paused_elsewhere(chat_id).await;
                 TriggerPermit::Withdrawn
             }
-            Ok(LeaseCheck::Held { acquired }) => {
-                // Whatever another process delivered while it held the lease is in the store.
-                if acquired {
-                    self.catch_up_with_store(chat_id).await;
+            Ok(LeaseCheck::Held { epoch, synced }) => {
+                if !synced && let Err(error) = self.take_trigger_state_over(chat_id, epoch).await {
+                    let message = format!(
+                        "could not take over this Chat's Trigger state from its Transcript: \
+                         {error}; no Trigger is delivered until it can"
+                    );
+                    leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
+                    return TriggerPermit::Failed(message);
                 }
                 let is_receiving = self
                     .inner
@@ -439,6 +498,21 @@ impl Agent {
                 TriggerPermit::Fire
             }
         }
+    }
+
+    /// Under a newly taken lease, before anything is accepted or started under it: the Chat's
+    /// Trigger state rebuilt from the store, once for the holding however many permits ask for
+    /// it at the same time. A failure leaves the holding not synced, to be tried again.
+    async fn take_trigger_state_over(&self, chat_id: ChatId, epoch: u64) -> Result<(), String> {
+        let leases = &self.inner.chat_leases;
+        let gate = leases.sync_gate(chat_id);
+        let _taking_over = gate.lock().await;
+        if leases.is_synced(chat_id, epoch) {
+            return Ok(());
+        }
+        self.reload_trigger_state(chat_id).await?;
+        leases.mark_synced(chat_id, epoch);
+        Ok(())
     }
 
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的

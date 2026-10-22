@@ -2225,9 +2225,15 @@ impl Agent {
         }
     }
 
-    /// Reads again the watermarks of the Chat's subscriptions, which another process holding
-    /// the Chat's lease may have advanced: an update at or before them is not delivered again.
-    pub(super) async fn refresh_tick_watermarks(&self, chat_id: ChatId) {
+    /// The Chat's subscriptions delivered up to the newest of what this process knows, their
+    /// watermarks, which another process holding the Chat's lease may have advanced, and the
+    /// sequences `in_ledger` the ledger holds: an update at or before them is not delivered
+    /// again.
+    pub(super) async fn refresh_tick_watermarks(
+        &self,
+        chat_id: ChatId,
+        in_ledger: HashMap<Uuid, (u64, Uuid)>,
+    ) {
         let stored: Vec<_> = self
             .tick_deliveries()
             .subscriptions
@@ -2235,10 +2241,7 @@ impl Agent {
             .filter(|(_, runtime)| runtime.chat_id == chat_id)
             .filter_map(|(id, runtime)| Some((*id, runtime.watermarks.clone()?)))
             .collect();
-        if stored.is_empty() {
-            return;
-        }
-        let read = tokio::task::spawn_blocking(move || {
+        let mut read = tokio::task::spawn_blocking(move || {
             stored
                 .into_iter()
                 .filter_map(|(subscription, directory)| {
@@ -2251,6 +2254,13 @@ impl Agent {
         })
         .await
         .unwrap_or_default();
+        read.extend(
+            in_ledger
+                .into_iter()
+                .map(|(subscription, (sequence, delivery))| {
+                    (subscription, DeliveredWatermark { sequence, delivery })
+                }),
+        );
         let mut deliveries = self.tick_deliveries();
         for (subscription, mark) in read {
             if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription)

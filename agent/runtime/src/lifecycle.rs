@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
 use tickloop_agent_base::timestamp::format_timestamp;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, EventKind, InputId, PendingInput, Receipt, ResponseId, RunId, Usage,
+    ChatId, ChatSnapshot, EventKind, InputId, PendingInput, Receipt, ResponseId, RunId,
+    TriggerIdentity, Usage,
 };
 use uuid::Uuid;
 
@@ -102,6 +103,15 @@ pub(crate) struct Lifecycle {
 
 fn now() -> String {
     format_timestamp(unix_time_milliseconds())
+}
+
+/// How far an input got: accepted, started, settled.
+fn progress(state: &InputState) -> u8 {
+    match state {
+        InputState::Accepted => 0,
+        InputState::Started => 1,
+        InputState::Settled { .. } => 2,
+    }
 }
 
 impl Lifecycle {
@@ -734,33 +744,42 @@ impl Lifecycle {
         })
     }
 
-    /// The ledger and answers stored records describe, the latest record of each id winning.
-    /// Takes in the input records another writer of the Chat's store added: inputs this ledger
-    /// does not know, and the newer record of an input it holds queued that the other writer
-    /// already started or settled, whose runs it returns. They keep revision 0: the store holds
-    /// them already, so no recorder writes them again.
-    pub(crate) fn learn_inputs<'a>(
-        &mut self,
-        lines: impl IntoIterator<Item = &'a Line>,
-    ) -> Vec<RunId> {
+    /// The store's latest record of each Trigger input in `lines`, in place of this ledger's,
+    /// as a load reads them: what another process accepted, started or settled is known here as
+    /// it is there. This ledger's record stays where it is further along, and where it started
+    /// here and the store only says another loader found it started and interrupted it, which
+    /// ran nothing. The adopted records keep revision 0: the store holds them already, so no
+    /// recorder writes them again.
+    pub(crate) fn adopt_trigger_records<'a>(&mut self, lines: impl IntoIterator<Item = &'a Line>) {
         let mut stored: HashMap<InputId, &InputEntry> = HashMap::new();
         for line in lines {
-            if let Line::Input(entry) = line {
+            if let Line::Input(entry) = line
+                && entry.trigger.is_some()
+            {
                 stored.insert(entry.input_id, entry);
             }
         }
-        let mut ran_elsewhere = Vec::new();
         for (id, entry) in stored {
-            match self.inputs.get(&id) {
-                None => {}
-                Some(known)
-                    if known.record.state == InputState::Accepted
-                        && entry.state != InputState::Accepted =>
+            if let Some(known) = self.inputs.get(&id) {
+                let interrupted_by_a_loader = known.record.state == InputState::Started
+                    && entry.state
+                        == (InputState::Settled {
+                            outcome: SettledOutcome::Interrupted {
+                                by: InterruptedBy::Host,
+                            },
+                        });
+                if known.record == *entry
+                    || interrupted_by_a_loader
+                    || progress(&known.record.state) > progress(&entry.state)
                 {
-                    ran_elsewhere.push(known.record.run_id);
+                    continue;
+                }
+                if self.open_inputs.get(&known.record.run_id) == Some(&id) {
                     self.open_inputs.remove(&known.record.run_id);
                 }
-                Some(_) => continue,
+            }
+            if entry.state == InputState::Accepted {
+                self.open_inputs.insert(entry.run_id, id);
             }
             self.inputs.insert(
                 id,
@@ -770,9 +789,41 @@ impl Lifecycle {
                 },
             );
         }
-        ran_elsewhere
     }
 
+    /// Whether the input of `run` is accepted and has not started.
+    pub(crate) fn waits_to_start(&self, run: RunId) -> bool {
+        self.open_inputs
+            .get(&run)
+            .and_then(|id| self.input(*id))
+            .is_some_and(|input| input.state == InputState::Accepted)
+    }
+
+    /// The newest sequence of each Tick Subscription the ledger's Tick Update records hold, and
+    /// the input holding it: every update the ledger accepted was delivered.
+    pub(crate) fn delivered_tick_sequences(&self) -> HashMap<Uuid, (u64, InputId)> {
+        let mut delivered: HashMap<Uuid, (u64, InputId)> = HashMap::new();
+        for input in self.inputs.values() {
+            let Some(TriggerRecord {
+                identity: TriggerIdentity::TickUpdate { updates },
+                ..
+            }) = &input.record.trigger
+            else {
+                continue;
+            };
+            for update in updates {
+                let newest = delivered
+                    .entry(update.subscription)
+                    .or_insert((update.sequence, input.record.input_id));
+                if update.sequence > newest.0 {
+                    *newest = (update.sequence, input.record.input_id);
+                }
+            }
+        }
+        delivered
+    }
+
+    /// The ledger and answers stored records describe, the latest record of each id winning.
     /// Inputs restore as they were: an input still open stays open for a continuation. A copy
     /// under a new Chat id keeps the answers but not the source Chat's ledger.
     pub(crate) fn restore<'a>(
