@@ -211,19 +211,10 @@ impl Agent {
                     Eligibility::Eligible
                 }
             }
-            // A run stands while its task was not cancelled; a one-shot or final run outlives
-            // its task.
-            TriggerSource::ScheduledTask { task_id, .. } => {
-                if snapshot
-                    .scheduled_task_revocations
-                    .iter()
-                    .any(|revocation| revocation.task_id == *task_id)
-                {
-                    Eligibility::Ended(DiscardReason::SourceEnded)
-                } else {
-                    Eligibility::Eligible
-                }
-            }
+            TriggerSource::ScheduledTask {
+                task_id,
+                scheduled_for_ms,
+            } => self.scheduled_run_eligibility(snapshot, task_id, *scheduled_for_ms),
         };
         match (source_condition, snapshot.chat_loop.receiving) {
             (Eligibility::Ended(reason), _) => Eligibility::Ended(reason),
@@ -261,6 +252,21 @@ impl Agent {
             Eligibility::Eligible => {}
             Eligibility::Hold(hold) => return Admission::Hold(hold),
             Eligibility::Ended(reason) => return Admission::Refuse(reason),
+        }
+        // What only a new delivery must still be: a scheduled run prepared before its task
+        // moved on, as a Continue moves it past the times missed while paused, is not taken.
+        let is_current = match source {
+            TriggerSource::ScheduledTask {
+                task_id,
+                scheduled_for_ms,
+            } => super::scheduled_tasks::is_current_run(&chat.snapshot, task_id, *scheduled_for_ms),
+            TriggerSource::TickUpdate { .. }
+            | TriggerSource::TickManual { .. }
+            | TriggerSource::ArtifactFeedback { .. }
+            | TriggerSource::GoalContinuation { .. } => true,
+        };
+        if !is_current {
+            return Admission::Refuse(DiscardReason::SourceEnded);
         }
         let carries_delivered = match source {
             TriggerSource::TickUpdate { items } => {
@@ -657,6 +663,14 @@ impl Agent {
         source: TriggerSource,
         input: &str,
     ) -> Result<Receipt, AgentError> {
+        if let TriggerSource::ScheduledTask {
+            task_id,
+            scheduled_for_ms,
+        } = &source
+        {
+            self.stand_in_scheduled_task(chat_id, task_id, *scheduled_for_ms)
+                .await;
+        }
         self.deliver_trigger(
             chat_id,
             TriggerDelivery {

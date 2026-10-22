@@ -214,6 +214,26 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
 }
 
 impl Agent {
+    /// Whether a run of `task_id` for `scheduled_for_ms` still stands: its task was not
+    /// cancelled. A one-shot or final run outlives its task.
+    pub(crate) fn scheduled_run_eligibility(
+        &self,
+        snapshot: &ChatSnapshot,
+        task_id: &str,
+        scheduled_for_ms: u64,
+    ) -> crate::wakeup::Eligibility {
+        let is_revoked = snapshot
+            .scheduled_task_revocations
+            .iter()
+            .any(|revocation| revocation.task_id == task_id);
+        let _ = scheduled_for_ms;
+        if is_revoked {
+            crate::wakeup::Eligibility::Ended(DiscardReason::SourceEnded)
+        } else {
+            crate::wakeup::Eligibility::Eligible
+        }
+    }
+
     pub(crate) fn scheduled_now(&self) -> DateTime<Utc> {
         self.inner.schedule_clock.now()
     }
@@ -223,6 +243,60 @@ impl Agent {
     #[doc(hidden)]
     pub fn set_scheduled_now_for_tests(&self, now: DateTime<Utc>) {
         *self.inner.schedule_clock.fixed_now.lock().unwrap() = Some(now);
+    }
+
+    /// Stands in a task for a scheduled run a test hands over by itself: unless the Chat has
+    /// the task or cancelled it, a recurring task with that id is due at the run's time and
+    /// does not time on its own, and the clock is pinned there unless a test pinned it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn stand_in_scheduled_task(
+        &self,
+        chat_id: ChatId,
+        task_id: &str,
+        scheduled_for_ms: u64,
+    ) {
+        {
+            let mut fixed = self.inner.schedule_clock.fixed_now.lock().unwrap();
+            if fixed.is_none() {
+                *fixed = i64::try_from(scheduled_for_ms)
+                    .ok()
+                    .and_then(DateTime::from_timestamp_millis);
+            }
+        }
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        let snapshot = &mut chat.snapshot;
+        let known = snapshot
+            .scheduled_tasks
+            .iter()
+            .any(|task| task.id == task_id)
+            || snapshot
+                .scheduled_task_revocations
+                .iter()
+                .any(|revocation| revocation.task_id == task_id);
+        if !known {
+            snapshot.scheduled_tasks.push(ScheduledTask {
+                id: task_id.to_owned(),
+                kind: ScheduledTaskKind::Recurring {
+                    cron: "* * * * *".into(),
+                },
+                prompt: String::new(),
+                creator: ScheduledTaskCreator::User,
+                time_zone: "UTC".into(),
+                confirmation: None,
+                created_at_ms: scheduled_for_ms,
+                expires_at_ms: None,
+                scheduled_for_ms: Some(scheduled_for_ms),
+                next_fire_at_ms: None,
+                jitter_ms: 0,
+                last_fired_at_ms: None,
+                last_scheduled_for_ms: None,
+                started_by_run: None,
+                skipped: 0,
+            });
+        }
     }
 
     /// Stops each later wake-up after the ledger of its runs is stored and before the tasks'
@@ -930,6 +1004,23 @@ fn unused_id(snapshot: &ChatSnapshot) -> String {
 /// How long a cancellation is remembered: past a recurring task's seven days and the day a run
 /// may wait, no run of the task can still come.
 const REVOCATION_MEMORY_MS: u64 = 8 * 24 * 60 * 60 * 1000;
+
+/// Whether a new run of `task_id` for `scheduled_for_ms` is the one its task comes due for:
+/// not older than the task's next scheduled time, which a Continue moves past the times missed
+/// while paused, and not of a task that is gone. A run already handed over is answered by its
+/// ledger record before this is asked.
+pub(crate) fn is_current_run(
+    snapshot: &ChatSnapshot,
+    task_id: &str,
+    scheduled_for_ms: u64,
+) -> bool {
+    snapshot.scheduled_tasks.iter().any(|task| {
+        task.id == task_id
+            && task
+                .scheduled_for_ms
+                .is_some_and(|next| scheduled_for_ms >= next)
+    })
+}
 
 /// Records that `cancelled` tasks were cancelled at `now`, and forgets cancellations too old to
 /// matter.

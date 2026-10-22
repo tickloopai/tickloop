@@ -1186,3 +1186,41 @@ async fn the_final_run_cannot_start_the_self_paced_loop_over() {
         None
     );
 }
+
+/// A run prepared before `/stop` and handed over only after the Chat continued is for a time
+/// the Continue moved the task past: it is refused, while the task's next run is taken.
+#[tokio::test]
+async fn a_run_prepared_before_stop_is_refused_after_continuing() {
+    let model = HoldingModel::new(vec![
+        create("create", "*/10 * * * *", "check the build"),
+        text("Scheduled."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "schedule it").await;
+    let task = tasks(&agent, chat).await.remove(0);
+    let prepared = TriggerSource::ScheduledTask {
+        task_id: task.id.clone(),
+        scheduled_for_ms: ms(at(10, 10, 0)),
+    };
+    agent.stop(chat).await.unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 35, 0));
+    model.scripted.enqueue(text("Continuing."));
+    turn(&agent, chat, "carry on").await;
+    assert_eq!(
+        tasks(&agent, chat).await[0].scheduled_for_ms,
+        Some(ms(at(10, 40, 0)))
+    );
+    let late = agent
+        .deliver_trigger_for_tests(chat, prepared, "check the build")
+        .await;
+    assert!(late.is_err(), "{late:?}");
+    assert_eq!(model.seen("check the build"), 0);
+
+    // The task's jitter delays each run by less than five minutes.
+    model.scripted.enqueue(text("Checked."));
+    agent
+        .run_due_scheduled_tasks(chat, at(10, 45, 0))
+        .await
+        .unwrap();
+    wait_seen(&model, "check the build", 1).await;
+}
