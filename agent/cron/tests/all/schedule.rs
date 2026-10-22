@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
+use chrono_tz::Africa::Monrovia;
 use chrono_tz::America::New_York;
 use chrono_tz::Tz;
 use tickloop_agent_cron::{Schedule, ScheduleError};
@@ -417,4 +418,41 @@ fn skipped_fixed_times_and_the_first_real_time_after_the_gap_run_once() {
             utc(2026, 3, 9, 5, 0)
         ]
     );
+}
+
+#[test]
+fn a_query_at_the_end_of_a_spring_forward_gap_includes_the_skipped_times() {
+    let gap_end = new_york(2026, 3, 8, 3, 0);
+    for expression in ["30 2,4 * * *", "30 2 * * *", "0,30 1-3 * * *"] {
+        assert_eq!(
+            schedule(expression).next_at_or_after(&gap_end),
+            Some(gap_end),
+            "{expression}"
+        );
+    }
+    assert_eq!(
+        schedule("30 2,4 * * *").next_after(&gap_end),
+        Some(new_york(2026, 3, 8, 4, 30))
+    );
+    assert_eq!(
+        schedule("15 4 * * *").next_at_or_after(&gap_end),
+        Some(new_york(2026, 3, 8, 4, 15))
+    );
+}
+
+#[test]
+fn a_gap_that_ends_mid_minute_runs_skipped_times_at_its_exact_end() {
+    // Monrovia moved from UTC-00:44:30 to UTC at 1972-01-07 00:44:30 UTC, skipping local
+    // 00:00:00-00:44:29.
+    let gap_end = Utc
+        .with_ymd_and_hms(1972, 1, 7, 0, 44, 30)
+        .unwrap()
+        .with_timezone(&Monrovia);
+    let evening = Monrovia
+        .with_ymd_and_hms(1972, 1, 6, 12, 0, 0)
+        .single()
+        .unwrap();
+    let midnight = schedule("0 0 * * *");
+    assert_eq!(midnight.next_after(&evening), Some(gap_end));
+    assert_eq!(midnight.next_at_or_after(&gap_end), Some(gap_end));
 }

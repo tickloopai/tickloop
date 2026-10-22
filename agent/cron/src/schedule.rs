@@ -15,6 +15,7 @@ const DAYS_PER_MONTH: usize = 31;
 const DAYS_PER_WEEK: u16 = 7;
 const MONTHS_PER_YEAR: usize = 12;
 const MAX_GAP_MINUTES: i64 = 24 * 60;
+const SECONDS_PER_MINUTE: i64 = 60;
 const FIVE_MINUTE_MARKS: [u16; 12] = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -130,6 +131,21 @@ impl Schedule {
         // walk the wall clock here and resolve each match the vixie way.
         let zone = time.timezone();
         let mut wall_clock = time.naive_local();
+        if inclusive {
+            // At the first instant after a spring-forward gap, the skipped wall clock times
+            // are due now, so the walk starts where the gap began.
+            let gap_start = time
+                .clone()
+                .checked_sub_signed(TimeDelta::seconds(1))
+                .and_then(|previous| {
+                    previous
+                        .naive_local()
+                        .checked_add_signed(TimeDelta::seconds(1))
+                });
+            if let Some(gap_start) = gap_start {
+                wall_clock = wall_clock.min(gap_start);
+            }
+        }
         let mut includes_wall_clock = inclusive;
         loop {
             let candidate = self
@@ -184,15 +200,23 @@ impl Schedule {
     }
 }
 
-/// The first real instant after the spring-forward gap that swallowed `wall_clock`.
+/// The first real instant after the spring-forward gap that swallowed `wall_clock`. Gaps
+/// usually end on a minute, but some historical ones end mid-minute, so the minute found
+/// first is refined to the second.
 fn first_instant_after_gap<Tz: TimeZone>(
     zone: &Tz,
     wall_clock: NaiveDateTime,
 ) -> Option<DateTime<Tz>> {
-    (1..=MAX_GAP_MINUTES).find_map(|minutes| {
-        zone.from_local_datetime(&(wall_clock + TimeDelta::minutes(minutes)))
-            .earliest()
-    })
+    let resolve = |offset: TimeDelta| {
+        wall_clock
+            .checked_add_signed(offset)
+            .and_then(|shifted| zone.from_local_datetime(&shifted).earliest())
+    };
+    let first_valid_minute =
+        (1..=MAX_GAP_MINUTES).find(|&minutes| resolve(TimeDelta::minutes(minutes)).is_some())?;
+    let previous_minute_seconds = (first_valid_minute - 1) * SECONDS_PER_MINUTE;
+    (previous_minute_seconds + 1..=first_valid_minute * SECONDS_PER_MINUTE)
+        .find_map(|seconds| resolve(TimeDelta::seconds(seconds)))
 }
 
 impl FromStr for Schedule {

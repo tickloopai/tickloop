@@ -252,7 +252,8 @@ fn run_for_recomputes_a_stored_scheduled_time() {
         HALF_ID,
         next.scheduled_for,
         &created,
-    );
+    )
+    .unwrap();
     assert_eq!(restored, next);
 
     let later = run_for(
@@ -261,7 +262,8 @@ fn run_for_recomputes_a_stored_scheduled_time() {
         HALF_ID,
         utc(25, 9, 0, 0),
         &created,
-    );
+    )
+    .unwrap();
     assert_eq!(later.fire_at, utc(25, 9, 30, 0));
 }
 
@@ -274,7 +276,8 @@ fn run_for_never_fires_before_not_before() {
         HALF_ID,
         utc(22, 15, 0, 0),
         &utc(22, 14, 59, 50),
-    );
+    )
+    .unwrap();
     assert_eq!(run.fire_at, utc(22, 14, 59, 50));
 
     let resumed = run_for(
@@ -283,6 +286,30 @@ fn run_for_never_fires_before_not_before() {
         HALF_ID,
         utc(22, 15, 0, 0),
         &utc(22, 15, 20, 0),
-    );
+    )
+    .unwrap();
     assert_eq!(resumed.fire_at, utc(22, 15, 30, 0));
+}
+
+#[test]
+fn run_for_reports_jitter_outside_the_representable_range() {
+    let schedule = Schedule::parse("0 0 * * *").unwrap();
+    let earliest = DateTime::<Utc>::MIN_UTC;
+    assert_eq!(
+        run_for(&schedule, TaskKind::OneShot, HALF_ID, earliest, &earliest),
+        None
+    );
+    assert_eq!(
+        run_for(
+            &schedule,
+            TaskKind::OneShot,
+            NO_JITTER_ID,
+            earliest,
+            &earliest
+        ),
+        Some(Run {
+            scheduled_for: earliest,
+            fire_at: earliest
+        })
+    );
 }

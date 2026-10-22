@@ -46,7 +46,7 @@ pub fn next_run<Tz: TimeZone>(
     after: &DateTime<Tz>,
 ) -> Option<Run<Tz>> {
     let scheduled_for = schedule.next_after(after)?;
-    Some(run_for(schedule, kind, task_id, scheduled_for, after))
+    run_for(schedule, kind, task_id, scheduled_for, after)
 }
 
 /// The run of a known scheduled time, such as one restored from storage, with jitter derived
@@ -58,14 +58,15 @@ pub fn next_run<Tz: TimeZone>(
 /// - One-shot tasks scheduled on `:00` or `:30` local time fire up to 90 seconds early;
 ///   other minutes fire on time.
 ///
-/// The run never fires before `not_before`, typically when the task was created.
+/// The run never fires before `not_before`, typically when the task was created. `None` when
+/// the jittered time falls outside the representable range.
 pub fn run_for<Tz: TimeZone>(
     schedule: &Schedule,
     kind: TaskKind,
     task_id: &str,
     scheduled_for: DateTime<Tz>,
     not_before: &DateTime<Tz>,
-) -> Run<Tz> {
+) -> Option<Run<Tz>> {
     let jitter = match kind {
         TaskKind::Recurring if schedule.is_every_five_minutes() => -EVERY_FIVE_MINUTES_LEAD,
         TaskKind::Recurring => schedule
@@ -77,11 +78,14 @@ pub fn run_for<Tz: TimeZone>(
         }
         TaskKind::OneShot => TimeDelta::zero(),
     };
-    let fire_at = (scheduled_for.clone() + jitter).max(not_before.clone());
-    Run {
+    let fire_at = scheduled_for
+        .clone()
+        .checked_add_signed(jitter)?
+        .max(not_before.clone());
+    Some(Run {
         scheduled_for,
         fire_at,
-    }
+    })
 }
 
 /// `span` scaled by the task id read as a fraction in `[0, 1)`. Ids that are not 8 hex
