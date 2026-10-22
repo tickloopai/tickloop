@@ -607,6 +607,18 @@ impl Agent {
             chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
             // Started ahead of the input by a holder gone since, and never begun.
             chat.bookkeeping.lifecycle.reopen_started_ahead();
+            // Begun by a holder gone since: its run went with it.
+            for run in chat.bookkeeping.lifecycle.begun_trigger_runs() {
+                if chat.active_run != Some(run) && !chat.parked.contains_key(&run) {
+                    self.settle_input(
+                        chat,
+                        run,
+                        tickloop_agent_transcript::SettledOutcome::Interrupted {
+                            by: tickloop_agent_transcript::InterruptedBy::Host,
+                        },
+                    );
+                }
+            }
             let states = self.inner.trigger_source_states.read().unwrap().clone();
             for state in states {
                 state.take_over(self, chat, &lines);

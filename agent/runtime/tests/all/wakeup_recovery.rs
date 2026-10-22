@@ -1563,6 +1563,98 @@ async fn an_acceptance_is_never_stored_without_its_source_change() {
     agent.shutdown().await;
 }
 
+fn faulty_store(root: &std::path::Path) -> Arc<FaultyTranscriptStore> {
+    Arc::new(FaultyTranscriptStore::new(Arc::new(
+        tickloop_agent_runtime::transcript::JsonlTranscriptStore::open(root.into()).unwrap(),
+    )))
+}
+
+/// A process loading the Chat while its holder starts Trigger input writes none of what it
+/// guesses of that input: the holder's start, recorded after the load, stands, and once the
+/// holder is gone the loader taking the lease over does not run the input again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loader_records_none_of_its_guesses_at_what_the_holder_started() {
+    const MARKER: &str = "began-before-the-holder-died";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let (holder_store, holder_model) = (faulty_store(&root), ContractModel::new());
+    let holder = process_on(&root, holder_store.clone(), holder_model.clone());
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&holder, chat, "get ready").await;
+    hold_a_turn(&holder, chat, &holder_model).await;
+    holder
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), &format!("HOLD:begun {MARKER}"))
+        .await
+        .unwrap();
+    holder.flush_transcripts().await;
+    let recorded = holder.pause_next_for_tests(chat, PausePoint::TriggerStartRecorded);
+    holder_model.release_held_turn();
+    tokio::time::timeout(WAIT, recorded.entered)
+        .await
+        .expect("the start is recorded ahead of the input")
+        .unwrap();
+
+    let loader_model = ContractModel::new();
+    let loader = process_on(&root, faulty_store(&root), loader_model.clone());
+    loader.resume_chat(chat).await.unwrap();
+    drop(recorded.release);
+    holder_model.wait_held("begun").await;
+    // The holder dies with the input running: nothing more of it is stored.
+    holder_store.fence();
+    loader.flush_transcripts().await;
+    holder.shutdown().await;
+
+    // The loader's Loop receives again, under the lease it takes over.
+    complete_turn(&loader, chat, "taken-over").await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(holder_model.seen(MARKER), 1);
+    assert_eq!(loader_model.seen(MARKER), 0, "{:?}", loader_model.prompts());
+    loader.shutdown().await;
+}
+
+/// A process loading the Chat after its holder recorded a start, which the holder then takes
+/// back, runs the input once it takes the lease over: the record written last stands over what
+/// the load found.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_taken_back_after_a_load_runs_in_the_loader_taking_over() {
+    let processes = FaultyProcesses::new().await;
+    let (first, chat) = (processes.first.clone(), processes.chat);
+    // The start is stored, and the holder hears it was not: it tries again, in vain.
+    processes.first_store.lose_next_acknowledgement();
+    processes.start_while_the_store_refuses().await;
+    let loader_model = ContractModel::new();
+    let loader = process_on(
+        &processes.root,
+        faulty_store(&processes.root),
+        loader_model.clone(),
+    );
+    loader.resume_chat(chat).await.unwrap();
+
+    let abandoned = first.pause_next_for_tests(chat, PausePoint::TriggerStartAbandoned);
+    let shutdown = tokio::spawn({
+        let first = first.clone();
+        async move { first.shutdown().await }
+    });
+    tokio::time::timeout(WAIT, abandoned.entered)
+        .await
+        .expect("the shutdown abandons the start")
+        .unwrap();
+    processes.first_store.heal();
+    drop(abandoned.release);
+    shutdown.await.unwrap();
+
+    complete_turn(&loader, chat, "taken-over").await;
+    loader_model.wait_seen(FaultyProcesses::MARKER, 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        processes.first_model.seen(FaultyProcesses::MARKER)
+            + loader_model.seen(FaultyProcesses::MARKER),
+        1
+    );
+    loader.shutdown().await;
+    processes.second.shutdown().await;
+}
+
 /// A custom title Line, the record the example sources of these tests keep their state in.
 fn source_record(chat: Uuid, record: &str) -> tickloop_agent_transcript::Line {
     tickloop_agent_transcript::Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {
