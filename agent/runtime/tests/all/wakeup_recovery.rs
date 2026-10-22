@@ -843,6 +843,72 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     setup.ran_once().await;
 }
 
+/// Waits until `count` wait to enter the Chat's Trigger boundary.
+async fn boundary_waiters(agent: &Agent, chat: Uuid, count: usize) {
+    tokio::time::timeout(WAIT, async {
+        while agent.trigger_boundary_waiters_for_tests(chat) != count {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} wait(s) to enter the boundary"));
+}
+
+/// Whether the Chat's recorded receiving switch, which other processes read, is on.
+fn recorded_receiving(root: &std::path::Path) -> bool {
+    let state = files_under(root, "trigger")
+        .into_iter()
+        .find(|path| path.ends_with("receiving.state"))
+        .expect("the receiving switch is recorded");
+    serde_json::from_slice::<serde_json::Value>(&std::fs::read(state).unwrap()).unwrap()
+        ["receiving"]
+        .as_bool()
+        .unwrap()
+}
+
+/// A `/stop` and a Continue racing each turn the switch here and record it in one operation:
+/// the Continue waits for the stop, and the switch here and the recorded one end alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_and_a_continue_leave_the_switch_and_its_record_alike() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    let changed = agent.pause_next_for_tests(chat, PausePoint::ReceivingChanged);
+    let stop = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.stop(chat).await.unwrap() }
+    });
+    tokio::time::timeout(WAIT, changed.entered)
+        .await
+        .expect("the stop turned the switch here")
+        .unwrap();
+    let continued = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.continue_loop(chat).await.unwrap() }
+    });
+    boundary_waiters(&agent, chat, 1).await;
+    drop(changed.release);
+    stop.await.unwrap();
+    continued.await.unwrap();
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .chat_loop
+            .receiving
+            .is_receiving()
+    );
+    assert!(
+        recorded_receiving(&root),
+        "the record follows the switch here"
+    );
+    agent.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]

@@ -186,6 +186,9 @@ pub(super) struct ChatLeases {
     known_generations: Mutex<HashMap<ChatId, u64>>,
     notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
     retries: Mutex<HashMap<ChatId, PermitRetry>>,
+    /// How many wait to enter each Chat's boundary, for tests to know a waiter is in place.
+    #[cfg(any(test, feature = "test-support"))]
+    boundary_waiters: Arc<Mutex<HashMap<ChatId, usize>>>,
 }
 
 impl ChatLeases {
@@ -239,15 +242,6 @@ impl ChatLeases {
             .is_some_and(|holding| holding.epoch == epoch && holding.synced)
     }
 
-    /// The epoch of the Chat's current holding, if this process holds its lease.
-    fn holding_epoch(&self, chat_id: ChatId) -> Option<u64> {
-        self.held
-            .lock()
-            .unwrap()
-            .get(&chat_id)
-            .map(|holding| holding.epoch)
-    }
-
     /// The holding `epoch` took the Chat's Trigger state over, and a retry waiting for it is no
     /// longer needed. A later holding takes it over again.
     fn mark_synced(&self, chat_id: ChatId, epoch: u64) {
@@ -261,22 +255,6 @@ impl ChatLeases {
             holding.synced = true;
         }
         self.cancel_retry(chat_id);
-    }
-
-    /// Releases the holding `epoch` only: a pause releases what was held when it was asked for,
-    /// never a holding taken after it.
-    fn release_holding(&self, chat_id: ChatId, epoch: u64) {
-        let released = {
-            let mut held = self.held.lock().unwrap();
-            match held.get(&chat_id) {
-                Some(holding) if holding.epoch == epoch => held.remove(&chat_id),
-                Some(_) | None => None,
-            }
-        };
-        if released.is_some() {
-            self.cancel_retry(chat_id);
-            self.clear_notice(chat_id);
-        }
     }
 
     /// Whether a permit given under `holding` still stands: the lease it was given under is still
@@ -390,6 +368,33 @@ impl ChatLeases {
             }
         }
         self.notices.lock().unwrap().clear();
+    }
+}
+
+/// Counts one waiter of a Chat's boundary while it waits, whether it gets in or is dropped.
+#[cfg(any(test, feature = "test-support"))]
+struct BoundaryWaiter {
+    waiters: Arc<Mutex<HashMap<ChatId, usize>>>,
+    chat_id: ChatId,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl BoundaryWaiter {
+    fn new(waiters: &Arc<Mutex<HashMap<ChatId, usize>>>, chat_id: ChatId) -> Self {
+        *waiters.lock().unwrap().entry(chat_id).or_default() += 1;
+        Self {
+            waiters: waiters.clone(),
+            chat_id,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for BoundaryWaiter {
+    fn drop(&mut self) {
+        if let Some(count) = self.waiters.lock().unwrap().get_mut(&self.chat_id) {
+            *count -= 1;
+        }
     }
 }
 
@@ -550,7 +555,23 @@ impl Agent {
 
     /// Enters the Chat's Trigger boundary, waiting while another holds it.
     pub(super) async fn enter_trigger_boundary(&self, chat_id: ChatId) -> TriggerBoundary {
+        #[cfg(any(test, feature = "test-support"))]
+        let _waiting = BoundaryWaiter::new(&self.inner.chat_leases.boundary_waiters, chat_id);
         self.inner.chat_leases.boundary(chat_id).lock_owned().await
+    }
+
+    /// How many wait to enter the Chat's Trigger boundary now.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn trigger_boundary_waiters_for_tests(&self, chat_id: ChatId) -> usize {
+        self.inner
+            .chat_leases
+            .boundary_waiters
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
@@ -678,11 +699,13 @@ impl Agent {
 
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的
     /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。Within the Chat's
-    /// Trigger boundary: a pause releases the holding it was asked under, after whatever start
-    /// the boundary was recording.
-    pub(super) async fn record_receiving(&self, chat_id: ChatId, change: ReceivingChange) {
-        let asked_under = self.inner.chat_leases.holding_epoch(chat_id);
-        let _within = self.enter_trigger_boundary(chat_id).await;
+    /// Trigger boundary, as the end of the operation that turned the switch here.
+    pub(super) async fn record_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+        _within: TriggerBoundary,
+    ) {
         let recorded = match self.lease_directory(chat_id).await {
             Some(directory) if self.inner.recorder.is_some() => {
                 tokio::task::spawn_blocking(move || write_receiving(&directory, change))
@@ -703,11 +726,9 @@ impl Agent {
             super::wakeup::trigger_pauses::PausePoint::ReceivingRecorded,
         )
         .await;
-        match (change, asked_under) {
-            (ReceivingChange::Paused, Some(epoch)) => {
-                self.inner.chat_leases.release_holding(chat_id, epoch);
-            }
-            (ReceivingChange::Paused, None) | (ReceivingChange::Resumed, _) => {}
+        match change {
+            ReceivingChange::Paused => self.inner.chat_leases.release(chat_id),
+            ReceivingChange::Resumed => {}
         }
         if let Err(error) = recorded {
             self.inner.chat_leases.set_notice(

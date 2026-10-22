@@ -551,23 +551,42 @@ impl Agent {
     /// Trigger input queued while it was paused may start. A Loop already receiving only looks
     /// again at its artifact links, whose account may be back.
     pub(super) async fn continue_receiving(&self, chat_id: ChatId) {
-        let resumed = {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&chat_id) else {
-                return;
-            };
-            let resumed = resume_receiving(chat);
-            if resumed {
-                self.save(&chat.snapshot);
-            }
-            resumed.then_some(chat.snapshot.chat_loop.id)
-        };
-        if let Some(loop_id) = resumed {
-            self.record_receiving(chat_id, ReceivingChange::Resumed)
-                .await;
+        if let Some(loop_id) = self
+            .change_receiving(chat_id, ReceivingChange::Resumed)
+            .await
+        {
             self.flush_due_tick_delivery(chat_id, loop_id);
         }
         Box::pin(self.resume_feedback_sources(chat_id)).await;
+    }
+
+    /// Turns the receiving switch here and records it for other processes in one operation of
+    /// the Chat's Trigger boundary, so the switch here and the recorded one never part: a pause
+    /// also releases the lease, after whatever the boundary was doing. The Loop's id when the
+    /// switch turned; a resume of a Loop already receiving changes and records nothing.
+    async fn change_receiving(&self, chat_id: ChatId, change: ReceivingChange) -> Option<LoopId> {
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let changed = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id)?;
+            let changed = match change {
+                ReceivingChange::Paused => {
+                    pause_receiving(chat, PauseReason::Stopped);
+                    true
+                }
+                ReceivingChange::Resumed => resume_receiving(chat),
+            };
+            if changed {
+                self.save(&chat.snapshot);
+            }
+            changed.then_some(chat.snapshot.chat_loop.id)
+        };
+        changed?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(chat_id, trigger_pauses::PausePoint::ReceivingChanged)
+            .await;
+        self.record_receiving(chat_id, change, boundary).await;
+        changed
     }
 
     /// `/stop`: interrupts the current turn, with every turn that waits for a person, discards
@@ -614,8 +633,9 @@ impl Agent {
             self.save(&chat.snapshot);
             operations
         };
-        // Recorded before the lease is returned: a process taking it over sees the pause.
-        self.record_receiving(chat_id, ReceivingChange::Paused)
+        // Paused here at once, so no Trigger input starts meanwhile, and again with the record,
+        // before the lease is returned: a process taking it over sees the pause.
+        self.change_receiving(chat_id, ReceivingChange::Paused)
             .await;
         Ok(operations)
     }
@@ -716,6 +736,8 @@ pub mod trigger_pauses {
     pub enum PausePoint {
         /// A takeover read the store and has not applied it.
         TakeoverRead,
+        /// The receiving switch turned here and is not recorded yet.
+        ReceivingChanged,
         /// The receiving switch was recorded, and a pause has not released its holding.
         ReceivingRecorded,
         /// Queued Trigger input passed its permit and the check of its holding, and has not
