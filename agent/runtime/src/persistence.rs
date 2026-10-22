@@ -2158,7 +2158,6 @@ fn recover_transcript(
         .unwrap_or_default();
     if chat_id == source_chat_id {
         let scheduled = loaded
-            .metadata
             .scheduled_tasks
             .as_ref()
             .filter(|entry| entry.chat_id == chat_id);

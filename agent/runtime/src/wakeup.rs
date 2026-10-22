@@ -921,7 +921,13 @@ impl Agent {
             };
             if changed {
                 if change == ReceivingChange::Resumed {
-                    self.resume_scheduled_tasks(chat);
+                    // TODO: the scheduled tasks resume through the sources' resume hook once the
+                    // base gives one, under the lease; until then within the boundary alone.
+                    let source_change = SourceChange {
+                        agent: self,
+                        chat_id,
+                    };
+                    self.resume_scheduled_tasks(&source_change, chat);
                 }
                 self.save(&chat.snapshot);
             }

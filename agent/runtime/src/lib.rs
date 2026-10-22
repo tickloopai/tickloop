@@ -550,8 +550,8 @@ struct SubmissionOptions {
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     /// What the user's `/loop` schedules, when the input is one.
     user_loop: Option<tickloop_agent_config::loop_skill::LoopSchedule>,
-    /// The self-paced task the user's `/loop` started, which the input's turn belongs to.
-    started_loop: Option<String>,
+    /// The Run the input is answered by, when its caller chose it ahead.
+    run_id: Option<RunId>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
@@ -1714,12 +1714,21 @@ impl Agent {
         Ok(stopped.operations)
     }
 
-    /// Esc: interrupts the turn, and cancels the self-paced loop's pending wake-up.
+    /// Esc: interrupts the turn, and cancels the self-paced loop's pending wake-up under the
+    /// Chat's lease.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let operations = chat.interrupt();
-        self.cancel_self_paced_wakeup(chat);
+        let operations = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get_mut(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .interrupt();
+        self.run_source_change(chat_id, |change, chat| {
+            change.agent().cancel_self_paced_wakeup(change, chat);
+        })
+        .await?;
         Ok(operations)
     }
 
@@ -2290,9 +2299,11 @@ impl Agent {
             && invoked.name == tickloop_agent_config::skills::LOOP_SKILL_NAME)
             .then(|| tickloop_agent_config::loop_skill::LoopSchedule::of(&skill.arguments).ok())
             .flatten();
+        // The self-paced task names the turn it starts before the turn is submitted.
+        let run_id = Uuid::new_v4();
         let started_loop = match &user_loop {
             Some(tickloop_agent_config::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
-                self.start_users_self_paced_loop(chat_id, prompt.clone())
+                self.start_users_self_paced_loop(chat_id, prompt.clone(), run_id)
                     .await?
             }
             Some(tickloop_agent_config::loop_skill::LoopSchedule::Cron { .. }) | None => None,
@@ -2304,7 +2315,7 @@ impl Agent {
                 SubmissionOptions {
                     invoked_skill: Some(invoked),
                     user_loop,
-                    started_loop: started_loop.clone(),
+                    run_id: started_loop.is_some().then_some(run_id),
                     host_context,
                     ledger: Some(ledger),
                     turn,
@@ -2551,7 +2562,7 @@ impl Agent {
             trigger_commit,
             invoked_skill,
             user_loop,
-            started_loop,
+            run_id: chosen_run_id,
             host_context,
             agent_message,
             directed_human,
@@ -2646,7 +2657,9 @@ impl Agent {
             .and_then(|source| event_sources::feedback_identity(chat_id, loop_id, source));
         let run_id = feedback_input
             .as_ref()
-            .map_or_else(Uuid::new_v4, |feedback| feedback.delivery_id);
+            .map(|feedback| feedback.delivery_id)
+            .or(chosen_run_id)
+            .unwrap_or_else(Uuid::new_v4);
         let receipt = Receipt {
             chat_id,
             loop_id,
@@ -2654,15 +2667,6 @@ impl Agent {
         };
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id, user_loop);
-        }
-        let starts_loop = started_loop.is_some();
-        if let Some(task) = started_loop.and_then(|id| {
-            chat.snapshot
-                .scheduled_tasks
-                .iter_mut()
-                .find(|task| task.id == id)
-        }) {
-            task.started_by_run = Some(run_id);
         }
         if let Some(mut invoked_skill) = invoked_skill {
             if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
@@ -2787,11 +2791,6 @@ impl Agent {
             self.persist_family_message_hold(&candidate, mailbox);
         }
         *original = candidate;
-        if starts_loop {
-            // Recorded before the Run can start: a host that goes on with the turn from the
-            // Transcript knows it is the loop's first.
-            self.persist_scheduled_tasks(original, Vec::new());
-        }
         if cut.is_none()
             && let Some(leaf) = selected_leaf
         {

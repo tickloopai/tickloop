@@ -9,8 +9,7 @@ use tickloop_agent_protocol::ChatId;
 use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
     FamilyCompletionsEntry, FamilyInputsEntry, FamilyMessageHoldEntry, LastPromptEntry, Line,
-    MonitorMembersEntry, ProvenanceEntry, ScheduledTasksEntry, SentAgentMessagesEntry,
-    SubagentsEntry, TaskBoardsEntry,
+    MonitorMembersEntry, ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
 };
 use uuid::Uuid;
 
@@ -24,7 +23,6 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
     pub task_boards: Option<TaskBoardsEntry>,
-    pub scheduled_tasks: Option<ScheduledTasksEntry>,
     pub artifact_ticks: Option<ArtifactTicksEntry>,
     pub monitor_members: Option<MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
@@ -50,7 +48,6 @@ impl CachedMetadata {
             Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
             Line::TaskBoards(entry) => self.task_boards = Some(entry.clone()),
-            Line::ScheduledTasks(entry) => self.scheduled_tasks = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::FamilyMessageHold(entry) => self.family_message_hold = Some(entry.clone()),
@@ -72,7 +69,6 @@ impl CachedMetadata {
             .chain(self.ai_title.clone().map(Line::AiTitle))
             .chain(self.subagents.clone().map(Line::Subagents))
             .chain(self.task_boards.clone().map(Line::TaskBoards))
-            .chain(self.scheduled_tasks.clone().map(Line::ScheduledTasks))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
             .chain(

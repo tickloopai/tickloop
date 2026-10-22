@@ -276,3 +276,85 @@ async fn a_process_taking_the_chat_over_does_not_run_a_task_deleted_elsewhere() 
     );
     reader.shutdown().await;
 }
+
+/// A process that only loaded the Chat compacts it or leaves after another deleted its task:
+/// what it writes does not bring the task back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bystander_compacting_or_leaving_does_not_bring_a_deleted_task_back() {
+    for compacts in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let holder = Agent::open_embedded(root.clone(), config(), ContractModel::new()).unwrap();
+        holder.set_scheduled_now_for_tests(at(10, 0));
+        let chat = holder.create_chat(directory.path().into()).await.unwrap();
+        complete_turn(&holder, chat, "get ready").await;
+        complete_turn(&holder, chat, "and again").await;
+        let task = holder
+            .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+            .await
+            .unwrap();
+        holder.flush_transcripts().await;
+
+        let bystander = Agent::open_embedded(root.clone(), config(), ContractModel::new()).unwrap();
+        bystander.set_scheduled_now_for_tests(at(10, 0));
+        bystander.resume_chat(chat).await.unwrap();
+        assert_eq!(tasks(&bystander, chat).await.len(), 1);
+
+        holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+        holder.shutdown().await;
+        if compacts {
+            bystander.compact(chat).await.unwrap();
+        }
+        bystander.shutdown().await;
+
+        let reader = Agent::open_embedded(root, config(), ContractModel::new()).unwrap();
+        reader.resume_chat(chat).await.unwrap();
+        assert!(
+            tasks(&reader, chat).await.is_empty(),
+            "compacts: {compacts}: the deleted task stays deleted"
+        );
+        reader.shutdown().await;
+    }
+}
+
+/// A task is deleted and another process takes the Chat over at once: the deletion is stored
+/// before the lease can change hands, so the process taking over never runs the task.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_taking_over_right_after_a_deletion_does_not_run_the_task() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let holder = Agent::open_embedded(root.clone(), config(), ContractModel::new()).unwrap();
+    holder.set_scheduled_now_for_tests(at(10, 0));
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&holder, chat, "get ready").await;
+    let task = holder
+        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .await
+        .unwrap();
+    holder.flush_transcripts().await;
+
+    let taker_model = ContractModel::new();
+    let taker = Agent::open_embedded(root, config(), taker_model.clone()).unwrap();
+    taker.set_scheduled_now_for_tests(at(10, 0));
+    taker.resume_chat(chat).await.unwrap();
+    complete_turn(&taker, chat, "resume here").await;
+    taker.set_scheduled_now_for_tests(at(10, 15));
+
+    holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+    let woken = taker
+        .wake_scheduled_tasks(chat, task.next_fire_at_ms.unwrap())
+        .await;
+    holder.shutdown().await;
+    let woken_again = taker
+        .wake_scheduled_tasks(chat, task.next_fire_at_ms.unwrap())
+        .await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        taker_model.seen("check the build"),
+        0,
+        "{woken:?} {woken_again:?}: {:?}",
+        taker_model.prompts()
+    );
+    assert!(tasks(&taker, chat).await.is_empty());
+    taker.shutdown().await;
+}

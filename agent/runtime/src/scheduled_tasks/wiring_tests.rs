@@ -1122,36 +1122,31 @@ async fn the_agent_ending_its_self_paced_loop_is_shown_to_the_user() {
 async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
-    let model = HoldingModel::new(vec![
-        call(
-            "create",
-            tools::CRON_CREATE_TOOL_NAME,
-            json!({"cron": "*/15 * * * *", "prompt": "remind me", "recurring": false}),
-        ),
-        text("Reminder set."),
-        text("Reminded."),
-    ]);
-    let holder = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    holder.set_scheduled_now_for_tests(at(10, 0, 0));
-    let chat = holder.create_chat(directory.path().into()).await.unwrap();
-    turn(&holder, chat, "a reminder in a quarter of an hour").await;
-    let task = tasks(&holder, chat).await.remove(0);
-    holder.flush_transcripts().await;
+    // The process that creates the task holds the Chat's lease from then on.
+    let other = Agent::open_embedded(
+        root.clone(),
+        config(),
+        HoldingModel::new(vec![
+            call(
+                "create",
+                tools::CRON_CREATE_TOOL_NAME,
+                json!({"cron": "*/15 * * * *", "prompt": "remind me", "recurring": false}),
+            ),
+            text("Reminder set."),
+        ]),
+    )
+    .unwrap();
+    other.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = other.create_chat(directory.path().into()).await.unwrap();
+    turn(&other, chat, "a reminder in a quarter of an hour").await;
+    let task = tasks(&other, chat).await.remove(0);
+    other.flush_transcripts().await;
 
-    let other = Agent::open_embedded(root, config(), HoldingModel::new(vec![text("ok")])).unwrap();
-    other.resume_chat(chat).await.unwrap();
-    turn(&other, chat, "carry on").await;
-    other
-        .deliver_trigger_for_tests(
-            chat,
-            TriggerSource::ScheduledTask {
-                task_id: "elsewhere".into(),
-                scheduled_for_ms: 1,
-            },
-            "the other process takes the lease",
-        )
-        .await
-        .unwrap();
+    let model = HoldingModel::new(vec![text("ok"), text("Reminded.")]);
+    let holder = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    holder.set_scheduled_now_for_tests(at(10, 0, 0));
+    holder.resume_chat(chat).await.unwrap();
+    turn(&holder, chat, "carry on").await;
 
     assert!(
         holder
@@ -1175,13 +1170,56 @@ async fn a_refused_run_keeps_its_task_due_and_runs_when_handed_over_again() {
     assert_eq!(receipts.len(), 1);
     wait_seen(&model, "remind me", 1).await;
     wait_idle(&holder, chat).await;
-    assert!(
-        tasks(&holder, chat)
-            .await
-            .iter()
-            .all(|remaining| remaining.id != task.id)
-    );
+    assert!(tasks(&holder, chat).await.is_empty());
     holder.shutdown().await;
+}
+
+/// Another process holds the Chat's lease: the user's `/loop` is refused before its turn is
+/// submitted, and the Agent's CronDelete reports the refusal as its result; nothing changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_while_another_process_holds_the_lease_are_refused_visibly() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let other =
+        Agent::open_embedded(root.clone(), config(), HoldingModel::new(vec![text("ok")])).unwrap();
+    other.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = other.create_chat(directory.path().into()).await.unwrap();
+    turn(&other, chat, "get ready").await;
+    // Scheduling the task takes the Chat's lease, which a receiving process keeps.
+    let task = other
+        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .await
+        .unwrap();
+    other.flush_transcripts().await;
+
+    let model = HoldingModel::new(vec![
+        text("ok"),
+        call(
+            "delete",
+            tools::CRON_DELETE_TOOL_NAME,
+            json!({ "id": task.id }),
+        ),
+        text("Could not delete it."),
+    ]);
+    let here = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    here.set_scheduled_now_for_tests(at(10, 0, 0));
+    here.resume_chat(chat).await.unwrap();
+    turn(&here, chat, "carry on").await;
+
+    let refused = here.invoke_skill(chat, "loop", "watch the build").await;
+    assert!(
+        matches!(&refused, Err(AgentError::Invalid(message)) if message.contains("another Tickloop process")),
+        "{refused:?}"
+    );
+    assert_eq!(model.seen("watch the build"), 0);
+
+    turn(&here, chat, "delete the check").await;
+    let (result, is_error) = tool_result(&here, chat, "delete").await;
+    assert!(is_error, "{result}");
+    assert!(result.contains("another Tickloop process"), "{result}");
+    assert_eq!(tasks(&here, chat).await, [task]);
+    here.shutdown().await;
+    other.shutdown().await;
 }
 
 /// A task cancelled after its run was prepared, before the base took it: the run is refused,

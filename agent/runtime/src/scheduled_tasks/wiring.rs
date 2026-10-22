@@ -20,7 +20,7 @@ use super::tasks::{
     SelfPacedTurnEnd, Wakeup,
 };
 use super::tools::{self, ScheduledTaskCall};
-use crate::wakeup::TriggerDelivery;
+use crate::wakeup::{SourceChange, SourceChangeError, TriggerDelivery};
 use crate::{Agent, AgentError, Chat};
 use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopSchedule};
 
@@ -201,7 +201,40 @@ impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
         }
         chat.snapshot.scheduled_tasks = recorded.tasks.clone();
         chat.snapshot.scheduled_task_revocations = recorded.revoked.clone();
-        agent.persist_scheduled_tasks(chat, Vec::new());
+        agent.announce_scheduled_tasks(chat, Vec::new());
+    }
+
+    fn records(&self, chat: &Chat) -> Vec<Line> {
+        let snapshot = &chat.snapshot;
+        if snapshot.scheduled_tasks.is_empty() && snapshot.scheduled_task_revocations.is_empty() {
+            return Vec::new();
+        }
+        vec![scheduled_tasks_record(chat)]
+    }
+
+    /// `/stop` cancels the self-paced loop's pending wake-up with the pause.
+    fn on_stop(&self, change: &SourceChange, chat: &mut Chat) {
+        change.agent().cancel_self_paced_wakeup(change, chat);
+    }
+}
+
+fn scheduled_tasks_record(chat: &Chat) -> Line {
+    Line::ScheduledTasks(ScheduledTasksEntry {
+        chat_id: chat.snapshot.id,
+        tasks: chat.snapshot.scheduled_tasks.clone(),
+        revoked: chat.snapshot.scheduled_task_revocations.clone(),
+    })
+}
+
+impl From<SourceChangeError> for AgentError {
+    fn from(error: SourceChangeError) -> Self {
+        match error {
+            SourceChangeError::NotLoaded => Self::NotFound,
+            SourceChangeError::Unrecorded(message) => Self::Storage(message),
+            error @ (SourceChangeError::HeldElsewhere
+            | SourceChangeError::ForeignHost(_)
+            | SourceChangeError::Closing) => Self::Invalid(error.to_string()),
+        }
     }
 }
 
@@ -319,32 +352,25 @@ impl Agent {
             });
             // Recorded, so a process taking the Chat over finds the task its run belongs to;
             // the timer is left alone, as the task does not time on its own.
-            self.record_chat_metadata(
-                chat_id,
-                Line::ScheduledTasks(ScheduledTasksEntry {
-                    chat_id,
-                    tasks: snapshot.scheduled_tasks.clone(),
-                    revoked: snapshot.scheduled_task_revocations.clone(),
-                }),
-            );
+            self.queue_source_state(chat_id, scheduled_tasks_record(chat));
         }
     }
 
-    /// Records the Chat's scheduled tasks after a change, announces it, and has the timer look
-    /// at them again.
+    /// Records the Chat's scheduled tasks after a change made under its lease, announces it,
+    /// and has the timer look at them again.
     pub(crate) fn persist_scheduled_tasks(
         &self,
+        change: &SourceChange,
         chat: &mut Chat,
         notices: Vec<ScheduledTaskNotice>,
     ) {
-        self.record_chat_metadata(
-            chat.snapshot.id,
-            Line::ScheduledTasks(ScheduledTasksEntry {
-                chat_id: chat.snapshot.id,
-                tasks: chat.snapshot.scheduled_tasks.clone(),
-                revoked: chat.snapshot.scheduled_task_revocations.clone(),
-            }),
-        );
+        change.record_source_state(scheduled_tasks_record(chat));
+        self.announce_scheduled_tasks(chat, notices);
+    }
+
+    /// Announces the Chat's scheduled tasks as they are now, and has the timer look at them
+    /// again.
+    fn announce_scheduled_tasks(&self, chat: &mut Chat, notices: Vec<ScheduledTaskNotice>) {
         self.save(&chat.snapshot);
         let receipt = Receipt {
             chat_id: chat.snapshot.id,
@@ -404,6 +430,7 @@ impl Agent {
     /// Deletes tasks from the Chat, with their queued runs.
     fn delete_scheduled(
         &self,
+        change: &SourceChange,
         chat: &mut Chat,
         deleted: Vec<ScheduledTask>,
         notices: Vec<ScheduledTaskNotice>,
@@ -415,7 +442,7 @@ impl Agent {
             .scheduled_tasks
             .retain(|task| !deleted.iter().any(|gone| gone.id == task.id));
         self.revoke_scheduled(chat, &deleted);
-        self.persist_scheduled_tasks(chat, notices);
+        self.persist_scheduled_tasks(change, chat, notices);
     }
 
     /// Who creates a task in the turn `receipt`: the user only for the one task their own
@@ -444,7 +471,8 @@ impl Agent {
         }
     }
 
-    /// One call of the scheduled task tools.
+    /// One call of the scheduled task tools. A change is made under the Chat's lease and
+    /// recorded before the call returns; another process holding the lease refuses it.
     pub(crate) async fn scheduled_task_tool(
         &self,
         receipt: &Receipt,
@@ -454,17 +482,46 @@ impl Agent {
             Ok(call) => call,
             Err(message) => return Ok(tool_error(message)),
         };
-        let now = self.scheduled_now();
-        let zone = self.inner.schedule_clock.zone();
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or_else(|| "the Chat is gone".to_owned())?;
-        if chat.snapshot.delegation.is_some() {
+        if self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .ok_or_else(|| "the Chat is gone".to_owned())?
+            .snapshot
+            .delegation
+            .is_some()
+        {
             return Ok(tool_error(
                 "Only the root Agent schedules tasks; a Subagent has none.".into(),
             ));
         }
+        let now = self.scheduled_now();
+        let zone = self.inner.schedule_clock.zone();
+        let call_receipt = receipt.clone();
+        self.run_source_change(receipt.chat_id, move |change, chat| {
+            change
+                .agent()
+                .apply_scheduled_task_call(change, chat, &call_receipt, call, zone, now)
+        })
+        .await
+        .or_else(|error| {
+            Ok(tool_error(format!(
+                "The scheduled tasks were not changed: {error}."
+            )))
+        })
+    }
+
+    fn apply_scheduled_task_call(
+        &self,
+        change: &SourceChange,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        call: ScheduledTaskCall,
+        zone: Zone,
+        now: DateTime<Utc>,
+    ) -> ToolResult {
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
         let id = unused_id(&chat.snapshot);
         let outcome = match call {
@@ -493,7 +550,7 @@ impl Agent {
             },
             ScheduledTaskCall::List => {
                 let listed: Vec<Value> = tasks.tasks().iter().map(describe).collect();
-                return Ok(tool_result(json!({ "tasks": listed })));
+                return tool_result(json!({ "tasks": listed }));
             }
             ScheduledTaskCall::Delete { id } => match tasks.delete(&id) {
                 Some(task) => Ok((json!({ "deleted": task.id }), vec![task], Vec::new())),
@@ -548,12 +605,12 @@ impl Agent {
         };
         let (value, deleted, notices) = match outcome {
             Ok(outcome) => outcome,
-            Err(message) => return Ok(tool_error(message)),
+            Err(message) => return tool_error(message),
         };
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
         self.revoke_scheduled(chat, &deleted);
-        self.persist_scheduled_tasks(chat, notices);
-        Ok(tool_result(value))
+        self.persist_scheduled_tasks(change, chat, notices);
+        tool_result(value)
     }
 
     /// The user schedules a task through the host's interface, as with `/loop`: it needs no
@@ -573,73 +630,91 @@ impl Agent {
             CronTask::OneShot(schedule)
         };
         let now = self.scheduled_now();
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if chat.snapshot.delegation.is_some() {
-            return Err(AgentError::Invalid(
-                "only the root Agent has scheduled tasks".into(),
-            ));
-        }
-        let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let id = unused_id(&chat.snapshot);
-        let task = tasks
-            .create_cron(
-                id,
-                cron_task,
-                prompt,
-                Creation {
-                    creator: ScheduledTaskCreator::User,
-                    needs_confirmation: false,
-                },
-                self.inner.schedule_clock.zone(),
-                &now,
-            )
-            .map_err(|error| AgentError::Invalid(error.to_string()))?
-            .clone();
-        chat.snapshot.scheduled_tasks = tasks.into_tasks();
-        self.persist_scheduled_tasks(chat, Vec::new());
-        Ok(task)
+        let zone = self.inner.schedule_clock.zone();
+        self.run_source_change(chat_id, move |change, chat| {
+            if chat.snapshot.delegation.is_some() {
+                return Err(AgentError::Invalid(
+                    "only the root Agent has scheduled tasks".into(),
+                ));
+            }
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let id = unused_id(&chat.snapshot);
+            let task = tasks
+                .create_cron(
+                    id,
+                    cron_task,
+                    prompt,
+                    Creation {
+                        creator: ScheduledTaskCreator::User,
+                        needs_confirmation: false,
+                    },
+                    zone,
+                    &now,
+                )
+                .map_err(|error| AgentError::Invalid(error.to_string()))?
+                .clone();
+            chat.snapshot.scheduled_tasks = tasks.into_tasks();
+            change
+                .agent()
+                .persist_scheduled_tasks(change, chat, Vec::new());
+            Ok(task)
+        })
+        .await?
     }
 
-    /// The user's `/loop` without an interval starts the self-paced loop with its turn, so that
-    /// turn gets the fallback wake-up too; a self-paced loop running already is replaced.
+    /// The user's `/loop` without an interval starts the self-paced loop with its turn `run`,
+    /// so that turn gets the fallback wake-up too; a self-paced loop running already is
+    /// replaced. The task is recorded under the Chat's lease, naming `run`, before the turn is
+    /// submitted.
     pub(crate) async fn start_users_self_paced_loop(
         &self,
         chat_id: ChatId,
         prompt: String,
+        run: tickloop_agent_protocol::RunId,
     ) -> Result<Option<String>, AgentError> {
         if !self.inner.tool_policy.scheduled_tasks {
             return Ok(None);
         }
         let now = self.scheduled_now();
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if chat.snapshot.delegation.is_some() {
-            return Ok(None);
-        }
-        let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let replaced = tasks
-            .tasks()
-            .iter()
-            .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
-            .cloned();
-        let id = unused_id(&chat.snapshot);
-        tasks
-            .start_self_paced(
-                id.clone(),
-                prompt,
-                Creation {
-                    creator: ScheduledTaskCreator::User,
-                    needs_confirmation: false,
-                },
-                self.inner.schedule_clock.zone(),
-                &now,
-            )
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        chat.snapshot.scheduled_tasks = tasks.into_tasks();
-        self.revoke_scheduled(chat, replaced.as_slice());
-        self.persist_scheduled_tasks(chat, Vec::new());
-        Ok(Some(id))
+        let zone = self.inner.schedule_clock.zone();
+        self.run_source_change(chat_id, move |change, chat| {
+            if chat.snapshot.delegation.is_some() {
+                return Ok(None);
+            }
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let replaced = tasks
+                .tasks()
+                .iter()
+                .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+                .cloned();
+            let id = unused_id(&chat.snapshot);
+            tasks
+                .start_self_paced(
+                    id.clone(),
+                    prompt,
+                    Creation {
+                        creator: ScheduledTaskCreator::User,
+                        needs_confirmation: false,
+                    },
+                    zone,
+                    &now,
+                )
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            chat.snapshot.scheduled_tasks = tasks.into_tasks();
+            if let Some(task) = chat
+                .snapshot
+                .scheduled_tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+            {
+                task.started_by_run = Some(run);
+            }
+            let agent = change.agent();
+            agent.revoke_scheduled(chat, replaced.as_slice());
+            agent.persist_scheduled_tasks(change, chat, Vec::new());
+            Ok(Some(id))
+        })
+        .await?
     }
 
     /// Cancels one of the Chat's scheduled tasks at the user's request.
@@ -648,14 +723,18 @@ impl Agent {
         chat_id: ChatId,
         task_id: &str,
     ) -> Result<(), AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let deleted = tasks
-            .delete(task_id)
-            .ok_or_else(|| AgentError::Invalid(format!("no scheduled task `{task_id}`")))?;
-        self.delete_scheduled(chat, vec![deleted], Vec::new());
-        Ok(())
+        let task_id = task_id.to_owned();
+        self.run_source_change(chat_id, move |change, chat| {
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let deleted = tasks
+                .delete(&task_id)
+                .ok_or_else(|| AgentError::Invalid(format!("no scheduled task `{task_id}`")))?;
+            change
+                .agent()
+                .delete_scheduled(change, chat, vec![deleted], Vec::new());
+            Ok(())
+        })
+        .await?
     }
 
     /// The user's answer to a task the Agent created on a host without permission requests:
@@ -668,21 +747,25 @@ impl Agent {
         decision: ScheduledTaskDecision,
     ) -> Result<(), AgentError> {
         let now = self.scheduled_now();
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        let notices = match tasks
-            .decide(task_id, decision, &now)
-            .map_err(|error| AgentError::Invalid(error.to_string()))?
-        {
-            DecisionOutcome::Confirmed(_) | DecisionOutcome::Rejected(_) => Vec::new(),
-            DecisionOutcome::ExpiredUnrun(task) => {
-                vec![ScheduledTaskNotice::ExpiredUnrun { task_id: task.id }]
-            }
-        };
-        chat.snapshot.scheduled_tasks = tasks.into_tasks();
-        self.persist_scheduled_tasks(chat, notices);
-        Ok(())
+        let task_id = task_id.to_owned();
+        self.run_source_change(chat_id, move |change, chat| {
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let notices = match tasks
+                .decide(&task_id, decision, &now)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?
+            {
+                DecisionOutcome::Confirmed(_) | DecisionOutcome::Rejected(_) => Vec::new(),
+                DecisionOutcome::ExpiredUnrun(task) => {
+                    vec![ScheduledTaskNotice::ExpiredUnrun { task_id: task.id }]
+                }
+            };
+            chat.snapshot.scheduled_tasks = tasks.into_tasks();
+            change
+                .agent()
+                .persist_scheduled_tasks(change, chat, notices);
+            Ok(())
+        })
+        .await?
     }
 
     /// A stateless host's wake-up at `due_at_ms`, the time the Harness reported last: every
@@ -713,7 +796,7 @@ impl Agent {
         chat_id: ChatId,
         now: DateTime<Utc>,
     ) -> Result<Vec<Receipt>, AgentError> {
-        let runs = {
+        let (unreadable, runs) = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return Err(AgentError::NotFound);
@@ -729,10 +812,8 @@ impl Agent {
                 .into_iter()
                 .filter(|task| !due.fired.iter().any(|fired| fired.task.id == task.id))
                 .collect();
-            if !unreadable.is_empty() {
-                self.delete_scheduled(chat, unreadable, Vec::new());
-            }
-            due.fired
+            let runs = due
+                .fired
                 .into_iter()
                 .filter_map(|fired| {
                     let before = chat
@@ -757,12 +838,27 @@ impl Agent {
                         input,
                         ledger: None,
                         on_accept: Some(Box::new(move |change, chat, receipt| {
-                            change.agent().commit_scheduled_run(chat, &run, receipt);
+                            change
+                                .agent()
+                                .commit_scheduled_run(change, chat, &run, receipt);
                         })),
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (unreadable, runs)
         };
+        if !unreadable.is_empty() {
+            self.run_source_change(chat_id, move |change, chat| {
+                let unreadable = unreadable
+                    .into_iter()
+                    .filter(|task| chat.snapshot.scheduled_tasks.contains(task))
+                    .collect();
+                change
+                    .agent()
+                    .delete_scheduled(change, chat, unreadable, Vec::new());
+            })
+            .await?;
+        }
         let mut receipts = Vec::new();
         let mut refusal = None;
         for delivery in runs {
@@ -784,7 +880,13 @@ impl Agent {
     /// ends with its last run, unless it changed since the run was prepared, such as by a
     /// reschedule. A run merged into one of the task's that already waits is passed over like
     /// one the Loop was too busy for.
-    fn commit_scheduled_run(&self, chat: &mut Chat, run: &DueRun, receipt: &Receipt) {
+    fn commit_scheduled_run(
+        &self,
+        change: &SourceChange,
+        chat: &mut Chat,
+        run: &DueRun,
+        receipt: &Receipt,
+    ) {
         let Some(index) = chat
             .snapshot
             .scheduled_tasks
@@ -809,6 +911,7 @@ impl Agent {
             chat.snapshot.scheduled_tasks[index] = after;
         }
         self.persist_scheduled_tasks(
+            change,
             chat,
             vec![ScheduledTaskNotice::Fired {
                 task_id: run.before.id.clone(),
@@ -818,9 +921,38 @@ impl Agent {
 
     /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it
     /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
-    /// fallback turn that did not reschedule either the loop ends.
+    /// fallback turn that did not reschedule either the loop ends. The change is made under the
+    /// Chat's lease, on a task of the Agent's own.
     pub(crate) fn end_self_paced_turn(&self, chat: &mut Chat, run: tickloop_agent_protocol::RunId) {
         chat.user_loops.remove(&run);
+        if !chat
+            .snapshot
+            .scheduled_tasks
+            .iter()
+            .any(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+        {
+            return;
+        }
+        let agent = self.clone();
+        let chat_id = chat.snapshot.id;
+        self.inner.tasks.spawn(Box::pin(async move {
+            let changed = agent
+                .run_source_change(chat_id, move |change, chat| {
+                    change.agent().fall_back_after_self_paced_turn(change, chat, run);
+                })
+                .await;
+            if let Err(error) = changed {
+                tracing::warn!(%chat_id, %error, "the self-paced loop's fallback was not scheduled");
+            }
+        }));
+    }
+
+    fn fall_back_after_self_paced_turn(
+        &self,
+        change: &SourceChange,
+        chat: &mut Chat,
+        run: tickloop_agent_protocol::RunId,
+    ) {
         let Some(task) = chat
             .snapshot
             .scheduled_tasks
@@ -840,11 +972,12 @@ impl Agent {
             SelfPacedTurnEnd::Unchanged => {}
             SelfPacedTurnEnd::FallbackScheduled => {
                 chat.snapshot.scheduled_tasks = tasks.into_tasks();
-                self.persist_scheduled_tasks(chat, Vec::new());
+                self.persist_scheduled_tasks(change, chat, Vec::new());
             }
             SelfPacedTurnEnd::Ended(task) => {
                 chat.snapshot.scheduled_tasks = tasks.into_tasks();
                 self.persist_scheduled_tasks(
+                    change,
                     chat,
                     vec![ScheduledTaskNotice::SelfPacedEnded { task_id: task.id }],
                 );
@@ -854,7 +987,7 @@ impl Agent {
 
     /// Esc or `/stop`: the self-paced loop's pending wake-up, its fallback and its queued run
     /// are cancelled; fixed-interval and one-shot tasks go on.
-    pub(crate) fn cancel_self_paced_wakeup(&self, chat: &mut Chat) {
+    pub(crate) fn cancel_self_paced_wakeup(&self, change: &SourceChange, chat: &mut Chat) {
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
         let Some(task) = tasks.stop_self_paced() else {
             return;
@@ -862,12 +995,12 @@ impl Agent {
         let notice = ScheduledTaskNotice::WakeupCancelled {
             task_id: task.id.clone(),
         };
-        self.delete_scheduled(chat, vec![task], vec![notice]);
+        self.delete_scheduled(change, chat, vec![task], vec![notice]);
     }
 
     /// Receiving resumed: each task waits for its next time after now, and nothing missed
     /// while paused runs late.
-    pub(crate) fn resume_scheduled_tasks(&self, chat: &mut Chat) {
+    pub(crate) fn resume_scheduled_tasks(&self, change: &SourceChange, chat: &mut Chat) {
         if chat.snapshot.scheduled_tasks.is_empty() {
             return;
         }
@@ -875,7 +1008,7 @@ impl Agent {
         let removed = tasks.resume(&self.scheduled_now());
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
         self.withdraw_deleted_task_runs(chat, &removed);
-        self.persist_scheduled_tasks(chat, Vec::new());
+        self.persist_scheduled_tasks(change, chat, Vec::new());
     }
 
     /// When a Loop that receives next needs its host: the earliest fire time of its confirmed

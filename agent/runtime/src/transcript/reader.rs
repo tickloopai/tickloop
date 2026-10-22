@@ -5,7 +5,7 @@ use uuid::Uuid;
 use tickloop_agent_base::timestamp::parse_timestamp_ms;
 use tickloop_agent_protocol::{Content, OriginalUserInput, Role, Usage};
 use tickloop_agent_transcript::{
-    ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line,
+    ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line, ScheduledTasksEntry,
 };
 
 use super::outbox::CachedMetadata;
@@ -16,6 +16,9 @@ pub(crate) struct LoadedTranscript {
     /// 从根到叶子的当前对话链。
     pub chain: Vec<ChainEntry>,
     pub metadata: CachedMetadata,
+    /// The latest record of the scheduled tasks, a Trigger source's own state, which is not
+    /// written again as metadata.
+    pub scheduled_tasks: Option<ScheduledTasksEntry>,
     /// 照 Claude Code：按条目 `messageId` 保存的文件回滚快照，同一键以最后一条为准。
     pub file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
     /// 文件顺序中全部内容替换条目；调用方按 chatId 取用（照 Claude Code 按 sessionId 取用）。
@@ -37,6 +40,7 @@ pub(crate) struct LoadedTranscript {
 #[derive(Default)]
 struct RetainedState {
     metadata: CachedMetadata,
+    scheduled_tasks: Option<ScheduledTasksEntry>,
     file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
     content_replacements: Vec<ContentReplacementEntry>,
     lifecycle: Vec<Line>,
@@ -60,7 +64,7 @@ impl RetainedState {
                 self.metadata.family_message_hold = Some(entry.clone())
             }
             Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
-            Line::ScheduledTasks(entry) => self.metadata.scheduled_tasks = Some(entry.clone()),
+            Line::ScheduledTasks(entry) => self.scheduled_tasks = Some(entry.clone()),
             Line::FamilyCompletions(entry) => {
                 self.metadata.family_completions = Some(entry.clone())
             }
@@ -205,6 +209,7 @@ pub(crate) fn assemble(
     }
     let RetainedState {
         metadata,
+        scheduled_tasks,
         file_history_snapshots,
         content_replacements,
         lifecycle,
@@ -263,6 +268,7 @@ pub(crate) fn assemble(
             uuids,
             chain: Vec::new(),
             metadata,
+            scheduled_tasks,
             file_history_snapshots,
             content_replacements,
             warnings,
@@ -307,6 +313,7 @@ pub(crate) fn assemble(
         uuids,
         chain,
         metadata,
+        scheduled_tasks,
         file_history_snapshots,
         content_replacements,
         warnings,
