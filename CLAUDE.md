@@ -14,7 +14,7 @@ Tickloop（tickloop.ai）是面向代码与办公的终端 AI Agent，以 Tick�
 - Herdr Pane、Monitor 弹窗与普通终端只是附着视图，同一 Tick 可同时有多个视图；`open` 带 placement 时另建一个视图 Pane。关闭视图不结束 Tick，结束 Tick 用 TickManage `close` 或 Monitor。默认当前 Workspace，明确指定时可跨 Workspace；Herdr 外 Tick 照常运行，只是不能显示在 Pane 中。
 - 订阅频率只有四档：及时（Shell 固定）、高频 1 分钟（扩展 Tick 与 Terminal Tick 的默认）、中频 10 分钟、低频 30 分钟。状态类 update 只给最新一份：扩展 Tick 的业务变化、Terminal Tick 到期时与上次送出不同的屏幕文字、Shell 的退出。Artifact 不接受 Tick Subscription，Artifact 关联向同一用户的每个关联 Agent 交付 @tickloop 留言，反馈没有执行任务状态（ADR 0028）。安静无模型调用、忙时合并和停止规则由现有 Loop runtime 持有。
 - 订阅的已有内容只建立基线，后来加入和取消重启都有自己的起点。移动视图不改变实例身份，重启／重开需要重新选取，不静默改绑旧订阅。
-- detach/attach 保留活进程。关闭 Agent Pane、`/exit` 或 View EOF 只离开界面，本机 daemon 中的 Agent 继续；Shell 随普通 Worker 退出结束，计划升级先交接所有权。执行所有者退出与历史装载／明确 Continue 分别处理，见 ADR 0013、0014。修改安装升级、进程生命周期或版本回收前，读取 ADR 0029（`docs/adr/0029-graceful-local-runtime-upgrades.md`），以及维护者本地的平滑升级规格 `.scratch/graceful-upgrades/spec.md`（存在时）。
+- detach/attach 保留活进程。关闭 Agent Pane、`/exit` 或 View EOF 只离开界面，本机 daemon 中的 Agent 继续（托管执行的客户端 EOF 按控制租约释放，见下文 ACP 与 `-p`）；Shell 随普通 Worker 退出结束，计划升级先交接所有权。执行所有者退出与历史装载／明确 Continue 分别处理，见 ADR 0013、0014。修改安装升级、进程生命周期或版本回收前，读取 ADR 0029（`docs/adr/0029-graceful-local-runtime-upgrades.md`），以及维护者本地的平滑升级规格 `.scratch/graceful-upgrades/spec.md`（存在时）。
 - 工具先解析目标和参数，再让同一份单次准备结果贯穿审批与执行。超时/取消发生在派发之后时可能是 OutcomeUnknown，修改操作不自动重发。Skill 不提供额外权限。
 
 详细契约与操作入口见 Tickhost 与 Herdr 视图（`docs/design/native-herdr.md`） 与 ADR 0024（`docs/adr/0024-tickhost-runs-every-local-tick.md`）；维护者本地的实现规格与验收依据在 `.scratch/tickhost-unification/spec.md`，进度和证据在其 `issues/` 下各工单的记录（存在时）。设计记录不等于运行验收。
@@ -36,9 +36,9 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 
 | 路径 | 内容 |
 | --- | --- |
-| `agent/tickloop/` | 可执行文件 `tickloop`：分派 Console、`daemon run`／`daemon stop`、`worker`、`monitor` 与 `tick`（Tick 包的 install／uninstall／login／logout／list，安装与登录经 `agent/packages`）；端到端测试与 cli_fixture |
-| `agent/print/` | `-p`／`--print` 非交互薄适配器，复用 AgentAccess 托管执行；stdout 仅最终文本或版本化 JSON／JSONL |
-| `agent/acp/` | `tickloop acp` stdio 适配器，使用官方 ACP SDK，仅通过 AgentAccess 执行；ACP 不是 Tick 类型 |
+| `agent/tickloop/` | 可执行文件 `tickloop`：分派 Console、`-p`／`--print`、`acp`、`daemon run`／`daemon stop`、`worker`、`monitor` 与 `tick`（Tick 包的 install／uninstall／login／logout／list，安装与登录经 `agent/packages`）；端到端测试与 cli_fixture |
+| `agent/print/` | `-p`／`--print` 非交互薄适配器，复用 AgentAccess 托管执行；stdout 仅最终文本或版本化 JSON／JSONL；依赖 client、config 与 protocol |
+| `agent/acp/` | `tickloop acp` stdio 适配器，使用官方 ACP SDK，仅通过 AgentAccess 执行；ACP 不是 Tick 类型；依赖 client、config、model、base、protocol 与 transcript |
 | `agent/console/` | Agent Console（terminal、agent_console、Monitor 行，含 `/ticks` 面板），只经 AgentAccess 访问 Agent，不依赖 runtime 与 daemon；Tick 包经 `agent/packages` 管理 |
 | `agent/packages/` | Tick 市场的读取与下载（https，市场在本机时才接受本机 http），`/ticks` 与 `tickloop tick` 共用的安装、更新、卸载、登录与退出登录（OAuth 经 tick/oauth，按 base 的 HTTP 策略建客户端）；依赖 base、tick/packages 与 tick/oauth |
 | `agent/client/` | AgentAccess 客户端：Unix socket 传输、断线恢复、查找或启动本机 daemon；只依赖 protocol |
