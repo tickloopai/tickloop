@@ -346,7 +346,7 @@ fn clearing_removes_any_goal() {
 }
 
 #[test]
-fn usage_counts_from_setting_and_survives_pause_and_resume() {
+fn usage_counts_only_while_active_and_survives_pause_and_resume() {
     let goal = goal_with(None);
     assert_eq!(goal.tokens_used, 0);
     let goal = next(&goal, GoalEvent::TokensUsed(300));
@@ -356,11 +356,21 @@ fn usage_counts_from_setting_and_survives_pause_and_resume() {
     let goal = next(&goal, GoalEvent::TimeElapsed { ms: 5_000 });
     let goal = next(&goal, GoalEvent::Resume);
     let goal = next(&goal, GoalEvent::TokensUsed(100));
-    assert_eq!(goal.tokens_used, 600);
+    assert_eq!(goal.tokens_used, 400);
     assert_eq!(goal.time_used_ms, 2_000);
 
-    let complete = with_status(GoalStatus::Complete);
-    assert_eq!(next(&complete, GoalEvent::TokensUsed(100)), complete);
+    for status in [
+        paused(GoalPause::Interrupted),
+        blocked(),
+        GoalStatus::BudgetLimited,
+        GoalStatus::Complete,
+    ] {
+        let goal = with_status(status);
+        let transition = step(&goal, GoalEvent::TokensUsed(100));
+        assert_eq!(transition.goal, Some(goal.clone()));
+        assert!(transition.effects.is_empty());
+        assert_eq!(next(&goal, GoalEvent::TimeElapsed { ms: 100 }), goal);
+    }
 }
 
 #[test]
@@ -407,8 +417,13 @@ fn a_budget_limited_goal_resumes_only_after_the_budget_is_raised_or_removed() {
     }
 
     let paused_over_budget = next(
-        &next(&goal_with(Some(1_000)), GoalEvent::Pause),
-        GoalEvent::TokensUsed(1_000),
+        &next(
+            &next(&goal_with(Some(1_000)), GoalEvent::TokensUsed(600)),
+            GoalEvent::Pause,
+        ),
+        GoalEvent::SetBudget {
+            token_budget: Some(500),
+        },
     );
     assert_eq!(paused_over_budget.status, paused(GoalPause::User));
     assert_eq!(
@@ -464,12 +479,17 @@ fn three_quiet_continuations_block_the_goal() {
 }
 
 #[test]
-fn user_turns_do_not_count_and_progress_resets_the_quiet_count() {
+fn user_turns_and_progress_break_a_run_of_quiet_continuations() {
     let goal = next(&goal_with(None), continuation(false, false));
     let goal = next(&goal, continuation(false, false));
     let after_user_turn = next(&goal, user_turn());
-    assert_eq!(after_user_turn.quiet_turns, 2);
+    assert_eq!(after_user_turn.quiet_turns, 0);
     assert_eq!(after_user_turn.status, GoalStatus::Active);
+
+    let goal_after_user_turn = next(&after_user_turn, continuation(false, false));
+    let goal_after_user_turn = next(&goal_after_user_turn, continuation(false, false));
+    assert_eq!(goal_after_user_turn.quiet_turns, 2);
+    assert_eq!(goal_after_user_turn.status, GoalStatus::Active);
 
     assert_eq!(next(&goal, continuation(true, false)).quiet_turns, 0);
     assert_eq!(next(&goal, continuation(false, true)).quiet_turns, 0);

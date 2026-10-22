@@ -32,7 +32,7 @@ pub(crate) enum GoalEvent {
         token_budget: Option<u64>,
     },
     TurnEnded(TurnSummary),
-    /// Tokens any model of the Agent family reported.
+    /// Tokens any model of the Agent family reported; only an active goal counts them.
     TokensUsed(u64),
     /// Running time since the last report.
     TimeElapsed {
@@ -259,7 +259,7 @@ pub(crate) fn apply(
             }
         }
         GoalEvent::TokensUsed(tokens) => {
-            if !current.status.is_finished() {
+            if current.status == GoalStatus::Active {
                 next.tokens_used = next.tokens_used.saturating_add(tokens);
                 limit_if_exhausted(&mut next, &mut effects);
             }
@@ -359,11 +359,8 @@ fn end_turn(goal: &mut GoalSnapshot, summary: TurnSummary, effects: &mut Vec<Goa
         block(goal, GoalBlock::ExecutionFailed { error }, effects);
         return;
     }
-    // Only continuations count toward the quiet limit; a user-triggered turn leaves it alone.
-    if !summary.continuation {
-        return;
-    }
-    if summary.called_tools || summary.replied_substantively {
+    // A user-triggered turn never counts as quiet, but it breaks a run of quiet continuations.
+    if !summary.continuation || summary.called_tools || summary.replied_substantively {
         goal.quiet_turns = 0;
         return;
     }

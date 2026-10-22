@@ -10,8 +10,8 @@ pub struct GoalSnapshot {
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
-    /// Tokens the whole Agent family's models reported since the goal was set; pausing and
-    /// resuming do not reset it.
+    /// Tokens the whole Agent family's models reported while the goal was active since it was
+    /// set; pausing and resuming do not reset it.
     pub tokens_used: u64,
     /// Time spent while the goal was active.
     pub time_used_ms: u64,
