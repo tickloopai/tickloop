@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::Value;
-use tickloop_agent_protocol::{ToolResultContent, Usage};
+use tickloop_agent_protocol::{GoalVerdict, ToolResultContent, Usage};
 
 const OBJECTIVE: &str = "Ship the export command with tests";
 const REPORT: &str = "cargo test export passed";
@@ -186,13 +186,13 @@ fn cutting_respects_character_boundaries() {
 fn reply_parses_into_the_three_verdicts() {
     assert_eq!(
         parse_check_reply(&output(r#"{"verdict":"met","reason":"tests pass"}"#)),
-        Ok(CheckVerdict::Met)
+        Ok(GoalVerdict::Met)
     );
     assert_eq!(
         parse_check_reply(&output(
             r#"{"verdict":"not_met","reason":" No test output shown "}"#
         )),
-        Ok(CheckVerdict::NotMet {
+        Ok(GoalVerdict::NotMet {
             reason: "No test output shown".into(),
         })
     );
@@ -200,7 +200,7 @@ fn reply_parses_into_the_three_verdicts() {
         parse_check_reply(&output(
             "```json\n{\"verdict\":\"impossible\",\"reason\":\"The API was removed\"}\n```"
         )),
-        Ok(CheckVerdict::Impossible {
+        Ok(GoalVerdict::Impossible {
             reason: "The API was removed".into(),
         })
     );

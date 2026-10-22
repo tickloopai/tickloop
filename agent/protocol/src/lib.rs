@@ -14,6 +14,7 @@ mod denials;
 mod family;
 mod file_change;
 mod frame;
+mod goal;
 mod history;
 mod host;
 mod hosted;
@@ -110,6 +111,9 @@ pub use file_change::{
     PreparedFileChange,
 };
 pub use frame::{check_frame_length, decode_frame, encode_frame};
+pub use goal::{
+    GoalAction, GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+};
 pub use history::{
     ActiveConversationItem, BranchCreation, BranchOrigin, BranchOutcome, BranchPublicItem,
     BranchPublicSource, BranchRequest, BranchSessionPermissionRegistration, COMPACT_BOUNDARY_TEXT,

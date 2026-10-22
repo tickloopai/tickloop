@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tickloop_agent_model::{ModelOutput, ModelRequest, StructuredOutput};
-use tickloop_agent_protocol::{Content, Message, Role};
+use tickloop_agent_protocol::{Content, GoalVerdict, Message, Role};
 
 pub(crate) const CHECK_RESULT_NAME: &str = "goal_check_result";
 const CHECK_SYSTEM_PROMPT: &str = include_str!("templates/completion_check.md");
@@ -64,18 +64,6 @@ pub(crate) struct EvidenceTruncation {
     pub omitted_oldest: usize,
     pub shortened: usize,
     pub omitted_bytes: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CheckVerdict {
-    Met,
-    /// The goal stays active; the reason guides the next continuation.
-    NotMet {
-        reason: String,
-    },
-    Impossible {
-        reason: String,
-    },
 }
 
 #[derive(Serialize)]
@@ -204,7 +192,7 @@ pub(crate) fn check_request(
     }
 }
 
-pub(crate) fn parse_check_reply(output: &ModelOutput) -> Result<CheckVerdict, &'static str> {
+pub(crate) fn parse_check_reply(output: &ModelOutput) -> Result<GoalVerdict, &'static str> {
     if !matches!(output.stop_reason.as_str(), "end_turn" | "stop") {
         return Err("completion check response did not finish");
     }
@@ -228,12 +216,12 @@ pub(crate) fn parse_check_reply(output: &ModelOutput) -> Result<CheckVerdict, &'
         .map_err(|_| "completion check returned an invalid verdict")?;
     let reason = reply.reason.trim().to_owned();
     match reply.verdict {
-        ReplyVerdict::Met => Ok(CheckVerdict::Met),
+        ReplyVerdict::Met => Ok(GoalVerdict::Met),
         ReplyVerdict::NotMet | ReplyVerdict::Impossible if reason.is_empty() => {
             Err("completion check gave no reason")
         }
-        ReplyVerdict::NotMet => Ok(CheckVerdict::NotMet { reason }),
-        ReplyVerdict::Impossible => Ok(CheckVerdict::Impossible { reason }),
+        ReplyVerdict::NotMet => Ok(GoalVerdict::NotMet { reason }),
+        ReplyVerdict::Impossible => Ok(GoalVerdict::Impossible { reason }),
     }
 }
 
