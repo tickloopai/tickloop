@@ -14,6 +14,7 @@ use tickloop_agent_protocol::{
     ChatSnapshot, Coalesce, LoopSnapshot, LoopState, OperationRecord, PauseReason, Receipt,
     Receiving, TriggerSource,
 };
+use tickloop_agent_transcript::Line;
 
 const STOPPED_BEFORE_ADMISSION: &str = "the Chat was stopped before Shell admission";
 
@@ -24,6 +25,27 @@ pub(super) struct TriggerDelivery {
     pub(super) input: String,
     /// The ledger input a host named for it; otherwise the source names one.
     pub(super) ledger: Option<lifecycle::LedgerInput>,
+    /// The source's own change for this delivery, made with its acceptance.
+    pub(super) on_accept: Option<SourceCommit>,
+}
+
+/// A source's own change for a delivery, such as a scheduled task's next time or the run it
+/// started: called once as the delivery is accepted, queued or merged, with the receipt it is
+/// accepted under; not for a replay, a hold or a refusal, which leave the delivery with its
+/// source. It is called within the Chat's boundary and under the Chats lock, after the
+/// acceptance's ledger record is queued for the Transcript, so what it changes in the Chat or
+/// records with `record_chat_metadata` lands after that record, in the checkpoint that follows
+/// the acceptance, and no later than the start record the delivery's turn waits for.
+pub(super) type SourceCommit = Box<dyn FnOnce(&Agent, &mut Chat, &Receipt) + Send>;
+
+/// A Trigger source's own state kept in the Chat's Transcript beside the ledger, such as a Goal
+/// or the scheduled tasks and their revocations.
+pub(super) trait TriggerSourceState: Send + Sync {
+    /// Takes the source's state over from `stored`, the Chat's stored Lines, under a newly taken
+    /// lease: within the Chat's boundary and under the Chats lock, right after the ledger's
+    /// Trigger records, before anything is accepted or started under the lease, so eligibility
+    /// reads the newest state another process left.
+    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]);
 }
 
 /// Why a delivery waits at its source instead of entering the Loop's queue, or why a queued one
@@ -374,6 +396,7 @@ impl Agent {
             source,
             input,
             ledger,
+            on_accept,
         } = delivery;
         Box::pin(self.submit_internal(
             chat_id,
@@ -381,6 +404,7 @@ impl Agent {
             SubmissionOptions {
                 trigger_source: Some(source),
                 trigger_lease: Some((holding, boundary)),
+                trigger_commit: on_accept,
                 ledger,
                 ..Default::default()
             },
@@ -499,6 +523,10 @@ impl Agent {
                 .get_mut(&chat_id)
                 .ok_or("the Chat is no longer loaded")?;
             chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
+            let states = self.inner.trigger_source_states.read().unwrap().clone();
+            for state in states {
+                state.take_over(self, chat, &lines);
+            }
             let lifecycle = &chat.bookkeeping.lifecycle;
             let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut chat.snapshot.pending_inputs)
@@ -552,6 +580,38 @@ impl Agent {
         })
     }
 
+    /// Registers a source's own state, taken over from the store with each newly taken lease;
+    /// sources register as the Agent is built.
+    pub(super) fn register_trigger_source_state(&self, state: Arc<dyn TriggerSourceState>) {
+        self.inner
+            .trigger_source_states
+            .write()
+            .unwrap()
+            .push(state);
+    }
+
+    /// The change a source made with an acceptance reaches the Transcript with it, within the
+    /// boundary; a failure leaves both queued, for the start record the turn waits for.
+    pub(super) async fn checkpoint_trigger_acceptance(&self, chat_id: ChatId) {
+        if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
+            let _ = self
+                .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await;
+        }
+    }
+
+    /// Applies a source's change for a delivery just accepted, after the acceptance is queued
+    /// for the Transcript.
+    pub(super) fn commit_trigger_source(
+        &self,
+        chat: &mut Chat,
+        commit: SourceCommit,
+        receipt: &Receipt,
+    ) {
+        self.queue_for_transcript(chat);
+        commit(self, chat, receipt);
+    }
+
     /// The pause another process recorded: this process pauses too, without recording it again.
     pub(super) async fn pause_receiving_paused_elsewhere(&self, chat_id: ChatId) {
         {
@@ -569,24 +629,71 @@ impl Agent {
     /// Trigger input queued while it was paused may start. A Loop already receiving only looks
     /// again at its artifact links, whose account may be back.
     pub(super) async fn continue_receiving(&self, chat_id: ChatId) {
-        let resumed = {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&chat_id) else {
-                return;
-            };
-            let resumed = resume_receiving(chat);
-            if resumed {
-                self.resume_scheduled_tasks(chat);
-                self.save(&chat.snapshot);
-            }
-            resumed.then_some(chat.snapshot.chat_loop.id)
-        };
-        if let Some(loop_id) = resumed {
-            self.record_receiving(chat_id, ReceivingChange::Resumed)
-                .await;
+        let change = self.change_receiving(chat_id, ReceivingChange::Resumed);
+        if let Ok(Some(loop_id)) = change.await {
             self.flush_due_tick_delivery(chat_id, loop_id);
+            // A turn that ended while the switch was off left the input waiting for it.
+            self.inner
+                .tasks
+                .spawn(self.clone().start_waiting_input(chat_id));
         }
         Box::pin(self.resume_feedback_sources(chat_id)).await;
+    }
+
+    /// Turns the receiving switch here and records it for other processes in one operation of
+    /// the Chat's Trigger boundary, so the switch here and the recorded one never part: a pause
+    /// also releases the lease, after whatever the boundary was doing. The Loop's id when the
+    /// switch turned; a resume of a Loop already receiving changes and records nothing.
+    /// Started at once on a task of the Agent's own, which a caller that stops waiting does not
+    /// stop: the switch here is never left turned without its record.
+    fn change_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> tokio::task::JoinHandle<Option<LoopId>> {
+        self.inner
+            .tasks
+            .spawn(self.clone().change_receiving_whole(chat_id, change))
+    }
+
+    fn change_receiving_whole(
+        self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> futures_util::future::BoxFuture<'static, Option<LoopId>> {
+        Box::pin(async move { self.change_and_record_receiving(chat_id, change).await })
+    }
+
+    async fn change_and_record_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+    ) -> Option<LoopId> {
+        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let changed = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id)?;
+            let changed = match change {
+                ReceivingChange::Paused => {
+                    pause_receiving(chat, PauseReason::Stopped);
+                    true
+                }
+                ReceivingChange::Resumed => resume_receiving(chat),
+            };
+            if changed {
+                if change == ReceivingChange::Resumed {
+                    self.resume_scheduled_tasks(chat);
+                }
+                self.save(&chat.snapshot);
+            }
+            changed.then_some(chat.snapshot.chat_loop.id)
+        };
+        changed?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(chat_id, trigger_pauses::PausePoint::ReceivingChanged)
+            .await;
+        self.record_receiving(chat_id, change, boundary).await;
+        changed
     }
 
     /// `/stop`: interrupts the current turn, with every turn that waits for a person, discards
@@ -633,8 +740,11 @@ impl Agent {
             self.save(&chat.snapshot);
             operations
         };
-        // Recorded before the lease is returned: a process taking it over sees the pause.
-        self.record_receiving(chat_id, ReceivingChange::Paused)
+        // Paused here at once, so no Trigger input starts meanwhile, and again with the record,
+        // before the lease is returned: a process taking it over sees the pause. The record is
+        // started with the pause, so a stop that stops waiting still records it.
+        let _ = self
+            .change_receiving(chat_id, ReceivingChange::Paused)
             .await;
         Ok(operations)
     }
@@ -663,23 +773,65 @@ impl Agent {
         source: TriggerSource,
         input: &str,
     ) -> Result<Receipt, AgentError> {
-        if let TriggerSource::ScheduledTask {
-            task_id,
-            scheduled_for_ms,
-        } = &source
-        {
-            self.stand_in_scheduled_task(chat_id, task_id, *scheduled_for_ms)
-                .await;
-        }
+        self.stand_in_scheduled_task(chat_id, &source).await;
         self.deliver_trigger(
             chat_id,
             TriggerDelivery {
                 source,
                 input: input.into(),
                 ledger: None,
+                on_accept: None,
             },
         )
         .await
+    }
+
+    /// Hands a delivery to the one entry with `commit` as its source's change, which records
+    /// the Lines it returns for the Transcript.
+    #[doc(hidden)]
+    pub async fn deliver_trigger_with_commit_for_tests(
+        &self,
+        chat_id: ChatId,
+        source: TriggerSource,
+        input: &str,
+        commit: impl FnOnce(&mut ChatSnapshot, &Receipt) -> Vec<Line> + Send + 'static,
+    ) -> Result<Receipt, AgentError> {
+        self.stand_in_scheduled_task(chat_id, &source).await;
+        self.deliver_trigger(
+            chat_id,
+            TriggerDelivery {
+                source,
+                input: input.into(),
+                ledger: None,
+                on_accept: Some(Box::new(
+                    move |agent: &Agent, chat: &mut Chat, receipt: &Receipt| {
+                        for line in commit(&mut chat.snapshot, receipt) {
+                            agent.record_chat_metadata(chat.snapshot.id, line);
+                        }
+                    },
+                )),
+            },
+        )
+        .await
+    }
+
+    /// Registers, as a source does, a state that takes over the Chat's snapshot from its stored
+    /// Lines with each newly taken lease.
+    #[doc(hidden)]
+    pub fn register_trigger_source_state_for_tests(
+        &self,
+        take_over: impl Fn(&mut ChatSnapshot, &[Line]) + Send + Sync + 'static,
+    ) {
+        struct TestSourceState<F>(F);
+        impl<F> TriggerSourceState for TestSourceState<F>
+        where
+            F: Fn(&mut ChatSnapshot, &[Line]) + Send + Sync,
+        {
+            fn take_over(&self, _agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+                (self.0)(&mut chat.snapshot, stored);
+            }
+        }
+        self.register_trigger_source_state(Arc::new(TestSourceState(take_over)));
     }
 
     /// Takes back the queued deliveries `ended` names, as a source that stopped standing behind
@@ -717,9 +869,25 @@ impl Agent {
         trigger_pauses::pause_next(self.pause_key(), chat_id, point)
     }
 
+    /// How long Trigger input waits for its start to be recorded before receiving pauses, for
+    /// the tests of this process.
+    #[doc(hidden)]
+    pub fn set_trigger_start_budget_for_tests(budget: std::time::Duration) {
+        super::TRIGGER_START_BUDGET_FOR_TESTS.store(
+            budget.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Holds the Chat at `point` if a test asked to.
     pub(super) async fn pause_point(&self, chat_id: ChatId, point: trigger_pauses::PausePoint) {
         trigger_pauses::wait_if_paused(self.pause_key(), chat_id, point).await;
+    }
+
+    /// Holds the thread at `point` if a test asked to, for a point within work that does not
+    /// yield.
+    pub(super) fn pause_point_blocking(&self, chat_id: ChatId, point: trigger_pauses::PausePoint) {
+        trigger_pauses::wait_if_paused_blocking(self.pause_key(), chat_id, point);
     }
 
     /// Pauses are this Agent's own: another Agent in the same test process holding the same Chat
@@ -743,11 +911,20 @@ pub mod trigger_pauses {
     pub enum PausePoint {
         /// A takeover read the store and has not applied it.
         TakeoverRead,
+        /// A permit is about to check the lease, on the thread that runs it.
+        LeaseChecking,
+        /// The receiving switch turned here and is not recorded yet.
+        ReceivingChanged,
         /// The receiving switch was recorded, and a pause has not released its holding.
         ReceivingRecorded,
         /// Queued Trigger input passed its permit and the check of its holding, and has not
         /// started.
         TriggerChecked,
+        /// Queued Trigger input started, and its start is not recorded durably yet.
+        TriggerStarted,
+        /// A shutdown abandons Trigger input whose start is not recorded, before it drops
+        /// what the Transcript did not take.
+        TriggerStartAbandoned,
     }
 
     type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
@@ -770,6 +947,21 @@ pub mod trigger_pauses {
             .get_or_insert_with(HashMap::new)
             .insert((agent, chat, point), (entered_sender, release_receiver));
         Pause { entered, release }
+    }
+
+    pub(crate) fn wait_if_paused_blocking(agent: usize, chat: ChatId, point: PausePoint) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|gates| gates.remove(&(agent, chat, point)));
+        if let Some((entered, mut release)) = gate {
+            let _ = entered.send(());
+            // Waiting within the runtime's own thread: polled, as a blocking receive would refuse.
+            while matches!(release.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     pub(crate) async fn wait_if_paused(agent: usize, chat: ChatId, point: PausePoint) {

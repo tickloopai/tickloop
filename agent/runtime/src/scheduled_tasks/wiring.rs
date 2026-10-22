@@ -251,12 +251,15 @@ impl Agent {
     /// the task or cancelled it, a recurring task with that id is due at the run's time and
     /// does not time on its own, and the clock is pinned there unless a test pinned it.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn stand_in_scheduled_task(
-        &self,
-        chat_id: ChatId,
-        task_id: &str,
-        scheduled_for_ms: u64,
-    ) {
+    pub(crate) async fn stand_in_scheduled_task(&self, chat_id: ChatId, source: &TriggerSource) {
+        let TriggerSource::ScheduledTask {
+            task_id,
+            scheduled_for_ms,
+        } = source
+        else {
+            return;
+        };
+        let scheduled_for_ms = *scheduled_for_ms;
         {
             let mut fixed = self.inner.schedule_clock.fixed_now.lock().unwrap();
             if fixed.is_none() {
@@ -273,14 +276,14 @@ impl Agent {
         let known = snapshot
             .scheduled_tasks
             .iter()
-            .any(|task| task.id == task_id)
+            .any(|task| task.id == *task_id)
             || snapshot
                 .scheduled_task_revocations
                 .iter()
-                .any(|revocation| revocation.task_id == task_id);
+                .any(|revocation| revocation.task_id == *task_id);
         if !known {
             snapshot.scheduled_tasks.push(ScheduledTask {
-                id: task_id.to_owned(),
+                id: task_id.clone(),
                 kind: ScheduledTaskKind::Recurring {
                     cron: "* * * * *".into(),
                 },
@@ -744,6 +747,7 @@ impl Agent {
                         },
                         input,
                         ledger: None,
+                        on_accept: None,
                     };
                     Some((
                         DueRun {

@@ -90,6 +90,9 @@ pub enum PauseReason {
     Stopped,
     /// The Chat was loaded from its history; a planned upgrade's live handoff is no such load.
     HistoryLoaded,
+    /// A Trigger input's start could not be recorded in the Transcript for too long; the
+    /// process keeps the Chat's lease and tries on.
+    TranscriptUnavailable,
 }
 
 /// An artifact linked to a Loop for one account's @tickloop feedback requests. Records saved in
