@@ -8,8 +8,8 @@ use std::time::Duration;
 use tickloop_agent_protocol::ChatId;
 use tickloop_agent_transcript::{
     AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
-    FamilyCompletionsEntry, FamilyInputsEntry, LastPromptEntry, Line, MonitorMembersEntry,
-    ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
+    FamilyCompletionsEntry, FamilyInputsEntry, FamilyMessageHoldEntry, LastPromptEntry, Line,
+    MonitorMembersEntry, ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
 };
 use uuid::Uuid;
 
@@ -30,6 +30,7 @@ pub(crate) struct CachedMetadata {
     pub subagents: Option<SubagentsEntry>,
     pub family_completions: Option<FamilyCompletionsEntry>,
     pub family_inputs: Option<FamilyInputsEntry>,
+    pub family_message_hold: Option<FamilyMessageHoldEntry>,
     pub sent_agent_messages: Option<SentAgentMessagesEntry>,
     pub provenance: Option<ProvenanceEntry>,
     pub citation_sources: Option<tickloop_agent_transcript::CitationSourcesEntry>,
@@ -49,6 +50,7 @@ impl CachedMetadata {
             Line::TaskBoards(entry) => self.task_boards = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
+            Line::FamilyMessageHold(entry) => self.family_message_hold = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
             Line::Provenance(entry) => self.provenance = Some(entry.clone()),
             Line::CitationSources(entry) => self.citation_sources = Some(entry.clone()),
@@ -69,6 +71,11 @@ impl CachedMetadata {
             .chain(self.task_boards.clone().map(Line::TaskBoards))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
+            .chain(
+                self.family_message_hold
+                    .clone()
+                    .map(Line::FamilyMessageHold),
+            )
             .chain(
                 self.sent_agent_messages
                     .clone()

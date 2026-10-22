@@ -22,7 +22,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         SubagentNotificationDelivery::Queued,
         SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
             code: FamilyMessageRejectionCode::StaleTarget,
-            message: "The receiving parent is stopped".into(),
+            message: "The receiving parent is unavailable".into(),
         }),
     ] {
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({

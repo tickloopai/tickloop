@@ -350,6 +350,28 @@ impl ChatRecorder {
         );
     }
 
+    pub(super) fn record_family_message_hold(&self, chat: &Chat, stopped_runs: HashSet<RunId>) {
+        // Sync advances the lifecycle revision baseline with the records queued alongside the
+        // hold. An append already in progress may drain this group before the next dirty flush.
+        let Some(mut lines) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
+            return;
+        };
+        lines.push(Line::FamilyMessageHold(
+            tickloop_agent_transcript::FamilyMessageHoldEntry {
+                chat_id: chat.snapshot.id,
+                stopped_runs,
+            },
+        ));
+        self.outbox.set_display_leaf(
+            chat.snapshot.id,
+            chat.bookkeeping
+                .lifecycle
+                .display_leaf(&chat.snapshot, &chat.bookkeeping.message_responses),
+        );
+        self.outbox
+            .enqueue(chat.snapshot.id, lines, Some(chat.snapshot.last_sequence));
+    }
+
     pub(super) fn record_family_inputs(
         &self,
         chat_id: ChatId,
@@ -3352,6 +3374,15 @@ impl Agent {
             RestoreTarget::Resume => self.inner.waits,
             RestoreTarget::NewChat { .. } => WaitHosting::Process,
         };
+        let stopped_runs = (chat_id == source_chat_id).then(|| {
+            loaded
+                .metadata
+                .family_message_hold
+                .as_ref()
+                .filter(|entry| entry.chat_id == chat_id)
+                .map(|entry| entry.stopped_runs.clone())
+                .unwrap_or_default()
+        });
         let registrations = if chat_id == source_chat_id {
             loaded
                 .metadata
@@ -3471,6 +3502,14 @@ impl Agent {
             .lock()
             .await
             .insert(chat_id, registrations);
+        if let Some(stopped_runs) = stopped_runs {
+            self.inner
+                .family_mailbox
+                .lock()
+                .await
+                .stopped_runs
+                .insert(chat_id, stopped_runs);
+        }
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {

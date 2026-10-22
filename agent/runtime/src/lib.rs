@@ -58,6 +58,9 @@ pub mod tick_tools;
 pub mod transcript;
 pub use family::summary_state;
 mod family_mailbox;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod family_pauses;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
 mod chat_reads;
@@ -762,57 +765,40 @@ impl Chat {
     }
 
     /// Cancels the running run, or else the latest waiting one, as the user's interruption.
-    /// Queued user messages stay armed and start right after it; Agent messages queued for the
-    /// interrupted Loop wait for explicit continuation. Returns the operations whose outcome the
-    /// interruption may leave admitted or unknown.
+    /// Queued user and Agent messages stay armed and start right after it. Returns the
+    /// operations whose outcome the interruption may leave admitted or unknown.
     /// Esc: interrupts the running turn, or else the latest one waiting for a person.
     fn interrupt(&mut self) -> Vec<OperationRecord> {
-        let mut is_interrupted = false;
         if let Some(cancel) = &self.active {
             cancel.cancel();
             if let Some(run_id) = self.active_run {
                 self.user_cancelled_runs.insert(run_id);
-                is_interrupted = true;
             }
         } else if let Some(waiting) = self.parked.values().max_by_key(|run| run.sequence) {
             waiting.cancel.cancel();
             self.user_cancelled_runs.insert(waiting.receipt.run_id);
-            is_interrupted = true;
-        }
-        if is_interrupted {
-            self.hold_queued_agent_messages();
         }
         self.uncertain_operations()
     }
 
     /// `/stop`: interrupts the running turn and every turn waiting for a person.
     fn interrupt_every_run(&mut self) -> Vec<OperationRecord> {
-        let mut is_interrupted = false;
         if let Some(cancel) = &self.active {
             cancel.cancel();
             if let Some(run_id) = self.active_run {
                 self.user_cancelled_runs.insert(run_id);
-                is_interrupted = true;
             }
         }
         for waiting in self.parked.values() {
             waiting.cancel.cancel();
             self.user_cancelled_runs.insert(waiting.receipt.run_id);
-            is_interrupted = true;
         }
-        if is_interrupted {
-            self.hold_queued_agent_messages();
+        // Root continuation may proceed after this stop's memory transition. Descendants
+        // remain closed to new execution until their subtree stop finishes.
+        if self.snapshot.delegation.is_none() {
+            self.family_stopping = false;
         }
         self.uncertain_operations()
-    }
-
-    /// Agent messages queued for an interrupted turn wait until the Chat is continued.
-    fn hold_queued_agent_messages(&mut self) {
-        for pending in &mut self.snapshot.pending_inputs {
-            if pending.agent_message.is_some() {
-                pending.armed = false;
-            }
-        }
     }
 
     fn uncertain_operations(&self) -> Vec<OperationRecord> {
@@ -1669,30 +1655,16 @@ impl Agent {
     }
 
     /// `/stop`: interrupts the current turn and pauses receiving until the Chat is continued.
-    /// On a Subagent it stops the member and its descendants.
+    /// Stops this Agent and all of its descendants.
     pub async fn stop(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
-        let is_child = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .snapshot
-            .delegation
-            .is_some();
-        if is_child {
-            let stopped = self.stop_subagent_tree(chat_id, None).await?;
-            if !stopped.failures.is_empty() {
-                return Err(AgentError::Invalid(format!(
-                    "Subagent subtree stop was incomplete: {}",
-                    serde_json::json!({"failures":stopped.failures,"unresolved_operations":stopped.operations})
-                )));
-            }
-            Ok(stopped.operations)
-        } else {
-            self.stop_loop(chat_id).await
+        let stopped = self.stop_subagent_tree(chat_id, None).await?;
+        if !stopped.failures.is_empty() {
+            return Err(AgentError::Invalid(format!(
+                "Agent subtree stop was incomplete: {}",
+                serde_json::json!({"failures":stopped.failures,"unresolved_operations":stopped.operations})
+            )));
         }
+        Ok(stopped.operations)
     }
 
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
@@ -2530,6 +2502,11 @@ impl Agent {
         if input.trim().is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
+        let mut family_mailbox = if continues_chat {
+            Some(self.inner.family_mailbox.lock().await)
+        } else {
+            None
+        };
         let mut chats = self.inner.chats.lock().await;
         if self.inner.closed.load(Ordering::SeqCst)
             || self.inner.upgrade_paused.load(Ordering::SeqCst)
@@ -2639,8 +2616,6 @@ impl Agent {
             return Ok(waiting);
         }
         let chat_loop = &mut chat.snapshot.chat_loop;
-        let continues_ended_turn =
-            matches!(chat_loop.state, LoopState::Failed | LoopState::Interrupted);
         if !matches!(
             chat_loop.state,
             LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
@@ -2702,6 +2677,11 @@ impl Agent {
         if let Some((index, _)) = cut {
             self.commit_cut(original, &mut candidate, index);
         }
+        if let Some(mailbox) = family_mailbox.as_mut() {
+            mailbox.stopped_runs.remove(&chat_id);
+            family::resume_messages(&mut candidate);
+            self.persist_family_message_hold(&candidate, mailbox);
+        }
         *original = candidate;
         if cut.is_none()
             && let Some(leaf) = selected_leaf
@@ -2722,6 +2702,7 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        drop(family_mailbox);
         // Accepted: the run it may start enters the boundary again to take it.
         drop(trigger_lease);
         if let Some(parent) = task_delegation {
@@ -2743,11 +2724,6 @@ impl Agent {
         if let Some(next) = next {
             self.run_task(next);
         }
-        // Child completions held for this failed or interrupted turn arrive once it is continued.
-        if continues_ended_turn {
-            self.flush_subagent_notifications(chat_id).await;
-        }
-
         self.inner.ledger_changes.send_replace(());
         if continues_chat {
             Box::pin(self.continue_receiving(chat_id)).await;
@@ -3902,7 +3878,6 @@ impl Agent {
             )?;
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
-            let mut agent_message_receipts = Vec::new();
             if pending.agent_message.is_none()
                 && pending.trigger_source.is_none()
                 && !pending.task_continuation
@@ -3931,19 +3906,10 @@ impl Agent {
                 let mut retained = Vec::new();
                 for queued in std::mem::take(&mut candidate.snapshot.pending_inputs) {
                     if queued.agent_message.is_some()
-                        && !queued.armed
+                        && queued.armed
                         && queued.receipt.loop_id == pending.receipt.loop_id
                     {
-                        let receipt = queued.receipt.clone();
-                        self.append_input_message(&mut candidate, queued);
-                        self.settle_input(
-                            &mut candidate,
-                            receipt.run_id,
-                            SettledOutcome::Merged {
-                                into: pending.receipt.run_id,
-                            },
-                        );
-                        agent_message_receipts.push(receipt);
+                        merged_inputs.push(queued);
                     } else {
                         retained.push(queued);
                     }
@@ -3965,7 +3931,9 @@ impl Agent {
             let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
             for queued in merged_inputs {
                 let consumed = queued.receipt.clone();
-                self.merge_host_context(&receipt, &consumed);
+                if queued.agent_message.is_none() {
+                    self.merge_host_context(&receipt, &consumed);
+                }
                 self.append_input_message(&mut candidate, queued);
                 self.settle_input(
                     &mut candidate,
@@ -3977,15 +3945,6 @@ impl Agent {
                 merged_receipts.push(consumed);
             }
             self.save(&candidate.snapshot);
-            for consumed in agent_message_receipts {
-                self.emit(
-                    &mut candidate,
-                    &consumed,
-                    EventKind::InputMerged {
-                        into_run_id: receipt.run_id,
-                    },
-                );
-            }
             self.start_response(&mut candidate, &receipt);
             self.emit(&mut candidate, &receipt, EventKind::Started);
             for consumed in merged_receipts {
