@@ -2,6 +2,7 @@ mod agent_messages;
 mod agent_tasks;
 mod approval_assessment;
 pub(crate) mod approval_context;
+mod artifact_reads;
 mod auto_approval;
 #[cfg(test)]
 mod auto_benchmark_tests;

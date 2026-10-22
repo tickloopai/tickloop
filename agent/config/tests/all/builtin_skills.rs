@@ -42,10 +42,12 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`ArtifactUpload` sends a local image file to a Slides artifact",
         "`asset:<asset_id>`",
         "when the user wants a doc, page or slides",
+        "read the body with `ArtifactRead` only when this Chat has not read or written it",
     ] {
         assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
     }
     for retired in [
+        "read the body with `ArtifactRead` when the task needs it",
         "herdr:",
         "every_seconds",
         "5–86400",

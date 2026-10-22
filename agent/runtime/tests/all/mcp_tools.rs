@@ -3762,6 +3762,66 @@ async fn an_artifact_result_reaches_the_model_once_and_a_page_read_stays_inline(
 }
 
 #[tokio::test]
+async fn reading_back_an_unchanged_page_this_chat_wrote_returns_a_note_instead_of_its_source() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "<!doctype html><html><head><title>Fixture</title></head><body><p>Own words</p></body></html>";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "create",
+            "ArtifactEdit",
+            json!({"action":"create","title":"Fixture","format":"page","content":source}),
+        ),
+        text("Created."),
+        call(
+            "own",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read my page."),
+        call(
+            "changed",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":CREATED_ARTIFACT}),
+        ),
+        text("Read the edited page."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let turn = async |prompt: &str, requests: usize| {
+        agent.submit(chat, None, prompt.into()).await.unwrap();
+        eventually(async || model.requests.lock().unwrap().len() >= requests).await;
+    };
+    turn("Make a page", 2).await;
+    let page = |revision: u64, source: &str| {
+        let body = json!({"artifact_id":CREATED_ARTIFACT,"title":"Fixture","format":"page","url":"https://example.invalid/artifact/page","access_role":"owner","revision":revision,"source":source});
+        json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":false})
+    };
+    *service.control.read_result.lock().unwrap() = Some(page(0, source));
+    turn("Read it back", 4).await;
+    let edited = "<!doctype html><html><head><title>Fixture</title></head><body><p>Someone else's words</p></body></html>";
+    *service.control.read_result.lock().unwrap() = Some(page(1, edited));
+    turn("Read it again", 6).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let own = tool_result_text(&requests[3], "own");
+        assert!(!own.contains("Own words"), "{own}");
+        let own: Value = serde_json::from_str(&own).unwrap();
+        assert_eq!(own["revision"], 0);
+        assert!(
+            own["source_unchanged"]
+                .as_str()
+                .unwrap()
+                .contains("edit from it instead of reading it again"),
+            "{own}"
+        );
+        let changed = tool_result_text(&requests[5], "changed");
+        assert!(changed.contains("Someone else's words"), "{changed}");
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
