@@ -40,13 +40,12 @@ impl KittyKeyboard {
         };
         let number = |text: &str, default: usize| text.parse().unwrap_or(default);
         match (final_byte, parameters.chars().next()) {
-            (b'h' | b'l', Some('?')) => {
+            (b'h' | b'l', Some('?'))
                 if parameters[1..]
                     .split(';')
-                    .any(|mode| ALTERNATE_SCREEN_MODES.contains(&mode))
-                {
-                    self.on_alternate = final_byte == b'h';
-                }
+                    .any(|mode| ALTERNATE_SCREEN_MODES.contains(&mode)) =>
+            {
+                self.on_alternate = final_byte == b'h';
             }
             (b'u', Some('>')) => {
                 let flags = number(&parameters[1..], 0) as u8;

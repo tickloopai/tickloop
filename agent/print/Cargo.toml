@@ -1,0 +1,24 @@
+[package]
+name = "tickloop-agent-print"
+description = "Non-interactive print adapter over AgentAccess"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tickloop-agent-client = { path = "../client" }
+tickloop-agent-config = { path = "../config" }
+tickloop-agent-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+async-trait = "0.1"

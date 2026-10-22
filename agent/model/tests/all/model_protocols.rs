@@ -120,6 +120,7 @@ fn message(role: Role, text: &str) -> Message {
 fn response_event(event_type: &str, sequence: u64, mut value: Value) -> String {
     value["type"] = json!(event_type);
     value["sequence_number"] = json!(sequence);
+    value.sort_all_objects();
     format!("event: {event_type}\ndata: {value}\n\n")
 }
 

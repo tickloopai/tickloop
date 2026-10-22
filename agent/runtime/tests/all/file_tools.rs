@@ -213,8 +213,9 @@ async fn agent_answers_from_a_real_file_in_its_chat_directory() {
             .as_object()
             .unwrap()
             .keys()
-            .collect::<Vec<_>>(),
-        ["file_path", "limit", "offset"]
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["file_path", "limit", "offset"])
     );
     agent.shutdown().await;
 }

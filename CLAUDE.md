@@ -37,6 +37,8 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 | 路径 | 内容 |
 | --- | --- |
 | `agent/tickloop/` | 可执行文件 `tickloop`：分派 Console、`daemon run`／`daemon stop`、`worker`、`monitor` 与 `tick`（Tick 包的 install／uninstall／login／logout／list，安装与登录经 `agent/packages`）；端到端测试与 cli_fixture |
+| `agent/print/` | `-p`／`--print` 非交互薄适配器，复用 AgentAccess 托管执行；stdout 仅最终文本或版本化 JSON／JSONL |
+| `agent/acp/` | `tickloop acp` stdio 适配器，使用官方 ACP SDK，仅通过 AgentAccess 执行；ACP 不是 Tick 类型 |
 | `agent/console/` | Agent Console（terminal、agent_console、Monitor 行，含 `/ticks` 面板），只经 AgentAccess 访问 Agent，不依赖 runtime 与 daemon；Tick 包经 `agent/packages` 管理 |
 | `agent/packages/` | Tick 市场的读取与下载（https，市场在本机时才接受本机 http），`/ticks` 与 `tickloop tick` 共用的安装、更新、卸载、登录与退出登录（OAuth 经 tick/oauth，按 base 的 HTTP 策略建客户端）；依赖 base、tick/packages 与 tick/oauth |
 | `agent/client/` | AgentAccess 客户端：Unix socket 传输、断线恢复、查找或启动本机 daemon；只依赖 protocol |
@@ -66,7 +68,7 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 
 Agent 的 HostToolProvider 与 TickStreamPort 是主要接入 Seam：Worker 侧只有 Tickhost 客户端（`hosted:` 与 `shell:`）和 Artifact 两个 Tick 适配器，协议、终端与 Shell 适配器在 Tickhost 中。Shell 的审批留在 Worker，Tickhost 只执行一次性起进程授权绑定的请求。Loop 不持有 Herdr 布局状态，数据 Source 留在 Tick 包中。通用 TickCall 读取目录再调用，不为每个实例生成模型工具；见 ADR 0007、0008、0019、0024。
 
-系统级 Skill 仍名为 tickloop，支持模型渐进披露与用户显式调用；其指令必须匹配实际工具和权限。各数据来源的 argv 写在 Tick 包自带的 Skill 中（`<包>:usage`），系统 Skill 不写死。最小子 Agent 由 `Subagent` 真实委派：前台等待最终报告，后台立即返回并主动推送完成通知；消息自动进入接收 Loop，空闲接收方开始新回合，模型无需查询收件箱。后续输入保持原授权上限；Subagent 可自行派生，最多三层，全部后代仍属于同一家族。根可停止后代子树，成员可停止直接孩子子树；家族内一对一消息和按需共享 Task 已开放，Task 工具由 Settings 的唯一开关控制，默认关闭，主／子 Agent 一致，不由后台或创建成员触发；单人与团队共用任务列表，开启且有数据才显示，关闭立即隐藏并保留数据。修改委派、协作任务或其界面前读取 ADR 0026（`docs/adr/0026-one-subagent-family-and-shared-tasks.md`），以及维护者本地的协作规格 `.scratch/subagent-collaboration/spec.md`（存在时）。跨家族通信、广播、自动任务领取及整家族 stop 不提供。MCP、ACP 和 Hooks 不在这次迁移内。
+系统级 Skill 仍名为 tickloop，支持模型渐进披露与用户显式调用；其指令必须匹配实际工具和权限。各数据来源的 argv 写在 Tick 包自带的 Skill 中（`<包>:usage`），系统 Skill 不写死。最小子 Agent 由 `Subagent` 真实委派：前台等待最终报告，后台立即返回并主动推送完成通知；消息自动进入接收 Loop，空闲接收方开始新回合，模型无需查询收件箱。后续输入保持原授权上限；Subagent 可自行派生，最多三层，全部后代仍属于同一家族。根可停止后代子树，成员可停止直接孩子子树；家族内一对一消息和按需共享 Task 已开放，Task 工具由 Settings 的唯一开关控制，默认关闭，主／子 Agent 一致，不由后台或创建成员触发；单人与团队共用任务列表，开启且有数据才显示，关闭立即隐藏并保留数据。修改委派、协作任务或其界面前读取 ADR 0026（`docs/adr/0026-one-subagent-family-and-shared-tasks.md`），以及维护者本地的协作规格 `.scratch/subagent-collaboration/spec.md`（存在时）。跨家族通信、广播、自动任务领取及整家族 stop 不提供。MCP 和 Hooks 不在这次迁移内。ACP 与 `-p`／`--print` 是独立的 AgentAccess 客户端入口，使用显式托管 profile 与控制租约；不提供子 Agent、Plan／结构化问答和持续 Trigger。Print 不复用历史；ACP 仅独占恢复带持久 ACP 来源标记的非活 Chat，完整公开历史回放不触发执行。ACP 支持有界资源／内联图片、启动上限内的会话模型与 Auto／Ask 配置、真实用户 Skill。会话 stdio MCP 首次 prompt 在模型调用前强制人工一次性审批，显式 Deny 优先；Worker 私有配置脱敏，服务最小环境、不作为 Tick、不承诺 OS 沙箱。正常回合保留 MCP，释放／EOF／租约失效显式关闭；活 MCP 阻止 Worker 升级，不自动重启或重放。一次性执行默认 Auto + DenyOnPrompt，完成前确认并清理所属 Shell／Tick；不能把 Completed 或 Waiting 直接视为成功，不改变普通 Console detach 语义。
 
 本仓库是领域无关的宿主：不认识任何 Tick 种类、领域概念或具体包程序名。官方 Tick 包（程序、包清单与 Skill）及其打包、发布在公开仓库 [tickloopai/ticks](https://github.com/tickloopai/ticks)（同时是 Tick 市场，包源码在 `packages/<包>/`，标签 `<包>-v<版本>`），本仓库只保留包机制。宿主接入的验收不需要任何真实数据源账户。
 

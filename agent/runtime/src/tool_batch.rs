@@ -159,6 +159,7 @@ impl Agent {
         receipt: &Receipt,
         cancel: &CancellationToken,
     ) -> Result<ToolRegistry, String> {
+        self.bootstrap_session_mcp(receipt, cancel).await?;
         let host_provider = self.inner.host_tools.read().unwrap().clone();
         if let Some(provider) = host_provider {
             let _ = provider.refresh(cancel.clone()).await;
@@ -593,6 +594,7 @@ impl Agent {
             self.record_final_denial(record).await;
         }
         if let Some(HostEffect::CreatedArtifact(tick)) = &host_effect
+            && !self.inner.tool_policy.is_managed()
             && !result.is_error
             && host_call_status == Some(HostCallStatus::Completed)
             && let Err(error) = self.link_created_artifact(receipt, tick).await

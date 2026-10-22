@@ -592,7 +592,8 @@
   {
     "Skills": {
       "available": true,
-      "warnings": []
+      "warnings": [],
+      "commands": []
     }
   },
   {

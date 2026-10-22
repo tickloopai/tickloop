@@ -19,6 +19,7 @@ pub mod attach;
 mod auto_setup_surface;
 #[cfg(test)]
 mod child_config_tests;
+mod cli_help;
 mod clipboard;
 mod clipboard_hint;
 mod completed_tasks;
@@ -835,21 +836,28 @@ async fn connect_daemon_at_startup(
 }
 
 pub fn print_help() {
-    println!("{}", help_text());
+    print!("{}", cli_help::render());
 }
 
-fn help_text() -> String {
+fn interactive_help_text() -> String {
     let guidance = r#"Tickloop
 Usage: tickloop [--cwd DIRECTORY]
        [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
+       tickloop -p [PROMPT | -] [--output-format text|json|stream-json] [--timeout SECONDS]
+       tickloop --print [PROMPT | -] [--cwd DIRECTORY] [--working-directory-is-trusted]
+       tickloop acp [--working-directory-is-trusted]
        tickloop update [--check | --status]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
        tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]
+
+Print mode accepts piped UTF-8 input; --print aliases -p, while --p is rejected. Run tickloop -p --help for details.
+Print/ACP use new managed Chats, not Console resume. They disable questions, Plan approvals, Subagents, scheduled goals, subscriptions and persistent Artifact feedback; completion/cancel/disconnect cleans invocation-owned resources.
+ACP stdout contains protocol traffic only; it offers one-time tool permissions and cancellation, not session loading or client filesystem/terminal/MCP support.
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
@@ -1213,6 +1221,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
+        profile: tickloop_agent_protocol::ExecutionProfile::Local,
+        session_mcp_servers: Vec::new(),
         folder: workdir.clone(),
         config_root: config_root.clone(),
         model: Some(config.clone()),
@@ -1645,7 +1655,7 @@ async fn interact(
         input,
         startup,
         config_root,
-        &mut herdr_reporter,
+        herdr_reporter.as_ref(),
     )
     .await;
     if let Some(reporter) = &mut herdr_reporter {
@@ -1661,7 +1671,7 @@ async fn interact_with_herdr(
     mut input: mpsc::Receiver<InputEvent>,
     startup: StartupState,
     config_root: Option<PathBuf>,
-    herdr_reporter: &mut Option<herdr_agent::Reporter>,
+    herdr_reporter: Option<&herdr_agent::Reporter>,
 ) -> Result<(), String> {
     let user_settings = startup.user_settings;
     console.set_prompt_suggestion_enabled(
@@ -2485,11 +2495,9 @@ async fn interact_with_herdr(
                 selected_loops: selected_loops.clone(),
                 configuration,
             };
-            // exec replaces this process without running destructors. Release the old
-            // pane report first; the replacement View will publish its current state.
-            if let Some(reporter) = herdr_reporter.as_mut() {
-                reporter.shutdown().await;
-            }
+            // The pane report is kept: exec skips destructors and the replacement View
+            // reports the same pane with a newer sequence. A postponed attempt returns here
+            // on later loops, so releasing first would drop the pane entry on each of them.
             if let Err(error) = view_upgrade::try_reexec(
                 console,
                 &input,
@@ -2504,8 +2512,6 @@ async fn interact_with_herdr(
                 });
                 ready_runtime = None;
             }
-            // A postponed upgrade also returns without replacing the process.
-            *herdr_reporter = herdr_agent::Reporter::from_environment(interactive);
         }
         if interactive {
             let execution = selected_chat
@@ -2540,7 +2546,7 @@ async fn interact_with_herdr(
                 .or_else(|| installation_notice.clone());
             console.set_update_notice(notice)?;
         }
-        if let Some(reporter) = herdr_reporter.as_ref() {
+        if let Some(reporter) = herdr_reporter {
             reporter.update(herdr_view_state(
                 selected_chat,
                 overview_active,
@@ -3521,7 +3527,7 @@ async fn interact_with_herdr(
                     match line.as_str() {
                         "/exit" => return view_exit(interactive, failed),
                         "/help" | "/" if interactive => menus.help(console,None)?,
-                        "/help" => outln!(console, "{}",help_text()),
+                        "/help" => outln!(console, "{}",interactive_help_text()),
                         "/help advanced" if interactive => menus.help_advanced(console)?,
                         "/help advanced" => outln!(console, "{}",completion::command_help(true)),
                         command if command == "/artifacts" || command.starts_with("/artifacts ") => {
@@ -5738,13 +5744,11 @@ fn render_restored_observation(
                 EventKind::FamilyRunCompleted { completion } => {
                     show_family_completion(console, completion, &observation.snapshot)?
                 }
-                EventKind::Thinking(thinking) => {
-                    if !console.is_interactive() {
-                        if starts_thinking {
-                            console.write("\nThinking: ")?;
-                        }
-                        console.write(&safe_text(thinking))?;
+                EventKind::Thinking(thinking) if !console.is_interactive() => {
+                    if starts_thinking {
+                        console.write("\nThinking: ")?;
                     }
+                    console.write(&safe_text(thinking))?;
                 }
                 EventKind::Text(text) if !failed_runs.contains(&event.run_id) => {
                     if console.is_interactive() {
@@ -5783,17 +5787,16 @@ fn render_restored_observation(
                         &[(failure, Some(Role::Error)), (retry, Some(Role::MutedText))],
                     )?;
                 }
-                EventKind::Interrupted if console.is_interactive() => {
-                    if !interrupted_by_rejection {
-                        console.write_response(&[(
-                            format!(
-                                "{}\n",
-                                presentation::interrupted_notice(console.display_profile()?)
-                            ),
-                            Some(Role::MutedText),
-                        )])?;
-                    }
+                EventKind::Interrupted if console.is_interactive() && !interrupted_by_rejection => {
+                    console.write_response(&[(
+                        format!(
+                            "{}\n",
+                            presentation::interrupted_notice(console.display_profile()?)
+                        ),
+                        Some(Role::MutedText),
+                    )])?;
                 }
+                EventKind::Interrupted if console.is_interactive() => {}
                 EventKind::Interrupted => outln!(console, "\nInterrupted"),
                 EventKind::GoalEnded { reason, operations } => {
                     print_goal_end(console, event.loop_id, reason, operations)?
@@ -8893,7 +8896,7 @@ mod tests {
     }
     use super::{
         Agent, BranchRequest, CommandTiming, Console, EventKind, Menus, Renderer, TUI_SYNTAX,
-        Workflow, branch_failure_message, branch_name, command_timing, help_text,
+        Workflow, branch_failure_message, branch_name, command_timing, interactive_help_text,
         is_branch_command, is_rewind_command, open_rewind, safe_line,
         should_dismiss_menu_before_dispatch, should_pause_input_for_summary,
         switch_to_saved_branch, tui_renderer_request,
@@ -9173,7 +9176,7 @@ mod tests {
         assert!(is_branch_command("/branch 研究路径 β"));
         assert!(!is_branch_command("/branching"));
         assert!(!is_branch_command("/fork"));
-        assert!(help_text().contains("/branch [NAME]"));
+        assert!(interactive_help_text().contains("/branch [NAME]"));
         assert_eq!(branch_name("/branch").unwrap(), None);
         assert_eq!(branch_name("/branch   ").unwrap(), None);
         assert_eq!(
@@ -9341,14 +9344,14 @@ mod tests {
                 CommandTiming::AfterTurn,
                 "{command}"
             );
-            assert!(!help_text().contains(command), "{command}");
+            assert!(!interactive_help_text().contains(command), "{command}");
         }
-        assert!(help_text().contains("Monitor lists this Chat's background Shells"));
+        assert!(interactive_help_text().contains("Monitor lists this Chat's background Shells"));
     }
 
     #[test]
     fn help_offers_daemon_stop_and_hides_the_process_entries() {
-        let help = help_text();
+        let help = interactive_help_text();
         assert!(help.contains("tickloop daemon stop"));
         assert!(help.contains("all of its workers, which is every running Agent"));
         assert!(help.contains("Ticks in the Tickhost keep running"));
@@ -9372,7 +9375,10 @@ mod tests {
                 CommandTiming::Immediate,
                 "{command}"
             );
-            assert!(help_text().contains(command), "missing help for {command}");
+            assert!(
+                interactive_help_text().contains(command),
+                "missing help for {command}"
+            );
         }
         for command in [
             "/rew",
@@ -9997,8 +10003,23 @@ mod tests {
 #[cfg(test)]
 mod status_agents_help_tests {
     #[test]
+    fn interactive_help_keeps_the_startup_and_configuration_guide() {
+        let help = super::interactive_help_text();
+        for detail in [
+            "/loops new",
+            "/clear",
+            "/resume CHAT",
+            "TICKLOOP_CONFIG_DIR",
+            "cleanupPeriodDays",
+            "Commands and Skills:",
+        ] {
+            assert!(help.contains(detail), "missing {detail}: {help}");
+        }
+    }
+
+    #[test]
     fn help_describes_subagents_and_shared_tasks() {
-        let help = super::help_text();
+        let help = super::interactive_help_text();
         assert!(help.contains("Subagents N") && help.contains("expanded by default"));
         assert!(help.contains("Click Subagents N") && help.contains("returns to the editor"));
         assert!(help.contains("x dismisses a finished subagent"));
@@ -10010,7 +10031,7 @@ mod status_agents_help_tests {
 
     #[test]
     fn help_names_the_monitor_commands_and_hosted_tick_keys() {
-        let help = super::help_text();
+        let help = super::interactive_help_text();
         assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
         assert!(help.contains("tickloop monitor attach"));
         assert!(help.contains(

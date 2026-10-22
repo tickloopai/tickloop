@@ -1,7 +1,8 @@
-use std::io::Cursor;
+use std::{io::Cursor, sync::Mutex};
 
 use ::image::{
-    DynamicImage, GenericImageView, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType,
+    DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, codecs::jpeg::JpegEncoder,
+    imageops::FilterType,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use tickloop_agent_protocol::{Image, ImageMediaType};
@@ -10,6 +11,13 @@ use tickloop_agent_protocol::{Image, ImageMediaType};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 /// Anthropic's per-image base64 limit, shared by every image entry point.
 pub const MAX_BASE64_BYTES: usize = 5 * 1024 * 1024;
+/// Source pixel and decoder allocation budgets, checked before allocating decoded pixels.
+pub const MAX_DECODED_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SOURCE_DIMENSION: u32 = 32 * 1024;
+// Preparation can hold source, decoded and resized buffers at once. Serialize all entry points
+// so independent ACP requests and clipboard workers cannot multiply that working set.
+static PREPARATION: Mutex<()> = Mutex::new(());
 const MAX_DIMENSION: u32 = 2000;
 const JPEG_FALLBACK_QUALITY: u8 = 80;
 
@@ -54,10 +62,23 @@ pub fn prepare(bytes: &[u8]) -> Result<Image, ImageError> {
     if bytes.len() > MAX_SOURCE_BYTES {
         return Err(ImageError::TooLarge);
     }
+    let _guard = PREPARATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let format = source_format(bytes).ok_or(ImageError::UnsupportedFormat)?;
-    let decoded = ::image::load_from_memory_with_format(bytes, format.decoder_format())
-        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    let (width, height) = decoded.dimensions();
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_SOURCE_DIMENSION);
+    limits.max_image_height = Some(MAX_SOURCE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format.decoder_format());
+    reader.limits(limits);
+    let decoder = reader.into_decoder().map_err(decode_error)?;
+    let (width, height) = decoder.dimensions();
+    check_dimensions(width, height)?;
+    if decoder.total_bytes() > MAX_DECODED_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+    let decoded = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
     let (pixels, encoded, media_type) = if width.max(height) > MAX_DIMENSION {
         let resized = decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
         let media_type = format.output_media_type();
@@ -85,6 +106,13 @@ pub fn prepare_rgba(width: u32, height: u32, bytes: Vec<u8>) -> Result<Image, Im
             "invalid RGBA dimensions or buffer length".into(),
         ));
     }
+    check_dimensions(width, height)?;
+    if bytes.len() as u64 > MAX_DECODED_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+    let _guard = PREPARATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rgba = ::image::RgbaImage::from_raw(width, height, bytes)
         .ok_or_else(|| ImageError::Undecodable("invalid RGBA image".into()))?;
     let decoded = DynamicImage::ImageRgba8(rgba);
@@ -95,6 +123,23 @@ pub fn prepare_rgba(width: u32, height: u32, bytes: Vec<u8>) -> Result<Image, Im
     };
     let encoded = encode(&pixels, ImageMediaType::Png)?;
     finish(pixels, encoded, ImageMediaType::Png)
+}
+
+fn check_dimensions(width: u32, height: u32) -> Result<(), ImageError> {
+    if width > MAX_SOURCE_DIMENSION
+        || height > MAX_SOURCE_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_DECODED_PIXELS
+    {
+        return Err(ImageError::TooLarge);
+    }
+    Ok(())
+}
+
+fn decode_error(error: ::image::ImageError) -> ImageError {
+    match error {
+        ::image::ImageError::Limits(_) => ImageError::TooLarge,
+        error => ImageError::Undecodable(error.to_string()),
+    }
 }
 
 fn finish(
@@ -175,7 +220,7 @@ fn encode(image: &DynamicImage, media_type: ImageMediaType) -> Result<Vec<u8>, I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::image::{Rgb, RgbImage, Rgba, RgbaImage};
+    use ::image::{GenericImageView, Rgb, RgbImage, Rgba, RgbaImage};
 
     fn gradient(width: u32, height: u32) -> DynamicImage {
         DynamicImage::ImageRgba8(RgbaImage::from_fn(width, height, |x, y| {
@@ -258,6 +303,32 @@ mod tests {
             prepare(&vec![0; MAX_SOURCE_BYTES + 1]),
             Err(ImageError::TooLarge)
         );
+    }
+
+    #[test]
+    fn compressed_images_cannot_allocate_an_unbounded_pixel_buffer() {
+        for (width, height) in [(8192u32, 8192u32), (MAX_SOURCE_DIMENSION + 1, 1)] {
+            let mut bytes = encoded(&gradient(1, 1), ImageFormat::Png);
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            // Recompute the IHDR CRC so rejection is due to the budget, not corrupt input.
+            let mut crc = !0u32;
+            for byte in &bytes[12..29] {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320u32 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+            assert_eq!(prepare(&bytes), Err(ImageError::TooLarge));
+        }
+    }
+
+    #[test]
+    fn decoded_pixel_and_memory_budgets_are_bounded() {
+        assert_eq!(check_dimensions(8192, 8192), Err(ImageError::TooLarge));
+        assert_eq!(check_dimensions(4200, 2100), Ok(()));
+        assert_eq!(MAX_DECODED_PIXELS * 4, MAX_DECODED_BYTES);
     }
 
     #[test]

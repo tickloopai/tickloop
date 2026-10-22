@@ -604,9 +604,11 @@ fn the_tick_command_explains_its_usage_and_leaves_the_console_arguments_alone() 
     }
     let console_help = succeeded(&fixture.tickloop(&["--help"]));
     assert!(
-        console_help.contains(
-            "tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]"
-        ),
+        console_help.contains("Manage Tick packages and logins"),
+        "{console_help}"
+    );
+    assert!(
+        console_help.contains("tickloop tick --help"),
         "{console_help}"
     );
     assert!(!fixture.root.join("config").exists());

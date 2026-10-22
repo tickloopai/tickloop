@@ -708,12 +708,10 @@ pub fn complete_boundaries(messages: &[Message]) -> Result<Vec<usize>, InvalidCo
     for (index, message) in messages.iter().enumerate() {
         for content in &message.content {
             match content {
-                Content::ToolUse { id, .. } => {
-                    if !pending.insert(id.clone()) {
-                        return Err(InvalidConversation(
-                            "context has duplicate unresolved tool calls".into(),
-                        ));
-                    }
+                Content::ToolUse { id, .. } if !pending.insert(id.clone()) => {
+                    return Err(InvalidConversation(
+                        "context has duplicate unresolved tool calls".into(),
+                    ));
                 }
                 Content::ToolResult { tool_use_id, .. } if !pending.remove(tool_use_id) => {
                     return Err(InvalidConversation(

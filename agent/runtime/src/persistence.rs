@@ -39,13 +39,13 @@ use tickloop_agent_protocol::{
     Usage,
 };
 use tickloop_agent_transcript::{
-    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
-    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
-    CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
-    FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
-    LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
-    MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, SentAgentMessagesEntry,
-    SubagentsEntry, SummarizeMetadataEntry,
+    AcpSessionEntry, AcpSessionOrigin, AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry,
+    COMPACT_BOUNDARY_SUBTYPE, ChainEntry, CompactMetadata, CompactTriggerEntry,
+    ContentReplacementEntry, ContentReplacementRecord, CustomTitleEntry, DelegationEntry,
+    FamilyCompletionsEntry, FamilyInputsEntry, FileHistorySnapshotEntry, ForkedFrom,
+    LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE,
+    LastPromptEntry, Line, LoopRecord, MonitorMembersEntry, PartialCompactDirection,
+    ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, SummarizeMetadataEntry,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -229,6 +229,65 @@ struct MessageLink {
 }
 
 impl ChatRecorder {
+    pub(super) async fn acp_session(
+        &self,
+        chat: ChatId,
+    ) -> Result<Option<AcpSessionEntry>, AgentError> {
+        match self.load_chat(chat, ChatLoad::default()).await {
+            Ok(loaded) => Ok(loaded
+                .metadata
+                .acp_session
+                .filter(|entry| entry.chat_id == chat)),
+            Err(AgentError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Called while the host excludes submissions. This never takes the Chat lock or flushes
+    /// Chat snapshots, so configuration can hold that lock through its durable commit.
+    pub(super) async fn record_acp_configuration(
+        &self,
+        chat: ChatId,
+        model: &ModelConfig,
+        mode: ExecutionMode,
+    ) -> Result<(), AgentError> {
+        let _appends = self.appends.lock().await;
+        let Some(mut entry) = self.acp_session(chat).await? else {
+            return Ok(());
+        };
+        entry.model = model.identity();
+        entry.execution_mode = mode;
+        self.outbox
+            .enqueue(chat, vec![Line::AcpSession(entry)], None);
+        if let Err(error) = self.append_queued(chat, true).await {
+            self.outbox.refuse_chat(
+                chat,
+                TranscriptError::Conflict(format!(
+                    "ACP metadata commit requires reconciliation: {error}"
+                )),
+            );
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn record_new_acp_metadata(&self, entry: AcpSessionEntry) -> Result<(), AgentError> {
+        let _appends = self.appends.lock().await;
+        let chat = entry.chat_id;
+        self.outbox
+            .enqueue(chat, vec![Line::AcpSession(entry)], None);
+        if let Err(error) = self.append_queued(chat, true).await {
+            self.outbox.refuse_chat(
+                chat,
+                TranscriptError::Conflict(format!(
+                    "ACP metadata commit requires reconciliation: {error}"
+                )),
+            );
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub(super) async fn read_subagents(
         &self,
         parent: ChatId,
@@ -964,6 +1023,15 @@ impl ChatRecorder {
         Some(super::plan::plans_directory(self.local.as_ref()?.root()))
     }
 
+    pub(super) fn record_edit(
+        &self,
+        chat_id: ChatId,
+        edit: tickloop_agent_transcript::RecordedEditEntry,
+    ) {
+        self.outbox
+            .enqueue(chat_id, vec![Line::RecordedEdit(edit)], None);
+    }
+
     /// 照 Claude Code `recordFileHistorySnapshot`：快照作为元数据条目追加到 Chat 的 Transcript。
     pub(super) fn record_file_history_snapshot(
         &self,
@@ -1136,7 +1204,15 @@ impl ChatRecorder {
             let prompt = (role == Role::User
                 && !is_meta
                 && !snapshot.agent_message_origins.contains_key(&uuid))
-            .then(|| typed_prompt(&message))
+            .then(|| {
+                typed_prompt(
+                    &message,
+                    snapshot
+                        .message_contexts
+                        .get(&index)
+                        .is_some_and(|contexts| !contexts.is_empty()),
+                )
+            })
             .flatten();
             let blocks = message.content.len();
             let mut entry = chain_entry(
@@ -1777,7 +1853,7 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
 }
 
 /// 用户输入的纯文本提示；本地消息（中断标记、`!` 命令、任务通知）不算。
-fn typed_prompt(message: &Message) -> Option<String> {
+fn typed_prompt(message: &Message, has_contexts: bool) -> Option<String> {
     let text = message
         .content
         .iter()
@@ -1787,7 +1863,7 @@ fn typed_prompt(message: &Message) -> Option<String> {
         })
         .collect::<Option<Vec<_>>>()?
         .join("\n");
-    (!text.trim().is_empty()
+    ((!text.trim().is_empty() || has_contexts)
         && matches!(
             LocalMessage::parse(&text),
             None | Some(LocalMessage::AgentCommunication { .. })
@@ -2028,7 +2104,14 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             && entry.message.role == Role::User
             && !entry.is_meta
             && entry.agent_message_origin.is_none()
-            && typed_prompt(&entry.message).is_some()
+            && typed_prompt(
+                &entry.message,
+                restored
+                    .message_contexts
+                    .get(&index)
+                    .is_some_and(|contexts| !contexts.is_empty()),
+            )
+            .is_some()
         {
             restored
                 .prompt_execution_modes
@@ -2228,6 +2311,13 @@ fn recover_transcript(
                     .monitor_members
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
+            })
+            .or_else(|| {
+                loaded
+                    .metadata
+                    .acp_session
+                    .as_ref()
+                    .map(|entry| entry.origin.canonical_cwd.clone())
             }),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());
@@ -2366,6 +2456,7 @@ fn recover_transcript(
         kept.meta_messages.clone(),
         waits,
         family,
+        loaded.metadata.acp_session.is_none(),
     )
 }
 
@@ -2527,6 +2618,7 @@ fn recover_snapshot_for_resume(
     mut meta_messages: HashSet<usize>,
     waits: WaitHosting,
     family: Option<&super::family_load::FamilyRecords>,
+    append_bootstrap: bool,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let rebuilt_runs = |snapshot: &ChatSnapshot| {
         super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
@@ -2555,7 +2647,7 @@ fn recover_snapshot_for_resume(
         .find(|index| snapshot.messages[*index].role != Role::System)
         .and_then(|index| snapshot.message_runs.get(&index))
         .is_some_and(|run| rebuilt.contains(run));
-    if !ends_with_rebuilt_run {
+    if append_bootstrap && !ends_with_rebuilt_run {
         append_interruption_messages(&mut snapshot, &mut meta_messages);
     }
     super::branch::validate_snapshot(&snapshot)?;
@@ -2690,6 +2782,105 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    /// Publishes even an empty ACP session only after its origin and configuration are durable.
+    pub async fn record_new_acp_session(
+        &self,
+        chat_id: ChatId,
+        cwd: &Path,
+        config_root: &Path,
+    ) -> Result<(), AgentError> {
+        if !self.inner.tool_policy.is_managed() {
+            return Err(AgentError::Invalid(
+                "ACP metadata requires a managed Agent".into(),
+            ));
+        }
+        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
+        let origin = AcpSessionOrigin::capture(cwd, config_root)
+            .map_err(|error| AgentError::Storage(error.to_string()))?;
+        let snapshot = self.snapshot(chat_id).await?;
+        if snapshot.delegation.is_some() || snapshot.folder.as_ref() != Some(&origin.canonical_cwd)
+        {
+            return Err(AgentError::Invalid(
+                "ACP session origin does not match its root Chat".into(),
+            ));
+        }
+        self.claim_acp_session(chat_id, cwd, config_root).await?;
+        let mut startup_permission_ceiling = snapshot.policy.clone();
+        startup_permission_ceiling.host_rules.clear();
+        startup_permission_ceiling
+            .rules
+            .retain(|rule| rule.decision != tickloop_agent_protocol::Decision::Allow);
+        let result = recorder
+            .record_new_acp_metadata(AcpSessionEntry {
+                chat_id,
+                origin,
+                startup_permission_ceiling,
+                execution_mode: snapshot.policy.mode,
+                model: snapshot.model.identity(),
+            })
+            .await;
+        if result.is_err() {
+            self.release_acp_session_claim(chat_id).await;
+        }
+        result
+    }
+
+    pub async fn flush_acp_session(&self, chat_id: ChatId) -> Result<(), AgentError> {
+        self.flush_transcripts().await;
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        let _appends = recorder.appends.lock().await;
+        recorder
+            .append_queued(chat_id, true)
+            .await
+            .map(|_| ())
+            .map_err(|error| AgentError::Storage(error.to_string()))
+    }
+
+    pub async fn read_acp_session(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Option<AcpSessionEntry>, AgentError> {
+        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
+        recorder.acp_session(chat_id).await
+    }
+
+    /// Reattaches a stored ACP Chat without executing a prompt or restoring client MCP state.
+    /// The host starts this worker with the saved model identity selected from its own catalog.
+    pub async fn resume_acp_session(
+        &self,
+        chat_id: ChatId,
+        cwd: &Path,
+        config_root: &Path,
+    ) -> Result<ChatSnapshot, AgentError> {
+        if !self.inner.tool_policy.is_managed() {
+            return Err(AgentError::Invalid(
+                "ACP resume requires a managed Agent".into(),
+            ));
+        }
+        let entry = self
+            .read_acp_session(chat_id)
+            .await?
+            .ok_or_else(|| AgentError::Invalid("Chat was not created as an ACP session".into()))?;
+        if !entry
+            .origin
+            .matches_current(cwd, config_root)
+            .map_err(|error| AgentError::Invalid(error.to_string()))?
+        {
+            return Err(AgentError::Invalid(
+                "ACP session origin identity changed".into(),
+            ));
+        }
+        self.require_working_directory_trust(cwd)?;
+        self.claim_acp_session(chat_id, cwd, config_root).await?;
+        let result = self.resume_chat(chat_id).await;
+        if result.is_err() {
+            self.release_acp_session_claim(chat_id).await;
+        }
+        result
+    }
+
     pub(super) async fn adopt_upgrade_transcript(
         &self,
         snapshot: &ChatSnapshot,
@@ -3496,7 +3687,53 @@ impl Agent {
         } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits, family)?;
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+        let (mut client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+        if chat_id == source_chat_id
+            && self.inner.tool_policy.is_managed()
+            && let Some(entry) = loaded.metadata.acp_session.as_ref()
+        {
+            let mode_rank = |mode: ExecutionMode| match mode {
+                ExecutionMode::Plan => 0,
+                ExecutionMode::AcceptEdits => 1,
+                ExecutionMode::Auto => 2,
+                ExecutionMode::FullAccess => 3,
+            };
+            let config = tickloop_agent_model::cards::ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .find(|config| config.identity() == entry.model)
+                .ok_or_else(|| {
+                    AgentError::Invalid("saved ACP model is not in the current catalog".into())
+                })?;
+            client = self.inner.models.client(&config)?;
+            snapshot.model = config;
+            if mode_rank(entry.execution_mode) > mode_rank(entry.startup_permission_ceiling.mode)
+                || mode_rank(entry.execution_mode) > mode_rank(snapshot.policy.mode)
+            {
+                return Err(AgentError::Invalid(
+                    "saved ACP configuration exceeds this worker's model or permission ceiling"
+                        .into(),
+                ));
+            }
+            snapshot.policy.mode = entry.execution_mode;
+            snapshot
+                .policy
+                .project_constraints
+                .extend(entry.startup_permission_ceiling.project_constraints.clone());
+            snapshot
+                .policy
+                .managed_constraints
+                .extend(entry.startup_permission_ceiling.managed_constraints.clone());
+            snapshot.policy.managed_constraints.extend(
+                entry
+                    .startup_permission_ceiling
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.decision != tickloop_agent_protocol::Decision::Allow)
+                    .cloned(),
+            );
+            self.apply_host_rules(&mut snapshot.policy);
+        }
         if let Some(delegation) = &mut snapshot.delegation {
             self.apply_host_rules(&mut delegation.ceiling.policy);
             folder = delegation.ceiling.folder.clone();

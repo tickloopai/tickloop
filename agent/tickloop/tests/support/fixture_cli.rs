@@ -30,8 +30,14 @@ pub const BUILD_IDENTITY_MODE: &str = "--build-identity";
 /// the executable links covers its own dependencies; the dev-dependencies that export a type are
 /// listed one by one.
 pub fn build_identity() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut fixture = std::collections::hash_map::DefaultHasher::new();
+    include_str!("cli_fixture_main.rs").hash(&mut fixture);
+    include_str!("fixture_cli.rs").hash(&mut fixture);
     format!(
-        "{:?}",
+        "{}:{:016x}:{:?}",
+        env!("TICKLOOP_BUILD_IDENTITY"),
+        fixture.finish(),
         [
             TypeId::of::<tickloop_agent_client::LocalAgentClient>(),
             TypeId::of::<tickloop_agent_console::agent_console::AgentConsole>(),

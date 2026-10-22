@@ -1,9 +1,9 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use tickloop_agent_protocol::Content;
-use tickloop_agent_transcript::{ForkedFrom, Line};
+use tickloop_agent_transcript::{AcpSessionEntry, ForkedFrom, Line};
 use uuid::Uuid;
 
 use super::path::TRANSCRIPT_FILE_SUFFIX;
@@ -22,6 +22,7 @@ pub struct TranscriptSummary {
     pub last_prompt: Option<String>,
     pub git_branch: Option<String>,
     pub forked_from: Option<ForkedFrom>,
+    pub acp_session: Option<AcpSessionEntry>,
 }
 
 /// 列出项目目录中的 Transcript，按修改时间从新到旧排列；目录不存在时为空。
@@ -71,6 +72,7 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
             git_branch: last_json_string_field(&tail, "gitBranch")
                 .or_else(|| first_json_string_field(&head, "gitBranch")),
             forked_from: forked_from(&tail).or_else(|| forked_from(&head)),
+            acp_session: acp_session(&tail).or_else(|| acp_session(&head)),
         });
     }
     summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
@@ -117,6 +119,40 @@ fn first_prompt(head: &str) -> Option<String> {
             }
             _ => None,
         })
+}
+
+/// The lite listing window can miss a large or middle-of-file ACP origin. This fallback is
+/// only for ACP listing: scan one line at a time and never project or retain conversation data.
+/// The first origin is sufficient here; cwd/root identity is immutable across configurations.
+pub(super) fn scan_acp_session(path: &Path) -> io::Result<Option<AcpSessionEntry>> {
+    let mut reader = io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
+        if (line.starts_with("{\"type\":\"acp-session\"")
+            || line.starts_with("{\"type\":\"retained-snapshot\""))
+            && let Some(entry) = acp_session(&line)
+        {
+            return Ok(Some(entry));
+        }
+        line.clear();
+    }
+    Ok(None)
+}
+
+fn acp_session(text: &str) -> Option<AcpSessionEntry> {
+    fn from_line(line: Line) -> Option<AcpSessionEntry> {
+        match line {
+            Line::AcpSession(entry) => Some(entry),
+            Line::RetainedSnapshot(snapshot) => {
+                snapshot.lines.into_iter().rev().find_map(from_line)
+            }
+            _ => None,
+        }
+    }
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Line>(line).ok())
+        .find_map(from_line)
 }
 
 fn forked_from(text: &str) -> Option<ForkedFrom> {
@@ -169,6 +205,70 @@ fn json_string_at(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_origin_is_found_outside_both_lite_windows() {
+        use std::io::Write;
+        use tickloop_agent_protocol::{
+            ExecutionMode, ModelIdentity, ModelProvider, PermissionPolicy, Protocol,
+        };
+        use tickloop_agent_transcript::AcpSessionOrigin;
+        let directory = tempfile::tempdir().unwrap();
+        let chat = Uuid::new_v4();
+        let path = directory
+            .path()
+            .join(format!("{chat}{TRANSCRIPT_FILE_SUFFIX}"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let filler = format!(
+            "{{\"type\":\"unknown-test\",\"data\":\"{}\"}}\n",
+            "x".repeat(2 * LITE_READ_BUF_SIZE)
+        );
+        file.write_all(filler.as_bytes()).unwrap();
+        let origin = AcpSessionEntry {
+            chat_id: chat,
+            origin: AcpSessionOrigin::capture(directory.path(), directory.path()).unwrap(),
+            startup_permission_ceiling: PermissionPolicy::default(),
+            execution_mode: ExecutionMode::Auto,
+            model: ModelIdentity {
+                profile: "test".into(),
+                protocol: Protocol::Messages,
+                requested_model: "test".into(),
+                provider: ModelProvider::default(),
+            },
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Line::AcpSession(origin.clone())).unwrap()
+        )
+        .unwrap();
+        file.write_all(filler.as_bytes()).unwrap();
+        drop(file);
+        let summary = list_project(directory.path()).unwrap().remove(0);
+        assert!(
+            summary.acp_session.is_none(),
+            "fixture must exceed the lite windows"
+        );
+        assert_eq!(scan_acp_session(&path).unwrap().unwrap().chat_id, chat);
+
+        // Snapshot-only stores can put the origin inside a line larger than both windows.
+        let filler: Line = serde_json::from_str(filler.trim()).unwrap();
+        let snapshot = Line::RetainedSnapshot(tickloop_agent_transcript::RetainedSnapshotEntry {
+            chat_id: chat,
+            lines: vec![filler.clone(), Line::AcpSession(origin), filler],
+        });
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&snapshot).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            list_project(directory.path()).unwrap()[0]
+                .acp_session
+                .is_none()
+        );
+        assert_eq!(scan_acp_session(&path).unwrap().unwrap().chat_id, chat);
+    }
 
     #[test]
     fn string_fields_are_extracted_with_escapes_and_truncation() {

@@ -403,6 +403,24 @@ pub(crate) struct HostToolUpgradeCheckpoint {
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Host-initiated session starts; preparation alone must never spawn a process.
+    fn session_bootstrap(&self) -> Result<Vec<PreparedHostCall>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn start_session_server(
+        &self,
+        _call: PreparedHostCall,
+        _cancel: CancellationToken,
+    ) -> Result<(), String> {
+        Err("session MCP startup is unavailable".into())
+    }
+
+    /// Ends session-owned processes, unlike per-prompt settlement.
+    async fn close_session(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Private process-transfer state. `None` defers replacement while the provider owns an
     /// interaction that cannot move, such as a pending device sign-in.
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
@@ -442,6 +460,40 @@ pub trait HostToolProvider: Send + Sync {
     /// The instructions of the MCP servers whose tools this provider currently offers.
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
         Vec::new()
+    }
+
+    fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
+        self.mcp_resource_server().into_iter().collect()
+    }
+
+    async fn list_mcp_resources_from(
+        &self,
+        server: &str,
+        cursor: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        if self
+            .mcp_resource_server()
+            .is_none_or(|source| source.name != server)
+        {
+            return Err("MCP resource server is unavailable".into());
+        }
+        self.list_mcp_resources(cursor, cancel).await
+    }
+
+    async fn read_mcp_resource_from(
+        &self,
+        server: &str,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        if self
+            .mcp_resource_server()
+            .is_none_or(|source| source.name != server)
+        {
+            return Err("MCP resource server is unavailable".into());
+        }
+        self.read_mcp_resource(uri, cancel).await
     }
 
     async fn list_mcp_resources(

@@ -275,9 +275,11 @@ impl ToolRegistry {
             );
         }
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
-            if provider.mcp_resource_server().is_some_and(|server| {
-                crate::mcp_resource_authority_allowed(chat, &server.authority)
-            }) {
+            if provider
+                .mcp_resource_servers()
+                .into_iter()
+                .any(|server| crate::mcp_resource_authority_allowed(chat, &server.authority))
+            {
                 tools.extend(
                     crate::mcp_resources::definitions()
                         .into_iter()
@@ -1724,6 +1726,22 @@ impl Agent {
                         let chat = chats.get_mut(&receipt.chat_id).unwrap();
                         chat.snapshot.operations.push(operation.clone());
                         self.save(&chat.snapshot);
+                    }
+                    if operation.file_change.is_some()
+                        && let Some(recorder) = &self.inner.recorder
+                        && let Ok(Some(review)) = self
+                            .operation_review(receipt.chat_id, receipt.run_id, &id)
+                            .await
+                    {
+                        recorder.record_edit(
+                            receipt.chat_id,
+                            tickloop_agent_transcript::RecordedEditEntry {
+                                operation_id: operation.id,
+                                run_id: receipt.run_id,
+                                call_id: id.clone(),
+                                review,
+                            },
+                        );
                     }
                     let (
                         mut decision,

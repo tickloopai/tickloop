@@ -379,8 +379,9 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
             .as_object()
             .unwrap()
             .keys()
-            .collect::<Vec<_>>(),
-        ["args", "skill"]
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["args", "skill"])
     );
     assert_eq!(skill_tool.input_schema["required"], json!(["skill"]));
     assert_eq!(

@@ -210,15 +210,20 @@ fn an_oauth_token_is_saved_in_the_standard_fields_and_replaced_at_once() {
     let saved: Value =
         serde_json::from_slice(&fs::read(credentials.oauth_token_path()).unwrap()).unwrap();
     assert_eq!(
-        saved.as_object().unwrap().keys().collect::<Vec<_>>(),
-        [
+        saved
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
             "access_token",
             "client_id",
             "expires_at",
             "issuer",
             "token_endpoint",
             "token_type"
-        ]
+        ])
     );
     assert_eq!(credentials.oauth_token().unwrap(), Some(short));
     assert_eq!(

@@ -10,8 +10,9 @@ use std::{
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, Decision, LoopId, LoopState, ModelConfig, PermissionRule,
-    PromptPolicy, SearchConfig, UserShellState,
+    AgentHostOptions, ChatId, ChatSnapshot, CommandState, Decision, ExecutionProfile, LoopId,
+    LoopState, ModelConfig, OperationState, PermissionRule, PromptPolicy, SearchConfig,
+    UserShellState,
 };
 
 use uuid::Uuid;
@@ -178,6 +179,31 @@ impl ToolPolicy {
             web_fetch_requires_provenance: false,
             artifact_writes_require_provenance: false,
         }
+    }
+
+    /// A single managed request: no human questions or work that schedules another turn.
+    /// Permission review and the host's resource cleanup still apply.
+    pub const fn one_shot() -> Self {
+        Self {
+            plan: false,
+            questions: false,
+            delegation: false,
+            family_messages: false,
+            tasks: false,
+            goals: false,
+            tick_subscriptions: false,
+            ..Self::local()
+        }
+    }
+
+    /// The initial ACP surface supports permission replies, but not structured questions,
+    /// plans, delegation or autonomous follow-up turns yet.
+    pub const fn acp() -> Self {
+        Self::one_shot()
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        *self == Self::one_shot() || *self == Self::acp()
     }
 
     /// A durable Chat's: WebFetch of URLs and Artifact writes to targets with provenance,
@@ -389,6 +415,224 @@ impl Agent {
             recorder,
             seams.environment,
         ))
+    }
+
+    /// Verifies a launch contract against the Harness that will execute it. The caller must
+    /// normalize launch host options first; a managed profile cannot weaken the actual host's
+    /// trust, permission or execution-mode policy, or use a Harness with ordinary tools.
+    pub fn validate_execution_profile(
+        &self,
+        profile: ExecutionProfile,
+        host: AgentHostOptions,
+    ) -> Result<(), AgentError> {
+        let matches = match profile {
+            ExecutionProfile::Local => !self.inner.tool_policy.is_managed(),
+            ExecutionProfile::OneShot => {
+                self.inner.tool_policy == ToolPolicy::one_shot()
+                    && self.inner.host_options == host
+                    && host.prompt_policy == PromptPolicy::DenyOnPrompt
+            }
+            ExecutionProfile::Acp => {
+                self.inner.tool_policy == ToolPolicy::acp() && self.inner.host_options == host
+            }
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(AgentError::Invalid(
+                "execution profile does not match the Harness tool and host policies".into(),
+            ))
+        }
+    }
+
+    /// Settles one managed root Chat, without shutting down the Harness or other Chats.
+    /// The host must serialize submissions with this call and end the root's hosted Ticks
+    /// separately, even when this returns an error. Interrupted/unknown operations remain in
+    /// the returned or persisted snapshot; settlement never retries a dispatched operation.
+    pub async fn settle_managed(
+        &self,
+        chat_id: ChatId,
+        cancel: bool,
+    ) -> Result<ChatSnapshot, AgentError> {
+        if !self.inner.tool_policy.is_managed() {
+            return Err(AgentError::Invalid(
+                "managed settlement is unavailable to ordinary Chats".into(),
+            ));
+        }
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if chat.snapshot.delegation.is_some()
+                || !crate::family_tree::descendants(&chats, chat_id)
+                    .map_err(AgentError::Invalid)?
+                    .is_empty()
+            {
+                return Err(AgentError::Invalid(
+                    "managed settlement requires a root Chat without delegated children".into(),
+                ));
+            }
+        }
+        let mut failures = Vec::new();
+        if cancel {
+            self.interrupt(chat_id).await?;
+        }
+        // A user Shell may still be queued or awaiting admission, with no Tools process yet.
+        // Withdraw those requests through the runtime API before inspecting model quiescence.
+        let user_cleanup_started = tokio::time::Instant::now();
+        let user_cleanup = async {
+            for shell in self.snapshot(chat_id).await?.user_shells {
+                if matches!(
+                    shell.state,
+                    UserShellState::Queued
+                        | UserShellState::WaitingPermission
+                        | UserShellState::Running
+                        | UserShellState::Background
+                        | UserShellState::Cancelling
+                ) && let Err(error) = self.stop_user_shell(chat_id, shell.id).await
+                {
+                    failures.push(format!("user Shell {}: {error}", shell.id));
+                }
+            }
+            Ok::<_, AgentError>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), user_cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(error.to_string()),
+            Err(_) => failures.push("user Shell cleanup exceeded 10 seconds".into()),
+        }
+        let cleanup_budget = Duration::from_secs(10).saturating_sub(user_cleanup_started.elapsed());
+        // quiesce does not count background Bash, which must be stopped explicitly below.
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.quiesce_managed(chat_id, cancel),
+        )
+        .await
+        {
+            Ok(Quiescence::Idle) => {}
+            Ok(Quiescence::Waiting(_)) => {
+                failures.push("Chat still waits for interaction or an event".to_owned());
+                self.interrupt(chat_id).await?;
+            }
+            Err(_) => {
+                failures.push("Chat did not settle within 30 seconds".to_owned());
+                self.interrupt(chat_id).await?;
+            }
+        }
+        // Continue cleanup after each failed stop; Unknown is not a confirmed process exit.
+        let cleanup = async {
+            let tools = self.chat_tools(chat_id).await?;
+            for command in tools.commands().await {
+                if matches!(
+                    command.state,
+                    CommandState::Running | CommandState::Background | CommandState::Cancelling
+                ) && let Err(error) = self.stop_command(chat_id, command.operation_id).await
+                {
+                    failures.push(format!("Shell {}: {error}", command.operation_id));
+                }
+            }
+            for command in tools.user_commands().await {
+                if matches!(
+                    command.state,
+                    CommandState::Running | CommandState::Background | CommandState::Cancelling
+                ) {
+                    match tools.stop_user_shell(command.operation_id, chat_id).await {
+                        Ok(command) => {
+                            self.record_user_shell(chat_id, command).await?;
+                        }
+                        Err(error) => {
+                            failures.push(format!("user Shell {}: {error}", command.operation_id))
+                        }
+                    }
+                }
+            }
+            Ok::<_, AgentError>(())
+        };
+        match tokio::time::timeout(cleanup_budget, cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(error.to_string()),
+            Err(_) => failures.push("Shell cleanup exceeded 10 seconds".into()),
+        }
+        match tokio::time::timeout(Duration::from_secs(10), self.quiesce_managed(chat_id, true))
+            .await
+        {
+            Ok(Quiescence::Idle) => {}
+            _ => failures.push("Chat remains active or waiting after cleanup".into()),
+        }
+        if tokio::time::timeout(Duration::from_secs(10), self.flush_transcripts())
+            .await
+            .is_err()
+        {
+            failures.push("Transcript flush exceeded 10 seconds".into());
+        }
+        if let Some(error) = self.transcript_write_error() {
+            failures.push(format!("Transcript flush failed: {error}"));
+        }
+        let snapshot = self.snapshot(chat_id).await?;
+        let unresolved = snapshot
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.state,
+                    OperationState::Admitted | OperationState::Unknown
+                )
+            })
+            .collect::<Vec<_>>();
+        if snapshot.commands.iter().any(|command| {
+            !matches!(
+                command.state,
+                CommandState::Completed | CommandState::Failed
+            )
+        }) || snapshot.user_shells.iter().any(|shell| {
+            !matches!(
+                shell.state,
+                UserShellState::Completed | UserShellState::Failed
+            )
+        }) || !unresolved.is_empty()
+        {
+            failures.push("Shell or dispatched operation outcome remains unresolved".into());
+        }
+        if snapshot.loops.iter().any(|goal| {
+            matches!(
+                goal.state,
+                LoopState::Queued
+                    | LoopState::Running
+                    | LoopState::WaitingPermission
+                    | LoopState::WaitingQuestion
+                    | LoopState::WaitingPlan
+                    | LoopState::WaitingTrigger
+            )
+        }) || !snapshot.pending_inputs.is_empty()
+            || !snapshot.permissions.is_empty()
+            || !snapshot.questions.is_empty()
+            || !snapshot.pending_commands.is_empty()
+        {
+            failures.push("Chat has unfinished work".into());
+        }
+        if failures.is_empty() {
+            Ok(snapshot)
+        } else {
+            Err(AgentError::Invalid(format!(
+                "managed settlement incomplete: {}",
+                serde_json::json!({"failures": failures, "unresolved_operations": unresolved})
+            )))
+        }
+    }
+
+    /// A cancelled parked Run still appears as Waiting until its task acknowledges cancellation.
+    /// Do not confuse that transient state with an interaction that still needs a person.
+    async fn quiesce_managed(&self, chat_id: ChatId, cancelled: bool) -> Quiescence {
+        let mut events = self.subscribe();
+        loop {
+            let state = self.quiesce(chat_id).await;
+            if !cancelled || matches!(state, Quiescence::Idle) {
+                return state;
+            }
+            tokio::select! {
+                _ = events.recv() => {}
+                _ = tokio::time::sleep(QUIESCE_RECHECK) => {}
+            }
+        }
     }
 
     /// Waits until nothing of the Chat's family runs: no member has an active or ready Run that

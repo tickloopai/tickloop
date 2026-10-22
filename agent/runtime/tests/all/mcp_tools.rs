@@ -157,22 +157,48 @@ async fn mcp_resources_list_and_read_work_without_the_skills_extension_and_follo
         .store(true, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("list", "ListMcpResourcesTool", json!({})),
         call(
-            "next",
+            "list",
             "ListMcpResourcesTool",
-            json!({"server":"tickloop-artifacts","cursor":"next-page"}),
+            json!({"server":"tickloop-artifacts"}),
         ),
-        call(
-            "read",
-            "ReadMcpResourceTool",
-            json!({"server":"tickloop-artifacts","uri":"fixture://tickloop-artifacts/info"}),
-        ),
-        text("done"),
+        text("listed"),
     ]));
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    submit_and_wait(&agent, chat, "Find and read the MCP resources").await;
+    submit_and_wait(&agent, chat, "Find the MCP resources").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let cursor = snapshot
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| {
+            if let tickloop_agent_protocol::Content::ToolResult { content, .. } = content {
+                let result: Value = serde_json::from_str(&content.text()).ok()?;
+                result["nextCursor"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .expect("resource list returned an opaque cursor");
+    assert!(cursor.starts_with("mcp-resource:v1:"));
+    model.enqueue(call(
+        "next",
+        "ListMcpResourcesTool",
+        json!({"server":"tickloop-artifacts","cursor":cursor}),
+    ));
+    model.enqueue(call(
+        "read",
+        "ReadMcpResourceTool",
+        json!({"server":"tickloop-artifacts","uri":"fixture://tickloop-artifacts/info"}),
+    ));
+    model.enqueue(text("done"));
+    submit_and_wait(
+        &agent,
+        chat,
+        "Follow that resource cursor and read the resource",
+    )
+    .await;
     assert!(
         agent
             .snapshot(chat)
@@ -207,7 +233,7 @@ async fn mcp_resources_list_and_read_work_without_the_skills_extension_and_follo
             "fixture://tickloop-artifacts/info",
             "fixture://tickloop-artifacts/details",
             "Ordinary MCP resource fixture",
-            "next-page",
+            "mcp-resource:v1:",
         ] {
             assert!(last.contains(expected), "{expected}");
         }

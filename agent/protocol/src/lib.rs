@@ -24,6 +24,8 @@ mod interaction;
 mod limits;
 pub mod local_messages;
 mod loops;
+pub mod mcp;
+pub use mcp::{SessionMcpServer, validate_session_mcp_servers};
 mod model;
 mod model_availability;
 mod model_card;
@@ -51,11 +53,13 @@ pub use access::{
     AgentDetailQuery, AgentFilter, AgentSummary, CLIENT_HANDOFF_VERSION, ChunkedResponseKind,
     ClientHandoffHello, ClientMessage, CommandEnvelope, CommandReceipt, CommandResult,
     ConfigurationChange, Cursor, DEFAULT_PAGE_LIMIT, DisplayReceipt, DisplayUpdate, DisplayedView,
-    EnvironmentValue, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
-    HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
-    LoopRef, MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure,
-    ObservationRequest, ObservationUpdate, ObservationValue, OtherTickhost, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits,
+    EnvironmentValue, ExecutionAvailability, ExecutionProfile, ExecutionRef, HistoryAction,
+    HostLocation, HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus,
+    LoopAction, LoopRef, MANAGED_LEASE_SECONDS, MAX_PAGE_LIMIT, ManagedConfiguration,
+    ManagedConfigurationChange, ManagedHistoryPage, ManagedModelInfo, ManagedSessionInfo,
+    ManagedSessionPage, ManagedSkillInfo, ManagedToken, Observation, ObservationChange,
+    ObservationFailure, ObservationRequest, ObservationUpdate, ObservationValue, OtherTickhost,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits,
     ProviderCredentialScope, QueuedCommandFailure, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS,
     REPLAY_CAPACITY, ReceiptState, RecordedMessage, RecordedTranscript, RequestRef, ResetReason,
     ServerHandoffHello, ServerHello, ServerMessage, SessionResume, TaskAction, TaskOrigin, TaskRef,
@@ -107,7 +111,7 @@ pub use family::{
 };
 pub use file_change::{
     FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileIdentity, FileVersion,
-    PreparedFileChange,
+    PreparedFileChange, RecordedFileChangeReview,
 };
 pub use frame::{check_frame_length, decode_frame, encode_frame};
 pub use history::{
@@ -128,7 +132,9 @@ pub use hosted::{
 };
 pub use ids::ChatId;
 pub use image::{Image, ImageMediaType};
-pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};
+pub use input::{
+    ImageContext, ImageOrigin, InputContext, ResourceContext, TextContext, render_input_context,
+};
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
 pub use limits::*;
 pub use local_messages::{

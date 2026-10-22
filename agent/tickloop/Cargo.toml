@@ -29,6 +29,8 @@ harness = false
 [dependencies]
 crossterm = "0.29"
 serde_json = "1"
+tickloop-agent-acp = { path = "../acp" }
+tickloop-agent-print = { path = "../print" }
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-config = { path = "../config" }
 tickloop-agent-console = { path = "../console" }

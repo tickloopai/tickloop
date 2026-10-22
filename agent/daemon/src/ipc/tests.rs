@@ -96,6 +96,68 @@ impl AgentAccess for ControlledFeed {
 }
 
 #[tokio::test]
+async fn managed_capability_requires_the_current_business_protocol_major() {
+    for major in [PROTOCOL_MAJOR - 1, PROTOCOL_MAJOR] {
+        let minor = PROTOCOL_MINOR;
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: None,
+        });
+        let (server_stream, mut client) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(serve_connection(
+            server_stream,
+            source,
+            epoch,
+            TRANSPORT_LIMITS,
+        ));
+        write_frame(
+            &mut client,
+            &ClientMessage::Hello {
+                major,
+                minor,
+                handoff: None,
+            },
+            HANDSHAKE_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let response = read_frame::<_, ServerMessage>(&mut client, HANDSHAKE_FRAME_BYTES)
+            .await
+            .unwrap();
+        if major != PROTOCOL_MAJOR {
+            assert!(matches!(
+                response,
+                Some(ServerMessage::Error {
+                    error: AccessError {
+                        code: AccessErrorCode::VersionMismatch,
+                        ..
+                    },
+                    ..
+                })
+            ));
+            server.await.unwrap().unwrap();
+            continue;
+        }
+        let Some(ServerMessage::Hello(hello)) = response else {
+            panic!("hello required");
+        };
+        for capability in [
+            tickloop_agent_protocol::AccessCapability::ManagedExecutions,
+            tickloop_agent_protocol::AccessCapability::ManagedConfiguration,
+            tickloop_agent_protocol::AccessCapability::ManagedHistory,
+            tickloop_agent_protocol::AccessCapability::ManagedSessionLoad,
+            tickloop_agent_protocol::AccessCapability::ManagedSessionList,
+        ] {
+            assert!(hello.capabilities.contains(&capability));
+        }
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_peer_closing_during_hello_is_unavailable_without_a_version_claim() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let path = temporary.path().join("daemon.sock");

@@ -13,6 +13,7 @@ use tickloop_agent_transcript::{Line, MetadataHeader, MetadataKind};
 
 use super::listing::{LITE_READ_BUF_SIZE, TranscriptSummary, last_json_string_field, list_project};
 use super::path::{locate, project_directory, transcript_path};
+#[cfg(test)]
 use super::reader::{LoadedTranscript, assemble};
 use super::store::{
     AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
@@ -158,6 +159,21 @@ impl JsonlTranscriptStore {
     /// The saved Chats of `folder`'s project, newest first.
     pub fn project_chats(&self, folder: &Path) -> io::Result<Vec<TranscriptSummary>> {
         list_project(&project_directory(&self.files.root, folder))
+    }
+
+    /// ACP listing cannot treat a missed head/tail metadata window as an ordinary Chat.
+    pub fn project_acp_chats(&self, folder: &Path) -> io::Result<Vec<TranscriptSummary>> {
+        let mut summaries = self.project_chats(folder)?;
+        let directory = project_directory(&self.files.root, folder);
+        for summary in &mut summaries {
+            if summary.acp_session.is_none() {
+                summary.acp_session = super::listing::scan_acp_session(&transcript_path(
+                    &directory,
+                    summary.chat_id,
+                ))?;
+            }
+        }
+        Ok(summaries)
     }
 
     /// The saved titles in the project of a Chat this store registered or loaded.
@@ -357,6 +373,7 @@ impl ChatFiles {
 
 /// Loads a Transcript file the way the Harness loads a Chat: from the latest boundary, and in
 /// full when that misses the root.
+#[cfg(test)]
 pub(crate) fn load_file(path: &Path) -> io::Result<Option<LoadedTranscript>> {
     let (loaded, reaches_root) = assemble(&read_file(path, LoadRange::FromLatestBoundary)?, None);
     if reaches_root && loaded.is_some() {
