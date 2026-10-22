@@ -508,7 +508,7 @@ impl Agent {
         evidence: &str,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
-        let (goal_id, objective_revision, objective, conversation, client, model) = {
+        let (goal_id, objective_revision, objective, conversation, checker) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
             let Some(goal) = chat.snapshot.goal.as_ref() else {
@@ -522,42 +522,46 @@ impl Agent {
                 .settings
                 .as_ref()
                 .and_then(|settings| settings.goal_check_model());
-            let (client, model) = match check_model {
-                Some(model) => (
-                    self.inner
-                        .models
-                        .client(&model)
-                        .map_err(|error| error.to_string())?,
-                    model,
-                ),
-                None => (chat.client.clone(), chat.snapshot.model.clone()),
+            // A check model that cannot be reached is a failed check, like a failed call.
+            let checker = match check_model {
+                Some(model) => self
+                    .inner
+                    .models
+                    .client(&model)
+                    .map(|client| (client, model))
+                    .map_err(|error| error.to_string()),
+                None => Ok((chat.client.clone(), chat.snapshot.model.clone())),
             };
             (
                 goal.id,
                 goal.objective_revision,
                 goal.objective.clone(),
                 check::conversation_evidence(&chat.snapshot),
-                client,
-                model,
+                checker,
             )
         };
         let check_cancel = cancel.clone();
-        let request = check::check_request(
-            &objective,
-            evidence,
-            conversation,
-            check_budget_bytes(&model),
-        );
-        let verdict = match self
-            .tracked_model_request(
-                RequestContext::for_run(receipt, ModelRequestKind::GoalCheck),
-                client,
-                request,
-                cancel,
-                None,
-            )
-            .await
-        {
+        let checked = match checker {
+            Ok((client, model)) => {
+                let request = check::check_request(
+                    &objective,
+                    evidence,
+                    conversation,
+                    check_budget_bytes(&model),
+                );
+                self.tracked_model_request(
+                    RequestContext::for_run(receipt, ModelRequestKind::GoalCheck),
+                    client,
+                    request,
+                    cancel,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error),
+        };
+        let verdict = match checked {
             Ok(response) => {
                 let verdict = check::parse_check_reply(&response.output).map_err(str::to_owned);
                 let outcome = if verdict.is_ok() {
@@ -573,7 +577,7 @@ impl Agent {
                 }
                 verdict
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error),
         };
         // A check stopped with its turn proves nothing either way.
         if check_cancel.is_cancelled() {

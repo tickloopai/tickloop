@@ -961,3 +961,62 @@ async fn a_goal_set_before_any_message_keeps_the_chat() {
     assert_eq!(goal.objective, OBJECTIVE);
     reopened.shutdown().await;
 }
+
+/// Serves the scripted model, except that the check model's client cannot be built, as when its
+/// credentials are missing.
+struct OnlyTheChatModel(Arc<HoldingModel>);
+
+impl tickloop_agent_model::ModelClients for OnlyTheChatModel {
+    fn client(
+        &self,
+        model: &tickloop_agent_protocol::ModelConfig,
+    ) -> Result<Arc<dyn ModelClient>, ModelError> {
+        if model.model_id == "deepseek-flash" {
+            Err(ModelError::InvalidResponse(
+                "the check model has no credentials".into(),
+            ))
+        } else {
+            Ok(self.0.clone())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_check_model_that_cannot_be_built_blocks_the_goal() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"goalCheckModel":{"provider":"deepseek-api","model":"deepseek-flash"}}"#,
+    )
+    .unwrap();
+    let model = HoldingModel::new(vec![complete("u1"), text("Done.")], Vec::new());
+    let agent = tickloop_agent_test_support::harness::opened_agent(
+        root.path().into(),
+        config(),
+        Arc::new(OnlyTheChatModel(model.clone())),
+    );
+    approve_everything(&agent);
+    agent
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    set_goal(&agent, chat, None).await;
+
+    wait_for_goal(&agent, chat, |status| {
+        matches!(
+            status,
+            GoalStatus::Blocked {
+                by: GoalBlock::ExecutionFailed { error }
+            } if error.contains("the check model has no credentials")
+        )
+    })
+    .await;
+    assert!(model.check_requests().is_empty());
+    agent.shutdown().await;
+}
