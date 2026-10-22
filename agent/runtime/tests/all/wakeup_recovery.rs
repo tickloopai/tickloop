@@ -1309,6 +1309,131 @@ async fn a_switch_record_waiting_for_another_writer_holds_no_thread() {
     drop(other_writer);
 }
 
+/// A source's own change made with a delivery's acceptance is recorded after the acceptance's
+/// ledger record and before the delivery's turn reaches the model, and gets the receipt the
+/// delivery is accepted under.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_change_made_with_an_acceptance_lands_before_its_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    let source = scheduled("task", 1);
+    let committed_under = Arc::new(std::sync::Mutex::new(None));
+    let receipt = agent
+        .deliver_trigger_with_commit_for_tests(chat, source.clone(), "HOLD:turn advances", {
+            let committed_under = committed_under.clone();
+            move |snapshot, receipt| {
+                *committed_under.lock().unwrap() = Some(receipt.run_id);
+                vec![tickloop_agent_transcript::Line::CustomTitle(
+                    tickloop_agent_transcript::CustomTitleEntry {
+                        chat_id: snapshot.id,
+                        custom_title: "advanced with the acceptance".into(),
+                    },
+                )]
+            }
+        })
+        .await
+        .unwrap();
+    model.wait_held("turn").await;
+    assert_eq!(*committed_under.lock().unwrap(), Some(receipt.run_id));
+    let accepted = tickloop_agent_transcript::input_ids::trigger(chat, &source.identity());
+    let stored: Vec<tickloop_agent_transcript::Line> =
+        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+    let acceptance = stored.iter().position(|line| {
+        matches!(line, tickloop_agent_transcript::Line::Input(entry) if entry.input_id == accepted)
+    });
+    let change = stored.iter().position(|line| {
+        matches!(
+            line,
+            tickloop_agent_transcript::Line::CustomTitle(entry)
+                if entry.custom_title == "advanced with the acceptance"
+        )
+    });
+    assert!(
+        acceptance.is_some() && change.is_some() && acceptance < change,
+        "the change lands after the acceptance, before the turn: {acceptance:?} {change:?}"
+    );
+    model.release_held_turn();
+    agent.shutdown().await;
+}
+
+/// A source's own state is taken over from the store with a newly taken lease, before anything
+/// is accepted under it: what another process recorded decides whether the delivery that took
+/// the lease is eligible.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
+    const PLAN_FROM_NOW: &str = "plan from now on";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let holder = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&holder, chat, "get ready").await;
+    holder.flush_transcripts().await;
+    let taker_model = ContractModel::new();
+    let taker = Agent::open_embedded(root.clone(), config(), taker_model.clone()).unwrap();
+    // An example source whose state is a record in the Transcript: once it says so, the Chat
+    // plans, and Plan mode holds a Goal's continuation back.
+    taker.register_trigger_source_state_for_tests(|snapshot, stored| {
+        if stored.iter().any(|line| {
+            matches!(
+                line,
+                tickloop_agent_transcript::Line::CustomTitle(entry)
+                    if entry.custom_title == PLAN_FROM_NOW
+            )
+        }) {
+            snapshot.policy.mode = tickloop_agent_protocol::ExecutionMode::Plan;
+        }
+    });
+    taker.resume_chat(chat).await.unwrap();
+    complete_turn(&taker, chat, "resume here").await;
+
+    holder
+        .deliver_trigger_with_commit_for_tests(
+            chat,
+            scheduled("records", 1),
+            "recorded-here",
+            |snapshot, _| {
+                vec![tickloop_agent_transcript::Line::CustomTitle(
+                    tickloop_agent_transcript::CustomTitleEntry {
+                        chat_id: snapshot.id,
+                        custom_title: PLAN_FROM_NOW.into(),
+                    },
+                )]
+            },
+        )
+        .await
+        .unwrap();
+    model.wait_seen("recorded-here", 1).await;
+    holder.shutdown().await;
+
+    let continuation = tickloop_agent_protocol::TriggerSource::GoalContinuation {
+        goal_id: Uuid::from_u128(7),
+        after_run: Uuid::from_u128(1),
+    };
+    let held = taker
+        .deliver_trigger_for_tests(chat, continuation, "continues-the-goal")
+        .await;
+    assert!(
+        held.is_err(),
+        "the state taken over holds it back: {held:?}"
+    );
+    assert_eq!(
+        taker.snapshot(chat).await.unwrap().policy.mode,
+        tickloop_agent_protocol::ExecutionMode::Plan
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(taker_model.seen("continues-the-goal"), 0);
+    taker.shutdown().await;
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]

@@ -379,6 +379,8 @@ struct Inner {
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     chat_leases: loop_lease::ChatLeases,
+    /// The Trigger sources' own states, taken over from the store with each newly taken lease.
+    trigger_source_states: std::sync::RwLock<Vec<Arc<dyn wakeup::TriggerSourceState>>>,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -536,6 +538,8 @@ struct SubmissionOptions {
     /// The lease holding the delivery was let in under, which must still stand when it is
     /// accepted, and the Chat's Trigger boundary it is accepted within, left once it is.
     trigger_lease: Option<(loop_lease::LeaseHolding, loop_lease::TriggerBoundary)>,
+    /// The source's own change for the delivery, made as it is accepted.
+    trigger_commit: Option<wakeup::SourceCommit>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -1933,6 +1937,7 @@ impl Agent {
                 tasks: agent_tasks::AgentTasks::default(),
                 recorder,
                 chat_leases: loop_lease::ChatLeases::default(),
+                trigger_source_states: std::sync::RwLock::new(Vec::new()),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2538,6 +2543,7 @@ impl Agent {
             denial_reference,
             trigger_source,
             trigger_lease,
+            trigger_commit,
             invoked_skill,
             host_context,
             agent_message,
@@ -2677,7 +2683,15 @@ impl Agent {
         {
             self.record_merged_trigger(chat, &ledger, source, &waiting);
             *original = candidate;
+            let commits = trigger_commit.is_some();
+            if let Some(commit) = trigger_commit {
+                self.commit_trigger_source(original, commit, &waiting);
+            }
             self.save(&original.snapshot);
+            drop(chats);
+            if commits {
+                self.checkpoint_trigger_acceptance(chat_id).await;
+            }
             self.inner.ledger_changes.send_replace(());
             return Ok(waiting);
         }
@@ -2754,6 +2768,10 @@ impl Agent {
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
+        let commits = trigger_commit.is_some();
+        if let Some(commit) = trigger_commit {
+            self.commit_trigger_source(original, commit, &receipt);
+        }
         if let Some(source) = directed_origin {
             let source_chat = chats
                 .get_mut(&source.source_chat_id)
@@ -2765,6 +2783,9 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        if commits {
+            self.checkpoint_trigger_acceptance(chat_id).await;
+        }
         // Accepted: the run it may start enters the boundary again to take it.
         drop(trigger_lease);
         if let Some(parent) = task_delegation {

@@ -2578,6 +2578,20 @@ impl Agent {
         Ok(())
     }
 
+    /// Queues for the Chat's Transcript what it changed so far, ahead of whatever is recorded of
+    /// it next.
+    pub(super) fn queue_for_transcript(&self, chat: &Chat) {
+        if let Some(recorder) = &self.inner.recorder
+            && recorder
+                .logs
+                .lock()
+                .unwrap()
+                .contains_key(&chat.snapshot.id)
+        {
+            recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
+        }
+    }
+
     /// What the Chat queued for its Transcript and could not commit is dropped, and nothing more
     /// of it is written by this process.
     pub(super) fn withhold_transcript(&self, chat_id: ChatId, reason: &str) {

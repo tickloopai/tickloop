@@ -14,6 +14,7 @@ use tickloop_agent_protocol::{
     ChatSnapshot, Coalesce, LoopSnapshot, LoopState, OperationRecord, PauseReason, Receipt,
     Receiving, TriggerSource,
 };
+use tickloop_agent_transcript::Line;
 
 const STOPPED_BEFORE_ADMISSION: &str = "the Chat was stopped before Shell admission";
 
@@ -24,6 +25,27 @@ pub(super) struct TriggerDelivery {
     pub(super) input: String,
     /// The ledger input a host named for it; otherwise the source names one.
     pub(super) ledger: Option<lifecycle::LedgerInput>,
+    /// The source's own change for this delivery, made with its acceptance.
+    pub(super) on_accept: Option<SourceCommit>,
+}
+
+/// A source's own change for a delivery, such as a scheduled task's next time or the run it
+/// started: called once as the delivery is accepted, queued or merged, with the receipt it is
+/// accepted under; not for a replay, a hold or a refusal, which leave the delivery with its
+/// source. It is called within the Chat's boundary and under the Chats lock, after the
+/// acceptance's ledger record is queued for the Transcript, so what it changes in the Chat or
+/// records with `record_chat_metadata` lands after that record, in the checkpoint that follows
+/// the acceptance, and no later than the start record the delivery's turn waits for.
+pub(super) type SourceCommit = Box<dyn FnOnce(&Agent, &mut Chat, &Receipt) + Send>;
+
+/// A Trigger source's own state kept in the Chat's Transcript beside the ledger, such as a Goal
+/// or the scheduled tasks and their revocations.
+pub(super) trait TriggerSourceState: Send + Sync {
+    /// Takes the source's state over from `stored`, the Chat's stored Lines, under a newly taken
+    /// lease: within the Chat's boundary and under the Chats lock, right after the ledger's
+    /// Trigger records, before anything is accepted or started under the lease, so eligibility
+    /// reads the newest state another process left.
+    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]);
 }
 
 /// Why a delivery waits at its source instead of entering the Loop's queue, or why a queued one
@@ -356,6 +378,7 @@ impl Agent {
             source,
             input,
             ledger,
+            on_accept,
         } = delivery;
         Box::pin(self.submit_internal(
             chat_id,
@@ -363,6 +386,7 @@ impl Agent {
             SubmissionOptions {
                 trigger_source: Some(source),
                 trigger_lease: Some((holding, boundary)),
+                trigger_commit: on_accept,
                 ledger,
                 ..Default::default()
             },
@@ -481,6 +505,10 @@ impl Agent {
                 .get_mut(&chat_id)
                 .ok_or("the Chat is no longer loaded")?;
             chat.bookkeeping.lifecycle.adopt_trigger_records(&lines);
+            let states = self.inner.trigger_source_states.read().unwrap().clone();
+            for state in states {
+                state.take_over(self, chat, &lines);
+            }
             let lifecycle = &chat.bookkeeping.lifecycle;
             let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut chat.snapshot.pending_inputs)
@@ -532,6 +560,38 @@ impl Agent {
         Box::pin(async move {
             let _ = self.start_next_agent_run(chat_id).await;
         })
+    }
+
+    /// Registers a source's own state, taken over from the store with each newly taken lease;
+    /// sources register as the Agent is built.
+    pub(super) fn register_trigger_source_state(&self, state: Arc<dyn TriggerSourceState>) {
+        self.inner
+            .trigger_source_states
+            .write()
+            .unwrap()
+            .push(state);
+    }
+
+    /// The change a source made with an acceptance reaches the Transcript with it, within the
+    /// boundary; a failure leaves both queued, for the start record the turn waits for.
+    pub(super) async fn checkpoint_trigger_acceptance(&self, chat_id: ChatId) {
+        if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
+            let _ = self
+                .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                .await;
+        }
+    }
+
+    /// Applies a source's change for a delivery just accepted, after the acceptance is queued
+    /// for the Transcript.
+    pub(super) fn commit_trigger_source(
+        &self,
+        chat: &mut Chat,
+        commit: SourceCommit,
+        receipt: &Receipt,
+    ) {
+        self.queue_for_transcript(chat);
+        commit(self, chat, receipt);
     }
 
     /// The pause another process recorded: this process pauses too, without recording it again.
@@ -698,9 +758,57 @@ impl Agent {
                 source,
                 input: input.into(),
                 ledger: None,
+                on_accept: None,
             },
         )
         .await
+    }
+
+    /// Hands a delivery to the one entry with `commit` as its source's change, which records
+    /// the Lines it returns for the Transcript.
+    #[doc(hidden)]
+    pub async fn deliver_trigger_with_commit_for_tests(
+        &self,
+        chat_id: ChatId,
+        source: TriggerSource,
+        input: &str,
+        commit: impl FnOnce(&mut ChatSnapshot, &Receipt) -> Vec<Line> + Send + 'static,
+    ) -> Result<Receipt, AgentError> {
+        self.deliver_trigger(
+            chat_id,
+            TriggerDelivery {
+                source,
+                input: input.into(),
+                ledger: None,
+                on_accept: Some(Box::new(
+                    move |agent: &Agent, chat: &mut Chat, receipt: &Receipt| {
+                        for line in commit(&mut chat.snapshot, receipt) {
+                            agent.record_chat_metadata(chat.snapshot.id, line);
+                        }
+                    },
+                )),
+            },
+        )
+        .await
+    }
+
+    /// Registers, as a source does, a state that takes over the Chat's snapshot from its stored
+    /// Lines with each newly taken lease.
+    #[doc(hidden)]
+    pub fn register_trigger_source_state_for_tests(
+        &self,
+        take_over: impl Fn(&mut ChatSnapshot, &[Line]) + Send + Sync + 'static,
+    ) {
+        struct TestSourceState<F>(F);
+        impl<F> TriggerSourceState for TestSourceState<F>
+        where
+            F: Fn(&mut ChatSnapshot, &[Line]) + Send + Sync,
+        {
+            fn take_over(&self, _agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+                (self.0)(&mut chat.snapshot, stored);
+            }
+        }
+        self.register_trigger_source_state(Arc::new(TestSourceState(take_over)));
     }
 
     /// Takes back the queued deliveries `ended` names, as a source that stopped standing behind
