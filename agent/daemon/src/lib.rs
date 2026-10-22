@@ -326,6 +326,33 @@ impl WorkerFactory for ProcessWorkerFactory {
         }
         exited
     }
+    async fn retire(&self, worker: &Arc<dyn AgentAccess>) {
+        self.control.revoke(worker).await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .iter()
+                .position(|managed| Arc::ptr_eq(&managed.access, worker))
+                .map(|index| workers.remove(index))
+        };
+        let Some(retired) = retired else {
+            return;
+        };
+        let process = retired.process.clone();
+        // Lifeline EOF is the Worker's ordinary shutdown; reap it off the caller's path.
+        drop(retired);
+        tokio::spawn(async move {
+            let mut process = process.lock().await;
+            if let Some(process) = process.as_mut()
+                && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        });
+    }
 
     async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
         self.control

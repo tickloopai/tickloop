@@ -67,6 +67,7 @@ pub(crate) struct EmbeddedCheckpoint {
     executions: Vec<(ExecutionRef, Uuid)>,
     launches: Vec<(ExecutionRef, LaunchSpec)>,
     receipts: super::receipts::ReceiptCheckpoint,
+    #[serde(default)]
     managed: Vec<super::managed::SavedManaged>,
     queue: Vec<(Uuid, QueuedAction)>,
     queue_failures: VecDeque<QueuedCommandFailure>,

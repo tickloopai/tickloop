@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,11 +15,14 @@ use tickloop_agent_daemon::{DaemonServer, EmbeddedAgentAccess, WorkerFactory, se
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope,
     CommandReceipt, CommandResult, DisplayReceipt, DisplayUpdate, ExecutionMode, ExecutionProfile,
-    ExecutionRef, LaunchSpec, LiveChatSnapshot, ManagedToken, Observation, ObservationRequest,
-    ObservationValue, PendingRequestKind, PermissionScope, PromptPolicy, RequestRef, UserInput,
+    ExecutionRef, LaunchSpec, LiveChatSnapshot, MAX_PAGE_LIMIT, ManagedToken, Observation,
+    ObservationRequest, ObservationValue, Page, PendingRequestKind, PermissionScope, PromptPolicy,
+    RequestRef, UserInput,
 };
 use tickloop_agent_runtime::{
-    Agent, HarnessOptions, HarnessSeams, ToolPolicy, WaitHosting, environment::LocalEnvironment,
+    Agent, HarnessOptions, HarnessSeams, ToolPolicy, WaitHosting,
+    environment::LocalEnvironment,
+    transcript::{JsonlTranscriptStore, TranscriptStore},
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, harness::ChosenModels, text};
 use tokio::net::UnixListener;
@@ -32,6 +35,8 @@ struct Factory {
     runtimes: Mutex<Vec<Agent>>,
     launches: Mutex<Vec<LaunchSpec>>,
     cleanups: Mutex<Vec<(Uuid, Uuid)>>,
+    retired: AtomicUsize,
+    exited: AtomicBool,
     block_directory: Arc<AtomicBool>,
     directory_blocked: Arc<tokio::sync::Notify>,
     fail_settle: bool,
@@ -44,6 +49,8 @@ impl Factory {
             runtimes: Mutex::new(vec![]),
             launches: Mutex::new(vec![]),
             cleanups: Mutex::new(vec![]),
+            retired: AtomicUsize::new(0),
+            exited: AtomicBool::new(false),
             block_directory: Arc::new(AtomicBool::new(false)),
             directory_blocked: Arc::new(tokio::sync::Notify::new()),
             fail_settle: false,
@@ -68,7 +75,14 @@ impl WorkerFactory for Factory {
         self.launches.lock().unwrap().push(launch.clone());
         let runtime = Agent::with_seams(
             HarnessSeams {
-                transcripts: None,
+                transcripts: launch
+                    .config_root
+                    .clone()
+                    .filter(|_| launch.session_persistence)
+                    .map(|root| {
+                        Arc::new(JsonlTranscriptStore::open(root).unwrap())
+                            as Arc<dyn TranscriptStore>
+                    }),
                 environment: Some(Arc::new(LocalEnvironment::bare())),
                 models: ChosenModels::new(self.model.clone()),
             },
@@ -102,7 +116,11 @@ impl WorkerFactory for Factory {
     }
 
     async fn exited(&self, _: &Arc<dyn AgentAccess>) -> bool {
-        false
+        self.exited.load(Ordering::SeqCst)
+    }
+
+    async fn retire(&self, _: &Arc<dyn AgentAccess>) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn end_managed(
@@ -947,6 +965,148 @@ async fn hosted_cleanup_runs_even_when_worker_settlement_fails() {
     factory.shutdown().await;
 }
 
+async fn listed(daemon: &DaemonServer) -> Vec<ExecutionRef> {
+    let observation = daemon
+        .observe(ObservationRequest::Overview {
+            filter: Default::default(),
+            page: Page {
+                offset: 0,
+                limit: MAX_PAGE_LIMIT,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Overview(entries) = observation.initial else {
+        panic!("expected the Agent directory")
+    };
+    entries.into_iter().map(|entry| entry.execution).collect()
+}
+
+#[tokio::test]
+async fn released_or_refused_invocations_leave_no_worker_or_control_behind() {
+    let directory = tempfile::tempdir().unwrap();
+    let factory = Factory::new(vec![text("one-shot answer"), text("ACP answer")]);
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
+    let epoch = daemon.daemon_epoch();
+    let CommandResult::Created {
+        execution: local, ..
+    } = execute(
+        &daemon,
+        epoch,
+        AgentCommand::Create {
+            launch: launch(directory.path(), ExecutionProfile::Local),
+            initial: None,
+            origin: None,
+        },
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected a local Chat")
+    };
+    for (index, profile) in [ExecutionProfile::OneShot, ExecutionProfile::Acp]
+        .into_iter()
+        .enumerate()
+    {
+        let token = ManagedToken::new();
+        let execution = create(&daemon, epoch, launch(directory.path(), profile), &token).await;
+        submit(&daemon, execution, &token, "answer").await;
+        settle(&daemon, execution, &token, false).await;
+        // Settling a prompt keeps the invocation and its Worker.
+        assert_eq!(factory.retired.load(Ordering::SeqCst), index);
+        assert!(listed(&daemon).await.contains(&execution));
+        let beat = Uuid::new_v4();
+        daemon
+            .execute(CommandEnvelope {
+                daemon_epoch: epoch,
+                command_id: beat,
+                command: AgentCommand::ManagedHeartbeat {
+                    execution,
+                    token: token.clone(),
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let receipt = daemon
+            .observe(ObservationRequest::Receipt {
+                epoch,
+                command_id: beat,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(receipt.initial, ObservationValue::Receipt(None)),
+            "a renewal must not occupy receipt capacity"
+        );
+        execute(
+            &daemon,
+            epoch,
+            AgentCommand::ManagedRelease {
+                execution,
+                token: token.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(factory.retired.load(Ordering::SeqCst), index + 1);
+        assert_eq!(listed(&daemon).await, [local]);
+        // Neither a proof nor a route survives: an ordinary command finds no execution rather
+        // than a managed one it may not mutate.
+        assert_eq!(
+            execute(
+                &daemon,
+                epoch,
+                AgentCommand::Submit {
+                    execution,
+                    target_loop: None,
+                    input: input("after release"),
+                    origin: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .code,
+            AccessErrorCode::StaleExecution
+        );
+        assert_eq!(
+            execute(
+                &daemon,
+                epoch,
+                AgentCommand::ManagedHeartbeat { execution, token }
+            )
+            .await
+            .unwrap_err()
+            .code,
+            AccessErrorCode::AccessDenied
+        );
+    }
+    let mut refused = launch(directory.path(), ExecutionProfile::Acp);
+    refused.model = Some(config());
+    assert!(
+        execute(
+            &daemon,
+            epoch,
+            AgentCommand::CreateManaged {
+                launch: refused,
+                initial: None,
+                session_id: Uuid::new_v4(),
+                token: ManagedToken::new(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .message
+        .contains("built-in")
+    );
+    assert_eq!(factory.launches.lock().unwrap().len(), 4);
+    assert_eq!(factory.retired.load(Ordering::SeqCst), 3);
+    assert_eq!(listed(&daemon).await, [local]);
+    factory.shutdown().await;
+}
+
 #[tokio::test]
 async fn ipc_creation_must_claim_the_actual_client_session() {
     let directory = tempfile::tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT).unwrap();
@@ -1049,5 +1209,90 @@ async fn unresponsive_worker_directory_does_not_prevent_managed_lease_cleanup() 
         AccessErrorCode::AccessDenied
     );
     factory.block_directory.store(false, Ordering::SeqCst);
+    factory.shutdown().await;
+}
+
+#[tokio::test]
+async fn reloading_after_a_worker_exit_ends_the_old_invocation_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let factory = Factory::new(vec![]);
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
+    let epoch = daemon.daemon_epoch();
+    let mut spec = launch(directory.path(), ExecutionProfile::Acp);
+    spec.config_root = Some(root.path().into());
+    spec.model = Some(
+        tickloop_agent_model::cards::ModelCatalog::defaults()
+            .get("anthropic-api", "claude-sonnet-4-6")
+            .unwrap(),
+    );
+    let old_token = ManagedToken::new();
+    let old = create(&daemon, epoch, spec.clone(), &old_token).await;
+    let chat = snapshot(&daemon, old).await.conversation.id;
+    // The old Worker exits; its kernel-held session claim goes with it.
+    let old_runtime = factory.runtimes.lock().unwrap()[0].clone();
+    old_runtime.release_acp_session_claim(chat).await;
+    factory.exited.store(true, Ordering::SeqCst);
+    let new_token = ManagedToken::new();
+    let CommandResult::Loaded { execution: new, .. } = execute(
+        &daemon,
+        epoch,
+        AgentCommand::ManagedLoad {
+            session_uuid: chat,
+            launch: spec,
+            session_id: Uuid::new_v4(),
+            token: new_token.clone(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("expected the reloaded ACP session")
+    };
+    factory.exited.store(false, Ordering::SeqCst);
+    assert_ne!(new, old);
+    // The exited invocation's hosted ownership ended before its Chat ran again, and its Worker
+    // was forgotten.
+    let cleanups = factory.cleanups.lock().unwrap().clone();
+    assert_eq!(cleanups.len(), 1);
+    assert_eq!(cleanups[0].0, chat);
+    assert_eq!(factory.retired.load(Ordering::SeqCst), 1);
+    // Its proof is gone, so its late release can never end the new invocation's Ticks.
+    for command in [
+        AgentCommand::ManagedHeartbeat {
+            execution: old,
+            token: old_token.clone(),
+        },
+        AgentCommand::ManagedRelease {
+            execution: old,
+            token: old_token,
+        },
+    ] {
+        assert_eq!(
+            execute(&daemon, epoch, command).await.unwrap_err().code,
+            AccessErrorCode::AccessDenied
+        );
+    }
+    assert_eq!(factory.cleanups.lock().unwrap().len(), 1);
+    execute(
+        &daemon,
+        epoch,
+        AgentCommand::ManagedHeartbeat {
+            execution: new,
+            token: new_token.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    execute(
+        &daemon,
+        epoch,
+        AgentCommand::ManagedRelease {
+            execution: new,
+            token: new_token,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(factory.retired.load(Ordering::SeqCst), 2);
     factory.shutdown().await;
 }

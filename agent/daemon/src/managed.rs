@@ -136,17 +136,33 @@ impl ManagedRegistry {
     pub async fn contains(&self, execution: ExecutionRef) -> bool {
         self.entries.lock().await.contains_key(&execution)
     }
+    pub async fn entry(&self, execution: ExecutionRef) -> Option<Arc<ManagedEntry>> {
+        self.entries.lock().await.get(&execution).cloned()
+    }
+    /// Whether `entry` is still the registered control of `execution`, rather than one a
+    /// completed release or a replacing load already forgot.
+    pub async fn is_current(&self, execution: ExecutionRef, entry: &Arc<ManagedEntry>) -> bool {
+        self.entries
+            .lock()
+            .await
+            .get(&execution)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+    }
+    /// Forgets `entry`, its proof and its launch, unless another entry replaced it meanwhile.
+    pub async fn remove(&self, execution: ExecutionRef, entry: &Arc<ManagedEntry>) {
+        let mut entries = self.entries.lock().await;
+        if entries
+            .get(&execution)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entries.remove(&execution);
+        }
+    }
     pub async fn reacquirable(&self, execution: ExecutionRef) -> bool {
         let Some(entry) = self.entries.lock().await.get(&execution).cloned() else {
             return false;
         };
-        let state = entry.state.lock().await;
-        entry.launch.profile == ExecutionProfile::Acp
-            && state.released
-            && state.settled
-            && state.worker_settled
-            && !state.cleanup_running
-            && state.cleanup_error.is_none()
+        entry.launch.profile == ExecutionProfile::Acp && entry.released_cleanly().await
     }
     pub async fn warning(&self, execution: ExecutionRef) -> Option<String> {
         let entry = self.entries.lock().await.get(&execution).cloned()?;
@@ -434,6 +450,24 @@ impl ManagedEntry {
     pub async fn worker_settled(&self) -> bool {
         self.state.lock().await.worker_settled
     }
+    /// Revoked, settled, released by its Worker and with no cleanup running or failed.
+    pub async fn released_cleanly(&self) -> bool {
+        let state = self.state.lock().await;
+        state.released
+            && state.settled
+            && state.worker_settled
+            && !state.cleanup_running
+            && state.cleanup_error.is_none()
+    }
+    /// Records the hosted cleanup of a settled prompt. A round settlement never closes session
+    /// MCP, so it is never a Worker release; and once a release or lease expiry revoked the
+    /// proof, that cleanup owns this state and a late settlement must not overwrite it.
+    pub async fn round_finished(&self, error: Option<String>) {
+        let mut state = self.state.lock().await;
+        if !state.released {
+            state.cleanup_error = error;
+        }
+    }
     pub async fn cleanup_finished(&self, worker_settled: bool, error: Option<String>) {
         let mut state = self.state.lock().await;
         state.worker_settled |= worker_settled;
@@ -524,15 +558,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        entry.cleanup_finished(true, None).await;
+        entry.round_finished(None).await;
         entry.settle().await;
-        assert!(entry.worker_settled().await);
-        entry.state.lock().await.expires = Instant::now() - Duration::from_secs(1);
-        assert_eq!(registry.expired().await.len(), 1);
         assert!(
             !entry.worker_settled().await,
             "round settlement did not close session MCP"
         );
+        entry.state.lock().await.expires = Instant::now() - Duration::from_secs(1);
+        assert_eq!(registry.expired().await.len(), 1);
+        assert!(!entry.worker_settled().await);
         // A successful release is kept across retries of the remaining hosted cleanup.
         entry
             .cleanup_finished(true, Some("hosted cleanup pending".into()))
@@ -540,6 +574,38 @@ mod tests {
         entry.state.lock().await.retry_at = Instant::now();
         assert_eq!(registry.expired().await.len(), 1);
         assert!(entry.worker_settled().await);
+    }
+
+    #[tokio::test]
+    async fn settlement_finishing_after_revocation_leaves_release_cleanup_in_charge() {
+        let (registry, execution, token) = fixture().await;
+        let entry = registry
+            .authorize(&heartbeat(execution, &token))
+            .await
+            .unwrap()
+            .unwrap();
+        // The lease expires while a prompt settlement holds the gate.
+        entry.state.lock().await.expires = Instant::now() - Duration::from_secs(1);
+        assert_eq!(registry.expired().await.len(), 1);
+        entry.round_finished(None).await;
+        entry.settle().await;
+        assert!(!entry.worker_settled().await);
+        assert!(!entry.released_cleanly().await);
+        assert!(!registry.reacquirable(execution).await);
+        // The expiry gate timed out first; a later settlement cannot clear its failure.
+        entry
+            .cleanup_finished(false, Some("managed expiry admission timed out".into()))
+            .await;
+        entry.round_finished(None).await;
+        assert!(registry.warning(execution).await.is_some());
+        assert!(!registry.reacquirable(execution).await);
+        // Only the Worker release makes the entry releasable.
+        entry.cleanup_finished(true, None).await;
+        assert!(entry.released_cleanly().await);
+        assert!(registry.reacquirable(execution).await);
+        assert!(registry.is_current(execution, &entry).await);
+        registry.remove(execution, &entry).await;
+        assert!(!registry.contains(execution).await);
     }
 
     #[tokio::test]
