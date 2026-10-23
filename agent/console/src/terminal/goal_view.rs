@@ -203,28 +203,55 @@ fn format_elapsed(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests;
 
-pub(super) fn notice_runs(
+pub(super) fn notice_pieces(
     notice: &tickloop_agent_protocol::GoalNotice,
-) -> Vec<(String, Option<Role>)> {
+    objective: &str,
+) -> Vec<super::console::ConversationPiece> {
     use tickloop_agent_protocol::{GoalBlock, GoalNotice};
-    let (text, role) = match notice {
+    let (mut text, role): (String, Role) = match notice {
         GoalNotice::Set => ("Goal set".into(), Role::Accent),
         GoalNotice::Completed => ("Goal achieved".into(), Role::Success),
-        GoalNotice::Blocked { by } => (
-            format!(
-                "Goal stalled: {}",
-                match by {
-                    GoalBlock::Reported { reason } | GoalBlock::CheckImpossible { reason } =>
-                        super::safe_line(reason),
-                    GoalBlock::ExecutionFailed { error } => super::safe_line(error),
-                    GoalBlock::NoProgress => "no progress in three continuations".into(),
-                }
-            ),
-            Role::Warning,
-        ),
+        GoalNotice::Blocked { .. } => ("Goal stalled".into(), Role::Warning),
         GoalNotice::BudgetLimited => ("Goal token budget exhausted".into(), Role::Warning),
         GoalNotice::Paused { .. } => ("Goal paused · /goal resume".into(), Role::MutedText),
         GoalNotice::Cleared => ("Goal cleared".into(), Role::MutedText),
     };
-    vec![(format!("\n● {text}\n"), Some(role))]
+    if matches!(
+        notice,
+        GoalNotice::Set
+            | GoalNotice::Completed
+            | GoalNotice::Blocked { .. }
+            | GoalNotice::BudgetLimited
+    ) {
+        let condition = super::conversation_picker::compact_line(&super::safe_text(objective));
+        if !condition.is_empty() {
+            text.push(' ');
+            text.push_str(&condition);
+        }
+    }
+    if let GoalNotice::Blocked { by } = notice {
+        let reason = match by {
+            GoalBlock::Reported { reason } | GoalBlock::CheckImpossible { reason } => {
+                super::safe_line(reason)
+            }
+            GoalBlock::ExecutionFailed { error } => super::safe_line(error),
+            GoalBlock::NoProgress => "no progress in three continuations".into(),
+        };
+        text.push_str(": ");
+        text.push_str(&reason);
+    }
+    vec![
+        super::console::ConversationPiece::Block,
+        super::console::ConversationPiece::Notice {
+            text: format!("● {text}"),
+            role,
+        },
+    ]
+}
+
+pub(super) fn continuation_runs() -> Vec<(String, Option<Role>)> {
+    vec![(
+        format!("\n{}\n", tickloop_agent_protocol::GOAL_CONTINUATION_EVENT),
+        Some(Role::MutedText),
+    )]
 }

@@ -92,6 +92,9 @@ pub struct ChatSnapshot {
     pub invoked_skills: Vec<InvokedSkill>,
     #[serde(default)]
     pub message_runs: BTreeMap<usize, RunId>,
+    /// Recorded Trigger sources for display only; raw messages remain the model's input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trigger_origins: BTreeMap<RunId, crate::TriggerIdentity>,
     #[serde(default)]
     pub message_contexts: BTreeMap<usize, Vec<InputContext>>,
     /// Stable Transcript identities for prompts, replies and host messages, including after

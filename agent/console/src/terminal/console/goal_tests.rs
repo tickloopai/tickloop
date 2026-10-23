@@ -2,6 +2,317 @@ use super::*;
 use tickloop_agent_protocol::{GoalSnapshot, GoalStatus};
 
 #[test]
+fn goal_set_history_shows_its_recorded_condition_on_one_clipped_line() {
+    let chat = Uuid::new_v4();
+    let mut snapshot = super::monitor_tests::chat_snapshot(chat);
+    snapshot.goal = Some(goal());
+    snapshot.goal_history = vec![tickloop_agent_protocol::GoalHistoryEntry {
+        after_message_id: None,
+        objective: "不用tick查询到特斯拉现在的夜盘股价\n第二行\t尾部\x1b".into(),
+        notice: tickloop_agent_protocol::GoalNotice::Set,
+        timestamp: "2026-10-23T00:00:00Z".into(),
+    }];
+    let console = Console::test_interactive_for_chat(chat);
+    console.state.lock().unwrap().resize(40, 25);
+    super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+    let live = Console::test_interactive_for_chat(chat);
+    live.write_pieces(&super::super::goal_view::notice_pieces(
+        &snapshot.goal_history[0].notice,
+        &snapshot.goal_history[0].objective,
+    ))
+    .unwrap();
+    for width in [40, 18, 80, 14, 40] {
+        let rows = console
+            .state
+            .lock()
+            .unwrap()
+            .scrollback
+            .frame(width, 100)
+            .lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        let live_rows = live
+            .state
+            .lock()
+            .unwrap()
+            .scrollback
+            .frame(width, 100)
+            .lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, live_rows, "width {width}");
+        assert_eq!(rows.len(), 1, "width {width}: {rows:?}");
+        assert!(unicode_width::UnicodeWidthStr::width(rows[0].as_str()) <= width);
+        if width == 40 {
+            assert_eq!(rows, ["● Goal set 不用tick查询到特斯拉现在的夜…"]);
+        }
+        if width == 80 {
+            assert_eq!(
+                rows,
+                ["● Goal set 不用tick查询到特斯拉现在的夜盘股价 第二行 尾部"]
+            );
+        }
+    }
+}
+
+#[test]
+fn goal_event_clipping_keeps_whole_emoji_and_restores_text_when_widened() {
+    for emoji in ["👩‍💻", "👍🏽", "🇨🇳"] {
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        console
+            .write_pieces(&super::super::goal_view::notice_pieces(
+                &tickloop_agent_protocol::GoalNotice::Set,
+                &emoji.repeat(3),
+            ))
+            .unwrap();
+        for (width, expected) in [
+            (14, format!("● Goal set {emoji}…")),
+            (30, format!("● Goal set {}", emoji.repeat(3))),
+            (1, "…".into()),
+        ] {
+            let rows = console
+                .state
+                .lock()
+                .unwrap()
+                .scrollback
+                .frame(width, 100)
+                .lines
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(rows, [expected], "width {width}");
+        }
+    }
+}
+
+#[test]
+fn goal_history_uses_each_events_condition_after_replacement() {
+    use tickloop_agent_protocol::{GoalHistoryEntry, GoalNotice, GoalPause};
+    let chat = Uuid::new_v4();
+    let mut snapshot = super::monitor_tests::chat_snapshot(chat);
+    snapshot.goal = Some(goal());
+    snapshot.goal_history = [
+        ("First condition", GoalNotice::Set),
+        ("First condition", GoalNotice::Completed),
+        ("Replacement condition", GoalNotice::Set),
+        (
+            "Replacement condition",
+            GoalNotice::Paused {
+                by: GoalPause::User,
+            },
+        ),
+        ("Replacement condition", GoalNotice::Cleared),
+    ]
+    .into_iter()
+    .map(|(objective, notice)| GoalHistoryEntry {
+        after_message_id: None,
+        objective: objective.into(),
+        notice,
+        timestamp: "2026-10-23T00:00:00Z".into(),
+    })
+    .collect();
+    let console = Console::test_interactive_for_chat(chat);
+    super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+    let text = console.test_conversation_text();
+    assert_eq!(
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>(),
+        [
+            "● Goal set First condition",
+            "● Goal achieved First condition",
+            "● Goal set Replacement condition",
+            "● Goal paused · /goal resume",
+            "● Goal cleared",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event() {
+    use tickloop_agent_protocol::{GoalAction, Role as MessageRole, TriggerSource};
+    use tickloop_agent_runtime::Agent;
+    use tickloop_agent_test_support::{ScriptedModel, config, text};
+    let root = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("Progress recorded")]));
+    let agent = Agent::open(root.path().into(), config(), model.clone()).unwrap();
+    agent.hold_goal_continuations_for_tests();
+    agent
+        .trust_working_directory(folder.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .manage_goal(
+            chat,
+            GoalAction::Set {
+                objective: "Ship the release".into(),
+                token_budget: None,
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    let goal = agent.snapshot(chat).await.unwrap().goal.unwrap();
+    let receipt = agent.deliver_trigger_for_tests(chat, TriggerSource::GoalContinuation {
+        goal_id: goal.id, after_run: Uuid::new_v4(), objective_revision: goal.objective_revision,
+    }, "Continue working toward the active goal of this Chat.\n<objective>Ship the release</objective>\nUsage\nContinuation behavior").await.unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            if snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+                && snapshot
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Assistant)
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let raw = snapshot.messages.iter().find(|message| message.role == MessageRole::User && message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text.contains("<objective>")))).unwrap().clone();
+    assert!(
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.messages.contains(&raw))
+    );
+    assert!(snapshot.trigger_origins.contains_key(&receipt.run_id));
+    assert!(
+        agent
+            .resume_chat(chat)
+            .await
+            .unwrap()
+            .trigger_origins
+            .contains_key(&receipt.run_id)
+    );
+    let live = Console::test_interactive_for_chat(chat);
+    super::super::consume_input_echo_from_snapshot(&live, &snapshot, receipt.run_id).unwrap();
+    assert_eq!(
+        live.test_conversation_text()
+            .matches("↻ Continuing Goal")
+            .count(),
+        1
+    );
+    agent.shutdown().await;
+
+    let restored = Agent::open(
+        root.path().into(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![])),
+    )
+    .unwrap();
+    let snapshot = restored.resume_chat(chat).await.unwrap();
+    assert!(
+        snapshot.messages.contains(&raw),
+        "Transcript keeps the full prompt"
+    );
+    assert!(snapshot.trigger_origins.contains_key(&receipt.run_id));
+    let replay = Console::test_interactive_for_chat(chat);
+    super::super::workflows::write_public_history(&replay, &snapshot).unwrap();
+    super::super::consume_input_echo_from_snapshot(&replay, &snapshot, receipt.run_id).unwrap();
+    let history = replay.test_conversation_text();
+    assert_eq!(history.matches("↻ Continuing Goal").count(), 1);
+    assert!(!history.contains("<objective>"));
+    assert!(!history.contains("Continuation behavior"));
+    restored.shutdown().await;
+}
+
+#[test]
+fn goal_continuation_live_and_reopened_history_show_one_event() {
+    use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    let chat = Uuid::new_v4();
+    let run = Uuid::new_v4();
+    let mut snapshot = super::monitor_tests::chat_snapshot(chat);
+    snapshot.messages = vec![Message { role: MessageRole::User, content: vec![Content::Text {
+        text: "Continue working toward the active goal of this Chat.\n<objective>Ship it</objective>\nUsage\nContinuation behavior".into(),
+    }] }];
+    snapshot.message_runs.insert(0, run);
+    snapshot.trigger_origins.insert(
+        run,
+        TriggerIdentity::GoalContinuation {
+            goal_id: Uuid::new_v4(),
+            after_run: Uuid::new_v4(),
+        },
+    );
+    let live = Console::test_interactive_for_chat(chat);
+    for _ in 0..2 {
+        super::super::consume_input_echo_from_snapshot(&live, &snapshot, run).unwrap();
+    }
+    let replay = Console::test_interactive_for_chat(chat);
+    super::super::workflows::write_public_history(&replay, &snapshot).unwrap();
+    super::super::consume_input_echo_from_snapshot(&replay, &snapshot, run).unwrap();
+    for console in [&live, &replay] {
+        let text = console.test_conversation_text();
+        assert_eq!(
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>(),
+            ["↻ Continuing Goal"]
+        );
+        assert!(console.test_conversation_rows().iter().all(|line| {
+            line.fill != Some(Role::UserMessageBg)
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| span.role == Some(Role::MutedText))
+        }));
+    }
+    let detailed = super::super::conversation::project(&snapshot);
+    assert_eq!(detailed.blocks.len(), 1);
+    assert!(matches!(
+        detailed.blocks[0].kind,
+        super::super::conversation::ConversationBlockKind::GoalContinuation
+    ));
+
+    snapshot.trigger_origins.clear();
+    let user = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
+    assert!(
+        user.contains("<objective>Ship it</objective>"),
+        "identical user-written text stays visible"
+    );
+}
+
+#[test]
+fn scheduled_skill_live_and_history_show_the_users_instruction() {
+    use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    let chat = Uuid::new_v4();
+    let run = Uuid::new_v4();
+    let mut snapshot = super::monitor_tests::chat_snapshot(chat);
+    snapshot.messages = vec![Message { role: MessageRole::User, content: vec![Content::Text {
+        text: "Scheduled task 12345678: invoke the `review` Skill with the Skill tool with the arguments `main`.\n\nThis is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.".into(),
+    }] }];
+    snapshot.message_runs.insert(0, run);
+    snapshot.trigger_origins.insert(
+        run,
+        TriggerIdentity::ScheduledTask {
+            task_id: "12345678".into(),
+            scheduled_for_ms: 1,
+        },
+    );
+    for history in [false, true] {
+        let console = Console::test_interactive_for_chat(chat);
+        if history {
+            super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+        }
+        super::super::consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        let text = console.test_conversation_text();
+        assert!(text.contains("/review main"), "{text}");
+        assert!(!text.contains("Skill tool"));
+        assert!(!text.contains("final run"));
+        assert_eq!(text.matches("/review main").count(), 1);
+    }
+}
+
+#[test]
 fn continue_prompt_preserves_typed_and_pasted_messages_before_menu_cancellation_finishes() {
     for pasted in [false, true] {
         for draft in [

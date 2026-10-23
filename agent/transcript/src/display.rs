@@ -44,6 +44,8 @@ pub enum DisplayKind {
         input_id: Option<Uuid>,
         #[serde(default)]
         origin: PromptOrigin,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_event: bool,
     },
     /// One attempt of one Run; `attempt` is 0 until its lifecycle record is known.
     Answer {
@@ -406,9 +408,15 @@ impl DisplayProjector {
                     } else if let Some(id) = self.prompts_by_run.get(&input.run_id).copied() {
                         let origin = self.prompt_origin(&entry).unwrap_or_default();
                         if let Some(node) = self.nodes.get_mut(&id)
-                            && let DisplayKind::Prompt { origin: shown, .. } = &mut node.kind
+                            && let DisplayKind::Prompt {
+                                origin: shown,
+                                is_event,
+                                ..
+                            } = &mut node.kind
                         {
                             *shown = origin;
+                            *is_event = is_goal_continuation(shown);
+                            node.blocks = prompt_blocks(&entry, shown);
                             changed.push(id);
                         }
                     }
@@ -713,12 +721,8 @@ impl DisplayProjector {
             }
             None if is_prompt => {
                 let id = entry.original_message_id.unwrap_or(entry.uuid);
-                let mut blocks = Vec::new();
-                let text = message_text(&entry.message.content);
-                if !text.is_empty() {
-                    blocks.push(DisplayBlock::Text { text });
-                }
-                blocks.extend(prompt_images(entry).into_iter().map(DisplayBlock::Image));
+                let origin = origin.unwrap_or_default();
+                let blocks = prompt_blocks(entry, &origin);
                 if let Some(run) = entry.run_id {
                     self.prompts_by_run.insert(run, id);
                 }
@@ -727,7 +731,8 @@ impl DisplayProjector {
                     parent: follows,
                     kind: DisplayKind::Prompt {
                         input_id: entry.input_id,
-                        origin: origin.unwrap_or_default(),
+                        is_event: is_goal_continuation(&origin),
+                        origin,
                     },
                     blocks,
                     status: DisplayStatus::Complete,
@@ -780,6 +785,31 @@ impl DisplayProjector {
         }
         self.nodes.get_mut(&id).unwrap()
     }
+}
+
+fn prompt_blocks(entry: &ChainEntry, origin: &PromptOrigin) -> Vec<DisplayBlock> {
+    let mut text = message_text(&entry.message.content);
+    if let PromptOrigin::Trigger { identity, .. } = origin {
+        text = identity.display_input(&text).into_owned();
+    }
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(DisplayBlock::Text { text });
+    }
+    if !is_goal_continuation(origin) {
+        blocks.extend(prompt_images(entry).into_iter().map(DisplayBlock::Image));
+    }
+    blocks
+}
+
+fn is_goal_continuation(origin: &PromptOrigin) -> bool {
+    matches!(
+        origin,
+        PromptOrigin::Trigger {
+            identity: TriggerIdentity::GoalContinuation { .. },
+            ..
+        }
+    )
 }
 
 fn message_text(content: &[Content]) -> String {

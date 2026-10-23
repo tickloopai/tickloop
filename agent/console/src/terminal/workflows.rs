@@ -888,7 +888,10 @@ fn public_history_pieces(
     let mut answers_tick_delivery = false;
     let mut goal_history = chat.goal_history.iter().peekable();
     while let Some(entry) = goal_history.next_if(|entry| entry.after_message_id.is_none()) {
-        history.push_runs(&super::goal_view::notice_runs(&entry.notice));
+        history.pieces.extend(super::goal_view::notice_pieces(
+            &entry.notice,
+            &entry.objective,
+        ));
     }
     for item in projection {
         match item {
@@ -931,13 +934,19 @@ fn public_history_pieces(
                 while let Some(entry) =
                     goal_history.next_if(|entry| entry.after_message_id == source.message_id)
                 {
-                    history.push_runs(&super::goal_view::notice_runs(&entry.notice));
+                    history.pieces.extend(super::goal_view::notice_pieces(
+                        &entry.notice,
+                        &entry.objective,
+                    ));
                 }
             }
         }
     }
     for entry in goal_history {
-        history.push_runs(&super::goal_view::notice_runs(&entry.notice));
+        history.pieces.extend(super::goal_view::notice_pieces(
+            &entry.notice,
+            &entry.objective,
+        ));
     }
     let pending = pending_reply(chat);
     if !pending.is_empty() {
@@ -1039,7 +1048,10 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
         chat.message_runs
             .values()
             .copied()
-            .filter(|input| super::consumed_input_text(chat, *input).is_some())
+            .filter(|input| {
+                super::consumed_input_text(chat, *input).is_some()
+                    || matches!(chat.trigger_origins.get(input), Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. }))
+            })
             .chain(
                 chat.messages
                     .iter()
@@ -1135,6 +1147,16 @@ fn append_public_message(
     folded: bool,
 ) {
     let (source_chat_id, run_id) = (source.chat_id, source.run_id);
+    let trigger = (source_chat_id == history.chat.id && message.role == Role::User)
+        .then(|| run_id.and_then(|run| history.chat.trigger_origins.get(&run)))
+        .flatten();
+    if matches!(
+        trigger,
+        Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
+    ) {
+        history.push_runs(&super::goal_view::continuation_runs());
+        return;
+    }
     append_input_contexts(history, contexts);
     for content in &message.content {
         let follows_rejection = std::mem::take(&mut history.after_rejection);
@@ -1174,9 +1196,13 @@ fn append_public_message(
             }
             Content::Text { text } => match message.role {
                 Role::User => {
+                    let text = trigger.map_or_else(
+                        || std::borrow::Cow::Borrowed(text.as_str()),
+                        |trigger| trigger.display_input(text),
+                    );
                     history.push_prompt(
                         source_chat_id,
-                        &safe_text(text),
+                        &safe_text(&text),
                         display,
                         !source.is_agent_message,
                     );

@@ -302,9 +302,21 @@ fn goal_notices_use_semantic_roles_and_keep_untrusted_reasons_on_one_line() {
         ),
         (GoalNotice::Cleared, Role::MutedText),
     ] {
-        let runs = notice_runs(&notice);
-        assert_eq!(runs[0].1, Some(role));
-        assert_eq!(runs[0].0.lines().count(), 2);
-        assert!(!runs[0].0.contains('\x1b'));
+        let pieces = notice_pieces(&notice, "first\nsecond\tthird\x1b");
+        let super::super::console::ConversationPiece::Notice {
+            text,
+            role: actual_role,
+        } = &pieces[1]
+        else {
+            panic!("Goal notices are single-row events")
+        };
+        assert_eq!(*actual_role, role);
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\t'));
+        assert_eq!(
+            text.contains("first second third"),
+            !matches!(notice, GoalNotice::Paused { .. } | GoalNotice::Cleared)
+        );
     }
 }

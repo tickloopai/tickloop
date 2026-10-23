@@ -344,6 +344,97 @@ fn scheduled_run() -> tickloop_agent_protocol::TriggerSource {
 }
 
 #[test]
+fn goal_continuation_shows_one_event_without_its_model_prompt() {
+    let response = response(ResponseState::Started);
+    let mut prompt = entry(Role::User, vec![Content::Text {
+        text: "Continue working toward the active goal of this Chat.\n<objective>Ship it</objective>\nUsage\nContinuation behavior".into(),
+    }]);
+    prompt.run_id = Some(response.run_id);
+    let Line::Input(mut input) = input(&response, InputOp::Trigger) else {
+        unreachable!()
+    };
+    input.trigger = Some(crate::TriggerRecord::of(
+        &tickloop_agent_protocol::TriggerSource::GoalContinuation {
+            goal_id: Uuid::new_v4(),
+            after_run: Uuid::new_v4(),
+            objective_revision: 1,
+        },
+    ));
+    for lines in [
+        vec![Line::Input(input.clone()), Line::User(prompt.clone())],
+        vec![Line::User(prompt.clone()), Line::Input(input.clone())],
+    ] {
+        let nodes = project(&lines);
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(
+            nodes[0].kind,
+            DisplayKind::Prompt { is_event: true, .. }
+        ));
+        assert_eq!(
+            nodes[0].blocks,
+            vec![DisplayBlock::Text {
+                text: "↻ Continuing Goal".into()
+            }]
+        );
+        assert!(
+            !serde_json::to_string(&nodes)
+                .unwrap()
+                .contains("<objective>")
+        );
+        let retained = Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
+            chat_id: Uuid::nil(),
+            lines,
+        });
+        assert_eq!(project(&[retained]), nodes);
+    }
+}
+
+#[test]
+fn scheduled_input_projection_hides_the_skill_wrapper() {
+    let response = response(ResponseState::Started);
+    let mut prompt = entry(Role::User, vec![Content::Text {
+        text: "Scheduled task 0a1b2c3d: invoke the `review` Skill with the Skill tool with the arguments `main`.".into(),
+    }]);
+    prompt.run_id = Some(response.run_id);
+    let nodes = project(&[input(&response, InputOp::Trigger), Line::User(prompt)]);
+    assert_eq!(
+        nodes[0].blocks,
+        [DisplayBlock::Text {
+            text: "/review main".into()
+        }]
+    );
+    assert!(matches!(
+        nodes[0].kind,
+        DisplayKind::Prompt {
+            is_event: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn existing_display_prompts_without_event_metadata_still_deserialize() {
+    let kind: DisplayKind = serde_json::from_value(json!({
+        "kind": "prompt", "input_id": null, "origin": {"kind": "user"},
+    }))
+    .unwrap();
+    assert_eq!(
+        kind,
+        DisplayKind::Prompt {
+            input_id: None,
+            origin: PromptOrigin::User,
+            is_event: false
+        }
+    );
+    assert!(
+        serde_json::to_value(kind)
+            .unwrap()
+            .get("is_event")
+            .is_none()
+    );
+}
+
+#[test]
 fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
     let sender = Uuid::new_v4();
     for (op, source, text) in [
@@ -412,7 +503,8 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
             after[0].kind,
             DisplayKind::Prompt {
                 input_id: None,
-                origin: expected
+                origin: expected,
+                is_event: false,
             }
         );
         assert_eq!(after[1].parent, Some(prompt_id));

@@ -12,6 +12,7 @@ use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, EventKind, OperationRecord, OperationState, PromptPolicy, Receipt,
     ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision,
     ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation, ToolResult, TriggerSource,
+    final_scheduled_run_prompt, loop_instructions_error_prompt, scheduled_skill_prompt,
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
@@ -27,8 +28,6 @@ use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, 
 /// The longest a Worker's timer sleeps before it looks at the clock again, so a machine that
 /// slept or a wall clock that moved does not delay a run for long.
 const TIMER_RECHECK: Duration = Duration::from_secs(60);
-/// What the last run of a recurring or self-paced task tells the Agent.
-const FINAL_RUN_NOTE: &str = "This is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.";
 /// Why a turn a scheduled run started cannot start a self-paced loop.
 const NO_NEW_LOOP_FROM_A_RUN: &str = "No self-paced loop is running, and a turn a scheduled task started cannot start one: the loop ended, by its seven-day limit or by being cancelled. Tell the user; they can start a new /loop.";
 /// How long a Worker's timer waits before it hands a refused run over again.
@@ -85,10 +84,7 @@ fn run_input(chat: &Chat, task: &ScheduledTask, config_root: Option<&std::path::
     if prompt == DEFAULT_INSTRUCTIONS_PROMPT {
         return match LoopFiles::new(chat.snapshot.folder.as_deref(), config_root).instructions() {
             Ok(instructions) => instructions.prompt(),
-            Err(error) => format!(
-                "Scheduled task {}: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place.",
-                task.id
-            ),
+            Err(error) => loop_instructions_error_prompt(&task.id, &error.to_string()),
         };
     }
     if let Some(command) = prompt.strip_prefix('/') {
@@ -96,15 +92,7 @@ fn run_input(chat: &Chat, task: &ScheduledTask, config_root: Option<&std::path::
             .split_once(char::is_whitespace)
             .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
         if chat.skills.contains(name) && !chat.skills.is_user_only(name) {
-            let arguments = if arguments.is_empty() {
-                String::new()
-            } else {
-                format!(" with the arguments `{arguments}`")
-            };
-            return format!(
-                "Scheduled task {}: invoke the `{name}` Skill with the Skill tool{arguments}.",
-                task.id
-            );
+            return scheduled_skill_prompt(&task.id, name, arguments);
         }
     }
     task.prompt.clone()
@@ -832,7 +820,7 @@ impl Agent {
                     if fired.is_last
                         && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
                     {
-                        input.push_str(&format!("\n\n{FINAL_RUN_NOTE}"));
+                        input = final_scheduled_run_prompt(&input);
                     }
                     let source = TriggerSource::ScheduledTask {
                         task_id: before.id.clone(),

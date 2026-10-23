@@ -145,6 +145,7 @@ pub(super) enum ConversationBlockKind {
     Plan,
     Outcome(ConversationOutcome),
     WakeupCancelled,
+    GoalContinuation,
     FamilyInput {
         record: FamilyInputRecord,
     },
@@ -194,6 +195,24 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             continue;
         }
         let run_id = snapshot.message_runs.get(&message_index).copied();
+        let trigger = (message.role == Role::User)
+            .then(|| run_id.and_then(|run| snapshot.trigger_origins.get(&run)))
+            .flatten();
+        if matches!(
+            trigger,
+            Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
+        ) {
+            blocks.push(ConversationBlock {
+                id: ConversationBlockId::MessageContent {
+                    chat_id: snapshot.id,
+                    message_index,
+                    content_index: 0,
+                },
+                metadata: metadata(run_id, None, None),
+                kind: ConversationBlockKind::GoalContinuation,
+            });
+            continue;
+        }
         let model = (message.role == Role::Assistant)
             .then(|| run_model(snapshot, run_id))
             .flatten();
@@ -207,6 +226,11 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 content,
             ) {
                 block.metadata.model = model.clone();
+                if let ConversationBlockKind::User { text } = &mut block.kind
+                    && let Some(trigger) = trigger
+                {
+                    *text = trigger.display_input(text).into_owned();
+                }
                 blocks.push(block);
             }
         }

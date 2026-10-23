@@ -138,6 +138,7 @@ impl Agent {
             messages: model_seed.clone(),
             invoked_skills: source.snapshot.invoked_skills.clone(),
             message_runs: BTreeMap::new(),
+            trigger_origins: BTreeMap::new(),
             message_contexts: BTreeMap::new(),
             message_ids: BTreeMap::new(),
             agent_message_origins: source.snapshot.agent_message_origins.clone(),
