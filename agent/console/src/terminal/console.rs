@@ -12055,18 +12055,15 @@ impl State {
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
                 (KeyCode::Char(crate::monitor_rows::MONITOR_PAUSE_KEY), KeyModifiers::NONE) => {
                     let executor = if let Some(task) = self.monitor.selected_task() {
+                        // p is offered only where it acts; elsewhere it does nothing.
                         if task.confirmation
                             == Some(tickloop_agent_protocol::ScheduledTaskConfirmation::Pending)
                         {
-                            self.hold_status("Pending scheduled tasks cannot be paused");
                             return None;
                         }
                         super::scheduled_tasks::PauseAction::Scheduled(task.id.clone())
                     } else if let Some(entry) = self.monitor.selected() {
-                        if entry.subscription.is_none() {
-                            self.hold_status("Pausing this Tick is not supported");
-                            return None;
-                        }
+                        entry.subscription?;
                         super::scheduled_tasks::PauseAction::Subscription(entry.instance.clone())
                     } else {
                         return None;

@@ -5553,7 +5553,7 @@ fn collapsed_monitor_flash_render_evidence() {
 }
 
 #[test]
-fn p_pauses_periodic_ticks_and_scheduled_tasks_and_reports_unsupported_rows() {
+fn p_pauses_periodic_ticks_and_scheduled_tasks_and_does_nothing_elsewhere() {
     let pause_key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
     let mut state = click_fixture(140, false, TickGroup::Ticks);
     state.monitor.rebuild();
@@ -5607,13 +5607,22 @@ fn p_pauses_periodic_ticks_and_scheduled_tasks_and_reports_unsupported_rows() {
         .monitor
         .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
     assert!(!state.monitor.hint().contains("p pause"));
+    let status = state.status.clone();
     assert!(state.key(pause_key).is_none());
-    assert_eq!(state.status, "Pending scheduled tasks cannot be paused");
+    assert_eq!(
+        state.status, status,
+        "p does nothing where it is not offered"
+    );
     for group in [TickGroup::Shells, TickGroup::Artifacts] {
         let mut state = click_fixture(140, false, group);
         state.monitor.focus(false, None);
+        let status = state.status.clone();
+        assert!(!state.monitor.hint().contains("p pause"));
         assert!(state.key(pause_key).is_none());
-        assert_eq!(state.status, "Pausing this Tick is not supported");
+        assert_eq!(
+            state.status, status,
+            "p does nothing where it is not offered"
+        );
         assert!(state.monitor.focused);
         assert!(state.editor.draft().is_empty());
     }
