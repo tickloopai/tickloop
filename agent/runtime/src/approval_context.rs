@@ -25,7 +25,7 @@ use input_projection::{InputPurpose, project_tool_input};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v9";
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v10";
 pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v19";
 /// Images carry no review evidence in serialized text; their base64 never enters the snapshot.
 const IMAGE_PLACEHOLDER: &str = "[image omitted from the approval context]";
@@ -342,6 +342,77 @@ pub(super) struct AgentMessageEvidence {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub(super) struct ScheduledTaskEvidence {
+    pub id: String,
+    pub creator: tickloop_agent_protocol::ScheduledTaskCreator,
+    pub creation_call_id: Option<String>,
+    pub details: Value,
+}
+
+fn scheduled_task_evidence(
+    snapshot: &ChatSnapshot,
+    operation: &OperationRecord,
+    history: &ToolHistory,
+) -> Option<ScheduledTaskEvidence> {
+    if operation.name != crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME {
+        return None;
+    }
+    let id = operation.input.get("id")?.as_str()?;
+    let task = snapshot.scheduled_tasks.iter().find(|task| task.id == id)?;
+    let creation_call_id = history.calls.iter().find_map(|call| {
+        if task.creator != tickloop_agent_protocol::ScheduledTaskCreator::Agent
+            || call.tool != crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME
+            || !matches!(call.outcome, HistoricalToolOutcome::ReturnedSuccess)
+            || !snapshot.operations.iter().any(|prior| {
+                prior.loop_id == operation.loop_id
+                    && Some(prior.run_id) == call.run_id
+                    && prior.call_id == call.call_id
+                    && prior.name == call.tool
+                    && prior.state == tickloop_agent_protocol::OperationState::Completed
+            })
+        {
+            return None;
+        }
+        snapshot
+            .messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| {
+                if message.role != Role::User
+                    || snapshot.message_runs.get(&index).copied() != call.run_id
+                {
+                    return None;
+                }
+                message.content.iter().find_map(|content| match content {
+                    Content::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: false,
+                        ..
+                    } if tool_use_id == &call.call_id
+                        && serde_json::from_str::<Value>(&content.text())
+                            .ok()
+                            .is_some_and(|result| result["id"].as_str() == Some(id)) =>
+                    {
+                        Some(call.call_id.clone())
+                    }
+                    _ => None,
+                })
+            })
+    });
+    Some(ScheduledTaskEvidence {
+        id: task.id.clone(),
+        creator: task.creator,
+        creation_call_id,
+        details: project_tool_input(
+            "CronList",
+            &serde_json::json!({"kind": task.kind, "prompt": task.prompt}),
+            InputPurpose::Proposed,
+        )?,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalSnapshot {
     pub auto_policy: AutoPolicy,
     /// Present only when the evidence was cut to fit the reviewer's input capacity.
@@ -353,6 +424,7 @@ pub(super) struct ApprovalSnapshot {
     pub dependency_files: Option<Vec<DependencyEvidence>>,
     pub prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
     pub creation_receipt: Option<TickCreationReceipt>,
+    pub scheduled_task: Option<ScheduledTaskEvidence>,
     pub context_version: &'static str,
     pub review_template_version: &'static str,
     pub operation: ApprovalOperation,
@@ -640,9 +712,11 @@ pub(super) fn capture(
     if original_user_inputs.is_empty() {
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
+    let tool_history = tool_history(snapshot, operation);
+    let scheduled_task = scheduled_task_evidence(snapshot, operation, &tool_history);
     Ok(ApprovalSnapshot {
         context_truncation: None,
-        tool_history: tool_history(snapshot, operation),
+        tool_history,
         reply_history: capture_reply_history(
             snapshot,
             bookkeeping,
@@ -689,6 +763,7 @@ pub(super) fn capture(
         }),
         prepared_facts: None,
         creation_receipt: None,
+        scheduled_task,
         context_version: APPROVAL_CONTEXT_VERSION,
         review_template_version: REVIEW_TEMPLATE_VERSION,
         operation: ApprovalOperation {

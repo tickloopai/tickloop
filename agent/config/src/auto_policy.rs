@@ -4,8 +4,8 @@ use tickloop_agent_protocol::{
 
 use crate::AutoSettings;
 
-const AUTO_POLICY_VERSION: u64 = 6;
-const BUILTIN_GROUP_VERSION: u64 = 6;
+const AUTO_POLICY_VERSION: u64 = 8;
+const BUILTIN_GROUP_VERSION: u64 = 8;
 
 #[derive(serde::Deserialize)]
 struct BuiltinRule {
@@ -127,11 +127,7 @@ mod tests {
         let bootstrap = rule("builtin.soft_allow.toolchain_bootstrap");
         assert!(bootstrap.text.contains("sh.rustup.rs"));
         assert!(bootstrap.text.contains("manifest or build config"));
-        for unsupported in [
-            "memory_directory",
-            "claude_code_scheduling",
-            "browser_trusted_navigation",
-        ] {
+        for unsupported in ["memory_directory", "browser_trusted_navigation"] {
             assert!(
                 !policy
                     .rules
@@ -142,9 +138,57 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_maps_chat_scheduling_without_goal_rules() {
+        let policy = AutoSettings::default().policy();
+        let rule = |id: &str| policy.rules.iter().find(|rule| rule.id == id).unwrap();
+        let scheduling = rule("builtin.soft_allow.claude_code_scheduling");
+        assert_eq!(scheduling.kind, AutoRuleKind::SoftAllow);
+        for tool in ["CronCreate", "CronList", "CronDelete", "ScheduleWakeup"] {
+            assert!(scheduling.text.contains(tool), "missing {tool}");
+        }
+        for boundary in [
+            "Unauthorized Persistence",
+            "Account & Standing-Rule Changes",
+            "Session-Created Job Cleanup",
+            "Interfere With Workloads",
+            "user-created",
+        ] {
+            assert!(scheduling.text.contains(boundary), "missing {boundary}");
+        }
+        assert!(
+            !policy
+                .rules
+                .iter()
+                .any(|rule| rule.id == "builtin.soft_allow.chat_goal_lifecycle")
+        );
+        for tool in ["GetGoal", "CreateGoal", "UpdateGoal"] {
+            assert!(
+                !policy.rules.iter().any(|rule| rule.text.contains(tool)),
+                "{tool} does not use Auto classification"
+            );
+        }
+    }
+
+    #[test]
     fn default_policy_keeps_the_pinned_rule_kinds() {
         let policy = AutoSettings::default().policy();
-        assert_eq!(policy.rules.len(), 81);
+        assert_eq!(policy.rules.len(), 82);
+        assert_eq!(
+            policy
+                .rules
+                .iter()
+                .filter(|rule| rule.kind == AutoRuleKind::SoftAllow)
+                .count(),
+            15
+        );
+        assert_eq!(
+            policy
+                .rules
+                .iter()
+                .filter(|rule| rule.kind == AutoRuleKind::HardDeny)
+                .count(),
+            2
+        );
         assert!(
             policy
                 .rules
@@ -157,7 +201,7 @@ mod tests {
             policy
                 .rules
                 .iter()
-                .all(|rule| matches!(rule.source, AutoRuleSource::Builtin { version: 6 }))
+                .all(|rule| matches!(rule.source, AutoRuleSource::Builtin { version: 8 }))
         );
     }
 }

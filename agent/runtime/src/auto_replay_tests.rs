@@ -54,6 +54,7 @@ fn context(case: &Value) -> ApprovalSnapshot {
         .collect();
     let projected = project_tool_input(tool, &input, InputPurpose::Proposed).unwrap_or(Value::Null);
     ApprovalSnapshot {
+        scheduled_task: None,
         context_truncation: None,
         reply_history: Default::default(),
         agent_messages: Vec::new(),

@@ -1161,13 +1161,16 @@ impl Agent {
             .map(|call| call.permission())
             .or_else(|| {
                 let route = &registration.as_ref()?.route;
-                // Reading and reporting on the goal change nothing outside it; setting one is
-                // approved like any other call.
+                // As in Codex, the goal tools never wait on an approval: reading and reporting on
+                // the goal change nothing outside it, and setting one runs directly too.
                 if matches!(route, ToolRoute::SharedTask | ToolRoute::McpResource(_))
                     || matches!(route, ToolRoute::Goal)
                         && name != crate::goal::tools::CREATE_GOAL_TOOL_NAME
                 {
                     return Some(crate::host_tools::HostToolPermission::ReadOnly);
+                }
+                if matches!(route, ToolRoute::Goal) {
+                    return Some(crate::host_tools::HostToolPermission::Automatic);
                 }
                 if matches!(route, ToolRoute::ScheduledTask) {
                     return Some(crate::scheduled_tasks::tools::permission(&name));
