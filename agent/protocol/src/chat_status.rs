@@ -56,6 +56,8 @@ pub struct ChatStatus {
     pub user_shells: Vec<UserShellRecord>,
     pub commands: Vec<CommandSnapshot>,
     pub monitor: MonitorMembership,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_tasks: Vec<crate::ScheduledTask>,
     pub artifact_ticks: Vec<ArtifactTick>,
     pub provider_failures: HashMap<String, ProviderHttpFailure>,
     pub context_window_tokens: Option<usize>,
@@ -184,6 +186,7 @@ impl ChatStatus {
             user_shells: process.user_shells.to_vec(),
             commands: process.commands.to_vec(),
             monitor: conversation.monitor.clone(),
+            scheduled_tasks: conversation.scheduled_tasks.clone(),
             artifact_ticks: conversation.artifact_ticks.clone(),
             provider_failures: conversation.provider_failures.clone(),
             context_window_tokens: process.context_window_tokens,

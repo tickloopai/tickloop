@@ -80,6 +80,7 @@ mod reply_lines;
 mod running_shimmer;
 mod runtime_upgrade;
 mod scheduled_task_rows;
+mod scheduled_tasks;
 mod scrollback;
 mod selection;
 mod settings;
@@ -932,6 +933,8 @@ Shell task state and per-operation output are available only in this process; th
 Background Shell completions are added to their Chat as task notifications.
 A completion continues the Loop once it has worked, unless its last turn was interrupted or failed; otherwise it is only recorded.
 /compact [INSTRUCTIONS] summarizes context behind a compaction boundary.
+/loop [INTERVAL] [INSTRUCTION] repeats work: a fixed interval runs once immediately, then on schedule; without an interval the Agent picks each next wakeup. Without instructions it reads .tickloop/loop.md, then the config root's loop.md, else maintenance guidance. Chats without a Folder only read the config root's loop.md. Monitor shows each scheduled task; enter opens details, x confirms deletion. Esc cancels a self-paced pending wakeup; fixed schedules keep running. /stop pauses receiving; send a message to resume.
+
 /help advanced lists advanced commands; /exit closes this View; Agent work continues."#;
     format!(
         "{guidance}\n\nCommands and Skills:\n{}",
@@ -4402,6 +4405,9 @@ async fn interact_with_herdr(
                                 outln!(console, "\nProgress:");
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
+                        },
+                        EventKind::ScheduledTasksChanged { notice: Some(tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled { .. }) } => {
+                            outln!(console, "\nPending wakeup cancelled");
                         },
                         EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::GoalUpdated {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {

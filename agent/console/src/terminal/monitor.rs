@@ -130,8 +130,16 @@ pub(crate) struct ConfirmationOption {
     /// What confirming runs once the option is off.
     pub(crate) action_without: std::sync::Arc<dyn super::tick_actions::TickActionExecutor>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MonitorTarget {
+    Tick(InstanceRef),
+    ScheduledTask(String),
+}
+
 #[derive(Default)]
 pub(super) struct Monitor {
+    task_fires: HashMap<String, Option<u64>>,
+    task_flashes: HashMap<String, u64>,
     pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
     pub(super) subscriptions: Vec<TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<tickloop_agent_artifacts::ArtifactMetadata>>,
@@ -145,7 +153,7 @@ pub(super) struct Monitor {
     page_start: Option<PageCursor>,
     earlier_pages: Vec<Option<PageCursor>>,
     next_page: Option<PageCursor>,
-    selected: Option<InstanceRef>,
+    selected: Option<MonitorTarget>,
     rows: Option<MonitorRowsRegistry>,
     pub(super) chat_status: Option<Arc<ChatStatus>>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
@@ -190,7 +198,7 @@ pub(super) struct MonitorSources {
 
 pub(super) struct MonitorFrame {
     pub(super) lines: Vec<RoleLine>,
-    pub(super) targets: Vec<(usize, InstanceRef)>,
+    pub(super) targets: Vec<(usize, MonitorTarget)>,
 }
 
 impl Monitor {
@@ -212,11 +220,55 @@ impl Monitor {
         self.total
     }
     pub(super) fn selected(&self) -> Option<&MonitorEntry> {
-        self.selected.as_ref().and_then(|instance| {
-            self.entries
-                .iter()
-                .find(|entry| &entry.instance == instance)
-        })
+        let MonitorTarget::Tick(instance) = self.selected.as_ref()? else {
+            return None;
+        };
+        self.entries
+            .iter()
+            .find(|entry| &entry.instance == instance)
+    }
+    fn tasks(&self) -> &[tickloop_agent_protocol::ScheduledTask] {
+        self.chat_status
+            .as_ref()
+            .map_or(&[], |chat| chat.scheduled_tasks.as_slice())
+    }
+    pub(super) fn selected_task(&self) -> Option<&tickloop_agent_protocol::ScheduledTask> {
+        let MonitorTarget::ScheduledTask(id) = self.selected.as_ref()? else {
+            return None;
+        };
+        self.tasks().iter().find(|task| &task.id == id)
+    }
+    pub(super) fn select_target(&mut self, target: &MonitorTarget) {
+        match target {
+            MonitorTarget::Tick(instance) => self.select(instance),
+            MonitorTarget::ScheduledTask(id) => {
+                if self.tasks().iter().any(|task| &task.id == id) {
+                    self.selected = Some(target.clone());
+                }
+            }
+        }
+    }
+    fn tasks_visible(&self) -> bool {
+        self.next_page.is_none()
+    }
+    fn waiting_task(&self, id: &str) -> bool {
+        self.chat_status.as_ref().is_some_and(|chat| chat.pending_inputs.iter().any(|input| {
+            matches!(&input.trigger_source, Some(tickloop_agent_protocol::TriggerSource::ScheduledTask { task_id, .. }) if task_id == id)
+        }))
+    }
+    fn tasks_paused(&self) -> bool {
+        self.chat_status
+            .as_ref()
+            .is_some_and(|chat| !chat.chat_loop.receiving.is_receiving())
+    }
+    pub(super) fn remove_task(&mut self, id: &str) {
+        if let Some(chat) = &mut self.chat_status {
+            Arc::make_mut(chat)
+                .scheduled_tasks
+                .retain(|task| task.id != id);
+        }
+        self.close_detail();
+        self.rebuild();
     }
     /// Instances this Chat opened, as opposed to rows other sources show.
     fn members(&self) -> BTreeSet<InstanceRef> {
@@ -398,7 +450,20 @@ impl Monitor {
                 unreachable!("Monitor pages a deduplicated set with the default size: {error}")
             }
         };
-        self.total = page.total;
+        let tasks = self.tasks().to_vec();
+        for task in &tasks {
+            let previous = self
+                .task_fires
+                .insert(task.id.clone(), task.last_fired_at_ms);
+            if previous.is_some_and(|previous| task.last_fired_at_ms > previous) {
+                self.task_flashes.insert(task.id.clone(), now_ms);
+            }
+        }
+        self.task_fires
+            .retain(|id, _| tasks.iter().any(|task| &task.id == id));
+        self.task_flashes
+            .retain(|id, _| tasks.iter().any(|task| &task.id == id));
+        self.total = page.total + tasks.len();
         self.shown |= self.total > 0;
         self.next_page = page.next;
         self.entries = page.items.into_iter().map(MonitorEntry::from).collect();
@@ -425,6 +490,17 @@ impl Monitor {
                 crate::monitor_rows::subscriptions_on(&shown_subscriptions, &instance),
             );
             if detail.is_done() {
+                self.close_detail();
+            }
+        }
+        if let Some(detail) = self.detail.as_mut().and_then(|detail| {
+            detail
+                .as_any_mut()
+                .downcast_mut::<super::scheduled_tasks::TaskDetail>()
+        }) {
+            if let Some(task) = tasks.iter().find(|task| task.id == detail.task.id) {
+                detail.task = task.clone();
+            } else {
                 self.close_detail();
             }
         }
@@ -544,8 +620,40 @@ impl Monitor {
                 now_ms,
             )
         });
+        let task_animation = self
+            .tasks_visible()
+            .then(|| {
+                let flashing = (!self.tasks_paused())
+                    .then(|| {
+                        self.task_flashes
+                            .values()
+                            .filter_map(|since| display.next_flash_change_ms(*since, now_ms))
+                            .min()
+                    })
+                    .flatten();
+                let countdown = self
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| {
+                        let next = task.next_fire_at_ms?;
+                        let wait_ms =
+                            next.checked_sub(task.last_fired_at_ms.unwrap_or(task.created_at_ms))?;
+                        if wait_ms == 0 || self.waiting_task(&task.id) {
+                            return None;
+                        }
+                        NextCheck {
+                            at_ms: next,
+                            wait_ms,
+                        }
+                        .next_column_at(width.saturating_sub(4), now_ms)
+                    })
+                    .min();
+                flashing.into_iter().chain(countdown).min()
+            })
+            .flatten();
         running
             .into_iter()
+            .chain(task_animation)
             .chain(flashing)
             .chain(counting_down)
             .min()
@@ -604,13 +712,25 @@ impl Monitor {
         self.reconcile_selection();
     }
     fn reconcile_selection(&mut self) {
-        if self.entries.is_empty() {
+        if self.selected_task().is_some() && !self.tasks_visible() {
+            self.selected = None;
+        }
+        if self.entries.is_empty() && self.tasks().is_empty() {
             self.detail = None;
             self.focused = false;
             self.overlay = false;
         }
-        if self.selected().is_none() {
-            self.selected = self.entries.first().map(|entry| entry.instance.clone());
+        if self.selected().is_none() && self.selected_task().is_none() {
+            self.selected = self
+                .entries
+                .first()
+                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
+            if self.selected.is_none() && self.tasks_visible() {
+                self.selected = self
+                    .tasks()
+                    .first()
+                    .map(|task| MonitorTarget::ScheduledTask(task.id.clone()));
+            }
         }
     }
     /// Closes the open detail; an empty Monitor then releases focus back to the input. A finished
@@ -627,7 +747,7 @@ impl Monitor {
     }
     pub(super) fn select(&mut self, instance: &InstanceRef) {
         if self.entries.iter().any(|entry| &entry.instance == instance) {
-            self.selected = Some(instance.clone());
+            self.selected = Some(MonitorTarget::Tick(instance.clone()));
         }
     }
     pub(super) fn focus(&mut self, overlay: bool, group: Option<TickGroup>) {
@@ -637,7 +757,10 @@ impl Monitor {
             self.show_group(group);
         }
         if self.selected.is_none() {
-            self.selected = self.entries.first().map(|entry| entry.instance.clone());
+            self.selected = self
+                .entries
+                .first()
+                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
         }
     }
     /// Selects the group's first row, turning to the page that holds it.
@@ -657,23 +780,46 @@ impl Monitor {
             }
         }
         if let Some(entry) = self.entries.iter().find(|entry| entry.group == group) {
-            self.selected = Some(entry.instance.clone());
+            self.selected = Some(MonitorTarget::Tick(entry.instance.clone()));
         }
     }
     /// Moves within the page; past its last or first row the next or earlier page opens.
     pub(super) fn move_selection(&mut self, delta: isize) {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| Some(&entry.instance) == self.selected.as_ref())
-            .unwrap_or(0);
-        let target = index as isize + delta;
+        let index = match self.selected.as_ref() {
+            Some(MonitorTarget::Tick(instance)) => self
+                .entries
+                .iter()
+                .position(|entry| &entry.instance == instance),
+            Some(MonitorTarget::ScheduledTask(id)) => self
+                .tasks()
+                .iter()
+                .position(|task| &task.id == id)
+                .map(|index| index + self.entries.len()),
+            None => None,
+        }
+        .unwrap_or(0);
+        let target = (index as isize + delta).max(if self.entries.is_empty() {
+            0
+        } else {
+            isize::MIN
+        });
+        if self.tasks_visible() && !self.tasks().is_empty() && target >= self.entries.len() as isize
+        {
+            let task_index = (target as usize - self.entries.len()).min(self.tasks().len() - 1);
+            self.selected = Some(MonitorTarget::ScheduledTask(
+                self.tasks()[task_index].id.clone(),
+            ));
+            return;
+        }
         if target >= self.entries.len() as isize
             && let Some(next) = self.next_page.take()
         {
             self.earlier_pages.push(self.page_start.replace(next));
             self.rebuild();
-            self.selected = self.entries.first().map(|entry| entry.instance.clone());
+            self.selected = self
+                .entries
+                .first()
+                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
             return;
         }
         if target < 0
@@ -681,14 +827,17 @@ impl Monitor {
         {
             self.page_start = earlier;
             self.rebuild();
-            self.selected = self.entries.last().map(|entry| entry.instance.clone());
+            self.selected = self
+                .entries
+                .last()
+                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
             return;
         }
         if let Some(entry) = self
             .entries
             .get(target.clamp(0, self.entries.len().saturating_sub(1) as isize) as usize)
         {
-            self.selected = Some(entry.instance.clone());
+            self.selected = Some(MonitorTarget::Tick(entry.instance.clone()));
         }
     }
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
@@ -723,6 +872,9 @@ impl Monitor {
     }
 
     fn selected_status(&self) -> String {
+        if let Some(task) = self.selected_task() {
+            return format!("Scheduled task {}", task.id);
+        }
         let Some(entry) = self.selected() else {
             return String::new();
         };
@@ -754,6 +906,9 @@ impl Monitor {
 
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
+        if self.selected_task().is_some() {
+            return "enter details · x delete · esc input".into();
+        }
         let mut hints = self
             .selected()
             .map(|entry| {
@@ -785,11 +940,17 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> MonitorFrame {
-        let heading = if self.total > self.entries.len() {
+        let visible_count = self.entries.len()
+            + if self.tasks_visible() {
+                self.tasks().len()
+            } else {
+                0
+            };
+        let heading = if self.total > visible_count {
             let first = self.earlier_pages.len() * MAX_PAGE_SIZE + 1;
             format!(
                 "Monitor {first}–{} of {}",
-                first + self.entries.len().saturating_sub(1),
+                first + visible_count.saturating_sub(1),
                 self.total
             )
         } else {
@@ -818,7 +979,7 @@ impl Monitor {
             .iter()
             .zip(&titles)
             .map(|(entry, title)| ListRow {
-                selected: self.focused && self.selected.as_ref() == Some(&entry.instance),
+                selected: self.focused && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
                 glyph: display.glyph(entry.glyph),
                 glyph_role: self.glyph_role(entry, display, now_ms),
                 name: title,
@@ -863,11 +1024,42 @@ impl Monitor {
                 }
                 for line in row.lines(width) {
                     rows.push(line);
-                    row_ids.push(Some(entry.instance.clone()));
+                    row_ids.push(Some(MonitorTarget::Tick(entry.instance.clone())));
                 }
             }
         }
-        if self.entries.is_empty() {
+        if self.tasks_visible() && !self.tasks().is_empty() {
+            rows.push(RoleLine::role(
+                format!("Scheduled tasks ({})", self.tasks().len()),
+                Role::MutedText,
+            ));
+            row_ids.push(None);
+            for task in self.tasks() {
+                let selected = self.focused
+                    && matches!(&self.selected, Some(MonitorTarget::ScheduledTask(id)) if id == &task.id);
+                if selected {
+                    selected_row = rows.len();
+                }
+                let view = super::scheduled_tasks::view(
+                    task,
+                    self.tasks_paused(),
+                    self.task_flashes.get(&task.id).copied(),
+                    self.waiting_task(&task.id),
+                );
+                let render = super::scheduled_task_rows::ScheduledTaskRender {
+                    display,
+                    ascii: false,
+                    now: super::scheduled_tasks::local_time(now_ms, &task.time_zone)
+                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+                    now_ms,
+                };
+                for line in view.row_lines(width, selected, render) {
+                    rows.push(line);
+                    row_ids.push(Some(MonitorTarget::ScheduledTask(task.id.clone())));
+                }
+            }
+        }
+        if self.total == 0 {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
             row_ids.push(None);
         }
@@ -2232,5 +2424,152 @@ mod rebuild_benchmarks {
                 "BENCH monitor messages={messages} rebuild_us={rebuild:.1} status_refresh_us={refresh:.1}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduled_tests {
+    use super::*;
+    use tickloop_agent_protocol::{ChatSnapshot, PauseReason, Receiving, ScheduledTask};
+
+    fn task() -> ScheduledTask {
+        serde_json::from_value(serde_json::json!({
+            "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+            "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
+            "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
+            "jitter_ms":0, "skipped":0
+        }))
+        .unwrap()
+    }
+    fn chat(task: ScheduledTask) -> ChatStatus {
+        let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4(), "messages":[], "scheduled_tasks":[task],
+            "chat_loop":{"id":uuid::Uuid::nil(),"state":"Idle"}
+        }))
+        .unwrap();
+        ChatStatus::of(&snapshot)
+    }
+    #[test]
+    fn scheduled_rows_render_full_overdue_and_gray_paused_with_narrow_widths() {
+        let mut monitor = Monitor {
+            chat_status: Some(Arc::new(chat(task()))),
+            ..Default::default()
+        };
+        monitor.rebuild_at(30000);
+        assert_eq!(monitor.total(), 1);
+        assert!(monitor.is_shown());
+        assert!(
+            monitor.entries().is_empty(),
+            "scheduled tasks are not Ticks"
+        );
+        monitor.focus(false, None);
+        assert_eq!(monitor.selected_task().unwrap().id, "0123abcd");
+        let display = DisplayProfile::default();
+        for width in [1, 5, 16, 42] {
+            let frame = monitor.frame(width, 10, display, 60000);
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .all(
+                        |line| unicode_width::UnicodeWidthStr::width(line.text().as_str()) <= width
+                    )
+            );
+        }
+        let frame = monitor.frame(42, 10, display, 60000);
+        let band = frame
+            .lines
+            .iter()
+            .find_map(|line| line.band.as_ref())
+            .unwrap();
+        assert_eq!(band.columns.end, 42);
+        assert_eq!(band.role, Role::UpdateProgress);
+        let mut status = chat(task());
+        status.chat_loop.receiving = Receiving::Paused {
+            reason: PauseReason::Stopped,
+        };
+        monitor.chat_status = Some(Arc::new(status));
+        monitor.rebuild_at(60000);
+        let frame = monitor.frame(42, 10, display, 60000);
+        assert_eq!(
+            frame
+                .lines
+                .iter()
+                .find_map(|line| line.band.as_ref())
+                .unwrap()
+                .role,
+            Role::UserMessageBg
+        );
+    }
+    #[test]
+    fn new_task_delivery_flashes_once_and_navigation_includes_tasks() {
+        let mut monitor = Monitor {
+            chat_status: Some(Arc::new(chat(task()))),
+            ..Default::default()
+        };
+        monitor.rebuild_at(0);
+        let mut fired = task();
+        fired.last_fired_at_ms = Some(60000);
+        fired.next_fire_at_ms = Some(120000);
+        monitor.chat_status = Some(Arc::new(chat(fired)));
+        monitor.rebuild_at(60000);
+        let display = DisplayProfile::default();
+        assert!(
+            monitor
+                .frame(42, 10, display, 60000)
+                .lines
+                .iter()
+                .any(|line| line.fill == Some(Role::TakeInFlashStrong))
+        );
+        monitor.rebuild_at(62000);
+        assert!(
+            monitor
+                .frame(42, 10, display, 62000)
+                .lines
+                .iter()
+                .all(|line| line.fill != Some(Role::TakeInFlashStrong))
+        );
+        monitor.focus(false, None);
+        monitor.move_selection(-1);
+        assert!(monitor.selected_task().is_some());
+        monitor.move_selection(1);
+        assert!(monitor.selected_task().is_some());
+    }
+}
+
+#[cfg(test)]
+mod queued_scheduled_tests {
+    use super::*;
+    #[test]
+    fn a_delivered_task_waiting_for_an_idle_loop_keeps_its_full_bar() {
+        let chat: tickloop_agent_protocol::ChatSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "id":uuid::Uuid::nil(), "messages":[],
+                "chat_loop":{"id":uuid::Uuid::nil(),"state":"Running"},
+                "scheduled_tasks":[{
+                    "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+                    "prompt":"weather", "creator":"user", "time_zone":"UTC", "created_at_ms":0,
+                    "last_fired_at_ms":60000, "next_fire_at_ms":120000, "jitter_ms":0,"skipped":0
+                }]
+            }))
+            .unwrap();
+        let mut status = ChatStatus::of(&chat);
+        status.pending_inputs = serde_json::from_value(serde_json::json!([{
+            "receipt":{"chat_id":uuid::Uuid::nil(),"loop_id":uuid::Uuid::nil(),"run_id":uuid::Uuid::new_v4()},
+            "input":"weather", "trigger_source":{"kind":"scheduled_task","task_id":"0123abcd","scheduled_for_ms":60000}, "armed":true
+        }])).unwrap();
+        let mut monitor = Monitor {
+            chat_status: Some(Arc::new(status)),
+            ..Default::default()
+        };
+        monitor.rebuild_at(61000);
+        let frame = monitor.frame(42, 10, DisplayProfile::default(), 61000);
+        let band = frame
+            .lines
+            .iter()
+            .find_map(|line| line.band.as_ref())
+            .unwrap();
+        assert_eq!(band.columns.end, 42);
+        assert!(frame.lines.iter().any(|line| line.text().contains("00:01")));
     }
 }

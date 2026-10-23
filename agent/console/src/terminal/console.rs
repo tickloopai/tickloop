@@ -1146,7 +1146,7 @@ struct MonitorRowTarget {
     chat: Uuid,
     row: usize,
     columns: std::ops::Range<usize>,
-    instance: tick_protocol::InstanceRef,
+    target: super::monitor::MonitorTarget,
 }
 
 /// Paints the prompt glyph that leads the input's first line in `role`, leaving the rest as is.
@@ -1729,6 +1729,13 @@ impl Console {
             .map_err(|error| error.to_string())?
             .herdr_socket
             .clone())
+    }
+
+    pub(super) fn remove_scheduled_task(&self, chat: Uuid, id: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.monitor_for_chat_mut(chat).remove_task(id);
+        state.rendered_region = None;
+        Ok(())
     }
 
     pub(super) fn monitor_popup(&self) -> Result<tickloop_agent_config::MonitorPopup, String> {
@@ -6166,13 +6173,13 @@ impl State {
                                 && target.row == at.row
                                 && target.columns.contains(&at.column)
                         })
-                        .map(|target| target.instance.clone())
+                        .map(|target| target.target.clone())
                 {
                     self.clear_selection();
                     self.clear_footer_selection();
                     self.conversation_focused = false;
                     self.monitor.focus(self.monitor.overlay, None);
-                    self.monitor.select(&instance);
+                    self.monitor.select_target(&instance);
                     self.pointer_input =
                         self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     return true;
@@ -6904,11 +6911,11 @@ impl State {
                 self.monitor_row_targets = frame
                     .targets
                     .into_iter()
-                    .map(|(row, instance)| MonitorRowTarget {
+                    .map(|(row, target)| MonitorRowTarget {
                         chat,
                         row,
                         columns: columns.clone(),
-                        instance,
+                        target,
                     })
                     .collect();
             }
@@ -11548,6 +11555,23 @@ impl State {
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
+                (KeyCode::Enter | KeyCode::Char('x'), _)
+                    if self.monitor.selected_task().is_some() =>
+                {
+                    let task = self.monitor.selected_task()?.clone();
+                    let executor = super::scheduled_tasks::TaskAction::new(
+                        task,
+                        key.code == KeyCode::Char('x'),
+                    );
+                    let chat = self.chat?;
+                    match super::tick_actions::TickActionExecutor::prepare(
+                        &executor,
+                        &mut super::tick_actions::TickActionUi { state: self },
+                    ) {
+                        Ok(action) => return Some(InputEvent::TickAction { chat, action }),
+                        Err(error) => self.hold_status(&error),
+                    }
+                }
                 // As in Claude Code's footer, a character the selected row does not bind leaves
                 // the list and is typed into the input instead of being swallowed.
                 (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT)

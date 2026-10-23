@@ -3058,6 +3058,15 @@ impl ConsoleExecution {
         self.command(AgentCommand::ManageLoop { execution, action }, None)
             .await
     }
+    pub(super) async fn delete_scheduled_task(
+        &self,
+        chat: Uuid,
+        task_id: String,
+    ) -> Result<(), AccessError> {
+        self.loop_command(chat, LoopAction::DeleteScheduledTask { task_id })
+            .await
+            .map(|_| ())
+    }
     pub(super) async fn stop(&self, chat: Uuid) -> Result<Vec<OperationRecord>, AccessError> {
         match self.loop_command(chat, LoopAction::Stop).await? {
             CommandResult::Operations(value) => Ok(value),

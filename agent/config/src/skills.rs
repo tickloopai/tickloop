@@ -148,8 +148,10 @@ impl SkillRegistry {
     }
 
     /// Built-in guidance available without local Tick capabilities.
-    pub fn builtin_without_ticks() -> Self {
-        Self::with_builtins([SLIDES_SKILL])
+    pub fn builtin_without_ticks(config_root: Option<&Path>) -> Self {
+        let mut registry = Self::with_builtins([SLIDES_SKILL, LOOP_SKILL]);
+        registry.loop_files = LoopFiles::new(None, config_root);
+        registry
     }
 
     fn with_builtins<'a>(builtins: impl IntoIterator<Item = &'a str>) -> Self {

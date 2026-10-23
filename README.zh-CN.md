@@ -23,6 +23,16 @@ Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修�
 - **Artifact。** Agent 可以创建 Doc、Page 与 Slides，发布到 Tickloop Artifacts 服务，并接收其中的 @tickloop 反馈。用 `/artifacts` 登录。
 - **持续运行。** Agent 运行在本机 daemon 中。关闭终端、Pane 或 `/exit` 只离开界面；`/resume` 与 `tickloop -c` 可回到之前的 Chat。
 
+## 定时任务
+
+用 `/loop 5m 检查部署状态` 按固定间隔执行（创建后先执行一次），或用 `/loop 检查部署状态` 让 Agent 在每轮结束时选择下次唤醒时间并说明理由。间隔可写在开头（`30m`）或结尾（`every 2 hours`）；秒向上取整到分钟，无法均匀映射到 cron 的间隔会采用最接近的可用间隔并告知实际值。
+
+`/loop` 与 `/loop 5m` 不写指令时，每次运行重新读取项目 `.tickloop/loop.md`，其次配置根的 `loop.md`（最多 25,000 字节），都没有则继续未完成工作、照看当前分支 PR、清理本次工作涉及的代码。没有 Folder 的 Chat 只读取配置根的 `loop.md`。维护指令不授权新工作或未经允许的不可逆操作。
+
+Monitor 为每个定时任务显示一行：间隔、指令摘要、下次触发时间和进度。`Enter` 看 cron、完整指令、创建与到期时间、跳过次数，`x` 确认后删除。Agent 也可用 CronList 查看、CronDelete 删除任务，或用 CronCreate 创建一次性提醒。重复任务在 7 天后最后执行一次并删除。
+
+`Esc` 撤销自定节奏的待定唤醒，固定间隔与一次性任务继续；`/stop` 暂停接收，发送新消息或 Continue 恢复。离开界面后，定时任务仍由本机 daemon 运行。
+
 ## 运行环境
 
 - macOS（Apple silicon 或 Intel），或 Linux（ARM64 或 x86_64；静态构建，glibc 与 musl 发行版均可运行）。
