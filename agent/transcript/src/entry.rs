@@ -167,8 +167,8 @@ impl MetadataKind {
             | Self::Provenance
             | Self::CitationSources
             | Self::TaskBoards
-            | Self::ScheduledTasks
             | Self::FamilyCompletions => Retention::ChatLatest,
+            Self::ScheduledTasks => Retention::SourceState,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
             Self::FileHistorySnapshot | Self::ContentReplacement => Retention::Accumulating,
             Self::RetainedSnapshot => Retention::Snapshot,

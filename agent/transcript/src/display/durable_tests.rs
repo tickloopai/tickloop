@@ -634,7 +634,7 @@ fn trigger_deliveries_show_each_delivery_as_its_ledger_last_recorded_it() {
 }
 
 #[test]
-fn the_latest_scheduled_tasks_record_wins_through_retained_snapshots() {
+fn the_latest_scheduled_tasks_record_wins() {
     let chat = Uuid::new_v4();
     let task = |id: &str| -> tickloop_agent_protocol::ScheduledTask {
         serde_json::from_value(json!({
@@ -653,16 +653,14 @@ fn the_latest_scheduled_tasks_record_wins_through_retained_snapshots() {
             revoked: Vec::new(),
         })
     };
+    // A Trigger source's own state: no retained snapshot carries it.
     assert_eq!(
         crate::MetadataKind::ScheduledTasks.retention(),
-        crate::Retention::ChatLatest
+        crate::Retention::SourceState
     );
     let lines = [
         line(vec![task("0a1b2c3d")]),
-        Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
-            chat_id: chat,
-            lines: vec![line(vec![task("0a1b2c3d"), task("11111111")])],
-        }),
+        line(vec![task("0a1b2c3d"), task("11111111")]),
     ];
     assert_eq!(
         scheduled_tasks(&lines)

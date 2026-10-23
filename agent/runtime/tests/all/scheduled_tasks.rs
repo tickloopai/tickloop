@@ -319,12 +319,9 @@ async fn a_bystander_leaving_does_not_bring_a_deleted_task_back() {
     assert_a_bystander_does_not_bring_a_deleted_task_back(false).await;
 }
 
-/// Known limitation: the scheduled tasks' record is folded into the retained snapshot a
-/// compaction writes, so a bystander's snapshot can carry the record it loaded; the holder's
-/// rewrite after the compaction may lose to the bystander leaving. Several processes working
-/// one Chat at once is out of scope.
+/// No retained snapshot carries the scheduled tasks' record, and the compaction rewrites the
+/// record the lease holder has, taken over from the store.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "known limitation: a source's state is folded into the retained snapshot"]
 async fn a_bystander_compacting_does_not_bring_a_deleted_task_back() {
     assert_a_bystander_does_not_bring_a_deleted_task_back(true).await;
 }

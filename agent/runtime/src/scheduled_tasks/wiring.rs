@@ -187,7 +187,7 @@ fn started_by_scheduled_run(chat: &Chat, run: tickloop_agent_protocol::RunId) ->
 pub(crate) struct ScheduledTasksState;
 
 impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
-    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]) {
         let Some(recorded) = stored.iter().rev().find_map(|line| match line {
             Line::ScheduledTasks(entry) if entry.chat_id == chat.snapshot.id => Some(entry),
             _ => None,
@@ -201,7 +201,7 @@ impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
         }
         chat.snapshot.scheduled_tasks = recorded.tasks.clone();
         chat.snapshot.scheduled_task_revocations = recorded.revoked.clone();
-        agent.announce_scheduled_tasks(chat, Vec::new());
+        change.agent().announce_scheduled_tasks(chat, Vec::new());
     }
 
     fn records(&self, chat: &Chat) -> Vec<Line> {
