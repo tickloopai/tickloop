@@ -115,6 +115,14 @@ pub(super) enum MonitorTarget {
 
 #[derive(Default)]
 pub(super) struct Monitor {
+    auto_reveal_pending: bool,
+    auto_reveal_handled: bool,
+    subscriptions_initialized: bool,
+    /// Initial snapshots seed the baseline independently because sources can arrive separately.
+    /// Later rebuilds compare the full list, so adding a subscription to a member is not new.
+    listed_instances: BTreeSet<InstanceRef>,
+    pub(super) auto_shown: bool,
+    pub(super) entry_flash_at_ms: Option<u64>,
     task_fires: HashMap<String, Option<u64>>,
     task_flashes: HashMap<String, u64>,
     pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
@@ -181,6 +189,23 @@ pub(super) struct MonitorFrame {
 }
 
 impl Monitor {
+    pub(super) fn take_auto_reveal(&mut self) -> bool {
+        if !std::mem::take(&mut self.auto_reveal_pending) || self.auto_reveal_handled {
+            return false;
+        }
+        self.auto_reveal_handled = true;
+        true
+    }
+
+    pub(super) fn set_subscriptions(&mut self, subscriptions: Vec<TickSubscriptionStatus>) {
+        if !self.subscriptions_initialized {
+            self.listed_instances
+                .extend(subscriptions.iter().map(|row| row.instance.clone()));
+        }
+        self.subscriptions_initialized = true;
+        self.subscriptions = subscriptions;
+    }
+
     pub(super) fn goal(&self) -> Option<super::goal_view::GoalView<'_>> {
         let mut view =
             super::goal_view::GoalView::from_snapshot(self.chat_status.as_ref()?.goal.as_ref()?);
@@ -360,6 +385,10 @@ impl Monitor {
         shells: ShellTaskSnapshot,
         subscriptions: Option<Vec<TickSubscriptionStatus>>,
     ) {
+        if self.shell_snapshot.is_none() {
+            self.listed_instances
+                .extend(shells.tasks.iter().map(|task| InstanceRef::shell(task.id)));
+        }
         self.shell_starts = self
             .chat_status
             .as_deref()
@@ -367,7 +396,7 @@ impl Monitor {
             .unwrap_or_default();
         self.shell_snapshot = Some(shells);
         if let Some(subscriptions) = subscriptions {
-            self.subscriptions = subscriptions;
+            self.set_subscriptions(subscriptions);
         }
         self.rebuild();
     }
@@ -377,6 +406,17 @@ impl Monitor {
     fn adopt_chat_status(&mut self, status: Arc<ChatStatus>) {
         let previous = self.chat_status.take();
         if let Some(previous) = &previous {
+            self.auto_reveal_pending |= status.goal.as_ref().is_some_and(|goal| {
+                previous
+                    .goal
+                    .as_ref()
+                    .is_none_or(|known| known.id != goal.id)
+            }) || status.scheduled_tasks.iter().any(|task| {
+                !previous
+                    .scheduled_tasks
+                    .iter()
+                    .any(|known| known.id == task.id)
+            });
             if previous.goal.as_ref().map(|goal| goal.id)
                 != status.goal.as_ref().map(|goal| goal.id)
             {
@@ -396,6 +436,21 @@ impl Monitor {
                 self.goal_continued_at_ms =
                     Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
             }
+        }
+        if previous.is_none() {
+            self.listed_instances.extend(
+                status
+                    .monitor
+                    .members
+                    .iter()
+                    .map(|member| member.instance.clone()),
+            );
+            self.listed_instances.extend(
+                status
+                    .artifact_ticks
+                    .iter()
+                    .filter_map(|tick| tick.instance_id().parse().ok()),
+            );
         }
         for tick in &status.artifact_ticks {
             let id = tick.instance_id();
@@ -504,6 +559,10 @@ impl Monitor {
             .rows
             .get_or_insert_with(MonitorRowsRegistry::builtin)
             .list(&context);
+        self.auto_reveal_pending |= listed
+            .iter()
+            .any(|entry| !self.listed_instances.contains(&entry.instance));
+        self.listed_instances = listed.iter().map(|entry| entry.instance.clone()).collect();
         self.note_flashes(&listed, now_ms);
         self.group_totals.clear();
         for entry in &listed {

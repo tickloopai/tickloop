@@ -497,7 +497,7 @@ fn goal_continuation_flashes_once_without_replaying_history_or_usage_updates() {
 }
 
 #[test]
-fn goal_status_reaches_wide_and_short_console_frames() {
+fn status_bar_omits_every_goal_state_in_wide_and_short_console_frames() {
     for (goal_status, expected) in [
         (GoalStatus::Active, "Pursuing goal (12.5K / 50K)"),
         (
@@ -526,8 +526,9 @@ fn goal_status_reaches_wide_and_short_console_frames() {
             state.chat = Some(status.id);
             state.monitor.set_chat_status(Arc::new(status));
             let frame = state.frame().0.join("\n");
-            assert!(frame.contains(expected), "{width}x{height}: {frame}");
-            let status = frame.lines().find(|line| line.contains(expected)).unwrap();
+            assert!(!frame.contains(expected), "{width}x{height}: {frame}");
+            let status = frame.lines().find(|line| line.contains("fixture")).unwrap();
+            assert!(!status.to_lowercase().contains("goal"), "{status}");
             assert!(status.contains("fixture"), "{width}x{height}: {frame}");
             if width == 140 {
                 assert!(status.contains("Context 21% used"), "{frame}");
@@ -772,7 +773,8 @@ fn goal_ui_pty_records_monitor_menu_and_escape() {
             std::thread::sleep(Duration::from_millis(150));
             writer.write_all(b"/goal pause\r").unwrap();
             writer.flush().unwrap();
-            let frame = wait("Goal paused (/goal resume)")?;
+            let frame = wait("◎ Goal paused")?;
+            assert!(!frame.contains("Goal paused (/goal resume)"), "{frame}");
             println!("GOAL_PTY_{renderer}_PAUSED\n{frame}");
             Ok(())
         })();

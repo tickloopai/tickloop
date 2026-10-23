@@ -177,38 +177,10 @@ impl<'a> GoalView<'a> {
         }
         lines.into_iter().skip(top).take(height).collect()
     }
-
-    fn status(&self) -> String {
-        match self.state {
-            GoalState::Active => format!("Pursuing goal ({})", self.usage()),
-            GoalState::Paused => "Goal paused (/goal resume)".into(),
-            GoalState::Blocked => "Goal stalled (/goal resume)".into(),
-            GoalState::BudgetLimited => {
-                let usage = self
-                    .token_budget
-                    .map_or_else(|| tokens(self.tokens_used), |_| self.usage());
-                format!("Goal unmet ({usage} tokens)")
-            }
-            GoalState::Complete => {
-                let usage = self.token_budget.map_or_else(
-                    || self.usage(),
-                    |_| format!("{} tokens", tokens(self.tokens_used)),
-                );
-                format!("Goal achieved ({usage})")
-            }
-        }
-    }
 }
 
-pub(super) fn status_line(
-    goal: Option<&GoalView<'_>>,
-    triggers_paused: bool,
-    width: usize,
-) -> Option<RoleLine> {
-    if triggers_paused {
-        return Some(clipped(TRIGGERS_PAUSED, width, Role::MutedText));
-    }
-    goal.map(|goal| clipped(&goal.status(), width, goal.state.role()))
+pub(super) fn receiving_status_line(triggers_paused: bool, width: usize) -> Option<RoleLine> {
+    triggers_paused.then(|| clipped(TRIGGERS_PAUSED, width, Role::MutedText))
 }
 
 fn tokens(count: u64) -> String {

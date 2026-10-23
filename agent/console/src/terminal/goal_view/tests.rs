@@ -20,85 +20,41 @@ fn text(lines: &[RoleLine]) -> Vec<String> {
 }
 
 #[test]
-fn status_uses_codex_wording_for_every_goal_state() {
-    for (state, expected, role) in [
-        (
-            GoalState::Active,
-            "Pursuing goal (12.5K / 50K)",
-            Role::Accent,
-        ),
-        (
-            GoalState::Paused,
-            "Goal paused (/goal resume)",
-            Role::MutedText,
-        ),
-        (
-            GoalState::Blocked,
-            "Goal stalled (/goal resume)",
-            Role::Warning,
-        ),
-        (
-            GoalState::BudgetLimited,
-            "Goal unmet (12.5K / 50K tokens)",
-            Role::Warning,
-        ),
-        (
-            GoalState::Complete,
-            "Goal achieved (12.5K tokens)",
-            Role::Success,
-        ),
+fn monitor_uses_state_titles_and_colours_for_every_goal_state() {
+    for state in [
+        GoalState::Active,
+        GoalState::Paused,
+        GoalState::Blocked,
+        GoalState::BudgetLimited,
+        GoalState::Complete,
     ] {
         let goal = GoalView {
             state,
             ..example_goal()
         };
-        let line = status_line(Some(&goal), false, 100).unwrap();
-        assert_eq!(line.text(), expected);
-        assert_eq!(line.spans[0].role, Some(role));
         let monitor = goal.monitor_lines(100, false, DisplayProfile::default(), false, 0);
         assert!(
             monitor[0]
                 .text()
-                .trim_start()
                 .starts_with(&format!("◎ {}", state.title()))
         );
         assert!(
             monitor[0]
                 .spans
                 .iter()
-                .any(|span| span.text.contains(state.title()) && span.role == Some(role))
+                .any(|span| span.text.contains(state.title()) && span.role == Some(state.role()))
         );
         assert!(monitor[1].text().contains(goal.condition));
     }
 }
 
 #[test]
-fn unbudgeted_goals_show_runtime_and_trigger_pause_takes_priority() {
-    let mut goal = GoalView {
-        token_budget: None,
-        ..example_goal()
-    };
+fn receiving_status_only_shows_paused_triggers() {
     assert_eq!(
-        status_line(Some(&goal), false, 100).unwrap().text(),
-        "Pursuing goal (1m)"
+        receiving_status_line(true, 100).unwrap().text(),
+        TRIGGERS_PAUSED
     );
-    goal.state = GoalState::Complete;
-    assert_eq!(
-        status_line(Some(&goal), false, 100).unwrap().text(),
-        "Goal achieved (1m)"
-    );
-    goal.state = GoalState::BudgetLimited;
-    assert_eq!(
-        status_line(Some(&goal), false, 100).unwrap().text(),
-        "Goal unmet (12.5K tokens)"
-    );
-    for goal in [Some(&goal), None] {
-        assert_eq!(
-            status_line(goal, true, 100).unwrap().text(),
-            TRIGGERS_PAUSED
-        );
-    }
-    assert!(status_line(None, false, 100).is_none());
+    assert!(receiving_status_line(false, 100).is_none());
 }
 
 #[test]
@@ -195,10 +151,6 @@ fn unbudgeted_goal_runtime_uses_compact_minute_hour_and_day_boundaries() {
             ..example_goal()
         };
         assert_eq!(goal.usage(), expected, "{elapsed_ms}ms");
-        assert_eq!(
-            status_line(Some(&goal), false, 100).unwrap().text(),
-            format!("Pursuing goal ({expected})")
-        );
         assert!(
             goal.monitor_lines(100, false, DisplayProfile::default(), false, 0)[0]
                 .text()
@@ -280,8 +232,8 @@ fn narrow_and_wide_unicode_views_fit_and_resolve_in_both_themes() {
             display.set_theme(theme);
             let mut lines = goal.monitor_lines(width, false, display, false, 0);
             lines.extend(goal.detail_lines(width, 0, 100));
-            lines.push(status_line(Some(&goal), false, width).unwrap());
-            lines.push(status_line(Some(&goal), true, width).unwrap());
+            lines.extend(receiving_status_line(false, width));
+            lines.extend(receiving_status_line(true, width));
             for line in lines {
                 assert!(
                     line.text().width() <= width,
