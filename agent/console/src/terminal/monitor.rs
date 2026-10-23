@@ -797,12 +797,10 @@ impl Monitor {
             })
             .flatten()
             .filter_map(|since| display.next_flash_change_ms(*since, now_ms));
-        let counting_down = self.entries.iter().filter_map(|entry| {
-            entry.waiting_check()?.next_column_at(
-                width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
-                now_ms,
-            )
-        });
+        let counting_down = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.waiting_check()?.next_column_at(width, now_ms));
         let task_animation = self
             .chat_status
             .as_ref()
@@ -1277,12 +1275,7 @@ impl Monitor {
                 list_row::flash_fill(self.row_flash(entry), display, now_ms)
             },
             subscription: list_row::subscription_mark(entry.subscription, display),
-            bar_columns: entry.waiting_check().map(|check| {
-                check.elapsed_columns(
-                    width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
-                    now_ms,
-                )
-            }),
+            bar_columns: entry.waiting_check().map(|check| check.elapsed_columns(width, now_ms)),
         }.lines(width);
         if paused {
             for line in &mut lines {
@@ -1533,10 +1526,11 @@ impl Monitor {
                         0
                     },
             )
-            .min(gap_count);
+            .min(gap_count + usize::from(has_ticks || has_tasks || has_goal));
         let goal_gap = has_tasks && has_goal && spacing_budget > 0;
         let tick_gap =
             has_ticks && (has_tasks || has_goal) && spacing_budget > usize::from(goal_gap);
+        let heading_gap = spacing_budget > usize::from(goal_gap) + usize::from(tick_gap);
         let content_height = height - usize::from(goal_gap) - usize::from(tick_gap);
         let minimum_tasks = if self.tasks().is_empty() {
             0
@@ -1550,6 +1544,7 @@ impl Monitor {
         extra = extra.saturating_sub(usize::from(more));
         let show_heading = extra > 0;
         extra = extra.saturating_sub(usize::from(show_heading));
+        extra = extra.saturating_sub(usize::from(heading_gap));
         let show_footer = extra > 0 && !status.is_empty();
         let mut lines = if show_heading {
             vec![RoleLine::role(
@@ -1563,6 +1558,9 @@ impl Monitor {
         } else {
             Vec::new()
         };
+        if show_heading && heading_gap {
+            lines.push(RoleLine::default());
+        }
         let fixed_budget = content_height
             .saturating_sub(lines.len() + goal_lines.len() + usize::from(show_footer));
         let task_budget =
@@ -1617,10 +1615,7 @@ impl Monitor {
             .filter_map(|(row, id)| id.map(|id| (row + lines.len(), id)))
             .collect::<Vec<_>>();
         lines.extend(rows.into_iter().skip(offset).take(tick_capacity));
-        lines.resize(
-            usize::from(show_heading) + tick_capacity,
-            RoleLine::default(),
-        );
+        lines.resize(tick_start + tick_capacity, RoleLine::default());
         let tick_rows = tick_start..lines.len();
         if scrollbar {
             let thumb = scrollbar_thumb(tick_capacity, total_rows, offset);
@@ -1698,14 +1693,11 @@ impl Monitor {
                 use unicode_width::UnicodeWidthStr;
                 let title = super::safe_line(&entry.title);
                 let details = list_row::row_details(entry.tone, &entry.notes, now_ms);
-                let details_columns = if details.is_empty() {
-                    0
-                } else {
-                    details.width() + list_row::STATUS_GAP_COLUMNS
-                };
-                if list_row::name_column(display.glyph(entry.glyph))
-                    + title.width()
-                    + details_columns
+                if list_row::reserved_columns(
+                    display.glyph(entry.glyph),
+                    &details,
+                    list_row::subscription_mark(entry.subscription, display),
+                ) + title.width()
                     > tick_width
                 {
                     status.push_str(" · ");
@@ -2069,9 +2061,10 @@ mod signal_tests {
         monitor
     }
 
-    /// The row's line: the frame's heading and group title come first.
+    /// The first instance row, after the heading, optional gap and group title.
     fn row(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> RoleLine {
-        monitor.frame(WIDTH, 10, display, now_ms).lines[2].clone()
+        let frame = monitor.frame(WIDTH, 10, display, now_ms);
+        frame.lines[frame.targets[0].0].clone()
     }
 
     fn fill(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> Option<Role> {
@@ -2087,11 +2080,15 @@ mod signal_tests {
             .and_then(|span| span.role)
     }
 
-    /// The text and role of the row's first column.
-    fn lead(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> (String, Option<Role>) {
+    /// The text and role of the row's subscription mark at the right.
+    fn subscription_tail(
+        monitor: &Monitor,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> (String, Option<Role>) {
         let line = row(monitor, display, now_ms);
-        let first = &line.spans[0];
-        (first.text.chars().take(1).collect(), first.role)
+        let last = line.spans.last().unwrap();
+        (last.text.clone(), last.role)
     }
 
     fn reduced_motion() -> DisplayProfile {
@@ -2171,11 +2168,7 @@ mod signal_tests {
             );
             assert!(!line.text().contains('●'), "{line:?}");
             assert_eq!(glyph(&monitor, animated, now), Some(Role::UpdateMark));
-            assert_eq!(
-                lead(&monitor, animated, now),
-                (" ".to_owned(), Some(Role::MutedText)),
-                "the first column stays bare"
-            );
+            assert!(line.text().starts_with("◉ Quotes"), "{line:?}");
         }
         assert_eq!(
             monitor.next_frame_ms(UPDATED_AT + 100, WIDTH, animated),
@@ -2524,13 +2517,13 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_use_flash_starts_after_the_mark_and_a_selected_row_keeps_its_selection() {
+    fn a_use_flash_covers_the_whole_row_and_a_selected_row_keeps_its_selection() {
         let animated = DisplayProfile::default();
         let monitor = handled_while_listed(MonitorMembership::mark_used);
         let line = row(&monitor, animated, HANDLED_AT + 50);
         assert_eq!(
             (line.fill, line.fill_start),
-            (Some(Role::UseFlashStrong), 4),
+            (Some(Role::UseFlashStrong), 0),
             "a row without `↻` flashes from its first column"
         );
 
@@ -2543,15 +2536,15 @@ mod signal_tests {
         let line = row(&subscribed, animated, HANDLED_AT + 50);
         assert_eq!(
             (line.fill, line.fill_start, line.band),
-            (Some(Role::UseFlashStrong), 4, None),
-            "the flash starts after the `↻` and covers the bar"
+            (Some(Role::UseFlashStrong), 0, None),
+            "the flash covers the whole row, including `↻` and the bar"
         );
 
         subscribed.focus(false, None);
         let line = row(&subscribed, animated, HANDLED_AT + 50);
         assert_eq!(
             (line.fill, line.fill_start),
-            (Some(Role::Selection), 1),
+            (Some(Role::Selection), 0),
             "the selection wins over the flash"
         );
     }
@@ -2567,7 +2560,7 @@ mod signal_tests {
             (Some(Role::Selection), 0),
             "nothing keeps the first column off the selection"
         );
-        assert!(line.text().starts_with("  ◉ Quotes"), "{line:?}");
+        assert!(line.text().starts_with("◉ Quotes"), "{line:?}");
         assert_eq!(
             glyph(&monitor, DisplayProfile::default(), UPDATED_AT + 100),
             Some(Role::UpdateMark)
@@ -2638,11 +2631,8 @@ mod signal_tests {
 
     /// The columns and role of the row's update bar, `None` without one.
     fn bar(monitor: &Monitor, now_ms: u64) -> Option<(std::ops::Range<usize>, Role)> {
-        monitor
-            .frame(WIDTH, 10, DisplayProfile::default(), now_ms)
-            .lines[2]
+        row(monitor, DisplayProfile::default(), now_ms)
             .band
-            .clone()
             .map(|band| (band.columns, band.role))
     }
 
@@ -2669,10 +2659,10 @@ mod signal_tests {
         monitor.subscriptions[0] = serde_json::from_value(status).unwrap();
         monitor.rebuild_at(49_000);
         let actual = bar(&monitor, 49_000);
-        assert_eq!(actual, Some((4..5, Role::UpdateProgress)));
+        assert_eq!(actual, Some((0..1, Role::UpdateProgress)));
 
-        assert_eq!(bar(&monitor, 54_500), Some((4..22, Role::UpdateProgress)));
-        assert_eq!(bar(&monitor, 60_000), Some((4..40, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 54_500), Some((0..20, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 60_000), Some((0..40, Role::UpdateProgress)));
 
         let mut early = subscribed(
             vec![subscription(TickSubscriptionFrequency::High, Some(60_000))],
@@ -2680,7 +2670,7 @@ mod signal_tests {
         );
         early.subscriptions[0].has_pending_change = true;
         early.rebuild_at(1_000);
-        assert_eq!(bar(&early, 1_000), Some((4..5, Role::UpdateProgress)));
+        assert_eq!(bar(&early, 1_000), Some((0..1, Role::UpdateProgress)));
     }
 
     #[test]
@@ -2783,9 +2773,9 @@ mod signal_tests {
             Some(Role::SuccessMark)
         );
         assert_eq!(
-            lead(&monitor, DisplayProfile::default(), 70_000),
+            subscription_tail(&monitor, DisplayProfile::default(), 70_000),
             ("↻".to_owned(), Some(Role::SubscriptionHigh)),
-            "the `↻` leads the row in its frequency's colour"
+            "the `↻` ends the row in its frequency's colour"
         );
         assert_eq!(
             monitor.next_frame_ms(70_000, WIDTH, DisplayProfile::default()),
@@ -2803,15 +2793,15 @@ mod signal_tests {
             first_check - period,
         );
         for (now, end) in [
-            (first_check - period, 5),
-            (first_check - 45_000, 13),
-            (first_check - 30_000, 22),
+            (first_check - period, 1),
+            (first_check - 45_000, 10),
+            (first_check - 30_000, 20),
             (first_check, 40),
             (first_check + 5_000, 40),
         ] {
             assert_eq!(
                 bar(&monitor, now),
-                Some((4..end, Role::UpdateProgress)),
+                Some((0..end, Role::UpdateProgress)),
                 "at {now}"
             );
             assert_eq!(
@@ -2819,22 +2809,19 @@ mod signal_tests {
                 Some(Role::UpdateMark)
             );
             assert_eq!(
-                lead(&monitor, DisplayProfile::default(), now),
+                subscription_tail(&monitor, DisplayProfile::default(), now),
                 ("↻".to_owned(), Some(Role::SubscriptionHigh)),
                 "the `↻` keeps its frequency's colour on the bar"
             );
         }
-        let text = monitor
-            .frame(WIDTH, 10, DisplayProfile::default(), first_check - 30_000)
-            .lines[2]
-            .text();
+        let text = row(&monitor, DisplayProfile::default(), first_check - 30_000).text();
         assert!(
             !text.chars().any(|character| character.is_ascii_digit()),
             "no time left is written: {text}"
         );
         assert_eq!(
             monitor.next_frame_ms(first_check - 30_000, WIDTH, DisplayProfile::default()),
-            Some(first_check - 30_000 + 1_667),
+            Some(first_check - 30_000 + 1_500),
             "the next frame is when one more column fills"
         );
         assert_eq!(
@@ -2846,7 +2833,7 @@ mod signal_tests {
         monitor.focus(false, None);
         assert_eq!(
             bar(&monitor, first_check - 30_000),
-            Some((4..22, Role::UpdateProgress)),
+            Some((0..20, Role::UpdateProgress)),
             "a selected row keeps the bar's colour over the selection"
         );
 
@@ -2863,7 +2850,7 @@ mod signal_tests {
             "the check handed the update over, or found nothing to hand over"
         );
         assert_eq!(
-            lead(&monitor, DisplayProfile::default(), first_check + 100),
+            subscription_tail(&monitor, DisplayProfile::default(), first_check + 100),
             ("↻".to_owned(), Some(Role::SubscriptionHigh))
         );
         assert_eq!(
@@ -2888,12 +2875,12 @@ mod signal_tests {
         assert_eq!(glyph(&monitor, animated, 50_400), Some(Role::UpdateMarkDim));
         assert_eq!(
             bar(&monitor, 50_400),
-            Some((4..10, Role::UpdateProgress)),
+            Some((0..6, Role::UpdateProgress)),
             "the bar does not wait for the flash"
         );
         assert_eq!(monitor.next_frame_ms(50_900, WIDTH, animated), Some(51_200));
         assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
-        assert_eq!(bar(&monitor, 51_200), Some((4..10, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
     }
 
     /// A Tick that updates every second, quicker than a flash lasts, keeps its bar on screen and
@@ -2919,22 +2906,22 @@ mod signal_tests {
                 (800, Role::UpdateMark),
             ] {
                 let now = second + elapsed_in_second;
-                let filled = (now - (check - period)) as usize * (WIDTH - 4) / period as usize;
+                let filled = (now - (check - period)) as usize * WIDTH / period as usize;
                 assert_eq!(
                     bar(&monitor, now),
-                    Some((4..4 + filled.max(1), Role::UpdateProgress)),
+                    Some((0..filled.max(1), Role::UpdateProgress)),
                     "at {now} the bar shows the part of the period elapsed"
                 );
                 assert!(filled >= reached, "the bar never shrinks");
                 reached = filled;
                 assert_eq!(glyph(&monitor, animated, now), Some(phase), "at {now}");
                 assert_eq!(
-                    lead(&monitor, animated, now),
+                    subscription_tail(&monitor, animated, now),
                     ("↻".to_owned(), Some(Role::SubscriptionHigh))
                 );
             }
         }
-        assert_eq!(reached, 11, "the bar grew with the seconds");
+        assert_eq!(reached, 12, "the bar grew with the seconds");
     }
 
     /// A Terminal Tick's screen that changed since its subscription last got it flashes the glyph
@@ -2958,9 +2945,9 @@ mod signal_tests {
             Some(Role::UpdateMarkDim),
             "the change flashes the glyph"
         );
-        assert_eq!(bar(&monitor, 50_400), Some((4..10, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 50_400), Some((0..6, Role::UpdateProgress)));
         assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
-        assert_eq!(bar(&monitor, 51_200), Some((4..10, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
 
         let mut settled = subscription(TickSubscriptionFrequency::High, Some(160_000));
         settled.updated_at_ms = Some(50_000);
@@ -3001,22 +2988,23 @@ mod signal_tests {
             }),
             "the quiet high subscription's sooner check hands nothing over"
         );
-        let line = &monitor
-            .frame(WIDTH, 10, DisplayProfile::default(), now)
-            .lines[2];
+        let line = row(&monitor, DisplayProfile::default(), now);
         assert_eq!(line.text().matches('↻').count(), 1, "{line:?}");
         assert!(
             !line.text().contains(['2', '3']),
             "no count of subscriptions: {line:?}"
         );
         assert_eq!(
-            (line.spans[0].text.as_str(), line.spans[0].role),
+            (
+                line.spans.last().unwrap().text.as_str(),
+                line.spans.last().unwrap().role
+            ),
             ("↻", Some(Role::SubscriptionHigh)),
             "on the bar the `↻` keeps the most frequent subscription's colour"
         );
         assert_eq!(
             bar(&monitor, now),
-            Some((4..39, Role::UpdateProgress)),
+            Some((0..39, Role::UpdateProgress)),
             "the low subscription checks first, with 30 s of its 30 min left"
         );
     }
@@ -3031,9 +3019,7 @@ mod signal_tests {
             40_000,
         );
         assert_eq!(monitor.entries()[0].subscription, None);
-        let line = &monitor
-            .frame(WIDTH, 10, DisplayProfile::default(), 40_000)
-            .lines[2];
+        let line = row(&monitor, DisplayProfile::default(), 40_000);
         assert_eq!(line.band, None);
         assert!(!line.text().contains(['↻', '↯']), "{line:?}");
         assert_eq!(
@@ -3361,7 +3347,7 @@ mod scrolling_tests {
         for ascii in [false, true] {
             let frame = monitor.frame_with_ascii(24, 12, DisplayProfile::default(), 0, ascii);
             let rows = &frame.lines[frame.tick_rows.clone()];
-            assert_eq!(rows.len(), 11);
+            assert_eq!(rows.len(), 10);
             let thumb = if ascii { '#' } else { '┃' };
             let track = if ascii { '|' } else { '│' };
             assert!(rows[0].text().ends_with(thumb));
@@ -3413,7 +3399,7 @@ mod scrolling_tests {
         );
         assert_eq!(
             monitor.tick_viewport.get(),
-            (11, 9),
+            (10, 9),
             "clipped Tick names each count as one row"
         );
     }
@@ -3428,7 +3414,7 @@ mod scrolling_tests {
             monitor.frame(24, 12, DisplayProfile::default(), 0);
         }
         assert_eq!(monitor.entries().len(), 270);
-        assert_eq!(monitor.tick_offset.get(), 260);
+        assert_eq!(monitor.tick_offset.get(), 261);
         assert_eq!(monitor.selected().unwrap().instance, selected);
         let frame = monitor.frame(24, 12, DisplayProfile::default(), 0);
         assert!(frame.lines[frame.tick_rows.end - 1].text().ends_with('┃'));

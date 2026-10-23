@@ -1,5 +1,5 @@
-//! A single-line list row: subscription mark, state glyph, clipped name and right-aligned
-//! details. Selection, update progress and row flashes preserve the leading marks.
+//! A single-line list row: state glyph, clipped name, right-aligned details and subscription
+//! mark. Selection, update progress and row flashes cover the whole row.
 
 use unicode_width::UnicodeWidthStr;
 
@@ -11,20 +11,37 @@ use super::{
 use crate::monitor_rows::{StatusTone, SubscriptionMark};
 use tickloop_agent_protocol::TickSubscriptionFrequency;
 
-/// The columns before a list row's glyph. The selection fill alone marks the selected row.
+/// The indentation of panel rows outside Monitor.
 pub(super) const ROW_INDENT: &str = "  ";
-/// What follows a Monitor row's first column before its glyph: a blank column, so a `↻` some
-/// fallback font draws wider than its column never meets the glyph.
-const LEAD_GAP: &str = " ";
 const NAME_GAP: &str = " ";
-
-pub(super) fn name_column(glyph: &str) -> usize {
-    ROW_INDENT.width() + compact_name_column(glyph)
-}
+const SUBSCRIPTION_GAP: &str = " ";
 
 pub(super) fn compact_name_column(glyph: &str) -> usize {
     glyph.width() + NAME_GAP.width()
 }
+/// Columns reserved for a row's glyph, right-aligned details and subscription mark.
+pub(super) fn reserved_columns(
+    glyph: &str,
+    details: &str,
+    subscription: Option<(&str, Role)>,
+) -> usize {
+    let mark_columns = subscription.map_or(0, |(mark, _)| {
+        mark.width()
+            + if details.is_empty() {
+                0
+            } else {
+                SUBSCRIPTION_GAP.width()
+            }
+    });
+    let trailing_columns = details.width() + mark_columns;
+    compact_name_column(glyph)
+        + if trailing_columns == 0 {
+            0
+        } else {
+            STATUS_GAP_COLUMNS + trailing_columns
+        }
+}
+
 pub(super) const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
@@ -61,27 +78,9 @@ impl ListRow<'_> {
 
     fn prefix(&self) -> RoleLine {
         let role = self.role();
-        let mut line = match self.subscription {
-            Some((mark, mark_role)) => RoleLine::role(mark, mark_role),
-            None => RoleLine::role(" ", role),
-        };
-        line.push(LEAD_GAP, Some(role));
-        line.push(self.glyph, Some(self.glyph_role));
+        let mut line = RoleLine::role(self.glyph, self.glyph_role);
         line.push(NAME_GAP, Some(role));
         line
-    }
-
-    /// Columns a row's details take at its right, with the gap before them.
-    fn details_reserve(&self) -> usize {
-        match self.details.width() {
-            0 => 0,
-            columns => STATUS_GAP_COLUMNS + columns,
-        }
-    }
-
-    /// Columns a one-line row needs beside its name: the lead, glyph and details.
-    fn reserved_columns(&self) -> usize {
-        self.prefix().text().width() + self.details_reserve()
     }
 
     pub(super) fn lines(&self, width: usize) -> Vec<RoleLine> {
@@ -89,40 +88,58 @@ impl ListRow<'_> {
     }
 
     fn one_line(&self, width: usize) -> RoleLine {
+        let mut tail = RoleLine::default();
+        let mark_columns = self.subscription.map_or(0, |(mark, _)| mark.width());
+        let gap = if mark_columns > 0 && !self.details.is_empty() {
+            SUBSCRIPTION_GAP.width()
+        } else {
+            0
+        };
+        let details = ellipsize(
+            &self.details,
+            width.saturating_sub(compact_name_column(self.glyph) + mark_columns + gap),
+        );
+        tail.push(&details, Some(Role::MutedText));
+        if let Some((mark, role)) = self.subscription {
+            if !details.is_empty() {
+                tail.push(SUBSCRIPTION_GAP, None);
+            }
+            tail.push(mark, Some(role));
+        }
+        let tail_columns = tail.text().width();
         let mut line = self.prefix();
-        let name_columns = width.saturating_sub(self.reserved_columns());
+        line.truncate(width.saturating_sub(tail_columns));
+        let name_columns = width.saturating_sub(reserved_columns(
+            self.glyph,
+            &self.details,
+            self.subscription,
+        ));
         line.push(ellipsize(self.name, name_columns), Some(self.role()));
-        self.push_details(&mut line, width);
+        line.push(
+            " ".repeat(width.saturating_sub(line.text().width() + tail_columns)),
+            None,
+        );
+        line.spans.extend(tail.spans);
         self.finish(line, width)
     }
 
-    /// Right-aligns the details in the columns the line leaves, shortened there when they do not
-    /// fit.
-    fn push_details(&self, line: &mut RoleLine, width: usize) {
-        let details = ellipsize(&self.details, width.saturating_sub(line.text().width()));
-        line.push(
-            " ".repeat(width.saturating_sub(line.text().width() + details.width())),
-            None,
-        );
-        line.push(details, Some(Role::MutedText));
-    }
-
     /// Selection takes priority over a flash, with the progress bar over the selection.
-    /// Progress and flashes start at the name; the subscription mark keeps its own background.
+    /// All fills start at the first column, including the glyph and subscription mark.
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
         if line.text().width() > width {
             line.truncate(width);
         }
-        let name_start = name_column(self.glyph).min(width);
         let bar = self
             .bar_columns
-            .filter(|_| name_start < width)
-            .map(|columns| name_start..(name_start + columns.max(1)).min(width));
-        let after_mark = usize::from(self.subscription.is_some());
+            .filter(|_| width > 0)
+            .map(|columns| 0..columns.max(1).min(width));
+        line.preserve_selection_colours = self
+            .subscription
+            .is_some_and(|(_, role)| role == Role::MutedText);
         if self.selected {
-            line = line.filled_from(Role::Selection, after_mark);
+            line = line.filled(Role::Selection);
         } else if let Some(fill) = self.fill {
-            return line.filled_from(fill, name_start);
+            return line.filled(fill);
         }
         match bar {
             Some(columns) => line.banded(columns, Role::UpdateProgress),
@@ -203,7 +220,7 @@ fn subscription_role(frequency: TickSubscriptionFrequency) -> Role {
     }
 }
 
-/// The `↻` that leads a row with periodic subscriptions, in its frequency's colour.
+/// The `↻` at the right of a row with periodic subscriptions, in its frequency's colour.
 pub(super) fn subscription_mark(
     subscription: Option<SubscriptionMark>,
     display: DisplayProfile,
@@ -220,7 +237,7 @@ pub(super) fn subscription_mark(
     })
 }
 
-/// The details at a row's right. The glyph's colour already tells the state and the lead the
+/// The details at a row's right. The glyph's colour already tells the state and the mark the
 /// subscriptions, so no status word or result glyph repeats them: a running row's elapsed time
 /// and the row's notes. Nothing on the row keeps changing with each update, neither a time nor a
 /// count of waiting updates; its detail and the subscription detail tell them.
@@ -319,8 +336,8 @@ mod tests {
                     let text = lines[0].text();
                     assert!(text.width() <= width, "{width}: {text:?}");
                     if width >= 10 {
-                        assert!(text.starts_with("↻ $ "), "{text}");
-                        assert!(text.ends_with("14s"), "{text}");
+                        assert!(text.starts_with("$ "), "{text}");
+                        assert!(text.ends_with("14s ↻"), "{text}");
                         if width < 25 {
                             assert!(text.contains('…'), "{text}");
                         }
@@ -331,7 +348,7 @@ mod tests {
         }
         assert_eq!(
             row("Rerun full test suite in background to verify", "14s").lines(30)[0].text(),
-            "  $ Rerun full test suit…  14s"
+            "$ Rerun full test suite…   14s"
         );
     }
 
@@ -339,11 +356,8 @@ mod tests {
     fn clipping_names_preserves_whole_graphemes() {
         for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
             let name = format!("{grapheme}abc");
-            assert_eq!(row(&name, "").lines(6)[0].text(), "  $ … ");
-            assert_eq!(
-                row(&name, "").lines(7)[0].text(),
-                format!("  $ {grapheme}…")
-            );
+            assert_eq!(row(&name, "").lines(4)[0].text(), "$ … ");
+            assert_eq!(row(&name, "").lines(5)[0].text(), format!("$ {grapheme}…"));
         }
     }
 
@@ -392,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_subscription_leads_the_row_with_one_mark_coloured_by_frequency() {
+    fn periodic_subscriptions_trail_the_details_in_their_frequency_colour() {
         for (frequency, role) in [
             (TickSubscriptionFrequency::High, Role::SubscriptionHigh),
             (TickSubscriptionFrequency::Medium, Role::SubscriptionMedium),
@@ -404,237 +418,236 @@ mod tests {
                 subscription: mark,
                 ..row("Quotes", "exit 101")
             }
-            .lines(30)[0]
-                .clone();
-            assert_eq!(
-                lead(&line, 3),
-                [
-                    ("↻".to_owned(), Some(role)),
-                    (" ".to_owned(), Some(Role::MutedText)),
-                    ("$".to_owned(), Some(Role::RunningMark))
-                ],
-                "{frequency:?}: the mark, a blank column, then the glyph"
-            );
-            assert!(
-                line.text().ends_with("exit 101"),
-                "nothing trails the details: {line:?}"
-            );
+            .one_line(30);
+            assert!(line.text().starts_with("$ Quotes"), "{line:?}");
+            assert!(line.text().ends_with("exit 101 ↻"), "{line:?}");
+            let last = line.spans.last().unwrap();
+            assert_eq!((last.text.as_str(), last.role), ("↻", Some(role)));
         }
     }
 
     #[test]
-    fn the_name_starts_in_one_column_with_or_without_a_mark() {
-        let names = [
-            row("Quotes", "").lines(20)[0].clone(),
-            ListRow {
-                subscription: Some(("↻", Role::SubscriptionLow)),
+    fn all_tick_types_start_at_the_first_column() {
+        for glyph in ["◉", ">", "$", "↗"] {
+            for subscription in [None, Some(("↻", Role::SubscriptionHigh))] {
+                let line = ListRow {
+                    glyph,
+                    subscription,
+                    ..row("Example", "")
+                }
+                .one_line(20);
+                assert!(
+                    line.text().starts_with(&format!("{glyph} Example")),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subscribed_and_plain_rows_start_at_the_same_column_and_keep_their_tails() {
+        for subscription in [None, Some(("↻", Role::SubscriptionLow))] {
+            let line = ListRow {
+                subscription,
                 ..row("Quotes", "")
             }
-            .lines(20)[0]
-                .clone(),
-        ]
-        .map(|line| line.text().find("Quotes").unwrap());
-        assert_eq!(
-            names,
-            [4, 6],
-            "byte offsets: `↻` takes three bytes in one column"
-        );
-        let narrow = ListRow {
-            subscription: Some(("↻", Role::SubscriptionLow)),
-            ..row("python3 -q", "exit 101 · SIGTERM")
-        };
-        for width in [12, 20, 60] {
-            let last = narrow.lines(width).last().unwrap().text();
-            assert_eq!(last.width(), width, "{last:?}");
+            .one_line(20);
+            assert!(line.text().starts_with("$ Quotes"), "{line:?}");
+            for width in 7..=60 {
+                let line = ListRow {
+                    subscription,
+                    ..row("python3 -q with a long name", "14s")
+                }
+                .one_line(width);
+                assert_eq!(line.text().width(), width, "{line:?}");
+                assert!(
+                    line.text().ends_with(if subscription.is_some() {
+                        "14s ↻"
+                    } else {
+                        "14s"
+                    }),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_details_keep_the_type_glyph_and_trailing_subscription_mark() {
+        for width in 3..=20 {
+            let line = ListRow {
+                subscription: Some(("↻", Role::SubscriptionLow)),
+                ..row("python3 -q", "exit 101 · SIGTERM")
+            }
+            .one_line(width);
+            assert_eq!(line.text().width(), width, "{line:?}");
             assert!(
-                !last.ends_with('↻') && !last.ends_with(' '),
-                "{width}: no mark or blank column at the right: {last:?}"
+                line.text().starts_with("$ ") && line.text().ends_with('↻'),
+                "{line:?}"
             );
         }
     }
 
     #[test]
-    fn an_unread_row_leaves_its_first_column_bare_and_the_bar_turns_the_mark_clear_on_it() {
-        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+    fn an_unread_row_colours_its_first_column_and_progress_covers_the_whole_row() {
         let unread = ListRow {
             glyph_role: Role::UpdateMark,
             ..row("Quotes", "")
         }
-        .lines(20)[0]
-            .clone();
-        assert_eq!(unread.text(), row("Quotes", "").lines(20)[0].text());
-        assert_eq!(
-            lead(&unread, 3),
-            [
-                (" ".to_owned(), Some(Role::MutedText)),
-                (" ".to_owned(), Some(Role::MutedText)),
-                ("$".to_owned(), Some(Role::UpdateMark))
-            ],
-            "the glyph's colour alone tells the update"
-        );
-        assert_eq!(
-            unread.resolve(theme, 20).spans[0].style.background,
-            None,
-            "the first column has no background"
-        );
-        assert_eq!(
-            unread.band, None,
-            "no bar without a subscription holding the update"
-        );
-        let held = ListRow {
-            glyph_role: Role::UpdateMark,
-            bar_columns: Some(10),
-            subscription: Some(("↻", Role::SubscriptionMedium)),
-            ..row("Quotes", "")
-        }
-        .lines(20)[0]
-            .clone();
-        assert_eq!(
-            lead(&held, 2),
-            [
-                ("↻".to_owned(), Some(Role::SubscriptionMedium)),
-                (" ".to_owned(), Some(Role::MutedText))
-            ],
-            "on the bar the `↻` keeps its frequency's colour"
-        );
-        assert_eq!(
-            held.band.map(|band| (band.columns, band.role)),
-            Some((4..14, Role::UpdateProgress)),
-            "the bar starts after the icons"
-        );
-    }
-
-    #[test]
-    fn a_selected_row_fills_from_its_second_column_when_its_first_holds_a_mark() {
-        let selected_row = || ListRow {
-            selected: true,
-            glyph_role: Role::SuccessMark,
-            ..row("Run the console tests in the worktree", "12s")
-        };
-        let selected = selected_row();
-        let line = selected.one_line(40);
-        assert_eq!(line.text().width(), 40);
-        assert!(line.text().starts_with("  $ Run the console"), "{line:?}");
-        assert!(line.text().ends_with("the w…  12s"), "{line:?}");
-        assert_eq!(line.spans[1].role, Some(Role::SuccessMark));
-        assert_eq!(
-            (line.fill, line.fill_start),
-            (Some(Role::Selection), 0),
-            "without a mark the selection fills the whole row"
-        );
-        let narrow = selected.lines(30);
-        assert_eq!(narrow.len(), 1);
-        assert_eq!(narrow[0].fill, Some(Role::Selection));
-        assert!(narrow[0].text().contains('…'));
-        assert!(narrow[0].text().ends_with("12s"));
-        assert!(!line.text().contains('›'));
-        let marked = ListRow {
-            subscription: Some(("↻", Role::SubscriptionHigh)),
-            ..selected_row()
-        };
-        for line in marked.lines(30) {
+        .one_line(20);
+        assert_eq!(lead(&unread, 1), [("$".to_owned(), Some(Role::UpdateMark))]);
+        assert_eq!(unread.band, None);
+        for columns in [0, 10, 20, 30] {
+            let held = ListRow {
+                glyph_role: Role::UpdateMark,
+                bar_columns: Some(columns),
+                subscription: Some(("↻", Role::SubscriptionMedium)),
+                ..row("Quotes", "")
+            }
+            .one_line(20);
             assert_eq!(
-                (line.fill, line.fill_start),
-                (Some(Role::Selection), 1),
-                "the first column keeps its own colours: {line:?}"
+                held.band.clone().map(|band| (band.columns, band.role)),
+                Some((0..columns.clamp(1, 20), Role::UpdateProgress))
             );
+            let resolved = held.resolve(
+                super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark),
+                20,
+            );
+            let mark = resolved.spans.last().unwrap();
+            assert_eq!(mark.text, "↻");
+            if columns >= 20 {
+                let theme =
+                    super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+                assert_eq!(
+                    mark.style.background,
+                    theme.style(Role::UpdateProgress).background
+                );
+                assert_eq!(
+                    mark.style.foreground,
+                    theme.style(Role::SubscriptionMedium).foreground
+                );
+            }
         }
-        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
-        let unread = ListRow {
-            glyph_role: Role::UpdateMark,
-            ..selected_row()
-        }
-        .one_line(40);
-        assert_eq!(
-            (unread.fill, unread.fill_start),
-            (Some(Role::Selection), 0),
-            "an unread row without `↻` fills from its first column"
-        );
-        let glyph = unread
-            .resolve(theme, 40)
-            .spans
-            .into_iter()
-            .find(|span| span.text == "$")
-            .unwrap();
-        assert_eq!(
-            (glyph.style.foreground, glyph.style.background),
-            (
-                theme.style(Role::UpdateMark).foreground,
-                theme.style(Role::Selection).background
-            ),
-            "the glyph keeps the update colour on the selection"
-        );
-        let resolved = ListRow {
-            subscription: Some(("↻", Role::SubscriptionHigh)),
-            ..selected_row()
-        }
-        .one_line(40)
-        .resolve(theme, 40);
-        assert_eq!(resolved.spans[0].style.background, None, "{resolved:?}");
-        assert_eq!(
-            resolved.spans[1].style.background,
-            theme.style(Role::Selection).background,
-            "the selection starts at the second column"
-        );
     }
 
     #[test]
-    fn a_bar_and_flash_start_at_the_name_on_the_single_clipped_row() {
+    fn selection_and_flashes_fill_the_whole_row_with_or_without_a_subscription() {
+        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+        for subscription in [None, Some(("↻", Role::SubscriptionHigh))] {
+            for selected in [false, true] {
+                let fill = if selected {
+                    Role::Selection
+                } else {
+                    Role::UseFlashStrong
+                };
+                let line = ListRow {
+                    selected,
+                    glyph_role: Role::UpdateMark,
+                    subscription,
+                    fill: Some(Role::UseFlashStrong),
+                    ..row("Run the console tests in the worktree", "12s")
+                }
+                .one_line(30);
+                assert_eq!((line.fill, line.fill_start), (Some(fill), 0));
+                assert!(line.text().starts_with("$ Run the console"), "{line:?}");
+                assert!(line.text().contains('…'), "{line:?}");
+                let resolved = line.resolve(theme, 30);
+                assert!(
+                    resolved
+                        .spans
+                        .iter()
+                        .all(|span| span.style.background == theme.style(fill).background),
+                    "{resolved:?}"
+                );
+                assert_eq!(
+                    resolved.spans[0].style.foreground,
+                    theme.style(Role::UpdateMark).foreground
+                );
+                if subscription.is_some() {
+                    let mark = resolved.spans.last().unwrap();
+                    assert_eq!(mark.text, "↻");
+                    assert_eq!(
+                        mark.style.foreground,
+                        theme.style(Role::SubscriptionHigh).foreground
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bar_fills_the_row_and_selection_wins_over_a_flash() {
         let check = NextCheck {
             at_ms: 160_000,
             wait_ms: 60_000,
         };
         let waiting = ListRow {
-            bar_columns: Some(check.elapsed_columns(26, 130_000)),
+            bar_columns: Some(check.elapsed_columns(30, 130_000)),
             subscription: Some(("↻", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
         assert_eq!(lines.len(), 1);
-        for line in &lines {
-            assert_eq!(line.fill, None);
-            assert_eq!(
-                line.band.clone().map(|band| (band.columns, band.role)),
-                Some((4..17, Role::UpdateProgress)),
-                "half the wait fills half the name area: {line:?}"
-            );
-        }
-        let just_started = ListRow {
-            bar_columns: Some(0),
-            subscription: Some(("↻", Role::SubscriptionHigh)),
-            ..row("Quotes", "")
-        };
         assert_eq!(
-            just_started.lines(30)[0]
-                .band
-                .clone()
-                .map(|band| band.columns),
-            Some(4..5),
-            "the bar starts with one name cell and excludes the icons"
+            lines[0].band.clone().map(|band| (band.columns, band.role)),
+            Some((0..15, Role::UpdateProgress))
         );
         let flashing = ListRow {
             fill: Some(Role::UseFlashStrong),
             ..waiting
         };
-        for line in flashing.lines(30) {
-            assert_eq!(
-                (line.fill, line.fill_start),
-                (Some(Role::UseFlashStrong), 4),
-                "the flash starts at the name"
-            );
-            assert_eq!(line.band, None, "the flash covers the bar");
-        }
+        let line = flashing.one_line(30);
+        assert_eq!(
+            (line.fill, line.fill_start, line.band),
+            (Some(Role::UseFlashStrong), 0, None)
+        );
         let selected = ListRow {
             selected: true,
             ..flashing
-        };
-        for line in selected.lines(30) {
-            assert_eq!(line.fill, Some(Role::Selection), "the selection wins");
-            assert_eq!(
-                line.band.map(|band| (band.columns, band.role)),
-                Some((4..17, Role::UpdateProgress)),
-                "a selected row's bar keeps its colour over the selection"
-            );
+        }
+        .one_line(30);
+        assert_eq!(selected.fill, Some(Role::Selection));
+        assert_eq!(
+            selected.band.map(|band| (band.columns, band.role)),
+            Some((0..15, Role::UpdateProgress))
+        );
+    }
+
+    #[test]
+    fn paused_subscriptions_keep_a_muted_mark_at_the_right_in_narrow_rows() {
+        let mut subscription = periodic(TickSubscriptionFrequency::High).unwrap();
+        subscription.paused = true;
+        for width in 0..=12 {
+            let line = ListRow {
+                selected: true,
+                subscription: subscription_mark(Some(subscription), DisplayProfile::default()),
+                ..row("中文 long name 👩‍💻", "22s")
+            }
+            .one_line(width);
+            assert!(line.text().width() <= width, "{line:?}");
+            assert_eq!((line.fill, line.fill_start), (Some(Role::Selection), 0));
+            if width >= 3 {
+                assert!(line.text().starts_with("$ "), "{line:?}");
+            }
+            if width > 0 {
+                assert!(line.text().ends_with('↻'), "{line:?}");
+                assert_eq!(line.spans.last().unwrap().role, Some(Role::MutedText));
+                let theme =
+                    super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+                let resolved = line.resolve(theme, width);
+                let mark = resolved.spans.last().unwrap();
+                assert_eq!(
+                    mark.style.foreground,
+                    theme.style(Role::MutedText).foreground
+                );
+                assert_eq!(
+                    mark.style.background,
+                    theme.style(Role::Selection).background
+                );
+            }
+            if width >= 7 {
+                assert!(line.text().ends_with("22s ↻"), "{line:?}");
+            }
         }
     }
 

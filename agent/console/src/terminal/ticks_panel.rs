@@ -1597,9 +1597,11 @@ mod tests {
         let notice = frame(&mut panel)
             .iter()
             .filter(|line| {
-                line.spans
-                    .first()
-                    .is_some_and(|span| span.role == Some(Role::Success))
+                !line.spans.is_empty()
+                    && line
+                        .spans
+                        .iter()
+                        .all(|span| span.role == Some(Role::Success))
             })
             .map(RoleLine::text)
             .collect::<String>();
