@@ -216,6 +216,11 @@ impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
     fn on_stop(&self, change: &SourceChange, chat: &mut Chat) {
         change.agent().cancel_self_paced_wakeup(change, chat);
     }
+
+    /// Continuing re-times the tasks from now, so nothing missed while paused runs late.
+    fn on_resume(&self, change: &SourceChange, chat: &mut Chat) {
+        change.agent().resume_scheduled_tasks(change, chat);
+    }
 }
 
 fn scheduled_tasks_record(chat: &Chat) -> Line {
@@ -230,6 +235,7 @@ impl From<SourceChangeError> for AgentError {
     fn from(error: SourceChangeError) -> Self {
         match error {
             SourceChangeError::NotLoaded => Self::NotFound,
+            SourceChangeError::Busy => Self::Busy,
             SourceChangeError::Unrecorded(message) => Self::Storage(message),
             error @ (SourceChangeError::HeldElsewhere
             | SourceChangeError::ForeignHost(_)
@@ -352,7 +358,7 @@ impl Agent {
             });
             // Recorded, so a process taking the Chat over finds the task its run belongs to;
             // the timer is left alone, as the task does not time on its own.
-            self.queue_source_state(chat_id, scheduled_tasks_record(chat));
+            self.queue_with_source_states(chat, Vec::new(), vec![scheduled_tasks_record(chat)]);
         }
     }
 
@@ -1009,6 +1015,48 @@ impl Agent {
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
         self.withdraw_deleted_task_runs(chat, &removed);
         self.persist_scheduled_tasks(change, chat, Vec::new());
+    }
+
+    /// A Worker's history load dropped what does not outlive it, the self-paced loop among it:
+    /// that is recorded under the Chat's lease, so a takeover later does not bring the loop
+    /// back from the record before the load. Another live process holding the lease still runs
+    /// the Chat and its tasks, so nothing is recorded then.
+    pub(crate) async fn record_scheduled_tasks_after_history_load(&self, chat_id: ChatId) {
+        let has_tasks = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .is_some_and(|chat| {
+                !chat.snapshot.scheduled_tasks.is_empty()
+                    || !chat.snapshot.scheduled_task_revocations.is_empty()
+            });
+        if !has_tasks {
+            return;
+        }
+        let now = self.scheduled_now();
+        let recorded = self
+            .run_source_change(chat_id, move |change, chat| {
+                let before = (
+                    chat.snapshot.scheduled_tasks.clone(),
+                    chat.snapshot.scheduled_task_revocations.clone(),
+                );
+                after_history_load(&mut chat.snapshot, now);
+                let after = (
+                    &chat.snapshot.scheduled_tasks,
+                    &chat.snapshot.scheduled_task_revocations,
+                );
+                if after != (&before.0, &before.1) {
+                    change
+                        .agent()
+                        .persist_scheduled_tasks(change, chat, Vec::new());
+                }
+            })
+            .await;
+        if let Err(error) = recorded {
+            tracing::debug!(%chat_id, %error, "the history load's scheduled tasks were not recorded");
+        }
     }
 
     /// When a Loop that receives next needs its host: the earliest fire time of its confirmed

@@ -3208,6 +3208,7 @@ impl Agent {
         for (id, loaded) in pending.into_iter().rev() {
             // Boxed: restoring a Chat is a large future, and resuming awaits it in a loop.
             Box::pin(self.insert_restored_chat(id, loaded, RestoreTarget::Resume, None)).await?;
+            self.record_scheduled_tasks_after_history_load(id).await;
         }
         super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
             .map_err(AgentError::Invalid)?;
