@@ -1794,6 +1794,7 @@ async fn interact_with_herdr(
     // The catalog's account of each family member whose snapshot this View last applied.
     let mut applied_member_work: HashMap<uuid::Uuid, MemberWork> = HashMap::new();
     let mut running_activity: Option<RunningActivity> = None;
+    let mut idle_interruptible_chat = None;
     // A replayed or restored run has no known start; only a live Started event begins this clock.
     let mut observed_run_starts = HashMap::new();
     let mut cached_activity_status: Option<(uuid::Uuid, String)> = None;
@@ -2062,8 +2063,10 @@ async fn interact_with_herdr(
         }
         if interactive && status_dirty {
             running_activity = None;
+            idle_interruptible_chat = None;
             cached_activity_status = None;
             console.set_activity_interruptible(false)?;
+            console.set_idle_loop_interruptible(false)?;
             if overview_active {
                 completed_task_retention.observe(None, std::time::Instant::now());
                 // The overview heading and dispatch line carry counts and directory; the status
@@ -2214,6 +2217,29 @@ async fn interact_with_herdr(
                 } else {
                     console.set_execution_connection_notice(connection, agent.disconnected())?;
                 }
+                let loop_interruptible = daemon_unreachable.is_none()
+                    && agent.disconnected().is_none()
+                    && global.projection().rows.iter().any(|row| {
+                        row.chat_id == chat
+                            && row.availability == ExecutionAvailability::Live
+                            && row
+                                .capabilities
+                                .iter()
+                                .any(|capability| capability == "loop")
+                    });
+                idle_interruptible_chat = (loop_interruptible
+                    && !run_is_working
+                    && !directed_summaries.contains(chat)
+                    && (status.goal.as_ref().is_some_and(|goal| {
+                        matches!(goal.status, tickloop_agent_protocol::GoalStatus::Active)
+                    }) || status.scheduled_tasks.iter().any(|task| {
+                        matches!(
+                            task.kind,
+                            tickloop_agent_protocol::ScheduledTaskKind::SelfPaced { .. }
+                        )
+                    })))
+                .then_some(chat);
+                console.set_idle_loop_interruptible(idle_interruptible_chat.is_some())?;
                 let state = if connection
                     .is_some_and(|notice| notice != console::ExecutionConnectionNotice::CachedView)
                 {
@@ -2237,16 +2263,7 @@ async fn interact_with_herdr(
                         label: WORKING_ACTIVITY.to_owned(),
                         started_at: running_receipt
                             .and_then(|receipt| observed_run_starts.get(&receipt.run_id).copied()),
-                        interruptible: daemon_unreachable.is_none()
-                            && agent.disconnected().is_none()
-                            && global.projection().rows.iter().any(|row| {
-                                row.chat_id == chat
-                                    && row.availability == ExecutionAvailability::Live
-                                    && row
-                                        .capabilities
-                                        .iter()
-                                        .any(|capability| capability == "loop")
-                            }),
+                        interruptible: loop_interruptible,
                     };
                     let preview = pending.iter().find_map(|(run_id, receipt)| {
                         (receipt.chat_id == chat && thinking_runs.contains(run_id))
@@ -2947,8 +2964,8 @@ async fn interact_with_herdr(
                     }
                 },
                 Some(InputEvent::InterruptActivity) => {
-                    let Some(chat) = selected_chat.filter(|chat| running_activity.as_ref().is_some_and(|activity| activity.chat_id == *chat && activity.interruptible)) else { continue; };
-                    if pending.values().any(|receipt| receipt.chat_id == chat) || directed_summaries.contains(chat) {
+                    let Some(chat) = selected_chat.filter(|chat| idle_interruptible_chat == Some(*chat) || running_activity.as_ref().is_some_and(|activity| activity.chat_id == *chat && activity.interruptible)) else { continue; };
+                    if idle_interruptible_chat == Some(chat) || pending.values().any(|receipt| receipt.chat_id == chat) || directed_summaries.contains(chat) {
                         match agent.interrupt(chat).await {
                             Ok(_) => {
                                 user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
@@ -6991,9 +7008,14 @@ fn show_opened_chat(
     show_settings_warnings(console, agent.user_settings_warnings(snapshot.id))?;
     workflows::write_public_history(console, snapshot)?;
     if has_history {
+        let receiving_hint = if snapshot.chat_loop.receiving.is_receiving() {
+            "."
+        } else {
+            "; sending it resumes receiving Triggers."
+        };
         outln!(
             console,
-            "\nHistory opened. Enter a message to continue this Chat; sending it resumes receiving Triggers."
+            "\nHistory opened. Enter a message to continue this Chat{receiving_hint}"
         );
     } else {
         outln!(console, "Enter a message to continue this Chat.");
