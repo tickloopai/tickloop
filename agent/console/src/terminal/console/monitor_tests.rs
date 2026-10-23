@@ -5665,9 +5665,8 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
         );
         let state = console.state.lock().unwrap();
         assert!(
-            state
-                .status
-                .starts_with(if paused { "Paused " } else { "Resumed " })
+            !state.status.starts_with("Paused ") && !state.status.starts_with("Resumed "),
+            "the row shows the change; the status line stays quiet"
         );
     }
     let task = core
@@ -5694,13 +5693,9 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
             paused
         );
         let state = console.state.lock().unwrap();
-        assert_eq!(
-            state.status,
-            format!(
-                "{} scheduled task {}",
-                if paused { "Paused" } else { "Resumed" },
-                task.id
-            )
+        assert!(
+            !state.status.starts_with("Paused ") && !state.status.starts_with("Resumed "),
+            "the row shows the change; the status line stays quiet"
         );
     }
     core.shutdown().await;

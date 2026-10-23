@@ -183,7 +183,8 @@ impl TickActionExecutor for PauseAction {
 #[async_trait]
 impl TickActionBackend for PauseAction {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        let (paused, label) = match self {
+        // The row itself shows the change, so the toggle reports nothing in the status line.
+        match self {
             Self::Scheduled(id) => {
                 let status = ctx
                     .agent
@@ -206,7 +207,6 @@ impl TickActionBackend for PauseAction {
                         .await
                         .map_err(|error| error.to_string())?,
                 )?;
-                (paused, format!("scheduled task {id}"))
             }
             Self::Subscription(instance) => {
                 let subscriptions = ctx
@@ -233,13 +233,9 @@ impl TickActionBackend for PauseAction {
                     .await
                     .map_err(|error| error.to_string())?;
                 ctx.console.update_subscribed_ticks(ctx.chat, &rows)?;
-                (paused, instance.to_string())
             }
-        };
-        ctx.notify(&format!(
-            "{} {label}",
-            if paused { "Paused" } else { "Resumed" }
-        ))
+        }
+        Ok(())
     }
 }
 
