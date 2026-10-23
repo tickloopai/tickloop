@@ -897,7 +897,7 @@ impl TicksPanel {
         }
     }
 
-    /// The rows this page's list takes, one or two for each package at `width`.
+    /// One clipped row for each package at `width`.
     fn list_rows(&self, width: usize, display: DisplayProfile) -> Vec<(usize, Vec<RoleLine>)> {
         let glyph = display.glyph(Glyph::ProtocolTick);
         let selected = self.selected[self.page];

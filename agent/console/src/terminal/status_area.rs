@@ -1161,6 +1161,51 @@ mod tests {
     }
 
     #[test]
+    fn subagent_names_and_descriptions_remain_single_line_with_whole_graphemes() {
+        let root = Uuid::from_u128(1);
+        let child = AgentRow {
+            agent_id: Uuid::from_u128(2),
+            parent_id: Some(root),
+            title: String::new(),
+            status: "Running".into(),
+            state: tickloop_agent_protocol::LoopState::Running,
+            project: String::new(),
+            workspace: None,
+            approvals: 0,
+            questions: 0,
+            group: crate::agent_console::AttentionGroup::Working,
+            glyph: Glyph::AgentRunning,
+            preview: None,
+            updated_at: None,
+            run_started_at: Some(0),
+            subagent: Some(tickloop_agent_protocol::SubagentRegistration {
+                child_chat_id: Uuid::from_u128(2),
+                handle: "👩‍💻中文 mixed long name".into(),
+                description: "Mixed 描述 👩‍💻 long description".repeat(10),
+                created_at: 0,
+                color: None,
+            }),
+        };
+        for width in 0..=60 {
+            for selected in [false, true] {
+                let line = super::super::subagent_panel::family_line(
+                    &child,
+                    selected,
+                    false,
+                    (width, 12, DisplayProfile::default(), 14_000),
+                );
+                let text = line.text();
+                assert!(!text.contains('\n'));
+                assert!(text.width() <= width, "{width}: {text:?}");
+                if width >= 20 {
+                    assert!(text.contains('…') && text.ends_with("14s"), "{text:?}");
+                    assert!(text.contains("👩‍💻"), "{text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn subagent_panel_shows_run_elapsed_and_explicit_idle_state() {
         use crate::{agent_console::AttentionGroup, terminal::style::ThemeName};
         let root = Uuid::from_u128(1);
