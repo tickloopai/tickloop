@@ -170,8 +170,8 @@ impl MetadataKind {
             | Self::Provenance
             | Self::CitationSources
             | Self::TaskBoards
-            | Self::Goal
             | Self::FamilyCompletions => Retention::ChatLatest,
+            Self::Goal => Retention::SourceState,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
             Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
                 Retention::Accumulating

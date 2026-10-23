@@ -147,9 +147,6 @@ impl RetainedFold {
         };
         let kind = line.kind();
         match (kind.retention(), line) {
-            // A Trigger source's state, which only the lease holder writes: a snapshot taken
-            // from what this process loaded could carry a goal another process has replaced.
-            (Retention::ChatLatest, Line::Goal(_)) => {}
             (Retention::ChatLatest, _) => {
                 self.latest.insert(kind, kept);
             }

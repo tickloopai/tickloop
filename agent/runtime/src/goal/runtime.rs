@@ -153,9 +153,9 @@ impl From<SourceChangeError> for GoalUpdateError {
             SourceChangeError::HeldElsewhere => Self::Elsewhere(GOAL_HELD_ELSEWHERE.into()),
             SourceChangeError::NotLoaded => Self::NotLoaded,
             SourceChangeError::Unrecorded(error) => Self::Unrecorded(error),
-            error @ (SourceChangeError::ForeignHost(_) | SourceChangeError::Closing) => {
-                Self::Elsewhere(error.to_string())
-            }
+            error @ (SourceChangeError::ForeignHost(_)
+            | SourceChangeError::Closing
+            | SourceChangeError::Busy) => Self::Elsewhere(error.to_string()),
         }
     }
 }
@@ -851,7 +851,8 @@ impl Agent {
 pub(crate) struct GoalSourceState;
 
 impl crate::wakeup::TriggerSourceState for GoalSourceState {
-    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]) {
+        let agent = change.agent();
         if chat.snapshot.delegation.is_some() {
             return;
         }
@@ -881,14 +882,9 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
                 vec![GoalEvent::HistoryLoaded],
                 unix_time_milliseconds(),
             ) {
-                Ok((goal, effects)) => {
-                    // A takeover is made within the boundary under the lease newly taken, which
-                    // a source change would prove.
-                    let chat_id = chat.snapshot.id;
-                    agent.adopt_goal(chat, goal, effects, false, &|line| {
-                        agent.queue_source_state(chat_id, line)
-                    });
-                }
+                Ok((goal, effects)) => agent.adopt_goal(chat, goal, effects, false, &|line| {
+                    change.record_source_state(line)
+                }),
                 Err(error) => {
                     tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal")
                 }

@@ -73,8 +73,8 @@ fn goal_events_keep_every_line_through_retained_snapshots() {
 }
 
 #[test]
-fn goal_records_are_kept_as_the_latest_and_goal_events_accumulate() {
-    assert_eq!(MetadataKind::Goal.retention(), Retention::ChatLatest);
+fn goal_records_are_a_sources_state_and_goal_events_accumulate() {
+    assert_eq!(MetadataKind::Goal.retention(), Retention::SourceState);
     assert_eq!(MetadataKind::GoalEvent.retention(), Retention::Accumulating);
     let line = event_line(GoalNotice::Cleared);
     let value = serde_json::to_value(&line).unwrap();

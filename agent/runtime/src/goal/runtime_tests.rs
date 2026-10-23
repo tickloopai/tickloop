@@ -242,20 +242,26 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
         )
         .await
         .unwrap();
-    let mut chats = agent.inner.chats.lock().await;
-    let chat = chats.get_mut(&chat_id).unwrap();
-    let mut stored_goal = chat.snapshot.goal.clone().unwrap();
-    stored_goal.tokens_used = 5_000;
-    let stored = [Line::Goal(GoalEntry {
-        chat_id,
-        cwd: chat.snapshot.folder.clone(),
-        goal: Some(stored_goal),
-    })];
-    chat.snapshot.goal.as_mut().unwrap().tokens_used = 30_000;
-    GoalSourceState.take_over(&agent, chat, &stored);
-    assert_eq!(chat.snapshot.goal.as_ref().unwrap().tokens_used, 30_000);
-    assert_eq!(chat.goal_recorded_tokens, 5_000);
-    drop(chats);
+    let (tokens_used, recorded_tokens) = agent
+        .run_source_change(chat_id, move |change, chat| {
+            let mut stored_goal = chat.snapshot.goal.clone().unwrap();
+            stored_goal.tokens_used = 5_000;
+            let stored = [Line::Goal(GoalEntry {
+                chat_id,
+                cwd: chat.snapshot.folder.clone(),
+                goal: Some(stored_goal),
+            })];
+            chat.snapshot.goal.as_mut().unwrap().tokens_used = 30_000;
+            GoalSourceState.take_over(change, chat, &stored);
+            (
+                chat.snapshot.goal.as_ref().unwrap().tokens_used,
+                chat.goal_recorded_tokens,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(tokens_used, 30_000);
+    assert_eq!(recorded_tokens, 5_000);
     agent.shutdown().await;
 }
 
