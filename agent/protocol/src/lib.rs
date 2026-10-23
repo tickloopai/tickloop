@@ -41,6 +41,7 @@ mod skill;
 mod tick_subscriptions;
 mod tool;
 mod tools;
+mod trigger_display;
 mod upgrade;
 mod usage;
 
@@ -187,6 +188,12 @@ pub use tools::{
     CitationSource, CommandSnapshot, CommandState, FileReadRecord, SearchConfig,
     SearchProviderKind, SearchTestResult, SearchTestStatus, ToolResult, WebSearchFailure,
     WebSearchSuggestion,
+};
+pub use trigger_display::{
+    GOAL_CONTINUATION_EVENT, final_scheduled_run_prompt, loop_instructions_error_prompt,
+    loop_instructions_prompt, scheduled_skill_prompt, strip_final_scheduled_run_prompt,
+    strip_loop_instructions_error_prompt, strip_loop_instructions_prompt,
+    strip_scheduled_skill_prompt,
 };
 pub use usage::{
     CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,

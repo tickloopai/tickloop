@@ -3155,9 +3155,10 @@ impl Agent {
         }
         {
             let chats = self.inner.chats.lock().await;
-            if let Some(chat) = chats.get(&chat_id) {
+            if chats.contains_key(&chat_id) {
                 super::family_tree::lineage(&chats, chat_id).map_err(AgentError::Invalid)?;
-                return Ok(chat.snapshot.clone());
+                drop(chats);
+                return self.snapshot(chat_id).await;
             }
         }
         let Some(recorder) = &self.inner.recorder else {
@@ -3166,9 +3167,10 @@ impl Agent {
         let _resume = recorder.resume_lock.lock().await;
         {
             let chats = self.inner.chats.lock().await;
-            if let Some(chat) = chats.get(&chat_id) {
+            if chats.contains_key(&chat_id) {
                 super::family_tree::lineage(&chats, chat_id).map_err(AgentError::Invalid)?;
-                return Ok(chat.snapshot.clone());
+                drop(chats);
+                return self.snapshot(chat_id).await;
             }
         }
         let mut pending = Vec::new();

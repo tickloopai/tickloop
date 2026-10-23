@@ -3630,7 +3630,15 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let mut output = io::stdout().lock();
         if !state.interactive {
-            let text: String = pieces.iter().map(|piece| piece.text()).collect();
+            let text: String = pieces
+                .iter()
+                .map(|piece| match piece {
+                    ConversationPiece::Notice { text, .. } => {
+                        format!("{}\n", super::loop_view_text::ellipsize(text, state.width)).into()
+                    }
+                    piece => piece.text(),
+                })
+                .collect();
             output
                 .write_all(text.as_bytes())
                 .map_err(|error| error.to_string())?;
@@ -5087,6 +5095,11 @@ pub(super) enum ConversationPiece {
     /// A block that leaves an open read or search group open, such as a thinking label.
     Aside(String, Option<Role>),
     Styled(String, Option<Role>),
+    /// An event whose text is clipped to one row at the current conversation width.
+    Notice {
+        text: String,
+        role: Role,
+    },
     /// `⎿` response rows at the end of the conversation, each wrapping under its content.
     Response(Vec<(String, Option<Role>)>),
     /// A block's body rows indented under its heading with no connector, as Claude Code draws
@@ -5163,6 +5176,7 @@ impl ConversationPiece {
             Self::Response(runs) => scrollback.append_response(runs),
             Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
+            Self::Notice { text, role } => scrollback.append_notice(text, *role),
             Self::Input {
                 spans,
                 fill,
@@ -5188,6 +5202,7 @@ impl ConversationPiece {
         match self {
             Self::Block => "\n".into(),
             Self::Aside(text, _) => format!("\n{text}").into(),
+            Self::Notice { text, .. } => format!("{text}\n").into(),
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }

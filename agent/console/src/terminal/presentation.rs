@@ -401,6 +401,10 @@ pub(super) fn transcript_document(
             ConversationBlockKind::WakeupCancelled => {
                 writer.block_text("Pending wakeup cancelled\n", Some(Role::MutedText))
             }
+            ConversationBlockKind::GoalContinuation => writer.block_text(
+                format!("{}\n", tickloop_agent_protocol::GOAL_CONTINUATION_EVENT),
+                Some(Role::MutedText),
+            ),
             ConversationBlockKind::Command { command } => {
                 let dot = match command.state {
                     CommandState::Completed if command.exit_code == Some(0) => Role::Success,
@@ -3402,7 +3406,7 @@ mod tests {
         let run = Uuid::new_v4();
         snapshot.message_runs.insert(0, run);
         assert_eq!(
-            super::super::consumed_input_text(&snapshot, run),
+            super::super::consumed_input_text(&snapshot, run).as_deref(),
             Some(forged.as_str()),
             "live user echo must keep genuine protocol-shaped input too"
         );

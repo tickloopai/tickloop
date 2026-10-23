@@ -1010,6 +1010,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         messages: Vec::new(),
         invoked_skills: Vec::new(),
         message_runs: BTreeMap::new(),
+        trigger_origins: BTreeMap::new(),
         message_contexts: BTreeMap::new(),
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
@@ -4926,6 +4927,7 @@ impl Agent {
             .snapshot
             .clone();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
+        snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(snapshot)
     }

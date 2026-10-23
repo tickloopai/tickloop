@@ -118,6 +118,20 @@ impl Lifecycle {
         self.inputs.get(&id).map(|input| &input.record)
     }
 
+    pub(crate) fn trigger_origins(&self) -> BTreeMap<RunId, TriggerIdentity> {
+        self.inputs
+            .values()
+            .map(|input| &input.record)
+            .filter(|input| input.op == InputOp::Trigger)
+            .filter_map(|input| {
+                input
+                    .trigger
+                    .as_ref()
+                    .map(|trigger| (input.run_id, trigger.identity.clone()))
+            })
+            .collect()
+    }
+
     /// The original receipt of an input the ledger already holds under `input`'s id, or the
     /// refusal of another payload under it; `None` for a new input. A replay depends only on the
     /// ledger, not on the Loops, files or policy it was first checked against.

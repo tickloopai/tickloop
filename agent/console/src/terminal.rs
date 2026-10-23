@@ -4423,8 +4423,8 @@ async fn interact_with_herdr(
                         EventKind::ScheduledTasksChanged { notice: Some(tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled { .. }) } => {
                             outln!(console, "\nPending wakeup cancelled");
                         },
-                        EventKind::GoalUpdated {notice, ..} => {
-                            if let Some(notice) = notice { console.write_roles(&goal_view::notice_runs(&notice))?; }
+                        EventKind::GoalUpdated {goal, notice} => {
+                            if let Some(notice) = notice { console.write_pieces(&goal_view::notice_pieces(&notice, goal.as_ref().map_or("", |goal| goal.objective.as_str())))?; }
                         },
                         EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
@@ -5596,9 +5596,8 @@ fn render_restored_observation(
             if matches!(
                 event.kind,
                 EventKind::Started | EventKind::InputMerged { .. }
-            ) && let Some(input) = consumed_input_text(&observation.snapshot, event.run_id)
-            {
-                console.record_consumed_input(chat, event.run_id, &safe_text(input))?;
+            ) {
+                consume_input_echo_from_snapshot(console, &observation.snapshot, event.run_id)?;
             }
             if matches!(
                 event.kind,
@@ -6357,7 +6356,17 @@ fn input_adopted(id: uuid::Uuid) -> String {
     format!("Input {id} was already accepted; nothing was resent")
 }
 
-fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&str> {
+fn consumed_input_text(
+    snapshot: &ChatSnapshot,
+    input: uuid::Uuid,
+) -> Option<std::borrow::Cow<'_, str>> {
+    let trigger = snapshot.trigger_origins.get(&input);
+    if matches!(
+        trigger,
+        Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
+    ) {
+        return None;
+    }
     snapshot
         .messages
         .iter()
@@ -6381,7 +6390,10 @@ fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&st
                     if presentation::typed_local_message(text, false).is_none()
                         && !conversation::is_interruption_placeholder(message.role, text) =>
                 {
-                    Some(text.as_str())
+                    Some(trigger.map_or_else(
+                        || std::borrow::Cow::Borrowed(text.as_str()),
+                        |trigger| trigger.display_input(text),
+                    ))
                 }
                 _ => None,
             })
@@ -6559,7 +6571,7 @@ async fn track_accepted_echo(
             return console.record_consumed_input(
                 receipt.chat_id,
                 receipt.run_id,
-                &safe_text(input),
+                &safe_text(&input),
             );
         }
     }
@@ -6575,13 +6587,23 @@ async fn show_consumed_input(
     turn_snapshot: &mut TurnSnapshot,
     event: &tickloop_agent_protocol::Event,
 ) -> Result<Option<InputEcho>, String> {
-    if !console.is_interactive() || console.input_is_echoed(event.chat_id, event.run_id)? {
+    if console.input_is_echoed(event.chat_id, event.run_id)? {
         return Ok(None);
     }
-    console.defer_input_echo(event.chat_id, event.run_id)?;
+    if console.is_interactive() {
+        console.defer_input_echo(event.chat_id, event.run_id)?;
+    }
     let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await else {
         return Ok(None);
     };
+    if !console.is_interactive()
+        && !matches!(
+            snapshot.trigger_origins.get(&event.run_id),
+            Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
+        )
+    {
+        return Ok(None);
+    }
     consume_input_echo_from_snapshot(console, &snapshot, event.run_id)
 }
 
@@ -6590,6 +6612,19 @@ fn consume_input_echo_from_snapshot(
     snapshot: &ChatSnapshot,
     input: uuid::Uuid,
 ) -> Result<Option<InputEcho>, String> {
+    if console.input_is_echoed(snapshot.id, input)? {
+        return Ok(None);
+    }
+    if matches!(
+        snapshot.trigger_origins.get(&input),
+        Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
+    ) {
+        let _frame_hold = console.hold_frames()?;
+        console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+        console.write_roles(&goal_view::continuation_runs())?;
+        console.mark_input_echoes(snapshot.id, [input])?;
+        return Ok(None);
+    }
     let deliveries = snapshot
         .messages
         .iter()
@@ -6623,7 +6658,7 @@ fn consume_input_echo_from_snapshot(
             // The input leaves the queue in the frame that shows it sent.
             let _frame_hold = console.hold_frames()?;
             console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
-            console.record_consumed_input(snapshot.id, input, &safe_text(text))
+            console.record_consumed_input(snapshot.id, input, &safe_text(&text))
         }
         None => {
             let mut has_unshown_agent_message = false;

@@ -101,6 +101,7 @@ struct LineStyle {
     markdown: Option<Box<MarkdownBlock>>,
     /// Lines that produce no rows, such as a superseded completion notice.
     hidden: bool,
+    clipped: Option<Role>,
     flash: Option<(super::list_row::RowFlash, u64)>,
     pending_take_in: Option<tick_protocol::InstanceRef>,
 }
@@ -592,6 +593,12 @@ impl Scrollback {
         self.separate_block();
         self.append_as(text, role, None);
         self.open_group = open_group;
+    }
+
+    pub(super) fn append_notice(&mut self, text: &str, role: Role) {
+        self.append_as(text, Some(role), None);
+        self.line_styles.last_mut().unwrap().clipped = Some(role);
+        self.append_as("\n", None, None);
     }
 
     fn separate_block(&mut self) {
@@ -1472,7 +1479,21 @@ impl Scrollback {
                 }
                 continue;
             }
-            if let Some(block) = style.markdown.as_mut() {
+            if let Some(role) = style.clipped {
+                if line == first_line {
+                    self.rows.truncate(first_row);
+                }
+                let text = super::loop_view_text::ellipsize(text, self.width);
+                self.rows.push(Row {
+                    start: Position {
+                        line,
+                        byte: 0,
+                        tab_cell: 0,
+                    },
+                    styled: RoleLine::role(text.clone(), role),
+                    text,
+                });
+            } else if let Some(block) = style.markdown.as_mut() {
                 let existing_rows = if line == first_line {
                     first_line_rows
                 } else {
