@@ -897,13 +897,28 @@ impl Agent {
         match change {
             ReceivingChange::Paused => {
                 // The sources stop with the Loop where the lease is, before it goes back.
-                if let Ok(taken) = self.take_lease(chat_id, &within).await {
-                    let holding = match taken {
-                        LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding) => holding,
-                    };
-                    self.switch_sources(chat_id, holding, change).await;
-                }
+                let refused = match self.take_lease(chat_id, &within).await {
+                    Ok(LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding)) => {
+                        self.switch_sources(chat_id, holding, change).await;
+                        None
+                    }
+                    Err(refused) => Some(refused),
+                };
                 self.inner.chat_leases.release(chat_id);
+                if let Some(refused) = refused
+                    && self.has_trigger_source_states()
+                {
+                    self.inner.chat_leases.set_notice(
+                        chat_id,
+                        LoopTriggerNoticeKind::Warning,
+                        format!(
+                            "this Chat's Trigger sources, such as its goal or scheduled tasks, \
+                             did not stop here: {}; they stop where the lease is held once that \
+                             process learns of the stop",
+                            super::wakeup::SourceChangeError::from(refused)
+                        ),
+                    );
+                }
             }
             ReceivingChange::Resumed => {
                 // The sources resume with the Loop under the lease. One taken for that alone

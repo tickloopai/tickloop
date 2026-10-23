@@ -1953,6 +1953,37 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     here.shutdown().await;
 }
 
+/// A stop where another live process holds the lease cannot stop the sources here, and says
+/// so: they stop there once that process learns of the stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_away_from_the_lease_says_the_sources_did_not_stop_here() {
+    let setup = WaitingInput::new().await;
+    let chat = setup.chat;
+    setup.elsewhere.register_trigger_source_state_for_tests(
+        tickloop_agent_runtime::TestSourceState {
+            on_stop: Some(Box::new(|snapshot| {
+                vec![source_record(snapshot.id, "stopped elsewhere")]
+            })),
+            ..Default::default()
+        },
+    );
+    setup.elsewhere.stop(chat).await.unwrap();
+    let notices = setup.elsewhere.loop_trigger_notices();
+    assert!(
+        notices.iter().any(|notice| notice.chat_id == chat
+            && notice.kind == LoopTriggerNoticeKind::Warning
+            && notice.message.contains("did not stop here")),
+        "{notices:?}"
+    );
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "stopped elsewhere"),
+        0
+    );
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    setup.here.shutdown().await;
+}
+
 /// A Continue lets the sources resume with the Loop under the lease it takes, recorded by the
 /// time the Continue returns; another process learning of the Continue resumes none, and reads
 /// what they recorded as it next takes the lease over.
