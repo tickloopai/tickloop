@@ -6,6 +6,8 @@ mod builtin_catalog;
 mod builtin_skills;
 #[path = "all/goal_settings.rs"]
 mod goal_settings;
+#[path = "all/loop_skill.rs"]
+mod loop_skill;
 #[path = "all/model_configuration.rs"]
 mod model_configuration;
 #[path = "all/monitor_settings.rs"]

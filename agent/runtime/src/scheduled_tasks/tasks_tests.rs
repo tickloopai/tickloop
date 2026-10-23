@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, TimeZone};
+use chrono::{DateTime, TimeZone, Utc};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
     MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
@@ -23,15 +23,17 @@ const AGENT_NEEDING_CONFIRMATION: Creation = Creation {
     needs_confirmation: true,
 };
 
-/// 2026-10-<day> at the given local time in UTC+08:00.
-fn local(day: u32, hour: u32, minute: u32, second: u32) -> DateTime<FixedOffset> {
-    FixedOffset::east_opt(8 * 3600)
+/// Shanghai keeps UTC+08:00 all year.
+const ZONE: chrono_tz::Tz = chrono_tz::Asia::Shanghai;
+
+/// 2026-10-<day> at the given Shanghai time.
+fn local(day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+    ZONE.with_ymd_and_hms(2026, 10, day, hour, minute, second)
         .unwrap()
-        .with_ymd_and_hms(2026, 10, day, hour, minute, second)
-        .unwrap()
+        .with_timezone(&Utc)
 }
 
-fn ms(time: DateTime<FixedOffset>) -> u64 {
+fn ms(time: DateTime<Utc>) -> u64 {
     u64::try_from(time.timestamp_millis()).unwrap()
 }
 
@@ -48,10 +50,10 @@ fn create(
     id: &str,
     cron_task: CronTask,
     creation: Creation,
-    now: DateTime<FixedOffset>,
+    now: DateTime<Utc>,
 ) {
     tasks
-        .create_cron(id.into(), cron_task, "check".into(), creation, &now)
+        .create_cron(id.into(), cron_task, "check".into(), creation, ZONE, &now)
         .unwrap();
 }
 
@@ -117,6 +119,7 @@ fn a_schedule_that_never_runs_is_refused() {
             one_shot("0 0 30 2 *"),
             "never".into(),
             USER,
+            ZONE,
             &local(22, 10, 0, 0),
         )
         .unwrap_err();
@@ -138,7 +141,7 @@ fn a_chat_holds_at_most_fifty_tasks_and_a_new_self_paced_task_replaces_the_old()
         );
     }
     tasks
-        .start_self_paced("aaaaaaaa".into(), "first loop".into(), USER, &now)
+        .start_self_paced("aaaaaaaa".into(), "first loop".into(), USER, ZONE, &now)
         .unwrap();
     assert_eq!(tasks.tasks().len(), MAX_SCHEDULED_TASKS_PER_CHAT);
 
@@ -149,17 +152,18 @@ fn a_chat_holds_at_most_fifty_tasks_and_a_new_self_paced_task_replaces_the_old()
                 recurring("0 * * * *"),
                 "more".into(),
                 USER,
+                ZONE,
                 &now
             )
             .unwrap_err(),
         ScheduledTaskError::TooMany
     );
     tasks
-        .start_self_paced("cccccccc".into(), "second loop".into(), USER, &now)
+        .start_self_paced("cccccccc".into(), "second loop".into(), USER, ZONE, &now)
         .unwrap();
     assert!(tasks.get("aaaaaaaa").is_none());
     let rescheduled = tasks
-        .schedule_wakeup("dddddddd".into(), wakeup(300), USER, &now)
+        .schedule_wakeup("dddddddd".into(), wakeup(300), USER, ZONE, &now)
         .unwrap()
         .task;
     assert_eq!(rescheduled.id, "cccccccc");
@@ -181,13 +185,13 @@ fn a_full_chat_refuses_a_first_self_paced_task() {
     }
     assert_eq!(
         tasks
-            .start_self_paced("aaaaaaaa".into(), "loop".into(), USER, &now)
+            .start_self_paced("aaaaaaaa".into(), "loop".into(), USER, ZONE, &now)
             .unwrap_err(),
         ScheduledTaskError::TooMany
     );
     assert_eq!(
         tasks
-            .schedule_wakeup("aaaaaaaa".into(), wakeup(300), USER, &now)
+            .schedule_wakeup("aaaaaaaa".into(), wakeup(300), USER, ZONE, &now)
             .unwrap_err(),
         ScheduledTaskError::TooMany
     );
@@ -255,6 +259,7 @@ fn a_pending_wakeup_starts_its_delay_when_confirmed() {
             HALF_ID.into(),
             wakeup(600),
             AGENT_NEEDING_CONFIRMATION,
+            ZONE,
             &local(22, 10, 0, 0),
         )
         .unwrap();
@@ -287,6 +292,10 @@ fn a_late_wake_runs_a_recurring_task_once_and_counts_the_skipped_times() {
     assert!(!fired.is_last);
     assert_eq!(fired.task.skipped, 2);
     assert_eq!(fired.task.last_fired_at_ms, Some(ms(local(22, 10, 35, 0))));
+    assert_eq!(
+        fired.task.last_scheduled_for_ms,
+        Some(ms(local(22, 10, 30, 0)))
+    );
     assert!(due.removed.is_empty());
     assert_eq!(
         tasks.get(NO_JITTER_ID).unwrap().next_fire_at_ms,
@@ -383,6 +392,7 @@ fn a_self_paced_turn_without_a_reschedule_gets_one_fallback_then_ends() {
             HALF_ID.into(),
             "watch the deploy".into(),
             USER,
+            ZONE,
             &local(22, 10, 0, 0),
         )
         .unwrap();
@@ -419,7 +429,7 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
     let now = local(22, 10, 0, 0);
     let mut tasks = ScheduledTasks::default();
     tasks
-        .start_self_paced(HALF_ID.into(), "watch".into(), USER, &now)
+        .start_self_paced(HALF_ID.into(), "watch".into(), USER, ZONE, &now)
         .unwrap();
     assert_eq!(
         tasks.self_paced_turn_ended(&now),
@@ -427,7 +437,7 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
     );
 
     let task = tasks
-        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(10), USER, &now)
+        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(10), USER, ZONE, &now)
         .unwrap()
         .task;
     assert_eq!(task.id, HALF_ID);
@@ -446,7 +456,7 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
     );
 
     let task = tasks
-        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(7200), USER, &now)
+        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(7200), USER, ZONE, &now)
         .unwrap()
         .task;
     assert_eq!(task.next_fire_at_ms, Some(ms(local(22, 11, 0, 0))));
@@ -464,7 +474,7 @@ fn stopping_or_esc_deletes_only_the_self_paced_task() {
         now,
     );
     tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(300), USER, &now)
+        .schedule_wakeup(HALF_ID.into(), wakeup(300), USER, ZONE, &now)
         .unwrap();
     assert_eq!(tasks.stop_self_paced().unwrap().id, HALF_ID);
     assert_eq!(ids(tasks.tasks()), [NO_JITTER_ID]);
@@ -475,10 +485,22 @@ fn stopping_or_esc_deletes_only_the_self_paced_task() {
 fn a_self_paced_task_past_its_expiry_runs_once_more_and_ends() {
     let mut tasks = ScheduledTasks::default();
     tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(3600), USER, &local(22, 10, 0, 0))
+        .schedule_wakeup(
+            HALF_ID.into(),
+            wakeup(3600),
+            USER,
+            ZONE,
+            &local(22, 10, 0, 0),
+        )
         .unwrap();
     tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(3600), USER, &local(29, 9, 30, 0))
+        .schedule_wakeup(
+            HALF_ID.into(),
+            wakeup(3600),
+            USER,
+            ZONE,
+            &local(29, 9, 30, 0),
+        )
         .unwrap();
     let due = tasks.take_due(&local(29, 10, 30, 0));
     assert!(due.fired[0].is_last);
@@ -518,7 +540,7 @@ fn resuming_waits_for_the_next_time_after_now_without_catching_up() {
         created,
     );
     tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(600), USER, &created)
+        .schedule_wakeup(HALF_ID.into(), wakeup(600), USER, ZONE, &created)
         .unwrap();
 
     let resumed_at = local(22, 10, 35, 0);
@@ -584,7 +606,7 @@ fn a_history_load_keeps_only_unexpired_recurring_and_upcoming_one_shot_tasks() {
         created,
     );
     tasks
-        .start_self_paced("00000007".into(), "loop".into(), USER, &created)
+        .start_self_paced("00000007".into(), "loop".into(), USER, ZONE, &created)
         .unwrap();
 
     let removed = tasks.after_history_load(&local(22, 11, 0, 0));
@@ -593,20 +615,6 @@ fn a_history_load_keeps_only_unexpired_recurring_and_upcoming_one_shot_tasks() {
         ["00000002", "00000003", "00000005", "00000007"]
     );
     assert_eq!(ids(tasks.tasks()), ["00000001", "00000004", "00000006"]);
-}
-
-#[test]
-fn a_branch_inherits_no_tasks() {
-    let mut tasks = ScheduledTasks::default();
-    create(
-        &mut tasks,
-        NO_JITTER_ID,
-        recurring("*/10 * * * *"),
-        USER,
-        local(22, 10, 0, 0),
-    );
-    assert!(tasks.for_branch().tasks().is_empty());
-    assert_eq!(tasks.tasks().len(), 1);
 }
 
 #[test]
@@ -637,21 +645,6 @@ fn next_wake_is_the_earliest_confirmed_fire_time_while_receiving() {
     );
     assert_eq!(tasks.next_wake_at_ms(true), Some(ms(local(22, 10, 25, 0))));
     assert_eq!(tasks.next_wake_at_ms(false), None);
-}
-
-#[test]
-fn unused_ids_are_eight_hex_characters_not_taken_by_the_chat() {
-    let mut tasks = ScheduledTasks::default();
-    let id = tasks.unused_id();
-    assert_eq!(id.len(), 8);
-    create(
-        &mut tasks,
-        &id,
-        recurring("0 * * * *"),
-        USER,
-        local(22, 10, 0, 0),
-    );
-    assert_ne!(tasks.unused_id(), id);
 }
 
 #[test]
@@ -750,7 +743,7 @@ fn rescheduling_keeps_the_instruction_the_user_started() {
     let now = local(22, 10, 0, 0);
     let mut tasks = ScheduledTasks::default();
     tasks
-        .start_self_paced(HALF_ID.into(), "watch the deploy".into(), USER, &now)
+        .start_self_paced(HALF_ID.into(), "watch the deploy".into(), USER, ZONE, &now)
         .unwrap();
 
     let agent = Creation {
@@ -758,7 +751,7 @@ fn rescheduling_keeps_the_instruction_the_user_started() {
         needs_confirmation: true,
     };
     let rescheduled = tasks
-        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(300), agent, &now)
+        .schedule_wakeup(NO_JITTER_ID.into(), wakeup(300), agent, ZONE, &now)
         .unwrap();
     assert!(rescheduled.ignored_prompt);
     let task = rescheduled.task;
@@ -773,7 +766,7 @@ fn rescheduling_keeps_the_instruction_the_user_started() {
         ..wakeup(600)
     };
     let rescheduled = tasks
-        .schedule_wakeup(NO_JITTER_ID.into(), same_prompt, USER, &now)
+        .schedule_wakeup(NO_JITTER_ID.into(), same_prompt, USER, ZONE, &now)
         .unwrap();
     assert!(!rescheduled.ignored_prompt);
 }
@@ -782,7 +775,13 @@ fn rescheduling_keeps_the_instruction_the_user_started() {
 fn a_new_wakeup_takes_its_own_instruction() {
     let mut tasks = ScheduledTasks::default();
     let created = tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(300), USER, &local(22, 10, 0, 0))
+        .schedule_wakeup(
+            HALF_ID.into(),
+            wakeup(300),
+            USER,
+            ZONE,
+            &local(22, 10, 0, 0),
+        )
         .unwrap();
     assert!(!created.ignored_prompt);
     assert_eq!(created.task.prompt, "check the build");
@@ -831,6 +830,7 @@ fn rescheduling_a_pending_self_paced_task_keeps_it_pending_with_its_instruction(
             HALF_ID.into(),
             wakeup(600),
             AGENT_NEEDING_CONFIRMATION,
+            ZONE,
             &local(22, 10, 0, 0),
         )
         .unwrap();
@@ -843,6 +843,7 @@ fn rescheduling_a_pending_self_paced_task_keeps_it_pending_with_its_instruction(
             NO_JITTER_ID.into(),
             other_prompt,
             AGENT_NEEDING_CONFIRMATION,
+            ZONE,
             &local(22, 10, 5, 0),
         )
         .unwrap();
@@ -871,6 +872,7 @@ fn tasks_follow_the_local_clock_through_a_fall_back_overlap() {
             .with_ymd_and_hms(2026, 11, day, hour, minute, 0)
             .earliest()
             .unwrap()
+            .with_timezone(&Utc)
     };
     let utc_ms = |day: u32, hour: u32, minute: u32| {
         u64::try_from(
@@ -888,16 +890,14 @@ fn tasks_follow_the_local_clock_through_a_fall_back_overlap() {
             recurring("30 1,3 * * *"),
             "check".into(),
             USER,
+            New_York,
             &new_york(1, 0, 0),
         )
         .unwrap();
     // 01:30 EDT is 05:30 UTC; the repeated 01:30 EST (06:30 UTC) does not run again.
     let first = tasks.take_due(&new_york(1, 1, 30));
     assert_eq!(first.fired[0].scheduled_for_ms, utc_ms(1, 5, 30));
-    let second_pass = chrono::Utc
-        .with_ymd_and_hms(2026, 11, 1, 6, 30, 0)
-        .unwrap()
-        .with_timezone(&New_York);
+    let second_pass = Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap();
     assert!(tasks.take_due(&second_pass).fired.is_empty());
     assert_eq!(
         tasks.get(NO_JITTER_ID).unwrap().next_fire_at_ms,
@@ -920,14 +920,15 @@ fn extreme_times_do_not_overflow() {
                 recurring("* * * * *"),
                 "check".into(),
                 USER,
-                &latest,
+                ZONE,
+                &latest
             )
             .unwrap_err(),
         ScheduledTaskError::NeverRuns("* * * * *".into())
     );
 
     let wakeup_at_end = tasks
-        .schedule_wakeup(HALF_ID.into(), wakeup(3600), USER, &latest)
+        .schedule_wakeup(HALF_ID.into(), wakeup(3600), USER, ZONE, &latest)
         .unwrap()
         .task
         .clone();
@@ -946,6 +947,7 @@ fn extreme_times_do_not_overflow() {
                 recurring("0 * * * *"),
                 "check".into(),
                 USER,
+                ZONE,
                 &local(22, 10, 0, 0),
             )
             .unwrap()

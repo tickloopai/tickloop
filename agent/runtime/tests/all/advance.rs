@@ -1600,3 +1600,36 @@ async fn a_continued_answer_reusing_a_call_id_of_its_lost_attempt_fails_and_the_
     next.shutdown().await;
     first.shutdown().await;
 }
+
+/// Choosing another stored branch changes the conversation alone: the Chat's scheduled tasks
+/// stay as they are, as with a rewind.
+#[tokio::test]
+async fn a_branch_switch_keeps_the_chats_scheduled_tasks() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::replies(&["answer one", "answer two", "answer three", "answer four"]);
+    let agent = agent(store.clone(), model.clone());
+    let branches = branches(&agent, fixture.folder.clone()).await;
+    let task = agent
+        .schedule_task(
+            branches.chat,
+            "*/10 * * * *",
+            "check the build".into(),
+            true,
+        )
+        .await
+        .unwrap();
+    complete(
+        &agent,
+        branches.chat,
+        after(branches.answer_two, "prompt four"),
+    )
+    .await;
+    let request = model.last_request();
+    assert!(request.contains("answer two") && !request.contains("prompt three"));
+    assert_eq!(
+        agent.snapshot(branches.chat).await.unwrap().scheduled_tasks,
+        [task]
+    );
+    agent.shutdown().await;
+}

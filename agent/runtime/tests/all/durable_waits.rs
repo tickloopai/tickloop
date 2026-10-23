@@ -140,6 +140,7 @@ async fn asked_and_released(
                 kind: PersonWaitKind::Question,
             }],
             deliveries: Vec::new(),
+            next_wake_at_ms: None,
         })
     );
     asking.shutdown().await;

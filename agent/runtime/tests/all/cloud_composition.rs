@@ -214,6 +214,17 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
                 "ArtifactComment",
                 json!({"action": "reply", "artifact_id": "doc", "thread_id": "thread-1", "text": "Friday"}),
             ),
+            (
+                "schedule",
+                "CronCreate",
+                json!({"cron": "7 9 * * *", "prompt": "Check the delivery page."}),
+            ),
+            ("schedules", "CronList", json!({})),
+            (
+                "wakeup",
+                "ScheduleWakeup",
+                json!({"delaySeconds": 1200, "reason": "waiting for the delivery", "prompt": "Check the delivery page."}),
+            ),
             ("ask", "AskUserQuestion", single_question("Which format?")),
         ];
         for (id, name, input) in steps {
@@ -224,6 +235,10 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
         text("All tools used.")
     }))
 }
+
+/// The scheduled task tool a cloud Chat offers but reviews: nothing else checks a deletion,
+/// while a task the Agent creates waits for the user's confirmation.
+const REVIEWED_SCHEDULED_TASK_TOOLS: [&str; 1] = ["CronDelete"];
 
 /// Records whether any call was reviewed or put to a person.
 fn watch_admissions(agent: &Agent) -> Arc<Mutex<Vec<String>>> {
@@ -269,7 +284,9 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
 
 /// Every tool a cloud Chat offers its model is admitted without review or a prompt: WebFetch of
 /// a URL the user gave and the Subagent call by the host's rules, and the writes to an Artifact
-/// the user shared with the Chat by that Artifact's provenance. Nothing is denied.
+/// the user shared with the Chat by that Artifact's provenance. Nothing is denied. Deleting a
+/// scheduled task is the exception: it is reviewed, see
+/// `deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition`.
 #[tokio::test]
 async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
     let service = ArtifactService::start().await;
@@ -342,6 +359,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .tools
         .iter()
         .map(|tool| tool.name.clone())
+        .filter(|name| !REVIEWED_SCHEDULED_TASK_TOOLS.contains(&name.as_str()))
         .collect::<BTreeSet<_>>();
     let snapshot = agent.snapshot(root).await.unwrap();
     let called = snapshot
@@ -1308,6 +1326,69 @@ async fn a_create_cannot_carry_an_artifact_without_provenance() {
         service.tool_calls().len(),
         1,
         "only the plain create was sent"
+    );
+    agent.shutdown().await;
+}
+
+/// The host's rules let CronCreate through, since the Agent's task waits for the user to confirm
+/// it, but not CronDelete: with no reviewer and no person in a cloud Chat, the deletion is
+/// refused and the task stays.
+#[tokio::test]
+async fn deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition() {
+    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+        call(
+            "schedule",
+            "CronCreate",
+            json!({"cron": "7 9 * * *", "prompt": "Check the delivery page."}),
+        ),
+        text("Scheduled."),
+    ]));
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let agent = cloud_harness(
+        store,
+        model.clone(),
+        cloud_options(durable_chat_host_rules()),
+    );
+    let admissions = watch_admissions(&agent);
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let request = prompt("Check the delivery every morning.");
+    agent.advance(root, request.clone()).await.unwrap();
+    tokio::time::timeout(WAIT, agent.settled_input(root, request.input_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let task = agent
+        .snapshot(root)
+        .await
+        .unwrap()
+        .scheduled_tasks
+        .remove(0);
+    assert!(
+        admissions.lock().unwrap().is_empty(),
+        "CronCreate is the host's"
+    );
+
+    model.enqueue(call("unschedule", "CronDelete", json!({"id": task.id})));
+    model.enqueue(text("Done."));
+    let request = prompt("Stop checking.");
+    agent.advance(root, request.clone()).await.unwrap();
+    tokio::time::timeout(WAIT, agent.settled_input(root, request.input_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        admissions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| seen.starts_with("assessed")),
+        "CronDelete went to review: {:?}",
+        admissions.lock().unwrap()
+    );
+    assert_eq!(
+        agent.snapshot(root).await.unwrap().scheduled_tasks,
+        [task],
+        "the refused deletion left the task"
     );
     agent.shutdown().await;
 }

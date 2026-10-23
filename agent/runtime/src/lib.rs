@@ -43,10 +43,6 @@ pub mod mcp_tools;
 mod model_request;
 mod persistence;
 mod remote_skills;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "ticket 08 wires scheduled tasks")
-)]
 mod scheduled_tasks;
 pub mod tick_adapter;
 pub mod tick_stream;
@@ -412,6 +408,11 @@ struct Inner {
     /// Tests that hand goal continuations over themselves keep the host from starting them.
     #[cfg(any(test, feature = "test-support"))]
     goal_continuations_held: AtomicBool,
+    /// The zone scheduled tasks read cron expressions in, and their clock.
+    schedule_clock: scheduled_tasks::ScheduleClock,
+    /// Wakes a Worker's scheduled task timer when a Chat's tasks changed.
+    scheduled_wake: Arc<Notify>,
+    scheduled_timer_started: AtomicBool,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
     /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
@@ -492,6 +493,9 @@ struct Chat {
     feedback_watcher: Option<CancellationToken>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     feedback_cleanup_started: bool,
+    /// What the user's `/loop` of each turn schedules, as the host read it: the one task the
+    /// Agent may create for the user in that turn.
+    user_loops: HashMap<RunId, tickloop_agent_config::loop_skill::LoopSchedule>,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
     deferred_messages: Vec<Message>,
     /// 由用户中断或停止而取消的 Run；只有这些 Run 保留部分回复并写中断标记。
@@ -550,6 +554,10 @@ struct SubmissionOptions {
     /// The source's own change for the delivery, made as it is accepted.
     trigger_commit: Option<wakeup::SourceCommit>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
+    /// What the user's `/loop` schedules, when the input is one.
+    user_loop: Option<tickloop_agent_config::loop_skill::LoopSchedule>,
+    /// The Run the input is answered by, when its caller chose it ahead.
+    run_id: Option<RunId>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
@@ -987,6 +995,8 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         delegation: None,
         family_completions: Vec::new(),
         task_boards: BTreeMap::new(),
+        scheduled_tasks: Vec::new(),
+        scheduled_task_revocations: Vec::new(),
         task_board: None,
         goal: None,
         family_inputs: BTreeMap::new(),
@@ -1738,7 +1748,8 @@ impl Agent {
         Ok(stopped.operations)
     }
 
-    /// Esc: interrupts the current turn and pauses an active goal.
+    /// Esc: interrupts the current turn, pauses an active goal, and cancels the self-paced
+    /// loop's pending wake-up under the Chat's lease.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let operations = {
             let mut chats = self.inner.chats.lock().await;
@@ -1747,6 +1758,7 @@ impl Agent {
         };
         self.pause_goal(chat_id, goal::state::GoalEvent::Interrupted)
             .await;
+        self.cancel_self_paced_wakeup_on_esc(chat_id).await;
         Ok(operations)
     }
 
@@ -1895,6 +1907,7 @@ impl Agent {
             system_prompt_addition,
             citation_style,
             request_gates,
+            time_zone,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
@@ -1973,6 +1986,12 @@ impl Agent {
                 tick_wake: Notify::new(),
                 #[cfg(any(test, feature = "test-support"))]
                 goal_continuations_held: AtomicBool::new(false),
+                schedule_clock: scheduled_tasks::ScheduleClock::new(
+                    scheduled_tasks::resolve_zone(time_zone.as_deref())
+                        .unwrap_or(chrono_tz::Tz::UTC),
+                ),
+                scheduled_wake: Arc::new(Notify::new()),
+                scheduled_timer_started: AtomicBool::new(false),
                 session_permissions: Mutex::new(
                     session_permissions::SessionPermissionContext::default(),
                 ),
@@ -1982,6 +2001,7 @@ impl Agent {
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
         agent.register_trigger_source_state(Arc::new(goal::GoalSourceState));
+        agent.register_trigger_source_state(Arc::new(scheduled_tasks::ScheduledTasksState));
         agent
     }
 
@@ -2219,6 +2239,7 @@ impl Agent {
                 feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
+                user_loops: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -2309,18 +2330,41 @@ impl Agent {
         } else {
             format!("/{} {}", invoked.name, skill.arguments.trim())
         };
-        self.submit_internal(
-            chat_id,
-            input,
-            SubmissionOptions {
-                invoked_skill: Some(invoked),
-                host_context,
-                ledger: Some(ledger),
-                turn,
-                ..Default::default()
-            },
-        )
-        .await
+        // The host's reading of the user's /loop: the one task the turn creates for the user.
+        let user_loop = (invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
+            && invoked.name == tickloop_agent_config::skills::LOOP_SKILL_NAME)
+            .then(|| tickloop_agent_config::loop_skill::LoopSchedule::of(&skill.arguments).ok())
+            .flatten();
+        // The self-paced task names the turn it starts before the turn is submitted.
+        let run_id = Uuid::new_v4();
+        let started_loop = match &user_loop {
+            Some(tickloop_agent_config::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
+                self.start_users_self_paced_loop(chat_id, prompt.clone(), run_id)
+                    .await?
+            }
+            Some(tickloop_agent_config::loop_skill::LoopSchedule::Cron { .. }) | None => None,
+        };
+        let submitted = self
+            .submit_internal(
+                chat_id,
+                input,
+                SubmissionOptions {
+                    invoked_skill: Some(invoked),
+                    user_loop,
+                    run_id: started_loop.is_some().then_some(run_id),
+                    host_context,
+                    ledger: Some(ledger),
+                    turn,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Some(task_id) = started_loop
+            && submitted.is_err()
+        {
+            let _ = self.delete_scheduled_task(chat_id, &task_id).await;
+        }
+        submitted
     }
 
     pub async fn skill_warnings(&self, chat_id: ChatId) -> Result<Vec<String>, AgentError> {
@@ -2553,6 +2597,8 @@ impl Agent {
             trigger_lease,
             trigger_commit,
             invoked_skill,
+            user_loop,
+            run_id: chosen_run_id,
             host_context,
             agent_message,
             directed_human,
@@ -2654,12 +2700,17 @@ impl Agent {
             .and_then(|source| event_sources::feedback_identity(chat_id, loop_id, source));
         let run_id = feedback_input
             .as_ref()
-            .map_or_else(Uuid::new_v4, |feedback| feedback.delivery_id);
+            .map(|feedback| feedback.delivery_id)
+            .or(chosen_run_id)
+            .unwrap_or_else(Uuid::new_v4);
         let receipt = Receipt {
             chat_id,
             loop_id,
             run_id,
         };
+        if let Some(user_loop) = user_loop {
+            chat.user_loops.insert(run_id, user_loop);
+        }
         if let Some(mut invoked_skill) = invoked_skill {
             if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
                 && chat.skills.is_user_only(&invoked_skill.name)
@@ -3114,6 +3165,7 @@ impl Agent {
                 id.is_empty()
                     || (!available_tools.contains(name)
                         && !shared_tasks::is_task_tool(name)
+                        && !scheduled_tasks::tools::is_scheduled_task_tool(name)
                         && name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
                     || !input.is_object()
                     || !used_calls.insert(id.clone())
@@ -3538,6 +3590,7 @@ impl Agent {
                 EventKind::Failed(error)
             }
         };
+        let has_self_paced_task = self.end_self_paced_turn(chat, receipt.run_id);
         let is_closed = self.inner.closed.load(Ordering::SeqCst);
         let (ending, usage) = match &event {
             EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),
@@ -3597,6 +3650,10 @@ impl Agent {
         drop(chats);
         if let Some(events) = goal_turn {
             self.end_goal_turn(receipt.chat_id, events).await;
+        }
+        if has_self_paced_task {
+            self.fall_back_after_turn(receipt.chat_id, receipt.run_id)
+                .await;
         }
         if is_settled {
             self.settle_task_claims(&receipt).await;

@@ -11,6 +11,7 @@
 //! 失效是需要用户知道的）。
 
 mod auto_policy;
+pub mod loop_skill;
 pub mod new_chat;
 pub mod skills;
 #[cfg(test)]

@@ -314,6 +314,7 @@ async fn a_foreground_child_answered_hours_later_in_another_holding_goes_on_as_i
                 kind: PersonWaitKind::Question,
             }],
             deliveries: Vec::new(),
+            next_wake_at_ms: None,
         })
     );
     assert_eq!(cloud.chats.waiting(cloud.chat), asked.waiting);

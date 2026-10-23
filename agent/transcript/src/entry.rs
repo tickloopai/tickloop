@@ -28,6 +28,8 @@ pub enum Line {
     Goal(GoalEntry),
     /// A goal change the conversation shows as one line; every one is kept.
     GoalEvent(GoalEventEntry),
+    /// The root Chat's scheduled tasks; the latest record wins.
+    ScheduledTasks(ScheduledTasksEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
     FamilyMessageHold(FamilyMessageHoldEntry),
@@ -141,6 +143,7 @@ pub enum MetadataKind {
     TaskBoards,
     Goal,
     GoalEvent,
+    ScheduledTasks,
     FamilyCompletions,
     FileHistorySnapshot,
     ContentReplacement,
@@ -171,7 +174,7 @@ impl MetadataKind {
             | Self::CitationSources
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
-            Self::Goal => Retention::SourceState,
+            Self::Goal | Self::ScheduledTasks => Retention::SourceState,
             Self::Response | Self::Input | Self::Wait => Retention::LatestById,
             Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
                 Retention::Accumulating
@@ -235,6 +238,7 @@ impl Line {
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
             Self::Goal(_) => MetadataKind::Goal,
             Self::GoalEvent(_) => MetadataKind::GoalEvent,
+            Self::ScheduledTasks(_) => MetadataKind::ScheduledTasks,
             Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
             Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
             Self::FamilyMessageHold(_) => MetadataKind::FamilyMessageHold,
@@ -607,6 +611,17 @@ impl MonitorMembersEntry {
     pub fn materializes_chat(&self) -> bool {
         self.cwd.is_some() && !self.monitor.is_empty()
     }
+}
+
+/// The latest scheduled tasks of one Chat: every creation, run and deletion rewrites the whole
+/// list.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTasksEntry {
+    pub chat_id: Uuid,
+    pub tasks: Vec<tickloop_agent_protocol::ScheduledTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<tickloop_agent_protocol::ScheduledTaskRevocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

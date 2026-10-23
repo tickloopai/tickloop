@@ -49,6 +49,7 @@ enum ToolRoute {
     AgentMessage,
     SharedTask,
     Goal,
+    ScheduledTask,
     Handback,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
@@ -149,6 +150,10 @@ const UNOFFERED_WEB_SEARCH_MESSAGE: &str =
 /// The result of a Task tool call in a Chat whose host does not offer Task tools.
 const UNOFFERED_TASK_TOOLS_MESSAGE: &str = "Task tools are not available in this Chat; this call was not executed. Continue with the available tools.";
 
+/// The result of a scheduled task tool call in a Chat that does not offer them, such as a
+/// Subagent's.
+const UNOFFERED_SCHEDULED_TASK_TOOLS_MESSAGE: &str = "Scheduled task tools are not available in this Chat; only the root Agent schedules tasks. This call was not executed.";
+
 /// Host tools that need the Chat's Folder: they show its Ticks or send its local files.
 const FOLDER_HOST_TOOLS: [&str; 6] = [
     crate::tick_tools::READ_WORKSPACE,
@@ -247,6 +252,16 @@ impl ToolRegistry {
                     .map(|definition| RegisteredTool {
                         definition,
                         route: ToolRoute::Goal,
+                    }),
+            );
+        }
+        if policy.scheduled_tasks && !is_delegated {
+            tools.extend(
+                crate::scheduled_tasks::tools::definitions()
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::ScheduledTask,
                     }),
             );
         }
@@ -393,6 +408,7 @@ impl ToolRegistry {
             }
             ToolRoute::McpResource(_) => true,
             ToolRoute::SharedTask => matches!(name, "TaskGet" | "TaskList"),
+            ToolRoute::ScheduledTask => crate::scheduled_tasks::tools::is_concurrency_safe(name),
             _ => false,
         }
     }
@@ -655,6 +671,7 @@ impl Agent {
         match &registered.route {
             ToolRoute::SharedTask => self.shared_task_tool(receipt, operation, &cancel).await,
             ToolRoute::Goal => self.goal_tool(receipt, operation, cancel).await,
+            ToolRoute::ScheduledTask => self.scheduled_task_tool(receipt, operation).await,
             ToolRoute::AgentMessage => {
                 self.agent_message_tool(
                     receipt,
@@ -908,6 +925,11 @@ impl Agent {
                 .into(),
             ));
         }
+        if registration.is_none() && crate::scheduled_tasks::tools::is_scheduled_task_tool(&name) {
+            return Ok(ToolCallOutcome::not_admitted(
+                UNOFFERED_SCHEDULED_TASK_TOOLS_MESSAGE.into(),
+            ));
+        }
         self.refresh_task_binding_setting(receipt)
             .await
             .map_err(|error| ToolCallError::from(error.to_string()))?;
@@ -1146,6 +1168,9 @@ impl Agent {
                         && name != crate::goal::tools::CREATE_GOAL_TOOL_NAME
                 {
                     return Some(crate::host_tools::HostToolPermission::ReadOnly);
+                }
+                if matches!(route, ToolRoute::ScheduledTask) {
+                    return Some(crate::scheduled_tasks::tools::permission(&name));
                 }
                 (matches!(route, ToolRoute::Delegation)
                     || matches!(route, ToolRoute::AgentMessage)
@@ -2543,6 +2568,7 @@ mod tests {
             .chain(delegation::definitions())
             .chain(agent_messages::definitions())
             .chain([crate::handback::definition()])
+            .chain(crate::scheduled_tasks::tools::definitions())
             .chain(tick_subscriptions::definitions())
             .chain(skills.tool_definition())
             .chain(crate::mcp_resources::definitions())
@@ -2576,6 +2602,8 @@ mod tests {
             "TickManage",
             "ArtifactLogin",
             "ArtifactUpload",
+            "CronCreate",
+            "ScheduleWakeup",
         ] {
             assert!(
                 definitions.iter().any(|definition| definition.name == name),

@@ -2171,6 +2171,25 @@ fn recover_transcript(
             .as_ref()
             .filter(|entry| entry.chat_id == chat_id)
             .and_then(|entry| entry.goal.clone());
+        let scheduled = loaded
+            .scheduled_tasks
+            .as_ref()
+            .filter(|entry| entry.chat_id == chat_id);
+        snapshot.scheduled_tasks = scheduled
+            .map(|entry| entry.tasks.clone())
+            .unwrap_or_default();
+        snapshot.scheduled_task_revocations = scheduled
+            .map(|entry| entry.revoked.clone())
+            .unwrap_or_default();
+        // A Worker loading the Chat from its history keeps only the recurring tasks still
+        // running and the one-shot tasks still ahead; a durable host's load is how it runs the
+        // Chat, so it keeps them all.
+        if waits == WaitHosting::Process {
+            super::scheduled_tasks::after_history_load(
+                &mut snapshot,
+                std::time::SystemTime::now().into(),
+            );
+        }
         snapshot.task_boards = loaded
             .metadata
             .task_boards
@@ -3216,6 +3235,7 @@ impl Agent {
         for (id, loaded) in pending.into_iter().rev() {
             // Boxed: restoring a Chat is a large future, and resuming awaits it in a loop.
             Box::pin(self.insert_restored_chat(id, loaded, RestoreTarget::Resume, None)).await?;
+            self.record_scheduled_tasks_after_history_load(id).await;
         }
         super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
             .map_err(AgentError::Invalid)?;
@@ -3592,6 +3612,7 @@ impl Agent {
                 feedback_watcher: None,
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
+                user_loops: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -3686,6 +3707,9 @@ impl StagedBranch {
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();
         snapshot.pending_commands = previous.pending_commands.clone();
+        // Choosing another stored branch changes the conversation alone, as a rewind does.
+        snapshot.scheduled_tasks = previous.scheduled_tasks.clone();
+        snapshot.scheduled_task_revocations = previous.scheduled_task_revocations.clone();
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }

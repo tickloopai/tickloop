@@ -400,10 +400,19 @@ pub(crate) async fn subscribed_process(
 }
 
 /// The stand-in scheduled run `n` of task `task`, delivered as a source with no producer yet.
+/// Runs are timed from when the tests began, as a real run is near its time, so a process that
+/// keeps the wall clock does not take one for a run long past.
 pub(crate) fn scheduled(task: &str, n: u64) -> tickloop_agent_protocol::TriggerSource {
+    static TESTS_BEGAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let began = *TESTS_BEGAN_MS.get_or_init(|| {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        u64::try_from(since_epoch.as_millis()).unwrap()
+    });
     tickloop_agent_protocol::TriggerSource::ScheduledTask {
         task_id: task.into(),
-        scheduled_for_ms: n,
+        scheduled_for_ms: began + n,
     }
 }
 

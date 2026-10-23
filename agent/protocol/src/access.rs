@@ -61,8 +61,10 @@ use crate::{
 /// 28.0 puts every Trigger on one wake-up base: the Loop carries its receiving switch, with why
 /// it paused, and its Tick Subscriptions; a delivery names its source by type; the explicit
 /// Trigger commands are gone.
-/// 28.1 adds the Chat's goal: its snapshot on the Chat, `ManageGoal`, goal updates and the
-/// completion check's requests.
+/// 28.1 adds the Chat's goal and scheduled tasks: the Chat snapshot carries both, with
+/// `ManageGoal`, goal updates and the completion check's requests for the goal, and Loop
+/// actions that delete a scheduled task or answer a pending one, with an event announcing
+/// their changes.
 pub const PROTOCOL_MAJOR: u16 = 28;
 pub const PROTOCOL_MINOR: u16 = 1;
 
@@ -545,6 +547,16 @@ pub enum LoopAction {
     },
     RetryDeniedOperation {
         record_id: Uuid,
+    },
+    /// Cancels one of the Chat's scheduled tasks, as from its Monitor row.
+    DeleteScheduledTask {
+        task_id: String,
+    },
+    /// The user's answer to a scheduled task the Agent created on a host without permission
+    /// requests: confirming starts its timing, rejecting deletes it.
+    DecideScheduledTask {
+        task_id: String,
+        decision: crate::ScheduledTaskDecision,
     },
 }
 

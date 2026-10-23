@@ -6,15 +6,15 @@
 //! node they copy. Internal entries (Loop records, compaction markers, host notes, protocol
 //! data) are folded away: a prompt hangs under the display node its physical parent belongs to,
 //! and an answer under its Run's prompt or the parent its lifecycle record names. Loops and
-//! task boards have separate projections, without adding conversation nodes.
+//! task boards and scheduled tasks have separate projections, without adding conversation nodes.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
     AgentColor, AgentMessageSource, Authority, Content, GoalSnapshot, ImageContext, InputContext,
-    LocalMessage, LoopState, Protocol, Question, Receiving, Role, SharedTask, SubagentRegistration,
-    TaskBoard, TickSubscription, TriggerIdentity,
+    LocalMessage, LoopState, Protocol, Question, Receiving, Role, ScheduledTask, SharedTask,
+    SubagentRegistration, TaskBoard, TickSubscription, TriggerIdentity,
 };
 use uuid::Uuid;
 
@@ -248,6 +248,17 @@ pub fn task_boards(lines: &[Line], enabled: bool) -> Vec<DisplayTaskBoard> {
             tasks: board.tasks,
         })
         .collect()
+}
+
+/// The Chat's scheduled tasks as its latest record keeps them.
+pub fn scheduled_tasks(lines: &[Line]) -> Vec<ScheduledTask> {
+    let mut tasks = Vec::new();
+    visit_lines(lines, &mut |line| {
+        if let Line::ScheduledTasks(entry) = line {
+            tasks = entry.tasks.clone();
+        }
+    });
+    tasks
 }
 
 /// One Trigger delivery as the ledger last recorded it: its source, how many source events it

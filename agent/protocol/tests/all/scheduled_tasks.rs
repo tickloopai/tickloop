@@ -9,6 +9,7 @@ fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>
         kind,
         prompt: "check the deploy".into(),
         creator: ScheduledTaskCreator::User,
+        time_zone: "Asia/Shanghai".into(),
         confirmation,
         created_at_ms: 1_000,
         expires_at_ms: Some(605_801_000),
@@ -16,6 +17,8 @@ fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>
         next_fire_at_ms: Some(286_000),
         jitter_ms: -15_000,
         last_fired_at_ms: None,
+        last_scheduled_for_ms: None,
+        started_by_run: None,
         skipped: 0,
     }
 }

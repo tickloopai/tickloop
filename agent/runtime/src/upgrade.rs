@@ -360,6 +360,7 @@ impl Agent {
                     feedback_watcher: None,
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
+                    user_loops: HashMap::new(),
                     deferred_messages: saved.deferred_messages.clone(),
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,
@@ -482,6 +483,8 @@ impl Agent {
         }
         self.tick_deliveries().activate_upgrade();
         self.inner.tick_wake.notify_one();
+        // The Worker keeps time for the Chats it took over, idle ones included.
+        self.rearm_scheduled_timer();
         Ok(())
     }
 

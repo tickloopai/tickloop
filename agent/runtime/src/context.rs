@@ -878,6 +878,7 @@ mod tests {
                 citation_style: Default::default(),
                 system_prompt_addition: None,
                 request_gates: Vec::new(),
+                time_zone: None,
             },
         )
         .unwrap();

@@ -958,3 +958,41 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
     }).await.expect("the original Agent must answer the new input after rejecting its upgrade");
     original.shutdown().await;
 }
+
+/// An idle Chat with a task ahead: once the successor takes over, its timer runs the task when
+/// it comes due, with no new input.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_successor_keeps_time_for_an_idle_chats_scheduled_task() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![text("ready")])));
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    complete(&original, chat, "set up").await;
+    let task = original
+        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .await
+        .unwrap();
+    let checkpoint = prepare(&original).await;
+    let successor_model = Arc::new(ScriptedModel::new(vec![text("checked")]));
+    let successor = Agent::new_embedded(config(), successor_model.clone());
+    successor.restore_upgrade(checkpoint).await.unwrap();
+    successor.activate_upgrade().await.unwrap();
+    original.shutdown_for_upgrade().await;
+    let fire_at = i64::try_from(task.next_fire_at_ms.unwrap()).unwrap();
+    successor
+        .set_scheduled_now_for_tests(chrono::DateTime::from_timestamp_millis(fire_at).unwrap());
+    successor.release_upgrade().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !successor_model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| format!("{:?}", request.messages.last()).contains("check the build"))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the task ran without new input");
+    successor.shutdown().await;
+}

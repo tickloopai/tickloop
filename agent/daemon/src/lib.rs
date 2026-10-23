@@ -759,6 +759,7 @@ pub async fn build_runtime_with_models(
             citation_style: Default::default(),
             system_prompt_addition: None,
             request_gates: Vec::new(),
+            time_zone: None,
         },
     )
     .map_err(|error| error.to_string())?;

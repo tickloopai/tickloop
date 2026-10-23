@@ -168,7 +168,7 @@ pub use provider_connection::{ConnectionRegion, ModelDiscovery, ProductKind, Pro
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
 pub use scheduled_tasks::{
     MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
-    ScheduledTaskDecision, ScheduledTaskKind,
+    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation,
 };
 pub use shell_tasks::{
     FINISHED_SHELL_DISPLAY_MS, SHELL_TASK_OUTPUT_MAX_BYTES, SHELL_TASK_PROMPT_QUIET_PERIOD,

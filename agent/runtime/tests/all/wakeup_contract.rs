@@ -4,10 +4,10 @@
 //! every source.
 //!
 //! Tick Subscriptions run where Tick streams run, in a process that keeps its own waits.
-//! Artifact feedback runs there too, and on a durable host that pushes each request. Goal
-//! continuations run for a Chat's real goal, handed over by the test instead of at each turn's
-//! end. Scheduled tasks have no producer yet: a stand-in hands their deliveries to the same entry
-//! until 08 replaces it with the real source.
+//! Artifact feedback runs there too, and on a durable host that pushes each request. Scheduled
+//! tasks run where a stateless host wakes the Chat at the time the Harness reported, a task of
+//! its own per delivery, and in such a process too, the runs of one task. Goal continuations run
+//! for a Chat's real goal, handed over by the test instead of at each turn's end.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -461,7 +461,8 @@ macro_rules! contract {
 contract!(tick_subscription, TickSource);
 contract!(artifact_feedback_local, LocalFeedbackSource);
 contract!(artifact_feedback_durable, DurableFeedbackSource);
-contract!(scheduled_task_stand_in, ScheduledStandIn);
+contract!(scheduled_task, ScheduledSource);
+contract!(scheduled_task_one_key, OneTaskSource);
 contract!(goal_continuation, GoalSource);
 
 /// The receipts each hand-over of a delivery got, for sources that hand over synchronously.
@@ -975,118 +976,6 @@ impl Source for DurableFeedbackSource {
     }
 }
 
-/// A stand-in for a source with no producer yet, handing its deliveries to the same entry.
-struct StandIn {
-    process: ProcessChat,
-    source: fn(u64) -> TriggerSource,
-    hand_overs: HandOvers,
-}
-
-impl StandIn {
-    async fn new(model: Arc<ContractModel>, source: fn(u64) -> TriggerSource) -> Self {
-        Self {
-            process: ProcessChat::new(model).await,
-            source,
-            hand_overs: HandOvers::default(),
-        }
-    }
-
-    async fn deliver(&self, n: u64, marker: &str) {
-        let outcome = self
-            .process
-            .agent
-            .deliver_trigger_for_tests(self.process.chat, (self.source)(n), marker)
-            .await;
-        self.hand_overs
-            .record(n, outcome.map_err(|error| error.to_string()));
-    }
-
-    async fn end(&self) {
-        let kind = (self.source)(0).kind();
-        self.process
-            .agent
-            .withdraw_trigger_for_tests(self.process.chat, |queued| queued.kind() == kind)
-            .await;
-    }
-
-    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
-        let image = self.process.crashed().await;
-        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
-        Self {
-            process: self
-                .process
-                .resumed(image, model, async |_: &Agent| {})
-                .await,
-            source: self.source,
-            hand_overs,
-        }
-    }
-
-    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
-        Self {
-            process: self
-                .process
-                .resumed(self.process.root.clone(), model, async |_: &Agent| {})
-                .await,
-            source: self.source,
-            hand_overs: HandOvers::default(),
-        }
-    }
-}
-
-fn scheduled_run(n: u64) -> TriggerSource {
-    scheduled("contract", n)
-}
-
-/// Scheduled runs of one task: one waits at a time, and Plan mode takes them.
-struct ScheduledStandIn(StandIn);
-
-macro_rules! stand_in {
-    ($name:ident, $source:expr, $under_plan:expr) => {
-        #[async_trait]
-        impl Source for $name {
-            const COALESCING: Coalescing = Coalescing::OnePerKey;
-            const UNDER_PLAN: UnderPlan = $under_plan;
-            const USER_STOP: UserStop = UserStop::Receiving;
-            const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
-
-            async fn new(model: Arc<ContractModel>) -> Self {
-                Self(StandIn::new(model, $source).await)
-            }
-
-            fn agent(&self) -> &Agent {
-                &self.0.process.agent
-            }
-
-            fn chat(&self) -> ChatId {
-                self.0.process.chat
-            }
-
-            async fn deliver(&self, n: u64, marker: &str) {
-                self.0.deliver(n, marker).await;
-            }
-
-            async fn end(&self) {
-                self.0.end().await;
-            }
-
-            async fn replayed(&self, n: u64) -> bool {
-                self.0.hand_overs.replayed(n)
-            }
-
-            async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
-                Self(self.0.crash_and_reopen(model).await)
-            }
-
-            async fn another_host(&self, model: Arc<ContractModel>) -> Self {
-                Self(self.0.another_host(model).await)
-            }
-        }
-    };
-}
-
-stand_in!(ScheduledStandIn, scheduled_run, UnderPlan::Delivered);
-
 /// The continuations of a Chat's real goal: one waits at a time, Plan mode holds them back, and
 /// Esc and `/stop` pause the goal. Each turn's end would hand one over by itself; here the test
 /// hands them over instead, so each carries its marker.
@@ -1255,6 +1144,378 @@ async fn an_unlinked_artifacts_waiting_request_is_withdrawn_with_its_reason() {
         })
     );
     source.agent.shutdown().await;
+}
+
+/// Scheduled tasks of a Chat on a durable host, which wakes it at each task's next fire time.
+/// Each delivery is the run of a task of its own, so they wait each on its own; one task's runs
+/// merging into one waiting run is the wiring tests' (`scheduled_tasks::wiring`).
+struct ScheduledSource {
+    store: Arc<InMemoryTranscriptStore>,
+    agent: Agent,
+    chat: ChatId,
+    /// The fire time each delivery was handed at, to hand the same run again.
+    fired: Mutex<HashMap<u64, u64>>,
+    hand_overs: HandOvers,
+}
+
+impl ScheduledSource {
+    async fn loaded(
+        store: Arc<InMemoryTranscriptStore>,
+        chat: ChatId,
+        model: Arc<ContractModel>,
+        fired: HashMap<u64, u64>,
+        hand_overs: HandOvers,
+    ) -> Self {
+        let agent = durable_harness(store.clone(), model);
+        agent.resume_chat(chat).await.unwrap();
+        Self {
+            store,
+            agent,
+            chat,
+            fired: Mutex::new(fired),
+            hand_overs,
+        }
+    }
+
+    async fn task_with(&self, prompt: &str) -> Option<tickloop_agent_protocol::ScheduledTask> {
+        self.agent
+            .snapshot(self.chat)
+            .await
+            .ok()?
+            .scheduled_tasks
+            .into_iter()
+            .find(|task| task.prompt == prompt)
+    }
+}
+
+#[async_trait]
+impl Source for ScheduledSource {
+    const COALESCING: Coalescing = Coalescing::EachItem;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+    const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
+
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let setup = durable_harness(store.clone(), model.clone());
+        let chat = setup.create_chat_without_folder().await.unwrap();
+        complete_turn(&setup, chat, "get ready").await;
+        setup.sync().await.unwrap();
+        setup.shutdown().await;
+        Self::loaded(store, chat, model, HashMap::new(), HandOvers::default()).await
+    }
+
+    fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    fn chat(&self) -> ChatId {
+        self.chat
+    }
+
+    /// The `n`th delivery is the run of its own every-minute task: the host wakes the Chat at
+    /// the task's fire time, and for a run it handed before, at that run's time again. A wake
+    /// that hands nothing over leaves the run with the task, which comes due again.
+    async fn deliver(&self, n: u64, marker: &str) {
+        let prompt = format!("{marker} (task {n})");
+        let task = match self.task_with(&prompt).await {
+            Some(task) => task,
+            None => match self
+                .agent
+                .schedule_task(self.chat, "* * * * *", prompt.clone(), true)
+                .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    self.hand_overs.record(n, Err(error.to_string()));
+                    return;
+                }
+            },
+        };
+        let repeated = self.fired.lock().unwrap().get(&n).copied();
+        let Some(due_at) = repeated.or(task.next_fire_at_ms) else {
+            return;
+        };
+        let outcome = match self.agent.wake_scheduled_tasks(self.chat, due_at).await {
+            Ok(receipts) => receipts
+                .into_iter()
+                .next()
+                .ok_or_else(|| "nothing was due".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        if outcome.is_ok() {
+            self.fired.lock().unwrap().entry(n).or_insert(due_at);
+        }
+        self.hand_overs.record(n, outcome);
+    }
+
+    async fn end(&self) {
+        let tasks = self
+            .agent
+            .snapshot(self.chat)
+            .await
+            .unwrap()
+            .scheduled_tasks;
+        for task in tasks {
+            self.agent
+                .delete_scheduled_task(self.chat, &task.id)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn replayed(&self, n: u64) -> bool {
+        self.hand_overs.replayed(n)
+    }
+
+    /// The host goes down after the run was handed over and before the task's next time was
+    /// recorded: the next host loads the task as it was, finds the same run due again, and the
+    /// ledger record of the run answers it.
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        let _ = self.agent.sync().await;
+        let mut lines = self.store.lines(self.chat);
+        if let Some(advanced) = lines
+            .iter()
+            .rposition(|line| matches!(line, Line::ScheduledTasks(_)))
+        {
+            lines.remove(advanced);
+        }
+        let image = Arc::new(InMemoryTranscriptStore::new());
+        image.seed(self.chat, lines, self.store.position(self.chat).unwrap());
+        self.agent.shutdown().await;
+        let fired = self.fired.into_inner().unwrap();
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        Self::loaded(image, self.chat, model, fired, hand_overs).await
+    }
+
+    /// The host the family moves to: this one hands the Chat over first.
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        self.agent.sync().await.unwrap();
+        self.agent.shutdown().await;
+        Self::loaded(
+            self.store.clone(),
+            self.chat,
+            model,
+            HashMap::new(),
+            HandOvers::default(),
+        )
+        .await
+    }
+}
+
+/// The clock the processes of [`OneTaskSource`] run their tasks by: its daily task's next run
+/// is the next midnight.
+fn one_task_clock() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_792_749_600, 0).unwrap()
+}
+
+/// The runs of one daily task of a saved Chat, in a process that keeps its own waits, which a
+/// wake-up hands over at each run's time. The task runs the Chat's loop.md, read again at every
+/// run, so each run carries what the file says when it comes due: one waits at a time, and a
+/// later one merges into it.
+struct OneTaskSource {
+    process: ProcessChat,
+    /// The fire time each delivery was handed at, to hand the same run again.
+    fired: Mutex<HashMap<u64, u64>>,
+    hand_overs: HandOvers,
+}
+
+impl OneTaskSource {
+    fn loop_file(&self) -> std::path::PathBuf {
+        self.process.directory.path().join(".tickloop/loop.md")
+    }
+
+    async fn task(&self) -> Option<tickloop_agent_protocol::ScheduledTask> {
+        self.process
+            .agent
+            .snapshot(self.process.chat)
+            .await
+            .ok()?
+            .scheduled_tasks
+            .into_iter()
+            .next()
+    }
+
+    async fn resumed(&self, root: std::path::PathBuf, model: Arc<ContractModel>) -> ProcessChat {
+        self.process
+            .resumed(root, model, async |agent: &Agent| {
+                agent.set_scheduled_now_for_tests(one_task_clock())
+            })
+            .await
+    }
+}
+
+#[async_trait]
+impl Source for OneTaskSource {
+    const COALESCING: Coalescing = Coalescing::OnePerKey;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+    const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
+
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let process = ProcessChat::new(model).await;
+        process.agent.set_scheduled_now_for_tests(one_task_clock());
+        process
+            .agent
+            .schedule_task(
+                process.chat,
+                "0 0 * * *",
+                tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT.into(),
+                true,
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(process.directory.path().join(".tickloop")).unwrap();
+        Self {
+            process,
+            fired: Mutex::new(HashMap::new()),
+            hand_overs: HandOvers::default(),
+        }
+    }
+
+    fn agent(&self) -> &Agent {
+        &self.process.agent
+    }
+
+    fn chat(&self) -> ChatId {
+        self.process.chat
+    }
+
+    /// The `n`th delivery is the run the task comes due for next, carrying `marker` from
+    /// loop.md; a run handed over before is handed over again at its own time.
+    async fn deliver(&self, n: u64, marker: &str) {
+        std::fs::write(self.loop_file(), marker).unwrap();
+        let repeated = self.fired.lock().unwrap().get(&n).copied();
+        let Some(due_at) = repeated.or(self.task().await.and_then(|task| task.next_fire_at_ms))
+        else {
+            self.hand_overs.record(n, Err("no task".into()));
+            return;
+        };
+        let outcome = match self
+            .process
+            .agent
+            .wake_scheduled_tasks(self.process.chat, due_at)
+            .await
+        {
+            Ok(receipts) => receipts
+                .into_iter()
+                .next()
+                .ok_or_else(|| "nothing was due".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        if outcome.is_ok() {
+            self.fired.lock().unwrap().entry(n).or_insert(due_at);
+        }
+        self.hand_overs.record(n, outcome);
+    }
+
+    async fn end(&self) {
+        if let Some(task) = self.task().await {
+            self.process
+                .agent
+                .delete_scheduled_task(self.process.chat, &task.id)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn replayed(&self, n: u64) -> bool {
+        self.hand_overs.replayed(n)
+    }
+
+    /// The process goes down after the run's ledger was stored and before the task's next time
+    /// was: the next process loads the task as it was, and the same run, due again, is answered
+    /// by its record.
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        let image = self.process.crashed().await;
+        let transcript = tickloop_agent_test_support::transcript_file(&image, self.process.chat);
+        let mut lines: Vec<String> = std::fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if let Some(advanced) = lines
+            .iter()
+            .rposition(|line| line.contains("\"type\":\"scheduled-tasks\""))
+        {
+            lines.remove(advanced);
+        }
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        let process = self.resumed(image, model).await;
+        let fired = self.fired.into_inner().unwrap();
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        Self {
+            process,
+            fired: Mutex::new(fired),
+            hand_overs,
+        }
+    }
+
+    /// Another process holding the same Chat at the same time; only the lease holder hands the
+    /// run over.
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        Self {
+            process: self.resumed(self.process.root.clone(), model).await,
+            fired: Mutex::new(HashMap::new()),
+            hand_overs: HandOvers::default(),
+        }
+    }
+}
+
+/// One task's later run merges into its run waiting behind a busy turn: the ledger records the
+/// merge under the task, the task counts the passed-over time as skipped, and cancelling the
+/// task withdraws the waiting run with its reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_tasks_later_run_merges_counts_as_skipped_and_cancelling_withdraws() {
+    let model = ContractModel::new();
+    let source = OneTaskSource::new(model.clone()).await;
+    hold_a_turn(&source.process.agent, source.process.chat, &model).await;
+    source.deliver(1, "first-run").await;
+    source.deliver(2, "second-run").await;
+    let task = source.task().await.unwrap();
+    assert_eq!(task.skipped, 1);
+    source.process.agent.flush_transcripts().await;
+    let deliveries = stored_trigger_deliveries(&source.process.root, source.process.chat);
+    let states: Vec<_> = deliveries
+        .iter()
+        .filter(|delivery| {
+            matches!(
+                &delivery.identity,
+                tickloop_agent_protocol::TriggerIdentity::ScheduledTask { task_id, .. }
+                    if *task_id == task.id
+            )
+        })
+        .map(|delivery| delivery.state.clone())
+        .collect();
+    assert_eq!(states.len(), 2, "{states:?}");
+    assert!(
+        matches!(
+            states[1],
+            InputState::Settled {
+                outcome: SettledOutcome::Merged { .. }
+            }
+        ),
+        "{states:?}"
+    );
+
+    source.end().await;
+    model.release_held_turn();
+    wait_for_state(&source.process.agent, source.process.chat, LoopState::Idle).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen("first-run") + model.seen("second-run"), 0);
+    source.process.agent.flush_transcripts().await;
+    let withdrawn = stored_trigger_deliveries(&source.process.root, source.process.chat)
+        .into_iter()
+        .find(|delivery| {
+            delivery.state
+                == InputState::Settled {
+                    outcome: SettledOutcome::Discarded {
+                        reason: DiscardReason::SourceEnded,
+                    },
+                }
+        });
+    assert!(withdrawn.is_some());
+    source.process.agent.shutdown().await;
 }
 
 /// A Continue whose caller stops waiting after the switch turned here still watches the

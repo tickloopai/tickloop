@@ -502,6 +502,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::ContextCompaction { .. }
         | EventKind::TaskBoardChanged { .. }
         | EventKind::GoalUpdated { .. }
+        | EventKind::ScheduledTasksChanged { .. }
         | EventKind::ProgressUpdated { .. } => return None,
     };
     Some(block)

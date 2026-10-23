@@ -4403,7 +4403,7 @@ async fn interact_with_herdr(
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
                         },
-                        EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::GoalUpdated {..} => {},
+                        EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::GoalUpdated {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
                             outln!(console, "\nContext compaction: {status:?}");
                             if let Some(error)=error {outln!(console, "{}",safe_text(&error));}

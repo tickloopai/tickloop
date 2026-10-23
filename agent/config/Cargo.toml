@@ -16,6 +16,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tickloop-agent-base = { path = "../base" }
+tickloop-agent-cron = { path = "../cron" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
