@@ -70,6 +70,7 @@ const CONFIG_BYTES: u64 = 1024;
 const EMPTIED_MARK_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Polite termination before SIGKILL.
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+const KILL_CONFIRMATION: Duration = Duration::from_secs(1);
 /// The receipts kept; one of an unfinished operation, or of an open whose Tick still runs, is
 /// kept even beyond it.
 pub const RECEIPT_CAPACITY: usize = 4096;
@@ -1190,7 +1191,10 @@ impl Host {
             return;
         };
         if !recovery.is_zero() {
-            tokio::time::sleep(recovery).await;
+            tokio::select! {
+                _ = tokio::time::sleep(recovery) => {},
+                _ = self.shutdown.cancelled() => {},
+            }
         }
         if !task.release_disconnected_owner(generation) {
             return;
@@ -1358,9 +1362,11 @@ impl Host {
                 tick.remove_session_directory();
             });
         }
-        // Each task's spawner stops it, reports its exit, then lets the host forget it.
         for task in shells {
-            closing.spawn(async move { task.released.cancelled().await });
+            task.stop(CANCELLED_REASON);
+            closing.spawn(async move {
+                task.ended().await;
+            });
         }
         while closing.join_next().await.is_some() {}
         let mut state = self.state.lock().await;
@@ -1385,35 +1391,27 @@ pub struct OwnerSnapshotChunk {
 async fn stop_launcher(tick: &HostedTick) {
     let mut launcher = tick.launcher.lock().await;
     let group = tick.launcher_pid as libc::pid_t;
-    if let Adapter::Terminal(_) = tick.adapter {
-        // The program is waited for only here, so even after it exited its group id is still its
-        // own: whatever it left running in that group ends with the Tick.
-        let Ok(exited) = process::peek_exit(tick.launcher_pid) else {
-            return;
-        };
-        unsafe { libc::killpg(group, libc::SIGTERM) };
-        if exited.is_none() {
-            let _ = tokio::time::timeout(TERMINATE_GRACE, async {
-                while matches!(process::peek_exit(tick.launcher_pid), Ok(None)) {
-                    tokio::time::sleep(EXIT_POLL).await;
-                }
-            })
-            .await;
-        }
-        unsafe { libc::killpg(group, libc::SIGKILL) };
-        let _ = launcher.wait().await;
+    // Keep the group leader unreaped until both signals were sent: its pid must not be reused
+    // even if it exits before descendants that ignore SIGTERM.
+    let Ok(exited) = process::peek_exit(tick.launcher_pid) else {
         return;
-    }
-    if !matches!(launcher.try_wait(), Ok(None)) {
-        return;
-    }
+    };
     unsafe { libc::killpg(group, libc::SIGTERM) };
-    if tokio::time::timeout(TERMINATE_GRACE, launcher.wait())
-        .await
-        .is_err()
+    if exited.is_none() {
+        let _ = tokio::time::timeout(TERMINATE_GRACE, async {
+            while matches!(process::peek_exit(tick.launcher_pid), Ok(None)) {
+                tokio::time::sleep(EXIT_POLL).await;
+            }
+        })
+        .await;
+    }
+    unsafe { libc::killpg(group, libc::SIGKILL) };
+    let deadline = tokio::time::Instant::now() + KILL_CONFIRMATION;
+    let _ = tokio::time::timeout_at(deadline, launcher.wait()).await;
+    while crate::shell::process_group_exists(tick.launcher_pid)
+        && tokio::time::Instant::now() < deadline
     {
-        unsafe { libc::killpg(group, libc::SIGKILL) };
-        let _ = launcher.wait().await;
+        tokio::time::sleep(EXIT_POLL).await;
     }
 }
 
@@ -1583,6 +1581,7 @@ pub async fn serve_until(
         shutdown_state: watch::channel(ShutdownState::Running).0,
     });
     let mut sweep = tokio::time::interval(REAP_INTERVAL);
+    let mut connections = tokio::task::JoinSet::new();
     tokio::pin!(stop);
     let mut emptied = false;
     loop {
@@ -1590,7 +1589,7 @@ pub async fn serve_until(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let host = host.clone();
-                    tokio::spawn(async move { let _ = connection(stream, host).await; });
+                    connections.spawn(async move { let _ = connection(stream, host).await; });
                 }
                 Err(_) => tokio::time::sleep(ACCEPT_RETRY_DELAY).await,
             },
@@ -1602,11 +1601,13 @@ pub async fn serve_until(
             }
             _ = host.shutdown.cancelled() => break,
             _ = &mut stop => break,
+            Some(_) = connections.join_next() => {},
         }
     }
     host.shutdown.cancel();
     host.shutdown_state.send_replace(ShutdownState::Stopping);
     host.shut_down().await;
+    drop(listener);
     if emptied {
         // Without the mark a daemon later counts this host's Ticks as lost rather than ended.
         let _ = host.paths.record_emptied(host.epoch);
@@ -1615,6 +1616,12 @@ pub async fn serve_until(
     host.shutdown_state.send_replace(ShutdownState::Completed);
     // Requesters waiting on a completed shutdown answer before the process leaves.
     let _ = tokio::time::timeout(SHUTDOWN_REPLY_GRACE, host.shutdown_state.closed()).await;
+    let _ = tokio::time::timeout(STREAM_WRITE_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     drop(lock);
     Ok(())
 }

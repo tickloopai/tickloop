@@ -8,6 +8,41 @@ pub struct ProcessSample {
     pub rss_bytes: Option<u64>,
 }
 
+/// A process birth time, used to distinguish a stopped process from a reused pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity(u64, u64);
+
+#[cfg(target_os = "macos")]
+pub(crate) fn running_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
+    let Some(info) = bsd_info(pid)? else {
+        return Ok(None);
+    };
+    const ZOMBIE: u32 = 5;
+    Ok((info.pbi_status != ZOMBIE)
+        .then_some(ProcessIdentity(info.pbi_start_tvsec, info.pbi_start_tvusec)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn running_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+        .ok_or_else(|| std::io::Error::other("invalid process stat"))?;
+    if matches!(fields.first(), Some(&"Z" | &"X")) {
+        return Ok(None);
+    }
+    let started = fields
+        .get(19)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| std::io::Error::other("invalid process start time"))?;
+    Ok(Some(ProcessIdentity(started, 0)))
+}
+
 /// Whether child `pid` ended, and how, without waiting for it: until the host waits for it, its
 /// pid, and with it the id of the process group it leads, cannot be reused. An error means it was
 /// already waited for.
@@ -53,7 +88,7 @@ fn siginfo_child(info: &libc::siginfo_t) -> (libc::pid_t, libc::c_int) {
 }
 
 #[cfg(target_os = "macos")]
-pub fn sample(pid: u32) -> Option<ProcessSample> {
+fn bsd_info(pid: u32) -> std::io::Result<Option<libc::proc_bsdinfo>> {
     let mut bsd = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     if unsafe {
@@ -66,9 +101,19 @@ pub fn sample(pid: u32) -> Option<ProcessSample> {
         )
     } != size
     {
-        return None;
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
-    let bsd = unsafe { bsd.assume_init() };
+    Ok(Some(unsafe { bsd.assume_init() }))
+}
+
+#[cfg(target_os = "macos")]
+pub fn sample(pid: u32) -> Option<ProcessSample> {
+    let bsd = bsd_info(pid).ok()??;
     let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
     let task_size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let task = (unsafe {

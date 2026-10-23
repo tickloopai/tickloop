@@ -18,6 +18,7 @@ const USAGE: u8 = 2;
 /// How long `stop` waits for the host to end its Ticks: each gets the host's terminate grace,
 /// side by side.
 const STOP_WAIT: Duration = Duration::from_secs(10);
+const KILL_WAIT: Duration = Duration::from_secs(2);
 const STOP_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Parser, Debug)]
@@ -122,44 +123,85 @@ async fn launch(command: Vec<String>) -> Result<(), String> {
     }
 }
 
-/// Ends the running host with SIGTERM, which ends each of its Ticks, and waits until its lock is
-/// free. Without the empty-host mark, the daemon then counts those Ticks as lost.
+/// Ends the verified host with SIGTERM and waits for that process, not just its lock.
 async fn stop() -> Result<(), String> {
     let paths = HostPaths::from_environment();
-    let Some(pid) = verified_host_pid(&paths)? else {
+    let Some((pid, identity)) = verified_host_process(&paths)? else {
         println!("No Tickhost is running.");
         return Ok(());
     };
+    let socket_identity = crate::paths::file_identity(&paths.socket()).ok();
     if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
             return Err(format!("cannot stop Tickhost process {pid}: {error}"));
         }
     }
-    let deadline = tokio::time::Instant::now() + STOP_WAIT;
-    while paths.host_running().map_err(|error| error.to_string())? {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Tickhost process {pid} did not stop within {}s",
-                STOP_WAIT.as_secs()
-            ));
+    let forced = !wait_for_exit(pid, identity, STOP_WAIT).await?;
+    if forced {
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("cannot force-stop Tickhost process {pid}: {error}"));
+            }
         }
-        tokio::time::sleep(STOP_POLL).await;
+        if !wait_for_exit(pid, identity, KILL_WAIT).await? {
+            return Err(format!("Tickhost process {pid} did not exit after SIGKILL"));
+        }
+    }
+    if !paths.host_running().map_err(|error| error.to_string())?
+        && let Some(identity) = socket_identity
+    {
+        crate::paths::remove_if_identity(&paths.socket(), identity);
+    }
+    if forced {
+        return Err(format!(
+            "Tickhost process {pid} did not stop within {}s and required SIGKILL; the host has exited, but Tick cleanup could not be confirmed",
+            STOP_WAIT.as_secs()
+        ));
     }
     println!("Stopped the Tickhost; its Ticks have ended.");
     Ok(())
 }
 
+async fn wait_for_exit(
+    pid: u32,
+    identity: crate::process::ProcessIdentity,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let current = crate::process::running_identity(pid)
+            .map_err(|error| format!("cannot inspect Tickhost process {pid}: {error}"))?;
+        if current != Some(identity) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
 /// The pid of the live host, proven before anything signals it: the lock is held, the process it
 /// names was started as `tickhost run`, and the lock still names it afterwards. A host lock that
 /// names any other process, or one whose arguments cannot be read, is refused.
-fn verified_host_pid(paths: &HostPaths) -> Result<Option<u32>, String> {
+fn verified_host_process(
+    paths: &HostPaths,
+) -> Result<Option<(u32, crate::process::ProcessIdentity)>, String> {
     let read = || {
         paths
             .running_host_pid()
             .map_err(|error| format!("cannot read the Tickhost state: {error}"))
     };
     let Some(pid) = read()? else {
+        return Ok(None);
+    };
+    let process_identity = || {
+        crate::process::running_identity(pid)
+            .map_err(|error| format!("cannot inspect Tickhost process {pid}: {error}"))
+    };
+    let Some(identity) = process_identity()? else {
         return Ok(None);
     };
     let refusal = |reason: &str| {
@@ -178,12 +220,12 @@ fn verified_host_pid(paths: &HostPaths) -> Result<Option<u32>, String> {
     if !is_service {
         return Err(refusal("is not `tickhost run`"));
     }
-    if read()? != Some(pid) {
+    if read()? != Some(pid) || process_identity()? != Some(identity) {
         return Err(
             "the Tickhost changed while it was being stopped; run `tickhost stop` again".into(),
         );
     }
-    Ok(Some(pid))
+    Ok(Some((pid, identity)))
 }
 
 async fn serve() -> Result<(), String> {
