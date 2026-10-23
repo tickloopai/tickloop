@@ -145,6 +145,7 @@ fn describe(task: &ScheduledTask) -> Value {
         "next_run": local_time(task.next_fire_at_ms, &task.time_zone),
         "expires": local_time(task.expires_at_ms, &task.time_zone),
         "awaiting_confirmation": task.confirmation == Some(ScheduledTaskConfirmation::Pending),
+        "paused": task.paused_at_ms.is_some(),
         "skipped": task.skipped,
         "prompt": task.prompt,
     })
@@ -292,7 +293,11 @@ impl Agent {
             .any(|revocation| revocation.task_id == task_id);
         let now_ms = u64::try_from(self.scheduled_now().timestamp_millis()).unwrap_or(0);
         let is_void = scheduled_for_ms.saturating_add(MAX_RUN_AGE_MS) < now_ms;
-        if is_revoked || is_void {
+        let is_paused = snapshot
+            .scheduled_tasks
+            .iter()
+            .any(|task| task.id == task_id && task.paused_at_ms.is_some());
+        if is_revoked || is_void || is_paused {
             crate::wakeup::Eligibility::Ended(DiscardReason::SourceEnded)
         } else {
             crate::wakeup::Eligibility::Eligible
@@ -347,6 +352,7 @@ impl Agent {
                 .any(|revocation| revocation.task_id == *task_id);
         if !known {
             snapshot.scheduled_tasks.push(ScheduledTask {
+                paused_at_ms: None,
                 id: task_id.clone(),
                 kind: ScheduledTaskKind::Recurring {
                     cron: "* * * * *".into(),
@@ -730,6 +736,30 @@ impl Agent {
             Ok(Some(id))
         })
         .await?
+    }
+
+    pub async fn set_scheduled_task_paused(
+        &self,
+        chat_id: ChatId,
+        task_id: &str,
+        paused: bool,
+    ) -> Result<(), AgentError> {
+        let now = self.scheduled_now();
+        let task_id = task_id.to_owned();
+        self.run_source_change(chat_id, move |change, chat| {
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            tasks
+                .set_paused(&task_id, paused, &now)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            chat.snapshot.scheduled_tasks = tasks.into_tasks();
+            change
+                .agent()
+                .persist_scheduled_tasks(change, chat, Vec::new());
+            Ok::<(), AgentError>(())
+        })
+        .await??;
+        self.withdraw_every_ended_input().await;
+        Ok(())
     }
 
     /// Cancels one of the Chat's scheduled tasks at the user's request.

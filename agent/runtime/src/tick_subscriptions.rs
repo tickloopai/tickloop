@@ -1,8 +1,10 @@
 //! Tick Subscriptions: the path from a Tick Update to a Loop.
 //!
 //! A subscription belongs to the Chat's Loop, so every mutation goes through
-//! [`Agent::configure_subscriptions`] and is recorded with the Loop. The Agent keeps the union of
-//! every subscription's Tick Instance as the desired set of one [`TickStreamPort`], whether or
+//! the subscription configuration path and is recorded with the Loop; user pauses use the source
+//! change transaction. A paused subscription has no delivery watch, so resuming it establishes a
+//! fresh baseline. The Agent keeps the union of active subscriptions' Tick Instances as the desired
+//! set of one [`TickStreamPort`], whether or
 //! not its Loop receives now; updates arriving from that stream accumulate per subscription. A Terminal
 //! Tick pushes no screen: the stream only says when its screen first changed since a subscription
 //! last got it, which marks that change pending; when the subscription's period elapses, the
@@ -606,7 +608,9 @@ impl TickDeliveries {
                     .subscriptions
                     .iter()
                     .find(|configured| {
-                        configured.id == item.subscription && configured.instance == item.instance
+                        configured.id == item.subscription
+                            && configured.instance == item.instance
+                            && !configured.paused
                     })
                     .ok_or(DiscardReason::Unsubscribed)?;
                 let runtime = self
@@ -642,7 +646,9 @@ impl TickDeliveries {
     ) {
         for item in items {
             let Some(configured) = chat_loop.subscriptions.iter().find(|configured| {
-                configured.id == item.subscription && configured.instance == item.instance
+                configured.id == item.subscription
+                    && configured.instance == item.instance
+                    && !configured.paused
             }) else {
                 continue;
             };
@@ -1100,6 +1106,7 @@ impl Agent {
                         )
                     });
                 TickSubscriptionStatus {
+                    paused: subscription.paused,
                     id: subscription.id,
                     loop_state,
                     instance: subscription.instance.clone(),
@@ -1127,8 +1134,8 @@ impl Agent {
             .collect())
     }
 
-    /// Changes one subscription's frequency or cancels it, from Monitor or a model tool; a
-    /// frequency the Tick type does not allow is refused.
+    /// Changes a subscription from Monitor, or cancels it from a model tool. Only the user-facing
+    /// AgentAccess command exposes pauses; a frequency the Tick type does not allow is refused.
     pub async fn update_tick_subscription(
         &self,
         chat_id: ChatId,
@@ -1143,6 +1150,27 @@ impl Agent {
             return Err(AgentError::NotFound);
         }
         match change {
+            TickSubscriptionChange::Paused(paused) => {
+                self.run_source_change(chat_id, move |_change, chat| {
+                    let subscription = chat
+                        .snapshot
+                        .chat_loop
+                        .subscriptions
+                        .iter_mut()
+                        .find(|subscription| subscription.id == subscription_id)
+                        .ok_or(AgentError::NotFound)?;
+                    if subscription.frequency.period().is_none() {
+                        return Err(AgentError::Invalid(
+                            "Pausing this Tick is not supported".into(),
+                        ));
+                    }
+                    subscription.paused = paused;
+                    Ok(())
+                })
+                .await??;
+                self.sync_tick_subscriptions().await;
+                return Ok(());
+            }
             TickSubscriptionChange::Cancel => {
                 subscriptions.retain(|subscription| subscription.id != subscription_id)
             }
@@ -1614,6 +1642,7 @@ impl Agent {
             return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
         }
         subscriptions.push(TickSubscription {
+            paused: false,
             id: Uuid::new_v4(),
             instance,
             frequency,
@@ -1678,6 +1707,7 @@ impl Agent {
             ));
         }
         let subscription = TickSubscription {
+            paused: false,
             id: Uuid::new_v4(),
             instance,
             frequency,
@@ -1694,6 +1724,7 @@ impl Agent {
             "subscription": subscription.id,
             "tick_instance_id": subscription.instance,
             "frequency": subscription.frequency,
+            "paused": subscription.paused,
             "receiving": is_receiving,
             "ready": ready,
         });
@@ -1789,6 +1820,7 @@ impl Agent {
                     chat_loop
                         .subscriptions
                         .iter()
+                        .filter(|subscription| !subscription.paused)
                         .map(|subscription| {
                             (
                                 *chat_id,
@@ -2869,6 +2901,7 @@ mod manual_admission_tests {
             .configure_subscriptions(
                 observer,
                 vec![TickSubscription {
+                    paused: false,
                     id: Uuid::new_v4(),
                     instance: InstanceRef::shell(task.command_id),
                     frequency: TickSubscriptionFrequency::Immediate,
@@ -2894,6 +2927,7 @@ mod manual_admission_tests {
     #[test]
     fn a_loop_refuses_subscriptions_it_cannot_honour() {
         let subscription = |instance: InstanceRef, frequency| TickSubscription {
+            paused: false,
             id: Uuid::new_v4(),
             instance,
             frequency,

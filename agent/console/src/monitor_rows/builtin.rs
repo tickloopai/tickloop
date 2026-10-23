@@ -1002,6 +1002,7 @@ mod tests {
         let context = MonitorContext {
             chat: Some(Arc::new(chat)),
             subscriptions: vec![TickSubscriptionStatus {
+                paused: false,
                 id: Uuid::from_u128(2),
                 loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: quote.clone(),
@@ -1048,6 +1049,7 @@ mod tests {
         accumulated: u64,
     ) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            paused: false,
             id: Uuid::new_v4(),
             loop_state: tickloop_agent_protocol::LoopState::Idle,
             instance: instance.clone(),
@@ -1147,6 +1149,7 @@ mod tests {
         assert_eq!(
             quote_row.subscription,
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: None,
@@ -1196,6 +1199,7 @@ mod tests {
     fn a_tick_row_marks_its_most_frequent_subscription_and_the_nearest_check_holding_updates() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
         let checked = |frequency, next_check_at_ms| TickSubscriptionStatus {
+            paused: false,
             frequency,
             next_check_at_ms: Some(next_check_at_ms),
             period_ms: frequency
@@ -1219,6 +1223,7 @@ mod tests {
                 checked(TickSubscriptionFrequency::High, 70_000),
             ]),
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: Some(NextCheck {
@@ -1247,6 +1252,7 @@ mod tests {
                 ..checked(TickSubscriptionFrequency::High, 60_000)
             }]),
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: false,
                 next_check: None,
@@ -1262,6 +1268,7 @@ mod tests {
                 ..checked(TickSubscriptionFrequency::High, 60_000)
             }]),
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: Some(NextCheck {
@@ -1277,6 +1284,7 @@ mod tests {
                 ..checked(TickSubscriptionFrequency::Medium, 65_000)
             }]),
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::Medium,
                 is_waiting: true,
                 next_check: None,
@@ -1293,6 +1301,7 @@ mod tests {
                 tasks: vec![shell_task],
             }),
             subscriptions: vec![TickSubscriptionStatus {
+                paused: false,
                 frequency: TickSubscriptionFrequency::Immediate,
                 ..subscription(&shell, None, 0)
             }],

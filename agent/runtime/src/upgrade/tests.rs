@@ -600,6 +600,7 @@ async fn watch_reconnect_delivers_one_latest_update_since_the_original_baseline(
         .configure_subscriptions(
             chat,
             vec![tickloop_agent_protocol::TickSubscription {
+                paused: false,
                 id: Uuid::new_v4(),
                 instance: instance.clone(),
                 frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
@@ -994,5 +995,54 @@ async fn the_successor_keeps_time_for_an_idle_chats_scheduled_task() {
     })
     .await
     .expect("the task ran without new input");
+    successor.shutdown().await;
+}
+
+#[tokio::test]
+async fn planned_upgrade_keeps_individual_task_and_subscription_pauses() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    let task = original
+        .schedule_task(chat, "0 * * * *", "check build".into(), true)
+        .await
+        .unwrap();
+    original
+        .set_scheduled_task_paused(chat, &task.id, true)
+        .await
+        .unwrap();
+    let subscription = tickloop_agent_protocol::TickSubscription {
+        id: Uuid::new_v4(),
+        instance: "hosted:paused".parse().unwrap(),
+        frequency: tickloop_agent_protocol::TickSubscriptionFrequency::Medium,
+        paused: true,
+        authority: None,
+    };
+    original
+        .configure_subscriptions(chat, vec![subscription.clone()])
+        .await
+        .unwrap();
+    let checkpoint = prepare(&original).await;
+    let successor = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    successor
+        .restore_upgrade(serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap())
+        .await
+        .unwrap();
+    successor.activate_upgrade().await.unwrap();
+    original.shutdown_for_upgrade().await;
+    successor.release_upgrade().await.unwrap();
+    let restored = successor.snapshot(chat).await.unwrap();
+    assert_eq!(restored.chat_loop.subscriptions, vec![subscription]);
+    assert!(restored.scheduled_tasks[0].paused_at_ms.is_some());
+    assert_eq!(
+        restored.scheduled_tasks[0].expires_at_ms,
+        task.expires_at_ms
+    );
+    assert!(
+        restored
+            .scheduled_tasks
+            .iter()
+            .all(|task| !task.is_timing())
+    );
     successor.shutdown().await;
 }

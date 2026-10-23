@@ -1821,3 +1821,96 @@ async fn a_run_older_than_a_day_is_neither_handed_over_nor_taken() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn individual_task_pause_is_recorded_and_independent_of_stopping_the_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = HoldingModel::new(vec![text("continued")]);
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    turn(&agent, chat, "ready").await;
+    let task = agent
+        .schedule_task(chat, "*/10 * * * *", "paused instruction".into(), true)
+        .await
+        .unwrap();
+    agent
+        .set_scheduled_task_paused(chat, &task.id, true)
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .run_due_scheduled_tasks(chat, at(11, 0, 0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    agent.stop(chat).await.unwrap();
+    agent.continue_loop(chat).await.unwrap();
+    assert!(tasks(&agent, chat).await[0].paused_at_ms.is_some());
+    agent.flush_transcripts().await;
+    agent.shutdown().await;
+
+    let reopened = Agent::open_embedded(root, config(), model).unwrap();
+    reopened.set_scheduled_now_for_tests(at(11, 5, 0));
+    reopened.resume_chat(chat).await.unwrap();
+    let restored = tasks(&reopened, chat).await.remove(0);
+    assert_eq!(restored.paused_at_ms, Some(ms(at(10, 0, 0))));
+    assert_eq!(restored.expires_at_ms, task.expires_at_ms);
+    reopened
+        .set_scheduled_task_paused(chat, &task.id, false)
+        .await
+        .unwrap();
+    assert!(
+        !reopened
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .chat_loop
+            .receiving
+            .is_receiving()
+    );
+    assert!(
+        reopened
+            .run_due_scheduled_tasks(chat, at(11, 30, 0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    reopened.continue_loop(chat).await.unwrap();
+    let resumed = tasks(&reopened, chat).await.remove(0);
+    assert!(resumed.paused_at_ms.is_none());
+    assert_eq!(resumed.scheduled_for_ms, Some(ms(at(11, 10, 0))));
+    assert!(
+        reopened
+            .run_due_scheduled_tasks(chat, at(11, 5, 0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn cron_list_reports_a_user_pause_without_resuming_it() {
+    let model = HoldingModel::new(vec![
+        call("list", tools::CRON_LIST_TOOL_NAME, json!({})),
+        text("Listed paused task."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model).await;
+    let task = agent
+        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .await
+        .unwrap();
+    agent
+        .set_scheduled_task_paused(chat, &task.id, true)
+        .await
+        .unwrap();
+    turn(&agent, chat, "list schedules").await;
+    let (result, is_error) = tool_result(&agent, chat, "list").await;
+    assert!(!is_error, "{result}");
+    assert!(result.contains("\\\"paused\\\":true"), "{result}");
+    assert!(tasks(&agent, chat).await[0].paused_at_ms.is_some());
+    agent.shutdown().await;
+}

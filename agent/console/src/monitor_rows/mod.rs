@@ -192,6 +192,7 @@ impl RowUpdate {
 /// are never marked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionMark {
+    pub paused: bool,
     pub frequency: TickSubscriptionFrequency,
     /// Whether one of them holds what its next check hands to the Agent.
     pub is_waiting: bool,
@@ -207,8 +208,12 @@ impl SubscriptionMark {
             .clone()
             .map(|row| row.frequency)
             .min_by_key(|frequency| frequency.period())?;
-        let waiting = periodic.filter(|row| row.accumulated > 0 || row.has_pending_change);
+        let paused = periodic.clone().all(|row| row.paused);
+        let waiting = periodic
+            .filter(|row| !row.paused)
+            .filter(|row| row.accumulated > 0 || row.has_pending_change);
         Some(Self {
+            paused,
             frequency,
             is_waiting: waiting.clone().next().is_some(),
             next_check: waiting
@@ -340,7 +345,8 @@ const SUBSCRIPTION_ACTION_LABEL: &str = "subscriptions";
 pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
 /// match what a key does.
-pub const MONITOR_KEYS: [char; 1] = [MONITOR_REFRESH_KEY];
+pub const MONITOR_PAUSE_KEY: char = 'p';
+pub const MONITOR_KEYS: [char; 2] = [MONITOR_REFRESH_KEY, MONITOR_PAUSE_KEY];
 
 /// The Monitor half of an access. Rows are computed from the View's own Chat snapshot,
 /// subscriptions, Shell tasks, artifact metadata and host probes; they never read Tick content,

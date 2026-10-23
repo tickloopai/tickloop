@@ -190,6 +190,9 @@ impl SubscriptionDetail {
             if selected { "› " } else { "  " },
             frequency_label(row.frequency)
         );
+        if row.paused {
+            frequency.push_str(" · Paused");
+        }
         if row.accumulated > 0 {
             frequency.push_str(&format!(" · {} new", row.accumulated));
         }
@@ -372,6 +375,7 @@ mod tests {
 
     fn row(id: u128, frequency: TickSubscriptionFrequency) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            paused: false,
             title: None,
             updated_at_ms: None,
             kind: None,

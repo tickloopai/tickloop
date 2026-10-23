@@ -1,5 +1,5 @@
 use super::*;
-use crate::terminal::style::{Colour, ColourDepth, ThemeName};
+use crate::terminal::style::{ColourDepth, ThemeName};
 use tickloop_agent_config::DisplayPreferences;
 use time::UtcOffset;
 use unicode_width::UnicodeWidthStr;
@@ -159,7 +159,7 @@ fn progress_runs_from_last_trigger_and_stays_full_while_due() {
 }
 
 #[test]
-fn paused_receiving_greys_the_progress_and_suppresses_trigger_flash() {
+fn paused_receiving_greys_the_row_and_suppresses_progress_and_trigger_flash() {
     let task = ScheduledTaskView {
         triggers_paused: true,
         triggered_at_ms: Some(1_000),
@@ -167,7 +167,7 @@ fn paused_receiving_greys_the_progress_and_suppresses_trigger_flash() {
     };
     for selected in [false, true] {
         let lines = task.row_lines(44, selected, render(3_750));
-        assert_eq!(lines[0].band.as_ref().unwrap().role, Role::UserMessageBg);
+        assert!(lines[0].band.is_none());
         assert!(lines[1].band.is_none());
         for line in lines {
             assert_eq!(line.fill, selected.then_some(Role::Selection));
@@ -188,14 +188,7 @@ fn paused_receiving_greys_the_progress_and_suppresses_trigger_flash() {
             .iter()
             .filter_map(|span| span.style.background)
             .collect::<Vec<_>>();
-        assert!(!backgrounds.is_empty());
-        for background in backgrounds {
-            let Colour::Rgb(rgb) = background else {
-                panic!("paused progress uses the theme's grey surface")
-            };
-            assert_eq!(rgb.red, rgb.green);
-            assert_eq!(rgb.green, rgb.blue);
-        }
+        assert!(backgrounds.is_empty());
     }
 }
 

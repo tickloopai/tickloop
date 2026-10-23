@@ -578,6 +578,14 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::ManageLoop {
                 execution: execution(),
+                action: LoopAction::SetScheduledTaskPaused { task_id: "0123abcd".into(), paused: true },
+            },
+            AgentCommand::ManageLoop {
+                execution: execution(),
+                action: LoopAction::UpdateSubscription { subscription_id: id(0x31), change: TickSubscriptionChange::Paused(true) },
+            },
+            AgentCommand::ManageLoop {
+                execution: execution(),
                 action: LoopAction::UpdateSubscription {
                     subscription_id: id(0x31),
                     change: TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Low),
@@ -762,6 +770,7 @@ fn observation_values_keep_their_recorded_wire() {
             },
             ObservationValue::RewindFiles(None),
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
+                paused: false,
                 id: id(0x31),
                 loop_state: tickloop_agent_protocol::LoopState::Idle,
                 instance: hosted_instance(),

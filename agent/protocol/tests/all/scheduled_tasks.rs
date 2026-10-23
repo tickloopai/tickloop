@@ -5,6 +5,7 @@ use tickloop_agent_protocol::{
 
 fn task(kind: ScheduledTaskKind, confirmation: Option<ScheduledTaskConfirmation>) -> ScheduledTask {
     ScheduledTask {
+        paused_at_ms: None,
         id: "0a1b2c3d".into(),
         kind,
         prompt: "check the deploy".into(),
@@ -68,6 +69,9 @@ fn scheduled_tasks_time_only_when_confirmed_and_scheduled() {
     assert!(task(one_shot.clone(), None).is_timing());
     assert!(task(one_shot.clone(), Some(ScheduledTaskConfirmation::Confirmed)).is_timing());
     assert!(!task(one_shot.clone(), Some(ScheduledTaskConfirmation::Pending)).is_timing());
+    let mut paused = task(one_shot.clone(), None);
+    paused.paused_at_ms = Some(2_000);
+    assert!(!paused.is_timing());
     let waiting = ScheduledTask {
         scheduled_for_ms: None,
         next_fire_at_ms: None,

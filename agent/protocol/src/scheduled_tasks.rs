@@ -19,6 +19,8 @@ pub struct ScheduledTask {
     pub time_zone: String,
     /// `None` when the task never needed confirming.
     pub confirmation: Option<ScheduledTaskConfirmation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at_ms: Option<u64>,
     pub created_at_ms: u64,
     /// When a recurring or self-paced task runs for the last time; one-shot tasks have none.
     pub expires_at_ms: Option<u64>,
@@ -45,7 +47,8 @@ pub struct ScheduledTask {
 impl ScheduledTask {
     /// Whether the task is counting down to its next run.
     pub fn is_timing(&self) -> bool {
-        self.confirmation != Some(ScheduledTaskConfirmation::Pending)
+        self.paused_at_ms.is_none()
+            && self.confirmation != Some(ScheduledTaskConfirmation::Pending)
             && self.next_fire_at_ms.is_some()
     }
 }

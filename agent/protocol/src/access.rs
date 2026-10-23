@@ -67,8 +67,9 @@ use crate::{
 /// their changes.
 /// 28.2 adds Goal display history, continuation times, and the Goal and scheduled tasks on the
 /// lightweight Chat status.
+/// 28.3 adds user-controlled pauses of individual scheduled tasks and periodic subscriptions.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -551,6 +552,11 @@ pub enum LoopAction {
     },
     RetryDeniedOperation {
         record_id: Uuid,
+    },
+    /// Pauses or resumes one scheduled task at the user's request from Monitor.
+    SetScheduledTaskPaused {
+        task_id: String,
+        paused: bool,
     },
     /// Cancels one of the Chat's scheduled tasks, as from its Monitor row.
     DeleteScheduledTask {
