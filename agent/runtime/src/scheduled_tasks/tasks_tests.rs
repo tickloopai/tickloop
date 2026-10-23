@@ -442,7 +442,7 @@ fn a_self_paced_turn_without_a_reschedule_gets_one_fallback_then_ends() {
 
     let first_turn_end = local(22, 10, 2, 0);
     assert_eq!(
-        tasks.self_paced_turn_ended(&first_turn_end),
+        tasks.self_paced_turn_ended(RULES, &first_turn_end),
         SelfPacedTurnEnd::FallbackScheduled
     );
     let fallback_at = first_turn_end + FALLBACK_WAKEUP_DELAY;
@@ -457,11 +457,11 @@ fn a_self_paced_turn_without_a_reschedule_gets_one_fallback_then_ends() {
     assert!(due.fired[0].last_run.is_none());
     assert_eq!(tasks.next_wake_at_ms(true), None);
 
-    let ended = tasks.self_paced_turn_ended(&local(22, 10, 23, 0));
+    let ended = tasks.self_paced_turn_ended(RULES, &local(22, 10, 23, 0));
     assert!(matches!(ended, SelfPacedTurnEnd::Ended(task) if task.id == HALF_ID));
     assert!(tasks.tasks().is_empty());
     assert_eq!(
-        tasks.self_paced_turn_ended(&local(22, 10, 24, 0)),
+        tasks.self_paced_turn_ended(RULES, &local(22, 10, 24, 0)),
         SelfPacedTurnEnd::Unchanged
     );
 }
@@ -474,7 +474,7 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
         .start_self_paced(HALF_ID, "watch".into(), USER, ZONE, RULES, &now)
         .unwrap();
     assert_eq!(
-        tasks.self_paced_turn_ended(&now),
+        tasks.self_paced_turn_ended(RULES, &now),
         SelfPacedTurnEnd::FallbackScheduled
     );
 
@@ -493,7 +493,7 @@ fn a_reschedule_clears_the_fallback_and_clamps_the_delay() {
         }
     );
     assert_eq!(
-        tasks.self_paced_turn_ended(&now),
+        tasks.self_paced_turn_ended(RULES, &now),
         SelfPacedTurnEnd::Unchanged
     );
 
@@ -1495,4 +1495,29 @@ fn confirming_a_task_with_no_run_left_before_its_end_deletes_it_unrun() {
         }))
     ));
     assert!(tasks.tasks().is_empty());
+}
+
+#[test]
+fn a_least_interval_also_spaces_the_self_paced_loop() {
+    let rules = TaskRules {
+        min_interval: Some(Duration::from_secs(2 * 60 * 60)),
+        ..RULES
+    };
+    let now = local(22, 10, 0, 0);
+    let mut tasks = ScheduledTasks::default();
+    let woken = tasks
+        .schedule_wakeup(HALF_ID, wakeup(60), USER, ZONE, rules, &now)
+        .unwrap()
+        .task
+        .clone();
+    assert_eq!(woken.next_fire_at_ms, Some(ms(local(22, 12, 0, 0))));
+    tasks.take_due(&local(22, 12, 0, 0));
+    assert_eq!(
+        tasks.self_paced_turn_ended(rules, &local(22, 12, 5, 0)),
+        SelfPacedTurnEnd::FallbackScheduled
+    );
+    assert_eq!(
+        tasks.get(&HALF_ID).unwrap().next_fire_at_ms,
+        Some(ms(local(22, 14, 5, 0)))
+    );
 }

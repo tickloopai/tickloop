@@ -1346,7 +1346,7 @@ impl Agent {
             return;
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-        match tasks.self_paced_turn_ended(&self.scheduled_now()) {
+        match tasks.self_paced_turn_ended(self.scheduled_task_rules(), &self.scheduled_now()) {
             SelfPacedTurnEnd::Unchanged => {}
             SelfPacedTurnEnd::FallbackScheduled => {
                 chat.snapshot.scheduled_tasks = tasks.into_tasks();

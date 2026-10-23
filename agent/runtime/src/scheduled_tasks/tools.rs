@@ -9,9 +9,7 @@ use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{MAX_SCHEDULED_TASK_TITLE_CHARS, ToolDefinition};
 use uuid::Uuid;
 
-use super::tasks::{
-    CronTask, MAX_WAKEUP_DELAY, MIN_WAKEUP_DELAY, TaskRules, duration_words, rate, title,
-};
+use super::tasks::{CronTask, TaskRules, duration_words, rate, title};
 use crate::host_tools::HostToolPermission;
 use tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTRUCTIONS_PLACEHOLDER;
 
@@ -189,8 +187,8 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
 
 /// The tool definitions on `terms`, ScheduleWakeup only with `schedule_wakeup`.
 pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDefinition> {
-    let min_delay = MIN_WAKEUP_DELAY.as_secs();
-    let max_delay = MAX_WAKEUP_DELAY.as_secs();
+    let (min_delay, max_delay) = terms.rules.wakeup_delays();
+    let (min_delay, max_delay) = (min_delay.as_secs(), max_delay.as_secs());
     let recurring_examples = RECURRING_EXAMPLES
         .iter()
         .filter(|(cron, _)| {

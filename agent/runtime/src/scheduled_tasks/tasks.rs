@@ -69,6 +69,16 @@ impl TaskRules {
         min_interval: None,
     };
 
+    /// The delays ScheduleWakeup is clamped to: one minute through one hour, and never less
+    /// than [`Self::min_interval`], so a self-paced loop runs no more often than a recurring
+    /// task may.
+    pub(crate) fn wakeup_delays(&self) -> (Duration, Duration) {
+        let least = self.min_interval.map_or(MIN_WAKEUP_DELAY, |min_interval| {
+            min_interval.max(MIN_WAKEUP_DELAY)
+        });
+        (least, MAX_WAKEUP_DELAY.max(least))
+    }
+
     /// Whether `cron_task` keeps to [`Self::min_interval`]: every two consecutive times of a
     /// recurring schedule are at least that far apart on the wall clock. One-shot tasks run
     /// once.
@@ -434,7 +444,8 @@ impl ScheduledTasks {
         rules: TaskRules,
         now: &DateTime<Utc>,
     ) -> Result<ScheduledWakeup<'_>, ScheduledTaskError> {
-        let delay = wakeup.delay.clamp(MIN_WAKEUP_DELAY, MAX_WAKEUP_DELAY);
+        let (least, most) = rules.wakeup_delays();
+        let delay = wakeup.delay.clamp(least, most);
         let kind = ScheduledTaskKind::SelfPaced {
             delay_seconds: Some(delay.as_secs()),
             reason: Some(wakeup.reason),
@@ -478,9 +489,13 @@ impl ScheduledTasks {
     }
 
     /// A turn of the self-paced task ended. Without a reschedule the host wakes it once more
-    /// after [`FALLBACK_WAKEUP_DELAY`]; when that fallback turn does not reschedule either, the
-    /// task ends.
-    pub(crate) fn self_paced_turn_ended(&mut self, now: &DateTime<Utc>) -> SelfPacedTurnEnd {
+    /// after [`FALLBACK_WAKEUP_DELAY`], or the host's least interval when longer; when that
+    /// fallback turn does not reschedule either, the task ends.
+    pub(crate) fn self_paced_turn_ended(
+        &mut self,
+        rules: TaskRules,
+        now: &DateTime<Utc>,
+    ) -> SelfPacedTurnEnd {
         let Some(index) = self.tasks.iter().position(is_self_paced) else {
             return SelfPacedTurnEnd::Unchanged;
         };
@@ -498,7 +513,11 @@ impl ScheduledTasks {
             return SelfPacedTurnEnd::Ended(Box::new(self.tasks.remove(index)));
         }
         *fallback = true;
-        set_wake(task, now, FALLBACK_WAKEUP_DELAY);
+        set_wake(
+            task,
+            now,
+            FALLBACK_WAKEUP_DELAY.max(rules.wakeup_delays().0),
+        );
         SelfPacedTurnEnd::FallbackScheduled
     }
 
