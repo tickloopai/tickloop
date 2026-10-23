@@ -564,6 +564,7 @@ impl TickSource {
         let process = self
             .process
             .resumed(root, model, async |agent: &Agent| {
+                agent.register_trigger_source_state_for_tests(Default::default());
                 shell.install(agent).await
             })
             .await;
@@ -589,6 +590,8 @@ impl Source for TickSource {
         let root = directory.path().join("state");
         let task = Uuid::new_v4();
         let (agent, shell, chat) = subscribed_process(&root, directory.path(), task, model).await;
+        // As in the product, where the Goal and the scheduled tasks register theirs.
+        agent.register_trigger_source_state_for_tests(Default::default());
         Self {
             process: ProcessChat {
                 directory,
@@ -624,13 +627,21 @@ impl Source for TickSource {
 
     /// The update the stream gave again reached this process's subscription, which let it go as
     /// delivered, and left the ledger as it was: one delivery carries it, under the receipt it
-    /// got before the crash.
+    /// got before the crash. A process that took the Chat over before the update came, as the
+    /// sources' part of a Continue does, knows it delivered from its watermark and lets it go
+    /// as it arrives.
     async fn replayed(&self, n: u64) -> bool {
         let reached = tokio::time::timeout(WAIT, async {
-            while self.agent().tick_subscriptions(self.chat()).await.unwrap()[0]
-                .updated_at_ms
-                .is_none()
-            {
+            loop {
+                let status = &self.agent().tick_subscriptions(self.chat()).await.unwrap()[0];
+                if status.updated_at_ms.is_some()
+                    || self
+                        .agent()
+                        .tick_delivered_sequence_for_tests(status.id)
+                        .is_some_and(|sequence| sequence >= n)
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })

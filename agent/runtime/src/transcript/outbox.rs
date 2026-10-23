@@ -223,22 +223,20 @@ impl TranscriptOutbox {
     }
 
     pub(crate) fn enqueue(&self, chat: ChatId, lines: Vec<Line>, events_through: Option<u64>) {
-        self.enqueue_lines(chat, lines, events_through, true);
+        self.enqueue_group(chat, lines, Vec::new(), events_through);
     }
 
-    /// Queues the record of a Trigger source's own state, which its lease holder writes: never
-    /// kept to be written again as metadata, nor folded into a retained snapshot, so no stale
-    /// copy of it is written by a process that does not hold the lease.
-    pub(crate) fn enqueue_source_state(&self, chat: ChatId, line: Line) {
-        self.enqueue_lines(chat, vec![line], None, false);
-    }
-
-    fn enqueue_lines(
+    /// Queues `lines` and then `source_states` as one group: every batch holds all of it or none
+    /// of it, so the store commits it whole or not at all. The records of a Trigger source's own
+    /// state, which its lease holder writes, are never kept to be written again as metadata, nor
+    /// folded into a retained snapshot, so no stale copy of them is written by a process that
+    /// does not hold the lease; they follow a snapshot the group makes, as a compaction's.
+    pub(crate) fn enqueue_group(
         &self,
         chat: ChatId,
         lines: Vec<Line>,
+        source_states: Vec<Line>,
         events_through: Option<u64>,
-        kept: bool,
     ) {
         let mut chats = self.chats.lock().unwrap();
         let Some(outbox) = chats.get_mut(&chat) else {
@@ -250,20 +248,18 @@ impl TranscriptOutbox {
         if let Some(events_through) = events_through {
             outbox.events_through = outbox.events_through.max(events_through);
         }
-        if lines.is_empty() {
+        if lines.is_empty() && source_states.is_empty() {
             return;
         }
-        let mut accepted = Vec::with_capacity(lines.len());
+        let mut accepted = Vec::with_capacity(lines.len() + source_states.len() + 1);
         for line in lines {
             if let Some(entry) = line.chain_entry()
                 && !outbox.written_uuids.insert(entry.uuid)
             {
                 continue;
             }
-            if kept {
-                outbox.metadata.remember(&line);
-                outbox.retained.apply(&line);
-            }
+            outbox.metadata.remember(&line);
+            outbox.retained.apply(&line);
             accepted.push(line);
         }
         // A new start of the chain, or enough retained Lines since the last snapshot, are folded
@@ -277,6 +273,8 @@ impl TranscriptOutbox {
             outbox.retained.apply(&snapshot);
             accepted.push(snapshot);
         }
+        // After the snapshot, which does not stand for them.
+        accepted.extend(source_states);
         if !outbox.materialized {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()

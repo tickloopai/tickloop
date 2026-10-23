@@ -110,6 +110,7 @@ impl RetainedFold {
         let kind = line.kind();
         match kind.retention() {
             Retention::Chain => self.chain.add(line),
+            Retention::SourceState => {}
             Retention::Snapshot => {
                 let Line::RetainedSnapshot(snapshot) = line else {
                     unreachable!("a snapshot kind is a snapshot");

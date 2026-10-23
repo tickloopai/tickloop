@@ -1057,6 +1057,18 @@ impl Agent {
         self.tick_deliveries().content.used_bytes()
     }
 
+    /// The sequence of the newest update of `subscription` this process knows was delivered.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn tick_delivered_sequence_for_tests(&self, subscription: Uuid) -> Option<u64> {
+        self.tick_deliveries()
+            .subscriptions
+            .get(&subscription)?
+            .delivered
+            .as_ref()
+            .map(|delivered| delivered.sequence)
+    }
+
     pub async fn tick_subscriptions(
         &self,
         chat_id: ChatId,
