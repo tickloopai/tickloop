@@ -1677,7 +1677,7 @@ mod tests {
                         "{name:?} {depth:?} {role:?} on the bar: {ratio:.2}"
                     );
                 }
-                // The `↻` keeps its frequency's colour on the bar; a row flash starts after it.
+                // The `↻` keeps its frequency's colour on the bar; row flashes cover it too.
                 for mark in [
                     Role::SubscriptionHigh,
                     Role::SubscriptionMedium,

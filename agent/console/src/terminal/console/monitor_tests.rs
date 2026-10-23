@@ -1773,7 +1773,7 @@ fn monitor_rows_clip_names_to_keep_details_on_the_same_line() {
 }
 
 #[test]
-fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width() {
+fn row_details_and_subscription_marks_end_at_the_monitor_edge_at_any_width() {
     use crate::monitor_rows::{RowUpdate, StatusTone, Unread};
     let unread = Some(RowUpdate {
         at_ms: 1000,
@@ -1821,8 +1821,10 @@ fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width()
         };
         let subscribed_row = monitor_rows("python3 -q").remove(0);
         assert!(
-            subscribed_row.starts_with("↻ ") && subscribed_row.matches('↻').count() == 1,
-            "{width}: the mark leads the row, a blank column after it: {subscribed_row:?}"
+            subscribed_row.starts_with("$ ")
+                && subscribed_row.ends_with('↻')
+                && subscribed_row.matches('↻').count() == 1,
+            "{width}: the type glyph leads the row and the subscription mark ends it: {subscribed_row:?}"
         );
         let running_rows = monitor_rows("cargo nextest");
         let details_row = running_rows
@@ -2684,9 +2686,9 @@ fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
     let lines = state
         .monitor
         .lines(40, 10, DisplayProfile::default(), went + 3_600_000);
-    let glyph = lines[2]
-        .spans
+    let glyph = lines
         .iter()
+        .flat_map(|line| &line.spans)
         .find(|span| span.text == "◉")
         .and_then(|span| span.role);
     assert_eq!(glyph, Some(Role::ErrorMark), "the row shows red");
@@ -3587,7 +3589,8 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
 }
 
 #[test]
-fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
+fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
+    use crate::monitor_rows::StatusTone;
     let mut state = State::new(true, 140, 30);
     let chat = Uuid::from_u128(707);
     let mut snapshot = chat_snapshot(chat);
@@ -3609,7 +3612,7 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
     state
         .monitor
         .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
-    let mut subscribed = shell(Uuid::from_u128(1), "Subscribed Tick");
+    let mut subscribed = shell(Uuid::from_u128(1), "Quote · TSLA.US");
     subscribed.group = TickGroup::Ticks;
     subscribed.glyph = Glyph::ProtocolTick;
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
@@ -3624,7 +3627,12 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
     state
         .monitor
         .replace(TickGroup::Ticks, vec![subscribed, plain]);
-    let frame = state.monitor.frame(48, 15, state.display, 0);
+    let mut running_shell = shell(Uuid::from_u128(3), "sleep 900");
+    running_shell.tone = StatusTone::Running { since_ms: Some(0) };
+    state
+        .monitor
+        .replace(TickGroup::Shells, vec![running_shell]);
+    let frame = state.monitor.frame(48, 15, state.display, 22_000);
     let screen = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
     println!(
         "{}",
@@ -3634,16 +3642,22 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    assert_eq!(screen[0], "Monitor");
+    assert!(screen[1].is_empty());
+    assert_eq!(screen[2], "Ticks (2)");
     let find = |text: &str| screen.iter().find(|line| line.contains(text)).unwrap();
-    assert!(find("Subscribed Tick").starts_with("↻ ◉ "));
-    assert!(find("Plain Tick").starts_with("  ◉ "));
+    assert!(find("Quote · TSLA.US").starts_with("◉ "));
+    assert!(find("Quote · TSLA.US").ends_with('↻'));
+    assert!(find("Plain Tick").starts_with("◉ "));
     let scheduled = find("◷");
     assert_eq!(display_width(&scheduled[..scheduled.find('◷').unwrap()]), 0);
-    for title in ["Subscribed Tick", "Plain Tick"] {
+    assert!(find("sleep 900").starts_with("$ sleep 900"));
+    assert!(find("sleep 900").ends_with("22s"));
+    for title in ["Quote · TSLA.US", "Plain Tick", "sleep 900"] {
         let line = find(title);
         assert_eq!(
             display_width(&line[..line.find(title).unwrap()]),
-            4,
+            2,
             "{line}"
         );
     }
@@ -3663,6 +3677,35 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
     assert!(find("记录验收证据").starts_with("◎ "));
     assert!(screen.iter().any(|line| line == "Scheduled (1)"));
     assert!(find("Pursuing goal").ends_with("1m"));
+}
+
+#[test]
+fn a_trailing_subscription_mark_counts_toward_the_selected_name_clipping() {
+    let title = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for subscription in [
+        None,
+        Some(crate::monitor_rows::SubscriptionMark {
+            paused: false,
+            frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+            is_waiting: false,
+            next_check: None,
+        }),
+    ] {
+        let mut monitor = crate::terminal::monitor::Monitor::default();
+        let mut entry = shell(Uuid::from_u128(1), title);
+        entry.group = TickGroup::Ticks;
+        entry.glyph = Glyph::ProtocolTick;
+        entry.subscription = subscription;
+        monitor.replace(TickGroup::Ticks, vec![entry]);
+        monitor.focus(false, None);
+        let frame = monitor.frame(40, 6, DisplayProfile::default(), 0);
+        let footer = frame.lines.last().unwrap().text();
+        assert_eq!(
+            footer.contains("abcdef"),
+            subscription.is_some(),
+            "{footer}"
+        );
+    }
 }
 
 fn docked_monitor_fixture(task_count: usize, tick_count: usize) -> State {
@@ -4723,6 +4766,89 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
 }
 
 #[test]
+fn monitor_heading_gap_yields_before_section_gaps_footer_and_content() {
+    let mut state = docked_monitor_fixture(3, 1);
+    let tick = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&tick);
+    for height in 13..=16 {
+        let frame = state.monitor.frame(48, height, state.display, 0);
+        let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+        assert_eq!(lines.len(), height);
+        assert_eq!(lines[0], "Monitor");
+        let has_heading_gap = height == 16;
+        assert_eq!(lines[1].is_empty(), has_heading_gap, "{height}: {lines:#?}");
+        let ticks = 1 + usize::from(has_heading_gap);
+        assert_eq!(lines[ticks], "Ticks (1)");
+        assert_eq!(frame.tick_rows.start, ticks);
+        assert_eq!(frame.targets[0].0, ticks + 1);
+        assert!(lines.last().unwrap().starts_with("exit 0"), "{lines:#?}");
+        for index in 1..=3 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("Scheduled instruction {index}"))),
+                "{lines:#?}"
+            );
+        }
+        let scheduled = lines
+            .iter()
+            .position(|line| line == "Scheduled (3)")
+            .unwrap();
+        let goal = lines
+            .iter()
+            .position(|line| line.starts_with("Pursuing goal"))
+            .unwrap();
+        assert_eq!(lines[scheduled - 1].is_empty(), height >= 15, "{lines:#?}");
+        assert_eq!(lines[goal - 1].is_empty(), height >= 14, "{lines:#?}");
+        assert!(lines[goal + 1].starts_with("◎ Finish"));
+    }
+}
+
+#[test]
+fn monitor_heading_gap_precedes_any_first_section_and_keeps_small_frames_bounded() {
+    for (tasks, ticks, first_section) in [
+        (0, 1, "Ticks (1)"),
+        (1, 0, "Scheduled (1)"),
+        (0, 0, "Pursuing goal"),
+    ] {
+        let state = docked_monitor_fixture(tasks, ticks);
+        let frame = state.monitor.frame(48, 20, state.display, 0);
+        let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+        assert_eq!(lines[0], "Monitor");
+        assert!(lines[1].is_empty());
+        assert!(
+            lines
+                .iter()
+                .skip(2)
+                .find(|line| !line.is_empty())
+                .unwrap()
+                .starts_with(first_section),
+            "{lines:#?}"
+        );
+        for height in 0..=5 {
+            let frame = state.monitor.frame(12, height, state.display, 0);
+            assert!(frame.lines.len() <= height);
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .all(|line| display_width(&line.text()) <= 12)
+            );
+            assert!(
+                frame
+                    .targets
+                    .iter()
+                    .all(|(row, _)| *row < frame.lines.len())
+            );
+        }
+    }
+    let empty =
+        crate::terminal::monitor::Monitor::default().frame(48, 6, DisplayProfile::default(), 0);
+    assert_eq!(empty.lines[0].text(), "Monitor");
+    assert!(!empty.lines[1].text().is_empty());
+}
+
+#[test]
 fn monitor_removes_section_gaps_before_compressing_scheduled_content() {
     let state = docked_monitor_fixture(3, 30);
     for height in [13, 14, 15] {
@@ -5740,7 +5866,10 @@ fn single_line_monitor_render_output_preserves_paused_rows_and_pinned_sections()
             1,
             "{screen}"
         );
-        let tick = screen.lines().find(|line| line.contains("↻ ◉")).unwrap();
+        let tick = screen
+            .lines()
+            .find(|line| line.contains("◉ 检查 mixed"))
+            .unwrap();
         assert!(
             tick.contains("检查 mixed 中文") && tick.contains('…'),
             "{screen}"
