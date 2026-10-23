@@ -24,6 +24,7 @@ const RESTORED_ROUTE: &str = "restored";
 const STARTED_FILE: &str = "started";
 const GO_FILE: &str = "go";
 const STATE_FILE: &str = "state.json";
+const PHASE_FILE: &str = "phases.jsonl";
 const PLAN_REMINDER: &str = "Plan mode is active.";
 const EXIT_NOTICE: &str = "You have exited plan mode.";
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
@@ -46,7 +47,24 @@ fn plan_flow_pty_fixture() {
         .unwrap();
 }
 
+fn record_phase(directory: &Path, phase: &str) {
+    use std::io::Write;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join(PHASE_FILE))
+        .unwrap();
+    let record = json!({
+        "phase": phase,
+        "pid": std::process::id(),
+        "at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+    });
+    log.write_all(format!("{record}\n").as_bytes()).unwrap();
+}
+
 async fn run_plan_flow_fixture(directory: PathBuf) {
+    record_phase(&directory, "fixture-started");
     let route = std::fs::read_to_string(directory.join(ROUTE_FILE)).unwrap();
     let (initial_mode, replies) = match route.as_str() {
         SHIFT_TAB_ROUTE => (
@@ -123,6 +141,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
             scripted.clone(),
         )
         .unwrap();
+        record_phase(&directory, "agent-opened");
         core.install_own_tickhost();
         let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.clone());
         launch.model = Some(model.clone());
@@ -135,6 +154,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     } else {
         let model = tickloop_agent_test_support::config();
         let core = tickloop_agent_runtime::Agent::new_embedded(model.clone(), scripted.clone());
+        record_phase(&directory, "agent-opened");
         core.install_own_tickhost();
         let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
             core.clone(),
@@ -152,6 +172,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     let chat = match restored_chat {
         Some(chat) => {
             agent.resume_chat(chat).await.unwrap();
+            record_phase(&directory, "chat-restored");
             chat
         }
         None => {
@@ -166,7 +187,9 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         wait_for_plan_approval(&mut events).await;
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
+    record_phase(&directory, "snapshot-read");
     let (console, input) = Console::start(true).unwrap();
+    record_phase(&directory, "console-started");
     crate::terminal::initialize_startup_console(&console, &model, &directory, initial_mode, vec![])
         .unwrap();
     let interaction = crate::terminal::interact(
@@ -181,31 +204,36 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         },
         Some(directory.clone()),
     );
-    tokio::pin!(interaction);
-    let mut inspection = tokio::time::interval(POLL_INTERVAL);
-    loop {
-        tokio::select! {
-            result = &mut interaction => {
-                result.unwrap();
-                break;
-            }
-            _ = inspection.tick() => {
-                let snapshot = core.snapshot(chat).await.unwrap();
-                let state = json!({
-                    "mode": snapshot.policy.mode,
-                    "plans": snapshot.plans.iter().map(|plan| json!({
-                        "version": plan.version,
-                        "pending": plan.approval_pending,
-                        "approved": plan.approved_execution_mode,
-                    })).collect::<Vec<_>>(),
-                    "loop": format!("{:?}", snapshot.chat_loop.state),
-                    "permissions": snapshot.permissions.iter().map(|request| request.name.clone()).collect::<Vec<_>>(),
-                    "requests": request_summaries(&scripted),
-                });
-                std::fs::write(directory.join("state.tmp"), state.to_string()).unwrap();
-                std::fs::rename(directory.join("state.tmp"), directory.join(STATE_FILE)).unwrap();
-            }
+    record_phase(&directory, "interaction-started");
+    // Keep polling the interaction while snapshot waits for a lock that interaction may hold.
+    let inspection = async {
+        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        let mut sample = 0_u64;
+        loop {
+            interval.tick().await;
+            let snapshot = core.snapshot(chat).await.unwrap();
+            sample += 1;
+            let state = json!({
+                "sample": sample,
+                "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                "receiving": snapshot.chat_loop.receiving,
+                "mode": snapshot.policy.mode,
+                "plans": snapshot.plans.iter().map(|plan| json!({
+                    "version": plan.version,
+                    "pending": plan.approval_pending,
+                    "approved": plan.approved_execution_mode,
+                })).collect::<Vec<_>>(),
+                "loop": format!("{:?}", snapshot.chat_loop.state),
+                "permissions": snapshot.permissions.iter().map(|request| request.name.clone()).collect::<Vec<_>>(),
+                "requests": request_summaries(&scripted),
+            });
+            std::fs::write(directory.join("state.tmp"), state.to_string()).unwrap();
+            std::fs::rename(directory.join("state.tmp"), directory.join(STATE_FILE)).unwrap();
         }
+    };
+    tokio::select! {
+        result = interaction => result.unwrap(),
+        () = inspection => unreachable!("inspection runs until the interaction ends"),
     }
     core.shutdown().await;
 }
@@ -216,6 +244,7 @@ async fn raise_plan_approval_then_stop(
     workdir: &Path,
     model: tickloop_agent_protocol::ModelConfig,
 ) -> Uuid {
+    record_phase(workdir, "first-agent-opening");
     let core = tickloop_agent_runtime::Agent::open_embedded(
         root.to_owned(),
         model,
@@ -227,6 +256,7 @@ async fn raise_plan_approval_then_stop(
         ])),
     )
     .unwrap();
+    record_phase(workdir, "first-agent-opened");
     let chat = core.create_chat(workdir.to_owned()).await.unwrap();
     core.set_execution_mode(chat, ExecutionMode::Plan)
         .await
@@ -234,7 +264,9 @@ async fn raise_plan_approval_then_stop(
     let mut events = core.subscribe();
     core.submit(chat, "Plan the change".into()).await.unwrap();
     wait_for_plan_approval(&mut events).await;
+    record_phase(workdir, "approval-raised");
     core.shutdown().await;
+    record_phase(workdir, "shutdown-finished");
     chat
 }
 
@@ -336,7 +368,8 @@ impl PlanFlow {
     }
 
     /// Waits until both the screen and the recorded Agent state satisfy `ready`.
-    fn wait(&self, label: &str, ready: impl Fn(&str, &Value) -> bool) -> (String, Value) {
+    fn wait(&mut self, label: &str, ready: impl Fn(&str, &Value) -> bool) -> (String, Value) {
+        record_phase(self.directory.path(), &format!("waiting: {label}"));
         let deadline = Instant::now() + FLOW_TIMEOUT;
         loop {
             let frame = self.fixture.frame();
@@ -344,15 +377,41 @@ impl PlanFlow {
             if state.is_object() && ready(&frame, &state) {
                 return (frame, state);
             }
-            assert!(
-                Instant::now() < deadline,
-                "never reached {label}\nstate: {state}\nframe:\n{frame}"
-            );
+            let child_status = self.fixture.child.try_wait().unwrap();
+            if child_status.is_some() || Instant::now() >= deadline {
+                self.directory.disable_cleanup(true);
+                std::fs::write(
+                    self.directory.path().join("output.ansi"),
+                    self.fixture.raw_output(),
+                )
+                .unwrap();
+                std::fs::write(self.directory.path().join("frame.txt"), &frame).unwrap();
+                let state_result = std::fs::read_to_string(self.directory.path().join(STATE_FILE));
+                let phases = std::fs::read_to_string(self.directory.path().join(PHASE_FILE));
+                let processes = std::process::Command::new("ps")
+                    .args(["-axo", "pid,ppid,stat,etime,time,command"])
+                    .output()
+                    .map(|output| {
+                        format!(
+                            "status: {}\n{}{}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|error| error.to_string());
+                std::fs::write(self.directory.path().join("processes.txt"), processes).unwrap();
+                panic!(
+                    "never reached {label}\nchild: {child_status:?}\nevidence: {}\nphases: {phases:?}\nstate read: {state_result:?}\nstate: {state}\nframe:\n{frame}\nraw output:\n{}",
+                    self.directory.path().display(),
+                    self.fixture.raw_output()
+                );
+            }
             thread::sleep(POLL_INTERVAL);
         }
     }
 
-    fn wait_for_mode(&self, mode: &str) -> String {
+    fn wait_for_mode(&mut self, mode: &str) -> String {
         let route = std::fs::read_to_string(self.directory.path().join(ROUTE_FILE)).unwrap();
         let model = if route == RESTORED_ROUTE {
             "DeepSeek Flash"
@@ -402,9 +461,8 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     flow.wait_for_mode("Auto");
     flow.fixture.send(b"Implement the change\r");
     // Shift+Tab waits for the admitted tool: a mode changed earlier decides its permission.
-    flow.wait("the running Bash wait", |_, _| {
-        flow.directory.path().join(STARTED_FILE).exists()
-    });
+    let started = flow.directory.path().join(STARTED_FILE);
+    flow.wait("the running Bash wait", |_, _| started.exists());
 
     flow.fixture.send(SHIFT_TAB);
     flow.wait_for_mode("Ask");

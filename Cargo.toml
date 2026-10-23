@@ -20,5 +20,18 @@ homepage = "https://tickloop.ai"
 [profile.dev]
 debug = "line-tables-only"
 
+# Syntect compiles syntax regexes on first use; debug builds must keep that work responsive.
+[profile.dev.package.aho-corasick]
+opt-level = 2
+
+[profile.dev.package.fancy-regex]
+opt-level = 2
+
+[profile.dev.package.regex-automata]
+opt-level = 2
+
+[profile.dev.package.regex-syntax]
+opt-level = 2
+
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
