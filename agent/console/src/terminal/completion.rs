@@ -457,7 +457,7 @@ impl Completion {
                 .filter(|(_, spec)| {
                     spec.menu_group != Some(CommandGroup::Advanced)
                         && spec.command[1..].starts_with(query)
-                        && (scope != CommandScope::Overview || spec.unavailable_in(scope).is_none())
+                        && spec.unavailable_in(scope).is_none()
                 })
                 .map(|(index, _)| index),
         );

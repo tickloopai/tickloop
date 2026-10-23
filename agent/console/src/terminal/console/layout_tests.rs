@@ -4368,10 +4368,8 @@ fn agent_layout_commands_show_and_enforce_their_scope_before_sending() {
     state.insert("/cl");
     let candidates = candidate_texts(&state);
     assert!(
-        candidates
-            .iter()
-            .any(|line| line.contains("/clear") && line.contains("Unavailable")),
-        "a child explains the limit before sending: {candidates:#?}"
+        !candidates.iter().any(|line| line.contains("/clear")),
+        "a child offers no command it cannot run: {candidates:#?}"
     );
     assert!(submit(&mut state, "/clear").is_none());
     assert!(state.status.contains("child"), "{}", state.status);
