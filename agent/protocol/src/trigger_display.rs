@@ -1,6 +1,23 @@
 use std::borrow::Cow;
 
 use crate::TriggerIdentity;
+use serde::{Deserialize, Serialize};
+
+/// Model-only wrappers added by the host, in the order they were applied. Original instructions
+/// are kept where argument trimming or tag escaping would make formatting irreversible.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduledInputWrapper {
+    Skill {
+        instruction: String,
+    },
+    LoopInstructions {
+        origin: String,
+        instructions: String,
+    },
+    LoopInstructionsError,
+    FinalRun,
+}
 
 pub const GOAL_CONTINUATION_EVENT: &str = "↻ Continuing Goal";
 
@@ -29,19 +46,6 @@ pub fn scheduled_skill_prompt(task_id: &str, name: &str, arguments: &str) -> Str
     format!(
         "{SCHEDULED_TASK_PREFIX}{task_id}{SKILL_PREFIX}{name}{SKILL_SUFFIX}{arguments}{SENTENCE_END}"
     )
-}
-
-pub fn strip_scheduled_skill_prompt(task_id: &str, text: &str) -> Option<String> {
-    let wrapped = text.strip_prefix(&format!("{SCHEDULED_TASK_PREFIX}{task_id}{SKILL_PREFIX}"))?;
-    let (name, suffix) = wrapped.split_once(SKILL_SUFFIX)?;
-    let suffix = suffix.strip_suffix(SENTENCE_END)?;
-    if suffix.is_empty() {
-        return Some(format!("/{name}"));
-    }
-    let arguments = suffix
-        .strip_prefix(SKILL_ARGUMENTS_PREFIX)?
-        .strip_suffix(SKILL_ARGUMENTS_SUFFIX)?;
-    Some(format!("/{name} {arguments}"))
 }
 
 pub fn final_scheduled_run_prompt(input: &str) -> String {
@@ -73,43 +77,46 @@ pub fn loop_instructions_prompt(origin: &str, instructions: &str) -> String {
     )
 }
 
-pub fn strip_loop_instructions_prompt(text: &str) -> Option<String> {
-    let (_, instructions) = text
-        .strip_prefix(LOOP_INSTRUCTIONS_PREFIX)?
-        .split_once(&format!(
-            "{LOOP_INSTRUCTIONS_HEADER}{LOOP_INSTRUCTIONS_OPENING_TAG}\n"
-        ))?;
-    let instructions = instructions.strip_suffix(&format!("\n{LOOP_INSTRUCTIONS_CLOSING_TAG}"))?;
-    Some(instructions.replace(
-        ESCAPED_LOOP_INSTRUCTIONS_CLOSING_TAG,
-        LOOP_INSTRUCTIONS_CLOSING_TAG,
-    ))
-}
-
 impl TriggerIdentity {
     /// The input's visible text, without the host's model-only instructions. Callers must use
-    /// the recorded Trigger identity; matching a human prompt's wording does not establish it.
+    /// the recorded wrappers; matching a prompt's wording does not establish provenance.
     pub fn display_input<'a>(&self, text: &'a str) -> Cow<'a, str> {
         match self {
             Self::GoalContinuation { .. } => Cow::Borrowed(GOAL_CONTINUATION_EVENT),
-            Self::ScheduledTask { task_id, .. } => scheduled_input(task_id, text),
+            Self::ScheduledTask {
+                task_id, wrappers, ..
+            } => scheduled_input(task_id, wrappers, text),
             _ => Cow::Borrowed(text),
         }
     }
 }
 
-fn scheduled_input<'a>(task_id: &str, text: &'a str) -> Cow<'a, str> {
-    let text = strip_final_scheduled_run_prompt(text).unwrap_or(text);
-    if let Some(error) = strip_loop_instructions_error_prompt(task_id, text) {
-        return Cow::Owned(format!(
-            "Scheduled task {task_id}: loop instructions unavailable ({error})"
-        ));
+fn scheduled_input<'a>(
+    task_id: &str,
+    wrappers: &[ScheduledInputWrapper],
+    text: &'a str,
+) -> Cow<'a, str> {
+    let mut visible = Cow::Borrowed(text);
+    for wrapper in wrappers.iter().rev() {
+        let unwrapped = match wrapper {
+            ScheduledInputWrapper::FinalRun => {
+                strip_final_scheduled_run_prompt(&visible).map(str::to_owned)
+            }
+            ScheduledInputWrapper::Skill { instruction } => Some(instruction.clone()),
+            ScheduledInputWrapper::LoopInstructions {
+                origin,
+                instructions,
+            } => Some(format!("{origin}: {instructions}")),
+            ScheduledInputWrapper::LoopInstructionsError => {
+                strip_loop_instructions_error_prompt(task_id, &visible).map(|error| {
+                    format!("Scheduled task {task_id}: loop instructions unavailable ({error})")
+                })
+            }
+        };
+        let Some(unwrapped) = unwrapped else {
+            return Cow::Borrowed(text);
+        };
+        visible = Cow::Owned(unwrapped);
     }
-    if let Some(instruction) = strip_scheduled_skill_prompt(task_id, text) {
-        return Cow::Owned(instruction);
-    }
-    if let Some(instructions) = strip_loop_instructions_prompt(text) {
-        return Cow::Owned(instructions);
-    }
-    Cow::Borrowed(text)
+    visible
 }

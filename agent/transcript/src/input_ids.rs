@@ -74,6 +74,7 @@ pub fn trigger(chat: Uuid, identity: &TriggerIdentity) -> Uuid {
         TriggerIdentity::ScheduledTask {
             task_id,
             scheduled_for_ms,
+            ..
         } => named(
             SCHEDULED_TASK,
             &[
@@ -105,6 +106,28 @@ pub fn host_rule(tool: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_display_wrappers_do_not_change_the_input_id() {
+        let chat = Uuid::new_v4();
+        let identity = |wrappers| TriggerIdentity::ScheduledTask {
+            task_id: "12345678".into(),
+            scheduled_for_ms: 1,
+            wrappers,
+        };
+        assert_eq!(
+            trigger(chat, &identity(Vec::new())),
+            trigger(
+                chat,
+                &identity(vec![
+                    tickloop_agent_protocol::ScheduledInputWrapper::Skill {
+                        instruction: "/review main".into()
+                    },
+                    tickloop_agent_protocol::ScheduledInputWrapper::FinalRun,
+                ])
+            )
+        );
+    }
 
     #[test]
     fn a_source_names_one_id_and_different_sources_name_different_ones() {

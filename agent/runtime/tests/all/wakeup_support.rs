@@ -413,6 +413,7 @@ pub(crate) fn scheduled(task: &str, n: u64) -> tickloop_agent_protocol::TriggerS
     tickloop_agent_protocol::TriggerSource::ScheduledTask {
         task_id: task.into(),
         scheduled_for_ms: began + n,
+        wrappers: Vec::new(),
     }
 }
 

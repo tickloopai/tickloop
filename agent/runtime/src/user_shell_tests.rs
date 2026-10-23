@@ -163,6 +163,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
             trigger_source: Some(TriggerSource::ScheduledTask {
                 task_id: "restart".into(),
                 scheduled_for_ms: 1,
+                wrappers: Vec::new(),
             }),
             armed: true,
             queued_sequence: 1,
@@ -191,7 +192,8 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
                 chat_id,
                 tickloop_agent_protocol::TriggerSource::ScheduledTask {
                     task_id: "restart".into(),
-                    scheduled_for_ms: 2
+                    scheduled_for_ms: 2,
+                    wrappers: Vec::new(),
                 },
                 "check after restart"
             )
@@ -219,6 +221,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
             tickloop_agent_protocol::TriggerSource::ScheduledTask {
                 task_id: "restart".into(),
                 scheduled_for_ms: 3,
+                wrappers: Vec::new(),
             },
             "check after resuming",
         )
