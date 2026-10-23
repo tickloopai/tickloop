@@ -386,8 +386,14 @@ fn goal_only_monitor_is_fixed_selectable_and_enter_opens_its_menu() {
         state.prompt_enabled = true;
         state.monitor.set_chat_status(Arc::new(status));
         assert!(state.monitor.is_shown());
-        assert_eq!(state.monitor.total(), 0);
-        state.monitor.focus(state.monitor_overlay(), None);
+        assert_eq!(state.monitor.total(), 1);
+        assert!(matches!(
+            state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(InputEvent::TickAction { .. })
+        ));
+        assert!(state.monitor.is_goal_selected());
+        assert!(state.monitor.focused);
+        assert!(state.monitor_visible());
         let frame = state
             .monitor
             .frame(usize::from(width), 12, state.display, 0);
@@ -397,9 +403,9 @@ fn goal_only_monitor_is_fixed_selectable_and_enter_opens_its_menu() {
             .map(RoleLine::text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Goal"));
+        assert!(text.contains("Pursuing goal"));
         assert!(text.contains('…'));
-        assert!(text.contains("active"));
+        assert!(text.contains("1m"));
         assert!(frame.targets.is_empty(), "Goal is not a Tick member");
         assert!(
             frame
@@ -454,18 +460,23 @@ fn goal_status_reaches_wide_and_short_console_frames() {
         (GoalStatus::BudgetLimited, "Goal unmet (12.5K / 50K tokens)"),
         (GoalStatus::Complete, "Goal achieved (12.5K tokens)"),
     ] {
-        for height in [10, 30] {
-            let mut state = State::new(true, 140, height);
+        for (width, height) in [(140, 10), (140, 30), (60, 10), (60, 30)] {
+            let mut state = State::new(true, width, height);
             state
                 .status_area
-                .update("Auto".into(), "fixture".into(), None, None);
+                .update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
             let mut goal = goal();
             goal.status = goal_status.clone();
             let status = status(goal);
             state.chat = Some(status.id);
             state.monitor.set_chat_status(Arc::new(status));
             let frame = state.frame().0.join("\n");
-            assert!(frame.contains(expected), "{height}: {frame}");
+            assert!(frame.contains(expected), "{width}x{height}: {frame}");
+            let status = frame.lines().find(|line| line.contains(expected)).unwrap();
+            assert!(status.contains("fixture"), "{width}x{height}: {frame}");
+            if width == 140 {
+                assert!(status.contains("Context 21% used"), "{frame}");
+            }
         }
     }
 }
@@ -714,4 +725,122 @@ fn goal_ui_pty_records_monitor_menu_and_escape() {
         let _ = child.wait();
         result.unwrap();
     }
+}
+
+#[test]
+fn goal_monitor_render_evidence() {
+    let mut monitor = Monitor::default();
+    let mut goal = goal();
+    goal.token_budget = None;
+    monitor.set_chat_status(Arc::new(status(goal)));
+    monitor.focus(false, None);
+    let frame = monitor.frame(48, 9, DisplayProfile::default(), 0);
+    let screen = frame
+        .lines
+        .iter()
+        .map(|line| line.text().trim_end().to_owned())
+        .collect::<Vec<_>>();
+    println!("{}", screen.join("\n"));
+    assert_eq!(
+        screen,
+        [
+            "Monitor",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "◎ Pursuing goal                               1m",
+            "  Verify the release and record acceptance evid…"
+        ]
+    );
+    assert!(
+        frame.lines[7]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("Pursuing goal") && span.role == Some(Role::Accent))
+    );
+    assert_eq!(frame.lines[7].fill, Some(Role::Selection));
+    assert_eq!(frame.lines[8].fill, Some(Role::Selection));
+}
+
+#[test]
+fn goal_only_monitor_counts_as_content_for_periodic_refresh() {
+    let console = Console::test_interactive_for_chat(Uuid::from_u128(707));
+    console.update_monitor_chat(status(goal())).unwrap();
+    assert!(
+        console.monitor_has_entries().unwrap(),
+        "Goal-only Monitor must keep periodic refresh enabled"
+    );
+}
+
+#[test]
+fn paused_triggers_keep_model_in_the_same_status_line() {
+    for (width, height) in [(140, 10), (140, 30), (60, 10), (60, 30)] {
+        let mut state = State::new(true, width, height);
+        state
+            .status_area
+            .update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
+        let mut status = status(goal());
+        status.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+            reason: tickloop_agent_protocol::PauseReason::HistoryLoaded,
+        };
+        state.chat = Some(status.id);
+        state.monitor.set_chat_status(Arc::new(status));
+        let frame = state.frame().0.join("\n");
+        let line = frame
+            .lines()
+            .find(|line| line.contains("Triggers paused"))
+            .unwrap();
+        assert!(line.contains("fixture"), "{width}x{height}: {frame}");
+    }
+}
+
+#[tokio::test]
+async fn goal_budget_input_renders_compact_prefill_and_unit_help() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus};
+    use tickloop_agent_protocol::GoalAction;
+    let config = tickloop_agent_test_support::config();
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        config.clone(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+    );
+    core.hold_goal_continuations_for_tests();
+    let agent = ConsoleExecution::from_embedded(core.clone(), config);
+    let chat = agent
+        .create_chat(std::env::current_dir().unwrap())
+        .await
+        .unwrap();
+    core.manage_goal(
+        chat,
+        GoalAction::Set {
+            objective: "verify".into(),
+            token_budget: Some(1500000),
+            replace: false,
+        },
+    )
+    .await
+    .unwrap();
+    let console = Console::test_interactive_for_chat(chat);
+    let mut menus = Menus::default();
+    menus
+        .goal_command(&agent, &console, chat, "/goal")
+        .await
+        .unwrap();
+    menus
+        .choose(&agent, &console, menus.id().unwrap(), Some(3), None)
+        .await
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.selected_menu_comment().as_deref(), Some("1.5M"));
+        let screen = state.frame().0.join("\n");
+        assert!(
+            screen.contains("Token budget (e.g. 50K, 1.5M, or none):"),
+            "{screen}"
+        );
+        assert!(screen.contains("1.5M"));
+    }
+    agent.shutdown().await;
 }

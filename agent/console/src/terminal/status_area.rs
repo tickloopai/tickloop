@@ -426,16 +426,21 @@ impl StatusArea {
 
     #[cfg(test)]
     pub(super) fn status_line(&self, width: usize, notice: &str) -> RoleLine {
-        self.status_line_with_background(width, notice, None)
+        self.status_line_with_indicator(width, notice, None, None)
     }
 
-    pub(super) fn status_line_with_background(
+    pub(super) fn status_line_with_indicator(
         &self,
         width: usize,
         notice: &str,
         background: Option<&BackgroundStatusNotice>,
+        indicator: Option<RoleLine>,
     ) -> RoleLine {
         let mut line = RoleLine::default();
+        let compact_model = indicator
+            .as_ref()
+            .map(|_| super::loop_view_text::ellipsize(&self.model, width.saturating_sub(3) / 2));
+        let model = compact_model.as_deref().unwrap_or(&self.model);
         let mode = format!("⏵⏵ {}", self.mode);
         let mode_role = match self.mode.as_str() {
             "Plan" => Role::PlanMode,
@@ -444,7 +449,6 @@ impl StatusArea {
             "Auto" => Role::Warning,
             _ => Role::Text,
         };
-        line.push(mode.clone(), Some(mode_role));
         let (context, context_role) = match self.context {
             Some((used, limit)) => {
                 let percent =
@@ -479,9 +483,29 @@ impl StatusArea {
         let outcome_width = ordinary_background.map_or(0, |background| {
             3 + UnicodeWidthStr::width(background.message.as_str())
         });
-        let mut used_width = UnicodeWidthStr::width(mode.as_str());
+        if let Some(mut indicator) = indicator {
+            let model_columns = UnicodeWidthStr::width(model);
+            indicator.truncate(width.saturating_sub((model_columns + 3).min(width / 2)));
+            line.spans.extend(indicator.spans);
+        }
+        let mode_columns = UnicodeWidthStr::width(mode.as_str());
+        if line.spans.is_empty()
+            || UnicodeWidthStr::width(line.text().as_str())
+                + mode_columns
+                + 6
+                + UnicodeWidthStr::width(model)
+                + notice_width
+                + outcome_width
+                <= width
+        {
+            if !line.spans.is_empty() {
+                line.push(STATUS_SEGMENT_SEPARATOR, Some(Role::MutedText));
+            }
+            line.push(mode, Some(mode_role));
+        }
+        let mut used_width = UnicodeWidthStr::width(line.text().as_str());
         for (text, role) in [
-            (Some(self.model.as_str()), Role::Text),
+            (Some(model), Role::Text),
             (Some(context.as_str()), context_role),
         ] {
             let Some(text) = text else {
@@ -491,7 +515,7 @@ impl StatusArea {
             if used_width + segment_width + notice_width + outcome_width > width {
                 break;
             }
-            line.push(" · ", Some(Role::MutedText));
+            line.push(STATUS_SEGMENT_SEPARATOR, Some(Role::MutedText));
             line.push(text.to_owned(), Some(role));
             used_width += segment_width;
         }
@@ -1412,7 +1436,7 @@ mod tests {
                 necessary: true,
             };
             for width in [20, 40, 120] {
-                let line = area.status_line_with_background(width, "", Some(&notice));
+                let line = area.status_line_with_indicator(width, "", Some(&notice), None);
                 let waiting = line
                     .spans
                     .iter()
@@ -1430,6 +1454,54 @@ mod tests {
                         assert_eq!(span.role, Some(Role::MutedText), "{line:?}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn indicator_keeps_goal_and_model_before_optional_mode_and_context() {
+        let mut area = StatusArea::default();
+        area.update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
+        for (width, expected) in [
+            (
+                100,
+                "Pursuing goal (1m) · ⏵⏵ Auto · fixture · Context 21% used",
+            ),
+            (30, "Pursuing goal (1m) · fixture"),
+        ] {
+            let line = area.status_line_with_indicator(
+                width,
+                "",
+                None,
+                Some(RoleLine::role("Pursuing goal (1m)", Role::Accent)),
+            );
+            assert_eq!(line.text(), expected);
+            for (text, role) in [
+                ("Pursuing goal", Role::Accent),
+                ("fixture", Role::Text),
+                ("Context 21% used", Role::Success),
+            ] {
+                if line.text().contains(text) {
+                    assert!(
+                        line.spans
+                            .iter()
+                            .any(|span| span.text.contains(text) && span.role == Some(role)),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
+        for width in [1, 8, 20, 24, 28] {
+            let line = area.status_line_with_indicator(
+                width,
+                "",
+                None,
+                Some(RoleLine::role("Pursuing goal (12.5K / 50K)", Role::Accent)),
+            );
+            assert!(line.text().starts_with('P'));
+            assert!(UnicodeWidthStr::width(line.text().as_str()) <= width);
+            if width >= 20 {
+                assert!(line.text().ends_with("fixture"), "{line:?}");
             }
         }
     }

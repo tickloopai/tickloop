@@ -2,6 +2,15 @@ use super::*;
 use tickloop_agent_protocol::{AgentCommand, GoalAction, GoalSnapshot, GoalStatus};
 
 const MAX_OBJECTIVE_CHARACTERS: usize = 4000;
+const NO_GOAL: &str = "No Goal is set; use /goal CONDITION.";
+const GOAL_ACHIEVED: &str = "Goal already achieved. Set a new one with /goal CONDITION.";
+const BUDGET_EXHAUSTED: &str =
+    "Goal hit its token budget. Raise the budget from /goal before resuming.";
+const INVALID_BUDGET: &str =
+    "Enter a positive token budget such as 50K or 1.5M, or none for no budget.";
+const BUDGET_LABEL: &str = "Token budget (e.g. 50K, 1.5M, or none)";
+const TOKENS_PER_K: u64 = 1_000;
+const TOKENS_PER_M: u64 = 1_000_000;
 
 #[derive(Clone)]
 pub(super) enum GoalMenuAction {
@@ -54,26 +63,133 @@ fn validate_objective(objective: &str) -> Result<(), String> {
 }
 
 fn budget(value: &str) -> Result<Option<u64>, String> {
-    match value.trim() {
-        "none" => Ok(None),
-        value => value
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .map(Some)
-            .ok_or_else(|| "Enter a positive token count, or none to remove the budget.".into()),
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let (number, multiplier) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], TOKENS_PER_K),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], TOKENS_PER_M),
+        _ => (value, TOKENS_PER_K),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || number.ends_with('.')
+    {
+        return Err(INVALID_BUDGET.into());
+    }
+    let fraction = fraction.trim_end_matches('0');
+    let denominator = 10_u64
+        .checked_pow(u32::try_from(fraction.len()).unwrap_or(u32::MAX))
+        .filter(|denominator| *denominator <= multiplier)
+        .ok_or(INVALID_BUDGET)?;
+    let whole = whole
+        .parse::<u64>()
+        .ok()
+        .and_then(|whole| whole.checked_mul(multiplier))
+        .ok_or(INVALID_BUDGET)?;
+    let fractional = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u64>().map_err(|_| INVALID_BUDGET)? * (multiplier / denominator)
+    };
+    whole
+        .checked_add(fractional)
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| INVALID_BUDGET.into())
+}
+
+fn budget_text(value: u64) -> String {
+    let (divisor, unit) = if value >= TOKENS_PER_M {
+        (TOKENS_PER_M, "M")
+    } else {
+        (TOKENS_PER_K, "K")
+    };
+    let whole = value / divisor;
+    let remainder = value % divisor;
+    if remainder == 0 {
+        return format!("{whole}{unit}");
+    }
+    let digits = divisor.ilog10() as usize;
+    let fraction = format!("{remainder:0digits$}");
+    format!("{whole}.{}{unit}", fraction.trim_end_matches('0'))
+}
+
+fn action_refusal(goal: Option<&GoalSnapshot>, action: &GoalAction) -> Option<&'static str> {
+    if let GoalAction::Set { replace, .. } = action {
+        return goal
+            .filter(|goal| !*replace && !goal.status.is_finished())
+            .map(|_| "An unfinished Goal is already set. Open /goal to edit or clear it.");
+    }
+    let Some(goal) = goal else {
+        return Some(NO_GOAL);
+    };
+    if matches!(action, GoalAction::Clear) {
+        return None;
+    }
+    if goal.status == GoalStatus::Complete {
+        return Some(GOAL_ACHIEVED);
+    }
+    match action {
+        GoalAction::Resume if goal.status == GoalStatus::Active => Some("Goal is already active."),
+        GoalAction::Resume
+            if goal
+                .token_budget
+                .is_some_and(|budget| goal.tokens_used >= budget) =>
+        {
+            Some(BUDGET_EXHAUSTED)
+        }
+        GoalAction::Pause => match goal.status {
+            GoalStatus::Active => None,
+            GoalStatus::Paused { .. } => Some("Goal is already paused."),
+            GoalStatus::Blocked { .. } => {
+                Some("Goal is stalled. Resume it from /goal before pausing.")
+            }
+            GoalStatus::BudgetLimited => Some(BUDGET_EXHAUSTED),
+            GoalStatus::Complete => unreachable!(),
+        },
+        GoalAction::SetBudget {
+            token_budget: Some(0),
+        } => Some(INVALID_BUDGET),
+        _ => None,
     }
 }
 
 async fn apply(agent: &Agent, chat: Uuid, action: GoalAction) -> Result<(), String> {
+    let status = agent
+        .status(chat)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(reason) = action_refusal(status.goal.as_ref(), &action) {
+        return Err(reason.into());
+    }
     let execution = agent
         .reference(chat)
         .await
         .map_err(|error| error.to_string())?;
-    agent
-        .command(AgentCommand::ManageGoal { execution, action }, None)
+    if let Err(error) = agent
+        .command(
+            AgentCommand::ManageGoal {
+                execution,
+                action: action.clone(),
+            },
+            None,
+        )
         .await
-        .map_err(|error| error.to_string())?;
+    {
+        if error.code == tickloop_agent_protocol::AccessErrorCode::Invalid {
+            let latest = agent.status(chat).await.ok();
+            return Err(latest
+                .as_ref()
+                .and_then(|status| action_refusal(status.goal.as_ref(), &action))
+                .unwrap_or("Goal could not be changed. Open /goal to check its current state.")
+                .into());
+        }
+        return Err(error.to_string());
+    }
     Ok(())
 }
 
@@ -95,14 +211,9 @@ impl Menus {
         }
         match command {
             GoalCommand::Show => self.goal_summary(console, chat, snapshot.goal.as_ref()),
-            GoalCommand::Edit => self.goal_edit(
-                console,
-                chat,
-                snapshot
-                    .goal
-                    .as_ref()
-                    .ok_or("No Goal is set; use /goal CONDITION.")?,
-            ),
+            GoalCommand::Edit => {
+                self.goal_edit(console, chat, snapshot.goal.as_ref().ok_or(NO_GOAL)?)
+            }
             GoalCommand::Apply(GoalAction::Set {
                 objective,
                 token_budget,
@@ -152,7 +263,7 @@ impl Menus {
         goal: Option<&GoalSnapshot>,
     ) -> Result<(), String> {
         let Some(goal) = goal else {
-            console.set_status("No Goal is set; use /goal CONDITION.")?;
+            console.set_status(NO_GOAL)?;
             return console.write("No Goal is set; use /goal CONDITION.\n");
         };
         let context = super::super::goal_view::GoalView::from_snapshot(goal)
@@ -185,30 +296,50 @@ impl Menus {
             | GoalStatus::BudgetLimited
             | GoalStatus::Complete => ("Resume", GoalAction::Resume),
         };
+        let (options, actions) = if goal.status != GoalStatus::Active
+            && goal
+                .token_budget
+                .is_some_and(|budget| goal.tokens_used >= budget)
+        {
+            (
+                vec![
+                    "Adjust token budget".into(),
+                    "Edit · Ctrl+G external editor".into(),
+                    "Clear".into(),
+                ],
+                vec![
+                    GoalMenuAction::Budget,
+                    GoalMenuAction::Edit,
+                    GoalMenuAction::Command(GoalAction::Clear),
+                ],
+            )
+        } else {
+            (
+                vec![
+                    "Edit · Ctrl+G external editor".into(),
+                    label.into(),
+                    "Clear".into(),
+                    "Adjust token budget".into(),
+                ],
+                vec![
+                    GoalMenuAction::Edit,
+                    GoalMenuAction::Command(action),
+                    GoalMenuAction::Command(GoalAction::Clear),
+                    GoalMenuAction::Budget,
+                ],
+            )
+        };
         self.show(
             console,
             Menu {
                 id: Uuid::new_v4(),
                 title: "Goal".into(),
                 context,
-                options: vec![
-                    "Edit · Ctrl+G external editor".into(),
-                    label.into(),
-                    "Clear".into(),
-                    "Adjust token budget".into(),
-                ],
+                options,
                 selected: 0,
                 confirmation: false,
             },
-            Selection::Goal {
-                chat,
-                actions: vec![
-                    GoalMenuAction::Edit,
-                    GoalMenuAction::Command(action),
-                    GoalMenuAction::Command(GoalAction::Clear),
-                    GoalMenuAction::Budget,
-                ],
-            },
+            Selection::Goal { chat, actions },
         )
     }
 
@@ -218,6 +349,9 @@ impl Menus {
         chat: Uuid,
         goal: &GoalSnapshot,
     ) -> Result<(), String> {
+        if goal.status == GoalStatus::Complete {
+            return Err(GOAL_ACHIEVED.into());
+        }
         self.goal_input(
             console,
             chat,
@@ -342,9 +476,10 @@ impl Menus {
             GoalMenuAction::Command(action) => apply(agent, chat, action.clone()).await?,
             GoalMenuAction::Edit | GoalMenuAction::Budget => {
                 let snapshot = agent.snapshot(chat).await.map_err(|error| error.to_string())?;
-                let goal = snapshot.goal.as_ref().ok_or("Goal was cleared.")?;
+                let goal = snapshot.goal.as_ref().ok_or(NO_GOAL)?;
+                if goal.status == GoalStatus::Complete { return Err(GOAL_ACHIEVED.into()); }
                 if matches!(action, GoalMenuAction::Edit) { self.goal_edit(console, chat, goal)?; }
-                else { self.goal_input(console, chat, "Goal token budget", "Tokens (or none)", &goal.token_budget.map_or_else(|| "none".into(), |value| value.to_string()), GoalMenuAction::SaveBudget)?; }
+                else { self.goal_input(console, chat, "Goal token budget", BUDGET_LABEL, &goal.token_budget.map_or_else(|| "none".into(), budget_text), GoalMenuAction::SaveBudget)?; }
             }
             GoalMenuAction::SaveEdit => {
                 let objective = comment.ok_or("Enter a Goal condition.")?;

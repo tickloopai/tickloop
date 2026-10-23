@@ -23,6 +23,9 @@ const MONITOR_MIN_COLUMNS: usize = 32;
 pub(super) const CONVERSATION_MIN_COLUMNS: usize = 47;
 const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+const MAX_PINNED_TASKS: usize = 3;
+const TASK_ROWS: usize = 2;
+const GOAL_ROWS: usize = 2;
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 
 /// Monitor's column beside a content area `width` columns wide: the user's preferred width or
@@ -106,6 +109,7 @@ impl MonitorEntry {
 pub(super) enum MonitorTarget {
     Tick(InstanceRef),
     ScheduledTask(String),
+    MoreScheduled,
     Goal,
 }
 
@@ -126,6 +130,8 @@ pub(super) struct Monitor {
     earlier_pages: Vec<Option<PageCursor>>,
     next_page: Option<PageCursor>,
     selected: Option<MonitorTarget>,
+    tick_anchor: Option<InstanceRef>,
+    expanded_tasks: bool,
     goal_continued_at_ms: Option<u64>,
     rows: Option<MonitorRowsRegistry>,
     pub(super) chat_status: Option<Arc<ChatStatus>>,
@@ -217,9 +223,12 @@ impl Monitor {
     pub(super) fn entries(&self) -> &[MonitorEntry] {
         &self.entries
     }
-    /// The size of the Chat's complete deduplicated Monitor set, shown as `Monitor N`.
+    /// Ticks, scheduled tasks and an optional Goal, shown as `Monitor N`.
     pub(super) fn total(&self) -> usize {
-        self.total
+        self.total + usize::from(self.goal().is_some())
+    }
+    pub(super) fn has_content(&self) -> bool {
+        self.total() > 0
     }
     pub(super) fn selected(&self) -> Option<&MonitorEntry> {
         let MonitorTarget::Tick(instance) = self.selected.as_ref()? else {
@@ -244,11 +253,24 @@ impl Monitor {
         self.selected == Some(MonitorTarget::Goal) && self.goal().is_some()
     }
     pub(super) fn select_target(&mut self, target: &MonitorTarget) {
+        if let Some(entry) = self.selected() {
+            self.tick_anchor = Some(entry.instance.clone());
+        }
         match target {
             MonitorTarget::Tick(instance) => self.select(instance),
             MonitorTarget::ScheduledTask(id) => {
-                if self.tasks_visible() && self.tasks().iter().any(|task| &task.id == id) {
+                let limit = if self.expanded_tasks {
+                    self.tasks().len()
+                } else {
+                    self.preview_count()
+                };
+                if self.tasks().iter().take(limit).any(|task| &task.id == id) {
                     self.selected = Some(target.clone());
+                }
+            }
+            MonitorTarget::MoreScheduled => {
+                if self.tasks().len() > MAX_PINNED_TASKS {
+                    self.selected = Some(MonitorTarget::MoreScheduled);
                 }
             }
             MonitorTarget::Goal => {
@@ -258,8 +280,27 @@ impl Monitor {
             }
         }
     }
-    fn tasks_visible(&self) -> bool {
-        self.next_page.is_none()
+    fn preview_count(&self) -> usize {
+        self.tasks().len().min(MAX_PINNED_TASKS)
+    }
+    pub(super) fn is_more_selected(&self) -> bool {
+        self.selected == Some(MonitorTarget::MoreScheduled) && self.tasks().len() > MAX_PINNED_TASKS
+    }
+    pub(super) fn task_list_is_open(&self) -> bool {
+        self.expanded_tasks
+    }
+    pub(super) fn open_task_list(&mut self) {
+        if let Some(task) = self.tasks().get(MAX_PINNED_TASKS) {
+            self.selected = Some(MonitorTarget::ScheduledTask(task.id.clone()));
+            self.expanded_tasks = true;
+        }
+    }
+    pub(super) fn close_task_list(&mut self) {
+        self.expanded_tasks = false;
+        if self.tasks().len() > MAX_PINNED_TASKS {
+            self.selected = Some(MonitorTarget::MoreScheduled);
+        }
+        self.reconcile_selection();
     }
     fn waiting_task(&self, id: &str) -> bool {
         self.chat_status.as_ref().is_some_and(|chat| chat.pending_inputs.iter().any(|input| {
@@ -653,8 +694,10 @@ impl Monitor {
             )
         });
         let task_animation = self
-            .tasks_visible()
-            .then(|| {
+            .chat_status
+            .as_ref()
+            .filter(|chat| !chat.scheduled_tasks.is_empty())
+            .and_then(|_| {
                 let flashing = (!self.tasks_paused())
                     .then(|| {
                         self.task_flashes
@@ -675,14 +718,18 @@ impl Monitor {
                         }
                         NextCheck {
                             at_ms: next,
-                            wait_ms,
+                            wait_ms: wait_ms.min(super::scheduled_task_rows::PROGRESS_WINDOW_MS),
                         }
-                        .next_column_at(width.saturating_sub(4), now_ms)
+                        .next_column_at(
+                            width.saturating_sub(list_row::compact_name_column(
+                                display.glyph(Glyph::AgentWaiting),
+                            )),
+                            now_ms,
+                        )
                     })
                     .min();
                 flashing.into_iter().chain(countdown).min()
-            })
-            .flatten();
+            });
         running
             .into_iter()
             .chain(task_animation)
@@ -748,8 +795,8 @@ impl Monitor {
         self.reconcile_selection();
     }
     fn reconcile_selection(&mut self) {
-        if self.selected_task().is_some() && !self.tasks_visible() {
-            self.selected = None;
+        if self.expanded_tasks && self.tasks().is_empty() {
+            self.expanded_tasks = false;
         }
         if self.entries.is_empty() && self.tasks().is_empty() {
             self.detail = None;
@@ -758,12 +805,19 @@ impl Monitor {
             self.focused = false;
             self.overlay = false;
         }
-        if self.selected().is_none() && self.selected_task().is_none() && !self.is_goal_selected() {
-            self.selected = self
-                .entries
-                .first()
-                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
-            if self.selected.is_none() && self.tasks_visible() {
+        if self.selected().is_none()
+            && self.selected_task().is_none()
+            && !self.is_more_selected()
+            && !self.is_goal_selected()
+        {
+            self.selected = if self.expanded_tasks {
+                None
+            } else {
+                self.entries
+                    .first()
+                    .map(|entry| MonitorTarget::Tick(entry.instance.clone()))
+            };
+            if self.selected.is_none() {
                 self.selected = self
                     .tasks()
                     .first()
@@ -789,6 +843,7 @@ impl Monitor {
     pub(super) fn select(&mut self, instance: &InstanceRef) {
         if self.entries.iter().any(|entry| &entry.instance == instance) {
             self.selected = Some(MonitorTarget::Tick(instance.clone()));
+            self.tick_anchor = Some(instance.clone());
         }
     }
     pub(super) fn focus(&mut self, overlay: bool, group: Option<TickGroup>) {
@@ -821,28 +876,52 @@ impl Monitor {
     }
     /// Moves within the page; past its last or first row the next or earlier page opens.
     pub(super) fn move_selection(&mut self, delta: isize) {
-        let task_count = if self.tasks_visible() {
-            self.tasks().len()
-        } else {
-            0
-        };
-        let member_count = self.entries.len() + task_count;
-        let index = match self.selected.as_ref() {
-            Some(MonitorTarget::Tick(instance)) => self
-                .entries
-                .iter()
-                .position(|entry| &entry.instance == instance),
-            Some(MonitorTarget::ScheduledTask(id)) => self
-                .tasks()
-                .iter()
-                .position(|task| &task.id == id)
-                .map(|index| index + self.entries.len()),
-            Some(MonitorTarget::Goal) => Some(member_count),
-            None => None,
+        if self.expanded_tasks {
+            if self.tasks().is_empty() {
+                self.close_task_list();
+                return;
+            }
+            let index = self
+                .selected_task()
+                .and_then(|selected| self.tasks().iter().position(|task| task.id == selected.id))
+                .unwrap_or(0);
+            let target = (index as isize)
+                .saturating_add(delta)
+                .clamp(0, self.tasks().len() as isize - 1) as usize;
+            self.selected = Some(MonitorTarget::ScheduledTask(
+                self.tasks()[target].id.clone(),
+            ));
+            return;
         }
-        .unwrap_or(0);
+        let from_tick = matches!(self.selected, Some(MonitorTarget::Tick(_)));
+        if let Some(entry) = self.selected() {
+            self.tick_anchor = Some(entry.instance.clone());
+        }
+        let mut targets = self
+            .entries
+            .iter()
+            .map(|entry| MonitorTarget::Tick(entry.instance.clone()))
+            .collect::<Vec<_>>();
+        targets.extend(
+            self.tasks()
+                .iter()
+                .take(self.preview_count())
+                .map(|task| MonitorTarget::ScheduledTask(task.id.clone())),
+        );
+        if self.tasks().len() > MAX_PINNED_TASKS {
+            targets.push(MonitorTarget::MoreScheduled);
+        }
+        if self.goal().is_some() {
+            targets.push(MonitorTarget::Goal);
+        }
+        let index = self
+            .selected
+            .as_ref()
+            .and_then(|selected| targets.iter().position(|target| target == selected))
+            .unwrap_or(0);
         let target = (index as isize).saturating_add(delta);
-        if target >= self.entries.len() as isize
+        if from_tick
+            && target >= self.entries.len() as isize
             && let Some(next) = self.next_page.take()
         {
             self.earlier_pages.push(self.page_start.replace(next));
@@ -864,17 +943,9 @@ impl Monitor {
                 .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
             return;
         }
-        let selectable_count = member_count + usize::from(self.goal().is_some());
-        let target = target.clamp(0, selectable_count.saturating_sub(1) as isize) as usize;
-        if let Some(entry) = self.entries.get(target) {
-            self.selected = Some(MonitorTarget::Tick(entry.instance.clone()));
-        } else if target < member_count {
-            self.selected = Some(MonitorTarget::ScheduledTask(
-                self.tasks()[target - self.entries.len()].id.clone(),
-            ));
-        } else if self.goal().is_some() {
-            self.selected = Some(MonitorTarget::Goal);
-        }
+        self.selected = targets
+            .get(target.clamp(0, targets.len().saturating_sub(1) as isize) as usize)
+            .cloned();
     }
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
     pub(super) fn set_membership(&mut self, membership: MonitorMembership) {
@@ -942,11 +1013,19 @@ impl Monitor {
 
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
+        if self.is_more_selected() {
+            return "enter all scheduled · j/k select · esc input".into();
+        }
         if self.is_goal_selected() {
             return "enter Goal details · j/k select · esc return to input".into();
         }
         if self.selected_task().is_some() {
-            return "enter details · x delete · esc input".into();
+            return if self.expanded_tasks {
+                "enter details · x remove · j/k select · esc back"
+            } else {
+                "enter details · x remove · esc input"
+            }
+            .into();
         }
         let mut hints = self
             .selected()
@@ -972,6 +1051,75 @@ impl Monitor {
         hints.join(" · ")
     }
 
+    fn task_lines(
+        &self,
+        task: &tickloop_agent_protocol::ScheduledTask,
+        width: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> Vec<RoleLine> {
+        let selected = self.focused
+            && matches!(&self.selected, Some(MonitorTarget::ScheduledTask(id)) if id == &task.id);
+        let view = super::scheduled_tasks::view(
+            task,
+            self.tasks_paused(),
+            self.task_flashes.get(&task.id).copied(),
+            self.waiting_task(&task.id),
+        );
+        view.row_lines(
+            width,
+            selected,
+            super::scheduled_task_rows::ScheduledTaskRender {
+                display,
+                ascii: false,
+                now: super::scheduled_tasks::local_time(now_ms, &task.time_zone)
+                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+                now_ms,
+            },
+        )
+    }
+
+    fn task_list_frame(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> MonitorFrame {
+        let mut lines = vec![RoleLine::role(
+            format!("Scheduled ({})", self.tasks().len()),
+            Role::Title,
+        )];
+        let mut targets = Vec::new();
+        let capacity = height.saturating_sub(2);
+        let visible_tasks = (capacity / TASK_ROWS).max(1);
+        let selected = self
+            .selected_task()
+            .and_then(|selected| self.tasks().iter().position(|task| task.id == selected.id))
+            .unwrap_or(0);
+        let offset = selected.saturating_sub(visible_tasks.saturating_sub(1));
+        for task in self.tasks().iter().skip(offset).take(visible_tasks) {
+            for line in self.task_lines(task, width, display, now_ms) {
+                if lines.len() > capacity {
+                    break;
+                }
+                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id.clone())));
+                lines.push(line);
+            }
+        }
+        if height > 1 {
+            lines.resize(height - 1, RoleLine::default());
+            lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
+        }
+        lines.truncate(height);
+        for line in &mut lines {
+            if unicode_width::UnicodeWidthStr::width(line.text().as_str()) > width {
+                line.truncate(width);
+            }
+        }
+        MonitorFrame { lines, targets }
+    }
+
     pub(super) fn frame(
         &self,
         width: usize,
@@ -979,35 +1127,77 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> MonitorFrame {
-        let visible_count = self.entries.len()
-            + if self.tasks_visible() {
-                self.tasks().len()
-            } else {
-                0
-            };
-        let heading = if self.total > visible_count {
+        if self.expanded_tasks {
+            return self.task_list_frame(width, height, display, now_ms);
+        }
+        let ticks_total = self.total.saturating_sub(self.tasks().len());
+        let heading = if ticks_total > self.entries.len() {
             let first = self.earlier_pages.len() * MAX_PAGE_SIZE + 1;
             format!(
-                "Monitor {first}–{} of {}",
-                first + visible_count.saturating_sub(1),
-                self.total
+                "Monitor {first}–{} of {ticks_total}",
+                first + self.entries.len().saturating_sub(1)
             )
         } else {
             "Monitor".into()
         };
-        // The column's title stands out from its muted group headings.
-        let mut lines = vec![RoleLine::role(
-            heading,
-            if self.focused {
-                Role::Title
-            } else {
-                Role::Text
-            },
-        )];
-
+        let mut goal_lines = self
+            .goal()
+            .map(|goal| {
+                goal.monitor_lines(
+                    width,
+                    self.focused && self.is_goal_selected(),
+                    display,
+                    false,
+                    now_ms,
+                )
+            })
+            .unwrap_or_default();
+        goal_lines.truncate(height.min(GOAL_ROWS));
+        let minimum_tasks = if self.tasks().is_empty() {
+            0
+        } else {
+            TASK_ROWS.min(height.saturating_sub(goal_lines.len()))
+        };
+        let mut extra = height.saturating_sub(goal_lines.len() + minimum_tasks);
+        let scheduled_heading = !self.tasks().is_empty() && extra > 0;
+        extra = extra.saturating_sub(usize::from(scheduled_heading));
+        let more = self.tasks().len() > MAX_PINNED_TASKS && extra > 0;
+        extra = extra.saturating_sub(usize::from(more));
+        let show_heading = extra > 0;
+        extra = extra.saturating_sub(usize::from(show_heading));
+        let show_footer = extra > 0;
+        let mut lines = if show_heading {
+            vec![RoleLine::role(
+                heading,
+                if self.focused {
+                    Role::Title
+                } else {
+                    Role::Text
+                },
+            )]
+        } else {
+            Vec::new()
+        };
+        let fixed_budget =
+            height.saturating_sub(lines.len() + goal_lines.len() + usize::from(show_footer));
+        let task_budget =
+            fixed_budget.saturating_sub(usize::from(scheduled_heading) + usize::from(more));
+        let visible_tasks = if minimum_tasks > 0 {
+            (task_budget / TASK_ROWS).max(1).min(self.preview_count())
+        } else {
+            0
+        };
+        let scheduled_rows =
+            (usize::from(scheduled_heading) + visible_tasks * TASK_ROWS + usize::from(more))
+                .min(fixed_budget);
+        let tick_capacity = fixed_budget.saturating_sub(scheduled_rows);
         let mut rows = Vec::new();
         let mut row_ids = Vec::new();
         let mut selected_row = 0;
+        let scroll_target = match self.selected.as_ref() {
+            Some(MonitorTarget::Tick(instance)) => Some(instance),
+            _ => self.tick_anchor.as_ref(),
+        };
         let titles = self
             .entries
             .iter()
@@ -1058,7 +1248,7 @@ impl Monitor {
             ));
             row_ids.push(None);
             for (entry, row) in entries {
-                if row.selected {
+                if scroll_target == Some(&entry.instance) {
                     selected_row = rows.len();
                 }
                 for line in row.lines(width) {
@@ -1067,92 +1257,77 @@ impl Monitor {
                 }
             }
         }
-        if self.tasks_visible() && !self.tasks().is_empty() {
-            rows.push(RoleLine::role(
-                format!("Scheduled tasks ({})", self.tasks().len()),
-                Role::MutedText,
-            ));
-            row_ids.push(None);
-            for task in self.tasks() {
-                let selected = self.focused
-                    && matches!(&self.selected, Some(MonitorTarget::ScheduledTask(id)) if id == &task.id);
-                if selected {
-                    selected_row = rows.len();
-                }
-                let view = super::scheduled_tasks::view(
-                    task,
-                    self.tasks_paused(),
-                    self.task_flashes.get(&task.id).copied(),
-                    self.waiting_task(&task.id),
-                );
-                let render = super::scheduled_task_rows::ScheduledTaskRender {
-                    display,
-                    ascii: false,
-                    now: super::scheduled_tasks::local_time(now_ms, &task.time_zone)
-                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
-                    now_ms,
-                };
-                for line in view.row_lines(width, selected, render) {
-                    rows.push(line);
-                    row_ids.push(Some(MonitorTarget::ScheduledTask(task.id.clone())));
-                }
-            }
-        }
+
         if self.entries.is_empty() && self.tasks().is_empty() && self.goal().is_none() {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
             row_ids.push(None);
         }
-        let mut goal_lines = self
-            .goal()
-            .map(|goal| goal.monitor_lines(width, display, now_ms))
-            .unwrap_or_default();
-        goal_lines.truncate(height.saturating_sub(1));
-        if self.is_goal_selected()
-            && self.focused
-            && list_row::flash_fill(
-                self.goal_continued_at_ms
-                    .map(|since| (RowFlash::TakeIn, since)),
-                display,
-                now_ms,
-            )
-            .is_none()
-        {
-            goal_lines = goal_lines
-                .into_iter()
-                .map(|line| line.filled(Role::Selection))
-                .collect();
-        }
-        let capacity = height.saturating_sub(2 + goal_lines.len());
-        if self.is_goal_selected() {
-            selected_row = rows.len().saturating_sub(1);
-        }
-        let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
-        let targets = row_ids
+        let offset = selected_row.saturating_sub(tick_capacity.saturating_sub(2));
+        let mut targets = row_ids
             .into_iter()
             .skip(offset)
-            .take(capacity)
+            .take(tick_capacity)
             .enumerate()
-            .filter_map(|(row, id)| id.map(|id| (row + 1, id)))
-            .collect();
-        lines.extend(rows.into_iter().skip(offset).take(capacity));
-        if height > 1 {
-            lines.resize(
-                height.saturating_sub(1 + goal_lines.len()),
-                RoleLine::default(),
-            );
-            lines.extend(goal_lines);
+            .filter_map(|(row, id)| id.map(|id| (row + lines.len(), id)))
+            .collect::<Vec<_>>();
+        lines.extend(rows.into_iter().skip(offset).take(tick_capacity));
+        lines.resize(
+            usize::from(show_heading) + tick_capacity,
+            RoleLine::default(),
+        );
+        if show_footer {
+            lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
+        }
+        let scheduled_end = lines.len() + scheduled_rows;
+        if scheduled_heading {
             lines.push(RoleLine::role(
-                if self.is_goal_selected() {
-                    "Enter Goal details".into()
-                } else {
-                    self.selected_status()
-                },
+                format!("Scheduled ({})", self.tasks().len()),
                 Role::MutedText,
             ));
         }
+        let selected_task = self.selected_task().and_then(|selected| {
+            self.tasks()
+                .iter()
+                .take(self.preview_count())
+                .position(|task| task.id == selected.id)
+        });
+        let start = selected_task
+            .unwrap_or_else(|| {
+                if self.is_more_selected() || self.is_goal_selected() {
+                    self.preview_count().saturating_sub(1)
+                } else {
+                    0
+                }
+            })
+            .saturating_sub(visible_tasks.saturating_sub(1))
+            .min(self.preview_count().saturating_sub(visible_tasks));
+        for task in self.tasks().iter().skip(start).take(visible_tasks) {
+            for line in self.task_lines(task, width, display, now_ms) {
+                if lines.len() >= scheduled_end.saturating_sub(usize::from(more)) {
+                    break;
+                }
+                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id.clone())));
+                lines.push(line);
+            }
+        }
+        if more && lines.len() < scheduled_end {
+            let mut line = RoleLine::role(
+                format!("+{} more", self.tasks().len() - self.preview_count()),
+                Role::MutedText,
+            );
+            if self.focused && self.is_more_selected() {
+                line = line.filled(Role::Selection);
+            }
+            targets.push((lines.len(), MonitorTarget::MoreScheduled));
+            lines.push(line);
+        }
+        lines.truncate(scheduled_end);
+        lines.extend(goal_lines);
         lines.truncate(height);
         for line in &mut lines {
-            line.truncate(width);
+            if unicode_width::UnicodeWidthStr::width(line.text().as_str()) > width {
+                line.truncate(width);
+            }
         }
         MonitorFrame { lines, targets }
     }

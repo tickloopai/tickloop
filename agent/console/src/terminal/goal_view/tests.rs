@@ -55,11 +55,20 @@ fn status_uses_codex_wording_for_every_goal_state() {
         let line = status_line(Some(&goal), false, 100).unwrap();
         assert_eq!(line.text(), expected);
         assert_eq!(line.spans[0].role, Some(role));
+        let monitor = goal.monitor_lines(100, false, DisplayProfile::default(), false, 0);
         assert!(
-            goal.monitor_lines(100, DisplayProfile::default(), 0)
-                .iter()
-                .any(|line| line.text().starts_with(state.label()))
+            monitor[0]
+                .text()
+                .trim_start()
+                .starts_with(&format!("◎ {}", state.title()))
         );
+        assert!(
+            monitor[0]
+                .spans
+                .iter()
+                .any(|span| span.text.contains(state.title()) && span.role == Some(role))
+        );
+        assert!(monitor[1].text().contains(goal.condition));
     }
 }
 
@@ -93,63 +102,71 @@ fn unbudgeted_goals_show_runtime_and_trigger_pause_takes_priority() {
 }
 
 #[test]
-fn monitor_caps_condition_at_three_wrapped_lines_and_reason_at_one() {
+fn monitor_has_state_title_right_aligned_time_and_one_condition_line() {
     let goal = GoalView {
         condition: "第一行条件很长而且需要折行\n第二行\n第三行\n第四行",
         check_reason: Some("reason\nmore reason\u{1b}[31m"),
         ..example_goal()
     };
-    let lines = goal.monitor_lines(12, DisplayProfile::default(), 0);
-    assert_eq!(lines.len(), 6);
-    assert_eq!(lines[0].text(), "Goal");
-    assert!(lines[3].text().ends_with('…'));
-    assert!(lines[4].text().starts_with("active"));
-    assert!(lines[5].text().starts_with("Check: "));
+    let lines = goal.monitor_lines(12, false, DisplayProfile::default(), false, 0);
+    assert_eq!(text(&lines), ["◎ Pursui… 1m", "  第一行条…"]);
     assert!(lines.iter().all(|line| line.text().width() <= 12));
     assert!(
         lines
             .iter()
             .all(|line| !line.text().chars().any(char::is_control))
     );
-    let short = example_goal().monitor_lines(100, DisplayProfile::default(), 0);
-    assert_eq!(
-        text(&short),
-        [
-            "Goal",
-            "Ship the verified release",
-            "active · 12.5K / 50K",
-            "Check: The acceptance check still needs evidence"
-        ]
+    let short = example_goal().monitor_lines(60, false, DisplayProfile::default(), false, 0);
+    assert_eq!(short.len(), 2);
+    assert_eq!(short[0].text().width(), 60);
+    assert!(short[0].text().ends_with("1m"));
+    assert_eq!(short[1].text(), "  Ship the verified release");
+    assert!(
+        short
+            .iter()
+            .all(|line| !line.text().contains("Check:") && !line.text().contains("tokens"))
     );
 }
 
 #[test]
-fn monitor_three_line_boundary_preserves_whole_graphemes() {
+fn monitor_summary_truncation_preserves_whole_graphemes() {
     for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
         for (condition, width, expected) in [
-            (
-                format!("{grapheme}abc"),
-                2,
-                vec![grapheme.to_owned(), "ab".into(), "c".into()],
-            ),
-            (
-                format!("{grapheme}abcde"),
-                2,
-                vec![grapheme.to_owned(), "ab".into(), "c…".into()],
-            ),
-            (
-                format!("abc\ndef\n{grapheme}xy"),
-                3,
-                vec!["abc".into(), "def".into(), format!("{grapheme}…")],
-            ),
+            (format!("{grapheme}abc"), 5, format!("  {grapheme}…")),
+            (format!("{grapheme}abcde"), 4, "  …".into()),
+            (grapheme.to_owned(), 4, format!("  {grapheme}")),
+            (format!("abc\ndef\n{grapheme}xy"), 6, "  abc…".into()),
         ] {
             let goal = GoalView {
                 condition: &condition,
-                check_reason: None,
                 ..example_goal()
             };
-            let lines = goal.monitor_lines(width, DisplayProfile::default(), 0);
-            assert_eq!(text(&lines[1..4]), expected, "{condition:?}");
+            let lines = goal.monitor_lines(width, false, DisplayProfile::default(), false, 0);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[1].text().trim_end(), expected, "{condition:?}");
+        }
+    }
+}
+
+#[test]
+fn monitor_selection_wins_over_flash_and_keeps_text_indent() {
+    let goal = GoalView {
+        continued_at_ms: Some(1000),
+        ..example_goal()
+    };
+    for width in [1, 2, 3, 4, 8, 20, 80] {
+        for selected in [false, true] {
+            let lines = goal.monitor_lines(width, selected, DisplayProfile::default(), false, 1000);
+            assert_eq!(lines.len(), 2);
+            assert!(lines.iter().all(|line| line.fill
+                == Some(if selected {
+                    Role::Selection
+                } else {
+                    Role::TakeInFlashStrong
+                })));
+            assert!(lines.iter().all(|line| line.text().width() <= width));
+            assert!(lines[0].text().starts_with('◎'));
+            assert!(lines[1].text().starts_with(&" ".repeat(width.min(2))));
         }
     }
 }
@@ -182,9 +199,10 @@ fn unbudgeted_goal_runtime_uses_compact_minute_hour_and_day_boundaries() {
             status_line(Some(&goal), false, 100).unwrap().text(),
             format!("Pursuing goal ({expected})")
         );
-        assert_eq!(
-            goal.monitor_lines(100, DisplayProfile::default(), 0)[2].text(),
-            format!("active · {expected}")
+        assert!(
+            goal.monitor_lines(100, false, DisplayProfile::default(), false, 0)[0]
+                .text()
+                .ends_with(expected)
         );
         assert_eq!(
             goal.detail_lines(100, 0, 100)[3].text(),
@@ -235,7 +253,7 @@ fn continuation_flash_reuses_take_in_phases_and_reduced_motion() {
         (2_200, None),
     ] {
         assert!(
-            goal.monitor_lines(40, display, now)
+            goal.monitor_lines(40, false, display, false, now)
                 .iter()
                 .all(|line| line.fill == expected)
         );
@@ -244,7 +262,7 @@ fn continuation_flash_reuses_take_in_phases_and_reduced_motion() {
         prefers_reduced_motion: true,
     });
     assert!(
-        goal.monitor_lines(40, still, 1_000)
+        goal.monitor_lines(40, false, still, false, 1_000)
             .iter()
             .all(|line| line.fill.is_none())
     );
@@ -260,7 +278,7 @@ fn narrow_and_wide_unicode_views_fit_and_resolve_in_both_themes() {
         for theme in ThemeName::ALL {
             let mut display = DisplayProfile::default();
             display.set_theme(theme);
-            let mut lines = goal.monitor_lines(width, display, 0);
+            let mut lines = goal.monitor_lines(width, false, display, false, 0);
             lines.extend(goal.detail_lines(width, 0, 100));
             lines.push(status_line(Some(&goal), false, width).unwrap());
             lines.push(status_line(Some(&goal), true, width).unwrap());
@@ -318,5 +336,55 @@ fn goal_notices_use_semantic_roles_and_keep_untrusted_reasons_on_one_line() {
             text.contains("first second third"),
             !matches!(notice, GoalNotice::Paused { .. } | GoalNotice::Cleared)
         );
+    }
+}
+
+#[test]
+fn selected_monitor_title_keeps_state_colour_on_the_selection_background() {
+    for theme in ThemeName::ALL {
+        let mut display = DisplayProfile::default();
+        display.set_theme(theme);
+        for state in [
+            GoalState::Active,
+            GoalState::Paused,
+            GoalState::Blocked,
+            GoalState::BudgetLimited,
+            GoalState::Complete,
+        ] {
+            let goal = GoalView {
+                state,
+                ..example_goal()
+            };
+            let lines = goal.monitor_lines(48, true, display, false, 0);
+            let resolved = lines[0].resolve(display.theme(), 48);
+            let title = resolved
+                .spans
+                .iter()
+                .find(|span| span.text.contains(state.title()))
+                .unwrap();
+            assert_eq!(
+                title.style.foreground,
+                display.theme().style(state.role()).foreground
+            );
+            assert_eq!(
+                title.style.background,
+                display.theme().style(Role::Selection).background
+            );
+        }
+    }
+}
+
+#[test]
+fn goal_glyph_has_an_ascii_fallback_with_matching_indentation_and_state_colour() {
+    for ascii in [false, true] {
+        let lines = example_goal().monitor_lines(48, false, DisplayProfile::default(), ascii, 0);
+        assert!(lines[0].text().starts_with(if ascii {
+            "o Pursuing goal"
+        } else {
+            "◎ Pursuing goal"
+        }));
+        assert_eq!(lines[0].spans[0].role, Some(Role::Accent));
+        assert!(lines[1].text().starts_with("  Ship"));
+        assert_eq!(lines[0].text().width(), 48);
     }
 }

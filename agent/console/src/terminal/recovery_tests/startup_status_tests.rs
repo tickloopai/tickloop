@@ -37,6 +37,7 @@ fn startup_status_pty_fixture() {
                 let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
                 let core =
                     tickloop_agent_runtime::Agent::new_embedded(config.clone(), model.clone());
+                core.hold_goal_continuations_for_tests();
                 let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -217,4 +218,23 @@ fn startup_status_configuration_help_and_removed_model_file_notice_survive_refre
         );
         assert!(!selected.contains("Model selection: Applied"));
     }
+}
+
+#[test]
+fn new_chat_goal_only_monitor_opens_with_right_arrow() {
+    let (mut fixture, _directory) = start_startup_fixture("default");
+    fixture.wait_for("Tickloop");
+    fixture.send(b"/goal Verify the release and record acceptance evidence\r");
+    fixture.wait_for("Goal set");
+    fixture.send(b"/goal resume\r");
+    fixture.wait_for("Goal is already active.");
+    let refusal = fixture.repaint_after_recovery("Goal refusal", |frame| {
+        frame.contains("Goal is already active.")
+    });
+    assert!(!refusal.contains("invalid request:"), "{refusal}");
+    assert!(!refusal.contains("Cannot manage Goal:"), "{refusal}");
+    fixture.send(b"\x1b[C");
+    fixture.wait_for("enter Goal details");
+    fixture.send(b"\r");
+    fixture.wait_for("Adjust token budget");
 }

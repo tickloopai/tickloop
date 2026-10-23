@@ -40,7 +40,8 @@ pub enum LoopRequest {
 
 impl LoopRequest {
     /// Classifies the arguments of `/loop` after the cron crate splits off the interval; an
-    /// interval that is zero or too long is an error rather than part of the prompt.
+    /// interval that is zero or too long is an error rather than part of the prompt. Chinese
+    /// intervals such as `每分钟` can adjoin the instruction at either end.
     pub fn parse(arguments: &str) -> Result<Self, IntervalError> {
         let LoopArguments { interval, prompt } = parse_loop_arguments(arguments)?;
         let interval = interval.map(Interval::to_cron);

@@ -191,3 +191,49 @@ fn multi_day_intervals_restart_each_month() {
         ]
     );
 }
+
+#[test]
+fn chinese_intervals_work_at_either_end_without_spaces() {
+    for (phrase, expected) in [
+        ("每分钟", 1),
+        ("每5分钟", 5),
+        ("每 5 分钟", 5),
+        ("每小时", 60),
+        ("每2小时", 120),
+        ("每天", 1440),
+        ("每3天", 4320),
+        ("每30秒", 1),
+        ("每 90 秒", 2),
+    ] {
+        assert_eq!(Interval::parse(phrase), Ok(minutes(expected)));
+        for input in [
+            format!("{phrase}帮我看看特斯拉股价"),
+            format!("帮我看看特斯拉股价{phrase}"),
+        ] {
+            let parsed = parse_loop_arguments(&input).unwrap();
+            assert_eq!(parsed.interval, Some(minutes(expected)), "{input}");
+            assert_eq!(parsed.prompt, "帮我看看特斯拉股价", "{input}");
+        }
+        assert_eq!(parse_loop_arguments(phrase).unwrap().prompt, "");
+    }
+    assert!(matches!(
+        parse_loop_arguments("每0分钟检查"),
+        Err(IntervalError::Zero(_))
+    ));
+    assert!(matches!(
+        parse_loop_arguments("检查每99999999999999999999天"),
+        Err(IntervalError::TooLong(_))
+    ));
+    for input in [
+        "检查每个 PR",
+        "每次检查",
+        "检查每5分钟后再说",
+        "每-1分钟检查",
+    ] {
+        assert_eq!(
+            parse_loop_arguments(input).unwrap().interval,
+            None,
+            "{input}"
+        );
+    }
+}

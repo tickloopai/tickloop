@@ -1679,8 +1679,7 @@ impl Console {
             .lock()
             .map_err(|error| error.to_string())?
             .monitor
-            .total()
-            > 0)
+            .has_content())
     }
     pub(super) fn monitor_is_visible(&self) -> Result<bool, String> {
         Ok(self
@@ -6165,6 +6164,25 @@ impl State {
         }
         match event.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.monitor_visible()
+                    && self.monitor.task_list_is_open()
+                    && self.monitor.detail.is_none()
+                    && self.monitor_row_targets.first().is_some_and(|target| {
+                        Some(target.chat) == self.chat && target.columns.contains(&at.column)
+                    })
+                    && at.row < self.detail_area().1
+                {
+                    self.clear_footer_selection();
+                    self.conversation_focused = false;
+                    self.monitor.focus(self.monitor.overlay, None);
+                    self.monitor
+                        .move_selection(if event.kind == MouseEventKind::ScrollUp {
+                            -1
+                        } else {
+                            1
+                        });
+                    return true;
+                }
                 wheel_scroll(event.kind).is_some_and(|action| self.scroll_conversation(action))
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -6641,7 +6659,7 @@ impl State {
 
     fn monitor_visible(&self) -> bool {
         self.chat.is_some()
-            && (self.monitor.total() > 0 || self.monitor.is_shown())
+            && (self.monitor.has_content() || self.monitor.is_shown())
             && self.overview.projection.is_none()
             && self.workspace_trust.is_none()
             && self.history_search.is_none()
@@ -8056,11 +8074,16 @@ impl State {
                 self.width,
             )
         });
-        let has_goal_status = goal_status.is_some();
-        let core_status = goal_status.unwrap_or_else(|| {
-            self.status_area
-                .status_line_with_background(usize::MAX, "", None)
-        });
+        let core_status = self.status_area.status_line_with_indicator(
+            if goal_status.is_some() {
+                self.width
+            } else {
+                usize::MAX
+            },
+            "",
+            None,
+            goal_status.clone(),
+        );
         let float_core_status = !short
             && !overview
             && !self.help_open
@@ -8334,7 +8357,7 @@ impl State {
             if self.chat.is_some()
                 && self.overview.projection.is_none()
                 && !self.help_open
-                && (self.monitor.total() > 0 || self.monitor_visible())
+                && (self.monitor.has_content() || self.monitor_visible())
             {
                 let label = format!(
                     "{} Monitor {}",
@@ -8539,17 +8562,12 @@ impl State {
                 && compact_pending.is_none();
             let mut line = if core_in_hint_row {
                 // A short screen has room for one status row, and it keeps the core status.
-                if has_goal_status && background.is_none() {
-                    let mut line = core_status.clone();
-                    if !notice.is_empty() {
-                        line.push(format!(" · {notice}"), Some(Role::MutedText));
-                    }
-                    line.truncate(self.width);
-                    line
-                } else {
-                    self.status_area
-                        .status_line_with_background(self.width, &notice, background)
-                }
+                self.status_area.status_line_with_indicator(
+                    self.width,
+                    &notice,
+                    background,
+                    goal_status,
+                )
             } else {
                 let showing_update_notice = notice.is_empty()
                     && background.is_none()
@@ -8602,12 +8620,12 @@ impl State {
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
                     let navigation_hint = if self.visible_prompt_suggestion().is_some()
-                        && (self.monitor.total() > 0 || self.monitor.goal().is_some())
+                        && self.monitor.has_content()
                     {
                         "← Agents · → Monitor · tab accept · ? help · ctrl+o details · ctrl+g editor"
                     } else if self.visible_prompt_suggestion().is_some() {
                         "← Agents · tab accept · ? help · ctrl+o details · ctrl+g editor"
-                    } else if self.monitor.total() == 0 && self.monitor.goal().is_none() {
+                    } else if !self.monitor.has_content() {
                         "← Agents · ? help · ctrl+o details · ctrl+g editor"
                     } else {
                         "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor"
@@ -11557,6 +11575,10 @@ impl State {
                         .ok()?;
                     return Some(InputEvent::TickAction { chat, action });
                 }
+                (KeyCode::Esc | KeyCode::Left, _) if self.monitor.task_list_is_open() => {
+                    self.monitor.close_task_list();
+                    self.rendered_region = None;
+                }
                 (KeyCode::Esc | KeyCode::Left, _) => {
                     self.monitor.focused = false;
                     self.monitor.overlay = false;
@@ -11566,6 +11588,11 @@ impl State {
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
+                (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.is_more_selected() => {
+                    self.monitor.open_task_list();
+                    self.rendered_region = None;
+                }
+                (KeyCode::Char('x'), KeyModifiers::NONE) if self.monitor.is_more_selected() => {}
                 (KeyCode::Char('x'), KeyModifiers::NONE) if self.monitor.is_goal_selected() => {}
                 (KeyCode::Enter | KeyCode::Char('x'), _)
                     if self.monitor.selected_task().is_some() =>
@@ -11652,7 +11679,7 @@ impl State {
             return None;
         }
         if self.chat.is_some()
-            && (self.monitor.total() > 0 || self.monitor.goal().is_some())
+            && self.monitor.has_content()
             && self.ordinary_input_is_visible()
             && !self.conversation_focused
             && self.footer.selected().is_none()

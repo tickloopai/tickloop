@@ -25,7 +25,11 @@ const LEAD_GAP: &str = " ";
 const NAME_GAP: &str = " ";
 
 pub(super) fn name_column(glyph: &str) -> usize {
-    ROW_INDENT.width() + glyph.width() + NAME_GAP.width()
+    ROW_INDENT.width() + compact_name_column(glyph)
+}
+
+pub(super) fn compact_name_column(glyph: &str) -> usize {
+    glyph.width() + NAME_GAP.width()
 }
 const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";

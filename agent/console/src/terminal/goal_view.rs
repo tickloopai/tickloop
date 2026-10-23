@@ -1,12 +1,11 @@
 use super::{
-    display::DisplayProfile,
+    display::{DisplayProfile, Glyph},
     list_row::{self, RowFlash},
-    loop_view_text::{clipped, wrapped},
+    loop_view_text::{clipped, ellipsize, wrapped},
     presentation::compact_count,
     style::{Role, RoleLine},
 };
 
-const CONDITION_ROWS: usize = 3;
 const TRIGGERS_PAUSED: &str = "Triggers paused · send a message to resume";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +25,16 @@ impl GoalState {
             Self::Blocked => "blocked",
             Self::BudgetLimited => "budget_limited",
             Self::Complete => "complete",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Active => "Pursuing goal",
+            Self::Paused => "Goal paused",
+            Self::Blocked => "Goal stalled",
+            Self::BudgetLimited => "Goal unmet",
+            Self::Complete => "Goal achieved",
         }
     }
 
@@ -86,36 +95,65 @@ impl<'a> GoalView<'a> {
     pub(super) fn monitor_lines(
         &self,
         width: usize,
+        selected: bool,
         display: DisplayProfile,
+        ascii: bool,
         now_ms: u64,
     ) -> Vec<RoleLine> {
         if width == 0 {
             return Vec::new();
         }
-        let mut lines = vec![clipped("Goal", width, Role::Title)];
-        let mut condition = wrapped(self.condition, width, Role::Text);
-        if condition.len() > CONDITION_ROWS {
-            condition.truncate(CONDITION_ROWS);
-            let last = condition.last_mut().expect("condition has three rows");
-            *last = clipped(&format!("{}…", last.text()), width, Role::Text);
+        let glyph = if ascii {
+            "o"
+        } else {
+            display.glyph(Glyph::Goal)
+        };
+        let indent = list_row::compact_name_column(glyph).min(width);
+        let time = ellipsize(&format_elapsed(self.elapsed_ms), width - indent);
+        let title = ellipsize(
+            self.state.title(),
+            width.saturating_sub(indent + unicode_width::UnicodeWidthStr::width(time.as_str()) + 1),
+        );
+        let mut header = RoleLine::role(glyph, self.state.role());
+        if width > unicode_width::UnicodeWidthStr::width(glyph) {
+            header.push(" ", Some(self.state.role()));
         }
-        lines.extend(condition);
-        lines.push(clipped(
-            &format!("{} · {}", self.state.label(), self.usage()),
-            width,
-            self.state.role(),
-        ));
-        if let Some(reason) = self.check_reason {
-            lines.push(clipped(&format!("Check: {reason}"), width, Role::MutedText));
-        }
-        if let Some(fill) = list_row::flash_fill(
+        header.preserve_selection_colours = true;
+        header.push(title, Some(self.state.role()));
+        header.push(
+            " ".repeat(width.saturating_sub(
+                unicode_width::UnicodeWidthStr::width(header.text().as_str())
+                    + unicode_width::UnicodeWidthStr::width(time.as_str()),
+            )),
+            None,
+        );
+        header.push(time, Some(Role::MutedText));
+        let mut condition = RoleLine::role(" ".repeat(indent), Role::MutedText);
+        condition.push(
+            ellipsize(&super::safe_line(self.condition), width - indent),
+            Some(if selected {
+                Role::Text
+            } else {
+                Role::MutedText
+            }),
+        );
+        let fill = list_row::flash_fill(
             self.continued_at_ms.map(|since| (RowFlash::TakeIn, since)),
             display,
             now_ms,
-        ) {
-            lines = lines.into_iter().map(|line| line.filled(fill)).collect();
-        }
-        lines
+        );
+        [header, condition]
+            .into_iter()
+            .map(|line| {
+                if selected {
+                    line.filled(Role::Selection)
+                } else if let Some(fill) = fill {
+                    line.filled_from(fill, indent)
+                } else {
+                    line
+                }
+            })
+            .collect()
     }
 
     pub(super) fn detail_lines(&self, width: usize, top: usize, height: usize) -> Vec<RoleLine> {
