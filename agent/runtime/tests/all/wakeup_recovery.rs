@@ -888,7 +888,12 @@ async fn boundary_waiters(agent: &Agent, chat: Uuid, count: usize) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{count} wait(s) to enter the boundary"));
+    .unwrap_or_else(|_| {
+        panic!(
+            "{count} wait(s) to enter the boundary, not {}",
+            agent.trigger_boundary_waiters_for_tests(chat)
+        )
+    });
 }
 
 /// Whether the Chat's recorded receiving switch, which other processes read, is on.
@@ -1653,6 +1658,59 @@ async fn a_start_taken_back_after_a_load_runs_in_the_loader_taking_over() {
     );
     loader.shutdown().await;
     processes.second.shutdown().await;
+}
+
+/// Two takes of the same queued Trigger input, the second waiting for the boundary while the
+/// first starts it: the second finds it taken and leaves it alone, so nothing records the
+/// running input as waiting again, and a crash while it runs does not run it a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_finding_its_input_started_by_another_leaves_it_alone() {
+    const MARKER: &str = "taken-by-the-first";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), &format!("HOLD:raced {MARKER}"))
+        .await
+        .unwrap();
+    let checked = agent.pause_next_for_tests(chat, PausePoint::TriggerChecked);
+    model.release_held_turn();
+    tokio::time::timeout(WAIT, checked.entered)
+        .await
+        .expect("the first take is about to start the input")
+        .unwrap();
+    // The user's input looks at the queue too, finds the same input first and takes it as well;
+    // a change of the receiving switch to keep it on waits for the boundary beside it.
+    let second = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.submit(chat, "after the race".into()).await }
+    });
+    boundary_waiters(&agent, chat, 2).await;
+    drop(checked.release);
+    model.wait_held("raced").await;
+    second.await.unwrap().unwrap();
+    agent.flush_transcripts().await;
+    let image = crash_image(&root, directory.path());
+    model.release("raced");
+    agent.shutdown().await;
+
+    let restarted_model = ContractModel::new();
+    let restarted = Agent::open_embedded(image, config(), restarted_model.clone()).unwrap();
+    restarted.resume_chat(chat).await.unwrap();
+    complete_turn(&restarted, chat, "carry on").await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen(MARKER), 1);
+    assert_eq!(
+        restarted_model.seen(MARKER),
+        0,
+        "{:?}",
+        restarted_model.prompts()
+    );
+    restarted.shutdown().await;
 }
 
 /// A custom title Line, the record the example sources of these tests keep their state in.

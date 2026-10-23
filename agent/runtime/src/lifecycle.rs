@@ -270,8 +270,9 @@ impl Lifecycle {
             .is_some_and(|input| input.state == InputState::Started)
     }
 
-    /// Takes back the start of `queued`'s input, which has not run: a newer record has it
-    /// accepted and waiting again, with its content, whatever lands of the start before it.
+    /// Takes back the start of `queued`'s input made ahead of it: a newer record has it
+    /// accepted and waiting again, with its content, whatever lands of the start before it. A
+    /// start the input itself followed, its content in the conversation, is never taken back.
     pub(crate) fn take_start_back(&mut self, queued: &PendingInput) {
         let Some(id) = self.open_inputs.get(&queued.receipt.run_id).copied() else {
             return;
@@ -279,6 +280,7 @@ impl Lifecycle {
         let revision = self.next_revision();
         if let Some(input) = self.inputs.get_mut(&id)
             && input.record.state == InputState::Started
+            && input.record.queued.is_some()
         {
             input.record.state = InputState::Accepted;
             input.record.queued =

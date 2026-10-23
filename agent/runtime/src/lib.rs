@@ -597,6 +597,26 @@ enum TriggerTake {
     LookAgain,
 }
 
+/// Why a take of `pending` stops before it starts the input, as another take of it may have
+/// started it meanwhile; `None` while it waits in the Chat's queue as it was found there,
+/// accepted and not started.
+fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
+    let queued = chat.snapshot.pending_inputs.iter().any(|queued| {
+        queued.receipt.run_id == pending.receipt.run_id
+            && queued.input == pending.input
+            && queued.trigger_source == pending.trigger_source
+    });
+    if !queued {
+        return Some(TriggerTake::LookAgain);
+    }
+    // Queued but not waiting in the ledger: looking again would find it again.
+    (!chat
+        .bookkeeping
+        .lifecycle
+        .waits_to_start(pending.receipt.run_id))
+    .then_some(TriggerTake::Waits)
+}
+
 /// Queues a Run that continues the conversation without a message of its own.
 fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
@@ -3814,10 +3834,27 @@ impl Agent {
             }
             | loop_lease::TriggerPermit::Withdrawn => return Ok(TriggerTake::Waits),
         };
+        // Another take of the same input may have started it while this one waited for the
+        // boundary: only a take that finds it still waiting here goes on, so no take starts or
+        // takes back what another one started.
+        if let Some(take) = taken_elsewhere(
+            self.inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?,
+            pending,
+        ) {
+            return Ok(take);
+        }
         // Boxed: proving a source must not enlarge every run's shared async stack.
         let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if let Some(take) = taken_elsewhere(chat, pending) {
+            return Ok(take);
+        }
         if validation.is_err() {
             self.withdraw_trigger_input(chat, &pending.receipt, DiscardReason::SourceEnded);
             self.withdraw_ended_inputs(chat);
