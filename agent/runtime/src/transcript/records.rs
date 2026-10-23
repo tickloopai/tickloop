@@ -63,6 +63,18 @@ pub async fn transcript(
         .and_then(|entry| entry.cwd.clone())
         .unwrap_or_default();
     Ok(ObservationValue::Transcript(Box::new(RecordedTranscript {
+        goal_history: tickloop_agent_transcript::display::goal_events(&[loaded
+            .retained
+            .snapshot(record.chat_id)])
+        .into_iter()
+        .filter(|entry| entry.chat_id == record.chat_id)
+        .map(|entry| tickloop_agent_protocol::GoalHistoryEntry {
+            after_message_id: entry.after_message_id,
+            objective: entry.objective,
+            notice: entry.notice,
+            timestamp: entry.timestamp,
+        })
+        .collect(),
         record,
         title: loaded.metadata.custom_title.map(|entry| entry.custom_title),
         folder,

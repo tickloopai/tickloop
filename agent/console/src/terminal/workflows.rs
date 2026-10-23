@@ -886,6 +886,10 @@ fn public_history_pieces(
     };
     let mut tool_calls = HashMap::new();
     let mut answers_tick_delivery = false;
+    let mut goal_history = chat.goal_history.iter().peekable();
+    while let Some(entry) = goal_history.next_if(|entry| entry.after_message_id.is_none()) {
+        history.push_runs(&super::goal_view::notice_runs(&entry.notice));
+    }
     for item in projection {
         match item {
             BranchPublicItem::Summary { .. } => {
@@ -924,8 +928,16 @@ fn public_history_pieces(
                     display,
                     folded,
                 );
+                while let Some(entry) =
+                    goal_history.next_if(|entry| entry.after_message_id == source.message_id)
+                {
+                    history.push_runs(&super::goal_view::notice_runs(&entry.notice));
+                }
             }
         }
+    }
+    for entry in goal_history {
+        history.push_runs(&super::goal_view::notice_runs(&entry.notice));
     }
     let pending = pending_reply(chat);
     if !pending.is_empty() {

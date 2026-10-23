@@ -32,7 +32,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
     }
 }
 
-fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
+pub(super) fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
     serde_json::from_value(serde_json::json!({
         "id": chat,
         "folder": "/fixture",
@@ -235,6 +235,136 @@ fn tick_action_signature(input: Option<InputEvent>) -> String {
         }
         _ => panic!("expected a Tick row action"),
     }
+}
+
+#[test]
+fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hints() {
+    use crate::terminal::monitor::MonitorTarget;
+
+    let mut state = click_fixture(140, false, TickGroup::Shells);
+    let tick = state.monitor.entries()[0].clone();
+    let mut snapshot = chat_snapshot(state.chat.unwrap());
+    snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
+        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
+        "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
+        "jitter_ms":0, "skipped":0
+    }]))
+    .unwrap();
+    snapshot.goal = Some(
+        serde_json::from_value(serde_json::json!({
+            "id":Uuid::from_u128(707), "objective":"Verify release evidence",
+            "objective_revision":1, "set_by":"user", "status":{"state":"active"},
+            "tokens_used":0, "time_used_ms":0, "quiet_turns":0,
+            "created_at_ms":0, "updated_at_ms":0
+        }))
+        .unwrap(),
+    );
+    state.monitor.chat_status = Some(Arc::new(ChatStatus::of(&snapshot)));
+    state.monitor.replace(TickGroup::Shells, vec![tick.clone()]);
+    state.monitor.focus(false, None);
+    assert_eq!(state.monitor.total(), 2, "Goal is not a member row");
+
+    let expected = [
+        (
+            MonitorTarget::Tick(tick.instance.clone()),
+            "exit 0",
+            "enter open · x remove · esc input",
+        ),
+        (
+            MonitorTarget::ScheduledTask("0123abcd".into()),
+            "Scheduled task 0123abcd",
+            "enter details · x delete · esc input",
+        ),
+        (
+            MonitorTarget::Goal,
+            "Enter Goal details",
+            "enter Goal details · j/k select · esc return to input",
+        ),
+    ];
+    let mut goal_row = None;
+    for (key, index) in [('k', 0), ('j', 1), ('j', 2), ('j', 2), ('k', 1), ('k', 0)] {
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .is_none()
+        );
+        let (target, footer, hint) = &expected[index];
+        match target {
+            MonitorTarget::Tick(instance) => {
+                assert_eq!(&state.monitor.selected().unwrap().instance, instance)
+            }
+            MonitorTarget::ScheduledTask(id) => {
+                assert_eq!(&state.monitor.selected_task().unwrap().id, id)
+            }
+            MonitorTarget::Goal => {
+                assert!(state.monitor.is_goal_selected());
+                assert!(state.monitor.selected().is_none());
+                assert!(state.monitor.selected_task().is_none());
+            }
+        }
+        assert_eq!(state.monitor.hint(), *hint);
+        let frame = state.monitor.frame(80, 15, state.display, 0);
+        assert_eq!(frame.lines.last().unwrap().text(), *footer);
+        let row = frame
+            .lines
+            .iter()
+            .position(|line| line.text() == "Goal")
+            .unwrap();
+        assert_eq!(
+            *goal_row.get_or_insert(row),
+            row,
+            "Goal stays fixed at the bottom"
+        );
+        assert!(
+            !frame
+                .lines
+                .iter()
+                .any(|line| line.text() == "Nothing to monitor")
+        );
+        assert!(
+            frame
+                .targets
+                .iter()
+                .all(|(_, target)| *target != MonitorTarget::Goal)
+        );
+        assert_eq!(frame.lines[row].fill == Some(Role::Selection), index == 2);
+    }
+
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == tick.instance.to_string() && action.key == crate::monitor_rows::MONITOR_ENTER_KEY)
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == "0123abcd")
+    );
+    assert!(state.monitor.detail.is_some());
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.monitor.detail.is_none());
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.monitor.is_goal_selected());
+    assert!(state.monitor.focused);
+    assert!(state.editor.draft().is_empty());
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Line(line)) if line == "/goal")
+    );
 }
 
 #[test]

@@ -134,6 +134,7 @@ pub(crate) struct ConfirmationOption {
 pub(super) enum MonitorTarget {
     Tick(InstanceRef),
     ScheduledTask(String),
+    Goal,
 }
 
 #[derive(Default)]
@@ -154,6 +155,7 @@ pub(super) struct Monitor {
     earlier_pages: Vec<Option<PageCursor>>,
     next_page: Option<PageCursor>,
     selected: Option<MonitorTarget>,
+    goal_continued_at_ms: Option<u64>,
     rows: Option<MonitorRowsRegistry>,
     pub(super) chat_status: Option<Arc<ChatStatus>>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
@@ -202,6 +204,35 @@ pub(super) struct MonitorFrame {
 }
 
 impl Monitor {
+    pub(super) fn goal(&self) -> Option<super::goal_view::GoalView<'_>> {
+        let mut view =
+            super::goal_view::GoalView::from_snapshot(self.chat_status.as_ref()?.goal.as_ref()?);
+        view.continued_at_ms = self.goal_continued_at_ms;
+        if let Some(status) = &self.chat_status
+            && matches!(
+                status.goal.as_ref()?.status,
+                tickloop_agent_protocol::GoalStatus::Active
+            )
+            && matches!(
+                status.chat_loop.state,
+                tickloop_agent_protocol::LoopState::Running
+                    | tickloop_agent_protocol::LoopState::WaitingPermission
+                    | tickloop_agent_protocol::LoopState::WaitingQuestion
+                    | tickloop_agent_protocol::LoopState::WaitingPlan
+            )
+        {
+            let since = status
+                .goal
+                .as_ref()?
+                .updated_at_ms
+                .max(status.chat_loop.run_started_at.unwrap_or(u64::MAX));
+            view.elapsed_ms = view.elapsed_ms.saturating_add(
+                tickloop_agent_base::private_fs::unix_time_milliseconds().saturating_sub(since),
+            );
+        }
+        Some(view)
+    }
+
     pub(super) fn refresh_action(
         &mut self,
     ) -> std::sync::Arc<dyn super::tick_actions::TickActionExecutor> {
@@ -238,12 +269,20 @@ impl Monitor {
         };
         self.tasks().iter().find(|task| &task.id == id)
     }
+    pub(super) fn is_goal_selected(&self) -> bool {
+        self.selected == Some(MonitorTarget::Goal) && self.goal().is_some()
+    }
     pub(super) fn select_target(&mut self, target: &MonitorTarget) {
         match target {
             MonitorTarget::Tick(instance) => self.select(instance),
             MonitorTarget::ScheduledTask(id) => {
-                if self.tasks().iter().any(|task| &task.id == id) {
+                if self.tasks_visible() && self.tasks().iter().any(|task| &task.id == id) {
                     self.selected = Some(target.clone());
+                }
+            }
+            MonitorTarget::Goal => {
+                if self.goal().is_some() {
+                    self.selected = Some(MonitorTarget::Goal);
                 }
             }
         }
@@ -280,7 +319,7 @@ impl Monitor {
     }
     /// Whether the column has shown rows in this Chat, so it stays on screen when empty.
     pub(super) fn is_shown(&self) -> bool {
-        self.shown
+        self.shown || self.goal().is_some()
     }
     /// Rebuilds the list when time alone changed it, and says whether it did.
     pub(super) fn refresh_due(&mut self, now_ms: u64) -> bool {
@@ -325,6 +364,27 @@ impl Monitor {
     /// that one.
     fn adopt_chat_status(&mut self, status: Arc<ChatStatus>) {
         let previous = self.chat_status.take();
+        if let Some(previous) = &previous {
+            if previous.goal.as_ref().map(|goal| goal.id)
+                != status.goal.as_ref().map(|goal| goal.id)
+            {
+                self.goal_continued_at_ms = None;
+            }
+            let continued = status
+                .goal
+                .as_ref()
+                .and_then(|goal| goal.last_continued_at_ms);
+            if continued.is_some()
+                && continued
+                    != previous
+                        .goal
+                        .as_ref()
+                        .and_then(|goal| goal.last_continued_at_ms)
+            {
+                self.goal_continued_at_ms =
+                    Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
+            }
+        }
         for tick in &status.artifact_ticks {
             let id = tick.instance_id();
             let is_renamed = previous.as_ref().is_some_and(|previous| {
@@ -567,6 +627,7 @@ impl Monitor {
         self.update_flashes.clear();
         self.listed_updates.clear();
         self.flashes_since = Some(now_ms);
+        self.goal_continued_at_ms = None;
     }
     /// When time alone next changes the list: the next finished Shell to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
@@ -656,6 +717,10 @@ impl Monitor {
             .chain(task_animation)
             .chain(flashing)
             .chain(counting_down)
+            .chain(
+                self.goal_continued_at_ms
+                    .and_then(|since| display.next_flash_change_ms(since, now_ms)),
+            )
             .min()
     }
     /// What `entry`'s whole row flashes for, and since when: the later of an Agent turn taking its
@@ -703,7 +768,7 @@ impl Monitor {
             )
         });
         self.entries.dedup_by(|a, b| a.instance == b.instance);
-        self.total = self.entries.len();
+        self.total = self.entries.len() + self.tasks().len();
         self.shown |= self.total > 0;
         self.group_totals.clear();
         for entry in &self.entries {
@@ -717,10 +782,12 @@ impl Monitor {
         }
         if self.entries.is_empty() && self.tasks().is_empty() {
             self.detail = None;
+        }
+        if self.entries.is_empty() && self.tasks().is_empty() && self.goal().is_none() {
             self.focused = false;
             self.overlay = false;
         }
-        if self.selected().is_none() && self.selected_task().is_none() {
+        if self.selected().is_none() && self.selected_task().is_none() && !self.is_goal_selected() {
             self.selected = self
                 .entries
                 .first()
@@ -730,6 +797,9 @@ impl Monitor {
                     .tasks()
                     .first()
                     .map(|task| MonitorTarget::ScheduledTask(task.id.clone()));
+            }
+            if self.selected.is_none() && self.goal().is_some() {
+                self.selected = Some(MonitorTarget::Goal);
             }
         }
     }
@@ -756,12 +826,7 @@ impl Monitor {
         if let Some(group) = group {
             self.show_group(group);
         }
-        if self.selected.is_none() {
-            self.selected = self
-                .entries
-                .first()
-                .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
-        }
+        self.reconcile_selection();
     }
     /// Selects the group's first row, turning to the page that holds it.
     fn show_group(&mut self, group: TickGroup) {
@@ -785,6 +850,12 @@ impl Monitor {
     }
     /// Moves within the page; past its last or first row the next or earlier page opens.
     pub(super) fn move_selection(&mut self, delta: isize) {
+        let task_count = if self.tasks_visible() {
+            self.tasks().len()
+        } else {
+            0
+        };
+        let member_count = self.entries.len() + task_count;
         let index = match self.selected.as_ref() {
             Some(MonitorTarget::Tick(instance)) => self
                 .entries
@@ -795,22 +866,11 @@ impl Monitor {
                 .iter()
                 .position(|task| &task.id == id)
                 .map(|index| index + self.entries.len()),
+            Some(MonitorTarget::Goal) => Some(member_count),
             None => None,
         }
         .unwrap_or(0);
-        let target = (index as isize + delta).max(if self.entries.is_empty() {
-            0
-        } else {
-            isize::MIN
-        });
-        if self.tasks_visible() && !self.tasks().is_empty() && target >= self.entries.len() as isize
-        {
-            let task_index = (target as usize - self.entries.len()).min(self.tasks().len() - 1);
-            self.selected = Some(MonitorTarget::ScheduledTask(
-                self.tasks()[task_index].id.clone(),
-            ));
-            return;
-        }
+        let target = (index as isize).saturating_add(delta);
         if target >= self.entries.len() as isize
             && let Some(next) = self.next_page.take()
         {
@@ -833,11 +893,16 @@ impl Monitor {
                 .map(|entry| MonitorTarget::Tick(entry.instance.clone()));
             return;
         }
-        if let Some(entry) = self
-            .entries
-            .get(target.clamp(0, self.entries.len().saturating_sub(1) as isize) as usize)
-        {
+        let selectable_count = member_count + usize::from(self.goal().is_some());
+        let target = target.clamp(0, selectable_count.saturating_sub(1) as isize) as usize;
+        if let Some(entry) = self.entries.get(target) {
             self.selected = Some(MonitorTarget::Tick(entry.instance.clone()));
+        } else if target < member_count {
+            self.selected = Some(MonitorTarget::ScheduledTask(
+                self.tasks()[target - self.entries.len()].id.clone(),
+            ));
+        } else if self.goal().is_some() {
+            self.selected = Some(MonitorTarget::Goal);
         }
     }
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
@@ -906,6 +971,9 @@ impl Monitor {
 
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
+        if self.is_goal_selected() {
+            return "enter Goal details · j/k select · esc return to input".into();
+        }
         if self.selected_task().is_some() {
             return "enter details · x delete · esc input".into();
         }
@@ -1059,11 +1127,34 @@ impl Monitor {
                 }
             }
         }
-        if self.total == 0 {
+        if self.entries.is_empty() && self.tasks().is_empty() && self.goal().is_none() {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
             row_ids.push(None);
         }
-        let capacity = height.saturating_sub(2);
+        let mut goal_lines = self
+            .goal()
+            .map(|goal| goal.monitor_lines(width, display, now_ms))
+            .unwrap_or_default();
+        goal_lines.truncate(height.saturating_sub(1));
+        if self.is_goal_selected()
+            && self.focused
+            && list_row::flash_fill(
+                self.goal_continued_at_ms
+                    .map(|since| (RowFlash::TakeIn, since)),
+                display,
+                now_ms,
+            )
+            .is_none()
+        {
+            goal_lines = goal_lines
+                .into_iter()
+                .map(|line| line.filled(Role::Selection))
+                .collect();
+        }
+        let capacity = height.saturating_sub(2 + goal_lines.len());
+        if self.is_goal_selected() {
+            selected_row = rows.len().saturating_sub(1);
+        }
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
         let targets = row_ids
             .into_iter()
@@ -1074,8 +1165,19 @@ impl Monitor {
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
         if height > 1 {
-            lines.resize(height - 1, RoleLine::default());
-            lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
+            lines.resize(
+                height.saturating_sub(1 + goal_lines.len()),
+                RoleLine::default(),
+            );
+            lines.extend(goal_lines);
+            lines.push(RoleLine::role(
+                if self.is_goal_selected() {
+                    "Enter Goal details".into()
+                } else {
+                    self.selected_status()
+                },
+                Role::MutedText,
+            ));
         }
         lines.truncate(height);
         for line in &mut lines {

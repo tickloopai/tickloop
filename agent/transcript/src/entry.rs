@@ -712,6 +712,8 @@ pub struct GoalEntry {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalEventEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_message_id: Option<Uuid>,
     pub chat_id: Uuid,
     pub goal_id: Uuid,
     /// The objective when it happened.

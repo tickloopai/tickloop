@@ -65,8 +65,10 @@ use crate::{
 /// `ManageGoal`, goal updates and the completion check's requests for the goal, and Loop
 /// actions that delete a scheduled task or answer a pending one, with an event announcing
 /// their changes.
+/// 28.2 adds Goal display history, continuation times, and the Goal and scheduled tasks on the
+/// lightweight Chat status.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -146,6 +148,8 @@ pub struct RecordedMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecordedTranscript {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_history: Vec<crate::GoalHistoryEntry>,
     pub record: TranscriptRef,
     pub title: Option<String>,
     pub folder: PathBuf,

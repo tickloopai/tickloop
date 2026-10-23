@@ -383,15 +383,30 @@ impl Agent {
             .map_or(0, |goal| goal.tokens_used);
         record(goal_line(chat));
         if let Some((goal_id, objective)) = &subject {
+            let after_message_id = chat
+                .snapshot
+                .message_ids
+                .last_key_value()
+                .map(|(_, id)| *id);
             for notice in &notices {
+                let timestamp = format_timestamp(unix_time_milliseconds());
+                chat.snapshot
+                    .goal_history
+                    .push(tickloop_agent_protocol::GoalHistoryEntry {
+                        after_message_id,
+                        objective: objective.clone(),
+                        notice: notice.clone(),
+                        timestamp: timestamp.clone(),
+                    });
                 self.record_chat_metadata(
                     chat_id,
                     Line::GoalEvent(GoalEventEntry {
+                        after_message_id,
                         chat_id,
                         goal_id: *goal_id,
                         objective: objective.clone(),
                         notice: notice.clone(),
-                        timestamp: format_timestamp(unix_time_milliseconds()),
+                        timestamp,
                     }),
                 );
             }
@@ -605,6 +620,15 @@ impl Agent {
                 // The goal's usage so far is recorded with the acceptance, before its turn.
                 on_accept: Some(Box::new(
                     |change: &SourceChange, chat: &mut Chat, _: &Receipt| {
+                        if let Some(goal) = &mut chat.snapshot.goal {
+                            goal.last_continued_at_ms = Some(
+                                unix_time_milliseconds().max(
+                                    goal.last_continued_at_ms
+                                        .unwrap_or_default()
+                                        .saturating_add(1),
+                                ),
+                            );
+                        }
                         change.agent().record_goal(chat, None, Vec::new(), &|line| {
                             change.record_source_state(line)
                         });
@@ -856,6 +880,20 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
         if chat.snapshot.delegation.is_some() {
             return;
         }
+        let mut retained = crate::transcript::RetainedFold::default();
+        for line in stored {
+            retained.apply(line);
+        }
+        chat.snapshot.goal_history =
+            tickloop_agent_transcript::display::goal_events(&[retained.snapshot(chat.snapshot.id)])
+                .into_iter()
+                .map(|entry| tickloop_agent_protocol::GoalHistoryEntry {
+                    after_message_id: entry.after_message_id,
+                    objective: entry.objective,
+                    notice: entry.notice,
+                    timestamp: entry.timestamp,
+                })
+                .collect();
         let mut goal = tickloop_agent_transcript::display::goal(stored);
         chat.goal_recorded_tokens = goal.as_ref().map_or(0, |goal| goal.tokens_used);
         // What this process counted for the same goal and has not recorded yet still counts.

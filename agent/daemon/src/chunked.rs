@@ -114,6 +114,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             observation_id: Uuid::new_v4(),
             initial: ObservationValue::Transcript(Box::new(RecordedTranscript {
+                goal_history: Vec::new(),
                 record: TranscriptRef {
                     store_root: "/tmp/transcripts".into(),
                     chat_id: Uuid::new_v4(),

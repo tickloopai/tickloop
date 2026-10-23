@@ -14,6 +14,7 @@ fn snapshot(objective: &str, status: GoalStatus) -> GoalSnapshot {
         time_used_ms: 0,
         last_check: None,
         quiet_turns: 0,
+        last_continued_at_ms: None,
         created_at_ms: 1,
         updated_at_ms: 1,
     }
@@ -29,6 +30,7 @@ fn goal_line(goal: Option<GoalSnapshot>) -> Line {
 
 fn event_line(notice: GoalNotice) -> Line {
     Line::GoalEvent(GoalEventEntry {
+        after_message_id: None,
         chat_id: Uuid::nil(),
         goal_id: Uuid::nil(),
         objective: "Ship it".into(),

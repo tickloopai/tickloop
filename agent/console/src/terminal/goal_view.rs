@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tickets 07 and 09 wire the views")
-)]
-
 use super::{
     display::DisplayProfile,
     list_row::{self, RowFlash},
@@ -56,7 +51,31 @@ pub(super) struct GoalView<'a> {
     pub(super) continued_at_ms: Option<u64>,
 }
 
-impl GoalView<'_> {
+impl<'a> GoalView<'a> {
+    pub(super) fn from_snapshot(goal: &'a tickloop_agent_protocol::GoalSnapshot) -> Self {
+        use tickloop_agent_protocol::{GoalStatus, GoalVerdict};
+        Self {
+            condition: &goal.objective,
+            state: match goal.status {
+                GoalStatus::Active => GoalState::Active,
+                GoalStatus::Paused { .. } => GoalState::Paused,
+                GoalStatus::Blocked { .. } => GoalState::Blocked,
+                GoalStatus::BudgetLimited => GoalState::BudgetLimited,
+                GoalStatus::Complete => GoalState::Complete,
+            },
+            tokens_used: goal.tokens_used,
+            token_budget: goal.token_budget,
+            elapsed_ms: goal.time_used_ms,
+            check_reason: goal.last_check.as_ref().map(|check| match &check.verdict {
+                GoalVerdict::Met => "Goal met",
+                GoalVerdict::NotMet { reason } | GoalVerdict::Impossible { reason } => {
+                    reason.as_str()
+                }
+            }),
+            continued_at_ms: None,
+        }
+    }
+
     fn usage(&self) -> String {
         match self.token_budget {
             Some(budget) => format!("{} / {}", tokens(self.tokens_used), tokens(budget)),
@@ -183,3 +202,29 @@ fn format_elapsed(milliseconds: u64) -> String {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn notice_runs(
+    notice: &tickloop_agent_protocol::GoalNotice,
+) -> Vec<(String, Option<Role>)> {
+    use tickloop_agent_protocol::{GoalBlock, GoalNotice};
+    let (text, role) = match notice {
+        GoalNotice::Set => ("Goal set".into(), Role::Accent),
+        GoalNotice::Completed => ("Goal achieved".into(), Role::Success),
+        GoalNotice::Blocked { by } => (
+            format!(
+                "Goal stalled: {}",
+                match by {
+                    GoalBlock::Reported { reason } | GoalBlock::CheckImpossible { reason } =>
+                        super::safe_line(reason),
+                    GoalBlock::ExecutionFailed { error } => super::safe_line(error),
+                    GoalBlock::NoProgress => "no progress in three continuations".into(),
+                }
+            ),
+            Role::Warning,
+        ),
+        GoalNotice::BudgetLimited => ("Goal token budget exhausted".into(), Role::Warning),
+        GoalNotice::Paused { .. } => ("Goal paused · /goal resume".into(), Role::MutedText),
+        GoalNotice::Cleared => ("Goal cleared".into(), Role::MutedText),
+    };
+    vec![(format!("\n● {text}\n"), Some(role))]
+}
