@@ -309,8 +309,10 @@ pub(super) fn transcript_document(
                 }
                 let dot = match result {
                     None => Role::MutedText,
-                    Some(_) if failed => Role::Error,
-                    Some(_) => Role::Success,
+                    Some(_) => {
+                        tool_result_state(name, content.map_or("", |(content, _)| content), failed)
+                            .dot_role()
+                    }
                 };
                 let launch = content
                     .filter(|_| name == SUBAGENT_TOOL_NAME)
@@ -768,6 +770,14 @@ fn transcript_result_lines(
     {
         return subagent_result_lines(input, value, elapsed_ms, report);
     }
+    if let Some(reason) = goal_completion_rejection_reason(name, content, is_error) {
+        let mut lines = vec![ResultLine::new("Not complete yet", Some(Role::Warning))];
+        lines.extend(text_lines(
+            &format!("Reason: {}", safe_text(reason)),
+            Some(Role::MutedText),
+        ));
+        return lines;
+    }
     if is_error && let Some(lines) = web_search_failure_lines(name, content) {
         return lines;
     }
@@ -1060,7 +1070,14 @@ impl ToolPresentation {
                 call_id, result, ..
             } => console.finish_tool_call(
                 event.run_id,
-                Some((&tool_call_key(event.run_id, call_id), result.is_error)),
+                Some((
+                    &tool_call_key(event.run_id, call_id),
+                    tool_result_state(
+                        self.started_call(event, call_id).0,
+                        &result.content,
+                        result.is_error,
+                    ),
+                )),
             )?,
             EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
                 console.finish_tool_call(event.run_id, None)?
@@ -1132,11 +1149,11 @@ impl ToolPresentation {
                 call_id, result, ..
             } if !self.detailed => {
                 let key = tool_call_key(event.run_id, call_id);
-                let state = if result.is_error {
-                    ToolCallState::Failed
-                } else {
-                    ToolCallState::Finished
-                };
+                let state = tool_result_state(
+                    self.started_call(event, call_id).0,
+                    &result.content,
+                    result.is_error,
+                );
                 match self.started_call(event, call_id) {
                     // A failed TodoWrite shows its row.
                     (name, Some(input))
@@ -1167,7 +1184,7 @@ impl ToolPresentation {
                     }
                     _ => {}
                 }
-                console.write_tool_result(&key, &rendered)?
+                console.write_tool_result(&key, &rendered, state == ToolCallState::Warning)?
             }
             _ => console.write_roles(&rendered)?,
         }
@@ -1507,6 +1524,7 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
     .then_some(chat_loop.run_id)
     .flatten();
     let mut states = HashMap::new();
+    let mut names = HashMap::new();
     for operation in &snapshot.operations {
         let state = match operation.state {
             OperationState::Proposed if active_run == Some(operation.run_id) => {
@@ -1524,7 +1542,8 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
         };
         for content in &message.content {
             match content {
-                Content::ToolUse { id, .. } => {
+                Content::ToolUse { id, name, .. } => {
+                    names.insert((run, id.clone()), name.clone());
                     states
                         .entry((run, id.clone()))
                         .or_insert(if active_run == Some(run) {
@@ -1536,13 +1555,16 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                 Content::ToolResult {
                     tool_use_id,
                     is_error,
+                    content,
                     ..
                 } => {
-                    let finished = if *is_error {
-                        ToolCallState::Failed
-                    } else {
-                        ToolCallState::Finished
-                    };
+                    let finished = tool_result_state(
+                        names
+                            .get(&(run, tool_use_id.clone()))
+                            .map_or("", String::as_str),
+                        &content.text(),
+                        *is_error,
+                    );
                     states
                         .entry((run, tool_use_id.clone()))
                         .and_modify(|state| {
@@ -1577,7 +1599,8 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                     states.insert((event.run_id, call.call_id.clone()), ToolCallState::Queued);
                 }
             }
-            EventKind::ToolStarted { call_id, .. } => {
+            EventKind::ToolStarted { call_id, name, .. } => {
+                names.insert((event.run_id, call_id.clone()), name.clone());
                 states.insert((event.run_id, call_id.clone()), ToolCallState::Running);
             }
             EventKind::ToolCompleted {
@@ -1585,11 +1608,13 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
             } => {
                 states.insert(
                     (event.run_id, call_id.clone()),
-                    if result.is_error {
-                        ToolCallState::Failed
-                    } else {
-                        ToolCallState::Finished
-                    },
+                    tool_result_state(
+                        names
+                            .get(&(event.run_id, call_id.clone()))
+                            .map_or("", String::as_str),
+                        &result.content,
+                        result.is_error,
+                    ),
                 );
             }
             EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
@@ -2280,6 +2305,21 @@ fn compact_result_runs(
     let mut rows = ResponseRows::new(glyph);
     let failure = |failed: bool| if failed { Role::Error } else { Role::MutedText };
     let body = result.is_error.then_some(Role::Error);
+    if let Some(reason) = goal_completion_rejection_reason(name, &result.content, result.is_error) {
+        let reason = super::safe_line(reason);
+        let end = reason
+            .char_indices()
+            .find(|(index, character)| {
+                matches!(character, '。' | '！' | '？')
+                    || *character == '.' && reason[index + 1..].starts_with(char::is_whitespace)
+            })
+            .map_or(reason.len(), |(index, character)| {
+                index + character.len_utf8()
+            });
+        rows.row([("Not complete yet".into(), Some(Role::Warning))]);
+        rows.row([(format!("Reason: {}", &reason[..end]), Some(Role::MutedText))]);
+        return rows.runs;
+    }
     if is_rejection(result) {
         match input.and_then(|input| rejected_file_change(name, input, cwd)) {
             Some((operation, path)) => rows.row([
@@ -2450,9 +2490,33 @@ fn background_launch_id(content: &str) -> Option<Uuid> {
     Uuid::parse_str(id).ok()
 }
 
+const GOAL_COMPLETION_REJECTION_PREFIX: &str = "The completion check did not accept the report, so the goal stays active. Its reason, to verify against the current state: ";
+
+pub(super) fn goal_completion_rejection_reason<'a>(
+    name: &str,
+    content: &'a str,
+    is_error: bool,
+) -> Option<&'a str> {
+    (name == "UpdateGoal" && is_error)
+        .then(|| content.strip_prefix(GOAL_COMPLETION_REJECTION_PREFIX))
+        .flatten()
+}
+
+fn tool_result_state(name: &str, content: &str, is_error: bool) -> ToolCallState {
+    if goal_completion_rejection_reason(name, content, is_error).is_some() {
+        ToolCallState::Warning
+    } else if is_error {
+        ToolCallState::Failed
+    } else {
+        ToolCallState::Finished
+    }
+}
+
 fn tool_result_status(name: &str, result: &ToolResult) -> &'static str {
     if name == BASH_TOOL_NAME && background_launch_id(&result.content).is_some() {
         BACKGROUND_RUNNING_STATUS
+    } else if goal_completion_rejection_reason(name, &result.content, result.is_error).is_some() {
+        "Not complete yet"
     } else if result.is_error {
         "Failed"
     } else {
@@ -4795,5 +4859,162 @@ mod tests {
         let failure = render("CronCreate", "invalid cron".into(), true);
         assert!(failure.contains("Failed"));
         assert!(failure.contains("invalid cron"));
+    }
+
+    #[test]
+    fn update_goal_completion_rejection_is_warning_with_compact_reason_and_full_details() {
+        let reason = "The requested tests are missing. Full evidence and additional guidance must remain in details.";
+        let result = ToolResult {
+            content: format!(
+                "The completion check did not accept the report, so the goal stays active. Its reason, to verify against the current state: {reason}"
+            ),
+            is_error: true,
+            output_ref: None,
+        };
+        let runs = archived_tool_result(
+            "UpdateGoal",
+            None,
+            &result,
+            Path::new(""),
+            DisplayProfile::default(),
+            &CallFacts::default(),
+        );
+        let text = joined(&runs);
+        assert!(text.contains("Not complete yet"), "{text}");
+        assert!(!text.contains("Failed"));
+        assert!(!text.contains("Full evidence"));
+        assert!(
+            runs.iter()
+                .any(|(text, role)| text.contains("Not complete yet")
+                    && *role == Some(Role::Warning))
+        );
+        let full = transcript_result_lines("UpdateGoal", None, &result.content, true, None, None);
+        assert!(
+            full.iter()
+                .any(|line| joined(&line.spans).contains("Full evidence"))
+        );
+        assert!(result.is_error);
+        for error in ["invalid UpdateGoal input: unknown status", "no active goal"] {
+            let failure = ToolResult {
+                content: error.into(),
+                ..result.clone()
+            };
+            let runs = archived_tool_result(
+                "UpdateGoal",
+                None,
+                &failure,
+                Path::new(""),
+                DisplayProfile::default(),
+                &CallFacts::default(),
+            );
+            assert!(joined(&runs).contains("Failed"));
+            assert!(runs.iter().any(|(_, role)| *role == Some(Role::Error)));
+        }
+    }
+
+    #[test]
+    fn update_goal_rejection_keeps_warning_call_color_live_and_in_both_history_sources() {
+        let run = Uuid::new_v4();
+        let started = event(
+            run,
+            EventKind::ToolStarted {
+                call_id: "goal-check".into(),
+                name: "UpdateGoal".into(),
+                input: json!({"status":"complete","evidence":"report"}),
+            },
+        );
+        let content = format!(
+            "{GOAL_COMPLETION_REJECTION_PREFIX}{}。完整理由仅在详情中保留。",
+            "还缺少完整的验证证据".repeat(40)
+        );
+        let result = ToolResult {
+            content: content.clone(),
+            is_error: true,
+            output_ref: None,
+        };
+        let completed = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "goal-check".into(),
+                result: result.clone(),
+                sources: Vec::new(),
+            },
+        );
+        let console = Console::test_interactive_for_chat(Uuid::nil());
+        let mut presentation = ToolPresentation::new(false);
+        presentation
+            .present_event(&console, &started, &CallFacts::default())
+            .unwrap();
+        presentation
+            .present_event(&console, &completed, &CallFacts::default())
+            .unwrap();
+        let rows = console.test_conversation_rows();
+        let header = rows
+            .iter()
+            .find(|line| line.text().contains("UpdateGoal"))
+            .unwrap();
+        assert!(
+            header
+                .spans
+                .iter()
+                .any(|span| span.text.contains('⏺') && span.role == Some(Role::Warning)),
+            "{header:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|line| line.spans.iter().all(|span| span.role != Some(Role::Error)))
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line.text().contains("Reason:"))
+                .count(),
+            1
+        );
+        assert!(console.test_conversation_text().contains('…'));
+        let details = presentation.toggle();
+        assert!(details.contains(&content));
+        assert!(details.contains("Not complete yet"));
+        let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
+            "id": Uuid::nil(), "folder":"/fixture", "messages":[],
+            "chat_loop":{"id":Uuid::nil(), "state":"Idle"}
+        }))
+        .unwrap();
+        snapshot.events = vec![started.clone(), completed];
+        assert_eq!(
+            tool_call_states(&snapshot)[&(run, "goal-check".into())],
+            ToolCallState::Warning
+        );
+        snapshot.events.clear();
+        snapshot.messages = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"goal-check","name":"UpdateGoal","input":{"status":"complete"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"goal-check","content":content,"is_error":true}]}
+        ])).unwrap();
+        snapshot.message_runs = [(0, run), (1, run)].into();
+        assert_eq!(
+            tool_call_states(&snapshot)[&(run, "goal-check".into())],
+            ToolCallState::Warning
+        );
+        assert!(transcript_text(&snapshot).contains("完整理由仅在详情中保留"));
+        let display = DisplayProfile::default();
+        let runs = archived_tool_result(
+            "UpdateGoal",
+            None,
+            &result,
+            Path::new(""),
+            display,
+            &CallFacts::default(),
+        );
+        let mut scrollback = super::super::scrollback::Scrollback::new();
+        scrollback.append_tool_result("goal-check", &runs, true);
+        let frame = scrollback.frame(30, 100);
+        assert_eq!(
+            frame
+                .lines
+                .iter()
+                .filter(|line| line.contains("还缺少"))
+                .count(),
+            1
+        );
+        assert!(frame.lines.iter().any(|line| line.ends_with('…')));
     }
 }

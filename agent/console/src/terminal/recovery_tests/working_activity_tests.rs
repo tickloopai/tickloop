@@ -644,7 +644,9 @@ fn a_run_whose_end_event_was_lost_stops_working_once_the_snapshot_shows_it_ended
 fn idle_escape_pauses_an_active_goal_without_a_running_turn() {
     let (mut fixture, directory) = start_activity_fixture("idle-goal");
     fixture.wait_until_shown("active idle Goal", |frame| {
-        frame.contains("◎ Pursuing goal") && !frame.contains("Working (")
+        frame.contains("Pursuing goal")
+            && frame.contains("◎ Verify idle Escape")
+            && !frame.contains("Working (")
     });
     fixture.send(b"\x1b");
     let proof = fixture.wait_for_phase(&directory.path().join(ACTIVITY_INTERRUPTS), "interrupted");
