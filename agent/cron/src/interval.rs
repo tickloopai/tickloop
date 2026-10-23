@@ -36,10 +36,10 @@ enum Unit {
 impl Unit {
     fn parse(word: &str) -> Option<Self> {
         match word {
-            "s" | "sec" | "secs" | "second" | "seconds" => Some(Self::Second),
-            "m" | "min" | "mins" | "minute" | "minutes" => Some(Self::Minute),
-            "h" | "hr" | "hrs" | "hour" | "hours" => Some(Self::Hour),
-            "d" | "day" | "days" => Some(Self::Day),
+            "s" | "sec" | "secs" | "second" | "seconds" | "秒" => Some(Self::Second),
+            "m" | "min" | "mins" | "minute" | "minutes" | "分钟" => Some(Self::Minute),
+            "h" | "hr" | "hrs" | "hour" | "hours" | "小时" => Some(Self::Hour),
+            "d" | "day" | "days" | "天" => Some(Self::Day),
             _ => None,
         }
     }
@@ -69,26 +69,35 @@ impl Interval {
         self.minutes.get()
     }
 
-    /// Parses `30s`, `5m`, `2h`, `1d`, `2 hours` or `every 2 hours`. Seconds round up to
-    /// the next whole minute.
+    /// Parses `30s`, `5m`, `2h`, `1d`, `every 2 hours` or `每 5 分钟`.
+    /// Seconds round up to the next whole minute.
     pub fn parse(text: &str) -> Result<Self, IntervalError> {
         let trimmed = text.trim();
         let invalid = || IntervalError::Invalid(trimmed.to_string());
         let too_long = || IntervalError::TooLong(trimmed.to_string());
         let normalized = trimmed.to_ascii_lowercase();
+        let chinese = normalized.strip_prefix('每').map(str::trim);
         let mut words: Vec<&str> = normalized.split_whitespace().collect();
         if words.first() == Some(&EVERY_KEYWORD) {
             words.remove(0);
         }
-        let (count, unit) = match words.as_slice() {
-            [compact] => {
-                let digits_end = compact
-                    .find(|character: char| !character.is_ascii_digit())
-                    .unwrap_or(compact.len());
-                compact.split_at(digits_end)
+        let (count, unit) = if let Some(rest) = chinese {
+            let digits_end = rest
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (count, unit) = rest.split_at(digits_end);
+            (if count.is_empty() { "1" } else { count }, unit.trim())
+        } else {
+            match words.as_slice() {
+                [compact] => {
+                    let digits_end = compact
+                        .find(|character: char| !character.is_ascii_digit())
+                        .unwrap_or(compact.len());
+                    compact.split_at(digits_end)
+                }
+                [count, unit] => (*count, *unit),
+                _ => return Err(invalid()),
             }
-            [count, unit] => (*count, *unit),
-            _ => return Err(invalid()),
         };
         let unit = Unit::parse(unit).ok_or_else(invalid)?;
         if count.is_empty() || !count.chars().all(|character| character.is_ascii_digit()) {
@@ -182,10 +191,11 @@ pub struct LoopArguments<'a> {
     pub prompt: &'a str,
 }
 
-/// Splits `/loop` arguments the way Claude Code does: a leading token like `30m`, otherwise
-/// a trailing `every <N><unit>` or `every <N> <unit>` clause, otherwise no interval.
+/// Splits a leading token like `30m`, a Chinese interval at either end (also without spaces),
+/// or a trailing `every <N><unit>` or `every <N> <unit>` clause from the instruction.
 /// `check every PR` has no interval because `PR` is not a time.
 pub fn parse_loop_arguments(input: &str) -> Result<LoopArguments<'_>, IntervalError> {
+    let input = input.trim();
     let words: Vec<(usize, &str)> = input
         .split_whitespace()
         .map(|word| (word.as_ptr().addr() - input.as_ptr().addr(), word))
@@ -200,6 +210,22 @@ pub fn parse_loop_arguments(input: &str) -> Result<LoopArguments<'_>, IntervalEr
             interval: Some(interval),
             prompt,
         });
+    }
+
+    if let Some(end) = chinese_interval_end(input) {
+        return Ok(LoopArguments {
+            interval: Some(Interval::parse(&input[..end])?),
+            prompt: input[end..].trim(),
+        });
+    }
+    for (start, _) in input.match_indices('每').rev() {
+        let suffix = &input[start..];
+        if chinese_interval_end(suffix) == Some(suffix.len()) {
+            return Ok(LoopArguments {
+                interval: Some(Interval::parse(suffix)?),
+                prompt: input[..start].trim(),
+            });
+        }
     }
 
     for clause_words in [2, 3] {
@@ -225,6 +251,18 @@ pub fn parse_loop_arguments(input: &str) -> Result<LoopArguments<'_>, IntervalEr
     Ok(LoopArguments {
         interval: None,
         prompt: input.trim(),
+    })
+}
+
+fn chinese_interval_end(input: &str) -> Option<usize> {
+    let rest = input.strip_prefix('每')?.trim_start();
+    let digits_end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let unit = rest[digits_end..].trim_start();
+    ["分钟", "小时", "天", "秒"].into_iter().find_map(|suffix| {
+        unit.strip_prefix(suffix)
+            .map(|after| input.len() - after.len())
     })
 }
 

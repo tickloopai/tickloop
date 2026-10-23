@@ -17,7 +17,8 @@ use super::{
 };
 
 const MINUTES_PER_HOUR: u32 = 60;
-const MINUTES_PER_DAY: u32 = 24 * MINUTES_PER_HOUR;
+const HOURS_PER_DAY: u32 = 24;
+const MINUTES_PER_DAY: u32 = HOURS_PER_DAY * MINUTES_PER_HOUR;
 
 fn instruction(prompt: &str) -> &str {
     if matches!(
@@ -27,6 +28,9 @@ fn instruction(prompt: &str) -> &str {
         "loop.md or maintenance instructions"
     } else {
         prompt
+            .strip_prefix("/loop ")
+            .map(str::trim_start)
+            .unwrap_or(prompt)
     }
 }
 
@@ -55,7 +59,7 @@ pub(super) fn view(
 ) -> ScheduledTaskView<'_> {
     let schedule = match &task.kind {
         ScheduledTaskKind::SelfPaced { .. } => ScheduleView::SelfPaced,
-        ScheduledTaskKind::OneShot { cron } => ScheduleView::Cron(cron),
+        ScheduledTaskKind::OneShot { cron } => ScheduleView::Once(cron),
         ScheduledTaskKind::Recurring { cron } => {
             let fields = cron.split_whitespace().collect::<Vec<_>>();
             let minutes = match fields.as_slice() {
@@ -66,12 +70,14 @@ pub(super) fn view(
                     .strip_prefix("*/")
                     .and_then(|n| n.parse::<u32>().ok())
                     .and_then(|n| n.checked_mul(MINUTES_PER_DAY)),
-                [minute, "*", "*", "*", "*"] => {
-                    minute.strip_prefix("*/").and_then(|n| n.parse().ok())
-                }
+                [minute, "*", "*", "*", "*"] => minute
+                    .strip_prefix("*/")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .filter(|n| *n > 0 && MINUTES_PER_HOUR.is_multiple_of(*n)),
                 ["0", hour, "*", "*", "*"] => hour
                     .strip_prefix("*/")
                     .and_then(|n| n.parse::<u32>().ok())
+                    .filter(|n| *n > 0 && HOURS_PER_DAY.is_multiple_of(*n))
                     .and_then(|n| n.checked_mul(MINUTES_PER_HOUR)),
                 _ => None,
             };
@@ -92,6 +98,17 @@ pub(super) fn view(
             task.last_fired_at_ms.and_then(at)
         } else {
             task.next_fire_at_ms.and_then(at)
+        },
+        scheduled_at: if waiting {
+            task.last_scheduled_for_ms
+                .or(task.last_fired_at_ms)
+                .and_then(at)
+        } else {
+            task.scheduled_for_ms.and_then(at)
+        },
+        source: match task.creator {
+            tickloop_agent_protocol::ScheduledTaskCreator::User => "user",
+            tickloop_agent_protocol::ScheduledTaskCreator::Agent => "agent",
         },
         skipped: task.skipped,
         pending_confirmation: task.confirmation == Some(ScheduledTaskConfirmation::Pending),
@@ -139,7 +156,7 @@ impl TickActionBackend for TaskAction {
             .await
             .map_err(|error| error.to_string())?;
         ctx.console.remove_scheduled_task(ctx.chat, &self.task.id)?;
-        ctx.notify("Scheduled task deleted")
+        ctx.notify("Scheduled task removed")
     }
 }
 
@@ -160,7 +177,7 @@ impl TickDetailView for TaskDetail {
         self
     }
     fn hint(&self) -> String {
-        "j/k scroll · x delete · esc back".into()
+        "j/k scroll · x remove · esc back".into()
     }
     fn lines(&mut self, width: usize, height: usize, _now: u64) -> Vec<TickDetailLine> {
         let view = view(&self.task, false, None, false);
@@ -318,5 +335,79 @@ mod tests {
             result_lines("ScheduleWakeup", None, r#"{"stopped":"0123abcd"}"#).unwrap(),
             ["Self-paced loop stopped"]
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    #[test]
+    fn monitor_projects_nominal_time_and_details_keep_jittered_next_run() {
+        let mut task = super::tests::task();
+        task.kind = ScheduledTaskKind::Recurring {
+            cron: "0 12 * * 2".into(),
+        };
+        task.scheduled_for_ms = Some(14_400_000);
+        task.next_fire_at_ms = Some(16_200_000);
+        task.jitter_ms = 1_800_000;
+        let projected = view(&task, false, None, false);
+        let lines = projected.row_lines(
+            48,
+            false,
+            crate::terminal::scheduled_task_rows::ScheduledTaskRender {
+                display: crate::terminal::display::DisplayProfile::default(),
+                ascii: false,
+                now: local_time(0, "Asia/Shanghai").unwrap(),
+                now_ms: 0,
+            },
+        );
+        assert_eq!(lines[0].text(), "◷ 0 12 * * 2 · 12:00");
+        let details = projected
+            .detail_lines(80, 0, 100)
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details.contains("Next run: 1970-01-01T12:30:00+08:00"));
+        assert!(details.contains("Cron: 0 12 * * 2"));
+        assert!(details.contains("Source: user"));
+        task.next_fire_at_ms = Some(14_415_123);
+        let exact = view(&task, false, None, false)
+            .detail_lines(80, 0, 100)
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(exact.contains("Next run: 1970-01-01T12:00:15.123+08:00"));
+        task.kind = ScheduledTaskKind::OneShot {
+            cron: "0 12 * * *".into(),
+        };
+        assert_eq!(
+            view(&task, false, None, false).schedule,
+            ScheduleView::Once("0 12 * * *")
+        );
+        task.kind = ScheduledTaskKind::SelfPaced {
+            delay_seconds: Some(60),
+            reason: None,
+            fallback: false,
+        };
+        task.prompt = "/loop 看看 CI 状态".into();
+        assert_eq!(view(&task, false, None, false).instruction, "看看 CI 状态");
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+    #[test]
+    fn uneven_cron_steps_keep_the_original_expression() {
+        for cron in ["*/7 * * * *", "0 */5 * * *", "0 12 * * 2"] {
+            let mut task = super::tests::task();
+            task.kind = ScheduledTaskKind::Recurring { cron: cron.into() };
+            assert_eq!(
+                view(&task, false, None, false).schedule,
+                ScheduleView::Cron(cron)
+            );
+        }
     }
 }

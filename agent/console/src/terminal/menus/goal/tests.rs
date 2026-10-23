@@ -42,10 +42,10 @@ fn goal_command_parser_preserves_conditions_and_limits_unicode_characters() {
         .unwrap();
     assert!(error.contains("file or Artifact"));
     assert!(validate_objective("  ").is_err());
-    for value in ["0", "-1", "5k", "18446744073709551616"] {
+    for value in ["0", "-1", "5x", "18446744073709551616"] {
         assert!(budget(value).is_err());
     }
-    assert_eq!(budget("50000").unwrap(), Some(50_000));
+    assert_eq!(budget("50").unwrap(), Some(50_000));
     assert_eq!(budget("none").unwrap(), None);
 }
 
@@ -153,7 +153,7 @@ async fn goal_commands_confirm_replacement_and_edit_pause_resume_budget_clear() 
             &console,
             menus.id().unwrap(),
             Some(0),
-            Some("75000".into()),
+            Some("75K".into()),
         )
         .await
         .unwrap();
@@ -301,4 +301,204 @@ async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
     assert!(history.contains("Goal set"), "{history}");
     assert!(history.contains("Goal paused"), "{history}");
     reopened.shutdown().await;
+}
+
+#[test]
+fn budgets_accept_k_m_and_bare_k_units_and_preserve_prefill_values() {
+    for (input, expected) in [
+        ("50K", 50000),
+        ("50k", 50000),
+        ("1.5M", 1500000),
+        ("1.5m", 1500000),
+        ("50", 50000),
+        ("1.5", 1500),
+        ("0.001k", 1),
+        ("1.5000000M", 1500000),
+    ] {
+        assert_eq!(budget(input).unwrap(), Some(expected), "{input}");
+        assert_eq!(budget(&budget_text(expected)).unwrap(), Some(expected));
+    }
+    for (value, expected) in [(50000, "50K"), (1500000, "1.5M"), (12500, "12.5K")] {
+        assert_eq!(budget_text(value), expected);
+    }
+    for input in ["", " ", "none", "NONE"] {
+        assert_eq!(budget(input).unwrap(), None);
+    }
+    for input in [
+        "0",
+        "-1",
+        "NaN",
+        "1e3",
+        "1.2.3M",
+        "0.0001K",
+        "1.",
+        "K",
+        "18446744073709552K",
+    ] {
+        assert_eq!(budget(input).unwrap_err(), INVALID_BUDGET, "{input}");
+    }
+}
+
+#[test]
+fn structured_goal_states_explain_refusals_and_complete_goals_only_offer_clear() {
+    assert_eq!(action_refusal(None, &GoalAction::Resume), Some(NO_GOAL));
+    assert_eq!(action_refusal(None, &GoalAction::Pause), Some(NO_GOAL));
+    assert_eq!(action_refusal(None, &GoalAction::Clear), Some(NO_GOAL));
+    let active = goal(GoalStatus::Active);
+    assert_eq!(
+        action_refusal(Some(&active), &GoalAction::Resume),
+        Some("Goal is already active.")
+    );
+    let paused = goal(GoalStatus::Paused {
+        by: GoalPause::User,
+    });
+    assert_eq!(
+        action_refusal(Some(&paused), &GoalAction::Pause),
+        Some("Goal is already paused.")
+    );
+    let limited = GoalSnapshot {
+        tokens_used: 50000,
+        ..goal(GoalStatus::BudgetLimited)
+    };
+    assert_eq!(
+        action_refusal(Some(&limited), &GoalAction::Resume),
+        Some(BUDGET_EXHAUSTED)
+    );
+    let complete = goal(GoalStatus::Complete);
+    for action in [
+        GoalAction::Resume,
+        GoalAction::Pause,
+        GoalAction::Edit {
+            objective: "new".into(),
+        },
+        GoalAction::SetBudget { token_budget: None },
+    ] {
+        assert_eq!(
+            action_refusal(Some(&complete), &action),
+            Some(GOAL_ACHIEVED)
+        );
+    }
+    assert!(action_refusal(Some(&complete), &GoalAction::Clear).is_none());
+    assert!(
+        action_refusal(
+            Some(&complete),
+            &GoalAction::Set {
+                objective: "new".into(),
+                token_budget: None,
+                replace: false
+            }
+        )
+        .is_none()
+    );
+    let console = Console::test_interactive_for_chat(Uuid::from_u128(707));
+    let mut menus = Menus::default();
+    menus
+        .goal_summary(&console, Uuid::from_u128(707), Some(&complete))
+        .unwrap();
+    assert_eq!(
+        console
+            .menu_snapshot(menus.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .options,
+        ["Clear"]
+    );
+}
+
+#[tokio::test]
+async fn goal_command_refusals_are_friendly_and_budget_menu_uses_compact_units() {
+    let (agent, chat, console, mut menus) = fixture().await;
+    assert_eq!(
+        menus
+            .goal_command(&agent, &console, chat, "/goal resume")
+            .await
+            .unwrap_err(),
+        NO_GOAL
+    );
+    menus
+        .goal_command(&agent, &console, chat, "/goal verify")
+        .await
+        .unwrap();
+    assert_eq!(
+        menus
+            .goal_command(&agent, &console, chat, "/goal resume")
+            .await
+            .unwrap_err(),
+        "Goal is already active."
+    );
+    menus
+        .choose_goal(
+            &agent,
+            &console,
+            chat,
+            &[GoalMenuAction::Budget],
+            Some(0),
+            None,
+        )
+        .await
+        .unwrap();
+    // The saved value is converted only at the Console boundary; storage remains whole tokens.
+    menus
+        .choose_goal(
+            &agent,
+            &console,
+            chat,
+            &[GoalMenuAction::SaveBudget],
+            Some(0),
+            Some("1.5M".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .goal
+            .unwrap()
+            .token_budget,
+        Some(1500000)
+    );
+    assert_eq!(BUDGET_LABEL, "Token budget (e.g. 50K, 1.5M, or none)");
+    agent.shutdown().await;
+}
+
+#[test]
+fn exhausted_goal_menu_prioritizes_budget_and_offers_resume_after_budget_is_raised() {
+    for budget in [Some(50000), Some(75000), None] {
+        let limited = GoalSnapshot {
+            token_budget: budget,
+            tokens_used: 50000,
+            ..goal(GoalStatus::BudgetLimited)
+        };
+        let chat = Uuid::from_u128(707);
+        let console = Console::test_interactive_for_chat(chat);
+        let mut menus = Menus::default();
+        menus.goal_summary(&console, chat, Some(&limited)).unwrap();
+        let menu = console.menu_snapshot(menus.id().unwrap()).unwrap().unwrap();
+        assert!(!menu.confirmation);
+        if budget == Some(50000) {
+            assert_eq!(
+                menu.options,
+                [
+                    "Adjust token budget",
+                    "Edit · Ctrl+G external editor",
+                    "Clear"
+                ]
+            );
+            assert!(
+                matches!(&menus.active.as_ref().unwrap().1, Selection::Goal { actions, .. } if matches!(actions[0], GoalMenuAction::Budget))
+            );
+        } else {
+            assert_eq!(
+                menu.options,
+                [
+                    "Edit · Ctrl+G external editor",
+                    "Resume",
+                    "Clear",
+                    "Adjust token budget"
+                ]
+            );
+        }
+    }
 }

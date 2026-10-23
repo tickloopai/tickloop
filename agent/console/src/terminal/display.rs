@@ -20,6 +20,7 @@ pub(super) enum Glyph {
     ProtocolTick,
     /// A Monitor row's periodic Tick Subscription; its colour tells the frequency.
     Subscription,
+    Goal,
     Prompt,
     Assistant,
     Subagents,
@@ -95,6 +96,7 @@ impl DisplayProfile {
             Glyph::TerminalTick => ">",
             Glyph::ProtocolTick | Glyph::TickDelivery => "◉",
             Glyph::Subscription => "↻",
+            Glyph::Goal => "◎",
             Glyph::Prompt => "❯",
             Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall | Glyph::TurnSummary => "⏺",
             Glyph::ToolResult => "⎿",
@@ -211,6 +213,7 @@ mod tests {
             (Glyph::ProtocolTick, "◉"),
             (Glyph::TerminalTick, ">"),
             (Glyph::ArtifactTick, "↗"),
+            (Glyph::Goal, "◎"),
         ] {
             assert_eq!(unicode.glyph(glyph), expected);
             assert_eq!(unicode_width::UnicodeWidthStr::width(expected), 1);

@@ -21,6 +21,8 @@ fn task() -> ScheduledTaskView<'static> {
         expires_at: Some(at(604_800)),
         last_trigger_at: Some(at(3_600)),
         next_trigger_at: Some(at(3_900)),
+        scheduled_at: Some(at(3_900)),
+        source: "user",
         skipped: 2,
         pending_confirmation: false,
         triggers_paused: false,
@@ -48,9 +50,10 @@ fn text(lines: &[RoleLine]) -> String {
 #[test]
 fn rows_show_cadence_instruction_local_time_and_confirmation_without_selection_cursor() {
     for (schedule, label) in [
-        (task().schedule, "every 5m"),
-        (ScheduleView::SelfPaced, "self-paced"),
+        (task().schedule, "5m"),
+        (ScheduleView::SelfPaced, "auto"),
         (ScheduleView::Cron("0 9 * * 1"), "0 9 * * 1"),
+        (ScheduleView::Once("0 9 * * *"), "once"),
     ] {
         let task = ScheduledTaskView {
             schedule,
@@ -61,8 +64,11 @@ fn rows_show_cadence_instruction_local_time_and_confirmation_without_selection_c
         let shown = text(&lines);
         assert!(shown.contains(label), "{shown}");
         assert!(shown.contains("Check the build"));
-        assert!(shown.contains("09:05 · pending confirmation"));
-        assert!(shown.starts_with("  ◷ "));
+        assert!(lines[0].text().contains("pending"));
+        assert!(lines[0].text().ends_with("09:05"));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].text(), "  Check the build");
+        assert!(shown.starts_with("◷ "));
         assert!(!shown.contains('❯'));
         assert!(lines.iter().all(|line| line.fill == Some(Role::Selection)));
         assert!(lines.iter().all(|line| line.band.is_none()));
@@ -79,8 +85,8 @@ fn rows_preserve_whole_graphemes_in_instruction_summaries() {
             ..task()
         };
         assert_eq!(
-            text(&task.row_lines(15, false, render(3_750))),
-            format!("  ◷ x ·\n    {grapheme}a…  09:05")
+            text(&task.row_lines(13, false, render(3_750))),
+            format!("◷ x · 09:05\n  {grapheme}abcdefgh…")
         );
     }
 }
@@ -90,6 +96,7 @@ fn each_display_time_keeps_its_own_local_offset_across_clock_changes() {
     let next = at(3_900).to_offset(UtcOffset::from_hms(-5, 0, 0).unwrap());
     let task = ScheduledTaskView {
         next_trigger_at: Some(next),
+        scheduled_at: Some(next),
         expires_at: Some(next),
         ..task()
     };
@@ -116,7 +123,7 @@ fn progress_runs_from_last_trigger_and_stays_full_while_due() {
         assert_eq!(task.progress(40, at(seconds)), Some(expected));
     }
     let lines = task.row_lines(44, false, render(3_750));
-    assert_eq!(lines[0].band.as_ref().unwrap().columns, 4..24);
+    assert_eq!(lines[0].band.as_ref().unwrap().columns, 2..23);
     assert_eq!(lines[0].band.as_ref().unwrap().role, Role::UpdateProgress);
     assert_eq!(
         task.row_lines(44, false, render(4_000))[0]
@@ -124,15 +131,22 @@ fn progress_runs_from_last_trigger_and_stays_full_while_due() {
             .as_ref()
             .unwrap()
             .columns,
-        4..44
+        2..44
     );
     let created = ScheduledTaskView {
         last_trigger_at: None,
         ..task.clone()
     };
-    assert_eq!(created.progress(40, at(1_950)), Some(20));
+    assert_eq!(created.progress(40, at(1_950)), Some(0));
+    assert_eq!(created.progress(40, at(3_000)), Some(20));
+    assert!(
+        created.row_lines(44, false, render(1_950))[0]
+            .band
+            .is_none()
+    );
     let unscheduled = ScheduledTaskView {
         next_trigger_at: None,
+        scheduled_at: None,
         ..task.clone()
     };
     assert_eq!(unscheduled.progress(40, at(4_000)), None);
@@ -153,8 +167,9 @@ fn paused_receiving_greys_the_progress_and_suppresses_trigger_flash() {
     };
     for selected in [false, true] {
         let lines = task.row_lines(44, selected, render(3_750));
+        assert_eq!(lines[0].band.as_ref().unwrap().role, Role::UserMessageBg);
+        assert!(lines[1].band.is_none());
         for line in lines {
-            assert_eq!(line.band.as_ref().unwrap().role, Role::UserMessageBg);
             assert_eq!(line.fill, selected.then_some(Role::Selection));
             assert!(
                 line.spans
@@ -242,6 +257,8 @@ fn details_include_full_instruction_cron_dates_and_skip_count_and_scroll() {
             "fourth",
             "Created: 1970-01-01 08:00",
             "Expires: 1970-01-08 08:00",
+            "Next run: 1970-01-01T09:05:00+08:00",
+            "Source: user",
             "Skipped: 2"
         ]
         .join("\n")
@@ -275,11 +292,7 @@ fn narrow_rows_long_text_ascii_icon_and_both_themes_render_safely() {
                 render.display.set_theme(theme);
                 let mut lines = task.row_lines(width, false, render);
                 if width >= 4 {
-                    assert!(
-                        lines[0]
-                            .text()
-                            .starts_with(if ascii { "  @ " } else { "  ◷ " })
-                    );
+                    assert!(lines[0].text().starts_with(if ascii { "@ " } else { "◷ " }));
                 }
                 lines.extend(task.detail_lines(width, 0, 100));
                 for line in lines {
@@ -296,5 +309,150 @@ fn narrow_rows_long_text_ascii_icon_and_both_themes_render_safely() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn scheduled_task_render_evidence() {
+    let task = ScheduledTaskView {
+        instruction: "每小时帮我看看特斯拉股价并记录变化",
+        ..task()
+    };
+    let lines = task.row_lines(48, false, render(3_750));
+    println!("{}", text(&lines));
+    assert_eq!(
+        text(&lines),
+        "◷ 5m · 09:05\n  每小时帮我看看特斯拉股价并记录变化"
+    );
+}
+
+#[test]
+fn two_line_rows_prioritize_time_and_use_nominal_dates_and_compact_cadences() {
+    for (schedule, expected) in [
+        (
+            ScheduleView::Interval {
+                minutes: 60,
+                cron: "0 * * * *",
+            },
+            "1h",
+        ),
+        (
+            ScheduleView::Interval {
+                minutes: 1440,
+                cron: "0 0 * * *",
+            },
+            "1d",
+        ),
+        (ScheduleView::Cron("0 12 * * 2"), "0 12 * * 2"),
+        (ScheduleView::Once("0 12 * * *"), "once"),
+        (ScheduleView::SelfPaced, "auto"),
+    ] {
+        let task = ScheduledTaskView {
+            schedule,
+            scheduled_at: Some(at(86400 + 3600)),
+            ..task()
+        };
+        let lines = task.row_lines(48, false, render(3750));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].text(),
+            format!(
+                "◷ {expected} · {}01-02 09:00",
+                if schedule == ScheduleView::SelfPaced {
+                    "~"
+                } else {
+                    ""
+                }
+            )
+        );
+        let narrow = task.row_lines(20, false, render(3750));
+        assert!(narrow[0].text().ends_with("01-02 09:00"), "{narrow:?}");
+        assert!(narrow.iter().all(|line| line.text().width() <= 20));
+    }
+    let auto = ScheduledTaskView {
+        schedule: ScheduleView::SelfPaced,
+        scheduled_at: None,
+        next_trigger_at: None,
+        ..task()
+    };
+    assert_eq!(
+        auto.row_lines(40, false, render(3750))[0].text(),
+        "◷ auto · ~"
+    );
+}
+
+#[test]
+fn progress_uses_only_last_thirty_minutes_on_the_first_line_and_rounds_wide_cells_down() {
+    let task = ScheduledTaskView {
+        schedule: ScheduleView::Cron("中0文"),
+        instruction: "每小时中文与 ASCII mixed",
+        created_at: at(0),
+        last_trigger_at: Some(at(0)),
+        next_trigger_at: Some(at(7200)),
+        scheduled_at: Some(at(7200)),
+        ..task()
+    };
+    for (now, expected) in [
+        (5000, 0),
+        (5400, 0),
+        (5850, 5),
+        (6300, 10),
+        (7200, 20),
+        (7400, 20),
+    ] {
+        assert_eq!(task.progress(20, at(now)), Some(expected));
+        let lines = task.row_lines(24, false, render(now));
+        assert!(lines[1].band.is_none());
+        if expected == 0 {
+            assert!(lines[0].band.is_none());
+        }
+    }
+    // One display column into a wide glyph must leave the whole glyph unfilled.
+    let lines = task.row_lines(24, false, render(5490));
+    assert!(lines[0].band.is_none());
+    let lines = task.row_lines(24, false, render(5670));
+    assert_eq!(lines[0].band.as_ref().unwrap().columns, 2..5);
+    assert_eq!(floor_display_column("中0文", 1), 0);
+    assert_eq!(floor_display_column("中0文", 2), 2);
+    assert_eq!(floor_display_column("中0文", 4), 3);
+    for theme in ThemeName::ALL {
+        let mut display = DisplayProfile::default();
+        display.set_theme(theme);
+        let resolved = lines[0].resolve(display.theme(), 24);
+        assert!(resolved.spans.iter().any(|span| span.text.contains("中0")));
+        assert!(
+            lines[1]
+                .resolve(display.theme(), 24)
+                .spans
+                .iter()
+                .all(|span| span.style.background.is_none())
+        );
+    }
+}
+
+#[test]
+fn paused_receiving_replaces_every_kind_of_next_time_with_a_muted_paused_label() {
+    for schedule in [
+        task().schedule,
+        ScheduleView::Once("0 9 * * *"),
+        ScheduleView::Cron("0 12 * * 2"),
+        ScheduleView::SelfPaced,
+    ] {
+        let task = ScheduledTaskView {
+            schedule,
+            triggers_paused: true,
+            ..task()
+        };
+        let lines = task.row_lines(48, false, render(5000));
+        assert!(lines[0].text().ends_with("paused"), "{lines:?}");
+        assert!(!lines[0].text().contains("09:05"));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.role == Some(Role::MutedText))
+        );
+        assert!(lines[0].text().starts_with("◷ "));
+        assert!(lines[1].text().starts_with("  Check"));
     }
 }

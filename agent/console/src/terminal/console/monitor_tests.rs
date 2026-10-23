@@ -263,7 +263,11 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     state.monitor.chat_status = Some(Arc::new(ChatStatus::of(&snapshot)));
     state.monitor.replace(TickGroup::Shells, vec![tick.clone()]);
     state.monitor.focus(false, None);
-    assert_eq!(state.monitor.total(), 2, "Goal is not a member row");
+    assert_eq!(
+        state.monitor.total(),
+        3,
+        "Ticks, scheduled tasks and Goal all count"
+    );
 
     let expected = [
         (
@@ -274,11 +278,11 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::ScheduledTask("0123abcd".into()),
             "Scheduled task 0123abcd",
-            "enter details · x delete · esc input",
+            "enter details · x remove · esc input",
         ),
         (
             MonitorTarget::Goal,
-            "Enter Goal details",
+            "",
             "enter Goal details · j/k select · esc return to input",
         ),
     ];
@@ -297,6 +301,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             MonitorTarget::ScheduledTask(id) => {
                 assert_eq!(&state.monitor.selected_task().unwrap().id, id)
             }
+            MonitorTarget::MoreScheduled => panic!("one scheduled task has no overflow row"),
             MonitorTarget::Goal => {
                 assert!(state.monitor.is_goal_selected());
                 assert!(state.monitor.selected().is_none());
@@ -305,11 +310,16 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         }
         assert_eq!(state.monitor.hint(), *hint);
         let frame = state.monitor.frame(80, 15, state.display, 0);
-        assert_eq!(frame.lines.last().unwrap().text(), *footer);
+        let scheduled_heading = frame
+            .lines
+            .iter()
+            .position(|line| line.text() == "Scheduled (1)")
+            .unwrap();
+        assert_eq!(frame.lines[scheduled_heading - 1].text(), *footer);
         let row = frame
             .lines
             .iter()
-            .position(|line| line.text() == "Goal")
+            .position(|line| line.text().contains("Pursuing goal"))
             .unwrap();
         assert_eq!(
             *goal_row.get_or_insert(row),
@@ -3385,7 +3395,7 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_
         assert!(state.monitor.detail.is_none());
     }
     execute(press(KeyCode::Char('x')), context).await.unwrap();
-    assert_eq!(console.test_status_text(), "Scheduled task deleted");
+    assert_eq!(console.test_status_text(), "Scheduled task removed");
     assert!(
         core.snapshot(chat)
             .await
@@ -3394,6 +3404,40 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_
             .is_empty()
     );
     assert!(!console.monitor_has_entries().unwrap());
+    for index in 0..4 {
+        core.schedule_task(
+            chat,
+            "* * * * *",
+            format!("extra instruction {index}"),
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    console
+        .update_monitor_chat(agent.status(chat).await.unwrap())
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        state.monitor.move_selection(3);
+        assert!(state.monitor.is_more_selected());
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.monitor.task_list_is_open());
+    }
+    execute(press(KeyCode::Enter), context).await.unwrap();
+    execute(press(KeyCode::Char('x')), context).await.unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert!(
+            state.menu.is_none(),
+            "removing from details has no confirmation"
+        );
+        assert!(state.monitor.detail.is_none());
+        assert!(state.monitor.task_list_is_open());
+    }
+    assert_eq!(console.test_status_text(), "Scheduled task removed");
+    assert_eq!(core.snapshot(chat).await.unwrap().scheduled_tasks.len(), 3);
     core.shutdown().await;
 }
 
@@ -3476,4 +3520,341 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
         }
         core.shutdown().await;
     }
+}
+
+#[test]
+fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
+    let mut state = State::new(true, 140, 30);
+    let chat = Uuid::from_u128(707);
+    let mut snapshot = chat_snapshot(chat);
+    snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
+        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "prompt":"提醒我看天气", "creator":"user", "time_zone":"Asia/Shanghai",
+        "created_at_ms":0, "scheduled_for_ms":60000, "next_fire_at_ms":60000,
+        "jitter_ms":0, "skipped":0
+    }]))
+    .unwrap();
+    snapshot.goal = Some(
+        serde_json::from_value(serde_json::json!({
+            "id":Uuid::from_u128(708), "objective":"记录验收证据", "objective_revision":1,
+            "set_by":"user", "status":{"state":"active"}, "tokens_used":12500,
+            "time_used_ms":90000, "quiet_turns":0, "created_at_ms":0, "updated_at_ms":0
+        }))
+        .unwrap(),
+    );
+    state
+        .monitor
+        .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
+    let mut subscribed = shell(Uuid::from_u128(1), "Subscribed Tick");
+    subscribed.group = TickGroup::Ticks;
+    subscribed.glyph = Glyph::ProtocolTick;
+    subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+        is_waiting: false,
+        next_check: None,
+    });
+    let mut plain = shell(Uuid::from_u128(2), "Plain Tick");
+    plain.group = TickGroup::Ticks;
+    plain.glyph = Glyph::ProtocolTick;
+    state
+        .monitor
+        .replace(TickGroup::Ticks, vec![subscribed, plain]);
+    let frame = state.monitor.frame(48, 15, state.display, 0);
+    let screen = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+    println!(
+        "{}",
+        screen
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let find = |text: &str| screen.iter().find(|line| line.contains(text)).unwrap();
+    assert!(find("Subscribed Tick").starts_with("↻ ◉ "));
+    assert!(find("Plain Tick").starts_with("  ◉ "));
+    let scheduled = find("◷");
+    assert_eq!(display_width(&scheduled[..scheduled.find('◷').unwrap()]), 0);
+    for title in ["Subscribed Tick", "Plain Tick"] {
+        let line = find(title);
+        assert_eq!(
+            display_width(&line[..line.find(title).unwrap()]),
+            4,
+            "{line}"
+        );
+    }
+    for (text, title) in [
+        ("◷", "1m"),
+        ("提醒我看天气", "提醒我看天气"),
+        ("Pursuing goal", "Pursuing goal"),
+        ("记录验收证据", "记录验收证据"),
+    ] {
+        let line = find(text);
+        assert_eq!(
+            display_width(&line[..line.find(title).unwrap()]),
+            2,
+            "{line}"
+        );
+    }
+    assert!(find("Pursuing goal").starts_with("◎ "));
+    assert!(screen.iter().any(|line| line == "Scheduled (1)"));
+    assert!(find("Pursuing goal").ends_with("1m"));
+}
+
+fn docked_monitor_fixture(task_count: usize, tick_count: usize) -> State {
+    let mut state = State::new(true, 140, 30);
+    let chat = Uuid::from_u128(707);
+    state.chat = Some(chat);
+    state.prompt_enabled = true;
+    let mut snapshot = chat_snapshot(chat);
+    snapshot.scheduled_tasks = (0..task_count).map(|index| serde_json::from_value(serde_json::json!({
+        "id":format!("{index:08x}"), "kind":{"type":"recurring", "cron":"* * * * *"},
+        "prompt":format!("Scheduled instruction {}", index + 1), "creator":"user", "time_zone":"Asia/Shanghai",
+        "created_at_ms":0, "scheduled_for_ms":60000, "next_fire_at_ms":60000, "jitter_ms":0, "skipped":0
+    })).unwrap()).collect();
+    snapshot.goal = Some(serde_json::from_value(serde_json::json!({
+        "id":Uuid::from_u128(708), "objective":"Finish the acceptance checks", "objective_revision":1,
+        "set_by":"user", "status":{"state":"active"}, "tokens_used":12500,
+        "time_used_ms":90000, "quiet_turns":0, "created_at_ms":0, "updated_at_ms":0
+    })).unwrap());
+    state
+        .monitor
+        .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
+    let entries = (0..tick_count)
+        .map(|index| {
+            let mut entry = shell(
+                Uuid::from_u128(index as u128 + 1),
+                &format!("Tick {:02}", index + 1),
+            );
+            entry.group = TickGroup::Ticks;
+            entry.glyph = Glyph::ProtocolTick;
+            entry
+        })
+        .collect();
+    state.monitor.replace(TickGroup::Ticks, entries);
+    state.monitor.focus(false, None);
+    state
+}
+
+#[test]
+fn round3_monitor_render_evidence() {
+    let state = docked_monitor_fixture(5, 8);
+    let frame = state.monitor.frame(48, 16, state.display, 0);
+    println!(
+        "{}",
+        frame
+            .lines
+            .iter()
+            .map(|line| line.text().trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(frame.lines.len(), 16);
+}
+
+#[test]
+fn scheduled_and_goal_stay_docked_while_ticks_page_and_shrink_at_narrow_heights() {
+    let mut state = docked_monitor_fixture(5, 0);
+    {
+        let status = Arc::make_mut(state.monitor.chat_status.as_mut().unwrap());
+        for index in 0..130 {
+            status.monitor.members.push(MonitorMember {
+                is_terminal: false,
+                instance: format!("calendar:member-{index:03}").parse().unwrap(),
+                title: None,
+            });
+        }
+    }
+    state.monitor.rebuild();
+    let first_tick = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&first_tick);
+    assert_eq!(state.monitor.total(), 136);
+    let before = state.monitor.frame(48, 16, state.display, 0);
+    for _ in 0..128 {
+        state.monitor.move_selection(1);
+    }
+    assert_eq!(state.monitor.entries().len(), 2);
+    let after = state.monitor.frame(48, 16, state.display, 0);
+    assert_eq!(
+        &before.lines[6..],
+        &after.lines[6..],
+        "the dock does not move with Tick pages"
+    );
+    let text = after
+        .lines
+        .iter()
+        .map(RoleLine::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Scheduled instruction 3"));
+    assert!(!text.contains("Scheduled instruction 4"));
+    assert!(text.contains("+2 more"));
+    assert!(text.contains("Monitor 129–130 of 130"));
+    for height in [4, 5, 6, 7, 8, 10, 12, 16] {
+        let frame = state.monitor.frame(30, height, state.display, 0);
+        assert_eq!(frame.lines.len(), height);
+        assert!(
+            frame.lines[height - 2]
+                .text()
+                .starts_with("◎ Pursuing goal")
+        );
+        assert!(frame.lines[height - 1].text().starts_with("  Finish"));
+        assert!(frame.lines.iter().any(|line| line.text().starts_with("◷ ")));
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text().starts_with("  Scheduled instruction"))
+        );
+        assert!(
+            frame
+                .lines
+                .iter()
+                .all(|line| display_width(&line.text()) <= 30)
+        );
+    }
+}
+
+#[test]
+fn more_scheduled_opens_a_scrollable_list_and_details_return_to_that_list() {
+    use crate::terminal::monitor::MonitorTarget;
+    let mut state = docked_monitor_fixture(5, 1);
+    let first_tick = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&first_tick);
+    for _ in 0..3 {
+        state.monitor.move_selection(1);
+    }
+    assert_eq!(state.monitor.selected_task().unwrap().id, "00000002");
+    state.monitor.move_selection(1);
+    assert!(state.monitor.is_more_selected());
+    let frame = state.monitor.frame(48, 16, state.display, 0);
+    let more = frame
+        .lines
+        .iter()
+        .find(|line| line.text() == "+2 more")
+        .unwrap();
+    assert_eq!(more.fill, Some(Role::Selection));
+    assert_eq!(more.spans[0].role, Some(Role::MutedText));
+    assert!(
+        frame
+            .targets
+            .iter()
+            .any(|(_, target)| *target == MonitorTarget::MoreScheduled)
+    );
+    state.monitor.move_selection(1);
+    assert!(state.monitor.is_goal_selected());
+    state.monitor.move_selection(-1);
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.monitor.task_list_is_open());
+    assert_eq!(state.monitor.selected_task().unwrap().id, "00000003");
+    state.monitor.move_selection(1);
+    let expanded = state.monitor.frame(30, 8, state.display, 0);
+    assert!(
+        expanded
+            .lines
+            .iter()
+            .any(|line| line.text().contains("Scheduled instruction 5"))
+    );
+    assert!(
+        !expanded
+            .lines
+            .iter()
+            .any(|line| line.text().contains("Scheduled instruction 1"))
+    );
+    assert!(
+        expanded
+            .targets
+            .iter()
+            .all(|(_, target)| matches!(target, MonitorTarget::ScheduledTask(_)))
+    );
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(InputEvent::TickAction { .. })
+    ));
+    assert!(state.monitor.detail.is_some());
+    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(state.monitor.detail.is_none());
+    assert!(state.monitor.task_list_is_open());
+    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!state.monitor.task_list_is_open());
+    assert!(state.monitor.focused);
+    assert!(state.monitor.is_more_selected());
+}
+
+#[test]
+fn monitor_entry_counts_ticks_schedules_and_goal_and_preserves_the_empty_case() {
+    for (tasks, ticks, goal_present, expected) in
+        [(0, 0, true, 1), (2, 0, false, 2), (5, 8, true, 14)]
+    {
+        let mut state = docked_monitor_fixture(tasks, ticks);
+        if !goal_present {
+            Arc::make_mut(state.monitor.chat_status.as_mut().unwrap()).goal = None;
+            state.monitor.rebuild();
+        }
+        assert_eq!(state.monitor.total(), expected);
+        let frame = screen(&mut state);
+        assert!(frame.contains(&format!("Monitor {expected}")), "{frame}");
+    }
+    assert_eq!(Monitor::default().total(), 0);
+    assert!(!Monitor::default().has_content());
+}
+
+#[test]
+fn expanded_scheduled_list_scrolls_with_the_wheel_inside_its_visible_column() {
+    let mut state = docked_monitor_fixture(5, 1);
+    let first_tick = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&first_tick);
+    state.monitor.move_selection(4);
+    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(state.monitor.task_list_is_open());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let target = &state.monitor_row_targets[0];
+    let (row, column) = (target.row as u16, target.columns.start as u16);
+    let before = state.monitor.selected_task().unwrap().id.clone();
+    assert!(state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            row,
+            column,
+            modifiers: KeyModifiers::NONE
+        },
+        &mut Vec::new()
+    ));
+    assert_ne!(state.monitor.selected_task().unwrap().id, before);
+    assert!(state.monitor.task_list_is_open());
+    let before_blank_scroll = state.monitor.selected_task().unwrap().id.clone();
+    let blank_row = state.detail_area().1.saturating_sub(2) as u16;
+    assert!(state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            row: blank_row,
+            column,
+            modifiers: KeyModifiers::NONE
+        },
+        &mut Vec::new()
+    ));
+    assert_ne!(
+        state.monitor.selected_task().unwrap().id,
+        before_blank_scroll
+    );
+}
+
+#[test]
+fn returning_from_the_full_task_list_keeps_selection_when_removal_eliminates_overflow() {
+    let mut state = docked_monitor_fixture(4, 1);
+    state
+        .monitor
+        .select_target(&crate::terminal::monitor::MonitorTarget::MoreScheduled);
+    state.monitor.open_task_list();
+    state.monitor.remove_task("00000003");
+    assert!(state.monitor.task_list_is_open());
+    assert_eq!(state.monitor.selected_task().unwrap().id, "00000000");
+    state.monitor.close_task_list();
+    assert!(!state.monitor.task_list_is_open());
+    assert_eq!(state.monitor.selected_task().unwrap().id, "00000000");
+    let frame = state.monitor.frame(48, 16, state.display, 0);
+    assert!(!frame.lines.iter().any(|line| line.text().contains("more")));
 }

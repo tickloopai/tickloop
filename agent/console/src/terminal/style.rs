@@ -1048,6 +1048,8 @@ pub(super) struct RoleSpan {
 pub(super) struct RoleLine {
     pub(super) spans: Vec<RoleSpan>,
     pub(super) fill: Option<Role>,
+    /// State-bearing text can keep its semantic colour on the selection background.
+    pub(super) preserve_selection_colours: bool,
     /// The column `fill` starts at; the columns before it keep their own background.
     pub(super) fill_start: usize,
     pub(super) band: Option<BandFill>,
@@ -1236,7 +1238,7 @@ impl RoleLine {
             .map_or(Style::default(), |fill| theme.style(fill));
         let style = role.map_or(base, |role| base.patch(theme.style(role)));
         let on_selection = fill == Some(Role::Selection) || role == Some(Role::Selection);
-        if !on_selection || role.is_some_and(Role::is_mark) {
+        if !on_selection || self.preserve_selection_colours || role.is_some_and(Role::is_mark) {
             return style;
         }
         let selected = theme.selected(style);

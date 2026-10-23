@@ -464,3 +464,39 @@ fn a_chat_without_a_folder_uses_only_the_config_root_loop_file() {
         fs::remove_file(config_root.path().join("loop.md")).unwrap();
     }
 }
+
+#[test]
+fn chinese_loop_arguments_create_fixed_schedules_and_preserve_instructions() {
+    for (arguments, cron, prompt) in [
+        (
+            "每分钟帮我看看特斯拉股价",
+            "* * * * *",
+            "帮我看看特斯拉股价",
+        ),
+        ("看看 CI 状态每 5 分钟", "*/5 * * * *", "看看 CI 状态"),
+        ("每小时检查", "0 * * * *", "检查"),
+        ("检查每2小时", "0 */2 * * *", "检查"),
+        ("每天检查", "0 0 * * *", "检查"),
+        ("检查每3天", "0 0 */3 * *", "检查"),
+        ("每90秒检查", "*/2 * * * *", "检查"),
+    ] {
+        assert_eq!(
+            LoopSchedule::of(arguments).unwrap(),
+            LoopSchedule::Cron {
+                cron: cron.into(),
+                prompt: prompt.into()
+            }
+        );
+    }
+    assert_eq!(
+        LoopSchedule::of("每分钟").unwrap(),
+        LoopSchedule::Cron {
+            cron: "* * * * *".into(),
+            prompt: DEFAULT_INSTRUCTIONS_PROMPT.into()
+        }
+    );
+    assert!(matches!(
+        LoopRequest::parse("检查每0分钟"),
+        Err(IntervalError::Zero(_))
+    ));
+}

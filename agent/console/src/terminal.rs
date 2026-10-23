@@ -880,7 +880,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell immediately; x does what its hint says: it closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. All Monitor actions apply immediately and report their result on the status line. x deletes a scheduled task or unlinks an Artifact; f links new Artifact feedback and h includes earlier feedback.
+enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell immediately; x does what its hint says: it closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. All Monitor actions apply immediately and report their result on the status line. x removes a scheduled task or unlinks an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -3875,7 +3875,7 @@ async fn interact_with_herdr(
                         _ if line == "/goal" || line.starts_with("/goal ") => {
                             let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
                             if let Err(error) = menus.goal_command(agent, console, chat, &line).await {
-                                outln!(console, "Cannot manage Goal: {}", safe_text(&error));
+                                outln!(console, "{}", safe_text(&error));
                             }
                             status_dirty = true;
                         },
@@ -9717,7 +9717,7 @@ mod status_agents_help_tests {
         for expected in [
             "All Monitor actions apply immediately",
             "restoring its subscriptions at their frequencies",
-            "x deletes a scheduled task or unlinks an Artifact",
+            "x removes a scheduled task or unlinks an Artifact",
             "h includes earlier feedback",
         ] {
             assert!(help.contains(expected), "missing: {expected}");
