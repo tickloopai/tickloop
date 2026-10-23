@@ -9,9 +9,9 @@ use chrono_tz::Tz as Zone;
 use serde_json::{Value, json};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, EventKind, OperationRecord, PromptPolicy, Receipt, ScheduledTask,
-    ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision, ScheduledTaskKind,
-    ScheduledTaskNotice, ScheduledTaskRevocation, ToolResult, TriggerSource,
+    ChatId, ChatSnapshot, EventKind, OperationRecord, OperationState, PromptPolicy, Receipt,
+    ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision,
+    ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation, ToolResult, TriggerSource,
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
@@ -941,7 +941,8 @@ impl Agent {
 
     /// When the user's self-paced `/loop` or the self-paced task started the turn `run` and it
     /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
-    /// fallback turn that did not reschedule either the loop ends. Made under the Chat's lease
+    /// fallback turn that did not reschedule either the loop ends. Creating a cron task without
+    /// calling ScheduleWakeup converts the loop to that task instead. Made under the Chat's lease
     /// and recorded before the turn finishes, so a host that quiesces or hands over after the
     /// turn keeps the fallback.
     pub(crate) async fn fall_back_after_turn(
@@ -985,6 +986,28 @@ impl Agent {
         if task.scheduled_for_ms.is_some()
             || !(started_by_users_loop || started_run(chat, task, run))
         {
+            return;
+        }
+        let mut operations = chat
+            .snapshot
+            .operations
+            .iter()
+            .filter(|operation| operation.run_id == run);
+        let created_cron = operations.clone().any(|operation| {
+            operation.name == tools::CRON_CREATE_TOOL_NAME
+                && operation.state == OperationState::Completed
+                && operation
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.is_error)
+        });
+        let called_wakeup =
+            operations.any(|operation| operation.name == tools::SCHEDULE_WAKEUP_TOOL_NAME);
+        if created_cron && !called_wakeup {
+            let notice = ScheduledTaskNotice::SelfPacedEnded {
+                task_id: task.id.clone(),
+            };
+            self.delete_scheduled(change, chat, vec![task.clone()], vec![notice]);
             return;
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());

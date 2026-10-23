@@ -979,6 +979,185 @@ async fn the_users_self_paced_loop_starts_with_its_turn_and_falls_back_when_not_
     ));
 }
 
+#[tokio::test]
+async fn a_self_paced_loop_converts_to_a_cron_task_without_a_fallback() {
+    for from_wakeup in [false, true] {
+        for recurring in [false, true] {
+            let model = HoldingModel::new(Vec::new());
+            let (_directory, agent, chat) = local_agent(model.clone()).await;
+            if from_wakeup {
+                model.scripted.enqueue(wakeup(
+                    "initial_wake",
+                    600,
+                    "/loop check every Tuesday at noon",
+                ));
+                model.scripted.enqueue(text("Checked once."));
+                invoke(&agent, chat, "loop", "check every Tuesday at noon").await;
+                agent.quiesce(chat).await;
+                agent.set_scheduled_now_for_tests(at(10, 10, 0));
+            }
+            model.scripted.enqueue(call(
+                "convert",
+                tools::CRON_CREATE_TOOL_NAME,
+                json!({"cron": "0 12 * * 2", "prompt": "check the build", "recurring": recurring}),
+            ));
+            model.scripted.enqueue(text("Scheduled for Tuesday."));
+            let mut events = agent.subscribe();
+            if from_wakeup {
+                agent
+                    .run_due_scheduled_tasks(chat, at(10, 10, 0))
+                    .await
+                    .unwrap();
+            } else {
+                invoke(&agent, chat, "loop", "check every Tuesday at noon").await;
+            }
+            let quiet = agent.quiesce(chat).await;
+            let remaining = tasks(&agent, chat).await;
+            assert_eq!(remaining.len(), 1, "{remaining:?}");
+            let cron = &remaining[0];
+            assert_eq!(cron.prompt, "check the build");
+            assert_eq!(
+                cron.kind,
+                if recurring {
+                    ScheduledTaskKind::Recurring {
+                        cron: "0 12 * * 2".into(),
+                    }
+                } else {
+                    ScheduledTaskKind::OneShot {
+                        cron: "0 12 * * 2".into(),
+                    }
+                }
+            );
+            assert!(matches!(quiet, crate::Quiescence::Waiting(waits)
+                if waits.next_wake_at_ms == cron.next_fire_at_ms));
+            assert!(!tool_result(&agent, chat, "convert").await.1);
+            let ended = std::iter::from_fn(|| events.try_recv().ok())
+                .find_map(|event| match event.kind {
+                    EventKind::ScheduledTasksChanged {
+                        notice: Some(ScheduledTaskNotice::SelfPacedEnded { task_id }),
+                    } => Some(task_id),
+                    _ => None,
+                })
+                .expect("conversion announces the end of the self-paced loop");
+            assert_ne!(ended, cron.id);
+            assert!(
+                agent
+                    .snapshot(chat)
+                    .await
+                    .unwrap()
+                    .scheduled_task_revocations
+                    .iter()
+                    .any(|revocation| revocation.task_id == ended)
+            );
+            agent.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_self_paced_loop_keeps_both_tasks_when_it_also_schedules_a_wakeup() {
+    for from_wakeup in [false, true] {
+        for wakeup_first in [false, true] {
+            let model = HoldingModel::new(Vec::new());
+            let (_directory, agent, chat) = local_agent(model.clone()).await;
+            if from_wakeup {
+                model
+                    .scripted
+                    .enqueue(wakeup("initial_wake", 600, "/loop check the build"));
+                model.scripted.enqueue(text("Checked once."));
+                invoke(&agent, chat, "loop", "check the build").await;
+                agent.quiesce(chat).await;
+                agent.set_scheduled_now_for_tests(at(10, 10, 0));
+            }
+            let mut replies = vec![
+                create("cron", "0 12 * * 2", "check the build"),
+                wakeup("wake", 600, "/loop check the build"),
+            ];
+            if wakeup_first {
+                replies.reverse();
+            }
+            for reply in replies {
+                model.scripted.enqueue(reply);
+            }
+            model.scripted.enqueue(text("Both scheduled."));
+            if from_wakeup {
+                agent
+                    .run_due_scheduled_tasks(chat, at(10, 10, 0))
+                    .await
+                    .unwrap();
+            } else {
+                invoke(&agent, chat, "loop", "check the build").await;
+            }
+            agent.quiesce(chat).await;
+            let remaining = tasks(&agent, chat).await;
+            assert_eq!(remaining.len(), 2, "{remaining:?}");
+            assert!(
+                remaining
+                    .iter()
+                    .any(|task| matches!(task.kind, ScheduledTaskKind::Recurring { .. }))
+            );
+            let self_paced = remaining
+                .iter()
+                .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+                .unwrap();
+            assert_eq!(
+                self_paced.next_fire_at_ms,
+                Some(ms(at(10, if from_wakeup { 20 } else { 10 }, 0)))
+            );
+            assert!(matches!(
+                self_paced.kind,
+                ScheduledTaskKind::SelfPaced {
+                    fallback: false,
+                    ..
+                }
+            ));
+            assert!(!tool_result(&agent, chat, "cron").await.1);
+            assert!(!tool_result(&agent, chat, "wake").await.1);
+            agent.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_cron_create_does_not_end_a_self_paced_loop() {
+    let model = HoldingModel::new(vec![
+        create("invalid", "invalid cron", "check the build"),
+        text("Could not schedule."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model).await;
+    invoke(&agent, chat, "loop", "check every Tuesday at noon").await;
+    agent.quiesce(chat).await;
+    assert!(tool_result(&agent, chat, "invalid").await.1);
+    let remaining = tasks(&agent, chat).await;
+    assert_eq!(remaining.len(), 1);
+    assert!(matches!(
+        remaining[0].kind,
+        ScheduledTaskKind::SelfPaced { fallback: true, .. }
+    ));
+    assert_eq!(remaining[0].next_fire_at_ms, Some(ms(at(10, 20, 0))));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cron_created_in_an_earlier_turn_does_not_end_a_self_paced_loop() {
+    let model = HoldingModel::new(vec![
+        create("earlier", "0 12 * * 2", "check the build"),
+        text("Scheduled."),
+        text("Checked once."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model).await;
+    turn(&agent, chat, "schedule a weekly check").await;
+    invoke(&agent, chat, "loop", "watch the build").await;
+    agent.quiesce(chat).await;
+    let remaining = tasks(&agent, chat).await;
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|task| matches!(
+        task.kind,
+        ScheduledTaskKind::SelfPaced { fallback: true, .. }
+    )));
+    agent.shutdown().await;
+}
+
 /// The task names the `/loop` turn it started in the Transcript before that turn can run, so a
 /// host that goes on with the turn from the Transcript alone still knows it is the loop's first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
