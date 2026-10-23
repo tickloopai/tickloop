@@ -146,7 +146,8 @@ pub enum TriggerSource {
     },
     /// A scheduled task's run for one time its schedule names, in Unix milliseconds.
     ScheduledTask {
-        task_id: String,
+        #[serde(deserialize_with = "crate::scheduled_tasks::scheduled_task_reference")]
+        task_id: Uuid,
         scheduled_for_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         wrappers: Vec<crate::ScheduledInputWrapper>,
@@ -188,7 +189,8 @@ pub enum TriggerIdentity {
         after_run: RunId,
     },
     ScheduledTask {
-        task_id: String,
+        #[serde(deserialize_with = "crate::scheduled_tasks::scheduled_task_reference")]
+        task_id: Uuid,
         scheduled_for_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         wrappers: Vec<crate::ScheduledInputWrapper>,
@@ -307,7 +309,7 @@ impl TriggerSource {
                 scheduled_for_ms,
                 wrappers,
             } => TriggerIdentity::ScheduledTask {
-                task_id: task_id.clone(),
+                task_id: *task_id,
                 scheduled_for_ms: *scheduled_for_ms,
                 wrappers: wrappers.clone(),
             },
@@ -319,7 +321,7 @@ impl TriggerSource {
             Self::TickUpdate { .. } => Coalesce::LatestOnly,
             Self::TickManual { .. } | Self::ArtifactFeedback { .. } => Coalesce::EachItem,
             Self::GoalContinuation { goal_id, .. } => Coalesce::OnePerKey(goal_id.to_string()),
-            Self::ScheduledTask { task_id, .. } => Coalesce::OnePerKey(task_id.clone()),
+            Self::ScheduledTask { task_id, .. } => Coalesce::OnePerKey(task_id.to_string()),
         }
     }
 

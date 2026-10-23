@@ -616,12 +616,51 @@ impl MonitorMembersEntry {
 /// The latest scheduled tasks of one Chat: every creation, run and deletion rewrites the whole
 /// list.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "ScheduledTasksRecord")]
 pub struct ScheduledTasksEntry {
     pub chat_id: Uuid,
+    /// The Chat's folder, which lets tasks scheduled before any message keep the Chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub tasks: Vec<tickloop_agent_protocol::ScheduledTask>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked: Vec<tickloop_agent_protocol::ScheduledTaskRevocation>,
+}
+
+impl ScheduledTasksEntry {
+    pub fn materializes_chat(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+}
+
+/// A [`ScheduledTasksEntry`] as stored, whose tasks may predate their UUIDs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduledTasksRecord {
+    chat_id: Uuid,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    tasks: Vec<serde_json::Value>,
+    #[serde(default)]
+    revoked: Vec<tickloop_agent_protocol::ScheduledTaskRevocation>,
+}
+
+impl TryFrom<ScheduledTasksRecord> for ScheduledTasksEntry {
+    type Error = serde_json::Error;
+
+    fn try_from(record: ScheduledTasksRecord) -> Result<Self, Self::Error> {
+        let tasks = record
+            .tasks
+            .into_iter()
+            .map(|task| tickloop_agent_protocol::ScheduledTask::from_record(record.chat_id, task))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            chat_id: record.chat_id,
+            cwd: record.cwd,
+            tasks,
+            revoked: record.revoked,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

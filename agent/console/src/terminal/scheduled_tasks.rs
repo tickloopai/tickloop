@@ -139,7 +139,7 @@ impl TickActionExecutor for TaskAction {
             }));
         }
         Ok(PreparedTickAction::new(
-            self.task.id.clone(),
+            self.task.id,
             if self.delete { 'x' } else { '\n' },
             Arc::new(self.clone()),
         ))
@@ -152,7 +152,7 @@ impl TickActionBackend for TaskAction {
             return Ok(());
         }
         ctx.agent
-            .delete_scheduled_task(ctx.chat, self.task.id.clone())
+            .delete_scheduled_task(ctx.chat, self.task.id)
             .await
             .map_err(|error| error.to_string())?;
         ctx.console.remove_scheduled_task(ctx.chat, &self.task.id)?;
@@ -162,14 +162,14 @@ impl TickActionBackend for TaskAction {
 
 #[derive(Clone)]
 pub(super) enum PauseAction {
-    Scheduled(String),
+    Scheduled(Uuid),
     Subscription(tick_protocol::InstanceRef),
 }
 
 impl TickActionExecutor for PauseAction {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         let id = match self {
-            Self::Scheduled(id) => id.clone(),
+            Self::Scheduled(id) => id.to_string(),
             Self::Subscription(instance) => instance.to_string(),
         };
         Ok(PreparedTickAction::new(
@@ -198,7 +198,7 @@ impl TickActionBackend for PauseAction {
                     .ok_or("Scheduled task no longer exists")?;
                 let paused = task.paused_at_ms.is_none();
                 ctx.agent
-                    .set_scheduled_task_paused(ctx.chat, id.clone(), paused)
+                    .set_scheduled_task_paused(ctx.chat, *id, paused)
                     .await
                     .map_err(|error| error.to_string())?;
                 ctx.console.update_monitor_chat(
@@ -359,7 +359,7 @@ mod tests {
 
     pub(super) fn task() -> ScheduledTask {
         serde_json::from_value(json!({
-            "id": "0123abcd", "kind": {"type": "recurring", "cron": "* * * * *"},
+            "id": "00000000-0000-0000-0000-00000123abcd", "kind": {"type": "recurring", "cron": "* * * * *"},
             "prompt": "提醒我看天气", "creator": "user", "time_zone": "Asia/Shanghai",
             "created_at_ms": 0, "scheduled_for_ms": 60000, "next_fire_at_ms": 60000,
             "jitter_ms": 0, "skipped": 2

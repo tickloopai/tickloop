@@ -5,9 +5,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tickloop_agent_protocol::ToolDefinition;
+use tickloop_agent_cron::Schedule;
+use tickloop_agent_protocol::{MAX_SCHEDULED_TASK_TITLE_CHARS, ToolDefinition};
+use uuid::Uuid;
 
-use super::tasks::{MAX_WAKEUP_DELAY, MIN_WAKEUP_DELAY, TASK_LIFETIME};
+use super::tasks::{
+    CronTask, MAX_WAKEUP_DELAY, MIN_WAKEUP_DELAY, TaskRules, duration_words, rate, title,
+};
 use crate::host_tools::HostToolPermission;
 use tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTRUCTIONS_PLACEHOLDER;
 
@@ -16,7 +20,31 @@ pub(crate) const CRON_LIST_TOOL_NAME: &str = "CronList";
 pub(crate) const CRON_DELETE_TOOL_NAME: &str = "CronDelete";
 pub(crate) const SCHEDULE_WAKEUP_TOOL_NAME: &str = "ScheduleWakeup";
 
-const LIFETIME_DAYS: u64 = TASK_LIFETIME.as_secs() / (24 * 60 * 60);
+/// Recurring schedules the CronCreate description gives as examples, where the host allows
+/// them.
+const RECURRING_EXAMPLES: [(&str, &str); 3] = [
+    ("*/5 * * * *", "every 5 minutes"),
+    ("0 * * * *", "hourly"),
+    ("0 9 * * 1-5", "weekdays at 9am local"),
+];
+
+/// What the scheduled task tools promise the model on this host.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ToolTerms {
+    pub rules: TaskRules,
+    /// Whether a task the Agent creates waits for the user's confirmation on a host without
+    /// permission requests.
+    pub confirms_agent_tasks: bool,
+}
+
+impl ToolTerms {
+    /// Claude Code's.
+    #[cfg(test)]
+    pub(crate) const DEFAULT: Self = Self {
+        rules: TaskRules::DEFAULT,
+        confirms_agent_tasks: true,
+    };
+}
 
 pub(crate) fn is_scheduled_task_tool(name: &str) -> bool {
     matches!(
@@ -51,10 +79,11 @@ pub(crate) enum ScheduledTaskCall {
         cron: String,
         prompt: String,
         recurring: bool,
+        title: Option<String>,
     },
     List,
     Delete {
-        id: String,
+        id: Uuid,
     },
     Wakeup {
         delay: Duration,
@@ -71,6 +100,7 @@ struct CreateInput {
     prompt: String,
     #[serde(default = "recurring_by_default")]
     recurring: bool,
+    title: Option<String>,
 }
 
 fn recurring_by_default() -> bool {
@@ -105,10 +135,17 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
             if input.prompt.trim().is_empty() {
                 return Err(format!("{name} needs a prompt to run"));
             }
+            let title = input
+                .title
+                .as_deref()
+                .map(title)
+                .transpose()
+                .map_err(|error| error.to_string())?;
             Ok(ScheduledTaskCall::Create {
                 cron: input.cron,
                 prompt: input.prompt,
                 recurring: input.recurring,
+                title,
             })
         }
         CRON_LIST_TOOL_NAME => {
@@ -117,7 +154,13 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
         }
         CRON_DELETE_TOOL_NAME => {
             let input: DeleteInput = serde_json::from_value(input.clone()).map_err(invalid)?;
-            Ok(ScheduledTaskCall::Delete { id: input.id })
+            let id = input.id.trim().parse().map_err(|_| {
+                format!(
+                    "`{}` is not a task id; {CRON_LIST_TOOL_NAME} gives each task's id",
+                    input.id
+                )
+            })?;
+            Ok(ScheduledTaskCall::Delete { id })
         }
         SCHEDULE_WAKEUP_TOOL_NAME => {
             let input: WakeupInput = serde_json::from_value(input.clone()).map_err(invalid)?;
@@ -144,10 +187,44 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
     }
 }
 
-pub(crate) fn definitions() -> Vec<ToolDefinition> {
+/// The tool definitions on `terms`, ScheduleWakeup only with `schedule_wakeup`.
+pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDefinition> {
     let min_delay = MIN_WAKEUP_DELAY.as_secs();
     let max_delay = MAX_WAKEUP_DELAY.as_secs();
-    vec![
+    let recurring_examples = RECURRING_EXAMPLES
+        .iter()
+        .filter(|(cron, _)| {
+            Schedule::parse(cron).is_ok_and(|schedule| {
+                terms
+                    .rules
+                    .check_interval(&CronTask::Recurring(schedule))
+                    .is_ok()
+            })
+        })
+        .map(|(cron, meaning)| format!("\"{cron}\" ({meaning})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let frequency_limit = terms.rules.min_interval.map_or(String::new(), |min_interval| {
+        format!(
+            "\n\nOn this host a recurring task runs at most {}: any two consecutive times its expression names must be at least that far apart, and {CRON_CREATE_TOOL_NAME} refuses a schedule that runs more often. One-shot tasks are not limited.",
+            rate(min_interval)
+        )
+    });
+    let lifetime = match terms.rules.lifetime {
+        Some(lifetime) => {
+            let lifetime = duration_words(lifetime);
+            format!(
+                "Recurring tasks expire {lifetime} after creation: they run one final time, then are deleted. Tell the user about this limit when scheduling recurring tasks."
+            )
+        }
+        None => "Recurring tasks run until they are deleted.".to_owned(),
+    };
+    let confirmation = if terms.confirms_agent_tasks {
+        "\n\nOn a host without permission requests, a task you create waits for the user to confirm it before it starts timing; only the one task the user's /loop schedules, created exactly as its \"This /loop\" section gives it, does not."
+    } else {
+        ""
+    };
+    let mut definitions = vec![
         ToolDefinition {
             name: CRON_CREATE_TOOL_NAME.into(),
             description: format!(
@@ -164,7 +241,7 @@ For \"remind me at X\" or \"at <time>, do Y\" requests: the task runs once, then
 ## Recurring tasks (recurring: true, the default)
 
 For \"every N minutes\", \"every hour\" or \"weekdays at 9am\" requests:
-  \"*/5 * * * *\" (every 5 minutes), \"0 * * * *\" (hourly), \"0 9 * * 1-5\" (weekdays at 9am local)
+  {recurring_examples}{frequency_limit}
 
 ## Avoid the :00 and :30 minute marks when the task allows it
 
@@ -177,9 +254,7 @@ Use minute 0 or 30 only when the user names that exact time and clearly means it
 
 A task runs only between turns: when it comes due while a turn is running, it waits for the turn to end, and times passed meanwhile run once, not once each. Each task gets a small fixed jitter: recurring tasks run late by up to half the gap to their next run and at most 30 minutes, except that \"*/5 * * * *\" runs 15 seconds early; one-shot tasks landing on :00 or :30 run up to 90 seconds early.
 
-Recurring tasks expire {LIFETIME_DAYS} days after creation: they run one final time, then are deleted. Tell the user about the {LIFETIME_DAYS}-day limit when scheduling recurring tasks. A Chat holds at most {max} scheduled tasks.
-
-On a host without permission requests, a task you create waits for the user to confirm it before it starts timing; only the one task the user's /loop schedules, created exactly as its \"This /loop\" section gives it, does not.
+{lifetime} A Chat holds at most {max} scheduled tasks.{confirmation}
 
 Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
                 max = tickloop_agent_protocol::MAX_SCHEDULED_TASKS_PER_CHAT,
@@ -187,19 +262,20 @@ Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
             input_schema: json!({"type":"object","properties":{
                 "cron":{"type":"string","description":"Standard 5-field cron expression in the user's local time zone: \"M H DoM Mon DoW\"."},
                 "prompt":{"type":"string","minLength":1,"description":format!("The prompt to run at each scheduled time. Pass `{LOOP_INSTRUCTIONS_PLACEHOLDER}` to run the Chat's loop.md, or the built-in maintenance instructions when there is none.")},
-                "recurring":{"type":"boolean","description":"true (default) runs at every time the expression names; false runs once at the next one, then deletes the task."}
+                "recurring":{"type":"boolean","description":"true (default) runs at every time the expression names; false runs once at the next one, then deletes the task."},
+                "title":{"type":"string","minLength":1,"description":format!("A short name the user sees for the task, such as \"Daily news digest\", at most {MAX_SCHEDULED_TASK_TITLE_CHARS} characters.")}
             },"required":["cron","prompt"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: CRON_LIST_TOOL_NAME.into(),
-            description: format!("List this Chat's scheduled tasks with their ids, schedules, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps."),
+            description: format!("List this Chat's scheduled tasks with their ids, titles, schedules, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps."),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
         ToolDefinition {
             name: CRON_DELETE_TOOL_NAME.into(),
             description: format!("Cancel a scheduled task of this Chat by its id, as {CRON_CREATE_TOOL_NAME} or {CRON_LIST_TOOL_NAME} gave it."),
             input_schema: json!({"type":"object","properties":{
-                "id":{"type":"string","description":"The 8-character task id."}
+                "id":{"type":"string","description":"The task id, a UUID."}
             },"required":["id"],"additionalProperties":false}),
         },
         ToolDefinition {
@@ -221,5 +297,9 @@ One short sentence on what you chose and why, shown to the user: \"watching CI r
                 "stop":{"type":"boolean","description":"End the loop now; omit every other field."}
             },"additionalProperties":false}),
         },
-    ]
+    ];
+    if !schedule_wakeup {
+        definitions.retain(|definition| definition.name != SCHEDULE_WAKEUP_TOOL_NAME);
+    }
+    definitions
 }

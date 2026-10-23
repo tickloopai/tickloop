@@ -18,4 +18,4 @@ thiserror = "2"
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 unicode-width = "0.2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }

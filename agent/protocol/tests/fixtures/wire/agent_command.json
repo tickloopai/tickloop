@@ -275,7 +275,7 @@
     },
     "action": {
       "kind": "set_scheduled_task_paused",
-      "task_id": "0123abcd",
+      "task_id": "00000000-0000-0000-0000-00000123abcd",
       "paused": true
     }
   },

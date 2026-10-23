@@ -3,7 +3,6 @@ use uuid::Uuid;
 
 use crate::Schedule;
 
-const TASK_ID_LENGTH: usize = 8;
 const RECURRING_MAX_DELAY: TimeDelta = TimeDelta::minutes(30);
 const EVERY_FIVE_MINUTES_LEAD: TimeDelta = TimeDelta::seconds(15);
 const ONE_SHOT_MAX_LEAD: TimeDelta = TimeDelta::seconds(90);
@@ -31,9 +30,9 @@ impl<Tz: TimeZone> Run<Tz> {
     }
 }
 
-/// An 8-character lowercase hexadecimal id, like Claude Code's: the start of a random UUID.
-pub fn generate_task_id() -> String {
-    Uuid::new_v4().simple().to_string()[..TASK_ID_LENGTH].to_string()
+/// A new task id: a time-ordered UUIDv7, unique across every Chat.
+pub fn generate_task_id() -> Uuid {
+    Uuid::now_v7()
 }
 
 /// The first run scheduled strictly after `after`, fired as [`run_for`] describes and never
@@ -42,7 +41,7 @@ pub fn generate_task_id() -> String {
 pub fn next_run<Tz: TimeZone>(
     schedule: &Schedule,
     kind: TaskKind,
-    task_id: &str,
+    task_id: &Uuid,
     after: &DateTime<Tz>,
 ) -> Option<Run<Tz>> {
     let scheduled_for = schedule.next_after(after)?;
@@ -63,7 +62,7 @@ pub fn next_run<Tz: TimeZone>(
 pub fn run_for<Tz: TimeZone>(
     schedule: &Schedule,
     kind: TaskKind,
-    task_id: &str,
+    task_id: &Uuid,
     scheduled_for: DateTime<Tz>,
     not_before: &DateTime<Tz>,
 ) -> Option<Run<Tz>> {
@@ -88,14 +87,11 @@ pub fn run_for<Tz: TimeZone>(
     })
 }
 
-/// `span` scaled by the task id read as a fraction in `[0, 1)`. Ids that are not 8 hex
-/// digits get no jitter.
-fn share(span: TimeDelta, task_id: &str) -> TimeDelta {
-    let fraction = if task_id.len() == TASK_ID_LENGTH {
-        u32::from_str_radix(task_id, 16).unwrap_or(0)
-    } else {
-        0
-    };
+/// `span` scaled by the last 32 bits of the task id read as a fraction in `[0, 1)`: those bits
+/// are random in a UUIDv7 and hashed in a name-based UUID, unlike a UUIDv7's leading time.
+fn share(span: TimeDelta, task_id: &Uuid) -> TimeDelta {
+    let bytes = task_id.as_bytes();
+    let fraction = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     let milliseconds =
         i128::from(span.num_milliseconds()) * i128::from(fraction) / FRACTION_DENOMINATOR;
     TimeDelta::milliseconds(milliseconds as i64)

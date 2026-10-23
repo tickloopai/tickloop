@@ -3,6 +3,8 @@ use crate::{AbandonReason, InputState, ModelVisibleResult, ResumePoint, TaskBoar
 use serde_json::json;
 use tickloop_agent_protocol::{Message, QuestionRequest, ToolResult};
 
+const TASK: Uuid = Uuid::from_u128(0x0198_0a1b_2c3d_7000_8000_0000_0a1b_2c3d);
+
 fn entry(role: Role, content: Vec<Content>) -> ChainEntry {
     serde_json::from_value(json!({
         "uuid": Uuid::new_v4(), "chatId": Uuid::nil(), "timestamp": "2026-10-20T00:00:00Z",
@@ -338,7 +340,7 @@ fn input(response: &ResponseEntry, op: InputOp) -> Line {
 
 fn scheduled_run() -> tickloop_agent_protocol::TriggerSource {
     tickloop_agent_protocol::TriggerSource::ScheduledTask {
-        task_id: "0a1b2c3d".into(),
+        task_id: TASK,
         scheduled_for_ms: 1_000,
         wrappers: Vec::new(),
     }
@@ -393,16 +395,21 @@ fn goal_continuation_shows_one_event_without_its_model_prompt() {
 #[test]
 fn scheduled_input_projection_hides_the_skill_wrapper() {
     let response = response(ResponseState::Started);
-    let mut prompt = entry(Role::User, vec![Content::Text {
-        text: "Scheduled task 0a1b2c3d: invoke the `review` Skill with the Skill tool with the arguments `main`.".into(),
-    }]);
+    let mut prompt = entry(
+        Role::User,
+        vec![Content::Text {
+            text: format!(
+                "Scheduled task {TASK}: invoke the `review` Skill with the Skill tool with the arguments `main`."
+            ),
+        }],
+    );
     prompt.run_id = Some(response.run_id);
     let Line::Input(mut input) = input(&response, InputOp::Trigger) else {
         unreachable!()
     };
     input.trigger.as_mut().unwrap().identity =
         tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
-            task_id: "0a1b2c3d".into(),
+            task_id: TASK,
             scheduled_for_ms: 1_000,
             wrappers: vec![tickloop_agent_protocol::ScheduledInputWrapper::Skill {
                 instruction: "/review main".into(),
@@ -427,12 +434,12 @@ fn scheduled_input_projection_hides_the_skill_wrapper() {
 #[test]
 fn scheduled_projection_preserves_unrecorded_wrappers_through_retained_replay() {
     for instruction in [
-        tickloop_agent_protocol::scheduled_skill_prompt("0a1b2c3d", "review", "main"),
+        tickloop_agent_protocol::scheduled_skill_prompt(&TASK, "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        tickloop_agent_protocol::loop_instructions_error_prompt("0a1b2c3d", "permission denied"),
+        tickloop_agent_protocol::loop_instructions_error_prompt(&TASK, "permission denied"),
         tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
     ] {
         let response = response(ResponseState::Started);
@@ -511,7 +518,7 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
         let expected = match op {
             InputOp::Trigger => PromptOrigin::Trigger {
                 identity: tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
-                    task_id: "0a1b2c3d".into(),
+                    task_id: TASK,
                     scheduled_for_ms: 1_000,
                     wrappers: Vec::new(),
                 },
@@ -768,25 +775,23 @@ fn trigger_deliveries_show_each_delivery_as_its_ledger_last_recorded_it() {
     assert_eq!(deliveries[2].identity, scheduled_run().identity());
 }
 
+/// The latest record wins, and its tasks recorded before tasks had UUIDs read with the same
+/// UUIDv5 on every read.
 #[test]
 fn the_latest_scheduled_tasks_record_wins() {
     let chat = Uuid::new_v4();
-    let task = |id: &str| -> tickloop_agent_protocol::ScheduledTask {
-        serde_json::from_value(json!({
+    let legacy_task = |id: &str| {
+        json!({
             "id": id, "kind": {"type": "recurring", "cron": "*/5 * * * *"},
             "prompt": "check the deploy", "creator": "user", "time_zone": "Asia/Shanghai",
             "confirmation": null, "created_at_ms": 1, "expires_at_ms": 604_800_001,
             "scheduled_for_ms": 300_000, "next_fire_at_ms": 285_000, "jitter_ms": -15_000,
             "last_fired_at_ms": null, "skipped": 0,
-        }))
-        .unwrap()
-    };
-    let line = |tasks: Vec<tickloop_agent_protocol::ScheduledTask>| {
-        Line::ScheduledTasks(crate::ScheduledTasksEntry {
-            chat_id: chat,
-            tasks,
-            revoked: Vec::new(),
         })
+    };
+    let line = |tasks: Vec<serde_json::Value>| -> Line {
+        serde_json::from_value(json!({"type": "scheduled-tasks", "chatId": chat, "tasks": tasks}))
+            .unwrap()
     };
     // A Trigger source's own state: no retained snapshot carries it.
     assert_eq!(
@@ -794,18 +799,25 @@ fn the_latest_scheduled_tasks_record_wins() {
         crate::Retention::SourceState
     );
     let lines = [
-        line(vec![task("0a1b2c3d")]),
-        line(vec![task("0a1b2c3d"), task("11111111")]),
+        line(vec![legacy_task("0a1b2c3d")]),
+        line(vec![legacy_task("0a1b2c3d"), legacy_task("11111111")]),
     ];
-    assert_eq!(
-        scheduled_tasks(&lines)
+    let expected = [
+        tickloop_agent_protocol::legacy_scheduled_task_id(chat, "0a1b2c3d", 1),
+        tickloop_agent_protocol::legacy_scheduled_task_id(chat, "11111111", 1),
+    ];
+    let ids = |lines: &[Line]| {
+        scheduled_tasks(lines)
             .iter()
-            .map(|task| task.id.as_str())
-            .collect::<Vec<_>>(),
-        ["0a1b2c3d", "11111111"]
-    );
+            .map(|task| task.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&lines), expected);
+    assert_eq!(ids(&lines), ids(&lines.clone()));
     assert!(scheduled_tasks(&[lines[0].clone(), line(Vec::new())]).is_empty());
-    let written = serde_json::to_value(line(vec![task("0a1b2c3d")])).unwrap();
+    let written = serde_json::to_value(&lines[1]).unwrap();
     assert_eq!(written["type"], "scheduled-tasks");
-    assert!(serde_json::from_value::<Line>(written).is_ok());
+    assert_eq!(written["tasks"][0]["id"], json!(expected[0]));
+    let reread: Line = serde_json::from_value(written).unwrap();
+    assert_eq!(ids(&[reread]), expected);
 }

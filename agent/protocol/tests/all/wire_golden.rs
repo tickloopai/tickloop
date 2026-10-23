@@ -578,7 +578,7 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::ManageLoop {
                 execution: execution(),
-                action: LoopAction::SetScheduledTaskPaused { task_id: "0123abcd".into(), paused: true },
+                action: LoopAction::SetScheduledTaskPaused { task_id: id(0x0123_abcd), paused: true },
             },
             AgentCommand::ManageLoop {
                 execution: execution(),

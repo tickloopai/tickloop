@@ -746,7 +746,7 @@ mod tests {
             .deliver_trigger_for_tests(
                 first,
                 tickloop_agent_protocol::TriggerSource::ScheduledTask {
-                    task_id: "rewind".into(),
+                    task_id: Uuid::from_u128(0x5e1d),
                     scheduled_for_ms: 1,
                     wrappers: Vec::new(),
                 },

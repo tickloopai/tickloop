@@ -456,3 +456,26 @@ fn a_gap_that_ends_mid_minute_runs_skipped_times_at_its_exact_end() {
     assert_eq!(midnight.next_after(&evening), Some(gap_end));
     assert_eq!(midnight.next_at_or_after(&gap_end), Some(gap_end));
 }
+
+#[test]
+fn shortest_gap_reads_the_closest_two_times() {
+    let cases = [
+        ("*/5 * * * *", TimeDelta::minutes(5)),
+        ("*/30 * * * *", TimeDelta::minutes(30)),
+        ("0,30 9 * * *", TimeDelta::minutes(30)),
+        ("0 * * * *", TimeDelta::hours(1)),
+        ("0 0,23 * * *", TimeDelta::hours(1)),
+        ("59 23 * * *", TimeDelta::days(1)),
+        ("0 9 * * 1-5", TimeDelta::days(1)),
+        ("0 9 * * 1", TimeDelta::days(7)),
+        ("0 9 1 * *", TimeDelta::days(28)),
+    ];
+    for (expression, gap) in cases {
+        assert_eq!(
+            Schedule::parse(expression).unwrap().shortest_gap(),
+            Some(gap),
+            "{expression}"
+        );
+    }
+    assert_eq!(Schedule::parse("0 0 30 2 *").unwrap().shortest_gap(), None);
+}

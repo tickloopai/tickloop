@@ -555,17 +555,17 @@ pub enum LoopAction {
     },
     /// Pauses or resumes one scheduled task at the user's request from Monitor.
     SetScheduledTaskPaused {
-        task_id: String,
+        task_id: Uuid,
         paused: bool,
     },
     /// Cancels one of the Chat's scheduled tasks, as from its Monitor row.
     DeleteScheduledTask {
-        task_id: String,
+        task_id: Uuid,
     },
     /// The user's answer to a scheduled task the Agent created on a host without permission
     /// requests: confirming starts its timing, rejecting deletes it.
     DecideScheduledTask {
-        task_id: String,
+        task_id: Uuid,
         decision: crate::ScheduledTaskDecision,
     },
 }

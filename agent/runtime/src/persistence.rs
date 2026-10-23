@@ -2137,7 +2137,13 @@ fn recover_transcript(
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
             })
-            .or_else(|| loaded.goal.as_ref().and_then(|entry| entry.cwd.clone())),
+            .or_else(|| loaded.goal.as_ref().and_then(|entry| entry.cwd.clone()))
+            .or_else(|| {
+                loaded
+                    .scheduled_tasks
+                    .as_ref()
+                    .and_then(|entry| entry.cwd.clone())
+            }),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());
     snapshot.generated_title = loaded
@@ -2660,6 +2666,15 @@ impl Agent {
             .recorder
             .as_ref()
             .is_some_and(|recorder| recorder.outbox.holds_failed_batch(chat_id))
+    }
+
+    /// Whether the Chat's Transcript keeps what it queued buffered until something keeps the
+    /// Chat, such as its first message: there is nothing to commit for it yet.
+    pub(super) fn transcript_awaits_materializing(&self, chat_id: ChatId) -> bool {
+        self.inner.recorder.as_ref().is_some_and(|recorder| {
+            recorder.logs.lock().unwrap().contains_key(&chat_id)
+                && !recorder.outbox.is_materialized(chat_id)
+        })
     }
 
     pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {

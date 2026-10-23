@@ -288,13 +288,13 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
     let run = Uuid::new_v4();
     let mut snapshot = super::monitor_tests::chat_snapshot(chat);
     snapshot.messages = vec![Message { role: MessageRole::User, content: vec![Content::Text {
-        text: "Scheduled task 12345678: invoke the `review` Skill with the Skill tool with the arguments `main`.\n\nThis is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.".into(),
+        text: "Scheduled task 00000000-0000-0000-0000-000012345678: invoke the `review` Skill with the Skill tool with the arguments `main`.\n\nThis is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.".into(),
     }] }];
     snapshot.message_runs.insert(0, run);
     snapshot.trigger_origins.insert(
         run,
         TriggerIdentity::ScheduledTask {
-            task_id: "12345678".into(),
+            task_id: uuid::Uuid::from_u128(0x1234_5678),
             scheduled_for_ms: 1,
             wrappers: vec![
                 tickloop_agent_protocol::ScheduledInputWrapper::Skill {
@@ -322,12 +322,19 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
 fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
     use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     for instruction in [
-        tickloop_agent_protocol::scheduled_skill_prompt("12345678", "review", "main"),
+        tickloop_agent_protocol::scheduled_skill_prompt(
+            &uuid::Uuid::from_u128(0x1234_5678),
+            "review",
+            "main",
+        ),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        tickloop_agent_protocol::loop_instructions_error_prompt("12345678", "permission denied"),
+        tickloop_agent_protocol::loop_instructions_error_prompt(
+            &uuid::Uuid::from_u128(0x1234_5678),
+            "permission denied",
+        ),
         tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
     ] {
         let chat = Uuid::new_v4();
@@ -343,7 +350,7 @@ fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
         snapshot.trigger_origins.insert(
             run,
             TriggerIdentity::ScheduledTask {
-                task_id: "12345678".into(),
+                task_id: uuid::Uuid::from_u128(0x1234_5678),
                 scheduled_for_ms: 1,
                 wrappers: Vec::new(),
             },

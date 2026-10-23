@@ -89,7 +89,7 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
         .deliver_trigger_for_tests(
             chat,
             tickloop_agent_protocol::TriggerSource::ScheduledTask {
-                task_id: "evidence".into(),
+                task_id: uuid::Uuid::from_u128(0xe1d),
                 scheduled_for_ms: 1,
                 wrappers: Vec::new(),
             },

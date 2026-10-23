@@ -7,6 +7,8 @@ mod tasks_tests;
 pub(crate) mod tools;
 mod wiring;
 
+pub(crate) use tasks::{TASK_LIFETIME, TaskRules, interval_limit};
+pub use wiring::{NewScheduledTask, ScheduledTaskEdit};
 pub(crate) use wiring::{
     ScheduleClock, ScheduledTasksState, after_history_load, is_current_run, resolve_zone,
 };

@@ -530,7 +530,10 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
             }
             for prompt in ["First PTY reminder", "Second PTY reminder"] {
                 agent
-                    .schedule_task(chat, "* * * * *", prompt.into(), true)
+                    .schedule_task(
+                        chat,
+                        tickloop_agent_runtime::NewScheduledTask::new("* * * * *", prompt, true),
+                    )
                     .await
                     .unwrap();
             }

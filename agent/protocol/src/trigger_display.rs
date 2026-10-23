@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use crate::TriggerIdentity;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Model-only wrappers added by the host, in the order they were applied. Original instructions
 /// are kept where argument trimming or tag escaping would make formatting irreversible.
@@ -21,7 +22,10 @@ pub enum ScheduledInputWrapper {
 
 pub const GOAL_CONTINUATION_EVENT: &str = "↻ Continuing Goal";
 
+/// The note of a final run after the standard seven days.
 const FINAL_SCHEDULED_RUN_NOTE: &str = "\n\nThis is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.";
+const ENDING_SCHEDULED_RUN_NOTE_START: &str = "\n\nThis is the final run of this scheduled task: ";
+const ENDING_SCHEDULED_RUN_NOTE_END: &str = ", and it is deleted after this run. Do not schedule it again; tell the user it ended and that they can schedule a new task to continue.";
 const SCHEDULED_TASK_PREFIX: &str = "Scheduled task ";
 const SKILL_PREFIX: &str = ": invoke the `";
 const SKILL_SUFFIX: &str = "` Skill with the Skill tool";
@@ -37,7 +41,7 @@ const LOOP_INSTRUCTIONS_OPENING_TAG: &str = "<loop-instructions>";
 const LOOP_INSTRUCTIONS_CLOSING_TAG: &str = "</loop-instructions>";
 const ESCAPED_LOOP_INSTRUCTIONS_CLOSING_TAG: &str = "<\\/loop-instructions>";
 
-pub fn scheduled_skill_prompt(task_id: &str, name: &str, arguments: &str) -> String {
+pub fn scheduled_skill_prompt(task_id: &Uuid, name: &str, arguments: &str) -> String {
     let arguments = if arguments.is_empty() {
         String::new()
     } else {
@@ -48,19 +52,33 @@ pub fn scheduled_skill_prompt(task_id: &str, name: &str, arguments: &str) -> Str
     )
 }
 
+/// `input` with the note that this run of a task living the standard seven days is its last.
 pub fn final_scheduled_run_prompt(input: &str) -> String {
     format!("{input}{FINAL_SCHEDULED_RUN_NOTE}")
 }
 
-pub fn strip_final_scheduled_run_prompt(text: &str) -> Option<&str> {
-    text.strip_suffix(FINAL_SCHEDULED_RUN_NOTE)
+/// `input` with the note that this run is the task's last, saying why in `ending`, such as
+/// "it was created 3 days ago".
+pub fn ending_scheduled_run_prompt(input: &str, ending: &str) -> String {
+    format!("{input}{ENDING_SCHEDULED_RUN_NOTE_START}{ending}{ENDING_SCHEDULED_RUN_NOTE_END}")
 }
 
-pub fn loop_instructions_error_prompt(task_id: &str, error: &str) -> String {
+/// The input of either note's run without the note.
+pub fn strip_final_scheduled_run_prompt(text: &str) -> Option<&str> {
+    if let Some(input) = text.strip_suffix(FINAL_SCHEDULED_RUN_NOTE) {
+        return Some(input);
+    }
+    let without_end = text.strip_suffix(ENDING_SCHEDULED_RUN_NOTE_END)?;
+    without_end
+        .rfind(ENDING_SCHEDULED_RUN_NOTE_START)
+        .map(|start| &text[..start])
+}
+
+pub fn loop_instructions_error_prompt(task_id: &Uuid, error: &str) -> String {
     format!("{SCHEDULED_TASK_PREFIX}{task_id}{LOOP_ERROR_PREFIX}{error}{LOOP_ERROR_SUFFIX}")
 }
 
-pub fn strip_loop_instructions_error_prompt<'a>(task_id: &str, text: &'a str) -> Option<&'a str> {
+pub fn strip_loop_instructions_error_prompt<'a>(task_id: &Uuid, text: &'a str) -> Option<&'a str> {
     text.strip_prefix(&format!(
         "{SCHEDULED_TASK_PREFIX}{task_id}{LOOP_ERROR_PREFIX}"
     ))?
@@ -92,7 +110,7 @@ impl TriggerIdentity {
 }
 
 fn scheduled_input<'a>(
-    task_id: &str,
+    task_id: &Uuid,
     wrappers: &[ScheduledInputWrapper],
     text: &'a str,
 ) -> Cow<'a, str> {

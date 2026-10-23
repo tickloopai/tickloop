@@ -190,7 +190,14 @@ async fn cron_delete_requires_user_cancellation_or_exact_agent_creation() {
                 .remove(0)
         } else {
             agent
-                .schedule_task(chat, "7 9 * * *", "Check the build".into(), true)
+                .schedule_task(
+                    chat,
+                    tickloop_agent_runtime::NewScheduledTask::new(
+                        "7 9 * * *",
+                        "Check the build",
+                        true,
+                    ),
+                )
                 .await
                 .unwrap()
         };
@@ -235,7 +242,7 @@ async fn cron_delete_requires_user_cancellation_or_exact_agent_creation() {
             assert_eq!(requests.len(), 2, "screening plus authorization");
             for request in requests.iter() {
                 let facts = &request.state["scheduled_task"];
-                assert_eq!(facts["id"], task.id);
+                assert_eq!(facts["id"], json!(task.id));
                 assert_eq!(facts["details"]["prompt"], task.prompt);
                 assert_eq!(
                     facts["creation_call_id"],

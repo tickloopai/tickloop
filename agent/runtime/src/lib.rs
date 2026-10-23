@@ -44,6 +44,7 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
+pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tick_tools;
@@ -190,6 +191,12 @@ pub enum AgentError {
     Fenced,
     #[error("chat does not exist")]
     NotFound,
+    /// The Chat has no scheduled task with that id, such as one deleted already.
+    #[error("scheduled task does not exist")]
+    ScheduledTaskNotFound,
+    /// A recurring task's schedule runs more often than the host's least interval allows.
+    #[error("{}", scheduled_tasks::interval_limit(*min_interval))]
+    ScheduledTaskTooFrequent { min_interval: std::time::Duration },
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("chat is busy")]
@@ -410,6 +417,9 @@ struct Inner {
     goal_continuations_held: AtomicBool,
     /// The zone scheduled tasks read cron expressions in, and their clock.
     schedule_clock: scheduled_tasks::ScheduleClock,
+    scheduled_task_rules: scheduled_tasks::TaskRules,
+    /// Whether tasks the Agent creates start without the user's confirmation.
+    trust_model_scheduled_tasks: bool,
     /// Wakes a Worker's scheduled task timer when a Chat's tasks changed.
     scheduled_wake: Arc<Notify>,
     scheduled_timer_started: AtomicBool,
@@ -1109,6 +1119,7 @@ impl Agent {
                 shared_tasks::TaskToolAccess::Disabled
             },
             &self.inner.tool_policy,
+            self.scheduled_task_terms(),
         )
         .definitions()
     }
@@ -1912,6 +1923,9 @@ impl Agent {
             citation_style,
             request_gates,
             time_zone,
+            scheduled_task_expiry,
+            scheduled_task_min_interval,
+            trust_model_scheduled_tasks,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
@@ -1994,6 +2008,11 @@ impl Agent {
                     scheduled_tasks::resolve_zone(time_zone.as_deref())
                         .unwrap_or(chrono_tz::Tz::UTC),
                 ),
+                scheduled_task_rules: scheduled_tasks::TaskRules {
+                    lifetime: scheduled_task_expiry,
+                    min_interval: scheduled_task_min_interval,
+                },
+                trust_model_scheduled_tasks,
                 scheduled_wake: Arc::new(Notify::new()),
                 scheduled_timer_started: AtomicBool::new(false),
                 session_permissions: Mutex::new(
@@ -2366,7 +2385,7 @@ impl Agent {
         if let Some(task_id) = started_loop
             && submitted.is_err()
         {
-            let _ = self.delete_scheduled_task(chat_id, &task_id).await;
+            let _ = self.delete_scheduled_task(chat_id, task_id).await;
         }
         submitted
     }

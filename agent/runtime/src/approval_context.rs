@@ -343,7 +343,7 @@ pub(super) struct AgentMessageEvidence {
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ScheduledTaskEvidence {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub creator: tickloop_agent_protocol::ScheduledTaskCreator,
     pub creation_call_id: Option<String>,
     pub details: Value,
@@ -357,8 +357,13 @@ fn scheduled_task_evidence(
     if operation.name != crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME {
         return None;
     }
-    let id = operation.input.get("id")?.as_str()?;
-    let task = snapshot.scheduled_tasks.iter().find(|task| task.id == id)?;
+    let task_id: uuid::Uuid = operation.input.get("id")?.as_str()?.trim().parse().ok()?;
+    let task = snapshot
+        .scheduled_tasks
+        .iter()
+        .find(|task| task.id == task_id)?;
+    let id = task.id.to_string();
+    let id = id.as_str();
     let creation_call_id = history.calls.iter().find_map(|call| {
         if task.creator != tickloop_agent_protocol::ScheduledTaskCreator::Agent
             || call.tool != crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME
@@ -401,7 +406,7 @@ fn scheduled_task_evidence(
             })
     });
     Some(ScheduledTaskEvidence {
-        id: task.id.clone(),
+        id: task.id,
         creator: task.creator,
         creation_call_id,
         details: project_tool_input(

@@ -1314,18 +1314,16 @@ impl EmbeddedAgentAccess {
             )),
             LoopAction::SetScheduledTaskPaused { task_id, paused } => {
                 agent
-                    .set_scheduled_task_paused(chat, &task_id, paused)
+                    .set_scheduled_task_paused(chat, task_id, paused)
                     .await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::DeleteScheduledTask { task_id } => {
-                agent.delete_scheduled_task(chat, &task_id).await?;
+                agent.delete_scheduled_task(chat, task_id).await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::DecideScheduledTask { task_id, decision } => {
-                agent
-                    .decide_scheduled_task(chat, &task_id, decision)
-                    .await?;
+                agent.decide_scheduled_task(chat, task_id, decision).await?;
                 Ok(CommandResult::Done)
             }
         }

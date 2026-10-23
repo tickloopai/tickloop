@@ -1355,6 +1355,7 @@ impl Agent {
                 self.inner.host_options.prompt_policy,
                 TaskToolAccess::Disabled,
                 &self.inner.tool_policy,
+                self.scheduled_task_terms(),
             )
             .resolve(tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME);
             (notification, assistant_id, registered)

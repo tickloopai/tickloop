@@ -179,6 +179,7 @@ impl Agent {
             self.inner.host_options.prompt_policy,
             shared_tasks::tool_access(&chats, receipt),
             &self.inner.tool_policy,
+            self.scheduled_task_terms(),
         ))
     }
 

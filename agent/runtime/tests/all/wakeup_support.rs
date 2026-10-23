@@ -411,7 +411,7 @@ pub(crate) fn scheduled(task: &str, n: u64) -> tickloop_agent_protocol::TriggerS
         u64::try_from(since_epoch.as_millis()).unwrap()
     });
     tickloop_agent_protocol::TriggerSource::ScheduledTask {
-        task_id: task.into(),
+        task_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, task.as_bytes()),
         scheduled_for_ms: began + n,
         wrappers: Vec::new(),
     }

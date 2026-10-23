@@ -11,17 +11,19 @@ use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, EventKind, OperationRecord, OperationState, PromptPolicy, Receipt,
     ScheduledInputWrapper, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
-    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation,
-    ToolResult, TriggerSource, final_scheduled_run_prompt, loop_instructions_error_prompt,
-    scheduled_skill_prompt,
+    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRemovalReason,
+    ScheduledTaskRevocation, ToolResult, TriggerSource, ending_scheduled_run_prompt,
+    final_scheduled_run_prompt, loop_instructions_error_prompt, scheduled_skill_prompt,
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
+use uuid::Uuid;
 
 use super::tasks::{
-    Creation, CronTask, DecisionOutcome, FiredTask, ScheduledTaskError, ScheduledTasks,
-    SelfPacedTurnEnd, Wakeup,
+    Creation, CronTask, DecisionOutcome, FiredTask, NewCronTask, RemovedTask, ScheduledTaskError,
+    ScheduledTasks, SelfPacedTurnEnd, TASK_LIFETIME, TaskEdit, TaskRules, TimingEdit, Wakeup,
+    title,
 };
-use super::tools::{self, ScheduledTaskCall};
+use super::tools::{self, ScheduledTaskCall, ToolTerms};
 use crate::wakeup::{SourceChange, SourceChangeError, TriggerDelivery};
 use crate::{Agent, AgentError, Chat};
 use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopSchedule};
@@ -30,7 +32,7 @@ use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, 
 /// slept or a wall clock that moved does not delay a run for long.
 const TIMER_RECHECK: Duration = Duration::from_secs(60);
 /// Why a turn a scheduled run started cannot start a self-paced loop.
-const NO_NEW_LOOP_FROM_A_RUN: &str = "No self-paced loop is running, and a turn a scheduled task started cannot start one: the loop ended, by its seven-day limit or by being cancelled. Tell the user; they can start a new /loop.";
+const NO_NEW_LOOP_FROM_A_RUN: &str = "No self-paced loop is running, and a turn a scheduled task started cannot start one: the loop ended. Tell the user; they can start a new /loop.";
 /// How long a Worker's timer waits before it hands a refused run over again.
 const RETRY_DELAY_MS: u64 = 10_000;
 
@@ -60,6 +62,107 @@ impl ScheduleClock {
             return now;
         }
         DateTime::from(SystemTime::now())
+    }
+}
+
+/// A task the host creates for the user, such as from a scheduling dialog: it needs no
+/// confirmation and starts timing at once.
+#[derive(Clone, Debug)]
+pub struct NewScheduledTask {
+    /// A 5-field cron expression read in `time_zone`.
+    pub cron: String,
+    pub prompt: String,
+    /// `false` runs once, at the first time `cron` names.
+    pub recurring: bool,
+    /// The task's id. Creating a task with the id of one the Chat has returns that task
+    /// unchanged, so a retried request creates no second task; the id of a task the Chat
+    /// deleted is refused. A task that ended by itself, such as a one-shot task that ran, is no
+    /// longer known, so its id creates a new task. `None` generates a UUIDv7.
+    pub uuid: Option<Uuid>,
+    pub title: Option<String>,
+    /// An IANA zone; `None` uses the Harness's.
+    pub time_zone: Option<String>,
+    /// When the task ends: no run fires at or after it, and the task is deleted then.
+    pub ends_at_ms: Option<u64>,
+}
+
+impl NewScheduledTask {
+    /// A task on `cron` in the Harness's zone, with a generated id and neither title nor end.
+    pub fn new(cron: impl Into<String>, prompt: impl Into<String>, recurring: bool) -> Self {
+        Self {
+            cron: cron.into(),
+            prompt: prompt.into(),
+            recurring,
+            uuid: None,
+            title: None,
+            time_zone: None,
+            ends_at_ms: None,
+        }
+    }
+}
+
+/// A change the host makes to a task; `None` leaves that part as it is. A new schedule,
+/// recurrence, zone or end times the next run from now.
+#[derive(Clone, Debug, Default)]
+pub struct ScheduledTaskEdit {
+    pub prompt: Option<String>,
+    pub cron: Option<String>,
+    pub recurring: Option<bool>,
+    /// `Some(None)` removes the title.
+    pub title: Option<Option<String>>,
+    pub time_zone: Option<String>,
+    /// `Some(None)` lets the task run without an end.
+    pub ends_at_ms: Option<Option<u64>>,
+}
+
+impl From<ScheduledTaskError> for AgentError {
+    fn from(error: ScheduledTaskError) -> Self {
+        match error {
+            ScheduledTaskError::NotFound(_) => Self::ScheduledTaskNotFound,
+            ScheduledTaskError::TooFrequent { min_interval, .. } => {
+                Self::ScheduledTaskTooFrequent { min_interval }
+            }
+            error => Self::Invalid(error.to_string()),
+        }
+    }
+}
+
+/// The notice of each removed task, saying why it left.
+fn removal_notices(removed: &[RemovedTask]) -> Vec<ScheduledTaskNotice> {
+    removed
+        .iter()
+        .map(|removed| ScheduledTaskNotice::Removed {
+            task_id: removed.task.id,
+            reason: removed.reason,
+        })
+        .collect()
+}
+
+fn removed(task: ScheduledTask, reason: ScheduledTaskRemovalReason) -> RemovedTask {
+    RemovedTask { task, reason }
+}
+
+/// Why a recurring or self-paced task's final run is its last, for the note the run carries.
+/// A task living the standard seven days keeps the note it always had.
+fn final_run_input(
+    input: &str,
+    task: &ScheduledTask,
+    reason: ScheduledTaskRemovalReason,
+) -> String {
+    let lifetime = task
+        .expires_at_ms
+        .map(|expires_at| Duration::from_millis(expires_at.saturating_sub(task.created_at_ms)));
+    match (reason, lifetime) {
+        (ScheduledTaskRemovalReason::Expired, Some(TASK_LIFETIME)) => {
+            final_scheduled_run_prompt(input)
+        }
+        (ScheduledTaskRemovalReason::Expired, Some(_)) => {
+            ending_scheduled_run_prompt(input, "it reached the end of its lifetime")
+        }
+        (ScheduledTaskRemovalReason::EndsAtReached, _) => {
+            ending_scheduled_run_prompt(input, "it reached the end set for it")
+        }
+        _ => ending_scheduled_run_prompt(input, "its schedule names no later time"),
     }
 }
 
@@ -139,11 +242,13 @@ fn describe(task: &ScheduledTask) -> Value {
     };
     json!({
         "id": task.id,
+        "title": task.title,
         "schedule": schedule,
         "recurring": recurring,
         "time_zone": task.time_zone,
         "next_run": local_time(task.next_fire_at_ms, &task.time_zone),
         "expires": local_time(task.expires_at_ms, &task.time_zone),
+        "ends": local_time(task.ends_at_ms, &task.time_zone),
         "awaiting_confirmation": task.confirmation == Some(ScheduledTaskConfirmation::Pending),
         "paused": task.paused_at_ms.is_some(),
         "skipped": task.skipped,
@@ -234,6 +339,7 @@ impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
 fn scheduled_tasks_record(chat: &Chat) -> Line {
     Line::ScheduledTasks(ScheduledTasksEntry {
         chat_id: chat.snapshot.id,
+        cwd: chat.snapshot.folder.clone(),
         tasks: chat.snapshot.scheduled_tasks.clone(),
         revoked: chat.snapshot.scheduled_task_revocations.clone(),
     })
@@ -265,7 +371,7 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
         let input = tickloop_agent_transcript::input_ids::trigger(
             chat.snapshot.id,
             &tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
-                task_id: task.id.clone(),
+                task_id: task.id,
                 scheduled_for_ms,
                 wrappers: Vec::new(),
             },
@@ -284,19 +390,19 @@ impl Agent {
     pub(crate) fn scheduled_run_eligibility(
         &self,
         snapshot: &ChatSnapshot,
-        task_id: &str,
+        task_id: &Uuid,
         scheduled_for_ms: u64,
     ) -> crate::wakeup::Eligibility {
         let is_revoked = snapshot
             .scheduled_task_revocations
             .iter()
-            .any(|revocation| revocation.task_id == task_id);
+            .any(|revocation| revocation.task_id == *task_id);
         let now_ms = u64::try_from(self.scheduled_now().timestamp_millis()).unwrap_or(0);
         let is_void = scheduled_for_ms.saturating_add(MAX_RUN_AGE_MS) < now_ms;
         let is_paused = snapshot
             .scheduled_tasks
             .iter()
-            .any(|task| task.id == task_id && task.paused_at_ms.is_some());
+            .any(|task| task.id == *task_id && task.paused_at_ms.is_some());
         if is_revoked || is_void || is_paused {
             crate::wakeup::Eligibility::Ended(DiscardReason::SourceEnded)
         } else {
@@ -353,16 +459,18 @@ impl Agent {
         if !known {
             snapshot.scheduled_tasks.push(ScheduledTask {
                 paused_at_ms: None,
-                id: task_id.clone(),
+                id: *task_id,
                 kind: ScheduledTaskKind::Recurring {
                     cron: "* * * * *".into(),
                 },
+                title: None,
                 prompt: String::new(),
                 creator: ScheduledTaskCreator::User,
                 time_zone: "UTC".into(),
                 confirmation: None,
                 created_at_ms: scheduled_for_ms,
                 expires_at_ms: None,
+                ends_at_ms: None,
                 scheduled_for_ms: Some(scheduled_for_ms),
                 next_fire_at_ms: None,
                 jitter_ms: 0,
@@ -438,7 +546,7 @@ impl Agent {
                 matches!(
                     &pending.trigger_source,
                     Some(TriggerSource::ScheduledTask { task_id, .. })
-                        if deleted.iter().any(|task| &task.id == task_id)
+                        if deleted.iter().any(|task| task.id == *task_id)
                 )
             })
             .map(|pending| pending.receipt.clone())
@@ -448,17 +556,20 @@ impl Agent {
         }
     }
 
-    /// Deletes tasks from the Chat, with their queued runs.
+    /// Deletes tasks from the Chat, with their queued runs, announcing why each left after
+    /// `notices`.
     fn delete_scheduled(
         &self,
         change: &SourceChange,
         chat: &mut Chat,
-        deleted: Vec<ScheduledTask>,
-        notices: Vec<ScheduledTaskNotice>,
+        deleted: Vec<RemovedTask>,
+        mut notices: Vec<ScheduledTaskNotice>,
     ) {
         if deleted.is_empty() {
             return;
         }
+        notices.extend(removal_notices(&deleted));
+        let deleted: Vec<ScheduledTask> = deleted.into_iter().map(|removed| removed.task).collect();
         chat.snapshot
             .scheduled_tasks
             .retain(|task| !deleted.iter().any(|gone| gone.id == task.id));
@@ -466,9 +577,23 @@ impl Agent {
         self.persist_scheduled_tasks(change, chat, notices);
     }
 
+    /// The host's rules for its scheduled tasks.
+    pub(crate) fn scheduled_task_rules(&self) -> TaskRules {
+        self.inner.scheduled_task_rules
+    }
+
+    /// What the scheduled task tools offer and promise the model on this host.
+    pub(crate) fn scheduled_task_terms(&self) -> ToolTerms {
+        ToolTerms {
+            rules: self.inner.scheduled_task_rules,
+            confirms_agent_tasks: !self.inner.trust_model_scheduled_tasks,
+        }
+    }
+
     /// Who creates a task in the turn `receipt`: the user only for the one task their own
     /// `/loop` of that turn schedules, exactly as the host read it; the Agent for every other.
-    /// Only the Agent's need confirming, and only where nobody is asked.
+    /// Only the Agent's need confirming, and only where nobody is asked and the host does not
+    /// trust the Agent's tasks.
     fn creation(
         &self,
         chat: &mut Chat,
@@ -488,7 +613,8 @@ impl Agent {
         Creation {
             creator,
             needs_confirmation: creator == ScheduledTaskCreator::Agent
-                && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt,
+                && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                && !self.inner.trust_model_scheduled_tasks,
         }
     }
 
@@ -544,12 +670,14 @@ impl Agent {
         now: DateTime<Utc>,
     ) -> ToolResult {
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+        let rules = self.scheduled_task_rules();
         let id = unused_id(&chat.snapshot);
         let outcome = match call {
             ScheduledTaskCall::Create {
                 cron,
                 prompt,
                 recurring,
+                title,
             } => match Schedule::parse(&cron) {
                 Err(error) => Err(error.to_string()),
                 Ok(schedule) => {
@@ -558,13 +686,17 @@ impl Agent {
                         prompt: prompt.clone(),
                     });
                     let creation = self.creation(chat, receipt, users_loop.as_ref());
-                    let cron_task = if recurring {
-                        CronTask::Recurring(schedule)
-                    } else {
-                        CronTask::OneShot(schedule)
+                    let new = NewCronTask {
+                        id,
+                        cron_task: CronTask::new(schedule, recurring),
+                        prompt,
+                        title,
+                        creation,
+                        zone,
+                        ends_at_ms: None,
                     };
                     tasks
-                        .create_cron(id, cron_task, prompt, creation, zone, &now)
+                        .create_cron(new, rules, &now)
                         .map(|task| (describe(task), Vec::new(), Vec::new()))
                         .map_err(|error| error.to_string())
                 }
@@ -574,7 +706,11 @@ impl Agent {
                 return tool_result(json!({ "tasks": listed }));
             }
             ScheduledTaskCall::Delete { id } => match tasks.delete(&id) {
-                Some(task) => Ok((json!({ "deleted": task.id }), vec![task], Vec::new())),
+                Some(task) => Ok((
+                    json!({ "deleted": task.id }),
+                    vec![removed(task, ScheduledTaskRemovalReason::AgentDeleted)],
+                    Vec::new(),
+                )),
                 None => Err(ScheduledTaskError::NotFound(id).to_string()),
             },
             ScheduledTaskCall::Wakeup { .. }
@@ -598,6 +734,7 @@ impl Agent {
                     // the Agent's.
                     self.creation(chat, receipt, None),
                     zone,
+                    rules,
                     &now,
                 )
                 .map(|scheduled| {
@@ -612,10 +749,12 @@ impl Agent {
                 .map_err(|error| error.to_string()),
             ScheduledTaskCall::StopWakeup => match tasks.stop_self_paced() {
                 Some(task) => {
-                    let notice = ScheduledTaskNotice::SelfPacedEnded {
-                        task_id: task.id.clone(),
-                    };
-                    Ok((json!({ "stopped": task.id }), vec![task], vec![notice]))
+                    let notice = ScheduledTaskNotice::SelfPacedEnded { task_id: task.id };
+                    Ok((
+                        json!({ "stopped": task.id }),
+                        vec![removed(task, ScheduledTaskRemovalReason::SelfPacedEnded)],
+                        vec![notice],
+                    ))
                 }
                 None => Ok((
                     json!({ "stopped": null, "note": "No self-paced loop is running." }),
@@ -624,61 +763,188 @@ impl Agent {
                 )),
             },
         };
-        let (value, deleted, notices) = match outcome {
+        let (value, deleted, mut notices): (Value, Vec<RemovedTask>, _) = match outcome {
             Ok(outcome) => outcome,
             Err(message) => return tool_error(message),
         };
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
+        notices.extend(removal_notices(&deleted));
+        let deleted: Vec<ScheduledTask> = deleted.into_iter().map(|removed| removed.task).collect();
         self.revoke_scheduled(chat, &deleted);
         self.persist_scheduled_tasks(change, chat, notices);
         tool_result(value)
     }
 
     /// The user schedules a task through the host's interface, as with `/loop`: it needs no
-    /// confirmation and starts timing at once.
+    /// confirmation and starts timing at once, in a Chat with or without messages. A task
+    /// with the Chat's id of one it has already is returned as it is, so retrying a request
+    /// creates no second task; the id of a task the Chat deleted is refused. A recurring task
+    /// must keep to the host's least interval, refused with
+    /// [`AgentError::ScheduledTaskTooFrequent`].
     pub async fn schedule_task(
         &self,
         chat_id: ChatId,
-        cron: &str,
-        prompt: String,
-        recurring: bool,
+        task: NewScheduledTask,
     ) -> Result<ScheduledTask, AgentError> {
+        if task.prompt.trim().is_empty() {
+            return Err(AgentError::Invalid(
+                "a scheduled task needs a prompt to run".into(),
+            ));
+        }
         let schedule =
-            Schedule::parse(cron).map_err(|error| AgentError::Invalid(error.to_string()))?;
-        let cron_task = if recurring {
-            CronTask::Recurring(schedule)
-        } else {
-            CronTask::OneShot(schedule)
+            Schedule::parse(&task.cron).map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let zone = match &task.time_zone {
+            Some(name) => resolve_zone(Some(name)).map_err(AgentError::Invalid)?,
+            None => self.inner.schedule_clock.zone(),
         };
+        let task_title = task.title.as_deref().map(title).transpose()?;
         let now = self.scheduled_now();
-        let zone = self.inner.schedule_clock.zone();
+        let rules = self.scheduled_task_rules();
         self.run_source_change(chat_id, move |change, chat| {
             if chat.snapshot.delegation.is_some() {
                 return Err(AgentError::Invalid(
                     "only the root Agent has scheduled tasks".into(),
                 ));
             }
+            if let Some(id) = task.uuid {
+                if let Some(existing) = chat
+                    .snapshot
+                    .scheduled_tasks
+                    .iter()
+                    .find(|existing| existing.id == id)
+                {
+                    return Ok(existing.clone());
+                }
+                if chat
+                    .snapshot
+                    .scheduled_task_revocations
+                    .iter()
+                    .any(|revocation| revocation.task_id == id)
+                {
+                    return Err(AgentError::Invalid(format!(
+                        "scheduled task `{id}` was deleted; create it with another id"
+                    )));
+                }
+            }
             let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-            let id = unused_id(&chat.snapshot);
-            let task = tasks
-                .create_cron(
-                    id,
-                    cron_task,
-                    prompt,
-                    Creation {
-                        creator: ScheduledTaskCreator::User,
-                        needs_confirmation: false,
-                    },
-                    zone,
-                    &now,
-                )
-                .map_err(|error| AgentError::Invalid(error.to_string()))?
-                .clone();
+            let new = NewCronTask {
+                id: task.uuid.unwrap_or_else(|| unused_id(&chat.snapshot)),
+                cron_task: CronTask::new(schedule, task.recurring),
+                prompt: task.prompt,
+                title: task_title,
+                creation: Creation {
+                    creator: ScheduledTaskCreator::User,
+                    needs_confirmation: false,
+                },
+                zone,
+                ends_at_ms: task.ends_at_ms,
+            };
+            let created = tasks.create_cron(new, rules, &now)?.clone();
             chat.snapshot.scheduled_tasks = tasks.into_tasks();
             change
                 .agent()
                 .persist_scheduled_tasks(change, chat, Vec::new());
-            Ok(task)
+            Ok(created)
+        })
+        .await?
+    }
+
+    /// The user changes a task through the host's interface. Its id stays; a new schedule,
+    /// recurrence, zone or end times its next run from now and withdraws the run it had
+    /// queued for the old time. A recurring schedule must keep to the host's least interval,
+    /// and a task waiting for confirmation is confirmed or rejected instead.
+    pub async fn edit_scheduled_task(
+        &self,
+        chat_id: ChatId,
+        task_id: Uuid,
+        edit: ScheduledTaskEdit,
+    ) -> Result<ScheduledTask, AgentError> {
+        if edit
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.trim().is_empty())
+        {
+            return Err(AgentError::Invalid(
+                "a scheduled task needs a prompt to run".into(),
+            ));
+        }
+        let schedule = edit
+            .cron
+            .as_deref()
+            .map(Schedule::parse)
+            .transpose()
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let zone = edit
+            .time_zone
+            .as_deref()
+            .map(|name| resolve_zone(Some(name)))
+            .transpose()
+            .map_err(AgentError::Invalid)?;
+        let new_title = edit
+            .title
+            .map(|text| text.as_deref().map(title).transpose())
+            .transpose()?;
+        let changes_timing = schedule.is_some()
+            || edit.recurring.is_some()
+            || zone.is_some()
+            || edit.ends_at_ms.is_some();
+        let now = self.scheduled_now();
+        let rules = self.scheduled_task_rules();
+        self.run_source_change(chat_id, move |change, chat| {
+            let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
+            let before = tasks
+                .get(&task_id)
+                .cloned()
+                .ok_or(AgentError::ScheduledTaskNotFound)?;
+            let timing = match (changes_timing, &before.kind) {
+                (false, _) => None,
+                (true, ScheduledTaskKind::SelfPaced { .. }) => {
+                    return Err(ScheduledTaskError::SelfPaced(task_id).into());
+                }
+                (
+                    true,
+                    ScheduledTaskKind::Recurring { cron } | ScheduledTaskKind::OneShot { cron },
+                ) => {
+                    let schedule = match schedule {
+                        Some(schedule) => schedule,
+                        None => Schedule::parse(cron)
+                            .map_err(|error| AgentError::Invalid(error.to_string()))?,
+                    };
+                    let recurring = edit
+                        .recurring
+                        .unwrap_or(matches!(before.kind, ScheduledTaskKind::Recurring { .. }));
+                    let zone = match zone {
+                        Some(zone) => zone,
+                        None => {
+                            resolve_zone(Some(&before.time_zone)).map_err(AgentError::Invalid)?
+                        }
+                    };
+                    Some(TimingEdit {
+                        cron_task: CronTask::new(schedule, recurring),
+                        zone,
+                        ends_at_ms: edit.ends_at_ms.unwrap_or(before.ends_at_ms),
+                    })
+                }
+            };
+            let edited = tasks
+                .edit(
+                    &task_id,
+                    TaskEdit {
+                        prompt: edit.prompt,
+                        title: new_title,
+                        timing,
+                    },
+                    rules,
+                    &now,
+                )?
+                .clone();
+            chat.snapshot.scheduled_tasks = tasks.into_tasks();
+            let agent = change.agent();
+            if changes_timing {
+                agent.withdraw_deleted_task_runs(chat, std::slice::from_ref(&before));
+            }
+            agent.persist_scheduled_tasks(change, chat, Vec::new());
+            Ok(edited)
         })
         .await?
     }
@@ -692,12 +958,13 @@ impl Agent {
         chat_id: ChatId,
         prompt: String,
         run: tickloop_agent_protocol::RunId,
-    ) -> Result<Option<String>, AgentError> {
-        if !self.inner.tool_policy.scheduled_tasks {
+    ) -> Result<Option<Uuid>, AgentError> {
+        if !self.inner.tool_policy.scheduled_tasks || !self.inner.tool_policy.schedule_wakeup {
             return Ok(None);
         }
         let now = self.scheduled_now();
         let zone = self.inner.schedule_clock.zone();
+        let rules = self.scheduled_task_rules();
         self.run_source_change(chat_id, move |change, chat| {
             if chat.snapshot.delegation.is_some() {
                 return Ok(None);
@@ -709,18 +976,17 @@ impl Agent {
                 .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
                 .cloned();
             let id = unused_id(&chat.snapshot);
-            tasks
-                .start_self_paced(
-                    id.clone(),
-                    prompt,
-                    Creation {
-                        creator: ScheduledTaskCreator::User,
-                        needs_confirmation: false,
-                    },
-                    zone,
-                    &now,
-                )
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            tasks.start_self_paced(
+                id,
+                prompt,
+                Creation {
+                    creator: ScheduledTaskCreator::User,
+                    needs_confirmation: false,
+                },
+                zone,
+                rules,
+                &now,
+            )?;
             chat.snapshot.scheduled_tasks = tasks.into_tasks();
             if let Some(task) = chat
                 .snapshot
@@ -731,26 +997,33 @@ impl Agent {
                 task.started_by_run = Some(run);
             }
             let agent = change.agent();
+            let notices = replaced
+                .iter()
+                .map(|task| ScheduledTaskNotice::Removed {
+                    task_id: task.id,
+                    reason: ScheduledTaskRemovalReason::SelfPacedEnded,
+                })
+                .collect();
             agent.revoke_scheduled(chat, replaced.as_slice());
-            agent.persist_scheduled_tasks(change, chat, Vec::new());
+            agent.persist_scheduled_tasks(change, chat, notices);
             Ok(Some(id))
         })
         .await?
     }
 
+    /// Pauses or resumes a task at the user's request: a paused task neither runs nor counts
+    /// down, and resuming times its next run from now. A task waiting for confirmation is
+    /// confirmed or rejected instead.
     pub async fn set_scheduled_task_paused(
         &self,
         chat_id: ChatId,
-        task_id: &str,
+        task_id: Uuid,
         paused: bool,
     ) -> Result<(), AgentError> {
         let now = self.scheduled_now();
-        let task_id = task_id.to_owned();
         self.run_source_change(chat_id, move |change, chat| {
             let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-            tasks
-                .set_paused(&task_id, paused, &now)
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            tasks.set_paused(&task_id, paused, &now)?;
             chat.snapshot.scheduled_tasks = tasks.into_tasks();
             change
                 .agent()
@@ -766,17 +1039,19 @@ impl Agent {
     pub async fn delete_scheduled_task(
         &self,
         chat_id: ChatId,
-        task_id: &str,
+        task_id: Uuid,
     ) -> Result<(), AgentError> {
-        let task_id = task_id.to_owned();
         self.run_source_change(chat_id, move |change, chat| {
             let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
             let deleted = tasks
                 .delete(&task_id)
-                .ok_or_else(|| AgentError::Invalid(format!("no scheduled task `{task_id}`")))?;
-            change
-                .agent()
-                .delete_scheduled(change, chat, vec![deleted], Vec::new());
+                .ok_or(AgentError::ScheduledTaskNotFound)?;
+            change.agent().delete_scheduled(
+                change,
+                chat,
+                vec![removed(deleted, ScheduledTaskRemovalReason::UserDeleted)],
+                Vec::new(),
+            );
             Ok(())
         })
         .await?
@@ -788,21 +1063,27 @@ impl Agent {
     pub async fn decide_scheduled_task(
         &self,
         chat_id: ChatId,
-        task_id: &str,
+        task_id: Uuid,
         decision: ScheduledTaskDecision,
     ) -> Result<(), AgentError> {
         let now = self.scheduled_now();
-        let task_id = task_id.to_owned();
         self.run_source_change(chat_id, move |change, chat| {
             let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
-            let notices = match tasks
-                .decide(&task_id, decision, &now)
-                .map_err(|error| AgentError::Invalid(error.to_string()))?
-            {
-                DecisionOutcome::Confirmed(_) | DecisionOutcome::Rejected(_) => Vec::new(),
-                DecisionOutcome::ExpiredUnrun(task) => {
-                    vec![ScheduledTaskNotice::ExpiredUnrun { task_id: task.id }]
-                }
+            let notices = match tasks.decide(&task_id, decision, &now)? {
+                DecisionOutcome::Confirmed(_) => Vec::new(),
+                DecisionOutcome::Rejected(task) => vec![ScheduledTaskNotice::Removed {
+                    task_id: task.id,
+                    reason: ScheduledTaskRemovalReason::Rejected,
+                }],
+                DecisionOutcome::ExpiredUnrun(removed) => vec![
+                    ScheduledTaskNotice::ExpiredUnrun {
+                        task_id: removed.task.id,
+                    },
+                    ScheduledTaskNotice::Removed {
+                        task_id: removed.task.id,
+                        reason: removed.reason,
+                    },
+                ],
             };
             chat.snapshot.scheduled_tasks = tasks.into_tasks();
             change
@@ -851,11 +1132,16 @@ impl Agent {
             }
             let mut prepared = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
             let due = prepared.take_due(&now);
-            // A task whose stored schedule no longer reads is dropped without a run.
-            let unreadable: Vec<ScheduledTask> = due
+            // A task whose stored schedule no longer reads, or whose end came, is dropped
+            // without a run.
+            let unrun: Vec<RemovedTask> = due
                 .removed
                 .into_iter()
-                .filter(|task| !due.fired.iter().any(|fired| fired.task.id == task.id))
+                .filter(|removed| {
+                    !due.fired
+                        .iter()
+                        .any(|fired| fired.task.id == removed.task.id)
+                })
                 .collect();
             let runs = due
                 .fired
@@ -869,14 +1155,14 @@ impl Agent {
                         .clone();
                     let (mut input, mut wrappers) =
                         run_input(chat, &fired.task, self.inner.config_root.as_deref());
-                    if fired.is_last
+                    if let Some(reason) = fired.last_run
                         && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
                     {
-                        input = final_scheduled_run_prompt(&input);
+                        input = final_run_input(&input, &fired.task, reason);
                         wrappers.push(ScheduledInputWrapper::FinalRun);
                     }
                     let source = TriggerSource::ScheduledTask {
-                        task_id: before.id.clone(),
+                        task_id: before.id,
                         scheduled_for_ms: fired.scheduled_for_ms,
                         wrappers,
                     };
@@ -893,13 +1179,13 @@ impl Agent {
                     })
                 })
                 .collect::<Vec<_>>();
-            (unreadable, runs)
+            (unrun, runs)
         };
         if !unreadable.is_empty() {
             self.run_source_change(chat_id, move |change, chat| {
                 let unreadable = unreadable
                     .into_iter()
-                    .filter(|task| chat.snapshot.scheduled_tasks.contains(task))
+                    .filter(|removed| chat.snapshot.scheduled_tasks.contains(&removed.task))
                     .collect();
                 change
                     .agent()
@@ -925,9 +1211,9 @@ impl Agent {
     }
 
     /// The base accepted a task's run under `receipt`: the task moves on to its next time, or
-    /// ends with its last run, unless it changed since the run was prepared, such as by a
-    /// reschedule. A run merged into one of the task's that already waits is passed over like
-    /// one the Loop was too busy for.
+    /// ends with its last run, unless its timing changed since the run was prepared, such as by
+    /// a reschedule; a new prompt or title it was given meanwhile stays. A run merged into one
+    /// of the task's that already waits is passed over like one the Loop was too busy for.
     fn commit_scheduled_run(
         &self,
         change: &SourceChange,
@@ -935,16 +1221,25 @@ impl Agent {
         run: &DueRun,
         receipt: &Receipt,
     ) {
-        let Some(index) = chat
-            .snapshot
-            .scheduled_tasks
-            .iter()
-            .position(|task| *task == run.before)
-        else {
+        let Some(index) = chat.snapshot.scheduled_tasks.iter().position(|task| {
+            let with_prepared_wording = ScheduledTask {
+                prompt: run.before.prompt.clone(),
+                title: run.before.title.clone(),
+                ..task.clone()
+            };
+            with_prepared_wording == run.before
+        }) else {
             return;
         };
-        if run.fired.is_last {
+        let mut notices = vec![ScheduledTaskNotice::Fired {
+            task_id: run.before.id,
+        }];
+        if let Some(reason) = run.fired.last_run {
             chat.snapshot.scheduled_tasks.remove(index);
+            notices.push(ScheduledTaskNotice::Removed {
+                task_id: run.before.id,
+                reason,
+            });
         } else {
             let queued_itself = chat.snapshot.pending_inputs.iter().any(|pending| {
                 pending.receipt.run_id == receipt.run_id
@@ -954,17 +1249,16 @@ impl Agent {
                             if *scheduled_for_ms == run.fired.scheduled_for_ms
                     )
             });
-            let mut after = run.fired.task.clone();
+            let current = &chat.snapshot.scheduled_tasks[index];
+            let mut after = ScheduledTask {
+                prompt: current.prompt.clone(),
+                title: current.title.clone(),
+                ..run.fired.task.clone()
+            };
             after.skipped += u64::from(!queued_itself);
             chat.snapshot.scheduled_tasks[index] = after;
         }
-        self.persist_scheduled_tasks(
-            change,
-            chat,
-            vec![ScheduledTaskNotice::Fired {
-                task_id: run.before.id.clone(),
-            }],
-        );
+        self.persist_scheduled_tasks(change, chat, notices);
     }
 
     /// A turn ended: forgets the user's `/loop` it read, and tells whether a self-paced task is
@@ -1046,10 +1340,9 @@ impl Agent {
         let called_wakeup =
             operations.any(|operation| operation.name == tools::SCHEDULE_WAKEUP_TOOL_NAME);
         if created_cron && !called_wakeup {
-            let notice = ScheduledTaskNotice::SelfPacedEnded {
-                task_id: task.id.clone(),
-            };
-            self.delete_scheduled(change, chat, vec![task.clone()], vec![notice]);
+            let notice = ScheduledTaskNotice::SelfPacedEnded { task_id: task.id };
+            let ended = removed(task.clone(), ScheduledTaskRemovalReason::SelfPacedEnded);
+            self.delete_scheduled(change, chat, vec![ended], vec![notice]);
             return;
         }
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
@@ -1064,7 +1357,13 @@ impl Agent {
                 self.persist_scheduled_tasks(
                     change,
                     chat,
-                    vec![ScheduledTaskNotice::SelfPacedEnded { task_id: task.id }],
+                    vec![
+                        ScheduledTaskNotice::SelfPacedEnded { task_id: task.id },
+                        ScheduledTaskNotice::Removed {
+                            task_id: task.id,
+                            reason: ScheduledTaskRemovalReason::SelfPacedEnded,
+                        },
+                    ],
                 );
             }
         }
@@ -1077,10 +1376,9 @@ impl Agent {
         let Some(task) = tasks.stop_self_paced() else {
             return;
         };
-        let notice = ScheduledTaskNotice::WakeupCancelled {
-            task_id: task.id.clone(),
-        };
-        self.delete_scheduled(change, chat, vec![task], vec![notice]);
+        let notice = ScheduledTaskNotice::WakeupCancelled { task_id: task.id };
+        let cancelled = removed(task, ScheduledTaskRemovalReason::UserDeleted);
+        self.delete_scheduled(change, chat, vec![cancelled], vec![notice]);
     }
 
     /// Esc cancels the self-paced loop's pending wake-up under the Chat's lease; where it cannot,
@@ -1126,8 +1424,10 @@ impl Agent {
         let mut tasks = ScheduledTasks::new(chat.snapshot.scheduled_tasks.clone());
         let removed = tasks.resume(&self.scheduled_now());
         chat.snapshot.scheduled_tasks = tasks.into_tasks();
+        let notices = removal_notices(&removed);
+        let removed: Vec<ScheduledTask> = removed.into_iter().map(|removed| removed.task).collect();
         self.withdraw_deleted_task_runs(chat, &removed);
-        self.persist_scheduled_tasks(change, chat, Vec::new());
+        self.persist_scheduled_tasks(change, chat, notices);
     }
 
     /// A Worker's history load dropped what does not outlive it, the self-paced loop among it:
@@ -1270,7 +1570,7 @@ impl Agent {
 }
 
 /// A fresh task id that neither a task of the Chat nor a cancellation it remembers uses.
-fn unused_id(snapshot: &ChatSnapshot) -> String {
+fn unused_id(snapshot: &ChatSnapshot) -> Uuid {
     loop {
         let id = tickloop_agent_cron::generate_task_id();
         let taken = snapshot.scheduled_tasks.iter().any(|task| task.id == id)
@@ -1296,11 +1596,11 @@ const REVOCATION_MEMORY_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 /// ledger record before this is asked.
 pub(crate) fn is_current_run(
     snapshot: &ChatSnapshot,
-    task_id: &str,
+    task_id: &Uuid,
     scheduled_for_ms: u64,
 ) -> bool {
     snapshot.scheduled_tasks.iter().any(|task| {
-        task.id == task_id
+        task.id == *task_id
             && task
                 .scheduled_for_ms
                 .is_some_and(|next| scheduled_for_ms >= next)
@@ -1322,7 +1622,7 @@ fn revoke(
             > now_ms
     });
     revocations.extend(cancelled.iter().map(|task| ScheduledTaskRevocation {
-        task_id: task.id.clone(),
+        task_id: task.id,
         revoked_at_ms: now_ms,
     }));
 }

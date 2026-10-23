@@ -5,6 +5,8 @@ use tickloop_agent_protocol::{
     TickSubscriptionStatus,
 };
 
+const TASK_ID: Uuid = Uuid::from_u128(0x0123_abcd);
+
 fn remove_key() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
 }
@@ -266,7 +268,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     let tick = state.monitor.entries()[0].clone();
     let mut snapshot = chat_snapshot(state.chat.unwrap());
     snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
-        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "id":TASK_ID, "kind":{"type":"recurring", "cron":"* * * * *"},
         "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
         "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
         "jitter_ms":0, "skipped":0
@@ -297,7 +299,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             "enter open · ctrl+x remove · esc input",
         ),
         (
-            MonitorTarget::ScheduledTask("0123abcd".into()),
+            MonitorTarget::ScheduledTask(TASK_ID),
             "",
             "p pause · enter details · ctrl+x remove · esc input",
         ),
@@ -382,7 +384,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             .is_none()
     );
     assert!(
-        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == "0123abcd")
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == TASK_ID.to_string())
     );
     assert!(state.monitor.detail.is_some());
     assert!(
@@ -3417,9 +3419,12 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    core.schedule_task(chat, "* * * * *", "remind me about weather".into(), true)
-        .await
-        .unwrap();
+    core.schedule_task(
+        chat,
+        tickloop_agent_runtime::NewScheduledTask::new("* * * * *", "remind me about weather", true),
+    )
+    .await
+    .unwrap();
     let console = Console::test_for_chat(chat);
     console
         .update_monitor_chat(agent.status(chat).await.unwrap())
@@ -3480,9 +3485,11 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     for index in 0..4 {
         core.schedule_task(
             chat,
-            "* * * * *",
-            format!("extra instruction {index}"),
-            true,
+            tickloop_agent_runtime::NewScheduledTask::new(
+                "* * * * *",
+                format!("extra instruction {index}"),
+                true,
+            ),
         )
         .await
         .unwrap();
@@ -3607,7 +3614,7 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
     let chat = Uuid::from_u128(707);
     let mut snapshot = chat_snapshot(chat);
     snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
-        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "id":TASK_ID, "kind":{"type":"recurring", "cron":"* * * * *"},
         "prompt":"提醒我看天气", "creator":"user", "time_zone":"Asia/Shanghai",
         "created_at_ms":0, "scheduled_for_ms":60000, "next_fire_at_ms":60000,
         "jitter_ms":0, "skipped":0
@@ -3759,7 +3766,7 @@ fn docked_monitor_fixture(task_count: usize, tick_count: usize) -> State {
     state.prompt_enabled = true;
     let mut snapshot = chat_snapshot(chat);
     snapshot.scheduled_tasks = (0..task_count).map(|index| serde_json::from_value(serde_json::json!({
-        "id":format!("{index:08x}"), "kind":{"type":"recurring", "cron":"* * * * *"},
+        "id":Uuid::from_u128(index as u128), "kind":{"type":"recurring", "cron":"* * * * *"},
         "prompt":format!("Scheduled instruction {}", index + 1), "creator":"user", "time_zone":"Asia/Shanghai",
         "created_at_ms":0, "scheduled_for_ms":60000, "next_fire_at_ms":60000, "jitter_ms":0, "skipped":0
     })).unwrap()).collect();
@@ -3872,7 +3879,7 @@ fn tick_status_replaces_side_padding_below_goal_without_moving_docked_sections()
         assert_eq!(footer.spans[0].role, Some(Role::MutedText));
         assert!(!footer.text().contains(['│', '┃']));
         for target in [
-            MonitorTarget::ScheduledTask("00000000".into()),
+            MonitorTarget::ScheduledTask(Uuid::from_u128(0)),
             MonitorTarget::Goal,
         ] {
             state.monitor.select_target(&target);
@@ -4039,7 +4046,10 @@ fn more_scheduled_opens_a_scrollable_list_and_details_return_to_that_list() {
     for _ in 0..3 {
         state.monitor.move_selection(1);
     }
-    assert_eq!(state.monitor.selected_task().unwrap().id, "00000002");
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(2)
+    );
     state.monitor.move_selection(1);
     assert!(state.monitor.is_more_selected());
     let frame = state.monitor.frame(48, 16, state.display, 0);
@@ -4065,7 +4075,10 @@ fn more_scheduled_opens_a_scrollable_list_and_details_return_to_that_list() {
             .is_none()
     );
     assert!(state.monitor.task_list_is_open());
-    assert_eq!(state.monitor.selected_task().unwrap().id, "00000003");
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(3)
+    );
     state.monitor.move_selection(1);
     let expanded = state.monitor.frame(30, 8, state.display, 0);
     assert!(
@@ -4129,7 +4142,7 @@ fn expanded_scheduled_list_scrolls_with_the_wheel_inside_its_visible_column() {
     state.draw_frame(&mut Vec::new()).unwrap();
     let target = &state.monitor_row_targets[0];
     let (row, column) = (target.row as u16, target.columns.start as u16);
-    let before = state.monitor.selected_task().unwrap().id.clone();
+    let before = state.monitor.selected_task().unwrap().id;
     assert!(state.pointer(
         MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -4141,7 +4154,7 @@ fn expanded_scheduled_list_scrolls_with_the_wheel_inside_its_visible_column() {
     ));
     assert_ne!(state.monitor.selected_task().unwrap().id, before);
     assert!(state.monitor.task_list_is_open());
-    let before_blank_scroll = state.monitor.selected_task().unwrap().id.clone();
+    let before_blank_scroll = state.monitor.selected_task().unwrap().id;
     let blank_row = state.detail_area().1.saturating_sub(2) as u16;
     assert!(state.pointer(
         MouseEvent {
@@ -4165,12 +4178,18 @@ fn returning_from_the_full_task_list_keeps_selection_when_removal_eliminates_ove
         .monitor
         .select_target(&crate::terminal::monitor::MonitorTarget::MoreScheduled);
     state.monitor.open_task_list();
-    state.monitor.remove_task("00000003");
+    state.monitor.remove_task(&Uuid::from_u128(3));
     assert!(state.monitor.task_list_is_open());
-    assert_eq!(state.monitor.selected_task().unwrap().id, "00000000");
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(0)
+    );
     state.monitor.close_task_list();
     assert!(!state.monitor.task_list_is_open());
-    assert_eq!(state.monitor.selected_task().unwrap().id, "00000000");
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(0)
+    );
     let frame = state.monitor.frame(48, 16, state.display, 0);
     assert!(!frame.lines.iter().any(|line| line.text().contains("more")));
 }
@@ -4371,7 +4390,7 @@ fn scheduled_task_deletion_from_list_and_detail_requires_the_same_double_press()
                 Some(InputEvent::TickAction { .. })
             ));
         }
-        let id = state.monitor.selected_task().unwrap().id.clone();
+        let id = state.monitor.selected_task().unwrap().id;
         assert!(state.key(remove_key()).is_none());
         assert_eq!(
             state.confirmation_hint().as_deref(),
@@ -4379,7 +4398,7 @@ fn scheduled_task_deletion_from_list_and_detail_requires_the_same_double_press()
         );
         assert_eq!(state.monitor.selected_task().unwrap().id, id);
         assert!(
-            matches!(state.key(remove_key()), Some(InputEvent::TickAction { action, .. }) if action.instance == id && action.key == 'x')
+            matches!(state.key(remove_key()), Some(InputEvent::TickAction { action, .. }) if action.instance == id.to_string() && action.key == 'x')
         );
     }
 }
@@ -4415,7 +4434,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
         }
         "scheduled" => {
             snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
-                "id": "0123abcd", "kind": {"type": "recurring", "cron": "* * * * *"},
+                "id": TASK_ID, "kind": {"type": "recurring", "cron": "* * * * *"},
                 "prompt": "check progress", "creator": "user", "time_zone": "Asia/Shanghai",
                 "created_at_ms": 0, "next_fire_at_ms": 60000, "scheduled_for_ms": 60000,
                 "jitter_ms": 0, "skipped": 0
@@ -5647,7 +5666,7 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
                 }
             } else {
                 TriggerIdentity::ScheduledTask {
-                    task_id: "0123abcd".into(),
+                    task_id: TASK_ID,
                     scheduled_for_ms: 1,
                     wrappers: Vec::new(),
                 }
@@ -5659,7 +5678,7 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
                 text: if goal {
                     "Continue working toward the active goal of this Chat.".into()
                 } else {
-                    "Scheduled task 0123abcd: check progress".into()
+                    format!("Scheduled task {TASK_ID}: check progress")
                 },
             }],
         });
@@ -5798,7 +5817,7 @@ fn p_pauses_periodic_ticks_and_scheduled_tasks_and_does_nothing_elsewhere() {
 
     let mut snapshot = chat_snapshot(chat);
     snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
-        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "id":TASK_ID, "kind":{"type":"recurring", "cron":"* * * * *"},
         "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
         "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
         "jitter_ms":0, "skipped":0
@@ -5812,7 +5831,7 @@ fn p_pauses_periodic_ticks_and_scheduled_tasks_and_does_nothing_elsewhere() {
     assert!(state.monitor.hint().contains("p pause"));
     assert_eq!(
         tick_action_signature(state.key(pause_key)),
-        format!("{chat}/0123abcd/p")
+        format!("{chat}/{TASK_ID}/p")
     );
     snapshot.scheduled_tasks[0].paused_at_ms = Some(1000);
     state
@@ -5821,7 +5840,7 @@ fn p_pauses_periodic_ticks_and_scheduled_tasks_and_does_nothing_elsewhere() {
     assert!(state.monitor.hint().contains("p resume"));
     assert_eq!(
         tick_action_signature(state.key(pause_key)),
-        format!("{chat}/0123abcd/p")
+        format!("{chat}/{TASK_ID}/p")
     );
     snapshot.scheduled_tasks[0].confirmation =
         Some(tickloop_agent_protocol::ScheduledTaskConfirmation::Pending);
@@ -5892,7 +5911,10 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
         );
     }
     let task = core
-        .schedule_task(chat, "*/10 * * * *", "check build".into(), true)
+        .schedule_task(
+            chat,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check build", true),
+        )
         .await
         .unwrap();
     let status = agent.status(chat).await.unwrap();

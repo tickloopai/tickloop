@@ -1331,10 +1331,9 @@ async fn a_create_cannot_carry_an_artifact_without_provenance() {
 }
 
 /// The host's rules let CronCreate through, since the Agent's task waits for the user to confirm
-/// it, but not CronDelete: with no reviewer and no person in a cloud Chat, the deletion is
-/// refused and the task stays.
+/// it, and CronDelete, which only ends the Chat's own tasks: neither goes to review.
 #[tokio::test]
-async fn deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition() {
+async fn deleting_a_scheduled_task_is_admitted_under_the_cloud_composition() {
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         call(
             "schedule",
@@ -1363,10 +1362,6 @@ async fn deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition() {
         .unwrap()
         .scheduled_tasks
         .remove(0);
-    assert!(
-        admissions.lock().unwrap().is_empty(),
-        "CronCreate is the host's"
-    );
 
     model.enqueue(call("unschedule", "CronDelete", json!({"id": task.id})));
     model.enqueue(text("Done."));
@@ -1377,18 +1372,101 @@ async fn deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition() {
         .unwrap()
         .unwrap();
     assert!(
-        admissions
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|seen| seen.starts_with("assessed")),
-        "CronDelete went to review: {:?}",
+        admissions.lock().unwrap().is_empty(),
+        "CronCreate and CronDelete are the host's: {:?}",
         admissions.lock().unwrap()
     );
-    assert_eq!(
-        agent.snapshot(root).await.unwrap().scheduled_tasks,
-        [task],
-        "the refused deletion left the task"
+    assert!(
+        agent
+            .snapshot(root)
+            .await
+            .unwrap()
+            .scheduled_tasks
+            .is_empty()
     );
+    agent.shutdown().await;
+}
+
+/// A monitoring task the cloud runs without a lifetime: in the run it started, the Agent finds
+/// its condition met and deletes the task with CronDelete, so it never runs again.
+#[tokio::test]
+async fn a_task_deleted_in_its_own_run_never_runs_again() {
+    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+        call(
+            "schedule",
+            "CronCreate",
+            json!({"cron": "*/10 * * * *", "prompt": "Check whether the parcel arrived.", "title": "Parcel watch"}),
+        ),
+        text("I will check every ten minutes."),
+    ]));
+    let agent = cloud_harness(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        HarnessOptions {
+            scheduled_task_expiry: None,
+            trust_model_scheduled_tasks: true,
+            ..cloud_options(durable_chat_host_rules())
+        },
+    );
+    let admissions = watch_admissions(&agent);
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let request = prompt("Tell me when the parcel arrives.");
+    agent.advance(root, request.clone()).await.unwrap();
+    tokio::time::timeout(WAIT, agent.settled_input(root, request.input_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let task = agent
+        .snapshot(root)
+        .await
+        .unwrap()
+        .scheduled_tasks
+        .remove(0);
+    assert_eq!(task.confirmation, None, "the host trusts the Agent's tasks");
+    assert_eq!(task.expires_at_ms, None);
+    assert_eq!(task.title.as_deref(), Some("Parcel watch"));
+    let due_at = task.next_fire_at_ms.expect("the task times at once");
+
+    model.enqueue(call("stop", "CronDelete", json!({"id": task.id})));
+    model.enqueue(text("The parcel arrived; I stopped checking."));
+    let mut events = agent.subscribe();
+    let handed = agent.wake_scheduled_tasks(root, due_at).await.unwrap();
+    assert_eq!(handed.len(), 1);
+    let run_id = handed[0].run_id;
+    let removal = tokio::time::timeout(WAIT, async {
+        loop {
+            let event = tickloop_agent_test_support::next_event(&mut events).await;
+            if let EventKind::ScheduledTasksChanged {
+                notice:
+                    Some(tickloop_agent_protocol::ScheduledTaskNotice::Removed { task_id, reason }),
+            } = event.kind
+            {
+                return (task_id, reason, event.run_id);
+            }
+        }
+    })
+    .await
+    .expect("the run deletes its task");
+    assert_eq!(
+        removal,
+        (
+            task.id,
+            tickloop_agent_protocol::ScheduledTaskRemovalReason::AgentDeleted,
+            run_id
+        )
+    );
+    assert_eq!(agent.quiesce(root).await, Quiescence::Idle);
+    let snapshot = agent.snapshot(root).await.unwrap();
+    assert!(snapshot.scheduled_tasks.is_empty());
+    assert!(admissions.lock().unwrap().is_empty());
+    let later = due_at + 10 * 60 * 1000;
+    assert!(
+        agent
+            .wake_scheduled_tasks(root, later)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(agent.quiesce(root).await, Quiescence::Idle);
     agent.shutdown().await;
 }

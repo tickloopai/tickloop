@@ -180,6 +180,7 @@ impl ToolRegistry {
         prompt_policy: PromptPolicy,
         task_access: shared_tasks::TaskToolAccess,
         policy: &crate::ToolPolicy,
+        scheduled_task_terms: crate::scheduled_tasks::tools::ToolTerms,
     ) -> Self {
         let is_delegated = chat.snapshot.delegation.is_some();
         let has_folder = chat.snapshot.folder.is_some();
@@ -257,12 +258,15 @@ impl ToolRegistry {
         }
         if policy.scheduled_tasks && !is_delegated {
             tools.extend(
-                crate::scheduled_tasks::tools::definitions()
-                    .into_iter()
-                    .map(|definition| RegisteredTool {
-                        definition,
-                        route: ToolRoute::ScheduledTask,
-                    }),
+                crate::scheduled_tasks::tools::definitions(
+                    scheduled_task_terms,
+                    policy.schedule_wakeup,
+                )
+                .into_iter()
+                .map(|definition| RegisteredTool {
+                    definition,
+                    route: ToolRoute::ScheduledTask,
+                }),
             );
         }
         if policy.delegation && crate::handback::available(chat, prompt_policy) {
@@ -2478,6 +2482,7 @@ mod tests {
                 PromptPolicy::Interactive,
                 shared_tasks::TaskToolAccess::Disabled,
                 &crate::ToolPolicy::local(),
+                crate::scheduled_tasks::tools::ToolTerms::DEFAULT,
             );
             for enabled in [false, true, false] {
                 chat.snapshot.search_config =
@@ -2523,6 +2528,7 @@ mod tests {
                 PromptPolicy::Interactive,
                 shared_tasks::TaskToolAccess::Disabled,
                 &crate::ToolPolicy::local(),
+                crate::scheduled_tasks::tools::ToolTerms::DEFAULT,
             )
             .resolve(tickloop_agent_config::skills::SKILL_TOOL_NAME)
             .unwrap()
@@ -2571,7 +2577,10 @@ mod tests {
             .chain(delegation::definitions())
             .chain(agent_messages::definitions())
             .chain([crate::handback::definition()])
-            .chain(crate::scheduled_tasks::tools::definitions())
+            .chain(crate::scheduled_tasks::tools::definitions(
+                crate::scheduled_tasks::tools::ToolTerms::DEFAULT,
+                true,
+            ))
             .chain(tick_subscriptions::definitions())
             .chain(skills.tool_definition())
             .chain(crate::mcp_resources::definitions())

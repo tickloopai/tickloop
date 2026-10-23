@@ -44,9 +44,7 @@ use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model}
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
 };
-use tickloop_agent_runtime::{
-    Agent, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
-};
+use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
 
 mod chunked;
 pub mod daemon_control;
@@ -731,18 +729,9 @@ pub async fn build_runtime_with_models(
             models,
         },
         HarnessOptions {
-            search: Default::default(),
-            model,
             settings,
             host: launch.host_options,
-            tools: ToolPolicy::local(),
-            host_rules: Vec::new(),
-            task_tools: None,
-            waits: tickloop_agent_runtime::WaitHosting::Process,
-            citation_style: Default::default(),
-            system_prompt_addition: None,
-            request_gates: Vec::new(),
-            time_zone: None,
+            ..HarnessOptions::local(model)
         },
     )
     .map_err(|error| error.to_string())?;

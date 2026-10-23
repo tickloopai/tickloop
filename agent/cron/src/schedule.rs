@@ -17,6 +17,10 @@ const MONTHS_PER_YEAR: usize = 12;
 const MAX_GAP_MINUTES: i64 = 24 * 60;
 const SECONDS_PER_MINUTE: i64 = 60;
 const FIVE_MINUTE_MARKS: [u16; 12] = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
+/// Where [`Schedule::shortest_gap`] starts reading matching days: 2000-01-01 UTC, a leap year.
+const GAP_HORIZON_START: i64 = 946_684_800;
+/// How many days of matching days [`Schedule::shortest_gap`] reads: past one leap-year cycle.
+const GAP_HORIZON_DAYS: i64 = 5 * 366;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleError {
@@ -169,6 +173,48 @@ impl Schedule {
     pub fn gap_after<Tz: TimeZone>(&self, occurrence: &DateTime<Tz>) -> Option<TimeDelta> {
         self.next_after(occurrence)
             .map(|following| following - occurrence.clone())
+    }
+
+    /// The shortest time between two consecutive scheduled times, on the wall clock so that
+    /// daylight-saving shifts do not count; `None` when the expression names at most one time
+    /// within [`GAP_HORIZON_DAYS`]. Every matching day has the same times of day, so the
+    /// shortest gap is one between two of them or one across consecutive matching days.
+    pub fn shortest_gap(&self) -> Option<TimeDelta> {
+        let pattern = &self.cron.pattern;
+        let mut times_of_day: Vec<i64> = pattern
+            .hours
+            .values()
+            .into_iter()
+            .flat_map(|hour| {
+                pattern
+                    .minutes
+                    .values()
+                    .into_iter()
+                    .map(move |minute| i64::from(hour) * 60 + i64::from(minute))
+            })
+            .collect();
+        times_of_day.sort_unstable();
+        let within_a_day = times_of_day
+            .windows(2)
+            .map(|pair| TimeDelta::minutes(pair[1] - pair[0]))
+            .min();
+        let (Some(first), Some(last)) = (times_of_day.first(), times_of_day.last()) else {
+            return None;
+        };
+        let start = chrono::Utc.timestamp_opt(GAP_HORIZON_START, 0).single()?;
+        let horizon = start + TimeDelta::days(GAP_HORIZON_DAYS);
+        let mut across_days = None;
+        let mut day_start = self.next_at_or_after(&start)? - TimeDelta::minutes(*first);
+        while day_start < horizon {
+            let last_of_day = day_start + TimeDelta::minutes(*last);
+            let Some(next) = self.next_after(&last_of_day) else {
+                break;
+            };
+            let gap = next - last_of_day;
+            across_days = Some(across_days.map_or(gap, |shortest: TimeDelta| shortest.min(gap)));
+            day_start = next - TimeDelta::minutes(*first);
+        }
+        within_a_day.into_iter().chain(across_days).min()
     }
 
     /// Whether this is `*/5 * * * *` in any spelling: the cadence that keeps a five-minute

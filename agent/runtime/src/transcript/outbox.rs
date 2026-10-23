@@ -282,6 +282,7 @@ impl TranscriptOutbox {
                     || matches!(line, Line::ArtifactTicks(entry) if entry.cwd.is_some() && (!entry.artifact_ticks.is_empty() || !entry.removed_artifact_ticks.is_empty()))
                     || matches!(line, Line::MonitorMembers(entry) if entry.materializes_chat())
                     || matches!(line, Line::Goal(entry) if entry.cwd.is_some() && entry.goal.is_some())
+                    || matches!(line, Line::ScheduledTasks(entry) if entry.materializes_chat())
             }) {
                 outbox.buffered.extend(accepted);
                 return;

@@ -278,7 +278,10 @@ pub(crate) fn assemble(
                 .is_some_and(|entry| entry.materializes_chat())
             || goal
                 .as_ref()
-                .is_some_and(|entry| entry.cwd.is_some() && entry.goal.is_some());
+                .is_some_and(|entry| entry.cwd.is_some() && entry.goal.is_some())
+            || scheduled_tasks
+                .as_ref()
+                .is_some_and(ScheduledTasksEntry::materializes_chat);
         let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
             chain: Vec::new(),

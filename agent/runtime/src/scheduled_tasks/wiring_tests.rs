@@ -7,7 +7,8 @@ use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, Mod
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Content, EventKind, LoopState, ModelIdentity, PromptPolicy,
     Receiving, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
-    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, TriggerSource,
+    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRemovalReason,
+    TriggerSource,
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, harness::ChosenModels, text};
 use tokio::sync::Notify;
@@ -21,6 +22,7 @@ use crate::{
 };
 
 const WAIT: Duration = Duration::from_secs(10);
+const TASK: Uuid = Uuid::from_u128(0x0a1b_2c3d);
 /// A prompt containing it holds its turn until the test releases it.
 const HOLD: &str = "HOLD this turn";
 
@@ -263,7 +265,7 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
         call(
             "missing",
             tools::CRON_DELETE_TOOL_NAME,
-            json!({"id": "ffffffff"}),
+            json!({"id": Uuid::nil()}),
         ),
         create("invalid", "0 9 * * MON", "never"),
         text("Scheduled."),
@@ -283,7 +285,10 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
     );
     assert_eq!(task.scheduled_for_ms, Some(ms(at(10, 10, 0))));
     let (listed, is_error) = tool_result(&agent, chat, "list").await;
-    assert!(!is_error && listed.contains(&task.id), "{listed}");
+    assert!(
+        !is_error && listed.contains(&task.id.to_string()),
+        "{listed}"
+    );
     assert!(tool_result(&agent, chat, "missing").await.1);
     assert!(tool_result(&agent, chat, "invalid").await.1);
     for tools in model.tools() {
@@ -298,15 +303,20 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
     }
 
     let mut events = agent.subscribe();
-    agent.delete_scheduled_task(chat, &task.id).await.unwrap();
+    agent.delete_scheduled_task(chat, task.id).await.unwrap();
     assert!(tasks(&agent, chat).await.is_empty());
     assert!(matches!(
         tickloop_agent_test_support::next_event(&mut events)
             .await
             .kind,
-        EventKind::ScheduledTasksChanged { notice: None }
+        EventKind::ScheduledTasksChanged {
+            notice: Some(ScheduledTaskNotice::Removed {
+                task_id,
+                reason: ScheduledTaskRemovalReason::UserDeleted,
+            })
+        } if task_id == task.id
     ));
-    assert!(agent.delete_scheduled_task(chat, &task.id).await.is_err());
+    assert!(agent.delete_scheduled_task(chat, task.id).await.is_err());
 }
 
 /// The turn a scheduled run starts finds its task already moved on: the task's next time is
@@ -353,7 +363,7 @@ async fn a_due_task_runs_once_and_a_busy_loop_merges_later_times_as_skipped() {
     ]);
     let (_directory, agent, chat) = local_agent(model.clone()).await;
     turn(&agent, chat, "schedule it").await;
-    let task_id = tasks(&agent, chat).await[0].id.clone();
+    let task_id = tasks(&agent, chat).await[0].id;
 
     agent
         .run_due_scheduled_tasks(chat, at(10, 9, 59))
@@ -410,7 +420,7 @@ async fn a_one_shot_task_runs_once_and_is_deleted() {
     ]);
     let (_directory, agent, chat) = local_agent(model.clone()).await;
     turn(&agent, chat, "a reminder in a quarter of an hour").await;
-    let task_id = tasks(&agent, chat).await[0].id.clone();
+    let task_id = tasks(&agent, chat).await[0].id;
     let mut events = agent.subscribe();
     let receipts = agent
         .run_due_scheduled_tasks(chat, at(10, 15, 0))
@@ -618,7 +628,7 @@ async fn only_the_task_the_users_loop_schedules_is_the_users() {
 
 fn task_with(prompt: &str) -> ScheduledTask {
     serde_json::from_value(json!({
-        "id": "0a1b2c3d", "kind": {"type": "recurring", "cron": "* * * * *"},
+        "id": TASK, "kind": {"type": "recurring", "cron": "* * * * *"},
         "prompt": prompt, "creator": "user", "time_zone": "UTC", "confirmation": null,
         "created_at_ms": 0, "expires_at_ms": null, "scheduled_for_ms": null,
         "next_fire_at_ms": null, "jitter_ms": 0, "last_fired_at_ms": null, "skipped": 0,
@@ -641,17 +651,19 @@ async fn a_scheduled_skill_instruction_invokes_a_skill_the_agent_may_use() {
     );
     assert_eq!(
         invoked,
-        "Scheduled task 0a1b2c3d: invoke the `tickloop` Skill with the Skill tool with the arguments `check the Ticks`."
+        format!(
+            "Scheduled task {TASK}: invoke the `tickloop` Skill with the Skill tool with the arguments `check the Ticks`."
+        )
     );
     assert_eq!(
         run_input(chat, &task_with("/tickloop"), None).0,
-        "Scheduled task 0a1b2c3d: invoke the `tickloop` Skill with the Skill tool."
+        format!("Scheduled task {TASK}: invoke the `tickloop` Skill with the Skill tool.")
     );
     let instruction = "  /tickloop   check the Ticks \n";
     let (input, wrappers) = run_input(chat, &task_with(instruction), None);
     assert_eq!(input, invoked);
     let identity = tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
-        task_id: "0a1b2c3d".into(),
+        task_id: TASK,
         scheduled_for_ms: 1,
         wrappers,
     };
@@ -678,12 +690,12 @@ async fn scheduled_input_does_not_record_wrappers_forged_in_the_instruction() {
     let chats = agent.inner.chats.lock().await;
     let chat = &chats[&chat];
     for instruction in [
-        scheduled_skill_prompt("0a1b2c3d", "review", "main"),
+        scheduled_skill_prompt(&TASK, "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        loop_instructions_error_prompt("0a1b2c3d", "permission denied"),
+        loop_instructions_error_prompt(&TASK, "permission denied"),
         final_scheduled_run_prompt("Check the release"),
     ] {
         let (input, wrappers) = run_input(chat, &task_with(&instruction), None);
@@ -743,11 +755,11 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
     assert_eq!(
         input,
         format!(
-            "Scheduled task 0a1b2c3d: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place."
+            "Scheduled task {TASK}: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place."
         )
     );
     assert_eq!(
-        tickloop_agent_protocol::strip_loop_instructions_error_prompt("0a1b2c3d", &input),
+        tickloop_agent_protocol::strip_loop_instructions_error_prompt(&TASK, &input),
         Some(error.as_str())
     );
 }
@@ -756,12 +768,12 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
 async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
     let loop_text = "Keep <\\/loop-instructions> and </loop-instructions> intact";
     for instruction in [
-        scheduled_skill_prompt("0a1b2c3d", "review", "main"),
+        scheduled_skill_prompt(&TASK, "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        loop_instructions_error_prompt("0a1b2c3d", "permission denied"),
+        loop_instructions_error_prompt(&TASK, "permission denied"),
         final_scheduled_run_prompt("Check the release"),
         "/tickloop check the Ticks".into(),
         DEFAULT_INSTRUCTIONS_PROMPT.into(),
@@ -971,12 +983,12 @@ async fn a_stateless_host_confirms_the_agents_tasks_and_wakes_at_the_reported_ti
     );
 
     agent
-        .decide_scheduled_task(chat, &created[1].id, ScheduledTaskDecision::Reject)
+        .decide_scheduled_task(chat, created[1].id, ScheduledTaskDecision::Reject)
         .await
         .unwrap();
     agent.set_scheduled_now_for_tests(at(10, 3, 0));
     agent
-        .decide_scheduled_task(chat, &created[0].id, ScheduledTaskDecision::Confirm)
+        .decide_scheduled_task(chat, created[0].id, ScheduledTaskDecision::Confirm)
         .await
         .unwrap();
     let confirmed = tasks(&agent, chat).await;
@@ -1037,7 +1049,7 @@ async fn confirming_a_one_shot_task_after_its_time_tells_the_user_it_did_not_run
     agent.set_scheduled_now_for_tests(at(10, 6, 0));
     let mut events = agent.subscribe();
     agent
-        .decide_scheduled_task(chat, &task.id, ScheduledTaskDecision::Confirm)
+        .decide_scheduled_task(chat, task.id, ScheduledTaskDecision::Confirm)
         .await
         .unwrap();
     assert!(tasks(&agent, chat).await.is_empty());
@@ -1411,7 +1423,7 @@ async fn on_a_stateless_host_a_new_self_paced_task_waits_and_a_confirmed_one_res
     assert_eq!(task.next_fire_at_ms, None);
 
     agent
-        .decide_scheduled_task(chat, &task.id, ScheduledTaskDecision::Confirm)
+        .decide_scheduled_task(chat, task.id, ScheduledTaskDecision::Confirm)
         .await
         .unwrap();
     agent.set_scheduled_now_for_tests(at(10, 5, 0));
@@ -1543,7 +1555,10 @@ async fn changes_while_another_process_holds_the_lease_are_refused_visibly() {
     turn(&other, chat, "get ready").await;
     // Scheduling the task takes the Chat's lease, which a receiving process keeps.
     let task = other
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     other.flush_transcripts().await;
@@ -1589,12 +1604,12 @@ async fn a_run_handed_over_after_its_task_was_cancelled_is_refused() {
     let (_directory, agent, chat) = local_agent(model.clone()).await;
     turn(&agent, chat, "schedule it").await;
     let task = tasks(&agent, chat).await.remove(0);
-    agent.delete_scheduled_task(chat, &task.id).await.unwrap();
+    agent.delete_scheduled_task(chat, task.id).await.unwrap();
     let late = agent
         .deliver_trigger_for_tests(
             chat,
             TriggerSource::ScheduledTask {
-                task_id: task.id.clone(),
+                task_id: task.id,
                 scheduled_for_ms: task.scheduled_for_ms.unwrap(),
                 wrappers: Vec::new(),
             },
@@ -1610,7 +1625,7 @@ async fn a_run_handed_over_after_its_task_was_cancelled_is_refused() {
             .unwrap()
             .scheduled_task_revocations
             .iter()
-            .map(|revocation| revocation.task_id.clone())
+            .map(|revocation| revocation.task_id)
             .collect::<Vec<_>>(),
         [task.id]
     );
@@ -1739,7 +1754,7 @@ async fn a_run_prepared_before_stop_is_refused_after_continuing() {
     turn(&agent, chat, "schedule it").await;
     let task = tasks(&agent, chat).await.remove(0);
     let prepared = TriggerSource::ScheduledTask {
-        task_id: task.id.clone(),
+        task_id: task.id,
         scheduled_for_ms: ms(at(10, 10, 0)),
         wrappers: Vec::new(),
     };
@@ -1782,7 +1797,7 @@ async fn a_run_older_than_a_day_is_neither_handed_over_nor_taken() {
     turn(&agent, chat, "schedule it").await;
     let task = tasks(&agent, chat).await.remove(0);
     let run = TriggerSource::ScheduledTask {
-        task_id: task.id.clone(),
+        task_id: task.id,
         scheduled_for_ms: task.scheduled_for_ms.unwrap(),
         wrappers: Vec::new(),
     };
@@ -1832,11 +1847,14 @@ async fn individual_task_pause_is_recorded_and_independent_of_stopping_the_loop(
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     turn(&agent, chat, "ready").await;
     let task = agent
-        .schedule_task(chat, "*/10 * * * *", "paused instruction".into(), true)
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("*/10 * * * *", "paused instruction", true),
+        )
         .await
         .unwrap();
     agent
-        .set_scheduled_task_paused(chat, &task.id, true)
+        .set_scheduled_task_paused(chat, task.id, true)
         .await
         .unwrap();
     assert!(
@@ -1859,7 +1877,7 @@ async fn individual_task_pause_is_recorded_and_independent_of_stopping_the_loop(
     assert_eq!(restored.paused_at_ms, Some(ms(at(10, 0, 0))));
     assert_eq!(restored.expires_at_ms, task.expires_at_ms);
     reopened
-        .set_scheduled_task_paused(chat, &task.id, false)
+        .set_scheduled_task_paused(chat, task.id, false)
         .await
         .unwrap();
     assert!(
@@ -1900,11 +1918,14 @@ async fn cron_list_reports_a_user_pause_without_resuming_it() {
     ]);
     let (_directory, agent, chat) = local_agent(model).await;
     let task = agent
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     agent
-        .set_scheduled_task_paused(chat, &task.id, true)
+        .set_scheduled_task_paused(chat, task.id, true)
         .await
         .unwrap();
     turn(&agent, chat, "list schedules").await;
@@ -1912,5 +1933,225 @@ async fn cron_list_reports_a_user_pause_without_resuming_it() {
     assert!(!is_error, "{result}");
     assert!(result.contains("\\\"paused\\\":true"), "{result}");
     assert!(tasks(&agent, chat).await[0].paused_at_ms.is_some());
+    agent.shutdown().await;
+}
+
+/// A host that turns ScheduleWakeup off keeps CronCreate, CronList and CronDelete; the user's
+/// self-paced `/loop` starts no task, and a ScheduleWakeup call is not run.
+#[tokio::test]
+async fn schedule_wakeup_turns_off_without_the_cron_tools() {
+    let model = HoldingModel::new(vec![
+        wakeup("wake", 600, "watch the build"),
+        create("create", "*/10 * * * *", "check the build"),
+        text("Scheduled."),
+    ]);
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts: None,
+            environment: None,
+            models: ChosenModels::new(model.clone()),
+        },
+        HarnessOptions {
+            host: AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                ..AgentHostOptions::product_defaults()
+            },
+            tools: ToolPolicy {
+                scheduled_tasks: true,
+                schedule_wakeup: false,
+                ..ToolPolicy::web_fetch_only()
+            },
+            waits: WaitHosting::Durable,
+            host_rules: crate::durable_chat_host_rules(),
+            time_zone: Some("UTC".into()),
+            trust_model_scheduled_tasks: true,
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    advance(&agent, chat, "keep an eye on the build").await;
+    let offered = model.tools().remove(0);
+    for name in [
+        tools::CRON_CREATE_TOOL_NAME,
+        tools::CRON_LIST_TOOL_NAME,
+        tools::CRON_DELETE_TOOL_NAME,
+    ] {
+        assert!(offered.iter().any(|tool| tool == name), "{name}");
+    }
+    assert!(
+        !offered
+            .iter()
+            .any(|tool| tool == tools::SCHEDULE_WAKEUP_TOOL_NAME)
+    );
+    let created = tasks(&agent, chat).await;
+    assert_eq!(created.len(), 1, "only the cron task: {created:?}");
+    assert!(matches!(
+        created[0].kind,
+        ScheduledTaskKind::Recurring { .. }
+    ));
+    assert_eq!(
+        agent
+            .start_users_self_paced_loop(chat, "watch".into(), uuid::Uuid::new_v4())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(tasks(&agent, chat).await.len(), 1);
+    agent.shutdown().await;
+}
+
+/// The Agent deleting a task with CronDelete, and stopping its self-paced loop, announce why the
+/// task left.
+#[tokio::test]
+async fn the_agents_deletions_name_their_reason() {
+    let model = HoldingModel::new(vec![
+        create("create", "*/10 * * * *", "check the build"),
+        wakeup("wake", 600, "watch the build"),
+        text("Scheduled."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "schedule a check and watch").await;
+    let created = tasks(&agent, chat).await;
+    let cron = created
+        .iter()
+        .find(|task| matches!(task.kind, ScheduledTaskKind::Recurring { .. }))
+        .unwrap()
+        .id;
+    let self_paced = created
+        .iter()
+        .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+        .unwrap()
+        .id;
+    model.scripted.enqueue(call(
+        "delete",
+        tools::CRON_DELETE_TOOL_NAME,
+        json!({"id": cron}),
+    ));
+    model.scripted.enqueue(call(
+        "stop",
+        tools::SCHEDULE_WAKEUP_TOOL_NAME,
+        json!({"stop": true}),
+    ));
+    model.scripted.enqueue(text("Done."));
+    let mut events = agent.subscribe();
+    turn(&agent, chat, "that is enough").await;
+    assert!(tasks(&agent, chat).await.is_empty());
+    let mut removals = Vec::new();
+    while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+    {
+        if let EventKind::ScheduledTasksChanged {
+            notice: Some(ScheduledTaskNotice::Removed { task_id, reason }),
+        } = event.kind
+        {
+            removals.push((task_id, reason));
+        }
+    }
+    assert_eq!(
+        removals,
+        [
+            (cron, ScheduledTaskRemovalReason::AgentDeleted),
+            (self_paced, ScheduledTaskRemovalReason::SelfPacedEnded)
+        ]
+    );
+    agent.shutdown().await;
+}
+
+#[test]
+fn tool_descriptions_follow_the_hosts_terms() {
+    let description = |terms: ToolTerms| {
+        tools::definitions(terms, true)
+            .into_iter()
+            .find(|tool| tool.name == tools::CRON_CREATE_TOOL_NAME)
+            .unwrap()
+            .description
+    };
+    let standard = description(ToolTerms::DEFAULT);
+    assert!(standard.contains("Recurring tasks expire 7 days after creation"));
+    assert!(standard.contains("waits for the user to confirm it"));
+    assert!(!standard.contains("runs at most"));
+    let cloud = description(ToolTerms {
+        rules: TaskRules {
+            lifetime: None,
+            min_interval: Some(Duration::from_secs(60 * 60)),
+        },
+        confirms_agent_tasks: false,
+    });
+    assert!(
+        !cloud.contains("7 days") && !cloud.contains("expire"),
+        "{cloud}"
+    );
+    assert!(cloud.contains("Recurring tasks run until they are deleted."));
+    assert!(cloud.contains("On this host a recurring task runs at most once per hour"));
+    assert!(!cloud.contains("waits for the user to confirm"));
+    let names = |schedule_wakeup| {
+        tools::definitions(ToolTerms::DEFAULT, schedule_wakeup)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(true).len(), 4);
+    assert_eq!(
+        names(false),
+        [
+            tools::CRON_CREATE_TOOL_NAME,
+            tools::CRON_LIST_TOOL_NAME,
+            tools::CRON_DELETE_TOOL_NAME
+        ]
+    );
+}
+
+/// The host renames or rewords a task while its run is being handed over: the run still moves
+/// the task on, and the new wording stays.
+#[tokio::test]
+async fn a_run_handed_over_while_the_task_is_reworded_still_moves_it_on() {
+    let model = HoldingModel::new(vec![text("Ready.")]);
+    let agent = stateless_agent(model);
+    agent.set_scheduled_now_for_tests(at(10, 0, 0));
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let task = agent
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
+        .await
+        .unwrap();
+    let now = DateTime::from_timestamp_millis(task.next_fire_at_ms.unwrap() as i64).unwrap();
+    let mut prepared = ScheduledTasks::new(vec![task.clone()]);
+    let fired = prepared.take_due(&now).fired.remove(0);
+    let run = DueRun {
+        before: task.clone(),
+        fired,
+    };
+    agent
+        .edit_scheduled_task(
+            chat,
+            task.id,
+            ScheduledTaskEdit {
+                prompt: Some("check the release".into()),
+                title: Some(Some("Release".into())),
+                ..ScheduledTaskEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let receipt = Receipt {
+        chat_id: chat,
+        loop_id: uuid::Uuid::new_v4(),
+        run_id: uuid::Uuid::new_v4(),
+    };
+    agent
+        .run_source_change(chat, move |change, chat| {
+            change
+                .agent()
+                .commit_scheduled_run(change, chat, &run, &receipt);
+        })
+        .await
+        .unwrap();
+    let moved = tasks(&agent, chat).await.remove(0);
+    assert!(moved.scheduled_for_ms > task.scheduled_for_ms, "{moved:?}");
+    assert_eq!(moved.prompt, "check the release");
+    assert_eq!(moved.title.as_deref(), Some("Release"));
     agent.shutdown().await;
 }

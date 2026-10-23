@@ -969,7 +969,10 @@ async fn the_successor_keeps_time_for_an_idle_chats_scheduled_task() {
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     complete(&original, chat, "set up").await;
     let task = original
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            crate::NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     let checkpoint = prepare(&original).await;
@@ -1004,11 +1007,14 @@ async fn planned_upgrade_keeps_individual_task_and_subscription_pauses() {
     let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     let task = original
-        .schedule_task(chat, "0 * * * *", "check build".into(), true)
+        .schedule_task(
+            chat,
+            crate::NewScheduledTask::new("0 * * * *", "check build", true),
+        )
         .await
         .unwrap();
     original
-        .set_scheduled_task_paused(chat, &task.id, true)
+        .set_scheduled_task_paused(chat, task.id, true)
         .await
         .unwrap();
     let subscription = tickloop_agent_protocol::TickSubscription {

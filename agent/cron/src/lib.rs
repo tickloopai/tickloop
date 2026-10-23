@@ -4,7 +4,7 @@
 //!   evaluated in whatever time zone the caller's times carry, so the host passes local time.
 //! - [`Interval`] and [`parse_loop_arguments`]: `/loop` intervals and their conversion to cron.
 //! - [`next_run`] and [`run_for`]: when a scheduled time of a task actually fires after jitter.
-//! - [`generate_task_id`]: 8-character task ids.
+//! - [`generate_task_id`]: UUIDv7 task ids.
 //!
 //! Every function is pure apart from id generation: callers pass the current time.
 

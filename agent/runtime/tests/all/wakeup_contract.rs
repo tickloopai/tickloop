@@ -1222,7 +1222,14 @@ impl Source for ScheduledSource {
             Some(task) => task,
             None => match self
                 .agent
-                .schedule_task(self.chat, "* * * * *", prompt.clone(), true)
+                .schedule_task(
+                    self.chat,
+                    tickloop_agent_runtime::NewScheduledTask::new(
+                        "* * * * *",
+                        prompt.clone(),
+                        true,
+                    ),
+                )
                 .await
             {
                 Ok(task) => task,
@@ -1258,7 +1265,7 @@ impl Source for ScheduledSource {
             .scheduled_tasks;
         for task in tasks {
             self.agent
-                .delete_scheduled_task(self.chat, &task.id)
+                .delete_scheduled_task(self.chat, task.id)
                 .await
                 .unwrap();
         }
@@ -1359,9 +1366,11 @@ impl Source for OneTaskSource {
             .agent
             .schedule_task(
                 process.chat,
-                "0 0 * * *",
-                tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT.into(),
-                true,
+                tickloop_agent_runtime::NewScheduledTask::new(
+                    "0 0 * * *",
+                    tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT,
+                    true,
+                ),
             )
             .await
             .unwrap();
@@ -1413,7 +1422,7 @@ impl Source for OneTaskSource {
         if let Some(task) = self.task().await {
             self.process
                 .agent
-                .delete_scheduled_task(self.process.chat, &task.id)
+                .delete_scheduled_task(self.process.chat, task.id)
                 .await
                 .unwrap();
         }

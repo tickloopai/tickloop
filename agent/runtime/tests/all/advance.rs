@@ -1613,9 +1613,7 @@ async fn a_branch_switch_keeps_the_chats_scheduled_tasks() {
     let task = agent
         .schedule_task(
             branches.chat,
-            "*/10 * * * *",
-            "check the build".into(),
-            true,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check the build", true),
         )
         .await
         .unwrap();

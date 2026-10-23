@@ -1124,7 +1124,7 @@ mod tests {
             kind: EventKind::ScheduledTasksChanged {
                 notice: Some(
                     tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled {
-                        task_id: "0123abcd".into(),
+                        task_id: Uuid::from_u128(0x0123_abcd),
                     },
                 ),
             },

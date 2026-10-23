@@ -14,7 +14,7 @@ doctest = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 croner = { version = "4", default-features = false, features = ["chrono"] }
 thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 chrono-tz = "0.10"

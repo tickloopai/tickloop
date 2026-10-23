@@ -108,11 +108,14 @@ impl<'a> SourceChange<'a> {
         self.records.lock().unwrap().metadata.push(line);
     }
 
-    /// Queues the Chat's change and what the source recorded with it, as one group.
-    fn queue_with(self, chat: &Chat) {
+    /// Queues the Chat's change and what the source recorded with it, as one group; tells
+    /// whether the source recorded anything.
+    fn queue_with(self, chat: &Chat) -> bool {
         let records = self.records.into_inner().unwrap();
+        let recorded = !records.metadata.is_empty() || !records.source_states.is_empty();
         self.agent
             .queue_with_source_states(chat, records.metadata, records.source_states);
+        recorded
     }
 }
 
@@ -799,20 +802,24 @@ impl Agent {
             self.pause_here_for_a_pause_elsewhere(chat_id, holding)
                 .await;
         }
-        let result = {
+        let (result, recorded) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&chat_id)
                 .ok_or(SourceChangeError::NotLoaded)?;
             let source_change = SourceChange::new(self);
             let result = change(&source_change, chat);
-            source_change.queue_with(chat);
+            let recorded = source_change.queue_with(chat);
             self.save(&chat.snapshot);
-            result
+            (result, recorded)
         };
-        self.commit_queued(chat_id)
-            .await
-            .map_err(SourceChangeError::Unrecorded)?;
+        // A change that recorded nothing in a Chat its Transcript does not keep yet, such as a
+        // refused one, has nothing to commit; what else it queued stays buffered with the Chat.
+        if recorded || !self.transcript_awaits_materializing(chat_id) {
+            self.commit_queued(chat_id)
+                .await
+                .map_err(SourceChangeError::Unrecorded)?;
+        }
         let receiving = self
             .inner
             .chats

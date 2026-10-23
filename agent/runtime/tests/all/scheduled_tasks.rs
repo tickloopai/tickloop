@@ -51,7 +51,10 @@ async fn chat_with_a_task(agent: &Agent) -> (ChatId, ScheduledTask) {
     let chat = agent.create_chat_without_folder().await.unwrap();
     complete_turn(agent, chat, "get ready").await;
     let task = agent
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     (chat, task)
@@ -230,7 +233,10 @@ async fn a_process_taking_the_chat_over_does_not_run_a_task_deleted_elsewhere() 
     let chat = holder.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&holder, chat, "get ready").await;
     let task = holder
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     // The holder runs the task once, so the Chat's Trigger lease is its own.
@@ -249,7 +255,7 @@ async fn a_process_taking_the_chat_over_does_not_run_a_task_deleted_elsewhere() 
     let loaded = tasks(&taker, chat).await;
     assert_eq!(loaded.len(), 1, "{loaded:?}");
 
-    holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+    holder.delete_scheduled_task(chat, task.id).await.unwrap();
     holder.shutdown().await;
 
     taker.set_scheduled_now_for_tests(at(10, 35));
@@ -291,7 +297,10 @@ async fn assert_a_bystander_does_not_bring_a_deleted_task_back(compacts: bool) {
     complete_turn(&holder, chat, "get ready").await;
     complete_turn(&holder, chat, "and again").await;
     let task = holder
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     holder.flush_transcripts().await;
@@ -301,7 +310,7 @@ async fn assert_a_bystander_does_not_bring_a_deleted_task_back(compacts: bool) {
     bystander.resume_chat(chat).await.unwrap();
     assert_eq!(tasks(&bystander, chat).await.len(), 1);
 
-    holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+    holder.delete_scheduled_task(chat, task.id).await.unwrap();
     holder.shutdown().await;
     if compacts {
         bystander.compact(chat).await.unwrap();
@@ -340,7 +349,10 @@ async fn a_process_taking_over_right_after_a_deletion_does_not_run_the_task() {
     let chat = holder.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&holder, chat, "get ready").await;
     let task = holder
-        .schedule_task(chat, "*/10 * * * *", "check the build".into(), true)
+        .schedule_task(
+            chat,
+            tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check the build", true),
+        )
         .await
         .unwrap();
     holder.flush_transcripts().await;
@@ -352,7 +364,7 @@ async fn a_process_taking_over_right_after_a_deletion_does_not_run_the_task() {
     complete_turn(&taker, chat, "resume here").await;
     taker.set_scheduled_now_for_tests(at(10, 15));
 
-    holder.delete_scheduled_task(chat, &task.id).await.unwrap();
+    holder.delete_scheduled_task(chat, task.id).await.unwrap();
     let woken = taker
         .wake_scheduled_tasks(chat, task.next_fire_at_ms.unwrap())
         .await;

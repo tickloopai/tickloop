@@ -1762,7 +1762,7 @@ impl Console {
             .clone())
     }
 
-    pub(super) fn remove_scheduled_task(&self, chat: Uuid, id: &str) -> Result<(), String> {
+    pub(super) fn remove_scheduled_task(&self, chat: Uuid, id: &Uuid) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_for_chat_mut(chat).remove_task(id);
         state.rendered_region = None;
@@ -11441,7 +11441,7 @@ impl State {
         let detail = self.monitor.detail.as_ref().map(|detail| detail.id());
         let (target, intent, consequence) = if let Some(task) = self.monitor.selected_task() {
             (
-                MonitorTarget::ScheduledTask(task.id.clone()),
+                MonitorTarget::ScheduledTask(task.id),
                 None,
                 "delete this scheduled task".into(),
             )
@@ -12097,7 +12097,7 @@ impl State {
                         {
                             return None;
                         }
-                        super::scheduled_tasks::PauseAction::Scheduled(task.id.clone())
+                        super::scheduled_tasks::PauseAction::Scheduled(task.id)
                     } else if let Some(entry) = self.monitor.selected() {
                         entry.subscription?;
                         super::scheduled_tasks::PauseAction::Subscription(entry.instance.clone())

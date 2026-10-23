@@ -5,6 +5,7 @@ use std::{
 };
 
 use tickhost_connect::page::PageCursor;
+use uuid::Uuid;
 
 use super::{
     display::{DisplayProfile, Glyph},
@@ -111,7 +112,7 @@ impl MonitorEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MonitorTarget {
     Tick(InstanceRef),
-    ScheduledTask(String),
+    ScheduledTask(Uuid),
     MoreScheduled,
     Goal,
 }
@@ -128,8 +129,8 @@ pub(super) struct Monitor {
     pub(super) entry_flash_at_ms: Option<u64>,
     entry_signal: Option<(RowFlash, u64)>,
     received: HashMap<InstanceRef, u64>,
-    task_fires: HashMap<String, Option<u64>>,
-    task_flashes: HashMap<String, u64>,
+    task_fires: HashMap<Uuid, Option<u64>>,
+    task_flashes: HashMap<Uuid, u64>,
     pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
     pub(super) subscriptions: Vec<TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<tickloop_agent_artifacts::ArtifactMetadata>>,
@@ -340,7 +341,7 @@ impl Monitor {
     }
     pub(super) fn open_task_list(&mut self) {
         if let Some(task) = self.tasks().get(MAX_PINNED_TASKS) {
-            self.selected = Some(MonitorTarget::ScheduledTask(task.id.clone()));
+            self.selected = Some(MonitorTarget::ScheduledTask(task.id));
             self.expanded_tasks = true;
         }
     }
@@ -351,7 +352,7 @@ impl Monitor {
         }
         self.reconcile_selection();
     }
-    fn waiting_task(&self, id: &str) -> bool {
+    fn waiting_task(&self, id: &Uuid) -> bool {
         self.chat_status.as_ref().is_some_and(|chat| chat.pending_inputs.iter().any(|input| {
             matches!(&input.trigger_source, Some(tickloop_agent_protocol::TriggerSource::ScheduledTask { task_id, .. }) if task_id == id)
         }))
@@ -361,11 +362,11 @@ impl Monitor {
             .as_ref()
             .is_some_and(|chat| !chat.chat_loop.receiving.is_receiving())
     }
-    pub(super) fn remove_task(&mut self, id: &str) {
+    pub(super) fn remove_task(&mut self, id: &Uuid) {
         if let Some(chat) = &mut self.chat_status {
             Arc::make_mut(chat)
                 .scheduled_tasks
-                .retain(|task| task.id != id);
+                .retain(|task| task.id != *id);
         }
         self.close_detail();
         self.rebuild();
@@ -610,11 +611,9 @@ impl Monitor {
         }
         let tasks = self.tasks().to_vec();
         for task in &tasks {
-            let previous = self
-                .task_fires
-                .insert(task.id.clone(), task.last_fired_at_ms);
+            let previous = self.task_fires.insert(task.id, task.last_fired_at_ms);
             if previous.is_some_and(|previous| task.last_fired_at_ms > previous) {
-                self.task_flashes.insert(task.id.clone(), now_ms);
+                self.task_flashes.insert(task.id, now_ms);
                 self.note_entry_flash(RowFlash::TakeIn, now_ms);
             }
         }
@@ -870,7 +869,7 @@ impl Monitor {
     ) {
         match source {
             tickloop_agent_protocol::TriggerIdentity::ScheduledTask { task_id, .. } => {
-                self.task_flashes.insert(task_id.clone(), since_ms);
+                self.task_flashes.insert(*task_id, since_ms);
             }
             tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. } => {
                 self.goal_continued_at_ms = Some(since_ms);
@@ -988,7 +987,7 @@ impl Monitor {
                 self.selected = self
                     .tasks()
                     .first()
-                    .map(|task| MonitorTarget::ScheduledTask(task.id.clone()));
+                    .map(|task| MonitorTarget::ScheduledTask(task.id));
             }
             if self.selected.is_none() && self.goal().is_some() {
                 self.selected = Some(MonitorTarget::Goal);
@@ -1080,9 +1079,7 @@ impl Monitor {
             let target = (index as isize)
                 .saturating_add(delta)
                 .clamp(0, self.tasks().len() as isize - 1) as usize;
-            self.selected = Some(MonitorTarget::ScheduledTask(
-                self.tasks()[target].id.clone(),
-            ));
+            self.selected = Some(MonitorTarget::ScheduledTask(self.tasks()[target].id));
             return;
         }
         if delta < 0 && !matches!(self.selected, Some(MonitorTarget::Tick(_))) {
@@ -1116,7 +1113,7 @@ impl Monitor {
             self.tasks()
                 .iter()
                 .take(self.preview_count())
-                .map(|task| MonitorTarget::ScheduledTask(task.id.clone())),
+                .map(|task| MonitorTarget::ScheduledTask(task.id)),
         );
         if self.tasks().len() > MAX_PINNED_TASKS {
             targets.push(MonitorTarget::MoreScheduled);
@@ -1469,7 +1466,7 @@ impl Monitor {
                 if lines.len() > capacity {
                     break;
                 }
-                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id.clone())));
+                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id)));
                 lines.push(line);
             }
         }
@@ -1669,7 +1666,7 @@ impl Monitor {
                 if lines.len() >= scheduled_end.saturating_sub(usize::from(more)) {
                     break;
                 }
-                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id.clone())));
+                targets.push((lines.len(), MonitorTarget::ScheduledTask(task.id)));
                 lines.push(line);
             }
         }
@@ -3151,7 +3148,7 @@ mod scheduled_tests {
 
     fn task() -> ScheduledTask {
         serde_json::from_value(serde_json::json!({
-            "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+            "id":"00000000-0000-0000-0000-00000123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
             "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
             "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
             "jitter_ms":0, "skipped":0
@@ -3180,7 +3177,10 @@ mod scheduled_tests {
             "scheduled tasks are not Ticks"
         );
         monitor.focus(false, None);
-        assert_eq!(monitor.selected_task().unwrap().id, "0123abcd");
+        assert_eq!(
+            monitor.selected_task().unwrap().id,
+            Uuid::from_u128(0x0123_abcd)
+        );
         let display = DisplayProfile::default();
         for width in [1, 5, 16, 42] {
             let frame = monitor.frame(width, 10, display, 60000);
@@ -3287,7 +3287,7 @@ mod queued_scheduled_tests {
                 "id":uuid::Uuid::nil(), "messages":[],
                 "chat_loop":{"id":uuid::Uuid::nil(),"state":"Running"},
                 "scheduled_tasks":[{
-                    "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+                    "id":"00000000-0000-0000-0000-00000123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
                     "prompt":"weather", "creator":"user", "time_zone":"UTC", "created_at_ms":0,
                     "last_fired_at_ms":60000, "next_fire_at_ms":120000, "jitter_ms":0,"skipped":0
                 }]
@@ -3296,7 +3296,7 @@ mod queued_scheduled_tests {
         let mut status = ChatStatus::of(&chat);
         status.pending_inputs = serde_json::from_value(serde_json::json!([{
             "receipt":{"chat_id":uuid::Uuid::nil(),"loop_id":uuid::Uuid::nil(),"run_id":uuid::Uuid::new_v4()},
-            "input":"weather", "trigger_source":{"kind":"scheduled_task","task_id":"0123abcd","scheduled_for_ms":60000}, "armed":true
+            "input":"weather", "trigger_source":{"kind":"scheduled_task","task_id":"00000000-0000-0000-0000-00000123abcd","scheduled_for_ms":60000}, "armed":true
         }])).unwrap();
         let mut monitor = Monitor {
             chat_status: Some(Arc::new(status)),

@@ -60,6 +60,17 @@ pub struct HarnessOptions {
     /// The IANA time zone scheduled tasks read their cron expressions in: a stateless host
     /// passes the user's. `None` uses the machine's local zone.
     pub time_zone: Option<String>,
+    /// How long a recurring or self-paced task lives before its final run: seven days, as in
+    /// Claude Code, by default. `None` keeps each task until it is deleted or its own end
+    /// comes, and the tools tell the model no limit.
+    pub scheduled_task_expiry: Option<Duration>,
+    /// The least time between two runs of a recurring task its schedule may name, on the wall
+    /// clock; creating or editing one that runs more often is refused, and the tools tell the
+    /// model the limit. `None`, the default, sets no limit.
+    pub scheduled_task_min_interval: Option<Duration>,
+    /// Whether tasks the Agent creates with CronCreate or ScheduleWakeup start timing at once
+    /// on a host without permission requests, instead of waiting for the user's confirmation.
+    pub trust_model_scheduled_tasks: bool,
 }
 
 impl HarnessOptions {
@@ -78,6 +89,9 @@ impl HarnessOptions {
             system_prompt_addition: None,
             request_gates: Vec::new(),
             time_zone: None,
+            scheduled_task_expiry: Some(crate::scheduled_tasks::TASK_LIFETIME),
+            scheduled_task_min_interval: None,
+            trust_model_scheduled_tasks: false,
         }
     }
 }
@@ -136,6 +150,10 @@ pub struct ToolPolicy {
     pub goals: bool,
     /// CronCreate, CronList, CronDelete and ScheduleWakeup, for the root Agent only.
     pub scheduled_tasks: bool,
+    /// Whether the scheduled task tools include ScheduleWakeup and the user's self-paced
+    /// `/loop`; turning it off keeps CronCreate, CronList and CronDelete. Every constructor
+    /// turns it on, so it matters only with `scheduled_tasks`.
+    pub schedule_wakeup: bool,
     /// The host's tools, such as the Artifact and Tick tools, and its MCP resources.
     pub artifacts: bool,
     pub tick_subscriptions: bool,
@@ -167,6 +185,7 @@ impl ToolPolicy {
             tasks: true,
             goals: true,
             scheduled_tasks: true,
+            schedule_wakeup: true,
             artifacts: true,
             tick_subscriptions: true,
             folderless_reach: Reach::PublicAddresses,
@@ -191,6 +210,7 @@ impl ToolPolicy {
             tasks: true,
             goals: false,
             scheduled_tasks: true,
+            schedule_wakeup: true,
             artifacts: true,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -223,6 +243,7 @@ impl ToolPolicy {
             tasks: false,
             goals: false,
             scheduled_tasks: false,
+            schedule_wakeup: true,
             artifacts: false,
             tick_subscriptions: false,
             folderless_reach: Reach::PublicAddresses,
@@ -236,15 +257,17 @@ impl ToolPolicy {
 /// WebFetch fetches only URLs with provenance there, so it carries no data the model composed;
 /// Artifact writes are admitted by their target's provenance instead of a rule.
 /// CronCreate and ScheduleWakeup need no review there: a task the Agent creates waits for the
-/// user's confirmation, and rescheduling keeps the instruction the task was confirmed with.
-/// Deleting a task has no such check and stays reviewed.
-const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 7] = [
+/// user's confirmation unless the host trusts it, and rescheduling keeps the instruction the
+/// task was confirmed with. CronDelete only ends the Chat's own tasks, such as a monitoring
+/// task the Agent deletes in its run once its condition holds.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 8] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
     tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
     crate::mcp_tools::ARTIFACT_READ_TOOL,
     crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME,
+    crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME,
     crate::scheduled_tasks::tools::SCHEDULE_WAKEUP_TOOL_NAME,
 ];
 

@@ -111,7 +111,7 @@ mod tests {
     fn scheduled_display_wrappers_do_not_change_the_input_id() {
         let chat = Uuid::new_v4();
         let identity = |wrappers| TriggerIdentity::ScheduledTask {
-            task_id: "12345678".into(),
+            task_id: Uuid::from_u128(0x1234_5678),
             scheduled_for_ms: 1,
             wrappers,
         };

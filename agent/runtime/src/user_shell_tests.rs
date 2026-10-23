@@ -161,7 +161,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
             directed_human: None,
             denial_reference: None,
             trigger_source: Some(TriggerSource::ScheduledTask {
-                task_id: "restart".into(),
+                task_id: uuid::Uuid::from_u128(0x5e7),
                 scheduled_for_ms: 1,
                 wrappers: Vec::new(),
             }),
@@ -191,7 +191,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
             .deliver_trigger_for_tests(
                 chat_id,
                 tickloop_agent_protocol::TriggerSource::ScheduledTask {
-                    task_id: "restart".into(),
+                    task_id: uuid::Uuid::from_u128(0x5e7),
                     scheduled_for_ms: 2,
                     wrappers: Vec::new(),
                 },
@@ -219,7 +219,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
         .deliver_trigger_for_tests(
             chat_id,
             tickloop_agent_protocol::TriggerSource::ScheduledTask {
-                task_id: "restart".into(),
+                task_id: uuid::Uuid::from_u128(0x5e7),
                 scheduled_for_ms: 3,
                 wrappers: Vec::new(),
             },
