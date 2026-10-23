@@ -925,32 +925,46 @@ impl Agent {
         );
     }
 
-    /// A turn ended: when the user's self-paced `/loop` or the self-paced task started it and it
-    /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
-    /// fallback turn that did not reschedule either the loop ends. The change is made under the
-    /// Chat's lease, on a task of the Agent's own.
-    pub(crate) fn end_self_paced_turn(&self, chat: &mut Chat, run: tickloop_agent_protocol::RunId) {
+    /// A turn ended: forgets the user's `/loop` it read, and tells whether a self-paced task is
+    /// there for [`Agent::fall_back_after_turn`] to look at once the Chats lock is released.
+    pub(crate) fn end_self_paced_turn(
+        &self,
+        chat: &mut Chat,
+        run: tickloop_agent_protocol::RunId,
+    ) -> bool {
         chat.user_loops.remove(&run);
-        if !chat
-            .snapshot
+        chat.snapshot
             .scheduled_tasks
             .iter()
             .any(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
-        {
-            return;
+    }
+
+    /// When the user's self-paced `/loop` or the self-paced task started the turn `run` and it
+    /// neither rescheduled nor stopped the loop, the host wakes it once more later, and after a
+    /// fallback turn that did not reschedule either the loop ends. Made under the Chat's lease
+    /// and recorded before the turn finishes, so a host that quiesces or hands over after the
+    /// turn keeps the fallback.
+    pub(crate) async fn fall_back_after_turn(
+        &self,
+        chat_id: ChatId,
+        run: tickloop_agent_protocol::RunId,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(
+            chat_id,
+            crate::wakeup::trigger_pauses::PausePoint::SelfPacedTurnEnded,
+        )
+        .await;
+        let changed = self
+            .run_source_change(chat_id, move |change, chat| {
+                change
+                    .agent()
+                    .fall_back_after_self_paced_turn(change, chat, run);
+            })
+            .await;
+        if let Err(error) = changed {
+            tracing::warn!(%chat_id, %error, "the self-paced loop's fallback was not scheduled");
         }
-        let agent = self.clone();
-        let chat_id = chat.snapshot.id;
-        self.inner.tasks.spawn(Box::pin(async move {
-            let changed = agent
-                .run_source_change(chat_id, move |change, chat| {
-                    change.agent().fall_back_after_self_paced_turn(change, chat, run);
-                })
-                .await;
-            if let Err(error) = changed {
-                tracing::warn!(%chat_id, %error, "the self-paced loop's fallback was not scheduled");
-            }
-        }));
     }
 
     fn fall_back_after_self_paced_turn(

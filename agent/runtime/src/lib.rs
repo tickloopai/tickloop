@@ -3566,7 +3566,7 @@ impl Agent {
                 EventKind::Failed(error)
             }
         };
-        self.end_self_paced_turn(chat, receipt.run_id);
+        let has_self_paced_task = self.end_self_paced_turn(chat, receipt.run_id);
         let is_closed = self.inner.closed.load(Ordering::SeqCst);
         let (ending, usage) = match &event {
             EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),
@@ -3618,6 +3618,10 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
+        if has_self_paced_task {
+            self.fall_back_after_turn(receipt.chat_id, receipt.run_id)
+                .await;
+        }
         if is_settled {
             self.settle_task_claims(&receipt).await;
         }

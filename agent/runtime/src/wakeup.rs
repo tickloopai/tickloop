@@ -1345,6 +1345,9 @@ pub mod trigger_pauses {
         /// A shutdown abandons Trigger input whose start is not recorded, before it takes the
         /// start back.
         TriggerStartAbandoned,
+        /// A turn the self-paced loop may fall back after ended, and the fallback is not
+        /// recorded yet.
+        SelfPacedTurnEnded,
     }
 
     type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);

@@ -6,12 +6,15 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeZone, Utc};
 use tickloop_agent_protocol::{AgentHostOptions, ChatId, PromptPolicy, ScheduledTask};
 use tickloop_agent_runtime::transcript::TranscriptStore;
-use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, ToolPolicy, WaitHosting};
+use tickloop_agent_runtime::{
+    Agent, HarnessOptions, HarnessSeams, Quiescence, ToolPolicy, WaitHosting,
+};
 use tickloop_agent_test_support::config;
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 
 use super::wakeup_support::{ContractModel, SETTLE, WAIT, complete_turn, hold_a_turn};
+use tickloop_agent_runtime::trigger_pauses::PausePoint;
 
 fn at(hour: u32, minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 23, hour, minute, 0).unwrap()
@@ -366,4 +369,52 @@ async fn a_process_taking_over_right_after_a_deletion_does_not_run_the_task() {
     );
     assert!(tasks(&taker, chat).await.is_empty());
     taker.shutdown().await;
+}
+
+/// The first turn of the user's self-paced `/loop` ends without a reschedule, and the host
+/// leaves as soon as the Chat is quiet: the Chat is not quiet before the fallback wake-up is
+/// stored, so the quiet Chat reports it and the next host loads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_leaving_as_the_loops_turn_ends_keeps_its_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = ContractModel::new();
+    let agent = stateless_host_with_a_folder(store.clone(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    let ended = agent.pause_next_for_tests(chat, PausePoint::SelfPacedTurnEnded);
+    agent
+        .invoke_skill(chat, "loop", "watch the build")
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, ended.entered)
+        .await
+        .expect("the loop's turn ends")
+        .unwrap();
+    let quiescing = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.quiesce(chat).await }
+    });
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        !quiescing.is_finished(),
+        "the Chat is not quiet before the fallback is stored"
+    );
+    drop(ended.release);
+    let fallback = u64::try_from(at(10, 20).timestamp_millis()).unwrap();
+    let quiet = quiescing.await.unwrap();
+    assert!(
+        matches!(&quiet, Quiescence::Waiting(waits) if waits.next_wake_at_ms == Some(fallback)),
+        "{quiet:?}"
+    );
+    let image = Arc::new(InMemoryTranscriptStore::new());
+    image.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    agent.shutdown().await;
+
+    let next = stateless_host_with_a_folder(image, ContractModel::new());
+    next.resume_chat(chat).await.unwrap();
+    let loaded = tasks(&next, chat).await;
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert_eq!(loaded[0].next_fire_at_ms, Some(fallback));
+    next.shutdown().await;
 }
