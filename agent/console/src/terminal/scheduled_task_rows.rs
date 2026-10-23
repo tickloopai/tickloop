@@ -210,7 +210,7 @@ impl ScheduledTaskView<'_> {
     }
 
     fn progress(&self, columns: usize, now: OffsetDateTime) -> Option<usize> {
-        if self.pending_confirmation {
+        if self.pending_confirmation || self.triggers_paused {
             return None;
         }
         let next = self.next_trigger_at?;

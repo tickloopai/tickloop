@@ -933,13 +933,13 @@ j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
 /plan enters Plan mode, or opens this Chat's saved plan.
-Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; Ctrl+X twice confirms removal.
+Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; p pauses/resumes a periodic subscription or scheduled task; Ctrl+X twice confirms removal.
 The first new Goal, scheduled task or Tick in each Chat during this console session opens Monitor once without moving input focus, even when hidden. Closing it prevents further automatic opens. Existing content on opening a Chat does not trigger this; narrow terminals flash the Monitor entry instead of covering the conversation.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
 Background Shell completions are added to their Chat as task notifications.
 A completion continues the Loop once it has worked, unless its last turn was interrupted or failed; otherwise it is only recorded.
 /compact [INSTRUCTIONS] summarizes context behind a compaction boundary.
-/loop [INTERVAL] [INSTRUCTION] repeats work: a fixed interval runs once immediately, then on schedule; without an interval the Agent picks each next wakeup. Without instructions it reads .tickloop/loop.md, then the config root's loop.md, else maintenance guidance. Chats without a Folder only read the config root's loop.md. Monitor shows each scheduled task; enter opens details, Ctrl+X twice confirms deletion. Esc cancels a self-paced pending wakeup; fixed schedules keep running. /stop pauses receiving; send a message to resume.
+/loop [INTERVAL] [INSTRUCTION] repeats work: a fixed interval runs once immediately, then on schedule; without an interval the Agent picks each next wakeup. Without instructions it reads .tickloop/loop.md, then the config root's loop.md, else maintenance guidance. Chats without a Folder only read the config root's loop.md. Monitor shows each scheduled task; p pauses/resumes it (pending tasks cannot pause), enter opens details, Ctrl+X twice confirms deletion. Esc cancels a self-paced pending wakeup; fixed schedules keep running. /stop pauses receiving; send a message to resume.
 
 /help advanced lists advanced commands; /exit closes this View; Agent work continues."#;
     format!(

@@ -263,7 +263,11 @@ pub(super) fn subscription_mark(
     subscription.map(|mark| {
         (
             display.glyph(Glyph::Subscription),
-            subscription_role(mark.frequency),
+            if mark.paused {
+                Role::MutedText
+            } else {
+                subscription_role(mark.frequency)
+            },
         )
     })
 }
@@ -329,6 +333,7 @@ mod tests {
 
     fn periodic(frequency: TickSubscriptionFrequency) -> Option<SubscriptionMark> {
         Some(SubscriptionMark {
+            paused: false,
             frequency,
             is_waiting: false,
             next_check: None,

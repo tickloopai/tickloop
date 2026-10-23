@@ -27,6 +27,8 @@ pub(crate) enum ScheduledTaskError {
     NotFound(String),
     #[error("scheduled task `{0}` is not waiting for confirmation")]
     NotPending(String),
+    #[error("scheduled task `{0}` is waiting for confirmation and cannot be paused")]
+    Pending(String),
 }
 
 /// A cron-driven task to create.
@@ -251,7 +253,8 @@ impl ScheduledTasks {
             return SelfPacedTurnEnd::Unchanged;
         };
         let task = &mut self.tasks[index];
-        if task.scheduled_for_ms.is_some()
+        if task.paused_at_ms.is_some()
+            || task.scheduled_for_ms.is_some()
             || task.confirmation == Some(ScheduledTaskConfirmation::Pending)
         {
             return SelfPacedTurnEnd::Unchanged;
@@ -265,6 +268,46 @@ impl ScheduledTasks {
         *fallback = true;
         set_wake(task, now, FALLBACK_WAKEUP_DELAY);
         SelfPacedTurnEnd::FallbackScheduled
+    }
+
+    pub(crate) fn set_paused(
+        &mut self,
+        id: &str,
+        paused: bool,
+        now: &DateTime<Utc>,
+    ) -> Result<(), ScheduledTaskError> {
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .ok_or_else(|| ScheduledTaskError::NotFound(id.into()))?;
+        if task.confirmation == Some(ScheduledTaskConfirmation::Pending) {
+            return Err(ScheduledTaskError::Pending(id.into()));
+        }
+        if paused == task.paused_at_ms.is_some() {
+            return Ok(());
+        }
+        if paused {
+            task.paused_at_ms = Some(millis(now));
+        } else {
+            task.paused_at_ms = None;
+            match task.kind {
+                ScheduledTaskKind::SelfPaced { .. } => {
+                    if task.next_fire_at_ms.is_none_or(|fire| fire <= millis(now)) {
+                        set_wake(task, now, MIN_WAKEUP_DELAY);
+                    }
+                }
+                ScheduledTaskKind::Recurring { .. } | ScheduledTaskKind::OneShot { .. } => {
+                    match timing_after(task, now) {
+                        Timing::Run(run) => set_timing(task, &run),
+                        Timing::Wake(_) | Timing::AwaitingTurn | Timing::Never => {
+                            clear_timing(task)
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn delete(&mut self, id: &str) -> Option<ScheduledTask> {
@@ -376,13 +419,19 @@ impl ScheduledTasks {
         removed
     }
 
-    /// An ordinary history load: the self-paced task is not restored, and one-shot tasks
-    /// whose time passed and expired recurring tasks are deleted. Receiving starts paused, so
+    /// An ordinary history load drops expired tasks and unpaused self-paced tasks. A user's
+    /// individual pause survives while its seven-day lifetime permits. Receiving starts paused, so
     /// [`Self::resume`] sets the timing of what remains. Returns the deleted tasks.
     pub(crate) fn after_history_load(&mut self, now: &DateTime<Utc>) -> Vec<ScheduledTask> {
         let (kept, removed) = std::mem::take(&mut self.tasks)
             .into_iter()
-            .partition(|task| !is_self_paced(task) && !has_expired(task, now));
+            .partition(|task| {
+                (task.paused_at_ms.is_some()
+                    && task
+                        .expires_at_ms
+                        .is_none_or(|expires| expires > millis(now)))
+                    || (!is_self_paced(task) && !has_expired(task, now))
+            });
         self.tasks = kept;
         removed
     }
@@ -540,6 +589,7 @@ fn new_task(
     expires_at_ms: Option<u64>,
 ) -> ScheduledTask {
     ScheduledTask {
+        paused_at_ms: None,
         id,
         kind,
         prompt,

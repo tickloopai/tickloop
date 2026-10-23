@@ -192,7 +192,7 @@ Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
         },
         ToolDefinition {
             name: CRON_LIST_TOOL_NAME.into(),
-            description: format!("List this Chat's scheduled tasks with their ids, schedules, next run times and prompts, including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps."),
+            description: format!("List this Chat's scheduled tasks with their ids, schedules, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps."),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
         ToolDefinition {

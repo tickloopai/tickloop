@@ -937,6 +937,7 @@ fn extreme_times_do_not_overflow() {
     assert!(tasks.resume(&latest).is_empty());
 
     let corrupt = ScheduledTask {
+        paused_at_ms: None,
         id: "11111111".into(),
         scheduled_for_ms: Some(u64::MAX),
         next_fire_at_ms: Some(0),
@@ -961,4 +962,116 @@ fn extreme_times_do_not_overflow() {
 
 fn ms_utc(time: &chrono::DateTime<chrono::Utc>) -> u64 {
     u64::try_from(time.timestamp_millis()).unwrap()
+}
+
+#[test]
+fn individual_pause_skips_missed_cron_times_and_preserves_expiry() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        NO_JITTER_ID,
+        recurring("*/10 * * * *"),
+        USER,
+        local(22, 10, 0, 0),
+    );
+    let expires = tasks.get(NO_JITTER_ID).unwrap().expires_at_ms;
+    tasks
+        .set_paused(NO_JITTER_ID, true, &local(22, 10, 1, 0))
+        .unwrap();
+    assert_eq!(tasks.next_wake_at_ms(true), None);
+    assert!(tasks.take_due(&local(22, 11, 0, 0)).fired.is_empty());
+    // A Continue of the whole Loop cannot clear the user's individual pause.
+    tasks.resume(&local(22, 11, 1, 0));
+    assert!(tasks.get(NO_JITTER_ID).unwrap().paused_at_ms.is_some());
+    tasks
+        .set_paused(NO_JITTER_ID, false, &local(22, 11, 5, 0))
+        .unwrap();
+    let task = tasks.get(NO_JITTER_ID).unwrap();
+    assert_eq!(task.scheduled_for_ms, Some(ms(local(22, 11, 10, 0))));
+    assert_eq!(task.expires_at_ms, expires);
+    assert!(tasks.take_due(&local(22, 11, 5, 0)).fired.is_empty());
+    let final_run = tasks.take_due(&local(29, 11, 10, 0));
+    assert_eq!(final_run.fired.len(), 1);
+    assert!(final_run.fired[0].is_last);
+    assert!(tasks.tasks().is_empty());
+}
+
+#[test]
+fn pending_tasks_refuse_individual_pause() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        NO_JITTER_ID,
+        recurring("* * * * *"),
+        AGENT_NEEDING_CONFIRMATION,
+        local(22, 10, 0, 0),
+    );
+    let before = tasks.clone();
+    assert!(matches!(
+        tasks.set_paused(NO_JITTER_ID, true, &local(22, 10, 0, 0)),
+        Err(ScheduledTaskError::Pending(_))
+    ));
+    assert_eq!(tasks, before);
+}
+
+#[test]
+fn self_paced_resume_keeps_future_wake_and_delays_a_missed_wake_one_minute() {
+    let mut tasks = ScheduledTasks::default();
+    tasks
+        .schedule_wakeup(
+            NO_JITTER_ID.into(),
+            wakeup(600),
+            USER,
+            ZONE,
+            &local(22, 10, 0, 0),
+        )
+        .unwrap();
+    tasks
+        .set_paused(NO_JITTER_ID, true, &local(22, 10, 1, 0))
+        .unwrap();
+    tasks
+        .set_paused(NO_JITTER_ID, false, &local(22, 10, 2, 0))
+        .unwrap();
+    assert_eq!(
+        tasks.get(NO_JITTER_ID).unwrap().scheduled_for_ms,
+        Some(ms(local(22, 10, 10, 0)))
+    );
+    tasks
+        .set_paused(NO_JITTER_ID, true, &local(22, 10, 3, 0))
+        .unwrap();
+    let encoded = serde_json::to_value(tasks.tasks()).unwrap();
+    let mut tasks = ScheduledTasks::new(serde_json::from_value(encoded).unwrap());
+    assert!(tasks.after_history_load(&local(22, 10, 20, 0)).is_empty());
+    assert_eq!(tasks.next_wake_at_ms(true), None);
+    tasks
+        .set_paused(NO_JITTER_ID, false, &local(22, 10, 20, 0))
+        .unwrap();
+    assert_eq!(
+        tasks.get(NO_JITTER_ID).unwrap().scheduled_for_ms,
+        Some(ms(local(22, 10, 21, 0)))
+    );
+}
+
+#[test]
+fn paused_one_shot_survives_history_and_resumes_at_a_future_time() {
+    let mut tasks = ScheduledTasks::default();
+    create(
+        &mut tasks,
+        NO_JITTER_ID,
+        one_shot("0 11 * * *"),
+        USER,
+        local(22, 10, 0, 0),
+    );
+    tasks
+        .set_paused(NO_JITTER_ID, true, &local(22, 10, 1, 0))
+        .unwrap();
+    assert!(tasks.after_history_load(&local(22, 12, 0, 0)).is_empty());
+    tasks
+        .set_paused(NO_JITTER_ID, false, &local(22, 12, 0, 0))
+        .unwrap();
+    assert_eq!(
+        tasks.get(NO_JITTER_ID).unwrap().scheduled_for_ms,
+        Some(ms(local(23, 11, 0, 0)))
+    );
+    assert!(tasks.take_due(&local(22, 12, 0, 0)).fired.is_empty());
 }

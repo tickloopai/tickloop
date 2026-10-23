@@ -274,6 +274,34 @@
       "generation": 3
     },
     "action": {
+      "kind": "set_scheduled_task_paused",
+      "task_id": "0123abcd",
+      "paused": true
+    }
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "update_subscription",
+      "subscription_id": "00000000-0000-0000-0000-000000000031",
+      "change": {
+        "Paused": true
+      }
+    }
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
       "kind": "update_subscription",
       "subscription_id": "00000000-0000-0000-0000-000000000031",
       "change": {

@@ -65,6 +65,8 @@ pub struct TickSubscription {
     pub id: Uuid,
     pub instance: InstanceRef,
     pub frequency: TickSubscriptionFrequency,
+    #[serde(default)]
+    pub paused: bool,
     pub authority: Option<HostToolAuthority>,
 }
 
@@ -72,6 +74,7 @@ pub struct TickSubscription {
 pub enum TickSubscriptionChange {
     Frequency(TickSubscriptionFrequency),
     Cancel,
+    Paused(bool),
 }
 
 /// Whether a subscription currently reaches its Tick Instance.
@@ -93,6 +96,8 @@ pub struct TickSubscriptionStatus {
     pub loop_state: LoopState,
     pub instance: InstanceRef,
     pub frequency: TickSubscriptionFrequency,
+    #[serde(default)]
+    pub paused: bool,
     /// Tick Updates accumulated since the last delivery.
     pub accumulated: u64,
     /// A Terminal Tick's screen text changed since this subscription last got it; its next check

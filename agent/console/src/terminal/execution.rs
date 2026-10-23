@@ -3104,6 +3104,16 @@ impl ConsoleExecution {
         self.command(AgentCommand::ManageLoop { execution, action }, None)
             .await
     }
+    pub(super) async fn set_scheduled_task_paused(
+        &self,
+        chat: Uuid,
+        task_id: String,
+        paused: bool,
+    ) -> Result<(), AccessError> {
+        self.loop_command(chat, LoopAction::SetScheduledTaskPaused { task_id, paused })
+            .await
+            .map(|_| ())
+    }
     pub(super) async fn delete_scheduled_task(
         &self,
         chat: Uuid,

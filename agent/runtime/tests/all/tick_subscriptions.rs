@@ -1350,6 +1350,13 @@ async fn a_shell_subscription_is_immediate_and_refuses_a_frequency() {
     let rows = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].frequency, TickSubscriptionFrequency::Immediate);
+    assert!(
+        agent
+            .update_tick_subscription(chat, rows[0].id, TickSubscriptionChange::Paused(true))
+            .await
+            .is_err()
+    );
+    assert!(!agent.tick_subscriptions(chat).await.unwrap()[0].paused);
     assert_eq!(
         (rows[0].next_check_at_ms, rows[0].period_ms),
         (None, None),
@@ -3534,4 +3541,145 @@ fn requests_mentioning(model: &ScriptedModel, needle: &str) -> usize {
                 .is_some_and(|message| format!("{:?}", message.content).contains(needle))
         })
         .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn individual_subscription_pause_discards_changes_and_resume_starts_a_new_baseline() {
+    for terminal in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "subscribe",
+                "TickManage",
+                json!({"action":"subscribe","tick_instance_id":fixture_instance(7)}),
+            ),
+            text("watching"),
+            text("received after resume"),
+        ]));
+        let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+        let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0).id;
+        let old_watch = audience(&stream, 7)[0];
+        stream.push(update(7, 1, "discard before pause"));
+        settle().await;
+        agent
+            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Paused(true))
+            .await
+            .unwrap();
+        agent.stop(chat).await.unwrap();
+        agent
+            .update_tick_subscription(
+                chat,
+                subscription,
+                TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Medium),
+            )
+            .await
+            .unwrap();
+        stream.push(update(7, 20, "discard during pause"));
+        tokio::time::advance(Duration::from_secs(1800)).await;
+        settle().await;
+        let paused = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        assert!(paused.paused);
+        assert_eq!(paused.frequency, TickSubscriptionFrequency::Medium);
+        assert_eq!(paused.accumulated, 0);
+        assert!(!paused.has_pending_change);
+        assert!(paused.next_check_at_ms.is_none());
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        agent.continue_loop(chat).await.unwrap();
+        assert!(agent.tick_subscriptions(chat).await.unwrap()[0].paused);
+        // Resuming the item also leaves the Loop's independent receiving switch alone.
+        agent.stop(chat).await.unwrap();
+        agent
+            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Paused(false))
+            .await
+            .unwrap();
+        assert!(
+            !agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .chat_loop
+                .receiving
+                .is_receiving()
+        );
+        let watch = audience(&stream, 7)[0];
+        assert_ne!(watch, old_watch);
+        stream.emit(TickStreamEvent::Baseline {
+            watch,
+            sequence: 20,
+        });
+        stream.emit(TickStreamEvent::Ready { watch });
+        settle().await;
+        agent.continue_loop(chat).await.unwrap();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        settle().await;
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            2,
+            "baseline must not wake the model"
+        );
+        let mut events = agent.subscribe();
+        if terminal {
+            stream.emit(TickStreamEvent::ScreenChange {
+                instance: fixture_instance(7),
+                audience: vec![watch],
+                is_pending: true,
+            });
+            stream.change_on_next_sample(screen(
+                7,
+                21,
+                "new after resume",
+                serde_json::Value::Null,
+            ));
+        } else {
+            stream.push(update(7, 21, "new after resume"));
+        }
+        settle().await;
+        tokio::time::advance(Duration::from_secs(600)).await;
+        wait_for_completion(&mut events).await;
+        let delivered = last_user_text(&model);
+        assert!(delivered.contains("new after resume"), "{delivered}");
+        assert!(!delivered.contains("discard"), "{delivered}");
+        assert!(!delivered.contains("current baseline"), "{delivered}");
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn individual_subscription_pause_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "subscribe",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":fixture_instance(7)}),
+        ),
+        text("watching"),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0).id;
+    agent
+        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Paused(true))
+        .await
+        .unwrap();
+    agent.flush_transcripts().await;
+    agent.shutdown().await;
+    let reopened = Agent::open_embedded(root, config(), model).unwrap();
+    reopened
+        .install_tick_stream(Arc::new(InMemoryTickStream::new()))
+        .await;
+    reopened.resume_chat(chat).await.unwrap();
+    reopened.continue_loop(chat).await.unwrap();
+    let restored = reopened.tick_subscriptions(chat).await.unwrap().remove(0);
+    assert_eq!(restored.id, subscription);
+    assert!(restored.paused);
+    assert_eq!(restored.accumulated, 0);
+    assert!(restored.next_check_at_ms.is_none());
+    reopened.shutdown().await;
 }

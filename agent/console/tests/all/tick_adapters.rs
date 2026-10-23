@@ -138,6 +138,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     assert_eq!(
         rows[0].subscription,
         Some(SubscriptionMark {
+            paused: false,
             frequency: TickSubscriptionFrequency::High,
             is_waiting: false,
             next_check: None,
@@ -173,6 +174,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         matches!(
             rows[0].subscription,
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: Some(NextCheck {
@@ -344,6 +346,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert_eq!(rows[0].instance, instance);
     assert_eq!(rows[0].status, "live");
     let high = Some(SubscriptionMark {
+        paused: false,
         frequency: TickSubscriptionFrequency::High,
         is_waiting: true,
         next_check: None,
@@ -555,6 +558,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
         assert_eq!(
             rows[0].subscription,
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: false,
                 next_check: None,

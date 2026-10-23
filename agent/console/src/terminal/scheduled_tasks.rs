@@ -112,7 +112,7 @@ pub(super) fn view(
         },
         skipped: task.skipped,
         pending_confirmation: task.confirmation == Some(ScheduledTaskConfirmation::Pending),
-        triggers_paused: paused,
+        triggers_paused: paused || task.paused_at_ms.is_some(),
         triggered_at_ms: triggered,
     }
 }
@@ -157,6 +157,89 @@ impl TickActionBackend for TaskAction {
             .map_err(|error| error.to_string())?;
         ctx.console.remove_scheduled_task(ctx.chat, &self.task.id)?;
         ctx.notify("Scheduled task removed")
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum PauseAction {
+    Scheduled(String),
+    Subscription(tick_protocol::InstanceRef),
+}
+
+impl TickActionExecutor for PauseAction {
+    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let id = match self {
+            Self::Scheduled(id) => id.clone(),
+            Self::Subscription(instance) => instance.to_string(),
+        };
+        Ok(PreparedTickAction::new(
+            id,
+            crate::monitor_rows::MONITOR_PAUSE_KEY,
+            Arc::new(self.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl TickActionBackend for PauseAction {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        let (paused, label) = match self {
+            Self::Scheduled(id) => {
+                let status = ctx
+                    .agent
+                    .status(ctx.chat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let task = status
+                    .scheduled_tasks
+                    .iter()
+                    .find(|task| task.id == *id)
+                    .ok_or("Scheduled task no longer exists")?;
+                let paused = task.paused_at_ms.is_none();
+                ctx.agent
+                    .set_scheduled_task_paused(ctx.chat, id.clone(), paused)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                ctx.console.update_monitor_chat(
+                    ctx.agent
+                        .status(ctx.chat)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )?;
+                (paused, format!("scheduled task {id}"))
+            }
+            Self::Subscription(instance) => {
+                let subscriptions = ctx
+                    .agent
+                    .tick_subscriptions(ctx.chat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let row = subscriptions
+                    .iter()
+                    .find(|row| row.instance == *instance && row.frequency.period().is_some())
+                    .ok_or("Pausing this Tick is not supported")?;
+                let paused = !row.paused;
+                ctx.agent
+                    .update_tick_subscription(
+                        ctx.chat,
+                        row.id,
+                        tickloop_agent_protocol::TickSubscriptionChange::Paused(paused),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let rows = ctx
+                    .agent
+                    .tick_subscriptions(ctx.chat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                ctx.console.update_subscribed_ticks(ctx.chat, &rows)?;
+                (paused, instance.to_string())
+            }
+        };
+        ctx.notify(&format!(
+            "{} {label}",
+            if paused { "Paused" } else { "Resumed" }
+        ))
     }
 }
 
@@ -217,6 +300,9 @@ pub(super) fn result_lines(
     }
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     let next = |task: &serde_json::Value| {
+        if task["paused"] == true {
+            return "paused".to_owned();
+        }
         task["next_run"]
             .as_str()
             .and_then(|next| next.split_whitespace().nth(1))
@@ -311,6 +397,12 @@ mod tests {
         assert_eq!(
             result_lines("CronCreate", None, &task.to_string()).unwrap(),
             ["0123abcd · * * * * * · weather · next run 08:01"]
+        );
+        let mut paused = task.clone();
+        paused["paused"] = json!(true);
+        assert_eq!(
+            result_lines("CronList", None, &json!({"tasks":[paused]}).to_string()).unwrap(),
+            ["0123abcd · * * * * * · weather · paused"]
         );
         let list = json!({"tasks":[task.clone(),task.clone()]});
         assert_eq!(

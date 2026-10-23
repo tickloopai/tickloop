@@ -299,7 +299,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::ScheduledTask("0123abcd".into()),
             "",
-            "enter details · Ctrl+X remove · esc input",
+            "p pause · enter details · Ctrl+X remove · esc input",
         ),
         (
             MonitorTarget::Goal,
@@ -1122,6 +1122,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     assert_eq!(
         state.monitor.entries()[0].subscription,
         Some(crate::monitor_rows::SubscriptionMark {
+            paused: false,
             frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
             is_waiting: false,
             next_check: None,
@@ -1730,6 +1731,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.status = "live".into();
     subscribed.notes = vec!["feedback unavailable".into()];
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        paused: false,
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
         is_waiting: true,
         next_check: None,
@@ -1780,6 +1782,7 @@ fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width()
     subscribed.group = TickGroup::Ticks;
     subscribed.instance = "hosted:python".parse().unwrap();
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        paused: false,
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::Low,
         is_waiting: true,
         next_check: None,
@@ -3608,6 +3611,7 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
     subscribed.group = TickGroup::Ticks;
     subscribed.glyph = Glyph::ProtocolTick;
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        paused: false,
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
         is_waiting: false,
         next_check: None,
@@ -3700,6 +3704,7 @@ fn docked_subscribed_monitor_fixture(task_count: usize, tick_count: usize) -> St
     entries[0].tone = crate::monitor_rows::StatusTone::Live;
     entries[0].status = "live".into();
     entries[0].subscription = Some(crate::monitor_rows::SubscriptionMark {
+        paused: false,
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
         is_waiting: false,
         next_check: None,
@@ -5536,4 +5541,149 @@ fn collapsed_monitor_flash_render_evidence() {
             serde_json::json!({"phase":phase,"spans":spans})
         );
     }
+}
+
+#[test]
+fn p_pauses_periodic_ticks_and_scheduled_tasks_and_reports_unsupported_rows() {
+    let pause_key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+    let mut state = click_fixture(140, false, TickGroup::Ticks);
+    state.monitor.rebuild();
+    state.monitor.focus(false, None);
+    let instance = state.monitor.selected().unwrap().instance.clone();
+    let chat = state.chat.unwrap();
+    assert!(state.monitor.hint().contains("p pause"));
+    assert_eq!(
+        tick_action_signature(state.key(pause_key)),
+        format!("{chat}/{instance}/p")
+    );
+    state.monitor.subscriptions[0].paused = true;
+    state.monitor.rebuild();
+    assert!(state.monitor.hint().contains("p resume"));
+    assert_eq!(
+        tick_action_signature(state.key(pause_key)),
+        format!("{chat}/{instance}/p")
+    );
+    assert!(state.monitor.focused);
+
+    let mut snapshot = chat_snapshot(chat);
+    snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
+        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
+        "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
+        "jitter_ms":0, "skipped":0
+    }]))
+    .unwrap();
+    state.monitor = Default::default();
+    state
+        .monitor
+        .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
+    state.monitor.focus(false, None);
+    assert!(state.monitor.hint().contains("p pause"));
+    assert_eq!(
+        tick_action_signature(state.key(pause_key)),
+        format!("{chat}/0123abcd/p")
+    );
+    snapshot.scheduled_tasks[0].paused_at_ms = Some(1000);
+    state
+        .monitor
+        .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
+    assert!(state.monitor.hint().contains("p resume"));
+    assert_eq!(
+        tick_action_signature(state.key(pause_key)),
+        format!("{chat}/0123abcd/p")
+    );
+    snapshot.scheduled_tasks[0].confirmation =
+        Some(tickloop_agent_protocol::ScheduledTaskConfirmation::Pending);
+    state
+        .monitor
+        .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
+    assert!(!state.monitor.hint().contains("p pause"));
+    assert!(state.key(pause_key).is_none());
+    assert_eq!(state.status, "Pending scheduled tasks cannot be paused");
+    for group in [TickGroup::Shells, TickGroup::Artifacts] {
+        let mut state = click_fixture(140, false, group);
+        state.monitor.focus(false, None);
+        assert!(state.key(pause_key).is_none());
+        assert_eq!(state.status, "Pausing this Tick is not supported");
+        assert!(state.monitor.focused);
+        assert!(state.editor.draft().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
+    use crate::terminal::tick_actions::{TickActionContext, execute};
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let instance = agent.tick_subscriptions(chat).await.unwrap()[0]
+        .instance
+        .clone();
+    let press = || {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        match state.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)) {
+            Some(InputEvent::TickAction { action, .. }) => action,
+            event => panic!("expected pause action, got {event:?}"),
+        }
+    };
+    for paused in [true, false] {
+        execute(press(), context).await.unwrap();
+        assert_eq!(
+            agent
+                .tick_subscriptions(chat)
+                .await
+                .unwrap()
+                .iter()
+                .find(|row| row.instance == instance)
+                .unwrap()
+                .paused,
+            paused
+        );
+        let state = console.state.lock().unwrap();
+        assert!(
+            state
+                .status
+                .starts_with(if paused { "Paused " } else { "Resumed " })
+        );
+    }
+    let task = core
+        .schedule_task(chat, "*/10 * * * *", "check build".into(), true)
+        .await
+        .unwrap();
+    let status = agent.status(chat).await.unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.monitor = Default::default();
+        state.monitor.set_chat_status(Arc::new(status));
+    }
+    for paused in [true, false] {
+        execute(press(), context).await.unwrap();
+        let status = agent.status(chat).await.unwrap();
+        assert_eq!(
+            status
+                .scheduled_tasks
+                .iter()
+                .find(|row| row.id == task.id)
+                .unwrap()
+                .paused_at_ms
+                .is_some(),
+            paused
+        );
+        let state = console.state.lock().unwrap();
+        assert_eq!(
+            state.status,
+            format!(
+                "{} scheduled task {}",
+                if paused { "Paused" } else { "Resumed" },
+                task.id
+            )
+        );
+    }
+    core.shutdown().await;
 }

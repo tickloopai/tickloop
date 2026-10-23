@@ -12053,6 +12053,33 @@ impl State {
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
+                (KeyCode::Char(crate::monitor_rows::MONITOR_PAUSE_KEY), KeyModifiers::NONE) => {
+                    let executor = if let Some(task) = self.monitor.selected_task() {
+                        if task.confirmation
+                            == Some(tickloop_agent_protocol::ScheduledTaskConfirmation::Pending)
+                        {
+                            self.hold_status("Pending scheduled tasks cannot be paused");
+                            return None;
+                        }
+                        super::scheduled_tasks::PauseAction::Scheduled(task.id.clone())
+                    } else if let Some(entry) = self.monitor.selected() {
+                        if entry.subscription.is_none() {
+                            self.hold_status("Pausing this Tick is not supported");
+                            return None;
+                        }
+                        super::scheduled_tasks::PauseAction::Subscription(entry.instance.clone())
+                    } else {
+                        return None;
+                    };
+                    let chat = self.chat?;
+                    match super::tick_actions::TickActionExecutor::prepare(
+                        &executor,
+                        &mut super::tick_actions::TickActionUi { state: self },
+                    ) {
+                        Ok(action) => return Some(InputEvent::TickAction { chat, action }),
+                        Err(error) => self.hold_status(&error),
+                    }
+                }
                 (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.is_more_selected() => {
                     self.monitor.open_task_list();
                     self.rendered_region = None;
@@ -14130,6 +14157,7 @@ mod tests {
 
     pub(super) fn subscription_row(instance: u64) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            paused: false,
             title: None,
             updated_at_ms: None,
             kind: None,

@@ -833,6 +833,7 @@ impl Monitor {
                 let countdown = self
                     .tasks()
                     .iter()
+                    .filter(|task| task.paused_at_ms.is_none())
                     .filter_map(|task| {
                         let next = task.next_fire_at_ms?;
                         let wait_ms =
@@ -1206,6 +1207,9 @@ impl Monitor {
                 TickSubscriptionFrequency::Immediate => "Immediate",
             };
             parts.push(frequency.to_owned());
+            if mark.paused {
+                parts.push("Paused".into());
+            }
         }
         if entry.is_unread() {
             parts.push("Unread".to_owned());
@@ -1222,13 +1226,24 @@ impl Monitor {
         if self.is_goal_selected() {
             return "enter Goal details · j/k select · esc return to input".into();
         }
-        if self.selected_task().is_some() {
-            return if self.expanded_tasks {
-                "enter details · Ctrl+X remove · j/k select · esc back"
+        if let Some(task) = self.selected_task() {
+            let pause = if task.confirmation
+                == Some(tickloop_agent_protocol::ScheduledTaskConfirmation::Pending)
+            {
+                ""
+            } else if task.paused_at_ms.is_some() {
+                "p resume · "
             } else {
-                "enter details · Ctrl+X remove · esc input"
-            }
-            .into();
+                "p pause · "
+            };
+            return format!(
+                "{pause}{}",
+                if self.expanded_tasks {
+                    "enter details · Ctrl+X remove · j/k select · esc back"
+                } else {
+                    "enter details · Ctrl+X remove · esc input"
+                }
+            );
         }
         let mut hints = self
             .selected()
@@ -1252,6 +1267,9 @@ impl Monitor {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if let Some(mark) = self.selected().and_then(|entry| entry.subscription) {
+            hints.push(if mark.paused { "p resume" } else { "p pause" }.into());
+        }
         hints.push("esc input".into());
         hints.join(" · ")
     }
@@ -1264,13 +1282,19 @@ impl Monitor {
         now_ms: u64,
     ) -> Vec<RoleLine> {
         let title = super::safe_line(&entry.title);
-        ListRow {
-            selected: self.focused && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
+        let paused = entry.subscription.is_some_and(|mark| mark.paused);
+        let mut lines = ListRow {
+            selected: self.focused
+                && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
             glyph: display.glyph(entry.glyph),
             glyph_role: self.glyph_role(entry, display, now_ms),
             name: &title,
             details: list_row::row_details(entry.tone, &entry.notes, now_ms),
-            fill: list_row::flash_fill(self.row_flash(entry), display, now_ms),
+            fill: if paused {
+                None
+            } else {
+                list_row::flash_fill(self.row_flash(entry), display, now_ms)
+            },
             subscription: list_row::subscription_mark(entry.subscription, display),
             bar_columns: entry.waiting_check().map(|check| {
                 check.elapsed_columns(
@@ -1278,7 +1302,15 @@ impl Monitor {
                     now_ms,
                 )
             }),
-        }.lines(width)
+        }.lines(width);
+        if paused {
+            for line in &mut lines {
+                for span in &mut line.spans {
+                    span.role = Some(Role::MutedText);
+                }
+            }
+        }
+        lines
     }
 
     /// Tick status replaces bottom padding; unused padding yields before section gaps or content.
@@ -2614,6 +2646,7 @@ mod signal_tests {
         next_check_at_ms: Option<u64>,
     ) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            paused: false,
             id: uuid::Uuid::from_u128(frequency as u128 + 2),
             loop_state: LoopState::Idle,
             instance: quotes(),
@@ -2998,6 +3031,7 @@ mod signal_tests {
         assert_eq!(
             monitor.entries()[0].subscription,
             Some(SubscriptionMark {
+                paused: false,
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: Some(NextCheck {
@@ -3045,6 +3079,30 @@ mod signal_tests {
         assert_eq!(
             monitor.next_frame_ms(40_000, WIDTH, DisplayProfile::default()),
             None
+        );
+    }
+
+    #[test]
+    fn paused_tick_monitor_render_output() {
+        let mut status = subscription(TickSubscriptionFrequency::High, Some(70_000));
+        status.paused = true;
+        let mut monitor = subscribed(vec![status], 40_000);
+        monitor.focus(false, None);
+        let display = DisplayProfile::default();
+        let line = row(&monitor, display, 40_000);
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.role == Some(Role::MutedText))
+        );
+        assert!(monitor.selected_status().contains("Paused"));
+        assert!(monitor.hint().contains("p resume"));
+        assert!(bar(&monitor, 40_000).is_none());
+        println!(
+            "{}\n{}\n{}",
+            line.text(),
+            monitor.selected_status(),
+            monitor.hint()
         );
     }
 
@@ -3203,16 +3261,39 @@ mod scheduled_tests {
         monitor.chat_status = Some(Arc::new(status));
         monitor.rebuild_at(60000);
         let frame = monitor.frame(42, 10, display, 60000);
-        assert_eq!(
-            frame
-                .lines
+        assert!(frame.lines.iter().all(|line| line.band.is_none()));
+    }
+    #[test]
+    fn paused_scheduled_monitor_render_output() {
+        let mut task = task();
+        task.paused_at_ms = Some(30_000);
+        let mut monitor = Monitor {
+            chat_status: Some(Arc::new(chat(task.clone()))),
+            ..Default::default()
+        };
+        monitor.rebuild_at(40_000);
+        monitor.focus(false, None);
+        let display = DisplayProfile::default();
+        let lines = monitor.task_lines(&task, 42, display, 40_000);
+        assert_eq!(lines[0].text(), "◷ 1m · paused");
+        assert!(
+            lines
                 .iter()
-                .find_map(|line| line.band.as_ref())
-                .unwrap()
-                .role,
-            Role::UserMessageBg
+                .flat_map(|line| &line.spans)
+                .all(|span| span.role == Some(Role::MutedText))
+        );
+        assert!(lines.iter().all(|line| line.band.is_none()));
+        let later = monitor.task_lines(&task, 42, display, 120_000);
+        assert_eq!(lines, later);
+        assert!(monitor.hint().contains("p resume"));
+        println!(
+            "{}\n{}\n{}",
+            lines[0].text(),
+            lines[1].text(),
+            monitor.hint()
         );
     }
+
     #[test]
     fn new_task_delivery_flashes_once_and_navigation_includes_tasks() {
         let mut monitor = Monitor {
