@@ -62,6 +62,10 @@ pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, Ex
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
 const TASK_TOOLS_ENABLED_KEY: &str = "taskToolsEnabled";
+/// The token budget a new goal gets unless it names its own.
+const GOAL_TOKEN_BUDGET_KEY: &str = "goalTokenBudget";
+/// The model that checks a goal's reported completion; unset, the Chat's own model checks it.
+const GOAL_CHECK_MODEL_KEY: &str = "goalCheckModel";
 /// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tickloop 不按
 /// 天数自动删除任何文件，正数与未设置一样保存 Chat。
 const CLEANUP_PERIOD_DAYS_KEY: &str = "cleanupPeriodDays";
@@ -315,6 +319,34 @@ impl LoadedSettings {
                 ))
             })
             .ok()
+    }
+
+    pub fn goal_token_budget(&mut self) -> Option<u64> {
+        let value = self.settings.get(GOAL_TOKEN_BUDGET_KEY)?;
+        match value.as_u64() {
+            Some(budget) if budget > 0 => Some(budget),
+            _ => {
+                self.warn(format!(
+                    "`{GOAL_TOKEN_BUDGET_KEY}` must be a positive integer and is ignored"
+                ));
+                None
+            }
+        }
+    }
+
+    pub fn goal_check_model(&mut self) -> Option<ModelConfig> {
+        let value = self.settings.get(GOAL_CHECK_MODEL_KEY)?.clone();
+        let model = serde_json::from_value::<ModelSelection>(value)
+            .ok()
+            .and_then(|selection| {
+                ModelCatalog::defaults().get(&selection.provider, &selection.model)
+            });
+        if model.is_none() {
+            self.warn(format!(
+                "`{GOAL_CHECK_MODEL_KEY}` must name a built-in model as provider and model; the Chat's model checks goals instead"
+            ));
+        }
+        model
     }
 
     pub fn task_tools_enabled(&mut self) -> bool {
@@ -686,6 +718,14 @@ impl UserSettings {
 
     pub fn thinking_enabled(&self) -> bool {
         self.load().thinking_enabled()
+    }
+
+    pub fn goal_token_budget(&self) -> Option<u64> {
+        self.load().goal_token_budget()
+    }
+
+    pub fn goal_check_model(&self) -> Option<ModelConfig> {
+        self.load().goal_check_model()
     }
 
     pub fn context_window_tokens(&self) -> Option<usize> {

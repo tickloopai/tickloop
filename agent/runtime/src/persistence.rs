@@ -2134,7 +2134,8 @@ fn recover_transcript(
                     .monitor_members
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
-            }),
+            })
+            .or_else(|| loaded.goal.as_ref().and_then(|entry| entry.cwd.clone())),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());
     snapshot.generated_title = loaded
@@ -2165,6 +2166,11 @@ fn recover_transcript(
         .map(|entry| entry.completions.clone())
         .unwrap_or_default();
     if chat_id == source_chat_id {
+        snapshot.goal = loaded
+            .goal
+            .as_ref()
+            .filter(|entry| entry.chat_id == chat_id)
+            .and_then(|entry| entry.goal.clone());
         snapshot.task_boards = loaded
             .metadata
             .task_boards
@@ -3592,6 +3598,9 @@ impl Agent {
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
                 branch_reservation: None,
+                goal_recorded_tokens: snapshot.goal.as_ref().map_or(0, |goal| goal.tokens_used),
+                loaded_from_history: waits == WaitHosting::Process,
+                goal_clock_ms: 0,
             },
         );
         if let Some(context) = snapshot

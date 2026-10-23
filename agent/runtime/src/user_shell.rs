@@ -608,10 +608,12 @@ impl Agent {
         Ok(())
     }
 
+    /// Starts what waits in the Chat; with nothing waiting, its goal is considered again, as
+    /// what held its continuation back may have ended.
     pub(super) async fn start_next_agent_run(&self, chat_id: ChatId) -> Result<(), AgentError> {
-        let next = self.next_run(chat_id).await?;
-        if let Some(next) = next {
-            self.run_task(next);
+        match self.next_run(chat_id).await? {
+            Some(next) => self.run_task(next),
+            None => self.reconsider_goal(chat_id).await,
         }
         Ok(())
     }
@@ -651,7 +653,7 @@ impl Agent {
         } else {
             None
         };
-        let (record, continues_goal) = {
+        let (record, continues_goal, ended) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             let record = chat
@@ -669,7 +671,7 @@ impl Agent {
             record.starts_in_background |= command.was_background;
             if user_shell_state_is_terminal(&previous.state) {
                 record.output_bytes = record.output_bytes.max(command.output_bytes);
-                (record.clone(), false)
+                (record.clone(), false, false)
             } else {
                 record.set_state(map_state(&command.state));
                 record.pid = command.pid;
@@ -685,7 +687,8 @@ impl Agent {
                 } else {
                     self.record_user_shell_messages(chat, &previous, &record, &command, output)?
                 };
-                (record, continues_goal)
+                let ended = user_shell_state_is_terminal(&record.state);
+                (record, continues_goal, ended)
             }
         };
         let _ = self.inner.user_shell_events.send(record.clone());
@@ -694,7 +697,8 @@ impl Agent {
             self.describe_background_shell(chat_id, record.id, &record.command)
                 .await;
         }
-        if continues_goal {
+        // A Shell that ended may have been all a waiting goal continuation waited for.
+        if continues_goal || ended {
             self.start_next_agent_run(chat_id).await?;
         }
         Ok(record)

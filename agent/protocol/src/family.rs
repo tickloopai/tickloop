@@ -264,6 +264,17 @@ pub struct DelegationMetadata {
     pub trusted_user_inputs: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_reply_history: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_goal: Option<DelegatedGoal>,
+}
+
+/// The goal the user set with /goal on the family's root when the child was delegated. Only a
+/// reference: the child's Auto review weighs the root's goal as it is at each review, and only
+/// while it is still this one, unedited, unfinished.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DelegatedGoal {
+    pub goal_id: Uuid,
+    pub objective_revision: u64,
 }
 
 pub const MAX_SUBAGENT_DEPTH: usize = 3;

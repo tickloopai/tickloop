@@ -123,6 +123,7 @@ impl Agent {
             family_completions: Vec::new(),
             task_boards: BTreeMap::new(),
             task_board: None,
+            goal: None,
             family_inputs: BTreeMap::new(),
             sent_agent_messages: BTreeMap::new(),
             generated_title: None,
@@ -278,6 +279,9 @@ impl Agent {
                 output_style,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 branch_reservation: None,
+                goal_recorded_tokens: 0,
+                loaded_from_history: false,
+                goal_clock_ms: 0,
                 denial_window: super::denials::DenialWindow::default(),
             },
         );

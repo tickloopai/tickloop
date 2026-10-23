@@ -272,7 +272,9 @@ impl Agent {
             self.describe_background_shell(chat_id, command.operation_id, &command.command)
                 .await;
         }
-        if continues_goal {
+        // A background command that ended may have been all a waiting goal continuation waited
+        // for.
+        if continues_goal || needs_task_notification {
             self.start_next_agent_run(chat_id).await?;
         }
         Ok(command)

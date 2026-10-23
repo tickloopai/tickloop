@@ -109,6 +109,7 @@ impl RequestContext {
             ModelRequestKind::Conversation
                 | ModelRequestKind::PermissionCheck
                 | ModelRequestKind::WebFetch
+                | ModelRequestKind::GoalCheck
         )
         .then(|| Receipt {
             chat_id: self.owner.chat_id,
@@ -320,12 +321,25 @@ impl Agent {
         match delta {
             ModelDelta::OutputStarted => progress.output_started = true,
             ModelDelta::Usage(usage) => {
-                let effect = self
+                let (effect, charged) = self
                     .change_request_usage(context.owner.chat_id, |ledger| {
-                        ledger.observe(sequence, usage)
+                        let previous = ledger
+                            .entries()
+                            .iter()
+                            .find(|record| record.sequence == sequence)
+                            .map_or(0, |record| crate::goal::charged_tokens(&record.usage));
+                        let effect = ledger.observe(sequence, usage)?;
+                        let current = ledger
+                            .entries()
+                            .iter()
+                            .find(|record| record.sequence == sequence)
+                            .map_or(0, |record| crate::goal::charged_tokens(&record.usage));
+                        Ok((effect, current.saturating_sub(previous)))
                     })
                     .await?;
                 progress.regression = progress.regression.or(effect.regression);
+                self.charge_goal_tokens(context.owner.chat_id, charged)
+                    .await;
             }
             ModelDelta::Text(text) if display_text => {
                 progress.output_started = true;

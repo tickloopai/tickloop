@@ -418,6 +418,15 @@ impl ChatLeases {
         self.notices.lock().unwrap().remove(&chat_id);
     }
 
+    /// Whether this process holds the Chat's lease now and took over what its last holder left.
+    pub(super) fn holds_synced(&self, chat_id: ChatId) -> bool {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .is_some_and(|holding| holding.synced)
+    }
+
     pub(super) fn release(&self, chat_id: ChatId) {
         let released = self.held.lock().unwrap().remove(&chat_id);
         drop(released);

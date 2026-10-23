@@ -1171,6 +1171,7 @@ impl Agent {
                         trusted_user_inputs: trusted_user_inputs
                             .and_then(|inputs| serde_json::to_value(inputs).ok()),
                         trusted_reply_history,
+                        trusted_goal: approval_context::delegated_goal(&snapshot),
                         ceiling: DelegationCeiling {
                             folder: folder.clone(),
                             additional_directories: snapshot.additional_directories.clone(),

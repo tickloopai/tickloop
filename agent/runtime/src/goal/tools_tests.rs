@@ -48,9 +48,11 @@ fn update_goal_does_not_count_the_user_turn_toward_the_blocked_threshold() {
 #[test]
 fn create_goal_schema_and_description_state_its_limits() {
     let create = definition(CREATE_GOAL_TOOL_NAME);
-    assert_eq!(
-        create.input_schema["properties"]["objective"]["maxLength"],
-        MAX_OBJECTIVE_CHARACTERS
+    assert!(
+        create.input_schema["properties"]["objective"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("at most 4000 characters")
     );
     assert_eq!(create.input_schema["required"], json!(["objective"]));
     assert!(create.description.contains("explicitly asks"));

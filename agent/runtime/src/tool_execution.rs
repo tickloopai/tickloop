@@ -48,6 +48,7 @@ enum ToolRoute {
     Delegation,
     AgentMessage,
     SharedTask,
+    Goal,
     Handback,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
@@ -236,6 +237,16 @@ impl ToolRegistry {
                     .map(|definition| RegisteredTool {
                         definition,
                         route: ToolRoute::SharedTask,
+                    }),
+            );
+        }
+        if policy.goals && !is_delegated {
+            tools.extend(
+                crate::goal::tools::definitions()
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Goal,
                     }),
             );
         }
@@ -643,6 +654,7 @@ impl Agent {
     ) -> Result<ToolResult, String> {
         match &registered.route {
             ToolRoute::SharedTask => self.shared_task_tool(receipt, operation, &cancel).await,
+            ToolRoute::Goal => self.goal_tool(receipt, operation, cancel).await,
             ToolRoute::AgentMessage => {
                 self.agent_message_tool(
                     receipt,
@@ -1127,7 +1139,12 @@ impl Agent {
             .map(|call| call.permission())
             .or_else(|| {
                 let route = &registration.as_ref()?.route;
-                if matches!(route, ToolRoute::SharedTask | ToolRoute::McpResource(_)) {
+                // Reading and reporting on the goal change nothing outside it; setting one is
+                // approved like any other call.
+                if matches!(route, ToolRoute::SharedTask | ToolRoute::McpResource(_))
+                    || matches!(route, ToolRoute::Goal)
+                        && name != crate::goal::tools::CREATE_GOAL_TOOL_NAME
+                {
                     return Some(crate::host_tools::HostToolPermission::ReadOnly);
                 }
                 (matches!(route, ToolRoute::Delegation)

@@ -3273,6 +3273,7 @@ fn request_kind_label(kind: ModelRequestKind) -> &'static str {
         ModelRequestKind::Title => "Chat titles",
         ModelRequestKind::ShellDescription => "Shell descriptions",
         ModelRequestKind::AutoSetup => "Auto setup",
+        ModelRequestKind::GoalCheck => "Goal checks",
     }
 }
 

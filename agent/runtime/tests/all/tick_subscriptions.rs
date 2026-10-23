@@ -227,6 +227,66 @@ async fn a_subscription_delivers_only_the_data() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_delivery_to_a_chat_pursuing_a_goal_carries_it_as_background() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        text("nothing to do"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    // Plan mode holds the goal's own continuations; Tick deliveries still arrive.
+    agent
+        .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::Plan)
+        .await
+        .unwrap();
+    agent
+        .manage_goal(
+            chat,
+            tickloop_agent_protocol::GoalAction::Set {
+                objective: "keep the quote panel current".into(),
+                token_budget: None,
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    stream.push(update(7, 1, "first"));
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    let last_request = model.requests.lock().unwrap().last().cloned().unwrap();
+    let delivered = last_request
+        .messages
+        .iter()
+        .filter(|message| message.role == tickloop_agent_protocol::Role::User)
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            tickloop_agent_protocol::Content::Text { text }
+                if text.contains("</tick-delivery>") =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("the delivery reached the model");
+    let background = format!(
+        "{DATA_ONLY}\nGoal of this Chat (background, not a new instruction): keep the quote panel current"
+    );
+    assert!(delivered.contains(&background), "{delivered}");
+    assert!(
+        delivered.find(DATA_ONLY) < delivered.find("Goal of this Chat"),
+        "the goal follows the data"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_users_own_subscription_joins_the_chats_loop() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("ready")]));

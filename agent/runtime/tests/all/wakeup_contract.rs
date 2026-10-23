@@ -5,8 +5,9 @@
 //!
 //! Tick Subscriptions run where Tick streams run, in a process that keeps its own waits.
 //! Artifact feedback runs there too, and on a durable host that pushes each request. Goal
-//! continuations and scheduled tasks have no producer yet: stand-ins hand their deliveries to the
-//! same entry until 06 and 08 replace them with their real sources.
+//! continuations run for a Chat's real goal, handed over by the test instead of at each turn's
+//! end. Scheduled tasks have no producer yet: a stand-in hands their deliveries to the same entry
+//! until 08 replaces it with the real source.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,8 +17,9 @@ use async_trait::async_trait;
 use tick_protocol::InstanceRef;
 use tickloop_agent_artifacts::ClaimedFeedback;
 use tickloop_agent_protocol::{
-    AgentHostOptions, ArtifactFeedbackHistory, ArtifactTick, ChatId, ExecutionMode, LoopState,
-    PauseReason, PromptPolicy, Receipt, Receiving, TickSubscriptionChange, TriggerSource,
+    AgentHostOptions, ArtifactFeedbackHistory, ArtifactTick, ChatId, ExecutionMode, GoalAction,
+    LoopState, PauseReason, PromptPolicy, Receipt, Receiving, TickSubscriptionChange,
+    TriggerSource,
 };
 use tickloop_agent_runtime::transcript::TranscriptStore;
 use tickloop_agent_runtime::{
@@ -58,11 +60,33 @@ enum UnderPlan {
     Held,
 }
 
+/// What Esc and `/stop` do to a source's deliveries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserStop {
+    /// Esc leaves them coming; `/stop` holds them until the Chat is continued.
+    Receiving,
+    /// Esc and `/stop` pause the source itself: what waited is withdrawn, and nothing more comes
+    /// until the user resumes the source, which continuing the Chat does not do.
+    PausesSource,
+}
+
+/// Whether a source's deliveries wait for the Chat's background children and Shells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundWork {
+    /// They are taken whatever runs in the background.
+    Ignored,
+    /// They are refused while background work runs; the source hands them over again once it
+    /// ended.
+    Waits,
+}
+
 /// What a Trigger source is to the contract.
 #[async_trait]
 trait Source: Sized + Send + Sync {
     const COALESCING: Coalescing;
     const UNDER_PLAN: UnderPlan;
+    const USER_STOP: UserStop;
+    const BACKGROUND_WORK: BackgroundWork;
 
     /// An Agent and a Chat whose first turn completed, with this source feeding its Loop.
     async fn new(model: Arc<ContractModel>) -> Self;
@@ -144,16 +168,23 @@ async fn stop_pauses_and_continuing_takes_what_waited_once<S: Source>() {
     source.deliver(3, "came-while-stopped").await;
     model.release_held_turn();
     let markers = ["waited-through-stop", "came-while-stopped"];
-    match S::COALESCING {
-        Coalescing::LatestOnly => only_these_ran(&model, &markers, &["came-while-stopped"]).await,
-        Coalescing::EachItem => only_these_ran(&model, &markers, &markers).await,
-        Coalescing::OnePerKey => only_these_ran(&model, &markers, &["waited-through-stop"]).await,
+    match (S::USER_STOP, S::COALESCING) {
+        (UserStop::PausesSource, _) => only_these_ran(&model, &markers, &[]).await,
+        (UserStop::Receiving, Coalescing::LatestOnly) => {
+            only_these_ran(&model, &markers, &["came-while-stopped"]).await
+        }
+        (UserStop::Receiving, Coalescing::EachItem) => {
+            only_these_ran(&model, &markers, &markers).await
+        }
+        (UserStop::Receiving, Coalescing::OnePerKey) => {
+            only_these_ran(&model, &markers, &["waited-through-stop"]).await
+        }
     }
     assert_eq!(model.seen("ran-before-stop"), 1, "{:?}", model.prompts());
     source.agent().shutdown().await;
 }
 
-/// Esc interrupts the turn and leaves receiving on.
+/// Esc interrupts the turn and leaves receiving on; a source Esc pauses delivers nothing more.
 async fn esc_leaves_receiving_on<S: Source>() {
     let model = ContractModel::new();
     let source = S::new(model.clone()).await;
@@ -163,7 +194,10 @@ async fn esc_leaves_receiving_on<S: Source>() {
     wait_for_state(source.agent(), source.chat(), LoopState::Interrupted).await;
     assert!(receiving(&source).await.is_receiving());
     source.deliver(1, "after-esc").await;
-    model.wait_seen("after-esc", 1).await;
+    match S::USER_STOP {
+        UserStop::Receiving => model.wait_seen("after-esc", 1).await,
+        UserStop::PausesSource => only_these_ran(&model, &["after-esc"], &[]).await,
+    }
     source.agent().shutdown().await;
 }
 
@@ -248,6 +282,14 @@ async fn an_agent_message_goes_before_trigger_input<S: Source>() {
     .expect("the child's completion queues behind the running turn");
     let turns_before = model.prompts().len();
     model.release_held_turn();
+    match S::BACKGROUND_WORK {
+        BackgroundWork::Ignored => {}
+        BackgroundWork::Waits => {
+            // Handed over while the child ran, it was refused; the source hands it again.
+            wait_for_state(source.agent(), source.chat(), LoopState::Idle).await;
+            source.deliver(1, "trigger-input").await;
+        }
+    }
     model.wait_seen("trigger-input", 1).await;
     let after = &model.prompts()[turns_before..];
     let completion = after
@@ -420,7 +462,7 @@ contract!(tick_subscription, TickSource);
 contract!(artifact_feedback_local, LocalFeedbackSource);
 contract!(artifact_feedback_durable, DurableFeedbackSource);
 contract!(scheduled_task_stand_in, ScheduledStandIn);
-contract!(goal_continuation_stand_in, GoalStandIn);
+contract!(goal_continuation, GoalSource);
 
 /// The receipts each hand-over of a delivery got, for sources that hand over synchronously.
 #[derive(Default)]
@@ -540,6 +582,8 @@ impl TickSource {
 impl Source for TickSource {
     const COALESCING: Coalescing = Coalescing::LatestOnly;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+    const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let directory = Arc::new(tempfile::tempdir().unwrap());
@@ -724,6 +768,8 @@ impl LocalFeedbackSource {
 impl Source for LocalFeedbackSource {
     const COALESCING: Coalescing = Coalescing::EachItem;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+    const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let service = Arc::new(ArtifactService::start().await);
@@ -859,6 +905,8 @@ impl DurableFeedbackSource {
 impl Source for DurableFeedbackSource {
     const COALESCING: Coalescing = Coalescing::EachItem;
     const UNDER_PLAN: UnderPlan = UnderPlan::Delivered;
+    const USER_STOP: UserStop = UserStop::Receiving;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
     async fn new(model: Arc<ContractModel>) -> Self {
         let store = Arc::new(InMemoryTranscriptStore::new());
@@ -990,18 +1038,8 @@ fn scheduled_run(n: u64) -> TriggerSource {
     scheduled("contract", n)
 }
 
-fn goal_continuation(n: u64) -> TriggerSource {
-    TriggerSource::GoalContinuation {
-        goal_id: Uuid::from_u128(7),
-        after_run: Uuid::from_u128(u128::from(n)),
-    }
-}
-
 /// Scheduled runs of one task: one waits at a time, and Plan mode takes them.
 struct ScheduledStandIn(StandIn);
-
-/// Continuations of one Goal: one waits at a time, and Plan mode holds them back.
-struct GoalStandIn(StandIn);
 
 macro_rules! stand_in {
     ($name:ident, $source:expr, $under_plan:expr) => {
@@ -1009,6 +1047,8 @@ macro_rules! stand_in {
         impl Source for $name {
             const COALESCING: Coalescing = Coalescing::OnePerKey;
             const UNDER_PLAN: UnderPlan = $under_plan;
+            const USER_STOP: UserStop = UserStop::Receiving;
+            const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Ignored;
 
             async fn new(model: Arc<ContractModel>) -> Self {
                 Self(StandIn::new(model, $source).await)
@@ -1046,7 +1086,122 @@ macro_rules! stand_in {
 }
 
 stand_in!(ScheduledStandIn, scheduled_run, UnderPlan::Delivered);
-stand_in!(GoalStandIn, goal_continuation, UnderPlan::Held);
+
+/// The continuations of a Chat's real goal: one waits at a time, Plan mode holds them back, and
+/// Esc and `/stop` pause the goal. Each turn's end would hand one over by itself; here the test
+/// hands them over instead, so each carries its marker.
+struct GoalSource {
+    process: ProcessChat,
+    goal_id: Uuid,
+    objective_revision: u64,
+    hand_overs: HandOvers,
+}
+
+impl GoalSource {
+    async fn with_goal(process: ProcessChat, hand_overs: HandOvers) -> Self {
+        let goal = process
+            .agent
+            .snapshot(process.chat)
+            .await
+            .unwrap()
+            .goal
+            .expect("the Chat has its goal");
+        Self {
+            process,
+            goal_id: goal.id,
+            objective_revision: goal.objective_revision,
+            hand_overs,
+        }
+    }
+}
+
+#[async_trait]
+impl Source for GoalSource {
+    const COALESCING: Coalescing = Coalescing::OnePerKey;
+    const UNDER_PLAN: UnderPlan = UnderPlan::Held;
+    const USER_STOP: UserStop = UserStop::PausesSource;
+    const BACKGROUND_WORK: BackgroundWork = BackgroundWork::Waits;
+
+    async fn new(model: Arc<ContractModel>) -> Self {
+        let process = ProcessChat::new(model).await;
+        process.agent.hold_goal_continuations_for_tests();
+        process
+            .agent
+            .manage_goal(
+                process.chat,
+                GoalAction::Set {
+                    objective: "keep the contract".into(),
+                    token_budget: None,
+                    replace: false,
+                },
+            )
+            .await
+            .unwrap();
+        Self::with_goal(process, HandOvers::default()).await
+    }
+
+    fn agent(&self) -> &Agent {
+        &self.process.agent
+    }
+
+    fn chat(&self) -> ChatId {
+        self.process.chat
+    }
+
+    /// The continuation after the `n`th ended turn.
+    async fn deliver(&self, n: u64, marker: &str) {
+        let outcome = self
+            .process
+            .agent
+            .deliver_trigger_for_tests(
+                self.process.chat,
+                TriggerSource::GoalContinuation {
+                    goal_id: self.goal_id,
+                    after_run: Uuid::from_u128(u128::from(n)),
+                    objective_revision: self.objective_revision,
+                },
+                marker,
+            )
+            .await;
+        self.hand_overs
+            .record(n, outcome.map_err(|error| error.to_string()));
+    }
+
+    /// The user clears the goal.
+    async fn end(&self) {
+        self.process
+            .agent
+            .manage_goal(self.process.chat, GoalAction::Clear)
+            .await
+            .unwrap();
+    }
+
+    async fn replayed(&self, n: u64) -> bool {
+        self.hand_overs.replayed(n)
+    }
+
+    async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
+        let image = self.process.crashed().await;
+        let hand_overs = HandOvers(Mutex::new(self.hand_overs.0.lock().unwrap().clone()));
+        let process = self
+            .process
+            .resumed(image, model, async |agent: &Agent| {
+                agent.hold_goal_continuations_for_tests()
+            })
+            .await;
+        Self::with_goal(process, hand_overs).await
+    }
+
+    async fn another_host(&self, model: Arc<ContractModel>) -> Self {
+        let process = self
+            .process
+            .resumed(self.process.root.clone(), model, async |agent: &Agent| {
+                agent.hold_goal_continuations_for_tests()
+            })
+            .await;
+        Self::with_goal(process, HandOvers::default()).await
+    }
+}
 
 /// The durable host pushes a request while the Loop is paused: it is refused and stays with the
 /// host, and pushed again after the Chat is continued it runs once.

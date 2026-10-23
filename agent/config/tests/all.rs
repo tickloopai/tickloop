@@ -4,6 +4,8 @@
 mod builtin_catalog;
 #[path = "all/builtin_skills.rs"]
 mod builtin_skills;
+#[path = "all/goal_settings.rs"]
+mod goal_settings;
 #[path = "all/model_configuration.rs"]
 mod model_configuration;
 #[path = "all/monitor_settings.rs"]

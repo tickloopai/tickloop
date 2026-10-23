@@ -594,6 +594,7 @@ mod tests {
                     },
                     trusted_user_inputs: None,
                     trusted_reply_history: None,
+                    trusted_goal: None,
                 });
                 (plan, sequence)
             };

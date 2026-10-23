@@ -136,8 +136,14 @@ pub enum TriggerSource {
         feedback_id: String,
         delivery_id: Uuid,
     },
-    /// The Goal's continuation after the turn `after_run` ended.
-    GoalContinuation { goal_id: Uuid, after_run: RunId },
+    /// The Goal's continuation after the turn `after_run` ended, written for the objective at
+    /// `objective_revision`; a continuation taken after the objective changed is written again.
+    GoalContinuation {
+        goal_id: Uuid,
+        after_run: RunId,
+        #[serde(default)]
+        objective_revision: u64,
+    },
     /// A scheduled task's run for one time its schedule names, in Unix milliseconds.
     ScheduledTask {
         task_id: String,
@@ -286,7 +292,9 @@ impl TriggerSource {
                 account_id: account_id.clone(),
                 delivery_id: *delivery_id,
             },
-            Self::GoalContinuation { goal_id, after_run } => TriggerIdentity::GoalContinuation {
+            Self::GoalContinuation {
+                goal_id, after_run, ..
+            } => TriggerIdentity::GoalContinuation {
                 goal_id: *goal_id,
                 after_run: *after_run,
             },

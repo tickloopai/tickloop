@@ -63,6 +63,11 @@ struct ChatCheckpoint {
     shells: Value,
     waiting: Option<Receipt>,
     file_reads: Value,
+    /// When the goal's running time was last settled, so the successor goes on from there.
+    #[serde(default)]
+    goal_clock_ms: u64,
+    #[serde(default)]
+    goal_recorded_tokens: u64,
 }
 
 impl Agent {
@@ -140,6 +145,8 @@ impl Agent {
                 family_generation: chat.family_generation,
                 start_new_tool_result_message: chat.start_new_tool_result_message,
                 needs_plan_mode_exit_notice: chat.needs_plan_mode_exit_notice,
+                goal_clock_ms: chat.goal_clock_ms,
+                goal_recorded_tokens: chat.goal_recorded_tokens,
                 deferred_messages: chat.deferred_messages.clone(),
                 feedback_inputs: chat.feedback_inputs.clone(),
                 output_style: chat.output_style,
@@ -359,6 +366,9 @@ impl Agent {
                     auto_denials: saved.auto_denials.clone(),
                     denial_window: saved.denial_window.clone(),
                     branch_reservation: None,
+                    goal_recorded_tokens: saved.goal_recorded_tokens,
+                    loaded_from_history: false,
+                    goal_clock_ms: saved.goal_clock_ms,
                 },
             );
         }
@@ -465,6 +475,9 @@ impl Agent {
                 });
             } else if let Some(next) = self.next_run(id).await? {
                 self.run_task(next);
+            } else {
+                // The predecessor may have stopped just before continuing the goal.
+                self.reconsider_goal(id).await;
             }
         }
         self.tick_deliveries().activate_upgrade();

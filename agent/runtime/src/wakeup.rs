@@ -11,8 +11,8 @@
 use super::loop_lease::{ReceivingChange, TriggerPermit};
 use super::*;
 use tickloop_agent_protocol::{
-    ChatSnapshot, Coalesce, LoopSnapshot, LoopState, OperationRecord, PauseReason, Receipt,
-    Receiving, TriggerSource,
+    ChatSnapshot, Coalesce, GoalStatus, LoopSnapshot, LoopState, OperationRecord, PauseReason,
+    Receipt, Receiving, TriggerSource,
 };
 use tickloop_agent_transcript::Line;
 
@@ -335,13 +335,17 @@ impl Agent {
                 account_id,
                 artifact_id,
             ),
-            TriggerSource::GoalContinuation { .. } => {
-                if snapshot.policy.mode == ExecutionMode::Plan {
-                    Eligibility::Hold(Hold::PlanMode)
-                } else {
-                    Eligibility::Eligible
+            TriggerSource::GoalContinuation { goal_id, .. } => match &snapshot.goal {
+                Some(goal) if goal.id == *goal_id && goal.status == GoalStatus::Active => {
+                    if snapshot.policy.mode == ExecutionMode::Plan {
+                        Eligibility::Hold(Hold::PlanMode)
+                    } else {
+                        Eligibility::Eligible
+                    }
                 }
-            }
+                // Paused, finished, replaced or cleared: the goal no longer asks for it.
+                Some(_) | None => Eligibility::Ended(DiscardReason::SourceEnded),
+            },
             TriggerSource::ScheduledTask { .. } => Eligibility::Eligible,
         };
         match (source_condition, snapshot.chat_loop.receiving) {
@@ -1084,6 +1088,8 @@ impl Agent {
         self.continue_receiving(chat_id).await;
         if let Some(next) = self.next_run(chat_id).await? {
             self.run_task(next);
+        } else {
+            self.continue_goal(chat_id, Uuid::new_v4()).await;
         }
         Ok(())
     }

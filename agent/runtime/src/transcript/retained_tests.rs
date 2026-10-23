@@ -668,3 +668,57 @@ fn answered_question_blocks_survive_snapshots_until_their_answer_is_compacted() 
             .any(|line| matches!(line, Line::Wait(_)))
     );
 }
+
+#[test]
+fn goal_events_survive_every_snapshot_in_order() {
+    let chat = Uuid::new_v4();
+    let event = |notice: tickloop_agent_protocol::GoalNotice| {
+        Line::GoalEvent(tickloop_agent_transcript::GoalEventEntry {
+            chat_id: chat,
+            goal_id: Uuid::nil(),
+            objective: "Ship it".into(),
+            notice,
+            timestamp: TIMESTAMP.into(),
+        })
+    };
+    let mut fold = RetainedFold::default();
+    fold.apply(&event(tickloop_agent_protocol::GoalNotice::Set));
+    let first = fold.snapshot(chat);
+    let mut reloaded = RetainedFold::default();
+    reloaded.apply(&first);
+    reloaded.apply(&event(tickloop_agent_protocol::GoalNotice::Cleared));
+    let second = reloaded.snapshot(chat);
+
+    let notices = tickloop_agent_transcript::display::goal_events(&[second])
+        .into_iter()
+        .map(|entry| entry.notice)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notices,
+        [
+            tickloop_agent_protocol::GoalNotice::Set,
+            tickloop_agent_protocol::GoalNotice::Cleared
+        ]
+    );
+}
+
+#[test]
+fn a_snapshot_leaves_the_goal_to_its_own_records() {
+    let chat = Uuid::new_v4();
+    let mut fold = RetainedFold::default();
+    fold.apply(&Line::Goal(tickloop_agent_transcript::GoalEntry {
+        chat_id: chat,
+        cwd: Some("/project".into()),
+        goal: None,
+    }));
+    let snapshot = fold.snapshot(chat);
+    let Line::RetainedSnapshot(snapshot) = snapshot else {
+        panic!("a retained snapshot")
+    };
+    assert!(
+        !snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::Goal(_)))
+    );
+}

@@ -230,6 +230,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                 &bookkeeping,
                 &operation,
                 None,
+                None,
                 folder,
                 auto.policy_for_directory(folder),
             )

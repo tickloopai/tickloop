@@ -18,10 +18,6 @@ mod family;
 mod family_load;
 mod family_tree;
 pub mod file_history;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "ticket 06 wires Goal into the Loop")
-)]
 mod goal;
 mod handback;
 mod handover;
@@ -413,6 +409,9 @@ struct Inner {
     tick_deliveries: std::sync::Mutex<tick_subscriptions::TickDeliveries>,
     /// Wakes the delivery task when the subscription set or a frequency changed.
     tick_wake: Notify,
+    /// Tests that hand goal continuations over themselves keep the host from starting them.
+    #[cfg(any(test, feature = "test-support"))]
+    goal_continuations_held: AtomicBool,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
     /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
@@ -505,6 +504,13 @@ struct Chat {
     /// Another stored branch of the Chat is being restored to replace its conversation: until the
     /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
     branch_reservation: Option<Uuid>,
+    /// The goal's usage its last record holds that the Transcript took.
+    goal_recorded_tokens: u64,
+    /// Restored from history by this process and not yet taken over: the history-load rule
+    /// applies to its goal once it takes the Trigger lease.
+    loaded_from_history: bool,
+    /// When the goal's running time was last settled.
+    goal_clock_ms: u64,
 }
 
 enum RunAdmission {
@@ -982,6 +988,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         family_completions: Vec::new(),
         task_boards: BTreeMap::new(),
         task_board: None,
+        goal: None,
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
         generated_title: None,
@@ -1355,7 +1362,7 @@ impl Agent {
         cancel: CancellationToken,
         emit_permission: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, bookkeeping, chat_client, boundary_id) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id, root_goal) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1374,11 +1381,18 @@ impl Agent {
             let mut snapshot = chat.snapshot.clone();
             snapshot.policy =
                 delegation::effective_policy(&chats, receipt).map_err(AgentError::Invalid)?;
+            let root_goal = match &chat.snapshot.delegation {
+                None => chat.snapshot.goal.clone(),
+                Some(delegation) => chats
+                    .get(&delegation.root_chat_id())
+                    .and_then(|root| root.snapshot.goal.clone()),
+            };
             (
                 snapshot,
                 chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
+                root_goal,
             )
         };
         // One load serves both the original prompts and the history before the boundary.
@@ -1451,6 +1465,7 @@ impl Agent {
             &snapshot,
             &bookkeeping,
             operation,
+            root_goal.as_ref(),
             legacy,
             &folder,
             auto_settings.policy_for_directory(&folder),
@@ -1723,10 +1738,16 @@ impl Agent {
         Ok(stopped.operations)
     }
 
+    /// Esc: interrupts the current turn and pauses an active goal.
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        Ok(chat.interrupt())
+        let operations = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            chat.interrupt()
+        };
+        self.pause_goal(chat_id, goal::state::GoalEvent::Interrupted)
+            .await;
+        Ok(operations)
     }
 
     /// Sends the queued user message `run_id` now: interrupts the work ahead of it, after which
@@ -1950,6 +1971,8 @@ impl Agent {
                     tick_subscriptions::TickDeliveries::default(),
                 ),
                 tick_wake: Notify::new(),
+                #[cfg(any(test, feature = "test-support"))]
+                goal_continuations_held: AtomicBool::new(false),
                 session_permissions: Mutex::new(
                     session_permissions::SessionPermissionContext::default(),
                 ),
@@ -1958,6 +1981,7 @@ impl Agent {
             }),
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
+        agent.register_trigger_source_state(Arc::new(goal::GoalSourceState));
         agent
     }
 
@@ -2201,6 +2225,9 @@ impl Agent {
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
                 branch_reservation: None,
+                goal_recorded_tokens: 0,
+                loaded_from_history: false,
+                goal_clock_ms: 0,
             },
         );
         Ok(id)
@@ -2583,6 +2610,13 @@ impl Agent {
         if let Some(admission) = &attachment_admission {
             let sessions = self.inner.session_permissions.lock().await;
             Self::validate_attachment_admission(&chats, &sessions, chat_id, admission)?;
+        }
+        if matches!(trigger_source, Some(TriggerSource::GoalContinuation { .. }))
+            && goal::background_work_runs(&chats, chat_id)
+        {
+            return Err(AgentError::Invalid(
+                "the goal's continuation waits for the Chat's background work".into(),
+            ));
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
@@ -3525,6 +3559,12 @@ impl Agent {
                 Usage::default(),
             ),
         };
+        let goal_turn = match &event {
+            EventKind::Completed { .. } => goal::GoalTurnEnd::Completed,
+            EventKind::Failed(error) if !is_closed => goal::GoalTurnEnd::Failed(error.clone()),
+            _ => goal::GoalTurnEnd::Interrupted,
+        };
+        let goal_turn = self.goal_turn_events(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
         let is_settled = !(self.inner.waits == WaitHosting::Durable
@@ -3555,6 +3595,9 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
+        if let Some(events) = goal_turn {
+            self.end_goal_turn(receipt.chat_id, events).await;
+        }
         if is_settled {
             self.settle_task_claims(&receipt).await;
         }
@@ -3572,6 +3615,10 @@ impl Agent {
             return None;
         }
         match self.next_run(receipt.chat_id).await {
+            Ok(None) => {
+                self.continue_goal(receipt.chat_id, receipt.run_id).await;
+                None
+            }
             Ok(next) => next,
             Err(error) => {
                 let mut chats = self.inner.chats.lock().await;
@@ -3679,7 +3726,21 @@ impl Agent {
     /// Writes an accepted input to the conversation. User prompts capture the current execution
     /// mode and create a pending file snapshot as a rewind point. The run completes snapshots
     /// outside the lock through `complete_file_history_snapshots`.
-    fn append_input_message(&self, chat: &mut Chat, pending: PendingInput) {
+    fn append_input_message(&self, chat: &mut Chat, mut pending: PendingInput) {
+        if let Some(TriggerSource::GoalContinuation {
+            goal_id,
+            objective_revision,
+            ..
+        }) = &pending.trigger_source
+            && let Some(input) = chat
+                .snapshot
+                .goal
+                .as_ref()
+                .filter(|goal| goal.id == *goal_id)
+                .and_then(|goal| goal::current_continuation(goal, *objective_revision))
+        {
+            pending.input = input;
+        }
         if let Some(identity) = chat.feedback_inputs.remove(&pending.receipt.run_id) {
             let active = chat.active_run.unwrap_or(pending.receipt.run_id);
             chat.feedback_inputs.entry(active).or_insert(identity);
@@ -3760,11 +3821,12 @@ impl Agent {
         loop {
             let admission = {
                 let mut chats = self.inner.chats.lock().await;
+                let background_work = goal::background_work_runs(&chats, chat_id);
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                 if chat.family_stopping {
                     return Ok(None);
                 }
-                self.select_next_run(chat, None)?
+                self.select_next_run(chat, None, background_work)?
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
@@ -3893,8 +3955,9 @@ impl Agent {
         )
         .await;
         let mut chats = self.inner.chats.lock().await;
+        let background_work = goal::background_work_runs(&chats, chat_id);
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let admission = match self.select_next_run(chat, Some(pending)) {
+        let admission = match self.select_next_run(chat, Some(pending), background_work) {
             Ok(admission) => admission,
             Err(error) => {
                 // A selection that fails changes nothing of the Chat: the input never started,
@@ -4071,10 +4134,13 @@ impl Agent {
         );
     }
 
+    /// `background_work` holds back a goal continuation while the Chat's background children
+    /// or Shells still run.
     fn select_next_run(
         &self,
         chat: &mut Chat,
         validated_trigger: Option<&PendingInput>,
+        background_work: bool,
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
@@ -4134,6 +4200,8 @@ impl Agent {
                     // Trigger input waits while its Loop pauses receiving or its source holds it.
                     && pending.trigger_source.as_ref().is_none_or(|source| {
                         self.takes_trigger_input(&candidate, source) == wakeup::Eligibility::Eligible
+                            && !(background_work
+                                && matches!(source, TriggerSource::GoalContinuation { .. }))
                     })
             })
         {
@@ -4441,6 +4509,8 @@ impl Agent {
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         // Claude Code's `handlePlanModeTransition`: leaving Plan owes the model an exit notice, and
         // returning to Plan before it is sent withdraws it.
+        let leaves_plan =
+            chat.snapshot.policy.mode == ExecutionMode::Plan && mode != ExecutionMode::Plan;
         match (chat.snapshot.policy.mode, mode) {
             (_, ExecutionMode::Plan) => chat.needs_plan_mode_exit_notice = false,
             (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
@@ -4449,6 +4519,11 @@ impl Agent {
         chat.snapshot.policy.mode = mode;
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
+        drop(chats);
+        // Plan mode held the goal's continuation back.
+        if leaves_plan {
+            self.reconsider_goal(chat_id).await;
+        }
         Ok(())
     }
 

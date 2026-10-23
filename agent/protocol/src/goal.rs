@@ -10,6 +10,9 @@ pub struct GoalSnapshot {
     /// Grows whenever the objective is set, replaced or edited, so a completion check started
     /// for an earlier objective can be recognized and ignored.
     pub objective_revision: u64,
+    /// Who wrote the objective as it is: only the user's own `/goal` speaks for the user.
+    #[serde(default)]
+    pub set_by: GoalAuthor,
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
@@ -31,6 +34,16 @@ impl GoalSnapshot {
         self.token_budget
             .is_some_and(|budget| self.tokens_used >= budget)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAuthor {
+    /// The user set or edited it with `/goal`.
+    User,
+    /// The Agent set it with CreateGoal; it is the Agent's account of what the user asked.
+    #[default]
+    Agent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -79,6 +92,18 @@ pub enum GoalBlock {
     ExecutionFailed { error: String },
     /// The completion check found the objective impossible.
     CheckImpossible { reason: String },
+}
+
+/// A goal change the conversation shows as one line.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GoalNotice {
+    Set,
+    Completed,
+    Blocked { by: GoalBlock },
+    BudgetLimited,
+    Paused { by: GoalPause },
+    Cleared,
 }
 
 /// The completion check's latest conclusion about a reported completion.

@@ -3,7 +3,7 @@
 //! continuation conditions are judged here too, so every goal rule lives in one place.
 
 use tickloop_agent_protocol::{
-    GoalBlock, GoalCheck, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
+    GoalAuthor, GoalBlock, GoalCheck, GoalNotice, GoalPause, GoalSnapshot, GoalStatus, GoalVerdict,
 };
 use uuid::Uuid;
 
@@ -21,6 +21,7 @@ pub(crate) enum GoalEvent {
         token_budget: Option<u64>,
         /// Whether the user confirmed replacing an unfinished goal.
         replace: bool,
+        set_by: GoalAuthor,
     },
     Edit {
         objective: String,
@@ -44,6 +45,12 @@ pub(crate) enum GoalEvent {
         goal_id: Uuid,
         objective_revision: u64,
         verdict: GoalVerdict,
+    },
+    /// The completion check itself failed, which counts as an execution error.
+    CheckFailed {
+        goal_id: Uuid,
+        objective_revision: u64,
+        error: String,
     },
     /// UpdateGoal `blocked`.
     ReportedBlocked {
@@ -85,16 +92,6 @@ pub(crate) enum GoalEffect {
         goal_id: Uuid,
         objective_revision: u64,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GoalNotice {
-    Set,
-    Completed,
-    Blocked(GoalBlock),
-    BudgetLimited,
-    Paused(GoalPause),
-    Cleared,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,8 +186,14 @@ pub(crate) fn apply(
                 objective,
                 token_budget,
                 replace,
-            } => set(None, id, &objective, token_budget, replace, now_ms),
+                set_by,
+            } => set(None, id, &objective, token_budget, replace, set_by, now_ms),
             GoalEvent::Checked {
+                goal_id,
+                objective_revision,
+                ..
+            }
+            | GoalEvent::CheckFailed {
                 goal_id,
                 objective_revision,
                 ..
@@ -230,13 +233,26 @@ pub(crate) fn apply(
             objective,
             token_budget,
             replace,
-        } => return set(Some(current), id, &objective, token_budget, replace, now_ms),
+            set_by,
+        } => {
+            return set(
+                Some(current),
+                id,
+                &objective,
+                token_budget,
+                replace,
+                set_by,
+                now_ms,
+            );
+        }
         GoalEvent::Edit { objective } => {
             if current.status.is_finished() {
                 return Err(inapplicable("edit"));
             }
             next.objective = valid_objective(&objective)?;
             next.objective_revision = next.objective_revision.saturating_add(1);
+            // Only the user edits a goal.
+            next.set_by = GoalAuthor::User;
             next.last_check = None;
             next.quiet_turns = 0;
             // `/goal pause` does not interrupt the current turn, so a paused goal's turn may
@@ -295,18 +311,29 @@ pub(crate) fn apply(
         GoalEvent::Checked {
             goal_id,
             objective_revision,
-            verdict,
-        } => {
-            if (goal_id, objective_revision) != (current.id, current.objective_revision) {
-                effects.push(GoalEffect::StaleCheckDiscarded {
-                    goal_id,
-                    objective_revision,
-                });
-                return Ok(GoalTransition {
-                    goal: Some(next),
-                    effects,
-                });
+            ..
+        }
+        | GoalEvent::CheckFailed {
+            goal_id,
+            objective_revision,
+            ..
+        } if (goal_id, objective_revision) != (current.id, current.objective_revision) => {
+            effects.push(GoalEffect::StaleCheckDiscarded {
+                goal_id,
+                objective_revision,
+            });
+        }
+        GoalEvent::CheckFailed { error, .. } => {
+            if current.status.is_finished() {
+                return Err(inapplicable("check"));
             }
+            block(
+                &mut next,
+                GoalBlock::ExecutionFailed { error },
+                &mut effects,
+            );
+        }
+        GoalEvent::Checked { verdict, .. } => {
             if current.status.is_finished() {
                 return Err(inapplicable("check"));
             }
@@ -362,6 +389,7 @@ fn set(
     objective: &str,
     token_budget: Option<u64>,
     replace: bool,
+    set_by: GoalAuthor,
     now_ms: u64,
 ) -> Result<GoalTransition, GoalError> {
     let objective = valid_objective(objective)?;
@@ -379,6 +407,7 @@ fn set(
             id,
             objective,
             objective_revision: current.map_or(1, |goal| goal.objective_revision.saturating_add(1)),
+            set_by,
             status: GoalStatus::Active,
             token_budget,
             tokens_used: 0,
@@ -430,7 +459,7 @@ fn pause(goal: &mut GoalSnapshot, by: GoalPause, effects: &mut Vec<GoalEffect>) 
     leave_active(
         goal,
         GoalStatus::Paused { by },
-        GoalNotice::Paused(by),
+        GoalNotice::Paused { by },
         effects,
     );
 }
@@ -439,7 +468,7 @@ fn block(goal: &mut GoalSnapshot, by: GoalBlock, effects: &mut Vec<GoalEffect>) 
     leave_active(
         goal,
         GoalStatus::Blocked { by: by.clone() },
-        GoalNotice::Blocked(by),
+        GoalNotice::Blocked { by },
         effects,
     );
 }

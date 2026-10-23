@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use super::ChatBookkeeping;
 use tickloop_agent_protocol::{
-    AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
+    AutoPolicy, ChatSnapshot, CompactionMarker, Content, DelegatedGoal, GoalSnapshot,
+    OperationRecord, OriginalUserInput, Role,
 };
 use tickloop_agent_transcript::{ChainEntry, Line};
 
@@ -539,10 +540,66 @@ fn originals_for_active_chain_with_legacy(
     Ok(originals)
 }
 
+/// The goal a child delegated from `snapshot` may weigh as the user's: the root's goal the user
+/// set with /goal, unfinished, as a reference the child checks against the root at each review.
+pub(super) fn delegated_goal(snapshot: &ChatSnapshot) -> Option<DelegatedGoal> {
+    match &snapshot.delegation {
+        Some(delegation) => delegation.trusted_goal,
+        None => snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| is_users_unfinished_goal(goal))
+            .map(|goal| DelegatedGoal {
+                goal_id: goal.id,
+                objective_revision: goal.objective_revision,
+            }),
+    }
+}
+
+fn is_users_unfinished_goal(goal: &GoalSnapshot) -> bool {
+    goal.set_by == tickloop_agent_protocol::GoalAuthor::User && !goal.status.is_finished()
+}
+
+/// The root Chat's goal as it is now, `root_goal`, as one of the user's inputs, when the user set
+/// or edited it with /goal and it is unfinished: the user's own request for the work it continues.
+/// A goal the Agent set with CreateGoal is only the Agent's account of the request. A child
+/// weighs it only while it is still the goal, at the revision, it was delegated under.
+fn user_goal_input(
+    snapshot: &ChatSnapshot,
+    root_goal: Option<&GoalSnapshot>,
+    operation: &OperationRecord,
+) -> Option<OriginalUserInput> {
+    let goal = root_goal.filter(|goal| is_users_unfinished_goal(goal))?;
+    let (chat_id, loop_id) = match &snapshot.delegation {
+        None => (snapshot.id, operation.loop_id),
+        Some(delegation) => {
+            let delegated_under = DelegatedGoal {
+                goal_id: goal.id,
+                objective_revision: goal.objective_revision,
+            };
+            if delegation.trusted_goal != Some(delegated_under) {
+                return None;
+            }
+            (delegation.root_chat_id(), delegation.root_loop_id())
+        }
+    };
+    Some(OriginalUserInput {
+        chat_id,
+        loop_id,
+        run_id: operation.run_id,
+        message_id: goal.id,
+        text: format!(
+            "The user set this Chat's goal with /goal, for the Agent to keep working toward: {}",
+            goal.objective
+        ),
+    })
+}
+
 pub(super) fn capture(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
     operation: &OperationRecord,
+    root_goal: Option<&GoalSnapshot>,
     legacy: Option<Vec<OriginalUserInput>>,
     folder: &std::path::Path,
     auto_policy: AutoPolicy,
@@ -557,13 +614,13 @@ pub(super) fn capture(
         .into_iter()
         .filter(|input| input.chat_id == snapshot.id && input.loop_id == operation.loop_id)
         .collect::<Vec<_>>();
+    let goal_input = user_goal_input(snapshot, root_goal, operation);
     if let Some(delegation) = &snapshot.delegation {
         let frozen = delegation
             .trusted_user_inputs
             .as_ref()
             .and_then(|value| serde_json::from_value::<Vec<OriginalUserInput>>(value.clone()).ok())
-            .filter(|inputs| !inputs.is_empty())
-            .ok_or(ApprovalContextError::MissingOriginalUserInput)?;
+            .unwrap_or_default();
         let mut inherited = frozen
             .iter()
             .filter(|input| {
@@ -573,12 +630,13 @@ pub(super) fn capture(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if inherited.is_empty() {
+        if inherited.is_empty() && goal_input.is_none() {
             return Err(ApprovalContextError::MissingOriginalUserInput);
         }
         inherited.append(&mut original_user_inputs);
         original_user_inputs = inherited;
     }
+    original_user_inputs.extend(goal_input);
     if original_user_inputs.is_empty() {
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
@@ -683,6 +741,111 @@ impl crate::Agent {
 mod tests {
     use super::*;
     use tickloop_agent_protocol::{Message, ModelConfig, OperationState};
+
+    /// A child weighs its root's goal as the user's only while the root's goal is still the one,
+    /// at the revision, it was delegated under, the user's and unfinished.
+    #[test]
+    fn a_child_weighs_only_the_roots_current_goal_it_was_delegated_under() {
+        use crate::goal::state::{GoalEvent, apply};
+        use tickloop_agent_protocol::{GoalAuthor, GoalStatus};
+
+        let set = |set_by| {
+            apply(
+                None,
+                GoalEvent::Set {
+                    id: Uuid::new_v4(),
+                    objective: "Ship the export command".into(),
+                    token_budget: None,
+                    replace: false,
+                    set_by,
+                },
+                1_000,
+            )
+            .unwrap()
+            .goal
+            .unwrap()
+        };
+        let mut root = crate::empty_snapshot(
+            Uuid::new_v4(),
+            Some("/project".into()),
+            ModelConfig::unselected(),
+        );
+        root.goal = Some(set(GoalAuthor::User));
+        let delegated = delegated_goal(&root).expect("the user's goal is delegated");
+        let mut child = crate::empty_snapshot(
+            Uuid::new_v4(),
+            Some("/project".into()),
+            ModelConfig::unselected(),
+        );
+        child.delegation = Some(tickloop_agent_protocol::DelegationMetadata {
+            delegation_id: Uuid::new_v4(),
+            parent_chat_id: root.id,
+            parent_loop_id: root.chat_loop.id,
+            parent_run_id: Uuid::new_v4(),
+            parent_call_id: "s1".into(),
+            ancestors: Vec::new(),
+            task: "write the export".into(),
+            ceiling: tickloop_agent_protocol::DelegationCeiling {
+                folder: child.folder.clone(),
+                additional_directories: Vec::new(),
+                policy: child.policy.clone(),
+                session_denials: None,
+                host_context: None,
+                host_tools: Default::default(),
+                tick_instances: Vec::new(),
+            },
+            trusted_user_inputs: None,
+            trusted_reply_history: None,
+            trusted_goal: Some(delegated),
+        });
+        assert_eq!(
+            delegated_goal(&child),
+            Some(delegated),
+            "a grandchild inherits it"
+        );
+        let operation = OperationRecord {
+            task_binding: None,
+            id: Uuid::new_v4(),
+            loop_id: child.chat_loop.id,
+            run_id: Uuid::new_v4(),
+            call_id: "b1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "touch export.txt"}),
+            file_change: None,
+            state: OperationState::Proposed,
+            result: None,
+        };
+        let weighed =
+            |root_goal: Option<&GoalSnapshot>| user_goal_input(&child, root_goal, &operation);
+
+        let current = root.goal.clone().unwrap();
+        let input = weighed(Some(&current)).expect("the goal it was delegated under");
+        assert_eq!((input.chat_id, input.loop_id), (root.id, root.chat_loop.id));
+        assert!(input.text.contains("Ship the export command"));
+
+        assert!(weighed(None).is_none(), "a cleared goal");
+        let mut edited = current.clone();
+        edited.objective = "Ship the import command".into();
+        edited.objective_revision += 1;
+        assert!(weighed(Some(&edited)).is_none(), "an edited goal");
+        let mut complete = current.clone();
+        complete.status = GoalStatus::Complete;
+        assert!(weighed(Some(&complete)).is_none(), "a completed goal");
+        assert!(
+            weighed(Some(&set(GoalAuthor::User))).is_none(),
+            "another goal"
+        );
+        let mut agents = current.clone();
+        agents.set_by = GoalAuthor::Agent;
+        assert!(weighed(Some(&agents)).is_none(), "a goal the Agent set");
+
+        root.goal = Some(set(GoalAuthor::Agent));
+        assert_eq!(
+            delegated_goal(&root),
+            None,
+            "the Agent's goal is not delegated"
+        );
+    }
 
     #[test]
     fn tool_outputs_cannot_claim_success_or_replace_a_host_unknown_outcome() {

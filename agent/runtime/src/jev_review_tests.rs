@@ -54,6 +54,7 @@ fn review_request(
         bookkeeping,
         operation,
         None,
+        None,
         snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
     )
@@ -276,6 +277,7 @@ fn both_reviewers_receive_identical_state_and_policy_guidance() {
         &bookkeeping,
         &operation,
         None,
+        None,
         snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
     )
@@ -322,6 +324,7 @@ fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
             &snapshot,
             &bookkeeping,
             &operation,
+            None,
             None,
             snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
@@ -524,6 +527,7 @@ async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
         &snapshot,
         &bookkeeping,
         &operation,
+        None,
         None,
         snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
