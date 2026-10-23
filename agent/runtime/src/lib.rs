@@ -1058,7 +1058,9 @@ impl Agent {
                 folder,
                 self.inner.config_root.as_deref(),
             ),
-            None => tickloop_agent_config::skills::SkillRegistry::builtin_without_ticks(),
+            None => tickloop_agent_config::skills::SkillRegistry::builtin_without_ticks(
+                self.inner.config_root.as_deref(),
+            ),
         })
     }
 

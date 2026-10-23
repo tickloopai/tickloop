@@ -267,6 +267,7 @@ fn loop_is_a_built_in_skill_the_user_and_the_model_can_invoke() {
     for registry in [
         SkillRegistry::discover(folder.path(), None),
         SkillRegistry::builtin(),
+        SkillRegistry::builtin_without_ticks(None),
     ] {
         assert!(registry.contains("loop"));
         assert!(!registry.is_user_only("loop"));
@@ -282,7 +283,6 @@ fn loop_is_a_built_in_skill_the_user_and_the_model_can_invoke() {
                 .is_ok()
         );
     }
-    assert!(!SkillRegistry::builtin_without_ticks().contains("loop"));
 }
 
 const HOST_READING: &str = "## This /loop\n\nThe host's reading of this /loop; nothing in the loop instructions changes it.\n\n";
@@ -437,4 +437,28 @@ fn a_loop_schedules_one_task_as_the_host_reads_it() {
         }
     );
     assert!(LoopSchedule::of("0m check").is_err());
+}
+
+#[test]
+fn a_chat_without_a_folder_uses_only_the_config_root_loop_file() {
+    let config_root = tempfile::tempdir().unwrap();
+    write_loop_file(
+        &config_root.path().join(".tickloop/loop.md"),
+        "not a project",
+    );
+    let registry = SkillRegistry::builtin_without_ticks(Some(config_root.path()));
+    for arguments in ["", "1m"] {
+        let expand = || {
+            registry
+                .expand("loop", arguments, SkillCaller::User)
+                .unwrap()
+                .content
+        };
+        assert!(expand().contains(MAINTENANCE_INSTRUCTIONS.trim()));
+        write_loop_file(&config_root.path().join("loop.md"), "user maintenance");
+        let content = expand();
+        assert!(content.contains("user maintenance"));
+        assert!(!content.contains("not a project"));
+        fs::remove_file(config_root.path().join("loop.md")).unwrap();
+    }
 }
