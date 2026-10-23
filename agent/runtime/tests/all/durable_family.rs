@@ -1957,3 +1957,29 @@ async fn durable_stop_hold_and_ledger_survive_crash_during_append() {
 async fn durable_continue_hold_and_ledger_survive_crash_during_append() {
     assert_family_hold_crash_during_append(true).await;
 }
+
+/// A durable host that shut down changes no source's state: the change answers that the host
+/// is closing, and the store holds nothing of it, for the host that takes the family next.
+#[tokio::test]
+async fn a_shut_down_durable_host_changes_no_source_state() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = FamilyModel::new(|_| Reply::Says(text("Done")));
+    let agent = harness(store.clone(), model, WaitHosting::Durable);
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let turn = agent.advance(root, prompt("Get ready.")).await.unwrap();
+    outcome(&turn).await;
+    agent.shutdown().await;
+    let stored = store.lines(root).len();
+    let changed = agent
+        .run_source_change_for_tests(root, move |snapshot| {
+            vec![Line::CustomTitle(
+                tickloop_agent_transcript::CustomTitleEntry {
+                    chat_id: snapshot.id,
+                    custom_title: "after the shutdown".into(),
+                },
+            )]
+        })
+        .await;
+    assert_eq!(changed, Err("the Agent is shutting down".into()));
+    assert_eq!(store.lines(root).len(), stored);
+}

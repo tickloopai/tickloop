@@ -668,6 +668,14 @@ impl Agent {
         chat_id: ChatId,
         _within: &TriggerBoundary,
     ) -> Result<LeaseTaken, LeaseRefused> {
+        if self
+            .inner
+            .chat_leases
+            .closing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LeaseRefused::Closing);
+        }
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
