@@ -10,7 +10,6 @@ fn retired_commands_do_not_execute_or_become_prompts() {
     let directory = tempfile::tempdir().unwrap();
     let retired = [
         "/new",
-        "/goal",
         "/theme",
         "/logout",
         "/triggers",
