@@ -2119,6 +2119,7 @@ fn recover_transcript(
     source_chat_id: ChatId,
     waits: WaitHosting,
     family: Option<&super::family_load::FamilyRecords>,
+    scheduled_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let kept = restored.without(removed);
     let folder = match loaded.chain.last() {
@@ -2185,10 +2186,7 @@ fn recover_transcript(
         // running and the one-shot tasks still ahead; a durable host's load is how it runs the
         // Chat, so it keeps them all.
         if waits == WaitHosting::Process {
-            super::scheduled_tasks::after_history_load(
-                &mut snapshot,
-                std::time::SystemTime::now().into(),
-            );
+            super::scheduled_tasks::after_history_load(&mut snapshot, scheduled_now);
         }
         snapshot.task_boards = loaded
             .metadata
@@ -3311,6 +3309,7 @@ impl Agent {
             source_chat_id,
             waits,
             family,
+            self.scheduled_now(),
         )?;
         let folder = recovered.snapshot.folder.clone();
         match (&folder, &self.inner.environment) {
