@@ -1944,6 +1944,41 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     here.shutdown().await;
 }
 
+/// A Continue lets the sources resume with the Loop under the lease it takes, recorded by the
+/// time the Continue returns; another process learning of the Continue resumes none, and reads
+/// what they recorded as it next takes the lease over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_lets_the_sources_resume_under_the_lease() {
+    let setup = WaitingInput::new().await;
+    let (here, chat) = (setup.here.clone(), setup.chat);
+    let resuming = |record: &'static str| tickloop_agent_runtime::TestSourceState {
+        on_resume: Some(Box::new(move |snapshot| {
+            vec![source_record(snapshot.id, record)]
+        })),
+        ..Default::default()
+    };
+    here.register_trigger_source_state_for_tests(resuming("resumed here"));
+    setup
+        .elsewhere
+        .register_trigger_source_state_for_tests(resuming("resumed elsewhere"));
+    here.stop(chat).await.unwrap();
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "resumed here"),
+        0
+    );
+    here.continue_loop(chat).await.unwrap();
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "resumed here"),
+        1
+    );
+    setup.model.wait_seen(WaitingInput::MARKER, 1).await;
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "resumed elsewhere"),
+        0
+    );
+    setup.ran_once().await;
+}
+
 /// A source's record is written once, by its lease holder: never again from what a process
 /// keeps as metadata, as at its exit.
 #[tokio::test(flavor = "multi_thread")]

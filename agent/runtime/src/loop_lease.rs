@@ -885,11 +885,22 @@ impl Agent {
                     let holding = match taken {
                         LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding) => holding,
                     };
-                    self.stop_sources(chat_id, holding).await;
+                    self.switch_sources(chat_id, holding, change).await;
                 }
                 self.inner.chat_leases.release(chat_id);
             }
-            ReceivingChange::Resumed => {}
+            ReceivingChange::Resumed => {
+                // The sources resume with the Loop under the lease. One taken for that alone
+                // goes back once they are recorded, for the first delivery to take as before.
+                let held_before = self.inner.chat_leases.holding(chat_id).is_some();
+                if self.has_trigger_source_states()
+                    && let Ok(LeaseTaken::Held(holding)) = self.take_lease(chat_id, &within).await
+                    && self.switch_sources(chat_id, holding, change).await
+                    && !held_before
+                {
+                    self.inner.chat_leases.release(chat_id);
+                }
+            }
         }
         if let Err(error) = recorded {
             self.inner.chat_leases.set_notice(

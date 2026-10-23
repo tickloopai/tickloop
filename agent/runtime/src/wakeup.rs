@@ -58,6 +58,11 @@ pub(super) trait TriggerSourceState: Send + Sync {
     /// as pausing a Goal or revoking scheduled runs: made where the lease is, within the
     /// boundary, before it goes back, and recorded with it.
     fn on_stop(&self, _change: &SourceChange, _chat: &mut Chat) {}
+
+    /// The source's part of a resume of receiving here, as a Continue, such as resuming a
+    /// paused Goal: made under the lease, within the boundary, after the switch is recorded,
+    /// and recorded with it. A process another live one holds the lease from makes none.
+    fn on_resume(&self, _change: &SourceChange, _chat: &mut Chat) {}
 }
 
 /// Proof that its holder is within the Chat's boundary under its lease, which a source's change
@@ -695,6 +700,10 @@ impl Agent {
             .push(state);
     }
 
+    pub(super) fn has_trigger_source_states(&self) -> bool {
+        !self.inner.trigger_source_states.read().unwrap().is_empty()
+    }
+
     /// The change a source made with an acceptance reaches the Transcript with it, within the
     /// boundary; a failure leaves both queued, for the start record the turn waits for.
     pub(super) async fn checkpoint_trigger_acceptance(&self, chat_id: ChatId) {
@@ -795,20 +804,29 @@ impl Agent {
         Ok(result)
     }
 
-    /// The sources' part of a pause, where the lease `holding` is, recorded before the lease
-    /// goes back.
-    pub(super) async fn stop_sources(&self, chat_id: ChatId, holding: loop_lease::LeaseHolding) {
+    /// The sources' part of a turn of the receiving switch, where the lease `holding` is and
+    /// within the boundary, recorded with it: for a pause before the lease goes back. Whether
+    /// what they did is recorded.
+    pub(super) async fn switch_sources(
+        &self,
+        chat_id: ChatId,
+        holding: loop_lease::LeaseHolding,
+        switched: ReceivingChange,
+    ) -> bool {
         let states = self.inner.trigger_source_states.read().unwrap().clone();
         if states.is_empty() || !self.inner.chat_leases.stands(chat_id, holding) {
-            return;
+            return true;
         }
         let mut chats = self.inner.chats.lock().await;
         let Some(chat) = chats.get_mut(&chat_id) else {
-            return;
+            return true;
         };
         let change = SourceChange::new(self);
         for state in &states {
-            state.on_stop(&change, chat);
+            match switched {
+                ReceivingChange::Paused => state.on_stop(&change, chat),
+                ReceivingChange::Resumed => state.on_resume(&change, chat),
+            }
         }
         change.queue_with(chat);
         self.save(&chat.snapshot);
@@ -816,22 +834,31 @@ impl Agent {
             .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
             .await
         {
-            self.inner.chat_leases.set_notice(
-                chat_id,
-                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
-                format!(
+            let notice = match switched {
+                ReceivingChange::Paused => format!(
                     "what this Chat's Trigger sources did as it stopped could not be recorded \
                      ({error}); receiving is recorded as paused, so no other process goes on"
                 ),
+                ReceivingChange::Resumed => format!(
+                    "what this Chat's Trigger sources did as it continued could not be recorded \
+                     yet ({error}); this process keeps the Chat's Trigger until it is"
+                ),
+            };
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                notice,
             );
+            return false;
         }
+        true
     }
 
     /// After a compaction, the lease holder writes the sources' records again, within the
     /// boundary; a process another live one holds the lease from leaves them to it, and every
     /// takeover reads them from the whole store.
     pub(super) fn rewrite_source_records_after_compaction(&self, chat_id: ChatId) {
-        if self.inner.trigger_source_states.read().unwrap().is_empty() {
+        if !self.has_trigger_source_states() {
             return;
         }
         let agent = self.clone();
@@ -878,7 +905,8 @@ impl Agent {
             pause_receiving(chat, PauseReason::Stopped);
             self.save(&chat.snapshot);
         }
-        self.stop_sources(chat_id, holding).await;
+        self.switch_sources(chat_id, holding, ReceivingChange::Paused)
+            .await;
     }
 
     /// The Chat is continued: its Loop receives again, its sources deliver what they kept, and
@@ -1199,6 +1227,8 @@ pub struct TestSourceState {
     pub records: Option<Box<dyn Fn(&ChatSnapshot) -> Vec<Line> + Send + Sync>>,
     /// The Lines it records as the Chat stops.
     pub on_stop: Option<Box<dyn Fn(&mut ChatSnapshot) -> Vec<Line> + Send + Sync>>,
+    /// The Lines it records as the Chat continues.
+    pub on_resume: Option<Box<dyn Fn(&mut ChatSnapshot) -> Vec<Line> + Send + Sync>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1219,6 +1249,14 @@ impl TriggerSourceState for TestSourceState {
     fn on_stop(&self, change: &SourceChange, chat: &mut Chat) {
         if let Some(on_stop) = &self.on_stop {
             for line in on_stop(&mut chat.snapshot) {
+                change.record_source_state(line);
+            }
+        }
+    }
+
+    fn on_resume(&self, change: &SourceChange, chat: &mut Chat) {
+        if let Some(on_resume) = &self.on_resume {
+            for line in on_resume(&mut chat.snapshot) {
                 change.record_source_state(line);
             }
         }
