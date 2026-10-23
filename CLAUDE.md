@@ -33,6 +33,8 @@ Agent 的列表与菜单沿用 Vim 导航习惯，文本输入沿用 Claude Code
 
 AI 只能在既有授权范围内执行。读取与写入授权分别判断；新增接入不扩大已有权限。持续执行依赖本机运行环境。
 
+新增或修改任何模型工具时，同时确定它在 Auto 模式下的处理：只读工具标为 ReadOnly；有副作用的工具对照 Claude Code 的 auto-mode 默认政策，在 `agent/config/src/auto_policy/`（`defaults.json` 与 README 的映射、“不适用”清单与计数）中给出映射，并补测试，确保正常的用户请求在 Auto 模式下不被误拒、越权操作仍被拦截。
+
 ## 结构与接入边界
 
 | 路径 | 内容 |
