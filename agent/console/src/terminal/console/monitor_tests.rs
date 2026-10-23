@@ -3632,51 +3632,82 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
     state
         .monitor
         .replace(TickGroup::Shells, vec![running_shell]);
-    let frame = state.monitor.frame(48, 15, state.display, 22_000);
-    let screen = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
-    println!(
-        "{}",
-        screen
+    for height in [14, 15, 18] {
+        let frame = state.monitor.frame(48, height, state.display, 22_000);
+        let screen = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+        println!(
+            "[Monitor 48x{height}]\n{}",
+            screen
+                .iter()
+                .map(|line| line.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(screen[0], "Monitor");
+        assert!(screen[1].is_empty());
+        assert_eq!(screen[2], "Ticks (2)");
+        let shell_row = screen
             .iter()
-            .map(|line| line.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert_eq!(screen[0], "Monitor");
-    assert!(screen[1].is_empty());
-    assert_eq!(screen[2], "Ticks (2)");
-    let find = |text: &str| screen.iter().find(|line| line.contains(text)).unwrap();
-    assert!(find("Quote · TSLA.US").starts_with("◉ "));
-    assert!(find("Quote · TSLA.US").ends_with('↻'));
-    assert!(find("Plain Tick").starts_with("◉ "));
-    let scheduled = find("◷");
-    assert_eq!(display_width(&scheduled[..scheduled.find('◷').unwrap()]), 0);
-    assert!(find("sleep 900").starts_with("$ sleep 900"));
-    assert!(find("sleep 900").ends_with("22s"));
-    for title in ["Quote · TSLA.US", "Plain Tick", "sleep 900"] {
-        let line = find(title);
-        assert_eq!(
-            display_width(&line[..line.find(title).unwrap()]),
-            2,
-            "{line}"
+            .position(|line| line.starts_with("$ sleep 900"))
+            .unwrap();
+        let scheduled_heading = screen
+            .iter()
+            .position(|line| line == "Scheduled (1)")
+            .unwrap();
+        let padding = shell_row + 1..frame.tick_rows.end;
+        assert_eq!(padding.len(), height - 14, "{screen:#?}");
+        assert!(
+            screen[padding.clone()].iter().all(String::is_empty),
+            "{screen:#?}"
         );
-    }
-    for (text, title) in [
-        ("◷", "1m"),
-        ("提醒我看天气", "提醒我看天气"),
-        ("记录验收证据", "记录验收证据"),
-    ] {
-        let line = find(text);
+        assert_eq!(scheduled_heading, frame.tick_rows.end + 1);
+        assert!(screen[frame.tick_rows.end].is_empty());
         assert_eq!(
-            display_width(&line[..line.find(title).unwrap()]),
-            2,
-            "{line}"
+            scheduled_heading,
+            height - 6,
+            "Scheduled stays above the pinned Goal"
         );
+        assert!(screen[height - 2].starts_with("Pursuing goal"));
+        assert!(screen[height - 1].starts_with("◎ "));
+        assert!(
+            frame
+                .targets
+                .iter()
+                .all(|(row, _)| *row != 1 && !padding.contains(row) && *row != frame.tick_rows.end)
+        );
+        let find = |text: &str| screen.iter().find(|line| line.contains(text)).unwrap();
+        assert!(find("Quote · TSLA.US").starts_with("◉ "));
+        assert!(find("Quote · TSLA.US").ends_with('↻'));
+        assert!(find("Plain Tick").starts_with("◉ "));
+        let scheduled = find("◷");
+        assert_eq!(display_width(&scheduled[..scheduled.find('◷').unwrap()]), 0);
+        assert!(find("sleep 900").starts_with("$ sleep 900"));
+        assert!(find("sleep 900").ends_with("22s"));
+        for title in ["Quote · TSLA.US", "Plain Tick", "sleep 900"] {
+            let line = find(title);
+            assert_eq!(
+                display_width(&line[..line.find(title).unwrap()]),
+                2,
+                "{line}"
+            );
+        }
+        for (text, title) in [
+            ("◷", "1m"),
+            ("提醒我看天气", "提醒我看天气"),
+            ("记录验收证据", "记录验收证据"),
+        ] {
+            let line = find(text);
+            assert_eq!(
+                display_width(&line[..line.find(title).unwrap()]),
+                2,
+                "{line}"
+            );
+        }
+        assert!(find("Pursuing goal").starts_with("Pursuing goal"));
+        assert!(find("记录验收证据").starts_with("◎ "));
+        assert!(screen.iter().any(|line| line == "Scheduled (1)"));
+        assert!(find("Pursuing goal").ends_with("1m"));
     }
-    assert!(find("Pursuing goal").starts_with("Pursuing goal"));
-    assert!(find("记录验收证据").starts_with("◎ "));
-    assert!(screen.iter().any(|line| line == "Scheduled (1)"));
-    assert!(find("Pursuing goal").ends_with("1m"));
 }
 
 #[test]
