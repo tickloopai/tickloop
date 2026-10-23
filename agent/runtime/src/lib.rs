@@ -113,7 +113,7 @@ mod turn;
 mod wakeup;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use wakeup::trigger_pauses;
+pub use wakeup::{TestSourceState, trigger_pauses};
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{
@@ -382,6 +382,8 @@ struct Inner {
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     chat_leases: loop_lease::ChatLeases,
+    /// The Trigger sources' own states, taken over from the store with each newly taken lease.
+    trigger_source_states: std::sync::RwLock<Vec<Arc<dyn wakeup::TriggerSourceState>>>,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -539,6 +541,8 @@ struct SubmissionOptions {
     /// The lease holding the delivery was let in under, which must still stand when it is
     /// accepted, and the Chat's Trigger boundary it is accepted within, left once it is.
     trigger_lease: Option<(loop_lease::LeaseHolding, loop_lease::TriggerBoundary)>,
+    /// The source's own change for the delivery, made as it is accepted.
+    trigger_commit: Option<wakeup::SourceCommit>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -558,6 +562,58 @@ pub(crate) struct TurnAdmission {
     /// The stored branch that place is on, staged under a reservation of the Chat and installed
     /// in the same change that accepts the input.
     pub branch: Option<turn::BranchSwitch>,
+}
+
+/// How long a started Trigger input whose start cannot be recorded waits before it tries again,
+/// doubling with each failure up to the longest.
+const TRIGGER_START_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
+const TRIGGER_START_RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a Trigger input waits for its start to be recorded before receiving pauses.
+const TRIGGER_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(any(test, feature = "test-support"))]
+static TRIGGER_START_BUDGET_FOR_TESTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn trigger_start_budget() -> std::time::Duration {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let millis = TRIGGER_START_BUDGET_FOR_TESTS.load(Ordering::Relaxed);
+        if millis > 0 {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    TRIGGER_START_BUDGET
+}
+
+/// What taking queued Trigger input came to.
+enum TriggerTake {
+    /// It started, and its run runs.
+    Started,
+    /// It waits, for the lease, its source or the Loop.
+    Waits,
+    /// The queue changed meanwhile: look at it again.
+    LookAgain,
+}
+
+/// Why a take of `pending` stops before it starts the input, as another take of it may have
+/// started it meanwhile; `None` while it waits in the Chat's queue as it was found there and
+/// the ledger has not started it.
+fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
+    let queued = chat.snapshot.pending_inputs.iter().any(|queued| {
+        queued.receipt.run_id == pending.receipt.run_id
+            && queued.input == pending.input
+            && queued.trigger_source == pending.trigger_source
+    });
+    if !queued {
+        return Some(TriggerTake::LookAgain);
+    }
+    // Still queued while the ledger has it started: looking again would find it again.
+    chat.bookkeeping
+        .lifecycle
+        .is_started(pending.receipt.run_id)
+        .then_some(TriggerTake::Waits)
 }
 
 /// Queues a Run that continues the conversation without a message of its own.
@@ -1862,6 +1918,7 @@ impl Agent {
                 tasks: agent_tasks::AgentTasks::default(),
                 recorder,
                 chat_leases: loop_lease::ChatLeases::default(),
+                trigger_source_states: std::sync::RwLock::new(Vec::new()),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2467,6 +2524,7 @@ impl Agent {
             denial_reference,
             trigger_source,
             trigger_lease,
+            trigger_commit,
             invoked_skill,
             host_context,
             agent_message,
@@ -2611,7 +2669,15 @@ impl Agent {
         {
             self.record_merged_trigger(chat, &ledger, source, &waiting);
             *original = candidate;
+            let commits = trigger_commit.is_some();
+            if let Some(commit) = trigger_commit {
+                self.commit_trigger_source(original, commit, &waiting);
+            }
             self.save(&original.snapshot);
+            drop(chats);
+            if commits {
+                self.checkpoint_trigger_acceptance(chat_id).await;
+            }
             self.inner.ledger_changes.send_replace(());
             return Ok(waiting);
         }
@@ -2691,6 +2757,10 @@ impl Agent {
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
+        let commits = trigger_commit.is_some();
+        if let Some(commit) = trigger_commit {
+            self.commit_trigger_source(original, commit, &receipt);
+        }
         if let Some(source) = directed_origin {
             let source_chat = chats
                 .get_mut(&source.source_chat_id)
@@ -2703,6 +2773,9 @@ impl Agent {
         }
         drop(chats);
         drop(family_mailbox);
+        if commits {
+            self.checkpoint_trigger_acceptance(chat_id).await;
+        }
         // Accepted: the run it may start enters the boundary again to take it.
         drop(trigger_lease);
         if let Some(parent) = task_delegation {
@@ -2725,10 +2798,10 @@ impl Agent {
             self.run_task(next);
         }
         self.inner.ledger_changes.send_replace(());
+        self.start_title_generation(chat_id).await;
         if continues_chat {
             Box::pin(self.continue_receiving(chat_id)).await;
         }
-        self.start_title_generation(chat_id).await;
         Ok(requested_receipt)
     }
 
@@ -3699,25 +3772,48 @@ impl Agent {
                     return Ok(Some((receipt, request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
-                    if let Some(taken) =
-                        Box::pin(self.take_trigger_input(chat_id, &pending)).await?
-                    {
-                        return Ok(taken);
+                    match self.take_trigger_input(chat_id, *pending).await? {
+                        TriggerTake::LookAgain => {}
+                        // A run it started runs on a task of its own.
+                        TriggerTake::Started | TriggerTake::Waits => return Ok(None),
                     }
                 }
             }
         }
     }
 
-    /// Takes the queued Trigger input `pending` within the Chat's Trigger boundary: under the
-    /// Chat's lease, while no other process paused receiving, once its source proved it again;
-    /// its start is recorded durably before the boundary is left. `Some(None)` when nothing
-    /// starts, as it waits or is withdrawn; `None` to look at the queue again.
+    /// Takes the queued Trigger input `pending` and starts its run on a task of the Agent's own,
+    /// which a caller that stops waiting does not stop: no input is left started and not
+    /// running.
     async fn take_trigger_input(
         &self,
         chat_id: ChatId,
+        pending: PendingInput,
+    ) -> Result<TriggerTake, AgentError> {
+        self.inner
+            .tasks
+            .spawn(self.clone().take_and_start_trigger_input(chat_id, pending))
+            .await
+            .map_err(|error| AgentError::Invalid(format!("taking Trigger input failed: {error}")))?
+    }
+
+    /// The whole take, within the Chat's Trigger boundary: under the Chat's lease, while no
+    /// other process paused receiving, once its source proved it again, the input starts, its
+    /// start is recorded durably before the boundary is left, and its run is started. Its future
+    /// is named, not inferred: the run asks for the next input, which may be taken this way.
+    fn take_and_start_trigger_input(
+        self,
+        chat_id: ChatId,
+        pending: PendingInput,
+    ) -> futures_util::future::BoxFuture<'static, Result<TriggerTake, AgentError>> {
+        Box::pin(async move { self.take_and_start(chat_id, &pending).await })
+    }
+
+    async fn take_and_start(
+        &self,
+        chat_id: ChatId,
         pending: &PendingInput,
-    ) -> Result<Option<Option<(Receipt, ModelRequest, CancellationToken)>>, AgentError> {
+    ) -> Result<TriggerTake, AgentError> {
         let source = pending
             .trigger_source
             .as_ref()
@@ -3730,29 +3826,46 @@ impl Agent {
             }
             | loop_lease::TriggerPermit::Failed(_) => {
                 self.retry_waiting_trigger_input(chat_id);
-                return Ok(Some(None));
+                return Ok(TriggerTake::Waits);
             }
             loop_lease::TriggerPermit::Wait {
                 recoverable: false, ..
             }
-            | loop_lease::TriggerPermit::Withdrawn => return Ok(Some(None)),
+            | loop_lease::TriggerPermit::Withdrawn => return Ok(TriggerTake::Waits),
         };
+        // Another take of the same input may have started it while this one waited for the
+        // boundary: only a take that finds it still waiting here goes on, so no take starts or
+        // takes back what another one started.
+        if let Some(take) = taken_elsewhere(
+            self.inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?,
+            pending,
+        ) {
+            return Ok(take);
+        }
         // Boxed: proving a source must not enlarge every run's shared async stack.
         let validation = Box::pin(self.revalidate_trigger_source(chat_id, source)).await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if let Some(take) = taken_elsewhere(chat, pending) {
+            return Ok(take);
+        }
         if validation.is_err() {
             self.withdraw_trigger_input(chat, &pending.receipt, DiscardReason::SourceEnded);
             self.withdraw_ended_inputs(chat);
             self.save(&chat.snapshot);
-            return Ok(None);
+            return Ok(TriggerTake::LookAgain);
         }
         // Within the boundary nothing releases the lease, but the input waits rather than
         // start under a holding that is gone.
         if !self.inner.chat_leases.stands(chat_id, holding) {
             drop(chats);
             self.retry_waiting_trigger_input(chat_id);
-            return Ok(Some(None));
+            return Ok(TriggerTake::Waits);
         }
         #[cfg(any(test, feature = "test-support"))]
         let chat = {
@@ -3762,31 +3875,200 @@ impl Agent {
             chats = self.inner.chats.lock().await;
             chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?
         };
-        match self.select_next_run(chat, Some(pending))? {
-            RunAdmission::Idle => Ok(Some(None)),
-            RunAdmission::ValidateTrigger(_) => Ok(None),
+        // The start alone is recorded first, before the input enters the conversation or its
+        // run begins, so another process taking the lease over finds it started; until it is
+        // recorded the start can be taken back by a record after it.
+        chat.bookkeeping
+            .lifecycle
+            .start_ahead(pending.receipt.run_id);
+        self.save(&chat.snapshot);
+        drop(chats);
+        let Some(boundary) = self.record_trigger_start(chat_id, pending, boundary).await else {
+            return Ok(TriggerTake::Waits);
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point(
+            chat_id,
+            wakeup::trigger_pauses::PausePoint::TriggerStartRecorded,
+        )
+        .await;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let admission = match self.select_next_run(chat, Some(pending)) {
+            Ok(admission) => admission,
+            Err(error) => {
+                // A selection that fails changes nothing of the Chat: the input never started,
+                // and waits again.
+                chat.bookkeeping.lifecycle.take_start_back(pending);
+                self.save(&chat.snapshot);
+                return Err(error);
+            }
+        };
+        if !matches!(&admission, RunAdmission::Ready(receipt, ..) if receipt.run_id == pending.receipt.run_id)
+        {
+            // Something else came first: the start is taken back, and the input waits again.
+            chat.bookkeeping.lifecycle.take_start_back(pending);
+            self.save(&chat.snapshot);
+        }
+        match admission {
+            RunAdmission::Idle => Ok(TriggerTake::Waits),
+            RunAdmission::ValidateTrigger(_) => Ok(TriggerTake::LookAgain),
             RunAdmission::Ready(receipt, request, cancel) => {
-                // Another process taking the lease over after this boundary finds it started.
-                if let Some(chat) = chats.get(&chat_id)
-                    && let Err(error) = self
-                        .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-                        .await
-                {
-                    self.inner.chat_leases.set_notice(
-                        chat_id,
-                        tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
-                        format!(
-                            "the start of a Trigger input could not be recorded durably \
-                             ({error}); another Tickloop process taking this Chat over may \
-                             run it again"
-                        ),
-                    );
-                }
                 drop(chats);
+                #[cfg(any(test, feature = "test-support"))]
+                self.pause_point(chat_id, wakeup::trigger_pauses::PausePoint::TriggerStarted)
+                    .await;
+                // Its prompt is recorded before its run begins: a load that finds the start
+                // without the prompt after it knows the run never began.
+                if !self.record_trigger_prompt(chat_id, &cancel).await {
+                    return Ok(TriggerTake::Waits);
+                }
                 drop(boundary);
-                Ok(Some(Some((receipt, request, cancel))))
+                self.run_task((receipt, request, cancel));
+                Ok(TriggerTake::Started)
             }
         }
+    }
+
+    /// Records durably the start of the Trigger input `pending`, within the Chat's boundary,
+    /// trying again after a delay that doubles while the Transcript cannot be written, and gives
+    /// the boundary back once it is recorded. Otherwise the start is taken back by a record
+    /// after it, which the same Transcript writes in order, so whatever lands of the two, the
+    /// latest has the input accepted and not started: as receiving pauses here, as the Agent
+    /// shuts down, and past the budget, when receiving pauses here too, the lease kept, until
+    /// the Chat is continued.
+    async fn record_trigger_start(
+        &self,
+        chat_id: ChatId,
+        pending: &PendingInput,
+        boundary: loop_lease::TriggerBoundary,
+    ) -> Option<loop_lease::TriggerBoundary> {
+        // Nothing of the Chat is stored yet, so no other process can take it over.
+        if !self.transcript_materialized(chat_id) {
+            return Some(boundary);
+        }
+        let began = tokio::time::Instant::now();
+        let mut delay = TRIGGER_START_RETRY_FIRST;
+        loop {
+            let recorded = {
+                let mut chats = self.inner.chats.lock().await;
+                let chat = chats.get_mut(&chat_id)?;
+                if !chat
+                    .bookkeeping
+                    .lifecycle
+                    .is_started(pending.receipt.run_id)
+                {
+                    // Settled meanwhile, as withdrawn: nothing to take back.
+                    return None;
+                }
+                if !chat.snapshot.chat_loop.receiving.is_receiving() {
+                    chat.bookkeeping.lifecycle.take_start_back(pending);
+                    self.save(&chat.snapshot);
+                    return None;
+                }
+                self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                    .await
+            };
+            let Err(error) = recorded else {
+                return Some(boundary);
+            };
+            if began.elapsed() >= trigger_start_budget() {
+                self.pause_for_unwritable_transcript(chat_id, pending, &error)
+                    .await;
+                return None;
+            }
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                format!(
+                    "a Trigger input waits to start until its start is recorded in the \
+                     Transcript: {error}"
+                ),
+            );
+            #[cfg(any(test, feature = "test-support"))]
+            self.pause_point(
+                chat_id,
+                wakeup::trigger_pauses::PausePoint::TriggerStartRetrying,
+            )
+            .await;
+            tokio::select! {
+                _ = self.inner.shutdown.cancelled() => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.pause_point(
+                        chat_id,
+                        wakeup::trigger_pauses::PausePoint::TriggerStartAbandoned,
+                    )
+                    .await;
+                    if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+                        chat.bookkeeping.lifecycle.take_start_back(pending);
+                        self.save(&chat.snapshot);
+                    }
+                    return None;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);
+        }
+    }
+
+    /// Records the started input's prompt, trying again while the Transcript cannot be written;
+    /// whether its run may begin: once recorded, or once interrupted, when the run only ends.
+    /// A shutdown leaves the run unbegun: a prompt that never lands has the next load start the
+    /// input again, and one that lands late leaves it as one whose run may have begun.
+    async fn record_trigger_prompt(&self, chat_id: ChatId, cancel: &CancellationToken) -> bool {
+        let mut delay = TRIGGER_START_RETRY_FIRST;
+        loop {
+            let recorded = match self.inner.chats.lock().await.get(&chat_id) {
+                Some(chat) => {
+                    self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
+                        .await
+                }
+                None => return false,
+            };
+            let Err(error) = recorded else {
+                return true;
+            };
+            self.inner.chat_leases.set_notice(
+                chat_id,
+                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                format!(
+                    "a Trigger input waits to begin until its prompt is recorded in the \
+                     Transcript: {error}"
+                ),
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return !self.inner.closed.load(Ordering::SeqCst),
+                _ = self.inner.shutdown.cancelled() => return false,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(TRIGGER_START_RETRY_LONGEST);
+        }
+    }
+
+    /// The Transcript took no start for longer than the budget: the start is taken back,
+    /// receiving pauses here, and the user is told; the lease stays, so no other process runs
+    /// what may yet land as started here.
+    async fn pause_for_unwritable_transcript(
+        &self,
+        chat_id: ChatId,
+        pending: &PendingInput,
+        error: &str,
+    ) {
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+            chat.bookkeeping.lifecycle.take_start_back(pending);
+            chat.snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                reason: tickloop_agent_protocol::PauseReason::TranscriptUnavailable,
+            };
+            self.save(&chat.snapshot);
+        }
+        self.inner.chat_leases.set_notice(
+            chat_id,
+            tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+            format!(
+                "this Chat's Transcript cannot be written ({error}); receiving paused, and the \
+                 Trigger input waits. Continue the Chat to receive again"
+            ),
+        );
     }
 
     fn select_next_run(
@@ -4788,6 +5070,7 @@ impl Agent {
 
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.chat_leases.close();
         for chat in self.inner.chats.lock().await.values() {
             self.release_runs_at_shutdown(chat);
         }
@@ -4846,8 +5129,10 @@ impl Agent {
                 reviewer.close_chat(chat_id).await;
             }
         }
-        self.inner.chat_leases.release_all();
+        // The last writes land before the leases go back: none lands after another process took
+        // a Chat over.
         self.close_transcripts().await;
+        self.inner.chat_leases.release_all();
     }
 }
 

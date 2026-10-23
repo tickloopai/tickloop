@@ -193,6 +193,7 @@ pub struct FaultyTranscriptStore {
     inner: Arc<dyn TranscriptStore>,
     faults: Mutex<Faults>,
     loads_released: tokio::sync::Notify,
+    appends_released: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -205,6 +206,8 @@ struct Faults {
     batches: Vec<BatchId>,
     holds_loads: bool,
     waiting_loads: usize,
+    holds_appends: bool,
+    waiting_appends: usize,
 }
 
 impl FaultyTranscriptStore {
@@ -213,7 +216,23 @@ impl FaultyTranscriptStore {
             inner,
             faults: Mutex::default(),
             loads_released: tokio::sync::Notify::new(),
+            appends_released: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Every later append reaches the store and waits there until `release_appends`.
+    pub fn hold_appends(&self) {
+        self.faults.lock().unwrap().holds_appends = true;
+    }
+
+    pub fn release_appends(&self) {
+        self.faults.lock().unwrap().holds_appends = false;
+        self.appends_released.notify_waiters();
+    }
+
+    /// How many appends wait in the store for `release_appends`.
+    pub fn waiting_appends(&self) -> usize {
+        self.faults.lock().unwrap().waiting_appends
     }
 
     /// Every later load reads what the store holds now, then waits until `release_loads` to
@@ -334,6 +353,20 @@ impl TranscriptStore for FaultyTranscriptStore {
         batch: &AppendBatch,
     ) -> Result<AppendAck, TranscriptError> {
         self.before_append(batch)?;
+        loop {
+            let released = self.appends_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            {
+                let mut faults = self.faults.lock().unwrap();
+                if !faults.holds_appends {
+                    break;
+                }
+                faults.waiting_appends += 1;
+            }
+            released.await;
+            self.faults.lock().unwrap().waiting_appends -= 1;
+        }
         let result = self.inner.append(chat, batch).await;
         self.after_append(result)
     }

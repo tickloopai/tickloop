@@ -22,8 +22,10 @@ impl Agent {
     /// answer lost its host, unless it lost its host three times in a row; the inputs that were
     /// queued are queued again after them; suspended Runs are rebuilt. With process wait
     /// hosting, unconsumed family messages retain their delivery state, and Trigger inputs
-    /// are queued again since their sources already moved past them. Other inputs the Agent
-    /// queued for itself are lost with the process.
+    /// are queued again since their sources already moved past them; what the load makes of
+    /// the Trigger records is its guess, never recorded, since another process may hold the
+    /// Chat's lease and go on with them. Other inputs the Agent queued for itself are lost with
+    /// the process.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -31,6 +33,8 @@ impl Agent {
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     return;
                 };
+                let before = chat.bookkeeping.lifecycle.trigger_revisions();
+                chat.bookkeeping.lifecycle.reopen_started_ahead();
                 let survives_restart = |pending: &PendingInput| {
                     is_trigger_input(pending) || pending.agent_message.is_some()
                 };
@@ -44,6 +48,9 @@ impl Agent {
                     .collect::<std::collections::HashSet<_>>();
                 self.forget_inputs(chat, |entry| !waiting.contains(&entry.run_id));
                 self.requeue_inputs(chat, survives_restart);
+                chat.bookkeeping
+                    .lifecycle
+                    .leave_trigger_guesses_unrecorded(before);
                 self.save(&chat.snapshot);
             }
             WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,
@@ -58,6 +65,7 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
+        chat.bookkeeping.lifecycle.reopen_started_ahead();
         self.continue_lost_inputs(chat);
         self.requeue_inputs(chat, |_| true);
         self.save(&chat.snapshot);

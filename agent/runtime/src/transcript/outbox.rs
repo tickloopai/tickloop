@@ -223,6 +223,21 @@ impl TranscriptOutbox {
     }
 
     pub(crate) fn enqueue(&self, chat: ChatId, lines: Vec<Line>, events_through: Option<u64>) {
+        self.enqueue_group(chat, lines, Vec::new(), events_through);
+    }
+
+    /// Queues `lines` and then `source_states` as one group: every batch holds all of it or none
+    /// of it, so the store commits it whole or not at all. The records of a Trigger source's own
+    /// state, which its lease holder writes, are never kept to be written again as metadata, nor
+    /// folded into a retained snapshot, so no stale copy of them is written by a process that
+    /// does not hold the lease; they follow a snapshot the group makes, as a compaction's.
+    pub(crate) fn enqueue_group(
+        &self,
+        chat: ChatId,
+        lines: Vec<Line>,
+        source_states: Vec<Line>,
+        events_through: Option<u64>,
+    ) {
         let mut chats = self.chats.lock().unwrap();
         let Some(outbox) = chats.get_mut(&chat) else {
             return;
@@ -233,10 +248,10 @@ impl TranscriptOutbox {
         if let Some(events_through) = events_through {
             outbox.events_through = outbox.events_through.max(events_through);
         }
-        if lines.is_empty() {
+        if lines.is_empty() && source_states.is_empty() {
             return;
         }
-        let mut accepted = Vec::with_capacity(lines.len());
+        let mut accepted = Vec::with_capacity(lines.len() + source_states.len() + 1);
         for line in lines {
             if let Some(entry) = line.chain_entry()
                 && !outbox.written_uuids.insert(entry.uuid)
@@ -258,6 +273,8 @@ impl TranscriptOutbox {
             outbox.retained.apply(&snapshot);
             accepted.push(snapshot);
         }
+        // After the snapshot, which does not stand for them.
+        accepted.extend(source_states);
         if !outbox.materialized {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()
@@ -312,6 +329,15 @@ impl TranscriptOutbox {
 
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// Whether a batch of the Chat the store failed to take waits to be appended again.
+    pub(crate) fn holds_failed_batch(&self, chat: ChatId) -> bool {
+        self.chats
+            .lock()
+            .unwrap()
+            .get(&chat)
+            .is_some_and(|outbox| outbox.pending.is_some() && outbox.write_failure.is_some())
     }
 
     pub(crate) fn has_queued(&self, chat: ChatId) -> bool {

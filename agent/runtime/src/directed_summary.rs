@@ -250,12 +250,14 @@ impl Agent {
             .map(|history| history.rename_messages(&renamed))
             .unwrap_or_default();
         if let Some(recorder) = &self.inner.recorder {
+            let source_states = self.source_records_for_compaction(chat);
             recorder.compact(
                 chat,
                 &candidate,
                 &candidate_bookkeeping,
                 &layout,
                 &renamed_snapshots,
+                source_states,
             );
         }
         self.save(&candidate);

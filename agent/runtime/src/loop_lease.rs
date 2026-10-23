@@ -46,14 +46,22 @@ use super::Agent;
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically,
 };
-use tickloop_agent_protocol::{ChatId, LoopTriggerNotice, LoopTriggerNoticeKind};
+use tickloop_agent_protocol::{
+    ChatId, LoopTriggerNotice, LoopTriggerNoticeKind, PauseReason, Receiving,
+};
 
 const LEASE_DIRECTORY: &str = "trigger";
 const LEASE_FILE: &str = "lease.lock";
 const STATE_FILE: &str = "receiving.state";
 const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
+/// How long a write of the receiving switch waits for another process's write before it tries
+/// again.
+const RECEIVING_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
+/// How long a source waits to enter the Chat's Trigger boundary before it hears the Chat is
+/// busy: a take holds the boundary while the record of its start is retried.
+const SOURCE_BOUNDARY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const HELD_ELSEWHERE_MESSAGE: &str =
     "another Tickloop process holds this Chat's Trigger; the event was not delivered";
 
@@ -125,7 +133,14 @@ enum LeaseCheck {
     },
     HeldElsewhere,
     ForeignHost(String),
-    PausedElsewhere(u64),
+    /// Held, while another process recorded a pause newer than this one knows.
+    PausedElsewhere {
+        generation: u64,
+        epoch: u64,
+        synced: bool,
+    },
+    /// The Agent is shutting down or handing over: no lease is taken any more.
+    Closing,
 }
 
 /// 一次送达前的判断结果。
@@ -144,10 +159,38 @@ pub(super) enum TriggerPermit {
     Failed(String),
 }
 
+/// What taking a Chat's lease came to.
+pub(super) enum LeaseTaken {
+    /// Held, the Chat's Trigger state taken over.
+    Held(LeaseHolding),
+    /// Held, while another process paused receiving: this one pauses too.
+    PausedElsewhere(LeaseHolding),
+}
+
+/// Why a Chat's lease could not be taken.
+pub(super) enum LeaseRefused {
+    NotLoaded,
+    /// Another live process holds it.
+    HeldElsewhere,
+    /// A lock written on another host holds it.
+    ForeignHost(String),
+    Closing,
+    /// The lease files, or the Transcript the takeover reads, could not be used.
+    Failed(String),
+}
+
 /// The lease holding a permit was given under; `None` where a host needs no lease, as one that
 /// keeps waits durably or saves no Chats.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LeaseHolding(Option<u64>);
+
+impl LeaseHolding {
+    /// Whether another process may take the lease once it goes back: what must reach the store
+    /// before it does waits for the store.
+    pub(super) fn passes_on(self) -> bool {
+        self.0.is_some()
+    }
+}
 
 /// How long a Chat whose Trigger input waits on a failed permit waits before the first retry,
 /// doubling with each failure up to the longest.
@@ -180,12 +223,18 @@ struct HeldLease {
 #[derive(Default)]
 pub(super) struct ChatLeases {
     held: Mutex<HashMap<ChatId, HeldLease>>,
+    /// Set as the Agent shuts down, under `held`: a check after it takes no lease, so none is
+    /// taken after the leases are released.
+    closing: std::sync::atomic::AtomicBool,
     epochs: std::sync::atomic::AtomicU64,
     boundaries: Mutex<HashMap<ChatId, Arc<tokio::sync::Mutex<()>>>>,
     retry_ids: std::sync::atomic::AtomicU64,
     known_generations: Mutex<HashMap<ChatId, u64>>,
     notices: Mutex<HashMap<ChatId, LoopTriggerNotice>>,
     retries: Mutex<HashMap<ChatId, PermitRetry>>,
+    /// How many wait to enter each Chat's boundary, for tests to know a waiter is in place.
+    #[cfg(any(test, feature = "test-support"))]
+    boundary_waiters: Arc<Mutex<HashMap<ChatId, usize>>>,
 }
 
 impl ChatLeases {
@@ -193,39 +242,50 @@ impl ChatLeases {
     /// 因为自己的 flock 而误判为被其他进程持有。
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
-        let (epoch, synced) = {
+        // The holding is taken out of `held` while its files are looked at, so no file work is
+        // done under the lock every Chat shares; the Chat's boundary keeps anyone else of this
+        // process from its holding meanwhile, and a shutdown that closes meanwhile finds it
+        // closing below.
+        let taken = {
             let mut held = self.held.lock().unwrap();
-            // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
-            if held
-                .get(&key)
-                .is_some_and(|holding| !holding.lease.is_still_at_path())
-            {
-                held.remove(&key);
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(LeaseCheck::Closing);
             }
-            let holding = match held.entry(key) {
-                std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
-                std::collections::hash_map::Entry::Vacant(vacant) => {
-                    match try_acquire(directory, chat_id)? {
-                        LeaseAttempt::Acquired(lease) => vacant.insert(HeldLease {
-                            lease,
-                            epoch: self
-                                .epochs
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                            synced: false,
-                        }),
-                        LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
-                        LeaseAttempt::ForeignHost(host) => {
-                            return Ok(LeaseCheck::ForeignHost(host));
-                        }
-                    }
-                }
-            };
-            (holding.epoch, holding.synced)
+            held.remove(&key)
         };
+        // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
+        let holding = match taken.filter(|holding| holding.lease.is_still_at_path()) {
+            Some(holding) => holding,
+            None => match try_acquire(directory, chat_id)? {
+                LeaseAttempt::Acquired(lease) => HeldLease {
+                    lease,
+                    epoch: self
+                        .epochs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    synced: false,
+                },
+                LeaseAttempt::HeldElsewhere => return Ok(LeaseCheck::HeldElsewhere),
+                LeaseAttempt::ForeignHost(host) => return Ok(LeaseCheck::ForeignHost(host)),
+            },
+        };
+        let (epoch, synced) = (holding.epoch, holding.synced);
+        {
+            let mut held = self.held.lock().unwrap();
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(held);
+                drop(holding);
+                return Ok(LeaseCheck::Closing);
+            }
+            held.insert(key, holding);
+        }
         let known = self.known_generation(key);
         Ok(match read_receiving(directory)? {
             Some(state) if !state.receiving && state.generation > known => {
-                LeaseCheck::PausedElsewhere(state.generation)
+                LeaseCheck::PausedElsewhere {
+                    generation: state.generation,
+                    epoch,
+                    synced,
+                }
             }
             Some(_) | None => LeaseCheck::Held { epoch, synced },
         })
@@ -237,15 +297,6 @@ impl ChatLeases {
             .unwrap()
             .get(&chat_id)
             .is_some_and(|holding| holding.epoch == epoch && holding.synced)
-    }
-
-    /// The epoch of the Chat's current holding, if this process holds its lease.
-    fn holding_epoch(&self, chat_id: ChatId) -> Option<u64> {
-        self.held
-            .lock()
-            .unwrap()
-            .get(&chat_id)
-            .map(|holding| holding.epoch)
     }
 
     /// The holding `epoch` took the Chat's Trigger state over, and a retry waiting for it is no
@@ -263,20 +314,13 @@ impl ChatLeases {
         self.cancel_retry(chat_id);
     }
 
-    /// Releases the holding `epoch` only: a pause releases what was held when it was asked for,
-    /// never a holding taken after it.
-    fn release_holding(&self, chat_id: ChatId, epoch: u64) {
-        let released = {
-            let mut held = self.held.lock().unwrap();
-            match held.get(&chat_id) {
-                Some(holding) if holding.epoch == epoch => held.remove(&chat_id),
-                Some(_) | None => None,
-            }
-        };
-        if released.is_some() {
-            self.cancel_retry(chat_id);
-            self.clear_notice(chat_id);
-        }
+    /// The holding this process has of the Chat's lease, synced or not.
+    pub(super) fn holding(&self, chat_id: ChatId) -> Option<LeaseHolding> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .map(|holding| LeaseHolding(Some(holding.epoch)))
     }
 
     /// Whether a permit given under `holding` still stands: the lease it was given under is still
@@ -381,6 +425,14 @@ impl ChatLeases {
         self.clear_notice(chat_id);
     }
 
+    /// No lease is taken from now on; set under `held`, so a check in progress either put its
+    /// lease back before, for `release_all` to release, or drops it.
+    pub(super) fn close(&self) {
+        let _held = self.held.lock().unwrap();
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(super) fn release_all(&self) {
         let released = std::mem::take(&mut *self.held.lock().unwrap());
         drop(released);
@@ -390,6 +442,33 @@ impl ChatLeases {
             }
         }
         self.notices.lock().unwrap().clear();
+    }
+}
+
+/// Counts one waiter of a Chat's boundary while it waits, whether it gets in or is dropped.
+#[cfg(any(test, feature = "test-support"))]
+struct BoundaryWaiter {
+    waiters: Arc<Mutex<HashMap<ChatId, usize>>>,
+    chat_id: ChatId,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl BoundaryWaiter {
+    fn new(waiters: &Arc<Mutex<HashMap<ChatId, usize>>>, chat_id: ChatId) -> Self {
+        *waiters.lock().unwrap().entry(chat_id).or_default() += 1;
+        Self {
+            waiters: waiters.clone(),
+            chat_id,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for BoundaryWaiter {
+    fn drop(&mut self) {
+        if let Some(count) = self.waiters.lock().unwrap().get_mut(&self.chat_id) {
+            *count -= 1;
+        }
     }
 }
 
@@ -509,20 +588,30 @@ fn read_receiving(directory: &PrivateDirectory) -> io::Result<Option<ReceivingRe
 }
 
 /// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态。
-fn write_receiving(
-    directory: &PrivateDirectory,
-    change: ReceivingChange,
-) -> io::Result<ReceivingRecord> {
+fn open_receiving_write_lock(directory: &PrivateDirectory) -> io::Result<File> {
     directory.create()?;
-    let guard = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(PRIVATE_FILE_MODE)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.path().join(STATE_WRITE_LOCK_FILE))?;
-    guard.lock()?;
+        .open(directory.path().join(STATE_WRITE_LOCK_FILE))
+}
+
+/// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态；写锁正被别的进程持有时返回
+/// `None`，由调用方稍后再试。
+fn write_receiving(
+    directory: &PrivateDirectory,
+    change: ReceivingChange,
+) -> io::Result<Option<ReceivingRecord>> {
+    let guard = open_receiving_write_lock(directory)?;
+    match guard.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
     let current = read_receiving(directory)?;
     let next = ReceivingRecord {
         generation: current.map_or(0, |current| current.generation) + 1,
@@ -535,7 +624,7 @@ fn write_receiving(
     };
     let contents = serde_json::to_vec(&next).map_err(io::Error::other)?;
     replace_file_atomically(&receiving_path(directory), &contents, PRIVATE_FILE_MODE)?;
-    Ok(next)
+    Ok(Some(next))
 }
 
 impl Agent {
@@ -550,39 +639,104 @@ impl Agent {
 
     /// Enters the Chat's Trigger boundary, waiting while another holds it.
     pub(super) async fn enter_trigger_boundary(&self, chat_id: ChatId) -> TriggerBoundary {
+        #[cfg(any(test, feature = "test-support"))]
+        let _waiting = BoundaryWaiter::new(&self.inner.chat_leases.boundary_waiters, chat_id);
         self.inner.chat_leases.boundary(chat_id).lock_owned().await
     }
 
-    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
-    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
-    pub(super) async fn acquire_trigger_permit(
+    /// Whether this process holds the Chat's lease and took the Chat over under it, so it alone
+    /// writes the records of the Trigger sources' state. A host that keeps waits durably, or
+    /// keeps no Transcript, always does until it closes.
+    pub(super) fn holds_trigger_lease(&self, chat_id: ChatId) -> bool {
+        let leases = &self.inner.chat_leases;
+        if leases.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.recorder.is_none()
+            || self.inner.waits == super::WaitHosting::Durable
+            || leases
+                .holding(chat_id)
+                .is_some_and(|holding| leases.stands(chat_id, holding))
+    }
+
+    /// Gives the Chat's lease back, unless a batch of its Transcript the store failed to take
+    /// still waits to be appended again: appended after another process took the lease over, it
+    /// would land after that process's records, as a source's stale state among them. The lease
+    /// goes back with a later release once the batch is in, or with the process.
+    pub(super) fn release_trigger_lease(&self, chat_id: ChatId) {
+        if self.transcript_holds_failed_batch(chat_id) {
+            return;
+        }
+        self.inner.chat_leases.release(chat_id);
+    }
+
+    /// Enters the Chat's Trigger boundary for a source, as long as it is free soon enough;
+    /// `None` while it stays held.
+    pub(super) async fn enter_trigger_boundary_for_source(
+        &self,
+        chat_id: ChatId,
+    ) -> Option<TriggerBoundary> {
+        tokio::time::timeout(SOURCE_BOUNDARY_WAIT, self.enter_trigger_boundary(chat_id))
+            .await
+            .ok()
+    }
+
+    /// How many wait to enter the Chat's Trigger boundary now.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn trigger_boundary_waiters_for_tests(&self, chat_id: ChatId) -> usize {
+        self.inner
+            .chat_leases
+            .boundary_waiters
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Takes the Chat's lease within its boundary, whether the Loop receives or not: a holding
+    /// newly taken takes the Chat's Trigger state over first.
+    pub(super) async fn take_lease(
         &self,
         chat_id: ChatId,
         _within: &TriggerBoundary,
-    ) -> TriggerPermit {
+    ) -> Result<LeaseTaken, LeaseRefused> {
+        if self
+            .inner
+            .chat_leases
+            .closing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LeaseRefused::Closing);
+        }
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
-            return TriggerPermit::Fire(LeaseHolding(None));
+            return Ok(LeaseTaken::Held(LeaseHolding(None)));
         }
         let Some(directory) = self.lease_directory(chat_id).await else {
-            return TriggerPermit::Wait {
-                reason: "chat is no longer loaded".into(),
-                recoverable: false,
-            };
+            return Err(LeaseRefused::NotLoaded);
         };
-        let agent = self.clone();
-        let checked =
-            tokio::task::spawn_blocking(move || agent.inner.chat_leases.check(&directory, chat_id))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|checked| checked.map_err(|error| error.to_string()));
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_point_blocking(
+            chat_id,
+            super::wakeup::trigger_pauses::PausePoint::LeaseChecking,
+        );
+        // Done here, not on the blocking pool: a few small local files and a lock it only tries,
+        // and nothing of it may outlive the boundary, as work handed to the pool would once its
+        // waiter is dropped.
+        let checked = self
+            .inner
+            .chat_leases
+            .check(&directory, chat_id)
+            .map_err(|error| error.to_string());
         let leases = &self.inner.chat_leases;
-        match checked {
+        let (epoch, synced, paused_elsewhere) = match checked {
             Err(error) => {
                 let message = format!("could not take this Chat's Trigger lease: {error}");
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                TriggerPermit::Failed(message)
+                return Err(LeaseRefused::Failed(message));
             }
             Ok(LeaseCheck::HeldElsewhere) => {
                 leases.set_notice(
@@ -590,10 +744,7 @@ impl Agent {
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
                     "another Tickloop process holds this Chat's Trigger".into(),
                 );
-                TriggerPermit::Wait {
-                    reason: HELD_ELSEWHERE_MESSAGE.into(),
-                    recoverable: true,
-                }
+                return Err(LeaseRefused::HeldElsewhere);
             }
             Ok(LeaseCheck::ForeignHost(host)) => {
                 let message = format!(
@@ -602,46 +753,113 @@ impl Agent {
                      Remove the lock file if that host no longer runs Tickloop"
                 );
                 leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                TriggerPermit::Wait {
+                return Err(LeaseRefused::ForeignHost(message));
+            }
+            Ok(LeaseCheck::Closing) => return Err(LeaseRefused::Closing),
+            Ok(LeaseCheck::PausedElsewhere {
+                generation,
+                epoch,
+                synced,
+            }) => {
+                leases.remember_generation(chat_id, generation);
+                (epoch, synced, true)
+            }
+            Ok(LeaseCheck::Held { epoch, synced }) => (epoch, synced, false),
+        };
+        if !synced {
+            if let Err(error) = self.reload_trigger_state(chat_id).await {
+                let message = format!(
+                    "could not take over this Chat's Trigger state from its Transcript: {error}; \
+                     no Trigger is delivered until it can"
+                );
+                leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
+                return Err(LeaseRefused::Failed(message));
+            }
+            leases.mark_synced(chat_id, epoch);
+        }
+        let holding = LeaseHolding(Some(epoch));
+        Ok(if paused_elsewhere {
+            LeaseTaken::PausedElsewhere(holding)
+        } else {
+            LeaseTaken::Held(holding)
+        })
+    }
+
+    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
+    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    pub(super) async fn acquire_trigger_permit(
+        &self,
+        chat_id: ChatId,
+        within: &TriggerBoundary,
+    ) -> TriggerPermit {
+        let holding = match self.take_lease(chat_id, within).await {
+            Ok(LeaseTaken::Held(holding)) => holding,
+            Ok(LeaseTaken::PausedElsewhere(_)) => {
+                self.pause_receiving_paused_elsewhere(chat_id).await;
+                return TriggerPermit::Withdrawn;
+            }
+            Err(LeaseRefused::NotLoaded) => {
+                return TriggerPermit::Wait {
+                    reason: "chat is no longer loaded".into(),
+                    recoverable: false,
+                };
+            }
+            Err(LeaseRefused::HeldElsewhere) => {
+                return TriggerPermit::Wait {
+                    reason: HELD_ELSEWHERE_MESSAGE.into(),
+                    recoverable: true,
+                };
+            }
+            Err(LeaseRefused::ForeignHost(message)) => {
+                return TriggerPermit::Wait {
                     reason: message,
                     recoverable: true,
-                }
+                };
             }
-            Ok(LeaseCheck::PausedElsewhere(generation)) => {
-                leases.remember_generation(chat_id, generation);
-                self.pause_receiving_paused_elsewhere(chat_id).await;
-                TriggerPermit::Withdrawn
+            Err(LeaseRefused::Closing) => {
+                return TriggerPermit::Wait {
+                    reason: "this Agent is shutting down".into(),
+                    recoverable: false,
+                };
             }
-            Ok(LeaseCheck::Held { epoch, synced }) => {
-                if !synced {
-                    if let Err(error) = self.reload_trigger_state(chat_id).await {
-                        let message = format!(
-                            "could not take over this Chat's Trigger state from its \
-                             Transcript: {error}; no Trigger is delivered until it can"
-                        );
-                        leases.set_notice(chat_id, LoopTriggerNoticeKind::Warning, message.clone());
-                        return TriggerPermit::Failed(message);
-                    }
-                    leases.mark_synced(chat_id, epoch);
-                }
-                let is_receiving = self
-                    .inner
-                    .chats
-                    .lock()
-                    .await
-                    .get(&chat_id)
-                    .is_some_and(|chat| chat.snapshot.chat_loop.receiving.is_receiving());
-                if !is_receiving {
-                    leases.release(chat_id);
-                    return TriggerPermit::Wait {
-                        reason: "this Chat's Loop is not receiving".into(),
-                        recoverable: false,
-                    };
-                }
-                leases.clear_notice(chat_id);
-                TriggerPermit::Fire(LeaseHolding(Some(epoch)))
+            Err(LeaseRefused::Failed(message)) => return TriggerPermit::Failed(message),
+        };
+        if holding.0.is_none() {
+            return TriggerPermit::Fire(holding);
+        }
+        let leases = &self.inner.chat_leases;
+        let receiving = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .map(|chat| chat.snapshot.chat_loop.receiving);
+        match receiving {
+            Some(Receiving::Receiving) => {}
+            // The process keeps the lease while its Transcript cannot take a start: no other
+            // process runs what it may have started.
+            Some(Receiving::Paused {
+                reason: PauseReason::TranscriptUnavailable,
+            }) => {
+                return TriggerPermit::Wait {
+                    reason: "this Chat's Loop paused: its Transcript cannot be written".into(),
+                    recoverable: false,
+                };
+            }
+            Some(Receiving::Paused {
+                reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
+            })
+            | None => {
+                self.release_trigger_lease(chat_id);
+                return TriggerPermit::Wait {
+                    reason: "this Chat's Loop is not receiving".into(),
+                    recoverable: false,
+                };
             }
         }
+        leases.clear_notice(chat_id);
+        TriggerPermit::Fire(holding)
     }
 
     /// A permit for the Chat's waiting Trigger input failed: it is tried again after a delay
@@ -678,23 +896,22 @@ impl Agent {
 
     /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的
     /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。Within the Chat's
-    /// Trigger boundary: a pause releases the holding it was asked under, after whatever start
-    /// the boundary was recording.
-    pub(super) async fn record_receiving(&self, chat_id: ChatId, change: ReceivingChange) {
-        let asked_under = self.inner.chat_leases.holding_epoch(chat_id);
-        let _within = self.enter_trigger_boundary(chat_id).await;
+    /// Trigger boundary, as the end of the operation that turned the switch here.
+    pub(super) async fn record_receiving(
+        &self,
+        chat_id: ChatId,
+        change: ReceivingChange,
+        within: TriggerBoundary,
+    ) {
         let recorded = match self.lease_directory(chat_id).await {
-            Some(directory) if self.inner.recorder.is_some() => {
-                tokio::task::spawn_blocking(move || write_receiving(&directory, change))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|written| written.map_err(|error| error.to_string()))
-                    .map(|state| {
-                        self.inner
-                            .chat_leases
-                            .remember_generation(chat_id, state.generation)
-                    })
-            }
+            Some(directory) if self.inner.recorder.is_some() => self
+                .write_receiving_when_free(&directory, change)
+                .await
+                .map(|state| {
+                    self.inner
+                        .chat_leases
+                        .remember_generation(chat_id, state.generation)
+                }),
             Some(_) | None => Ok(()),
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -703,11 +920,44 @@ impl Agent {
             super::wakeup::trigger_pauses::PausePoint::ReceivingRecorded,
         )
         .await;
-        match (change, asked_under) {
-            (ReceivingChange::Paused, Some(epoch)) => {
-                self.inner.chat_leases.release_holding(chat_id, epoch);
+        match change {
+            ReceivingChange::Paused => {
+                // The sources stop with the Loop where the lease is, before it goes back.
+                let refused = match self.take_lease(chat_id, &within).await {
+                    Ok(LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding)) => {
+                        self.switch_sources(chat_id, holding, change).await;
+                        None
+                    }
+                    Err(refused) => Some(refused),
+                };
+                self.release_trigger_lease(chat_id);
+                if let Some(refused) = refused
+                    && self.has_trigger_source_states()
+                {
+                    self.inner.chat_leases.set_notice(
+                        chat_id,
+                        LoopTriggerNoticeKind::Warning,
+                        format!(
+                            "this Chat's Trigger sources, such as its goal or scheduled tasks, \
+                             did not stop here: {}; they stop where the lease is held once that \
+                             process learns of the stop",
+                            super::wakeup::SourceChangeError::from(refused)
+                        ),
+                    );
+                }
             }
-            (ReceivingChange::Paused, None) | (ReceivingChange::Resumed, _) => {}
+            ReceivingChange::Resumed => {
+                // The sources resume with the Loop under the lease. One taken for that alone
+                // goes back once they are recorded, for the first delivery to take as before.
+                let held_before = self.inner.chat_leases.holding(chat_id).is_some();
+                if self.has_trigger_source_states()
+                    && let Ok(LeaseTaken::Held(holding)) = self.take_lease(chat_id, &within).await
+                    && self.switch_sources(chat_id, holding, change).await
+                    && !held_before
+                {
+                    self.release_trigger_lease(chat_id);
+                }
+            }
         }
         if let Err(error) = recorded {
             self.inner.chat_leases.set_notice(
@@ -718,6 +968,28 @@ impl Agent {
                      processes may not see the change"
                 ),
             );
+        }
+    }
+
+    /// Writes the receiving switch once no other process holds its write lock, waiting between
+    /// tries without holding a thread; a shutdown ends the wait unwritten.
+    async fn write_receiving_when_free(
+        &self,
+        directory: &PrivateDirectory,
+        change: ReceivingChange,
+    ) -> Result<ReceivingRecord, String> {
+        loop {
+            match write_receiving(directory, change) {
+                Ok(Some(state)) => return Ok(state),
+                Ok(None) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            tokio::select! {
+                _ = self.inner.shutdown.cancelled() => {
+                    return Err("the Agent shut down before it could be written".into());
+                }
+                _ = tokio::time::sleep(RECEIVING_WRITE_RETRY) => {}
+            }
         }
     }
 
@@ -829,11 +1101,17 @@ mod tests {
     #[test]
     fn every_change_increases_the_generation() {
         let (_root, directory) = lease_directory();
-        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
-        let paused = write_receiving(&directory, ReceivingChange::Paused).unwrap();
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
+        let paused = write_receiving(&directory, ReceivingChange::Paused)
+            .unwrap()
+            .unwrap();
         assert!(resumed.receiving && !paused.receiving);
         assert_eq!(paused.generation, resumed.generation + 1);
-        let again = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        let again = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
         assert!(again.receiving);
         assert_eq!(again.generation, paused.generation + 1);
         assert!(read_receiving(&directory).unwrap().unwrap().receiving);
@@ -844,16 +1122,20 @@ mod tests {
         let (_root, directory) = lease_directory();
         let leases = ChatLeases::default();
         let chat_id = Uuid::new_v4();
-        let resumed = write_receiving(&directory, ReceivingChange::Resumed).unwrap();
+        let resumed = write_receiving(&directory, ReceivingChange::Resumed)
+            .unwrap()
+            .unwrap();
         leases.remember_generation(chat_id, resumed.generation);
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
             LeaseCheck::Held { .. }
         ));
-        write_receiving(&directory, ReceivingChange::Paused).unwrap();
+        write_receiving(&directory, ReceivingChange::Paused)
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             leases.check(&directory, chat_id).unwrap(),
-            LeaseCheck::PausedElsewhere(generation) if generation == resumed.generation + 1
+            LeaseCheck::PausedElsewhere { generation, .. } if generation == resumed.generation + 1
         ));
     }
 
