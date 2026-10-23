@@ -6767,10 +6767,19 @@ impl State {
     /// area.
     fn detail_area(&mut self) -> (usize, usize) {
         let frame = self.layout_frame();
-        (
-            self.monitor_columns().saturating_sub(2),
-            self.height.saturating_sub(frame.input.len()),
-        )
+        let width = self.monitor_columns().saturating_sub(2);
+        let height = self.height.saturating_sub(frame.input.len());
+        let height = if self.monitor.overlay {
+            height
+        } else {
+            self.monitor.side_content_height(
+                width,
+                height,
+                self.display,
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            )
+        };
+        (width, height)
     }
 
     #[cfg(test)]
@@ -7016,23 +7025,27 @@ impl State {
         };
         let side_columns = self.monitor_columns();
         let monitor_lines = self.monitor_visible().then(|| {
+            let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
+            let height = if self.monitor.overlay {
+                start
+            } else {
+                self.monitor.side_content_height(
+                    side_columns.saturating_sub(2),
+                    start,
+                    self.display,
+                    now_ms,
+                )
+            };
             if let Some(detail) = &mut self.monitor.detail {
                 return detail
-                    .lines(
-                        side_columns.saturating_sub(2),
-                        start,
-                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
-                    )
+                    .lines(side_columns.saturating_sub(2), height, now_ms)
                     .into_iter()
                     .map(|line| line.line)
                     .collect();
             }
-            let frame = self.monitor.frame(
-                side_columns.saturating_sub(2),
-                start,
-                self.display,
-                tickloop_agent_base::private_fs::unix_time_milliseconds(),
-            );
+            let frame =
+                self.monitor
+                    .frame(side_columns.saturating_sub(2), height, self.display, now_ms);
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
                 self.monitor_row_targets = frame
