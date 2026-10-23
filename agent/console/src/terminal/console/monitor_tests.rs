@@ -4499,7 +4499,7 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
     let terminal_rows = terminal.lines().collect::<Vec<_>>();
     assert!(terminal_rows[queue].contains("/loop 每分钟"), "{terminal}");
     assert!(
-        terminal_rows[divider - 1]
+        terminal_rows[divider - 2]
             .split_once('│')
             .unwrap()
             .1
@@ -4671,7 +4671,16 @@ fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
                 let (left, _) = row.split_once('│').unwrap();
                 assert_eq!(display_width(left), state.content_columns(), "{terminal}");
             }
-            assert!(rows[divider - 1].contains("◎ Finish"), "{terminal}");
+            assert!(rows[divider - 2].contains("◎ Finish"), "{terminal}");
+            assert!(
+                rows[divider - 1]
+                    .split_once('│')
+                    .unwrap()
+                    .1
+                    .trim()
+                    .is_empty(),
+                "{terminal}"
+            );
             if !suggestion {
                 assert!(
                     rows.iter()
@@ -4685,4 +4694,117 @@ fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
             }
         }
     }
+}
+
+#[test]
+fn side_monitor_leaves_a_bottom_row_above_the_chat_title_and_yields_it_when_short() {
+    for width in [80, 140] {
+        for height in [5, 6, 7, 10, 30] {
+            let mut state = docked_monitor_fixture(0, 0);
+            state.resize(width, height);
+            state.monitor.focused = false;
+            state.task_title = Some("Chat title".into());
+            let mut output = Vec::new();
+            state.draw_frame(&mut output).unwrap();
+            let terminal = tickloop_agent_test_support::screen::visible_screen(
+                &String::from_utf8_lossy(&output),
+                state.width,
+                state.height,
+            );
+            let rows = terminal.lines().collect::<Vec<_>>();
+            let divider = state.monitor_toggle_target.as_ref().unwrap().row;
+            let last = rows[divider - 1].split_once('│').unwrap().1.trim();
+            if divider > 3 {
+                assert!(last.is_empty(), "{width}x{height}: {terminal}");
+                assert!(rows[divider - 2].contains("◎ Finish"), "{terminal}");
+            } else {
+                assert!(last.starts_with("◎ Finish"), "{width}x{height}: {terminal}");
+            }
+            assert!(rows[divider].contains("Chat title"), "{terminal}");
+        }
+    }
+}
+
+#[test]
+fn side_monitor_bottom_padding_yields_before_section_gaps_and_pinned_content() {
+    let mut state = docked_monitor_fixture(3, 1);
+    let width = 48;
+    let minimum = 15;
+    for select_goal in [false, true] {
+        if select_goal {
+            state
+                .monitor
+                .select_target(&crate::terminal::monitor::MonitorTarget::Goal);
+        }
+        for height in [minimum, minimum + 1] {
+            let content_height = state
+                .monitor
+                .side_content_height(width, height, state.display, 0);
+            assert_eq!(content_height, minimum);
+            let frame = state.monitor.frame(width, content_height, state.display, 0);
+            let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+            for index in 1..=3 {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&format!("Scheduled instruction {index}"))),
+                    "{lines:#?}"
+                );
+            }
+            let scheduled = lines
+                .iter()
+                .position(|line| line == "Scheduled (3)")
+                .unwrap();
+            let goal = lines
+                .iter()
+                .position(|line| line.starts_with("Pursuing goal"))
+                .unwrap();
+            assert!(lines[scheduled - 1].is_empty());
+            assert!(lines[goal - 1].is_empty());
+            assert!(lines.last().unwrap().starts_with("◎ Finish"));
+        }
+    }
+}
+
+#[test]
+fn side_monitor_bottom_padding_preserves_a_wrapped_selected_tick() {
+    let mut state = docked_monitor_fixture(0, 1);
+    state.monitor.replace(
+        TickGroup::Ticks,
+        vec![shell(Uuid::new_v4(), &"long selected title ".repeat(20))],
+    );
+    state.monitor.focus(false, None);
+    let tick = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&tick);
+    assert!(state.monitor.selected().is_some());
+    let minimum = 8;
+    for height in [minimum, minimum + 1] {
+        let content_height = state
+            .monitor
+            .side_content_height(48, height, state.display, 0);
+        assert_eq!(content_height, minimum);
+        let frame = state.monitor.frame(48, content_height, state.display, 0);
+        assert_eq!(
+            frame.targets.len(),
+            2,
+            "both rows of the selected Tick remain visible"
+        );
+    }
+}
+
+#[test]
+fn monitor_bottom_padding_does_not_reduce_the_overlay() {
+    let mut state = docked_monitor_fixture(0, 0);
+    state.resize(60, 20);
+    state.monitor.focus(true, None);
+    let mut output = Vec::new();
+    state.draw_frame(&mut output).unwrap();
+    let terminal = tickloop_agent_test_support::screen::visible_screen(
+        &String::from_utf8_lossy(&output),
+        state.width,
+        state.height,
+    );
+    let rows = terminal.lines().collect::<Vec<_>>();
+    let divider = state.monitor_toggle_target.as_ref().unwrap().row;
+    assert!(rows[divider - 1].contains("◎ Finish"), "{terminal}");
 }

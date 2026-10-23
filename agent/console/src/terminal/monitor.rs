@@ -1113,6 +1113,78 @@ impl Monitor {
         hints.join(" · ")
     }
 
+    fn entry_lines(
+        &self,
+        entry: &MonitorEntry,
+        width: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> Vec<RoleLine> {
+        let title = super::safe_line(&entry.title);
+        ListRow {
+            selected: self.focused && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
+            glyph: display.glyph(entry.glyph),
+            glyph_role: self.glyph_role(entry, display, now_ms),
+            name: &title,
+            details: list_row::row_details(entry.tone, &entry.notes, now_ms),
+            fill: list_row::flash_fill(self.row_flash(entry), display, now_ms),
+            subscription: list_row::subscription_mark(entry.subscription, display),
+            bar_columns: entry.waiting_check().map(|check| {
+                check.elapsed_columns(
+                    width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
+                    now_ms,
+                )
+            }),
+        }.lines(width)
+    }
+
+    /// Bottom padding yields before section gaps, pinned rows or the selected Tick's full row.
+    pub(super) fn side_content_height(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> usize {
+        let minimum = if self.detail.is_some() {
+            1
+        } else if self.expanded_tasks {
+            TASK_ROWS + 2
+        } else {
+            let has_ticks = !self.entries.is_empty();
+            let has_tasks = !self.tasks().is_empty();
+            let has_goal = self.goal().is_some();
+            let tick_rows = self
+                .selected()
+                .or_else(|| {
+                    self.tick_anchor.as_ref().and_then(|instance| {
+                        self.entries
+                            .iter()
+                            .find(|entry| &entry.instance == instance)
+                    })
+                })
+                .or_else(|| self.entries.first())
+                .map_or(0, |entry| {
+                    1 + self.entry_lines(entry, width, display, now_ms).len()
+                });
+            let footer_rows = usize::from(!self.selected_status().is_empty());
+            let tick_rows = if has_ticks {
+                (tick_rows + footer_rows).max(MINIMUM_TICK_SECTION_ROWS)
+            } else {
+                footer_rows
+            };
+            1 + tick_rows
+                + usize::from(has_tasks)
+                + self.preview_count() * TASK_ROWS
+                + usize::from(self.tasks().len() > MAX_PINNED_TASKS)
+                + usize::from(has_goal) * GOAL_ROWS
+                + usize::from(has_ticks && (has_tasks || has_goal))
+                + usize::from(has_tasks && has_goal)
+                + usize::from(!has_ticks && !has_tasks && !has_goal)
+        };
+        height.saturating_sub(usize::from(height > minimum))
+    }
+
     fn task_lines(
         &self,
         task: &tickloop_agent_protocol::ScheduledTask,
@@ -1284,31 +1356,6 @@ impl Monitor {
             Some(MonitorTarget::Tick(instance)) => Some(instance),
             _ => self.tick_anchor.as_ref(),
         };
-        let titles = self
-            .entries
-            .iter()
-            .map(|entry| super::safe_line(&entry.title))
-            .collect::<Vec<_>>();
-        let list_rows = self
-            .entries
-            .iter()
-            .zip(&titles)
-            .map(|(entry, title)| ListRow {
-                selected: self.focused && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
-                glyph: display.glyph(entry.glyph),
-                glyph_role: self.glyph_role(entry, display, now_ms),
-                name: title,
-                details: list_row::row_details(entry.tone, &entry.notes, now_ms),
-                fill: list_row::flash_fill(self.row_flash(entry), display, now_ms),
-                subscription: list_row::subscription_mark(entry.subscription, display),
-                bar_columns: entry.waiting_check().map(|check| {
-                    check.elapsed_columns(
-                        width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
-                        now_ms,
-                    )
-                }),
-            })
-            .collect::<Vec<_>>();
         let groups = self
             .entries
             .iter()
@@ -1318,8 +1365,7 @@ impl Monitor {
             let entries: Vec<_> = self
                 .entries
                 .iter()
-                .zip(&list_rows)
-                .filter(|(entry, _)| entry.group == group)
+                .filter(|entry| entry.group == group)
                 .collect();
             rows.push(RoleLine::role(
                 format!(
@@ -1333,11 +1379,11 @@ impl Monitor {
                 Role::MutedText,
             ));
             row_ids.push(None);
-            for (entry, row) in entries {
+            for entry in entries {
                 if scroll_target == Some(&entry.instance) {
                     selected_row = rows.len();
                 }
-                for line in row.lines(width) {
+                for line in self.entry_lines(entry, width, display, now_ms) {
                     rows.push(line);
                     row_ids.push(Some(MonitorTarget::Tick(entry.instance.clone())));
                 }
