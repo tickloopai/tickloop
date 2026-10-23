@@ -692,10 +692,11 @@ impl ArtifactMetadataSink {
         monitor.metadata_failures.insert(id, error.clone());
         monitor.rebuild();
         if is_current {
-            state.hold_status(&format!(
+            state.monitor.action_error = Some(format!(
                 "Artifact refresh failed: {} · r retries",
-                super::safe_text(&error)
+                super::safe_line(&error)
             ));
+            let _ = state.draw(&mut io::stdout().lock());
         }
     }
 }
@@ -1408,6 +1409,11 @@ impl Console {
     #[cfg(test)]
     pub(super) fn test_status_text(&self) -> String {
         self.state.lock().unwrap().status.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_monitor_error(&self) -> Option<String> {
+        self.state.lock().unwrap().monitor.action_error.clone()
     }
 
     #[cfg(test)]
@@ -3641,6 +3647,17 @@ impl Console {
             .lock()
             .map_err(|error| error.to_string())?
             .idle_loop_interruptible = interruptible;
+        Ok(())
+    }
+
+    pub(super) fn report_monitor_error(&self, chat: Uuid, text: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.monitor_for_chat_mut(chat).action_error = Some(super::safe_line(text));
+        if state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -7112,11 +7129,25 @@ impl State {
                 )
             };
             if let Some(detail) = &mut self.monitor.detail {
-                return detail
-                    .lines(side_columns.saturating_sub(2), height, now_ms)
+                let error = self.monitor.action_error.as_deref();
+                let mut lines = detail
+                    .lines(
+                        side_columns.saturating_sub(2),
+                        height.saturating_sub(usize::from(error.is_some())),
+                        now_ms,
+                    )
                     .into_iter()
                     .map(|line| line.line)
-                    .collect();
+                    .collect::<Vec<_>>();
+                if let Some(error) = error.filter(|_| height > 0) {
+                    lines.resize(height - 1, RoleLine::default());
+                    lines.push(super::loop_view_text::clipped(
+                        error,
+                        side_columns.saturating_sub(2),
+                        Role::MutedText,
+                    ));
+                }
+                return lines;
             }
             self.monitor.prepare_ticks(height);
             let frame =
@@ -11107,10 +11138,14 @@ impl State {
         self.screen_initialized = false;
         self.rendered_region = None;
         match restored {
-            Err(error) => self.status = format!("Cannot restore the terminal: {error}"),
+            Err(error) => {
+                self.monitor.action_error = Some(super::safe_line(&format!(
+                    "Cannot restore the terminal: {error}"
+                )));
+            }
             Ok(()) => {
                 if let Some(failure) = failure {
-                    self.hold_status(failure);
+                    self.monitor.action_error = Some(super::safe_line(failure));
                 }
             }
         }
@@ -11542,7 +11577,7 @@ impl State {
                 action,
             }),
             Err(error) => {
-                self.hold_status(&error);
+                self.monitor.action_error = Some(super::safe_line(&error));
                 None
             }
         }
@@ -11994,6 +12029,7 @@ impl State {
             && self.monitor_visible()
             && self.monitor.focused
         {
+            self.monitor.action_error = None;
             self.shell_background_chord_started_at = None;
             if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
                 return self.request_monitor_removal();
@@ -12023,7 +12059,7 @@ impl State {
                         {
                             Ok(action) => Some(InputEvent::TickAction { chat, action }),
                             Err(error) => {
-                                self.hold_status(&error);
+                                self.monitor.action_error = Some(super::safe_line(&error));
                                 None
                             }
                         }
@@ -12074,7 +12110,7 @@ impl State {
                         &mut super::tick_actions::TickActionUi { state: self },
                     ) {
                         Ok(action) => return Some(InputEvent::TickAction { chat, action }),
-                        Err(error) => self.hold_status(&error),
+                        Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
                     }
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.is_more_selected() => {
@@ -12090,7 +12126,7 @@ impl State {
                         &mut super::tick_actions::TickActionUi { state: self },
                     ) {
                         Ok(action) => return Some(InputEvent::TickAction { chat, action }),
-                        Err(error) => self.hold_status(&error),
+                        Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
                     }
                 }
                 // As in Claude Code's footer, a character the selected row does not bind leaves
@@ -12122,7 +12158,7 @@ impl State {
                             .find(|action| action.key == action_key)?
                             .intent;
                         if let crate::monitor_rows::TickIntent::Notify(message) = intent {
-                            self.hold_status(message);
+                            self.monitor.action_error = Some(super::safe_line(message));
                             return None;
                         }
                         let chat = self.chat?;
@@ -12139,7 +12175,9 @@ impl State {
                                 };
                                 return Some(InputEvent::TickAction { chat, action });
                             }
-                            Err(error) => self.hold_status(&error),
+                            Err(error) => {
+                                self.monitor.action_error = Some(super::safe_line(&error))
+                            }
                         }
                     }
                 }
@@ -13376,7 +13414,8 @@ fn lend_terminal_to_attached_view(
     {
         let mut state = lock()?;
         if state.chat != Some(attach.chat) {
-            state.hold_status("Not opened: another Chat is shown now");
+            state.monitor_for_chat_mut(attach.chat).action_error =
+                Some("Not opened: another Chat is shown now".into());
             state.draw(&mut io::stdout().lock())?;
             return Ok(!stop.load(Ordering::Acquire));
         }
@@ -13395,7 +13434,8 @@ fn lend_terminal_to_attached_view(
         Ok(attached) => attached,
         Err(error) => {
             let mut state = lock()?;
-            state.hold_status(&format!("Cannot open the Tick: {error}"));
+            state.monitor_for_chat_mut(attach.chat).action_error =
+                Some(super::safe_line(&format!("Cannot open the Tick: {error}")));
             state.draw(&mut io::stdout().lock())?;
             return Ok(!stop.load(Ordering::Acquire));
         }

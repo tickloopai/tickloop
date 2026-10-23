@@ -232,6 +232,20 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.wait("Shell running · ctrl+b background");
     session.send(b"\x02");
     session.wait("Shells (1)");
+    assert!(
+        session
+            .frame()
+            .lines()
+            .next()
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .1
+            .trim()
+            == "Shells (1)",
+        "{}",
+        session.frame()
+    );
     std::fs::write(directory.path().join("finish"), "").unwrap();
     // A clean exit adds no words or time to the row; its unread end colours its glyph.
     session.wait_for_unread_shell();
@@ -395,8 +409,8 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         session.wait("Press ctrl+x again to unlink");
         assert!(session.frame().contains("PTY Research"));
         session.send(b"\x18");
-        session.wait("Artifact unlinked");
         session.wait("Nothing to monitor");
+        assert!(!session.frame().contains("Artifact unlinked"));
         session.exit();
     });
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -535,8 +549,8 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
     session.wait("Press ctrl+x again to delete this scheduled task");
     assert!(session.frame().contains("Cron: * * * * *"));
     session.send(b"\x18");
-    session.wait("Scheduled task removed");
     session.wait("Scheduled (1)");
+    assert!(!session.frame().contains("Scheduled task removed"));
     session.send(b"\x18");
     session.wait("Press ctrl+x again to delete this scheduled task");
     assert!(session.frame().contains("Scheduled (1)"));
@@ -579,6 +593,20 @@ fn monitor_keeps_neighbouring_ticks_visible_when_keyboard_navigation_crosses_a_p
     let mut session = Session::resume(&workdir, chat);
     session.keep_history_paused();
     session.wait("Ticks (140)");
+    assert!(
+        session
+            .frame()
+            .lines()
+            .next()
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .1
+            .trim()
+            .starts_with("Ticks (140)"),
+        "{}",
+        session.frame()
+    );
     assert!(!session.frame().contains("of 140"));
     session.send(b"\x1b[C");
     let wait_selected = |session: &Session, title: &str| {

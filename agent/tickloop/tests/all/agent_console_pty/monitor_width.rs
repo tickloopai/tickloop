@@ -61,6 +61,18 @@ async fn run_monitor_width(fixture: &PrivateFixture) {
             })
             .await;
         eprintln!("[monitor-width {terminal_columns}]\n{beside}\n[/monitor-width]");
+        assert_eq!(
+            beside
+                .lines()
+                .next()
+                .unwrap()
+                .split_once('│')
+                .unwrap()
+                .1
+                .trim(),
+            "Shells (1)",
+            "{beside}"
+        );
         assert!(
             shows_every_word(&conversation_beside_monitor(&beside)),
             "the conversation reflows beside Monitor: {beside}"
@@ -79,6 +91,18 @@ async fn run_monitor_width(fixture: &PrivateFixture) {
         })
         .await;
     eprintln!("[monitor-width {OVERLAY_WIDTH}]\n{overlay}\n[/monitor-width]");
+    assert_eq!(
+        overlay
+            .lines()
+            .next()
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .1
+            .trim(),
+        "Shells (1)",
+        "{overlay}"
+    );
     assert!(
         !shows_every_word(&conversation_beside_monitor(&overlay)),
         "below the minimum width Monitor covers the conversation: {overlay}"

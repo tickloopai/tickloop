@@ -204,6 +204,7 @@ fn install_path(fixture: &Fixture, directory: &Path) {
 /// Whether the row of `name` ends with `details`.
 fn row_shows(frame: &str, name: &str, details: &str) -> bool {
     frame.lines().any(|line| {
+        let line = line.replace(screen::SELECTED_MARK, " ");
         (line.contains(&format!("◉ {name} ")) || line.ends_with(&format!("◉ {name}")))
             && line.trim_end().ends_with(details)
     })
@@ -213,7 +214,7 @@ fn row_shows(frame: &str, name: &str, details: &str) -> bool {
 fn is_selected(frame: &str, name: &str) -> bool {
     frame
         .lines()
-        .any(|line| line.contains(&format!("◉ {name}")) && line.starts_with(screen::SELECTED_MARK))
+        .any(|line| line.starts_with(&format!("◉{}{name} ", screen::SELECTED_MARK)))
 }
 
 /// The input dialog's rows: those after its top rule.
@@ -268,7 +269,9 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
             && row_shows(frame, "beta", "1.0.0 · no login needed")
     });
     assert!(
-        frame.contains("Tick packages · [Installed]  Marketplace"),
+        frame
+            .replace(screen::SELECTED_MARK, " ")
+            .contains("Tick packages · [Installed]  Marketplace"),
         "{frame}"
     );
     assert!(

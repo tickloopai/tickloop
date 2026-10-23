@@ -190,8 +190,9 @@ pub const SELECTION_BACKGROUNDS: [&str; 4] =
 
 /// [`visible_screen`] with the selection fill made visible: in each row, the first cell painted
 /// with the selection background shows [`SELECTED_MARK`] when that cell is blank, as the indent
-/// of a list's selected row is. A Monitor row whose first column holds its `↻` keeps that column
-/// off the selection, so its mark falls on the second column. Where something
+/// of a list's selected row is. When selection begins on a glyph, a preceding blank cell carries
+/// the mark instead, preserving both the glyph and its screen column. Flush-left rows use the
+/// first selected blank after the glyph. Where something
 /// else paints the middle of a selected row, such as a Monitor row's update bar, the selection
 /// that resumes after it shows no second mark.
 pub fn visible_screen_with_selection(output: &str, width: usize, height: usize) -> String {
@@ -302,9 +303,24 @@ impl Screen {
             .map(|(mut line, selected)| {
                 if marks_selection
                     && let Some(column) = selected.iter().position(|selected| *selected)
-                    && line[column] == ' '
                 {
-                    line[column] = SELECTED_MARK;
+                    let mark = if line[column] == ' ' {
+                        Some(column)
+                    } else if line[column] == '❯' {
+                        None
+                    } else {
+                        column
+                            .checked_sub(1)
+                            .filter(|previous| line[*previous] == ' ')
+                            .or_else(|| {
+                                selected.iter().enumerate().find_map(|(at, selected)| {
+                                    (*selected && line[at] == ' ').then_some(at)
+                                })
+                            })
+                    };
+                    if let Some(column) = mark {
+                        line[column] = SELECTED_MARK;
+                    }
                 }
                 line.into_iter()
                     .filter(|character| *character != '\0')
@@ -341,6 +357,18 @@ fn the_selection_fill_shows_as_a_mark_where_its_run_begins_on_a_blank_cell() {
         "↻▌◉ quotes\n▌ ◉ news",
         "a Monitor row's `↻` stays off the selection; a row without one, whatever its glyph's \
          colour, is selected from its first column"
+    );
+    let flush_left = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[48;5;24m◉ chosen\x1b[0m\x1b[?2026l";
+    assert_eq!(
+        visible_screen_with_selection(flush_left, 20, 1),
+        "◉▌chosen",
+        "flush-left rows keep their glyph and expose their selection in the next blank"
+    );
+    let compact = "\x1b[?2026h\x1b[2J\x1b[1;1Hleft │ \x1b[48;5;24m◉ chosen\x1b[0m\x1b[?2026l";
+    assert_eq!(
+        visible_screen_with_selection(compact, 20, 1),
+        "left │▌◉ chosen",
+        "compact rows retain their glyph, name and click coordinates"
     );
 }
 

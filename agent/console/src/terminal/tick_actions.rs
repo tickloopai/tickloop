@@ -54,7 +54,7 @@ impl TickActionUi<'_> {
         self.state.rendered_region = None;
     }
     pub fn notify(&mut self, message: &str) {
-        self.state.hold_status(message);
+        self.state.monitor.action_error = Some(super::safe_line(message));
     }
     /// The subscriptions on `instance` as a Monitor detail starting with `operation`.
     pub(super) fn subscription_detail(
@@ -163,7 +163,7 @@ impl TickActionContext<'_> {
         self.chat
     }
     pub fn notify(&self, message: &str) -> Result<(), String> {
-        self.console.hold_status(message)
+        self.console.report_monitor_error(self.chat, message)
     }
     pub fn update_detail<T: TickDetailView, R>(
         &self,

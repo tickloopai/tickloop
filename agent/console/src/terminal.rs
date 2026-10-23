@@ -2736,7 +2736,7 @@ async fn interact_with_herdr(
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
-                        if let Err(error) = tick_actions::execute(action,context).await { console.hold_status(&safe_text(&error))?; }
+                        if let Err(error) = tick_actions::execute(action,context).await { console.report_monitor_error(chat, &error)?; }
                         status_dirty=true;
                         continue;
                     }

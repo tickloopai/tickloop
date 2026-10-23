@@ -156,7 +156,7 @@ impl TickActionBackend for TaskAction {
             .await
             .map_err(|error| error.to_string())?;
         ctx.console.remove_scheduled_task(ctx.chat, &self.task.id)?;
-        ctx.notify("Scheduled task removed")
+        Ok(())
     }
 }
 

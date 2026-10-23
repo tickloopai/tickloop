@@ -145,6 +145,7 @@ pub(super) struct Monitor {
     tick_viewport: Cell<(usize, usize)>,
     next_page: Option<PageCursor>,
     selected: Option<MonitorTarget>,
+    pub(super) action_error: Option<String>,
     tick_anchor: Option<InstanceRef>,
     expanded_tasks: bool,
     goal_continued_at_ms: Option<u64>,
@@ -1165,6 +1166,9 @@ impl Monitor {
     }
 
     fn selected_status(&self) -> String {
+        if let Some(error) = &self.action_error {
+            return error.clone();
+        }
         let Some(entry) = self.selected() else {
             return String::new();
         };
@@ -1295,8 +1299,10 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> usize {
-        let has_status =
-            self.detail.is_none() && !self.expanded_tasks && !self.selected_status().is_empty();
+        let has_status = self.action_error.is_some()
+            || (self.detail.is_none()
+                && !self.expanded_tasks
+                && !self.selected_status().is_empty());
         height.saturating_sub(usize::from(
             !has_status && height > self.minimum_content_height(width, display, now_ms),
         ))
@@ -1326,21 +1332,23 @@ impl Monitor {
                 1 + self.entry_lines(entry, width, display, now_ms).len()
             });
         let footer_rows = usize::from(!self.selected_status().is_empty());
-        1 + if has_ticks {
+        (if has_ticks {
             (tick_rows + footer_rows).max(MINIMUM_TICK_SECTION_ROWS)
         } else {
             footer_rows
-        } + usize::from(has_tasks)
+        }) + usize::from(has_tasks)
             + self.preview_count() * TASK_ROWS
             + usize::from(self.tasks().len() > MAX_PINNED_TASKS)
             + usize::from(has_goal) * GOAL_ROWS
             + usize::from(has_ticks && (has_tasks || has_goal))
             + usize::from(has_tasks && has_goal)
+            + self.group_totals.len().saturating_sub(1)
             + usize::from(!has_ticks && !has_tasks && !has_goal)
     }
 
-    fn tick_line_count(&self) -> usize {
+    fn tick_line_count(&self, group_gaps: bool) -> usize {
         self.group_totals.len()
+            + usize::from(group_gaps) * self.group_totals.len().saturating_sub(1)
             + self
                 .listing
                 .iter()
@@ -1350,7 +1358,13 @@ impl Monitor {
                 .len()
     }
 
-    fn tick_lines(&self, width: usize, display: DisplayProfile, now_ms: u64) -> TickLines {
+    fn tick_lines(
+        &self,
+        width: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+        group_gaps: bool,
+    ) -> TickLines {
         let mut rows = Vec::new();
         let mut row_ids = Vec::new();
         let mut selected_rows = 0..0;
@@ -1364,6 +1378,10 @@ impl Monitor {
             .map(|entry| entry.group)
             .collect::<BTreeSet<_>>();
         for group in groups {
+            if group_gaps && !rows.is_empty() {
+                rows.push(RoleLine::default());
+                row_ids.push(None);
+            }
             let entries = self
                 .entries
                 .iter()
@@ -1510,6 +1528,7 @@ impl Monitor {
         let has_ticks = !self.entries.is_empty();
         let has_tasks = !self.tasks().is_empty();
         let has_goal = !goal_lines.is_empty();
+        let group_gap_count = self.group_totals.len().saturating_sub(1);
         let gap_count =
             usize::from(has_ticks && (has_tasks || has_goal)) + usize::from(has_tasks && has_goal);
         let full_dock_rows = goal_lines.len()
@@ -1519,18 +1538,17 @@ impl Monitor {
         let spacing_budget = height
             .saturating_sub(
                 full_dock_rows
-                    + 1
                     + if has_ticks {
                         MINIMUM_TICK_SECTION_ROWS
                     } else {
                         0
                     },
             )
-            .min(gap_count + usize::from(has_ticks || has_tasks || has_goal));
+            .min(gap_count + group_gap_count);
         let goal_gap = has_tasks && has_goal && spacing_budget > 0;
         let tick_gap =
             has_ticks && (has_tasks || has_goal) && spacing_budget > usize::from(goal_gap);
-        let heading_gap = spacing_budget > usize::from(goal_gap) + usize::from(tick_gap);
+        let group_gaps = spacing_budget >= gap_count + group_gap_count;
         let content_height = height - usize::from(goal_gap) - usize::from(tick_gap);
         let minimum_tasks = if self.tasks().is_empty() {
             0
@@ -1542,25 +1560,8 @@ impl Monitor {
         extra = extra.saturating_sub(usize::from(scheduled_heading));
         let more = self.tasks().len() > MAX_PINNED_TASKS && extra > 0;
         extra = extra.saturating_sub(usize::from(more));
-        let show_heading = extra > 0;
-        extra = extra.saturating_sub(usize::from(show_heading));
-        extra = extra.saturating_sub(usize::from(heading_gap));
         let show_footer = extra > 0 && !status.is_empty();
-        let mut lines = if show_heading {
-            vec![RoleLine::role(
-                "Monitor",
-                if self.focused {
-                    Role::Title
-                } else {
-                    Role::Text
-                },
-            )]
-        } else {
-            Vec::new()
-        };
-        if show_heading && heading_gap {
-            lines.push(RoleLine::default());
-        }
+        let mut lines = Vec::new();
         let fixed_budget = content_height
             .saturating_sub(lines.len() + goal_lines.len() + usize::from(show_footer));
         let task_budget =
@@ -1574,18 +1575,18 @@ impl Monitor {
             (usize::from(scheduled_heading) + visible_tasks * TASK_ROWS + usize::from(more))
                 .min(fixed_budget);
         let tick_capacity = fixed_budget.saturating_sub(scheduled_rows);
-        let mut rendered = self.tick_lines(width, display, now_ms);
-        let scrollbar = width > 0 && tick_capacity > 0 && self.tick_line_count() > tick_capacity;
+        let mut rendered = self.tick_lines(width, display, now_ms, group_gaps);
+        let total_rows = self.tick_line_count(group_gaps);
+        let scrollbar = width > 0 && tick_capacity > 0 && total_rows > tick_capacity;
         let tick_width = width.saturating_sub(usize::from(scrollbar));
         if scrollbar {
-            rendered = self.tick_lines(tick_width, display, now_ms);
+            rendered = self.tick_lines(tick_width, display, now_ms, group_gaps);
         }
         let TickLines {
             lines: mut rows,
             targets: mut row_ids,
             selected: selected_rows,
         } = rendered;
-        let total_rows = self.tick_line_count();
         self.tick_viewport.set((tick_capacity, total_rows));
         if self.entries.is_empty() && self.tasks().is_empty() && self.goal().is_none() {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
@@ -1689,7 +1690,7 @@ impl Monitor {
         }
         lines.extend(goal_lines);
         if show_footer {
-            if let Some(entry) = self.selected() {
+            if let Some(entry) = self.selected().filter(|_| self.action_error.is_none()) {
                 use unicode_width::UnicodeWidthStr;
                 let title = super::safe_line(&entry.title);
                 let details = list_row::row_details(entry.tone, &entry.notes, now_ms);
@@ -3342,12 +3343,68 @@ mod scrolling_tests {
     }
 
     #[test]
+    fn group_gaps_scroll_with_rows_and_count_toward_the_scrollbar() {
+        let mut monitor = monitor(3);
+        let shells = monitor
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut entry = entry.clone();
+                entry.instance = InstanceRef::shell(uuid::Uuid::from_u128(index as u128 + 1));
+                entry.group = TickGroup::Shells;
+                entry.glyph = Glyph::ShellTick;
+                entry
+            })
+            .collect();
+        monitor.replace(TickGroup::Shells, shells);
+        let display = DisplayProfile::default();
+        let rendered = monitor.tick_lines(23, display, 0, true);
+        assert_eq!(rendered.lines.len(), 9);
+        assert_eq!(rendered.lines[4].text(), "");
+        assert_eq!(rendered.targets[4], None);
+        assert_eq!(rendered.lines[5].text(), "Shells (3)");
+        let selected = monitor.selected.clone();
+        for offset in 0..=3 {
+            let frame = monitor.frame(24, 6, display, 0);
+            assert_eq!(monitor.tick_viewport.get(), (6, 9));
+            assert_eq!(monitor.tick_offset.get(), offset);
+            let thumb = scrollbar_thumb(6, 9, offset);
+            for (row, line) in frame.lines[frame.tick_rows.clone()].iter().enumerate() {
+                assert_eq!(
+                    line.text().trim_end_matches(['│', '┃']).trim_end(),
+                    rendered.lines[offset + row].text().trim_end()
+                );
+                assert_eq!(line.text().ends_with('┃'), thumb.contains(&row));
+                assert_eq!(
+                    frame
+                        .targets
+                        .iter()
+                        .find(|(at, _)| *at == row)
+                        .map(|(_, target)| target),
+                    rendered.targets[offset + row].as_ref()
+                );
+            }
+            assert_eq!(monitor.selected, selected);
+            monitor.scroll_ticks(1);
+        }
+        monitor.move_selection(1);
+        let frame = monitor.frame(24, 6, display, 0);
+        assert!(
+            frame
+                .targets
+                .iter()
+                .any(|(_, target)| Some(target) == monitor.selected.as_ref())
+        );
+    }
+
+    #[test]
     fn scrollbar_tracks_the_whole_listing_and_has_an_ascii_fallback() {
         let monitor = monitor(130);
         for ascii in [false, true] {
             let frame = monitor.frame_with_ascii(24, 12, DisplayProfile::default(), 0, ascii);
             let rows = &frame.lines[frame.tick_rows.clone()];
-            assert_eq!(rows.len(), 10);
+            assert_eq!(rows.len(), 12);
             let thumb = if ascii { '#' } else { '┃' };
             let track = if ascii { '|' } else { '│' };
             assert!(rows[0].text().ends_with(thumb));
@@ -3360,7 +3417,6 @@ mod scrolling_tests {
                 rows.iter()
                     .all(|line| line.spans.last().unwrap().role == Some(Role::MutedText))
             );
-            assert!(frame.lines[0].text() == "Monitor");
             assert!(rows[0].text().starts_with("Ticks (130)"));
             assert!(
                 frame
@@ -3399,7 +3455,7 @@ mod scrolling_tests {
         );
         assert_eq!(
             monitor.tick_viewport.get(),
-            (10, 9),
+            (12, 9),
             "clipped Tick names each count as one row"
         );
     }
@@ -3414,7 +3470,7 @@ mod scrolling_tests {
             monitor.frame(24, 12, DisplayProfile::default(), 0);
         }
         assert_eq!(monitor.entries().len(), 270);
-        assert_eq!(monitor.tick_offset.get(), 261);
+        assert_eq!(monitor.tick_offset.get(), 259);
         assert_eq!(monitor.selected().unwrap().instance, selected);
         let frame = monitor.frame(24, 12, DisplayProfile::default(), 0);
         assert!(frame.lines[frame.tick_rows.end - 1].text().ends_with('┃'));

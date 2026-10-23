@@ -243,7 +243,7 @@ fn dialog_height_pty_grows_shrinks_resizes_and_restores_requests_in_both_rendere
             fixture.wait(|frame| frame.contains("Height picker") && dialog_rows(frame) == 22);
         assert!(grown.contains("Pinned height prompt"));
         assert!(
-            grown.contains("│ Monitor"),
+            grown.contains("│ Artifacts (2)"),
             "Monitor in the upper two rows: {grown}"
         );
         assert!(

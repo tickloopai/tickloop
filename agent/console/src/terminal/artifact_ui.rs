@@ -75,7 +75,8 @@ pub(super) async fn tick_action(
     match action {
         'o' => {
             if let Err(error) = super::login::open_artifact(&tick.url).await {
-                console.set_status(&format!("{error} · press c to copy the link"))?;
+                console
+                    .report_monitor_error(chat, &format!("{error} · press c to copy the link"))?;
             }
         }
         'c' => console.copy_artifact_link(&tick.url)?,
@@ -92,7 +93,6 @@ pub(super) async fn tick_action(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            console.hold_status("Artifact feedback linked here")?;
         }
         _ => {}
     }
@@ -115,7 +115,7 @@ async fn remove_local_artifact(
             .await
             .map_err(|error| error.to_string())?,
     )?;
-    console.hold_status("Artifact unlinked")
+    Ok(())
 }
 
 pub(super) async fn open(
@@ -433,7 +433,8 @@ mod tests {
             .unwrap();
         assert!(
             console
-                .test_status_text()
+                .test_monitor_error()
+                .unwrap()
                 .contains("Only HTTPS artifact links can be opened")
         );
         tick_action(&agent, &console, Some(&root), chat, id.clone(), 'c')
@@ -453,7 +454,7 @@ mod tests {
                 .iter()
                 .any(|request| request.starts_with("PUT /artifact/api/v1/agent/links/doc "))
         );
-        assert_eq!(console.test_status_text(), "Artifact feedback linked here");
+        assert!(console.test_status_text().is_empty());
         let snapshot = agent.snapshot(chat).await.unwrap();
         let binding = &snapshot.chat_loop.event_sources[0];
         assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
@@ -719,7 +720,7 @@ mod tests {
             remote.linked.lock().unwrap()[1],
             (tick, tickloop_agent_protocol::ArtifactFeedbackHistory::All)
         );
-        assert_eq!(console.test_status_text(), "Artifact feedback linked here");
+        assert!(console.test_status_text().is_empty());
         assert!(model.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
@@ -742,7 +743,7 @@ mod tests {
         tick_action(&agent, &console, Some(&root), chat, id.clone(), 'x')
             .await
             .unwrap();
-        assert_eq!(console.test_status_text(), "Artifact unlinked");
+        assert!(console.test_status_text().is_empty());
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert!(snapshot.chat_loop.event_sources.is_empty());
         assert!(snapshot.artifact_ticks.is_empty());
@@ -780,7 +781,7 @@ mod tests {
         tick_action(&agent, &console, None, chat, tick.instance_id(), 'x')
             .await
             .unwrap();
-        assert_eq!(console.test_status_text(), "Artifact unlinked");
+        assert!(console.test_status_text().is_empty());
         assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
         core.shutdown().await;
     }
