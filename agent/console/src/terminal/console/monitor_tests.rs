@@ -4497,6 +4497,15 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
     let separator = state.width - state.monitor_columns();
     assert!(terminal.contains("ctrl+enter to send now"), "{terminal}");
     let terminal_rows = terminal.lines().collect::<Vec<_>>();
+    assert!(terminal_rows[queue].contains("/loop 每分钟"), "{terminal}");
+    assert!(
+        terminal_rows[divider - 1]
+            .split_once('│')
+            .unwrap()
+            .1
+            .contains("◎ Finish"),
+        "{terminal}"
+    );
     for row in &terminal_rows[queue..divider] {
         assert_eq!(
             row.chars().find(|character| *character == '│'),
@@ -4544,4 +4553,136 @@ fn goal_only_monitor_has_no_extra_section_separator() {
     assert_eq!(frame.lines.len(), 2);
     assert!(frame.lines[0].text().starts_with("Pursuing goal"));
     assert!(frame.lines[1].text().starts_with("◎ Finish"));
+}
+
+#[test]
+fn queued_input_layout_is_bounded_by_conversation_width_before_rendering() {
+    let mut state = docked_monitor_fixture(1, 1);
+    state.monitor.focused = false;
+    state.activity_interruptible = true;
+    state
+        .scrollback
+        .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
+    state.queued_inputs = vec![tickloop_agent_protocol::QueuedInput {
+        id: Uuid::new_v4(),
+        chat_id: state.chat.unwrap(),
+        loop_id: Some(Uuid::new_v4()),
+        kind: tickloop_agent_protocol::QueuedInputKind::Message,
+        text: format!("/loop {}", "每分钟看看 qqq.us 的股价是多少".repeat(20)),
+        contexts: Vec::new(),
+        queued_sequence: 1,
+        armed: true,
+    }];
+    let lines = state.visible_pending_input_lines(MAX_PENDING_INPUT_ROWS);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text().contains("ctrl+enter to send now"))
+    );
+    let width = state.content_columns();
+    assert!(
+        lines
+            .iter()
+            .all(|line| display_width(&line.text()) <= width),
+        "width {width}: {lines:?}"
+    );
+    assert!(lines.iter().any(|line| line.text().ends_with('…')));
+    let frame = state.layout_frame();
+    assert!(
+        frame
+            .conversation_footer
+            .iter()
+            .all(|line| display_width(&line.text()) <= width)
+    );
+    assert!(
+        frame
+            .conversation_footer
+            .iter()
+            .any(|line| line.text().contains("/loop"))
+    );
+    assert!(!frame.input.iter().any(|line| line.text().contains("/loop")));
+}
+
+#[test]
+fn prompt_suggestion_layout_stays_inside_the_monitored_conversation() {
+    let mut state = docked_monitor_fixture(1, 1);
+    state.monitor.focused = false;
+    state.prompt_suggestion = Some(format!("suggested-next-step {}", "继续核对结果".repeat(40)));
+    assert!(state.visible_prompt_suggestion().is_some());
+    let (lines, _, _) = state.normal_styled_frame();
+    let suggestion = lines
+        .iter()
+        .position(|line| line.text().contains("suggested-next-step"))
+        .unwrap();
+    let divider = lines
+        .iter()
+        .position(|line| line.text().starts_with('─'))
+        .unwrap();
+    assert!(suggestion < divider, "{lines:#?}");
+    assert!(display_width(&lines[suggestion].text()) <= state.content_columns());
+}
+
+#[test]
+fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
+    for width in [80, 100, 140] {
+        for suggestion in [false, true] {
+            let mut state = docked_monitor_fixture(1, 1);
+            state.resize(width, 30);
+            state.monitor.focused = false;
+            if suggestion {
+                state.prompt_suggestion = Some(format!("suggestion {}", "检查全部结果".repeat(40)));
+            } else {
+                state.scrollback.set_activity(Some(RoleLine::role(
+                    format!("• Working {}", "progress ".repeat(40)),
+                    Role::MutedText,
+                )));
+                state.status_held = true;
+                state.status = format!("status-feedback {}", "details ".repeat(40));
+            }
+            let frame = state.layout_frame();
+            assert!(
+                frame
+                    .conversation_footer
+                    .iter()
+                    .all(|line| display_width(&line.text()) <= state.content_columns())
+            );
+            let mut output = Vec::new();
+            state.draw_frame(&mut output).unwrap();
+            let terminal = tickloop_agent_test_support::screen::visible_screen(
+                &String::from_utf8_lossy(&output),
+                state.width,
+                state.height,
+            );
+            let rows = terminal.lines().collect::<Vec<_>>();
+            let prefix = if suggestion {
+                "suggestion "
+            } else {
+                "status-feedback "
+            };
+            let content = rows.iter().position(|line| line.contains(prefix)).unwrap();
+            let divider = rows
+                .iter()
+                .enumerate()
+                .skip(content)
+                .find(|(_, line)| line.starts_with('─'))
+                .unwrap()
+                .0;
+            for row in &rows[content..divider] {
+                let (left, _) = row.split_once('│').unwrap();
+                assert_eq!(display_width(left), state.content_columns(), "{terminal}");
+            }
+            assert!(rows[divider - 1].contains("◎ Finish"), "{terminal}");
+            if !suggestion {
+                assert!(
+                    rows.iter()
+                        .any(|line| line.contains("• Working") && line.contains('│')),
+                    "{terminal}"
+                );
+            } else {
+                assert!(state.editor.draft().is_empty());
+                state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+                assert!(state.editor.draft().starts_with("suggestion "));
+            }
+        }
+    }
 }

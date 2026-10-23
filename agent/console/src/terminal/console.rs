@@ -5099,6 +5099,22 @@ impl Drop for Lifetime {
     }
 }
 
+struct ConsoleFrame {
+    conversation_footer: Vec<RoleLine>,
+    input: Vec<RoleLine>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+impl ConsoleFrame {
+    #[cfg(test)]
+    fn into_styled_rows(mut self) -> (Vec<RoleLine>, usize, usize) {
+        let cursor_row = self.conversation_footer.len() + self.cursor_row;
+        self.conversation_footer.append(&mut self.input);
+        (self.conversation_footer, cursor_row, self.cursor_column)
+    }
+}
+
 /// A run of conversation output: styled text, prompt text opening a link
 /// (a cached `[Image #N]`), or assistant reply Markdown that starts a new
 /// reply when `starts_message` is set.
@@ -5372,7 +5388,7 @@ fn pending_input_lines(
             String::new()
         };
         let text = display_text(&entry.text).replace('\n', " ↵ ");
-        let text = truncate_width(
+        let text = super::loop_view_text::ellipsize(
             &text,
             width.saturating_sub(display_width(&lead) + display_width(&more)),
         );
@@ -6750,15 +6766,11 @@ impl State {
     /// The columns and rows the open Monitor detail draws in: Monitor's column above the input
     /// area.
     fn detail_area(&mut self) -> (usize, usize) {
-        let body_rows = self.height.saturating_sub(self.styled_frame().0.len());
-        let height = if self.monitor.overlay {
-            body_rows
-        } else {
-            self.monitor_toggle_target
-                .as_ref()
-                .map_or(body_rows, |target| target.row)
-        };
-        (self.monitor_columns().saturating_sub(2), height)
+        let frame = self.layout_frame();
+        (
+            self.monitor_columns().saturating_sub(2),
+            self.height.saturating_sub(frame.input.len()),
+        )
     }
 
     #[cfg(test)]
@@ -6882,7 +6894,12 @@ impl State {
         self.footer_bar_target = None;
         self.monitor_toggle_target = None;
         if self.overview.projection.is_some() {
-            let (bottom, row, column) = self.styled_frame();
+            let ConsoleFrame {
+                input: bottom,
+                cursor_row: row,
+                cursor_column: column,
+                ..
+            } = self.layout_frame();
             let top_height = self.height.saturating_sub(bottom.len());
             let mut lines = self.overview.lines(
                 self.width,
@@ -6946,15 +6963,21 @@ impl State {
             self.rendered_screen = lines;
             return output.flush();
         }
-        let (lines, cursor_row, cursor_column) = self.styled_frame();
+        let ConsoleFrame {
+            input: lines,
+            conversation_footer,
+            cursor_row,
+            cursor_column,
+        } = self.layout_frame();
         let start = self.height - lines.len();
+        let footer_start = start.saturating_sub(conversation_footer.len());
         let content_columns = self.content_columns();
-        let sticky_prompt = (start >= 2 && self.workspace_trust.is_none())
+        let sticky_prompt = (footer_start >= 2 && self.workspace_trust.is_none())
             .then(|| {
                 let text = self.scrollback.sticky_input_text(
                     self.display.glyph(Glyph::Prompt),
                     content_columns,
-                    start,
+                    footer_start,
                 )?;
                 let text = format!(
                     "{} {}",
@@ -6968,7 +6991,7 @@ impl State {
             })
             .flatten();
         let sticky_rows = usize::from(sticky_prompt.is_some());
-        let body_height = start.saturating_sub(sticky_rows);
+        let body_height = footer_start.saturating_sub(sticky_rows);
         let body = self.scrollback.frame_with_motion(
             content_columns,
             body_height,
@@ -6992,20 +7015,12 @@ impl State {
             }
         };
         let side_columns = self.monitor_columns();
-        let monitor_end = if self.monitor_visible() && !self.monitor.overlay {
-            self.monitor_toggle_target
-                .as_ref()
-                .map_or(start, |target| target.row)
-        } else {
-            start
-        };
-        let prelude_rows = monitor_end.saturating_sub(start);
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
                 return detail
                     .lines(
                         side_columns.saturating_sub(2),
-                        monitor_end,
+                        start,
                         tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     )
                     .into_iter()
@@ -7014,7 +7029,7 @@ impl State {
             }
             let frame = self.monitor.frame(
                 side_columns.saturating_sub(2),
-                monitor_end,
+                start,
                 self.display,
                 tickloop_agent_base::private_fs::unix_time_milliseconds(),
             );
@@ -7034,8 +7049,7 @@ impl State {
             frame.lines
         });
         if monitor_lines.is_some() && !self.monitor.overlay {
-            self.monitor_separator =
-                Some((self.width.saturating_sub(side_columns), 0..monitor_end));
+            self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
         }
         // The viewport maps screen rows onto content rows one to one, so it ends at the gap; a
         // row below the gap is selected as part of the screen.
@@ -7054,17 +7068,22 @@ impl State {
             },
             first_row: body.top,
         });
-        let rows: Vec<String> = (0..monitor_end)
+        let rows: Vec<String> = (0..start)
             .map(|row| {
                 let pinned = if row == 0 {
                     sticky_prompt.as_ref()
                 } else {
                     None
                 };
+                let footer = row
+                    .checked_sub(footer_start)
+                    .and_then(|index| conversation_footer.get(index));
+                let footer_text = footer.map(RoleLine::text);
                 let pinned_text = pinned.map(RoleLine::text);
                 let line_index = body_index(row);
-                let line = pinned_text
+                let line = footer_text
                     .as_deref()
+                    .or(pinned_text.as_deref())
                     .or_else(|| {
                         line_index
                             .and_then(|index| body.lines.get(index))
@@ -7073,9 +7092,7 @@ impl State {
                     .unwrap_or_default();
                 if let Some(monitor_lines) = &monitor_lines {
                     let left_columns = self.width.saturating_sub(side_columns);
-                    let mut left = row
-                        .checked_sub(start)
-                        .and_then(|index| lines.get(index))
+                    let mut left = footer
                         .cloned()
                         .or_else(|| pinned.cloned())
                         .or_else(|| line_index.and_then(|index| body.styled.get(index)).cloned())
@@ -7095,7 +7112,8 @@ impl State {
                         )
                     )
                 } else {
-                    let resolved = pinned
+                    let resolved = footer
+                        .or(pinned)
                         .or_else(|| line_index.and_then(|index| body.styled.get(index)))
                         .map_or_else(
                             || StyledLine::plain(line),
@@ -7104,35 +7122,33 @@ impl State {
                     self.with_selection(row, resolved).render(self.colour_depth)
                 }
             })
-            .chain(
-                lines
-                    .iter()
-                    .enumerate()
-                    .skip(prelude_rows)
-                    .map(|(index, line)| {
-                        self.with_selection(
-                            start + index,
-                            line.resolve(self.display.theme(), self.width),
-                        )
-                        .render(self.colour_depth)
-                    }),
-            )
+            .chain(lines.iter().enumerate().map(|(index, line)| {
+                self.with_selection(
+                    start + index,
+                    line.resolve(self.display.theme(), self.width),
+                )
+                .render(self.colour_depth)
+            }))
             .collect();
-        let scroll_rows = if sticky_prompt.is_none() && !self.monitor_visible() {
-            start
-        } else {
-            0
-        };
+        let scroll_rows =
+            if sticky_prompt.is_none() && conversation_footer.is_empty() && !self.monitor_visible()
+            {
+                start
+            } else {
+                0
+            };
         self.paint_rows(
             output,
-            RenderedView::Conversation { body_rows: start },
+            RenderedView::Conversation {
+                body_rows: footer_start,
+            },
             rows,
             scroll_rows,
         )?;
-        self.rendered_screen = (0..monitor_end)
+        self.rendered_screen = (0..start)
             .map(|row| {
-                let line = if row >= start {
-                    lines[row - start].text()
+                let line = if row >= footer_start {
+                    conversation_footer[row - footer_start].text()
                 } else if row == 0
                     && let Some(prompt) = &sticky_prompt
                 {
@@ -7158,7 +7174,7 @@ impl State {
                     line
                 }
             })
-            .chain(lines.iter().skip(prelude_rows).map(RoleLine::text))
+            .chain(lines.iter().map(RoleLine::text))
             .collect();
         queue!(
             output,
@@ -7318,19 +7334,37 @@ impl State {
         (lines.iter().map(RoleLine::text).collect(), row, column)
     }
 
-    /// Builds the fixed rows below the conversation, each row carrying the
-    /// roles its parts play so the writer can apply the active theme.
+    #[cfg(test)]
     fn styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+        self.layout_frame().into_styled_rows()
+    }
+
+    #[cfg(test)]
+    fn normal_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+        self.normal_frame_layout().into_styled_rows()
+    }
+
+    fn layout_frame(&mut self) -> ConsoleFrame {
         self.clear_footer_selection_if_hidden();
-        let frame = if self.input_dialog_visible() {
-            self.input_dialog_frame()
-        } else if self.history_search.is_some() {
-            self.history_search_frame()
+        let frame = if self.input_dialog_visible() || self.history_search.is_some() {
+            let (input, cursor_row, cursor_column) = if self.input_dialog_visible() {
+                self.input_dialog_frame()
+            } else {
+                self.history_search_frame()
+            };
+            ConsoleFrame {
+                conversation_footer: Vec::new(),
+                input,
+                cursor_row,
+                cursor_column,
+            }
         } else {
-            self.normal_styled_frame()
+            self.normal_frame_layout()
         };
-        // A sticky conversation prompt may occupy the first row above the input frame.
-        let viewport_rows = self.height.saturating_sub(frame.0.len()).saturating_sub(1);
+        let viewport_rows = self
+            .height
+            .saturating_sub(frame.input.len() + frame.conversation_footer.len())
+            .saturating_sub(1);
         let task_lines = self.status_area.task_lines_in_viewport(
             self.content_columns(),
             self.height,
@@ -8042,7 +8076,7 @@ impl State {
         line
     }
 
-    fn normal_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+    fn normal_frame_layout(&mut self) -> ConsoleFrame {
         if let Some(chat) = &self.monitor.chat_status {
             self.scrollback.sync_native_take_in(&chat.monitor);
         }
@@ -8053,10 +8087,18 @@ impl State {
         let overview = self.overview.projection.is_some();
         let command_feedback =
             (self.status_held && !self.status.is_empty()).then(|| self.status.clone());
-        let feedback_rows = usize::from(command_feedback.is_some());
+        let suggestion = (self.monitor_visible() && !self.monitor.overlay)
+            .then(|| self.visible_prompt_suggestion().map(str::to_owned))
+            .flatten();
+        let feedback_rows =
+            usize::from(command_feedback.is_some()) + usize::from(suggestion.is_some());
         let short = self.height < agent_layout::NORMAL_LAYOUT_MIN_ROWS;
         let cap = agent_layout::bottom_capacity(self.height);
-        let (draft, cursor) = self.input_display();
+        let (draft, cursor) = if suggestion.is_some() {
+            (String::new(), 0)
+        } else {
+            self.input_display()
+        };
         let mut input_rows = agent_layout::editor_capacity(self.height);
         let input = InputView::frame_with_prompt(
             &draft,
@@ -8323,7 +8365,11 @@ impl State {
             self.width,
             input_rows,
             self.input_prompt(),
-            &self.input_image_marks(),
+            &if suggestion.is_some() {
+                Vec::new()
+            } else {
+                self.input_image_marks()
+            },
         );
         if !candidates.is_empty() {
             candidates = self.candidate_rows(candidates.len());
@@ -8353,9 +8399,26 @@ impl State {
         lines.extend(candidates);
         if let Some(feedback) = &command_feedback {
             let mut line = RoleLine::role(feedback, Role::Warning);
-            line.truncate(self.width);
+            line.truncate(self.content_columns());
             lines.push(line);
         }
+        if let Some(suggestion) = suggestion {
+            let lead = format!("{} ", self.display.glyph(Glyph::Prompt));
+            let text = super::loop_view_text::ellipsize(
+                &super::safe_line(&suggestion),
+                self.content_columns().saturating_sub(display_width(&lead)),
+            );
+            lines.push(RoleLine::role(format!("{lead}{text}"), Role::Subtle));
+        }
+        let conversation_footer = if overview {
+            Vec::new()
+        } else {
+            let mut footer = std::mem::take(&mut lines);
+            for line in &mut footer {
+                line.truncate(self.content_columns());
+            }
+            footer
+        };
         let child_badge =
             (!overview && self.visible_delegated && self.shell_input.kind() != InputKind::Shell)
                 .then(|| {
@@ -8908,11 +8971,12 @@ impl State {
                     self.status_area.panel_targets(&footer, self.width)
                 },
             });
-        (
-            lines,
-            cursor_row.min(cap.saturating_sub(1)),
-            input.cursor_column,
-        )
+        ConsoleFrame {
+            conversation_footer,
+            input: lines,
+            cursor_row: cursor_row.min(cap.saturating_sub(1)),
+            cursor_column: input.cursor_column,
+        }
     }
 
     fn candidate_rows(&self, capacity: usize) -> Vec<RoleLine> {
@@ -9359,11 +9423,12 @@ impl State {
     /// refused text is in the input history either way.
     /// Puts the last sent prompt back unless something was typed since; returns whether it did.
     fn visible_pending_input_lines(&self, rows: usize) -> Vec<RoleLine> {
+        let width = self.content_columns();
         let local = self.local_delayed_lines();
         if local.is_empty() {
             return pending_input_lines(
                 &self.queued_inputs,
-                self.width,
+                width,
                 rows,
                 self.display,
                 self.can_send_now(),
@@ -9383,7 +9448,7 @@ impl State {
             .take(shown)
             .map(|text| {
                 let mut line = RoleLine::role(display_single_line(text), Role::Subtle);
-                line.truncate(self.width);
+                line.truncate(width);
                 line
             })
             .collect::<Vec<_>>();
@@ -9394,7 +9459,7 @@ impl State {
         {
             lines.extend(pending_input_lines(
                 std::slice::from_ref(entry),
-                self.width,
+                width,
                 1,
                 self.display,
                 false,
@@ -9409,12 +9474,12 @@ impl State {
             let omitted = format!("… {local_left} local · {queued_left} Agent queued");
             if rows == 1 {
                 let suffix = format!(" · {omitted}");
-                lines[0].truncate(self.width.saturating_sub(display_width(&suffix)));
+                lines[0].truncate(width.saturating_sub(display_width(&suffix)));
                 lines[0].push(suffix, Some(Role::Subtle));
-                lines[0].truncate(self.width);
+                lines[0].truncate(width);
             } else {
                 let mut line = RoleLine::role(omitted, Role::Subtle);
-                line.truncate(self.width);
+                line.truncate(width);
                 lines.push(line);
             }
         }
