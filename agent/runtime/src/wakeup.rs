@@ -119,6 +119,8 @@ pub(super) enum SourceChangeError {
     ForeignHost(String),
     Closing,
     NotLoaded,
+    /// The Chat's boundary stayed held, as by a start whose record is retried; nothing changed.
+    Busy,
     /// The change was made here and could not be recorded; the lease is kept.
     Unrecorded(String),
 }
@@ -130,6 +132,7 @@ impl std::fmt::Display for SourceChangeError {
             Self::ForeignHost(message) | Self::Unrecorded(message) => formatter.write_str(message),
             Self::Closing => formatter.write_str("the Agent is shutting down"),
             Self::NotLoaded => formatter.write_str("the Chat is not loaded"),
+            Self::Busy => formatter.write_str("the Chat is busy"),
         }
     }
 }
@@ -455,13 +458,17 @@ impl Agent {
 
     /// The one entry every Trigger delivery comes through: within the Chat's Trigger boundary,
     /// under its lease, after its source proves it again, it is queued or merged as its source
-    /// coalesces, or refused. An error leaves the delivery with its source.
+    /// coalesces, or refused. An error leaves the delivery with its source; `Busy` when the
+    /// boundary stays held, as by a start whose record is retried.
     pub(super) async fn deliver_trigger(
         &self,
         chat_id: ChatId,
         delivery: TriggerDelivery,
     ) -> Result<Receipt, AgentError> {
-        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let boundary = self
+            .enter_trigger_boundary_for_source(chat_id)
+            .await
+            .ok_or(AgentError::Busy)?;
         let holding = match self.acquire_trigger_permit(chat_id, &boundary).await {
             TriggerPermit::Fire(holding) => holding,
             TriggerPermit::Wait { reason, .. } => return Err(AgentError::Invalid(reason)),
@@ -715,7 +722,8 @@ impl Agent {
     /// Agent's own, holding the Chat's lease whether the Loop receives or not; a lease newly
     /// taken takes the Chat's Trigger state over first. What it records is checkpointed before
     /// the result returns, and before the lease goes back, which it does when the Loop does not
-    /// receive; a change that cannot be recorded keeps the lease.
+    /// receive; a change that cannot be recorded keeps the lease. A boundary that stays held
+    /// makes nothing of the change: `Busy`.
     // The Goal and the scheduled tasks change their state through it as they are wired.
     #[allow(dead_code)]
     pub(super) async fn run_source_change<T: Send + 'static>(
@@ -745,7 +753,10 @@ impl Agent {
         chat_id: ChatId,
         change: Box<dyn FnOnce(&SourceChange, &mut Chat) -> T + Send>,
     ) -> Result<T, SourceChangeError> {
-        let boundary = self.enter_trigger_boundary(chat_id).await;
+        let boundary = self
+            .enter_trigger_boundary_for_source(chat_id)
+            .await
+            .ok_or(SourceChangeError::Busy)?;
         if let loop_lease::LeaseTaken::PausedElsewhere(holding) =
             self.take_lease(chat_id, &boundary).await?
         {
@@ -825,16 +836,21 @@ impl Agent {
         }
         let agent = self.clone();
         self.inner.tasks.spawn(Box::pin(async move {
-            let states = agent.inner.trigger_source_states.read().unwrap().clone();
-            let _ = agent
-                .run_source_change(chat_id, move |change, chat| {
-                    for state in &states {
-                        for line in state.records(chat) {
-                            change.record_source_state(line);
+            loop {
+                let states = agent.inner.trigger_source_states.read().unwrap().clone();
+                let rewritten = agent
+                    .run_source_change(chat_id, move |change, chat| {
+                        for state in &states {
+                            for line in state.records(chat) {
+                                change.record_source_state(line);
+                            }
                         }
-                    }
-                })
-                .await;
+                    })
+                    .await;
+                if !matches!(rewritten, Err(SourceChangeError::Busy)) {
+                    break;
+                }
+            }
         }));
     }
 

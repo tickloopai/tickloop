@@ -1296,6 +1296,38 @@ async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease
     processes.second.shutdown().await;
 }
 
+/// A source reaching the Chat while a start waits to be recorded, the store refusing writes,
+/// hears the Chat is busy within a bounded time instead of waiting through the retries: a
+/// delivery and a change of the source's own state alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_hears_the_chat_is_busy_while_a_start_waits_to_be_recorded() {
+    let processes = FaultyProcesses::new().await;
+    let (first, chat) = (processes.first.clone(), processes.chat);
+    processes.start_while_the_store_refuses().await;
+    let (delivered, changed) = tokio::time::timeout(
+        WAIT,
+        futures_util::future::join(
+            first.deliver_trigger_for_tests(chat, scheduled("other", 1), "waits-at-its-source"),
+            first.run_source_change_for_tests(chat, |_| Vec::new()),
+        ),
+    )
+    .await
+    .expect("both hear back while the start is retried");
+    assert!(
+        matches!(delivered, Err(tickloop_agent_runtime::AgentError::Busy)),
+        "{delivered:?}"
+    );
+    assert_eq!(changed, Err("the Chat is busy".into()));
+    processes.first_store.heal();
+    processes
+        .first_model
+        .wait_seen(FaultyProcesses::MARKER, 1)
+        .await;
+    assert_eq!(processes.first_model.seen("waits-at-its-source"), 0);
+    first.shutdown().await;
+    processes.second.shutdown().await;
+}
+
 /// Trigger input stopped while it waits for its start to be recorded never starts: its start
 /// is taken back, and it runs once the Chat is continued.
 #[tokio::test(flavor = "multi_thread")]
