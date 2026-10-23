@@ -35,6 +35,15 @@ const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
 
+pub(super) fn row_height(glyph: &str, name: &str, details: &str, width: usize) -> usize {
+    let details_columns = if details.is_empty() {
+        0
+    } else {
+        STATUS_GAP_COLUMNS + details.width()
+    };
+    1 + usize::from(name_column(glyph) + name.width() + details_columns > width)
+}
+
 pub(super) struct ListRow<'a> {
     pub(super) selected: bool,
     pub(super) glyph: &'a str,
@@ -93,7 +102,7 @@ impl ListRow<'_> {
     /// The row's lines: one when the whole name fits beside the details, else two, with the name
     /// running on into the second, so a name is never cut for its details while two lines hold it.
     pub(super) fn lines(&self, width: usize) -> Vec<RoleLine> {
-        if self.reserved_columns() + self.name.width() <= width {
+        if row_height(self.glyph, self.name, &self.details, width) == 1 {
             vec![self.one_line(width)]
         } else {
             self.two_lines(width).into()

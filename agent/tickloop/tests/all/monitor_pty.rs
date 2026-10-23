@@ -545,3 +545,79 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
     session.wait("Nothing to monitor");
     session.exit();
 }
+
+#[test]
+fn monitor_keeps_neighbouring_ticks_visible_when_keyboard_navigation_crosses_a_page_in_a_real_pty()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_agent_runtime::Agent::open_embedded(
+                workdir.join("state"),
+                tickloop_agent_test_support::config(),
+                Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            for index in 0..140 {
+                agent
+                    .record_reopened_tick(
+                        chat,
+                        &format!("calendar:lost-{index:03}").parse().unwrap(),
+                        format!("calendar:tick-{index:03}").parse().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+            chat
+        });
+    let mut session = Session::resume(&workdir, chat);
+    session.keep_history_paused();
+    session.wait("Ticks (140)");
+    assert!(!session.frame().contains("of 140"));
+    session.send(b"\x1b[C");
+    let wait_selected = |session: &Session, title: &str| {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frame = screen::visible_screen_with_selection(
+                &session.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame
+                .lines()
+                .any(|line| line.contains(title) && line.contains(screen::SELECTED_MARK))
+            {
+                return frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selected {title:?} was not shown: {frame}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_selected(&session, "calendar:tick-000");
+    session.send(&[b'j'; 127]);
+    let before = wait_selected(&session, "calendar:tick-127");
+    assert!(before.contains('┃'), "{before}");
+    session.send(b"j");
+    let after = wait_selected(&session, "calendar:tick-128");
+    assert!(
+        after.contains("calendar:tick-127"),
+        "previous page's last row stays visible: {after}"
+    );
+    session.send(b"k");
+    let returned = wait_selected(&session, "calendar:tick-127");
+    assert!(
+        returned.contains("calendar:tick-128"),
+        "upward navigation preserves the viewport: {returned}"
+    );
+    session.send(b"\x1b");
+    session.exit();
+}
