@@ -40,6 +40,12 @@ struct ServiceControl {
     requests: Mutex<Vec<Value>>,
 }
 
+/// An `access_role` for which the metadata endpoint answers that this account cannot see the
+/// Artifact.
+const NO_ACCESS: &str = "none";
+/// An `access_role` for which the metadata endpoint fails as an unavailable service.
+const UNAVAILABLE: &str = "unavailable";
+
 async fn service() -> (String, Arc<ServiceControl>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -93,6 +99,7 @@ async fn service() -> (String, Arc<ServiceControl>) {
                     control.release_call_response.notified().await;
                 }
                 let account = control.account.load(Ordering::SeqCst);
+                let mut status = "200 OK";
                 let response = if path
                     .starts_with("GET /.well-known/oauth-authorization-server/account ")
                 {
@@ -104,7 +111,20 @@ async fn service() -> (String, Arc<ServiceControl>) {
                 } else if path.starts_with("GET /account/userinfo ") {
                     json!({"sub":format!("user-{account}"),"name":"Test","email":"test@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/doc ") {
-                    json!({"id":"doc","title":"Report","format":"html","access_role":control.access_role.lock().unwrap().as_deref().unwrap_or("owner"),"publication":control.publication.lock().unwrap().clone()})
+                    let role = control.access_role.lock().unwrap().clone();
+                    match role.as_deref() {
+                        Some(NO_ACCESS) => {
+                            status = "404 Not Found";
+                            json!({"error":{"code":"not_found","message":"Artifact not found"}})
+                        }
+                        Some(UNAVAILABLE) => {
+                            status = "503 Service Unavailable";
+                            json!({"error":{"code":"unavailable","message":"Try again"}})
+                        }
+                        role => {
+                            json!({"id":"doc","title":"Report","format":"html","access_role":role.unwrap_or("owner"),"publication":control.publication.lock().unwrap().clone()})
+                        }
+                    }
                 } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match body["method"].as_str().unwrap_or("") {
                         "server/discover" => {
@@ -136,7 +156,7 @@ async fn service() -> (String, Arc<ServiceControl>) {
                 };
                 let response = response.to_string();
                 let message = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                     response.len()
                 );
                 stream.write_all(message.as_bytes()).await.unwrap();
@@ -959,7 +979,7 @@ async fn artifact_first_publication_consent_is_conversation_scoped_and_rules_sti
 }
 
 #[tokio::test]
-async fn artifact_content_without_verified_ownership_requires_human_confirmation() {
+async fn artifact_reads_follow_the_users_role_without_confirmation() {
     use tickloop_agent_protocol::{AgentHostOptions, ExecutionMode, PromptPolicy};
     use tickloop_agent_test_support::next_event;
     for (role, mode, rule, prompt_policy, approve, prompts, calls) in [
@@ -987,7 +1007,7 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
             None,
             PromptPolicy::Interactive,
             true,
-            1,
+            0,
             1,
         ),
         (
@@ -996,7 +1016,7 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
             None,
             PromptPolicy::Interactive,
             true,
-            1,
+            0,
             1,
         ),
         (
@@ -1004,6 +1024,24 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
             ExecutionMode::FullAccess,
             Some(Decision::Allow),
             PromptPolicy::Unrestricted,
+            true,
+            0,
+            1,
+        ),
+        (
+            "viewer",
+            ExecutionMode::Auto,
+            None,
+            PromptPolicy::DenyOnPrompt,
+            false,
+            0,
+            1,
+        ),
+        (
+            "viewer",
+            ExecutionMode::Auto,
+            Some(Decision::Ask),
+            PromptPolicy::Interactive,
             true,
             1,
             1,
@@ -1014,14 +1052,23 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
             Some(Decision::Allow),
             PromptPolicy::Interactive,
             false,
-            1,
+            0,
             0,
         ),
         (
-            "viewer",
+            NO_ACCESS,
             ExecutionMode::Auto,
             None,
-            PromptPolicy::DenyOnPrompt,
+            PromptPolicy::Interactive,
+            false,
+            0,
+            0,
+        ),
+        (
+            UNAVAILABLE,
+            ExecutionMode::Auto,
+            None,
+            PromptPolicy::Interactive,
             false,
             0,
             0,
@@ -1129,8 +1176,7 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
     }
 }
 
-#[tokio::test]
-async fn artifact_read_ownership_is_revalidated_before_content_dispatch() {
+async fn signed_in_provider() -> (McpHostToolProvider, Arc<ServiceControl>, tempfile::TempDir) {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let account =
@@ -1138,37 +1184,222 @@ async fn artifact_read_ownership_is_revalidated_before_content_dispatch() {
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
+    (provider, control, directory)
+}
+
+fn tool_calls(control: &ServiceControl) -> Vec<String> {
+    control
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["body"]["method"] == "tools/call")
+        .map(|request| {
+            request["body"]["params"]["name"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn artifact_access_is_revalidated_before_dispatch() {
+    use tickloop_agent_runtime::host_tools::HostToolPermission;
+    let (provider, control, _directory) = signed_in_provider().await;
     let chat = Uuid::new_v4();
-    let prepared = provider
-        .prepare_call(
-            chat,
-            "ArtifactRead",
-            &json!({
-                "action":"read","artifact_id":"doc"
-            }),
-            CancellationToken::new(),
-        )
+    let read = json!({"action":"read","artifact_id":"doc"});
+    let edit = json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"x"});
+    let prepared_read = provider
+        .prepare_call(chat, "ArtifactRead", &read, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(
-        prepared.permission(),
-        tickloop_agent_runtime::host_tools::HostToolPermission::ReadOnly
-    );
+    assert_eq!(prepared_read.permission(), HostToolPermission::ReadOnly);
+    let prepared_edit = provider
+        .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+        .await
+        .unwrap();
+
     *control.access_role.lock().unwrap() = Some("viewer".into());
-    assert!(
-        provider
-            .revalidate_call(chat, &prepared, CancellationToken::new())
+    provider
+        .revalidate_call(chat, &prepared_read, CancellationToken::new())
+        .await
+        .unwrap();
+    let error = provider
+        .revalidate_call(chat, &prepared_edit, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(error.contains("not edit"), "{error}");
+
+    *control.access_role.lock().unwrap() = Some(NO_ACCESS.into());
+    let error = provider
+        .revalidate_call(chat, &prepared_read, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(error.contains("no access"), "{error}");
+    assert!(tool_calls(&control).is_empty());
+}
+
+#[tokio::test]
+async fn each_role_prepares_only_the_artifact_calls_it_may_make() {
+    use tickloop_agent_runtime::host_tools::HostToolPermission;
+    let reply = json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Done"});
+    let edits = [
+        json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"x"}),
+        json!({"action":"patch","artifact_id":"doc","patches":[{"id":"b1","hash":"h1","content":"x"}]}),
+        json!({"action":"rename","artifact_id":"doc","title":"New","expected_title":"Report"}),
+    ];
+    let create = json!({"action":"create","title":"Notes","format":"doc","content":"# Notes"});
+    for role in ["owner", "editor", "viewer"] {
+        let (provider, control, _directory) = signed_in_provider().await;
+        *control.access_role.lock().unwrap() = Some(role.into());
+        let chat = Uuid::new_v4();
+        let comment = provider
+            .prepare_call(chat, "ArtifactComment", &reply, CancellationToken::new())
             .await
-            .is_err()
-    );
-    assert!(
-        !control
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|request| request["body"]["method"] == "tools/call")
-    );
+            .unwrap();
+        assert_eq!(
+            comment.permission(),
+            HostToolPermission::Reviewable,
+            "{role}"
+        );
+        for edit in &edits {
+            let prepared = provider
+                .prepare_call(chat, "ArtifactEdit", edit, CancellationToken::new())
+                .await;
+            if role == "viewer" {
+                let error = prepared.err().unwrap();
+                assert!(
+                    error.contains("can view artifact doc and comment on it but not edit it"),
+                    "{error}"
+                );
+            } else {
+                assert_ne!(
+                    prepared.unwrap().permission(),
+                    HostToolPermission::ReadOnly,
+                    "{role}"
+                );
+            }
+        }
+        provider
+            .prepare_call(chat, "ArtifactEdit", &create, CancellationToken::new())
+            .await
+            .unwrap();
+    }
+
+    for (role, expected) in [
+        (NO_ACCESS, "This account has no access to artifact doc"),
+        (
+            UNAVAILABLE,
+            "Access to artifact doc could not be verified for this account",
+        ),
+        (
+            "admin",
+            "Access to artifact doc could not be verified for this account",
+        ),
+    ] {
+        let (provider, control, _directory) = signed_in_provider().await;
+        *control.access_role.lock().unwrap() = Some(role.into());
+        for (tool, input) in [
+            (
+                "ArtifactRead",
+                json!({"action":"threads","artifact_id":"doc"}),
+            ),
+            ("ArtifactComment", reply.clone()),
+            ("ArtifactEdit", edits[0].clone()),
+        ] {
+            let error = provider
+                .prepare_call(Uuid::new_v4(), tool, &input, CancellationToken::new())
+                .await
+                .err()
+                .unwrap();
+            assert!(error.starts_with(expected), "{role} {tool}: {error}");
+        }
+        assert!(tool_calls(&control).is_empty());
+    }
+}
+
+/// A Cloud Agent runs unattended in Full Access with the Artifact tools allowed, as the user who
+/// asked: a viewer's Agent reads and replies, and its edit is refused before anyone is asked.
+#[tokio::test]
+async fn an_unattended_viewers_agent_reads_and_replies_but_cannot_edit() {
+    use tickloop_agent_protocol::{AgentHostOptions, ExecutionMode, PromptPolicy};
+    use tickloop_agent_test_support::next_event;
+    for (role, dispatched) in [
+        ("viewer", vec!["ArtifactRead", "ArtifactComment"]),
+        (
+            "editor",
+            vec!["ArtifactRead", "ArtifactEdit", "ArtifactComment"],
+        ),
+    ] {
+        let (provider, control, directory) = signed_in_provider().await;
+        *control.access_role.lock().unwrap() = Some(role.into());
+        let agent = Agent::new_with_options(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call(
+                    "read",
+                    "ArtifactRead",
+                    json!({"action":"read","artifact_id":"doc"}),
+                ),
+                call(
+                    "edit",
+                    "ArtifactEdit",
+                    json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"Shorter"}),
+                ),
+                call(
+                    "reply",
+                    "ArtifactComment",
+                    json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Done"}),
+                ),
+                text("done"),
+            ])),
+            AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                directory_trust: tickloop_agent_protocol::DirectoryTrustPolicy::CallerManaged,
+                ..Default::default()
+            },
+        );
+        agent.install_host_tools(Arc::new(provider)).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                ["ArtifactRead", "ArtifactEdit", "ArtifactComment"]
+                    .into_iter()
+                    .map(|tool| PermissionRule {
+                        id: Uuid::new_v4(),
+                        decision: Decision::Allow,
+                        tool: tool.into(),
+                        specifier: None,
+                        input: None,
+                        loop_id: None,
+                        persistent: false,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Tighten the introduction.".into())
+            .await
+            .unwrap();
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { .. } => panic!("{role}'s Agent was asked"),
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(tool_calls(&control), dispatched, "{role}");
+        agent.shutdown().await;
+    }
 }
 
 #[tokio::test]
