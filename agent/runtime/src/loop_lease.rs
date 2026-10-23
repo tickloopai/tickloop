@@ -644,6 +644,21 @@ impl Agent {
         self.inner.chat_leases.boundary(chat_id).lock_owned().await
     }
 
+    /// Whether this process holds the Chat's lease and took the Chat over under it, so it alone
+    /// writes the records of the Trigger sources' state. A host that keeps waits durably, or
+    /// keeps no Transcript, always does until it closes.
+    pub(super) fn holds_trigger_lease(&self, chat_id: ChatId) -> bool {
+        let leases = &self.inner.chat_leases;
+        if leases.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.recorder.is_none()
+            || self.inner.waits == super::WaitHosting::Durable
+            || leases
+                .holding(chat_id)
+                .is_some_and(|holding| leases.stands(chat_id, holding))
+    }
+
     /// Enters the Chat's Trigger boundary for a source, as long as it is free soon enough;
     /// `None` while it stays held.
     pub(super) async fn enter_trigger_boundary_for_source(

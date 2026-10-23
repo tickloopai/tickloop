@@ -506,8 +506,15 @@ impl Agent {
                             .request_usage
                             .finish(response.sequence, RequestOutcome::Accepted)?;
                         if let Some(recorder) = &self.inner.recorder {
-                            recorder.compact(chat, &snapshot, &bookkeeping, &layout, &[]);
-                            self.rewrite_source_records_after_compaction(chat.snapshot.id);
+                            let source_states = self.source_records_for_compaction(chat);
+                            recorder.compact(
+                                chat,
+                                &snapshot,
+                                &bookkeeping,
+                                &layout,
+                                &[],
+                                source_states,
+                            );
                         }
                         self.save(&snapshot);
                         chat.snapshot = snapshot;

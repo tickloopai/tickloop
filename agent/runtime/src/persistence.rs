@@ -741,6 +741,7 @@ impl ChatRecorder {
         compacted_bookkeeping: &ChatBookkeeping,
         layout: &CompactionLayout,
         renamed_snapshots: &[FileHistorySnapshot],
+        source_states: Vec<Line>,
     ) {
         let Some(mut lines) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
             return;
@@ -772,7 +773,8 @@ impl ChatRecorder {
                 replacements,
             }));
         }
-        self.outbox.enqueue(compacted.id, lines, events_through);
+        self.outbox
+            .enqueue_group(compacted.id, lines, source_states, events_through);
     }
 
     /// 压缩后对话中需要新写的链上条目，同时把已写出条目的对应表换成压缩后的对话。已写出的条目

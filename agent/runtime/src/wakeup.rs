@@ -867,13 +867,27 @@ impl Agent {
         true
     }
 
-    /// After a compaction, the lease holder writes the sources' records again, within the
-    /// boundary; a process another live one holds the lease from leaves them to it, and every
-    /// takeover reads them from the whole store.
-    pub(super) fn rewrite_source_records_after_compaction(&self, chat_id: ChatId) {
+    /// The records of the sources' state a compaction writes in its own group, after its
+    /// snapshot, so a load from the compaction finds them: the lease holder's, as they stand.
+    /// A process that does not hold the lease writes them again after the compaction if it can
+    /// take the lease; one another live process holds it from leaves them to that one, and
+    /// every takeover reads them from the whole store.
+    pub(super) fn source_records_for_compaction(&self, chat: &Chat) -> Vec<Line> {
         if !self.has_trigger_source_states() {
-            return;
+            return Vec::new();
         }
+        if !self.holds_trigger_lease(chat.snapshot.id) {
+            self.rewrite_source_records_after_compaction(chat.snapshot.id);
+            return Vec::new();
+        }
+        let states = self.inner.trigger_source_states.read().unwrap().clone();
+        states
+            .iter()
+            .flat_map(|state| state.records(chat))
+            .collect()
+    }
+
+    fn rewrite_source_records_after_compaction(&self, chat_id: ChatId) {
         let agent = self.clone();
         self.inner.tasks.spawn(Box::pin(async move {
             loop {

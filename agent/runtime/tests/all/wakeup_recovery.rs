@@ -2068,6 +2068,64 @@ async fn a_compaction_has_the_holder_write_the_source_records_again() {
     agent.shutdown().await;
 }
 
+/// The lease holder's compaction carries the sources' records itself: an exit right after it,
+/// while the Chat's boundary is still taken, leaves them after the compaction in the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_by_the_holder_keeps_the_source_records_through_an_exit() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+        records: Some(Box::new(|snapshot| {
+            vec![source_record(snapshot.id, "as it stands")]
+        })),
+        ..Default::default()
+    });
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), "takes-the-lease")
+        .await
+        .unwrap();
+    model.wait_seen("takes-the-lease", 1).await;
+    wait_for_state(&agent, chat, tickloop_agent_protocol::LoopState::Idle).await;
+    // A stop holds the boundary with the lease, its pause recorded and the lease not yet back.
+    let recorded = agent.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
+    let stop = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.stop(chat).await }
+    });
+    tokio::time::timeout(WAIT, recorded.entered)
+        .await
+        .expect("the stop holds the boundary")
+        .unwrap();
+    tokio::time::timeout(WAIT, agent.compact(chat))
+        .await
+        .expect("compacts")
+        .unwrap();
+    let shutdown = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.shutdown().await }
+    });
+    tokio::time::sleep(SETTLE).await;
+    drop(recorded.release);
+    stop.await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, shutdown)
+        .await
+        .expect("shuts down")
+        .unwrap();
+    let stored = stored_lines(&root, chat);
+    let boundary = stored
+        .iter()
+        .rposition(|line| {
+            line.chain_entry()
+                .is_some_and(tickloop_agent_transcript::ChainEntry::restarts_chain)
+        })
+        .expect("the compaction is stored");
+    assert_eq!(records_of(&stored[boundary..], "as it stands"), 1);
+}
+
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs
 /// once the lease can be taken, with nothing else delivered or submitted.
 #[tokio::test(flavor = "multi_thread")]

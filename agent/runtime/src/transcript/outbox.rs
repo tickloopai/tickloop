@@ -230,7 +230,7 @@ impl TranscriptOutbox {
     /// of it, so the store commits it whole or not at all. The records of a Trigger source's own
     /// state, which its lease holder writes, are never kept to be written again as metadata, nor
     /// folded into a retained snapshot, so no stale copy of them is written by a process that
-    /// does not hold the lease.
+    /// does not hold the lease; they follow a snapshot the group makes, as a compaction's.
     pub(crate) fn enqueue_group(
         &self,
         chat: ChatId,
@@ -251,21 +251,15 @@ impl TranscriptOutbox {
         if lines.is_empty() && source_states.is_empty() {
             return;
         }
-        let mut accepted = Vec::with_capacity(lines.len() + source_states.len());
-        let group = lines
-            .into_iter()
-            .map(|line| (line, true))
-            .chain(source_states.into_iter().map(|line| (line, false)));
-        for (line, kept) in group {
+        let mut accepted = Vec::with_capacity(lines.len() + source_states.len() + 1);
+        for line in lines {
             if let Some(entry) = line.chain_entry()
                 && !outbox.written_uuids.insert(entry.uuid)
             {
                 continue;
             }
-            if kept {
-                outbox.metadata.remember(&line);
-                outbox.retained.apply(&line);
-            }
+            outbox.metadata.remember(&line);
+            outbox.retained.apply(&line);
             accepted.push(line);
         }
         // A new start of the chain, or enough retained Lines since the last snapshot, are folded
@@ -279,6 +273,8 @@ impl TranscriptOutbox {
             outbox.retained.apply(&snapshot);
             accepted.push(snapshot);
         }
+        // After the snapshot, which does not stand for them.
+        accepted.extend(source_states);
         if !outbox.materialized {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()
