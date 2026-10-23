@@ -24,6 +24,8 @@ A run that comes due while the Loop is busy waits until the current turn ends. E
 
 Without an interval you choose when the next run happens.
 
+If the user's instruction includes an explicit schedule (for example, every Tuesday at 12:00), use CronCreate for that schedule and do not call ScheduleWakeup; confirm the created task and end this run, and the host will end the self-paced loop automatically.
+
 1. Run it now.
 2. At the end of every run, decide whether the loop continues. Continuing is a choice each run makes, not a default.
    - To continue, call ScheduleWakeup with `delaySeconds` (60 to 3600), `reason` (one short sentence on why you picked that delay) and `prompt` (the scheduled prompt, which brings the next run back into this Skill).

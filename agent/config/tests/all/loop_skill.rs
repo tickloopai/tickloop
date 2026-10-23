@@ -388,6 +388,8 @@ fn the_loop_skill_teaches_the_three_forms_with_the_scheduling_tools() {
         "`stop: true` and no other fields",
         "after about 20 minutes",
         "Esc stops it while it waits",
+        "If the user's instruction includes an explicit schedule (for example, every Tuesday at 12:00), use CronCreate for that schedule and do not call ScheduleWakeup",
+        "the host will end the self-paced loop automatically",
         "Esc does not stop a fixed-interval task",
         "`.tickloop/loop.md`",
         "`loop.md` in the Tickloop config root",
