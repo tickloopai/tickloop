@@ -866,3 +866,108 @@ async fn a_transcript_with_eight_character_task_ids_still_loads() {
     );
     assert!(!tickloop_agent_transcript::display::project(&legacy).is_empty());
 }
+
+/// A Chat without messages that held only scheduled tasks stays loadable once its last task
+/// leaves, whether the host deleted it or its end came: another holder loads it empty, and it
+/// schedules and runs a new task, after whose one-shot run it loads again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_without_messages_stays_after_its_last_task_leaves() {
+    for ends in [false, true] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let first = host(store.clone(), ContractModel::new(), |_| {});
+        let chat = first.create_chat_without_folder().await.unwrap();
+        let ends_at_ms = ms(at(23, 12, 30));
+        let task = first
+            .schedule_task(
+                chat,
+                NewScheduledTask {
+                    ends_at_ms: ends.then_some(ends_at_ms),
+                    ..NewScheduledTask::new("7 * * * *", "hourly check", true)
+                },
+            )
+            .await
+            .unwrap();
+        if ends {
+            end_while_paused(&first, chat, task.id, ends_at_ms).await;
+        } else {
+            first.delete_scheduled_task(chat, task.id).await.unwrap();
+        }
+        assert!(tasks(&first, chat).await.is_empty(), "ends: {ends}");
+        first.sync().await.unwrap();
+        first.shutdown().await;
+
+        let model = ContractModel::new();
+        let next = host(store.clone(), model.clone(), |_| {});
+        let loaded = next.resume_chat(chat).await.unwrap();
+        assert!(loaded.scheduled_tasks.is_empty(), "ends: {ends}");
+        assert!(loaded.messages.is_empty(), "ends: {ends}");
+        let again = next
+            .schedule_task(
+                chat,
+                NewScheduledTask::new("13 10 * * *", "check again", false),
+            )
+            .await
+            .unwrap();
+        let handed = next
+            .wake_scheduled_tasks(chat, again.next_fire_at_ms.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(handed.len(), 1, "ends: {ends}");
+        model.wait_seen("check again", 1).await;
+        next.quiesce(chat).await;
+        assert!(tasks(&next, chat).await.is_empty());
+        next.sync().await.unwrap();
+        next.shutdown().await;
+
+        let last = host(store, ContractModel::new(), |_| {});
+        let reloaded = last.resume_chat(chat).await.unwrap();
+        assert!(reloaded.scheduled_tasks.is_empty());
+        assert!(
+            !reloaded.messages.is_empty(),
+            "the one-shot run's turn stays"
+        );
+        last.shutdown().await;
+    }
+}
+
+/// A Chat with a Folder and no messages keeps its Folder after its last task is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_with_a_folder_and_no_messages_keeps_its_folder_without_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let holder = Agent::open_embedded(root.clone(), config(), ContractModel::new()).unwrap();
+    holder.set_scheduled_now_for_tests(at(23, 10, 0));
+    let chat = holder.create_chat(directory.path().into()).await.unwrap();
+    let task = holder.schedule_task(chat, daily_digest()).await.unwrap();
+    holder.delete_scheduled_task(chat, task.id).await.unwrap();
+    holder.flush_transcripts().await;
+    holder.shutdown().await;
+
+    let reader = Agent::open_embedded(root, config(), ContractModel::new()).unwrap();
+    let loaded = reader.resume_chat(chat).await.unwrap();
+    assert_eq!(
+        loaded.folder.map(|folder| folder.canonicalize().unwrap()),
+        Some(directory.path().canonicalize().unwrap())
+    );
+    assert!(loaded.scheduled_tasks.is_empty());
+    assert!(loaded.messages.is_empty());
+    reader.shutdown().await;
+}
+
+/// Pauses the task, so it reaches its end without a run, and wakes the host at that end.
+async fn end_while_paused(agent: &Agent, chat: ChatId, task: Uuid, end_ms: u64) {
+    agent
+        .set_scheduled_task_paused(chat, task, true)
+        .await
+        .unwrap();
+    agent.set_scheduled_now_for_tests(
+        DateTime::from_timestamp_millis(i64::try_from(end_ms).unwrap()).unwrap(),
+    );
+    assert!(
+        agent
+            .wake_scheduled_tasks(chat, end_ms)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

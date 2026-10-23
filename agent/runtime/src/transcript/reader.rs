@@ -279,9 +279,8 @@ pub(crate) fn assemble(
             || goal
                 .as_ref()
                 .is_some_and(|entry| entry.cwd.is_some() && entry.goal.is_some())
-            || scheduled_tasks
-                .as_ref()
-                .is_some_and(ScheduledTasksEntry::materializes_chat);
+            // Only a Chat that scheduled a task records them, so it stays once they are gone.
+            || scheduled_tasks.is_some();
         let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
             chain: Vec::new(),

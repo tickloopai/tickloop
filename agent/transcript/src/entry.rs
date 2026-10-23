@@ -628,6 +628,8 @@ pub struct ScheduledTasksEntry {
 }
 
 impl ScheduledTasksEntry {
+    /// Whether the record has the store keep a Chat without messages; once kept, the Chat stays
+    /// after its last task is gone.
     pub fn materializes_chat(&self) -> bool {
         !self.tasks.is_empty()
     }
