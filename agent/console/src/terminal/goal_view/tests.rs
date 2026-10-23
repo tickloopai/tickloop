@@ -110,12 +110,18 @@ fn monitor_selection_wins_over_flash_and_keeps_text_indent() {
         for selected in [false, true] {
             let lines = goal.monitor_lines(width, selected, DisplayProfile::default(), false, 1000);
             assert_eq!(lines.len(), 2);
-            assert!(lines.iter().all(|line| line.fill
-                == Some(if selected {
+            assert_eq!(
+                lines[0].fill, None,
+                "the state line is the Goal's group title"
+            );
+            assert_eq!(
+                lines[1].fill,
+                Some(if selected {
                     Role::Selection
                 } else {
                     Role::TakeInFlashStrong
-                })));
+                })
+            );
             assert!(lines.iter().all(|line| line.text().width() <= width));
             assert!(lines[1].text().starts_with('◎'));
         }
@@ -199,11 +205,9 @@ fn continuation_flash_reuses_take_in_phases_and_reduced_motion() {
         (1_800, Some(Role::TakeInFlashStrong)),
         (2_200, None),
     ] {
-        assert!(
-            goal.monitor_lines(40, false, display, false, now)
-                .iter()
-                .all(|line| line.fill == expected)
-        );
+        let lines = goal.monitor_lines(40, false, display, false, now);
+        assert_eq!(lines[0].fill, None);
+        assert_eq!(lines[1].fill, expected);
     }
     let still = DisplayProfile::new(DisplayPreferences {
         prefers_reduced_motion: true,
@@ -287,7 +291,7 @@ fn goal_notices_use_semantic_roles_and_keep_untrusted_reasons_on_one_line() {
 }
 
 #[test]
-fn selected_monitor_title_keeps_state_colour_on_the_selection_background() {
+fn a_selected_goal_keeps_its_state_colours_and_leaves_the_title_unselected() {
     for theme in ThemeName::ALL {
         let mut display = DisplayProfile::default();
         display.set_theme(theme);
@@ -303,8 +307,8 @@ fn selected_monitor_title_keeps_state_colour_on_the_selection_background() {
                 ..example_goal()
             };
             let lines = goal.monitor_lines(48, true, display, false, 0);
-            let resolved = lines[0].resolve(display.theme(), 48);
-            let title = resolved
+            let title = lines[0].resolve(display.theme(), 48);
+            let title = title
                 .spans
                 .iter()
                 .find(|span| span.text.contains(state.title()))
@@ -313,8 +317,22 @@ fn selected_monitor_title_keeps_state_colour_on_the_selection_background() {
                 title.style.foreground,
                 display.theme().style(state.role()).foreground
             );
-            assert_eq!(
+            assert_ne!(
                 title.style.background,
+                display.theme().style(Role::Selection).background
+            );
+            let condition = lines[1].resolve(display.theme(), 48);
+            let glyph = condition
+                .spans
+                .iter()
+                .find(|span| span.text.contains('◎'))
+                .unwrap();
+            assert_eq!(
+                glyph.style.foreground,
+                display.theme().style(state.role()).foreground
+            );
+            assert_eq!(
+                glyph.style.background,
                 display.theme().style(Role::Selection).background
             );
         }

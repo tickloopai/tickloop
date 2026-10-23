@@ -1039,9 +1039,6 @@ impl Monitor {
     }
 
     fn selected_status(&self) -> String {
-        if let Some(task) = self.selected_task() {
-            return format!("Scheduled task {}", task.id);
-        }
         let Some(entry) = self.selected() else {
             return String::new();
         };

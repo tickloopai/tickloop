@@ -298,7 +298,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         ),
         (
             MonitorTarget::ScheduledTask("0123abcd".into()),
-            "Scheduled task 0123abcd",
+            "",
             "enter details · Ctrl+X remove · esc input",
         ),
         (
@@ -362,7 +362,14 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
                 .iter()
                 .all(|(_, target)| *target != MonitorTarget::Goal)
         );
-        assert_eq!(frame.lines[row].fill == Some(Role::Selection), index == 2);
+        assert_eq!(
+            frame.lines[row].fill, None,
+            "the Goal's state line is a group title"
+        );
+        assert_eq!(
+            frame.lines[row + 1].fill == Some(Role::Selection),
+            index == 2
+        );
     }
 
     assert!(

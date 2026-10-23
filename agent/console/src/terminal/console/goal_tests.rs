@@ -818,7 +818,7 @@ fn goal_monitor_render_evidence() {
             .iter()
             .any(|span| span.text.contains("Pursuing goal") && span.role == Some(Role::Accent))
     );
-    assert_eq!(frame.lines[7].fill, Some(Role::Selection));
+    assert_eq!(frame.lines[7].fill, None);
     assert_eq!(frame.lines[8].fill, Some(Role::Selection));
 }
 

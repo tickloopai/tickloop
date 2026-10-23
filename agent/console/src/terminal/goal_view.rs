@@ -142,18 +142,15 @@ impl<'a> GoalView<'a> {
             display,
             now_ms,
         );
-        [header, condition]
-            .into_iter()
-            .map(|line| {
-                if selected {
-                    line.filled(Role::Selection)
-                } else if let Some(fill) = fill {
-                    line.filled(fill)
-                } else {
-                    line
-                }
-            })
-            .collect()
+        // The state line is the Goal's group title; selection and the flash mark only its row.
+        let condition = if selected {
+            condition.filled(Role::Selection)
+        } else if let Some(fill) = fill {
+            condition.filled(fill)
+        } else {
+            condition
+        };
+        vec![header, condition]
     }
 
     pub(super) fn detail_lines(&self, width: usize, top: usize, height: usize) -> Vec<RoleLine> {
