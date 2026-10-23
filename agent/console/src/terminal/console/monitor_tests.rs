@@ -5073,3 +5073,467 @@ fn wheel_scrolls_only_the_tick_viewport_without_moving_selection_or_the_dock() {
         assert!(resumed.targets.iter().any(|(_, id)| id == &selected));
     }
 }
+
+fn monitor_entry_span(state: &mut State) -> RoleLine {
+    state
+        .styled_frame()
+        .0
+        .into_iter()
+        .find(|line| line.text().contains("◉ Monitor "))
+        .unwrap()
+}
+
+#[test]
+fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
+    for theme in super::super::style::ThemeName::ALL {
+        for (elapsed, expected) in [
+            (0, Role::TakeInFlashStrong),
+            (400, Role::TakeInFlashSoft),
+            (800, Role::TakeInFlashStrong),
+            (1300, Role::MutedText),
+        ] {
+            for expanded in [false, true] {
+                let mut state = click_fixture(140, false, TickGroup::Shells);
+                state.display.set_theme(theme);
+                state.monitor.focused = false;
+                state.monitor_preference = if expanded {
+                    tickloop_agent_config::MonitorPreference::Auto
+                } else {
+                    tickloop_agent_config::MonitorPreference::Hidden
+                };
+                let instance = state.monitor.entries()[0].instance.clone();
+                let since = tickloop_agent_base::private_fs::unix_time_milliseconds() - elapsed;
+                state.monitor.flash_received(instance, since);
+                let line = monitor_entry_span(&mut state);
+                let entry = line
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains("◉ Monitor "))
+                    .unwrap();
+                let role = if expanded { Role::Permission } else { expected };
+                let has_background = state.display.theme().style(role).background.is_some();
+                assert_eq!(
+                    entry.role,
+                    Some(if has_background { Role::Text } else { role })
+                );
+                let resolved = line.resolve(state.display.theme(), state.width);
+                let label = resolved
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains("◉ Monitor "))
+                    .unwrap();
+                assert_eq!(
+                    label.style.background,
+                    state
+                        .display
+                        .theme()
+                        .style(if expanded { Role::Permission } else { expected })
+                        .background
+                );
+                if has_background {
+                    assert_eq!(
+                        label.style.foreground,
+                        state.display.theme().style(Role::Text).foreground
+                    );
+                }
+                if !expanded && elapsed < 1200 {
+                    assert_eq!(
+                        state.next_row_clock(since + elapsed),
+                        Some(since + (elapsed / 400 + 1) * 400)
+                    );
+                }
+            }
+        }
+    }
+    let mut state = click_fixture(140, false, TickGroup::Shells);
+    state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+    state
+        .display
+        .set_preferences(tickloop_agent_config::DisplayPreferences {
+            prefers_reduced_motion: true,
+        });
+    let instance = state.monitor.entries()[0].instance.clone();
+    state.monitor.flash_received(
+        instance,
+        tickloop_agent_base::private_fs::unix_time_milliseconds(),
+    );
+    assert!(
+        monitor_entry_span(&mut state)
+            .spans
+            .iter()
+            .any(|span| span.text.contains("◉ Monitor ") && span.role == Some(Role::MutedText))
+    );
+    assert_eq!(
+        state.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds()),
+        None
+    );
+}
+
+#[test]
+fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_delivery() {
+    for artifact in [false, true] {
+        let chat = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(chat);
+        let mut snapshot = chat_snapshot(chat);
+        let instance = if artifact {
+            snapshot
+                .artifact_ticks
+                .push(tickloop_agent_protocol::ArtifactTick {
+                    artifact_id: "doc".into(),
+                    origin: "https://docs.example".into(),
+                    title: "Stream Artifact".into(),
+                    format: "markdown".into(),
+                    url: "https://docs.example/a/doc".into(),
+                    access_role: "owner".into(),
+                    added_at_ms: 1,
+                });
+            tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap()
+        } else {
+            let instance = tick_protocol::InstanceRef::new("calendar", "stream").unwrap();
+            snapshot.monitor.members.push(MonitorMember {
+                instance: instance.clone(),
+                is_terminal: false,
+                title: Some("Stream Tick".into()),
+            });
+            instance
+        };
+        console
+            .update_monitor_chat(ChatStatus::of(&snapshot))
+            .unwrap();
+        console
+            .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+            .unwrap();
+        let message = if artifact {
+            tickloop_agent_protocol::LocalMessage::ArtifactRequest {
+                artifact_id: "doc".into(),
+                request_id: "feedback".into(),
+                title: None,
+                body: "Review this".into(),
+            }
+        } else {
+            tickloop_agent_protocol::LocalMessage::TickDelivery {
+                items: vec![tickloop_agent_protocol::TickDeliveryLine {
+                    instance: instance.clone(),
+                    title: None,
+                    kind: None,
+                    seq: None,
+                    updates: 1,
+                    is_trimmed: false,
+                }],
+            }
+        };
+        let input = Uuid::new_v4();
+        console
+            .record_local_deliveries(&snapshot, input, std::slice::from_ref(&message))
+            .unwrap();
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        {
+            let mut state = console.state.lock().unwrap();
+            assert!(!state.monitor_visible());
+            assert_eq!(
+                state.monitor.entry_flash_role(state.display, now),
+                Some(Role::TakeInFlashStrong)
+            );
+            assert!(
+                state
+                    .monitor
+                    .frame(48, 12, state.display, now)
+                    .lines
+                    .iter()
+                    .any(|line| line.text().contains("Stream ")
+                        && line.fill == Some(Role::TakeInFlashStrong))
+            );
+            assert!(state.row_clock_at.is_some());
+            state.monitor.settle_flashes(now + 2000);
+        }
+        console
+            .record_local_deliveries(&snapshot, input, &[message])
+            .unwrap();
+        let state = console.state.lock().unwrap();
+        assert_eq!(
+            state.monitor.entry_flash_role(state.display, now + 2000),
+            None,
+            "the same content echo never flashes twice"
+        );
+    }
+}
+
+#[test]
+fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapshot() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    let mut shells = tests::task_snapshot(chat, 1);
+    shells.tasks[0].was_background = true;
+    shells.tasks[0].state = ShellTaskState::Background;
+    shells.tasks[0].command = "make test".into();
+    let instance = tick_protocol::InstanceRef::shell(shells.tasks[0].id);
+    console.update_monitor_chat(chat_status(chat)).unwrap();
+    console.refresh_monitor_ticks(shells.clone(), None).unwrap();
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    console
+        .write_shell_notification(&tickloop_agent_protocol::TaskNotification {
+            chat_id: chat,
+            task_id: shells.tasks[0].id,
+            tool_use_id: None,
+            output_file: "output.txt".into(),
+            status: tickloop_agent_protocol::TaskNotificationStatus::Completed,
+            summary: "make test completed".into(),
+        })
+        .unwrap();
+    let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(
+            state.monitor.entry_flash_role(state.display, now),
+            Some(Role::TakeInFlashStrong)
+        );
+        let row = state
+            .monitor
+            .frame(48, 12, state.display, now)
+            .lines
+            .into_iter()
+            .find(|line| line.text().contains("make test"))
+            .unwrap();
+        assert_eq!(row.fill, Some(Role::TakeInFlashStrong));
+    }
+    shells.tasks[0].state = ShellTaskState::Completed;
+    shells.tasks[0].updated_at_ms = Some(now + 1);
+    shells.tasks[0].exit_code = Some(0);
+    let before = console.state.lock().unwrap().frames_drawn;
+    console.refresh_monitor_ticks(shells, None).unwrap();
+    let state = console.state.lock().unwrap();
+    assert!(
+        state.frames_drawn > before,
+        "a hidden Monitor still repaints its entry on source refresh"
+    );
+    assert!(
+        state
+            .monitor
+            .entries()
+            .iter()
+            .any(|entry| entry.instance == instance)
+    );
+    assert_eq!(
+        state.monitor.entry_flash_role(state.display, now + 1),
+        Some(Role::TakeInFlashStrong)
+    );
+}
+
+#[test]
+fn artifact_metadata_updates_flash_live_rows_and_hidden_entries_without_replaying_history() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console
+        .refresh_monitor(auto_reveal_sources(chat, "artifact"))
+        .unwrap();
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    let instance = tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap();
+    let metadata = |updated: &str| {
+        serde_json::from_value(serde_json::json!({
+        "id":"doc", "title":"Edited Artifact", "format":"markdown", "access_role":"owner", "human_updated_at":updated
+    })).unwrap()
+    };
+    console
+        .update_artifact_metadata(
+            chat,
+            instance.to_string(),
+            Some(metadata("2020-01-01T00:00:00Z")),
+        )
+        .unwrap();
+    let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    assert_eq!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .monitor
+            .entry_flash_role(DisplayProfile::default(), now),
+        None
+    );
+    let before = console.state.lock().unwrap().frames_drawn;
+    console.artifact_metadata_sink().update(
+        chat,
+        instance.to_string(),
+        Some(metadata("2099-01-01T00:00:00Z")),
+    );
+    let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let first_frame;
+    {
+        let state = console.state.lock().unwrap();
+        assert!(state.frames_drawn > before);
+        assert_eq!(
+            state.monitor.entry_flash_role(state.display, now),
+            Some(Role::TakeInFlashStrong)
+        );
+        let row = state
+            .monitor
+            .frame(48, 12, state.display, now)
+            .lines
+            .into_iter()
+            .find(|line| line.text().contains("Edited Artifact"))
+            .unwrap();
+        assert_eq!(row.fill, Some(Role::TakeInFlashStrong));
+        first_frame = state.monitor.next_entry_flash_ms(state.display, now);
+    }
+    console.artifact_metadata_sink().update(
+        chat,
+        instance.to_string(),
+        Some(metadata("2099-01-01T00:00:00Z")),
+    );
+    let state = console.state.lock().unwrap();
+    assert_eq!(
+        state.monitor.next_entry_flash_ms(state.display, now),
+        first_frame,
+        "polling unchanged content does not restart a flash"
+    );
+}
+
+#[test]
+fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_not() {
+    use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    for goal in [false, true] {
+        let chat = Uuid::new_v4();
+        let source = auto_reveal_sources(chat, if goal { "goal" } else { "scheduled" });
+        let mut snapshot = chat_snapshot(chat);
+        snapshot.goal = source.chat.goal.clone();
+        snapshot.scheduled_tasks = source.chat.scheduled_tasks.clone();
+        let input = Uuid::new_v4();
+        snapshot.trigger_origins.insert(
+            input,
+            if goal {
+                TriggerIdentity::GoalContinuation {
+                    goal_id: snapshot.goal.as_ref().unwrap().id,
+                    after_run: Uuid::new_v4(),
+                }
+            } else {
+                TriggerIdentity::ScheduledTask {
+                    task_id: "0123abcd".into(),
+                    scheduled_for_ms: 1,
+                    wrappers: Vec::new(),
+                }
+            },
+        );
+        snapshot.messages.push(Message {
+            role: MessageRole::User,
+            content: vec![Content::Text {
+                text: if goal {
+                    "Continue working toward the active goal of this Chat.".into()
+                } else {
+                    "Scheduled task 0123abcd: check progress".into()
+                },
+            }],
+        });
+        snapshot.message_runs.insert(0, input);
+        for history in [false, true] {
+            let console = Console::test_interactive_for_chat(chat);
+            console
+                .refresh_monitor(auto_reveal_sources(chat, "empty"))
+                .unwrap();
+            console
+                .update_monitor_chat(ChatStatus::of(&snapshot))
+                .unwrap();
+            console
+                .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+                .unwrap();
+            if history {
+                super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+            }
+            super::super::consume_input_echo_from_snapshot(&console, &snapshot, input).unwrap();
+            let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+            let mut state = console.state.lock().unwrap();
+            assert_eq!(
+                state.monitor.entry_flash_role(state.display, now),
+                if history {
+                    None
+                } else {
+                    Some(Role::TakeInFlashStrong)
+                }
+            );
+            if !history {
+                let frame = state.monitor.frame(48, 12, state.display, now);
+                let text = if goal {
+                    "◎ Verify Monitor behavior"
+                } else {
+                    "check progress"
+                };
+                assert!(
+                    frame
+                        .lines
+                        .iter()
+                        .any(|line| line.text().starts_with(text)
+                            || line.text().trim_start() == text)
+                );
+                assert!(
+                    frame
+                        .lines
+                        .iter()
+                        .any(|line| line.fill == Some(Role::TakeInFlashStrong))
+                );
+                state.monitor.settle_flashes(now + 2000);
+            }
+            drop(state);
+            super::super::consume_input_echo_from_snapshot(&console, &snapshot, input).unwrap();
+            let state = console.state.lock().unwrap();
+            assert_eq!(
+                state.monitor.entry_flash_role(state.display, now + 2000),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn collapsed_monitor_flash_render_evidence() {
+    use crate::terminal::style::{Colour, Rgb};
+    fn colour(value: Option<Colour>) -> Option<String> {
+        match value {
+            Some(Colour::Rgb(Rgb { red, green, blue })) => {
+                Some(format!("#{red:02x}{green:02x}{blue:02x}"))
+            }
+            _ => None,
+        }
+    }
+    for (phase, elapsed) in [
+        ("warm strong", 0),
+        ("warm soft", 400),
+        ("warm strong again", 800),
+        ("settled", 1300),
+    ] {
+        let mut state = docked_subscribed_monitor_fixture(2, 30);
+        state.monitor.focused = false;
+        state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+        let instance = state.monitor.entries()[0].instance.clone();
+        let since = tickloop_agent_base::private_fs::unix_time_milliseconds() - elapsed;
+        state.monitor.flash_received(instance, since);
+        let line = monitor_entry_span(&mut state);
+        let resolved = line.resolve(state.display.theme(), state.width);
+        let spans = resolved.spans.iter().map(|span| serde_json::json!({
+            "text":span.text, "foreground":colour(span.style.foreground), "background":colour(span.style.background)
+        })).collect::<Vec<_>>();
+        let label = resolved
+            .spans
+            .iter()
+            .find(|span| span.text.contains("◉ Monitor "))
+            .unwrap();
+        let expected = if elapsed == 1300 {
+            Role::MutedText
+        } else if elapsed == 400 {
+            Role::TakeInFlashSoft
+        } else {
+            Role::TakeInFlashStrong
+        };
+        assert_eq!(
+            label.style.background,
+            state.display.theme().style(expected).background
+        );
+        println!("{phase}: {}", line.text());
+        println!(
+            "MONITOR_RENDER_JSON {}",
+            serde_json::json!({"phase":phase,"spans":spans})
+        );
+    }
+}

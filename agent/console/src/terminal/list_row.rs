@@ -220,7 +220,7 @@ pub(super) fn update_mark(flash_since: Option<u64>, display: DisplayProfile, now
 /// What a whole Monitor row flashes for, each in its own colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RowFlash {
-    /// An Agent turn took the row's update in: warm.
+    /// Content arrived, or an Agent turn took the row's update in: warm.
     TakeIn,
     /// The Agent read or operated the row's instance with a tool: cold.
     Use,

@@ -675,6 +675,9 @@ impl ArtifactMetadataSink {
         monitor.metadata_failures.remove(&id);
         monitor.metadata.insert(id, metadata);
         monitor.rebuild();
+        if state.chat == Some(chat) {
+            let _ = state.draw(&mut io::stdout().lock());
+        }
     }
 
     pub(super) fn failed(&self, chat: Uuid, id: String, error: String) {
@@ -1552,7 +1555,17 @@ impl Console {
             .monitor_for_chat_mut(chat)
             .refresh_ticks(shells, subscriptions);
         let revealed = state.auto_reveal_monitor(chat);
-        if state.chat != Some(chat) || !state.monitor_visible() && !revealed {
+        if state.chat != Some(chat)
+            || !state.monitor_visible()
+                && !revealed
+                && state
+                    .monitor
+                    .entry_flash_role(
+                        state.display,
+                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                    )
+                    .is_none()
+        {
             return Ok(());
         }
         state
@@ -1581,6 +1594,11 @@ impl Console {
         monitor.metadata_failures.remove(&id);
         monitor.metadata.insert(id, metadata);
         monitor.rebuild();
+        if state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
     pub(super) fn copy_artifact_link(&self, url: &str) -> Result<(), String> {
@@ -3791,15 +3809,15 @@ impl Console {
         let display = self.display_profile()?;
         let names = super::tick_labels::TickLabels::from_snapshot(snapshot);
         let mut labels = Vec::new();
+        let mut instances = Vec::new();
+        let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
         for message in messages.iter().cloned() {
             let message = super::presentation::name_local_ticks(message, &names);
             match &message {
                 tickloop_agent_protocol::LocalMessage::TickDelivery { items } => {
                     for item in items {
-                        let flash = snapshot
-                            .monitor
-                            .taken_in_at(&item.instance)
-                            .map(|since| (super::list_row::RowFlash::TakeIn, since));
+                        instances.push(item.instance.clone());
+                        let flash = Some((super::list_row::RowFlash::TakeIn, now_ms));
                         labels.push((
                             super::presentation::tick_delivery_runs(
                                 std::slice::from_ref(item),
@@ -3811,10 +3829,8 @@ impl Console {
                     }
                 }
                 tickloop_agent_protocol::LocalMessage::ArtifactRequest { artifact_id, .. } => {
-                    let flash = names
-                        .artifact_instance(artifact_id)
-                        .and_then(|instance| snapshot.monitor.taken_in_at(&instance))
-                        .map(|since| (super::list_row::RowFlash::TakeIn, since));
+                    instances.extend(names.artifact_instance(artifact_id));
+                    let flash = Some((super::list_row::RowFlash::TakeIn, now_ms));
                     labels.push((
                         super::presentation::local_message_runs(
                             &message,
@@ -3828,7 +3844,15 @@ impl Console {
                 _ => {}
             }
         }
-        self.record_delivery_labels(snapshot.id, input, labels)
+        self.record_delivery_labels(
+            snapshot.id,
+            input,
+            labels,
+            instances
+                .into_iter()
+                .map(|instance| (instance, now_ms))
+                .collect(),
+        )
     }
 
     fn record_delivery_labels(
@@ -3839,6 +3863,7 @@ impl Console {
             super::presentation::RoleRuns,
             Option<(super::list_row::RowFlash, u64)>,
         )>,
+        instances: Vec<(tick_protocol::InstanceRef, u64)>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let visible = state.chat == Some(chat);
@@ -3850,6 +3875,9 @@ impl Console {
         if visible {
             state.awaiting_input_echoes.remove(&input);
             if state.echoed_inputs.insert(input) {
+                for (instance, since) in instances {
+                    state.monitor.flash_received(instance, since);
+                }
                 append(&mut state.scrollback);
                 state
                     .draw(&mut io::stdout().lock())
@@ -3870,9 +3898,14 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let runs = super::task_notification_line(notification, state.display);
+        let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        state.monitor.flash_received(
+            tick_protocol::InstanceRef::shell(notification.task_id),
+            now_ms,
+        );
         state.scrollback.append_flashing_label(
             &runs,
-            None,
+            Some((super::list_row::RowFlash::TakeIn, now_ms)),
             Some(tick_protocol::InstanceRef::shell(notification.task_id)),
         );
         state
@@ -3892,6 +3925,23 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn flash_trigger_input(
+        &self,
+        snapshot: &tickloop_agent_protocol::ChatSnapshot,
+        input: Uuid,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat == Some(snapshot.id)
+            && let Some(source) = snapshot.trigger_origins.get(&input)
+        {
+            state.monitor.flash_trigger(
+                source,
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn record_consumed_input(
@@ -6886,9 +6936,13 @@ impl State {
             .chain(conversation)
             .chain(update)
             .chain(
-                self.monitor
-                    .entry_flash_at_ms
-                    .and_then(|since| self.display.next_flash_change_ms(since, now_ms)),
+                (!self.monitor_visible()
+                    && self.overview.projection.is_none()
+                    && !self.full_review
+                    && self.transcript.is_none()
+                    && !self.help_open)
+                    .then(|| self.monitor.next_entry_flash_ms(self.display, now_ms))
+                    .flatten(),
             )
             .min()
     }
@@ -8553,7 +8607,15 @@ impl State {
             if self.chat.is_some()
                 && self.overview.projection.is_none()
                 && !self.help_open
-                && (self.monitor.has_content() || self.monitor_visible())
+                && (self.monitor.has_content()
+                    || self.monitor_visible()
+                    || self
+                        .monitor
+                        .entry_flash_role(
+                            self.display,
+                            tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                        )
+                        .is_some())
             {
                 let label = format!(
                     "{} Monitor {}",
@@ -8591,23 +8653,28 @@ impl State {
                         );
                     }
                     line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
-                    line.push(
-                        label,
-                        Some(
-                            if self.monitor_visible()
-                                || self.monitor.entry_flash_at_ms.is_some_and(|since| {
-                                    self.display.flash_strong(
-                                        since,
-                                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
-                                    ) == Some(true)
-                                })
-                            {
-                                Role::Permission
-                            } else {
-                                Role::MutedText
-                            },
-                        ),
-                    );
+                    let entry_role = if self.monitor_visible() {
+                        Role::Permission
+                    } else {
+                        self.monitor
+                            .entry_flash_role(
+                                self.display,
+                                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                            )
+                            .unwrap_or(Role::MutedText)
+                    };
+                    let label_role = if self.display.theme().style(entry_role).background.is_some()
+                    {
+                        let start = column + DIVIDER_ENTRY_GAP_COLUMNS;
+                        line.band = Some(super::style::BandFill {
+                            columns: start..start + label_width,
+                            role: entry_role,
+                        });
+                        Role::Text
+                    } else {
+                        entry_role
+                    };
+                    line.push(label, Some(label_role));
                     if monitor_edge_width > 0 {
                         line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                         line.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));

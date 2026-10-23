@@ -214,7 +214,7 @@ pub(super) enum Role {
     UpdateMark,
     UpdateMarkDim,
     /// A one-off flash alternates these fills: strong, soft, strong. A Monitor row flashes the
-    /// warm take-in pair as an Agent turn takes its update in, and the cold use pair as the Agent
+    /// warm take-in pair when content arrives or an Agent turn takes its update in, and the cold use pair as the Agent
     /// reads or operates its instance with a tool.
     TakeInFlashStrong,
     TakeInFlashSoft,
