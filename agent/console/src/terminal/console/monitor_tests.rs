@@ -411,7 +411,6 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
         for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
             for meta in [false, true] {
                 let mut state = click_fixture(width, overlay, group);
-                // A two-line row's status line is its last target; a one-line row has one.
                 let rows = state
                     .monitor_row_targets
                     .iter()
@@ -1719,7 +1718,7 @@ fn separator_column(state: &State) -> Option<usize> {
 }
 
 #[test]
-fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_otherwise() {
+fn monitor_rows_clip_names_to_keep_details_on_the_same_line() {
     use crate::monitor_rows::{StatusTone, Unread};
     let mut finished = shell(Uuid::new_v4(), "Run tests");
     finished.status = "exit 101".into();
@@ -1742,11 +1741,11 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
         unread: Some(Unread { count: Some(3) }),
         taken_in_at_ms: None,
     });
-    for (width, preferred, entry, details, two_lines) in [
-        (140, None, &finished, "101", false),
-        (80, None, &finished, "101", false),
-        (140, None, &subscribed, "feedback unavailable", true),
-        (200, Some(80), &subscribed, "feedback unavailable", false),
+    for (width, preferred, entry, details) in [
+        (140, None, &finished, "101"),
+        (80, None, &finished, "101"),
+        (140, None, &subscribed, "feedback unavailable"),
+        (200, Some(80), &subscribed, "feedback unavailable"),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1755,12 +1754,15 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
         state.monitor.replace(entry.group, vec![entry.clone()]);
         state.draw_frame(&mut Vec::new()).unwrap();
         let screen = &state.rendered_screen;
-        let name = screen
-            .iter()
-            .position(|row| row.contains(&entry.title))
-            .unwrap();
-        let status = screen.iter().position(|row| row.contains(details)).unwrap();
-        assert_eq!(status - name, usize::from(two_lines), "{screen:#?}");
+        let row = screen.iter().find(|row| row.contains(details)).unwrap();
+        assert!(
+            row.contains(entry.title.split_whitespace().next().unwrap()),
+            "{screen:#?}"
+        );
+        assert_eq!(state.monitor_row_targets.len(), 1);
+        if entry.subscription.is_some() && preferred.is_none() {
+            assert!(row.contains('…'), "{screen:#?}");
+        }
         assert!(
             !screen.iter().any(|row| row.contains("Shell ·")
                 || row.contains("Tick ·")
@@ -4970,7 +4972,7 @@ fn side_monitor_bottom_padding_yields_before_section_gaps_and_pinned_content() {
 }
 
 #[test]
-fn side_monitor_bottom_padding_preserves_a_wrapped_selected_tick() {
+fn side_monitor_bottom_padding_preserves_a_single_clipped_selected_tick() {
     let mut state = docked_monitor_fixture(0, 1);
     state.monitor.replace(
         TickGroup::Ticks,
@@ -4987,7 +4989,14 @@ fn side_monitor_bottom_padding_preserves_a_wrapped_selected_tick() {
             .side_content_height(48, height, state.display, 0);
         assert_eq!(content_height, height);
         let frame = state.monitor.frame(48, content_height, state.display, 0);
-        assert_eq!(frame.lines.last().unwrap().text(), "exit 0");
+        assert!(
+            frame
+                .lines
+                .last()
+                .unwrap()
+                .text()
+                .starts_with("exit 0 · long selected title")
+        );
         assert!(
             frame.lines[content_height - 2]
                 .text()
@@ -4995,8 +5004,8 @@ fn side_monitor_bottom_padding_preserves_a_wrapped_selected_tick() {
         );
         assert_eq!(
             frame.targets.len(),
-            2,
-            "both rows of the selected Tick remain visible"
+            1,
+            "the selected Tick occupies exactly one row"
         );
     }
 }
@@ -5686,4 +5695,72 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
         );
     }
     core.shutdown().await;
+}
+
+#[test]
+fn single_line_monitor_render_output_preserves_paused_rows_and_pinned_sections() {
+    use crate::monitor_rows::{StatusTone, SubscriptionMark};
+    use tickloop_agent_protocol::TickSubscriptionFrequency;
+
+    let title = "检查 mixed 中文 build long selected name 👩‍💻 that must stay on one line";
+    for paused in [false, true] {
+        let mut state = docked_monitor_fixture(1, 1);
+        state.resize(140, 16);
+        let mut entry = state.monitor.entries()[0].clone();
+        entry.title = title.into();
+        entry.tone = StatusTone::Live;
+        entry.subscription = Some(SubscriptionMark {
+            paused,
+            frequency: TickSubscriptionFrequency::High,
+            is_waiting: false,
+            next_check: None,
+        });
+        let instance = entry.instance.clone();
+        state.monitor.replace(TickGroup::Ticks, vec![entry]);
+        state.monitor.select(&instance);
+        let mut output = Vec::new();
+        state.draw_frame(&mut output).unwrap();
+        let screen = tickloop_agent_test_support::screen::visible_screen(
+            &String::from_utf8_lossy(&output),
+            state.width,
+            state.height,
+        );
+        assert_eq!(
+            state
+                .monitor_row_targets
+                .iter()
+                .filter(|target| {
+                    target.target == crate::terminal::monitor::MonitorTarget::Tick(instance.clone())
+                })
+                .count(),
+            1,
+            "{screen}"
+        );
+        let tick = screen.lines().find(|line| line.contains("↻ ◉")).unwrap();
+        assert!(
+            tick.contains("检查 mixed 中文") && tick.contains('…'),
+            "{screen}"
+        );
+        assert!(screen.contains("Scheduled instruction 1"), "{screen}");
+        assert!(screen.contains("◎ Finish"), "{screen}");
+        assert_eq!(screen.contains("Paused"), paused, "{screen}");
+        let frame = state.monitor.frame(48, 12, state.display, 0);
+        let status = frame.lines.last().unwrap().text();
+        assert!(status.contains("检查 mixed"), "{status}");
+        assert!(status.ends_with('…'), "{status}");
+        let selected = frame.targets[0].0;
+        if paused {
+            assert!(
+                frame.lines[selected]
+                    .spans
+                    .iter()
+                    .all(|span| span.role == Some(Role::MutedText))
+            );
+        }
+        assert_eq!(
+            crate::terminal::monitor::member_facts(state.monitor.selected().unwrap(), 0)[0],
+            title
+        );
+        println!("[single-line Monitor, paused={paused}]\n{screen}");
+    }
 }

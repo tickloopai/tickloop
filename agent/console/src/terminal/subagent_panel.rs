@@ -2,6 +2,7 @@ use super::{
     console::{AgentRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, WIDE_TERMINAL_COLUMNS, truncate_width},
     display::{DisplayProfile, Glyph},
     list_row,
+    loop_view_text::ellipsize,
     style::{Role, RoleLine},
 };
 use crate::agent_console::AttentionGroup;
@@ -151,14 +152,4 @@ pub(super) fn agent_role(row: &AgentRow) -> Option<Role> {
         .as_ref()
         .and_then(|registration| registration.color)
         .map(Role::agent)
-}
-
-fn ellipsize(text: &str, width: usize) -> String {
-    if display_width(text) <= width {
-        text.to_owned()
-    } else if width == 0 {
-        String::new()
-    } else {
-        format!("{}…", truncate_width(text, width - 1))
-    }
 }

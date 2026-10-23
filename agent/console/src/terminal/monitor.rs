@@ -1365,46 +1365,15 @@ impl Monitor {
             + usize::from(!has_ticks && !has_tasks && !has_goal)
     }
 
-    fn tick_entry_height(
-        &self,
-        entry: &MonitorEntry,
-        width: usize,
-        display: DisplayProfile,
-        now_ms: u64,
-    ) -> usize {
-        list_row::row_height(
-            display.glyph(entry.glyph),
-            &super::safe_line(&entry.title),
-            &list_row::row_details(entry.tone, &entry.notes, now_ms),
-            width,
-        )
-    }
-
-    fn tick_line_count(&self, width: usize, display: DisplayProfile, now_ms: u64) -> usize {
-        let loaded = self
-            .entries
-            .iter()
-            .map(|entry| &entry.instance)
-            .collect::<BTreeSet<_>>();
+    fn tick_line_count(&self) -> usize {
         self.group_totals.len()
-            + self
-                .entries
-                .iter()
-                .map(|entry| self.tick_entry_height(entry, width, display, now_ms))
-                .sum::<usize>()
             + self
                 .listing
                 .iter()
-                .filter(|entry| !loaded.contains(&entry.instance))
-                .map(|entry| {
-                    self.tick_entry_height(
-                        &MonitorEntry::from(entry.clone()),
-                        width,
-                        display,
-                        now_ms,
-                    )
-                })
-                .sum::<usize>()
+                .map(|entry| &entry.instance)
+                .chain(self.entries.iter().map(|entry| &entry.instance))
+                .collect::<BTreeSet<_>>()
+                .len()
     }
 
     fn tick_lines(&self, width: usize, display: DisplayProfile, now_ms: u64) -> TickLines {
@@ -1550,7 +1519,7 @@ impl Monitor {
         if self.expanded_tasks {
             return self.task_list_frame(width, height, display, now_ms);
         }
-        let status = self.selected_status();
+        let mut status = self.selected_status();
         let mut goal_lines = self
             .goal()
             .map(|goal| {
@@ -1627,9 +1596,7 @@ impl Monitor {
                 .min(fixed_budget);
         let tick_capacity = fixed_budget.saturating_sub(scheduled_rows);
         let mut rendered = self.tick_lines(width, display, now_ms);
-        let scrollbar = width > 0
-            && tick_capacity > 0
-            && self.tick_line_count(width, display, now_ms) > tick_capacity;
+        let scrollbar = width > 0 && tick_capacity > 0 && self.tick_line_count() > tick_capacity;
         let tick_width = width.saturating_sub(usize::from(scrollbar));
         if scrollbar {
             rendered = self.tick_lines(tick_width, display, now_ms);
@@ -1639,7 +1606,7 @@ impl Monitor {
             targets: mut row_ids,
             selected: selected_rows,
         } = rendered;
-        let total_rows = self.tick_line_count(tick_width, display, now_ms);
+        let total_rows = self.tick_line_count();
         self.tick_viewport.set((tick_capacity, total_rows));
         if self.entries.is_empty() && self.tasks().is_empty() && self.goal().is_none() {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
@@ -1746,7 +1713,29 @@ impl Monitor {
         }
         lines.extend(goal_lines);
         if show_footer {
-            lines.push(RoleLine::role(status, Role::MutedText));
+            if let Some(entry) = self.selected() {
+                use unicode_width::UnicodeWidthStr;
+                let title = super::safe_line(&entry.title);
+                let details = list_row::row_details(entry.tone, &entry.notes, now_ms);
+                let details_columns = if details.is_empty() {
+                    0
+                } else {
+                    details.width() + list_row::STATUS_GAP_COLUMNS
+                };
+                if list_row::name_column(display.glyph(entry.glyph))
+                    + title.width()
+                    + details_columns
+                    > tick_width
+                {
+                    status.push_str(" · ");
+                    status.push_str(&title);
+                }
+            }
+            lines.push(super::loop_view_text::clipped(
+                &status,
+                width,
+                Role::MutedText,
+            ));
         }
         lines.truncate(height);
         for line in &mut lines {
@@ -3445,14 +3434,16 @@ mod scrolling_tests {
             );
         }
         let narrow = monitor.frame(11, 12, DisplayProfile::default(), 0);
-        assert!(narrow.lines[narrow.tick_rows.clone()].iter().all(|line| {
-            let text = line.text();
-            unicode_width::UnicodeWidthStr::width(text.as_str()) == 11 && text.ends_with(['│', '┃'])
-        }));
+        assert!(
+            narrow
+                .lines
+                .iter()
+                .all(|line| !line.text().contains(['│', '┃']))
+        );
         assert_eq!(
             monitor.tick_viewport.get(),
-            (11, 17),
-            "wrapped Tick rows count toward the full scroll range"
+            (11, 9),
+            "clipped Tick names each count as one row"
         );
     }
 

@@ -1,12 +1,6 @@
-//! A list row in the Subagents panel's look: an indent the selection fill covers, a glyph whose
-//! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
-//! does not fit beside its details continues the name on a second line, under its first, and
-//! keeps the details at the right edge there, so details line up whatever a row's height. A
-//! Monitor row leads with its periodic subscriptions' `↻` in the first column, and its glyph
-//! takes the update colour over its state colour while the row holds an unhandled update; while a
-//! periodic subscription holds the update, a bar runs from the first column across the row.
+//! A single-line list row: subscription mark, state glyph, clipped name and right-aligned
+//! details. Selection, update progress and row flashes preserve the leading marks.
 
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
@@ -31,18 +25,9 @@ pub(super) fn name_column(glyph: &str) -> usize {
 pub(super) fn compact_name_column(glyph: &str) -> usize {
     glyph.width() + NAME_GAP.width()
 }
-const STATUS_GAP_COLUMNS: usize = 2;
+pub(super) const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
-
-pub(super) fn row_height(glyph: &str, name: &str, details: &str, width: usize) -> usize {
-    let details_columns = if details.is_empty() {
-        0
-    } else {
-        STATUS_GAP_COLUMNS + details.width()
-    };
-    1 + usize::from(name_column(glyph) + name.width() + details_columns > width)
-}
 
 pub(super) struct ListRow<'a> {
     pub(super) selected: bool,
@@ -99,14 +84,8 @@ impl ListRow<'_> {
         self.prefix().text().width() + self.details_reserve()
     }
 
-    /// The row's lines: one when the whole name fits beside the details, else two, with the name
-    /// running on into the second, so a name is never cut for its details while two lines hold it.
     pub(super) fn lines(&self, width: usize) -> Vec<RoleLine> {
-        if row_height(self.glyph, self.name, &self.details, width) == 1 {
-            vec![self.one_line(width)]
-        } else {
-            self.two_lines(width).into()
-        }
+        vec![self.one_line(width)]
     }
 
     fn one_line(&self, width: usize) -> RoleLine {
@@ -115,18 +94,6 @@ impl ListRow<'_> {
         line.push(ellipsize(self.name, name_columns), Some(self.role()));
         self.push_details(&mut line, width);
         self.finish(line, width)
-    }
-
-    fn two_lines(&self, width: usize) -> [RoleLine; 2] {
-        let mut first = self.prefix();
-        let name_column = first.text().width();
-        let (head, tail) = split_at_columns(self.name, width.saturating_sub(name_column));
-        first.push(head, Some(self.role()));
-        let mut second = RoleLine::role(" ".repeat(name_column), self.role());
-        let tail_columns = width.saturating_sub(name_column + self.details_reserve());
-        second.push(ellipsize(tail, tail_columns), Some(self.role()));
-        self.push_details(&mut second, width);
-        [self.finish(first, width), self.finish(second, width)]
     }
 
     /// Right-aligns the details in the columns the line leaves, shortened there when they do not
@@ -162,25 +129,6 @@ impl ListRow<'_> {
             None => line,
         }
     }
-}
-
-/// Splits `text` where its first `columns` end, at the last space within them when there is one,
-/// so a name continues on the next line at a word.
-fn split_at_columns(text: &str, columns: usize) -> (&str, &str) {
-    let mut used = 0;
-    let mut last_space = None;
-    for (index, grapheme) in text.grapheme_indices(true) {
-        let grapheme_columns = grapheme.width();
-        if used + grapheme_columns > columns {
-            let cut = last_space.filter(|space| *space > 0).unwrap_or(index);
-            return (text[..cut].trim_end(), text[cut..].trim_start());
-        }
-        if grapheme == " " {
-            last_space = Some(index);
-        }
-        used += grapheme_columns;
-    }
-    (text, "")
 }
 
 /// The colour of a row's leading glyph, which carries the row's state: accent while running,
@@ -354,78 +302,49 @@ mod tests {
     }
 
     #[test]
-    fn a_long_name_continues_on_its_second_line_with_the_details_still_at_the_right() {
-        let long = row("Rerun full test suite in background to verify", "14s");
-        let lines = long
-            .lines(30)
-            .iter()
-            .map(RoleLine::text)
-            .collect::<Vec<_>>();
+    fn long_selected_and_mixed_width_names_stay_on_one_line() {
+        for name in [
+            "Rerun full test suite in background to verify",
+            "中英文 mixed 名称 very long 👩‍💻👍🏽🇨🇳",
+        ] {
+            for selected in [false, true] {
+                for width in 0..=60 {
+                    let lines = ListRow {
+                        selected,
+                        subscription: Some(("↻", Role::SubscriptionHigh)),
+                        ..row(name, "14s")
+                    }
+                    .lines(width);
+                    assert_eq!(lines.len(), 1);
+                    let text = lines[0].text();
+                    assert!(text.width() <= width, "{width}: {text:?}");
+                    if width >= 10 {
+                        assert!(text.starts_with("↻ $ "), "{text}");
+                        assert!(text.ends_with("14s"), "{text}");
+                        if width < 25 {
+                            assert!(text.contains('…'), "{text}");
+                        }
+                    }
+                    assert_eq!(lines[0].fill == Some(Role::Selection), selected);
+                }
+            }
+        }
         assert_eq!(
-            lines,
-            [
-                "  $ Rerun full test suite in",
-                "    background to verify   14s"
-            ]
-        );
-        let one_line = ListRow {
-            name: "cargo test",
-            ..long
-        };
-        let line = one_line.lines(30)[0].text();
-        assert_eq!(line, "  $ cargo test             14s");
-        assert_eq!(
-            line.width(),
-            lines[1].width(),
-            "details share one right edge"
+            row("Rerun full test suite in background to verify", "14s").lines(30)[0].text(),
+            "  $ Rerun full test suit…  14s"
         );
     }
 
     #[test]
-    fn splitting_and_rendering_names_preserve_whole_graphemes() {
+    fn clipping_names_preserves_whole_graphemes() {
         for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
             let name = format!("{grapheme}abc");
-            assert_eq!(split_at_columns(&name, 1), ("", name.as_str()));
-            assert_eq!(split_at_columns(&name, 2), (grapheme, "abc"));
+            assert_eq!(row(&name, "").lines(6)[0].text(), "  $ … ");
             assert_eq!(
-                split_at_columns(&name, 3),
-                (format!("{grapheme}a").as_str(), "bc")
-            );
-            let spaced = format!("go {grapheme}abc");
-            assert_eq!(split_at_columns(&spaced, 5), ("go", name.as_str()));
-            assert_eq!(
-                row(&name, "")
-                    .lines(6)
-                    .iter()
-                    .map(RoleLine::text)
-                    .collect::<Vec<_>>(),
-                [format!("  $ {grapheme}"), "    a…".into()]
-            );
-            assert_eq!(
-                row(&format!("abcd{grapheme}abc"), "")
-                    .lines(8)
-                    .iter()
-                    .map(RoleLine::text)
-                    .collect::<Vec<_>>(),
-                ["  $ abcd".into(), format!("    {grapheme}a…")]
+                row(&name, "").lines(7)[0].text(),
+                format!("  $ {grapheme}…")
             );
         }
-    }
-
-    #[test]
-    fn a_name_too_long_for_two_lines_is_cut_before_the_details() {
-        let lines = row(
-            "a b c d e f g h i j k l m n o p q r s t u v w x y z",
-            "2m 3s",
-        )
-        .lines(20);
-        assert_eq!(lines[0].text(), "  $ a b c d e f g h");
-        let second = lines[1].text();
-        assert!(
-            second.contains('…') && second.ends_with("  2m 3s"),
-            "{second}"
-        );
-        assert_eq!(lines[1].text().width(), 20);
     }
 
     #[test]
@@ -603,11 +522,11 @@ mod tests {
             (Some(Role::Selection), 0),
             "without a mark the selection fills the whole row"
         );
-        let [name, status] = selected.two_lines(30);
-        assert_eq!(name.text(), "  $ Run the console tests in");
-        assert_eq!(status.text(), "    the worktree           12s");
-        assert_eq!(name.fill, Some(Role::Selection));
-        assert_eq!(status.fill, Some(Role::Selection));
+        let narrow = selected.lines(30);
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(narrow[0].fill, Some(Role::Selection));
+        assert!(narrow[0].text().contains('…'));
+        assert!(narrow[0].text().ends_with("12s"));
         assert!(!line.text().contains('›'));
         let marked = ListRow {
             subscription: Some(("↻", Role::SubscriptionHigh)),
@@ -660,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bar_and_flash_start_at_the_name_on_every_line() {
+    fn a_bar_and_flash_start_at_the_name_on_the_single_clipped_row() {
         let check = NextCheck {
             at_ms: 160_000,
             wait_ms: 60_000,
@@ -671,7 +590,7 @@ mod tests {
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         for line in &lines {
             assert_eq!(line.fill, None);
             assert_eq!(

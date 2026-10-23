@@ -7,7 +7,8 @@
 //! the string.
 
 use tickloop_ui::markdown::Continuation;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::hyperlink::Hyperlink;
 
@@ -1135,22 +1136,21 @@ impl RoleLine {
         self.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
-    /// Cuts the row to `width` display columns without splitting a wide
-    /// character, keeping each surviving character's role.
+    /// Cuts the row to `width` display columns without splitting a grapheme, keeping its role.
     pub(super) fn truncate(&mut self, width: usize) {
         let mut column = 0;
         let mut kept = Vec::new();
         for span in self.spans.drain(..) {
             let mut text = String::new();
             let mut full = false;
-            for character in span.text.chars() {
-                let character_width = character.width().unwrap_or(0);
-                if column + character_width > width {
+            for grapheme in span.text.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if column + grapheme_width > width {
                     full = true;
                     break;
                 }
-                text.push(character);
-                column += character_width;
+                text.push_str(grapheme);
+                column += grapheme_width;
             }
             if !text.is_empty() {
                 kept.push(RoleSpan {
@@ -1201,10 +1201,7 @@ impl RoleLine {
                     Span::styled(piece, self.style_at(theme, column, span.role))
                         .linked(span.link.clone()),
                 );
-                column += piece
-                    .chars()
-                    .map(|character| character.width().unwrap_or(0))
-                    .sum::<usize>();
+                column += piece.width();
                 rest = after;
             }
         }
@@ -1253,14 +1250,14 @@ impl RoleLine {
     }
 }
 
-/// Splits `text` before the first character that starts at or after `columns`.
+/// Splits `text` before the first grapheme that starts at or after `columns`.
 fn split_at_column(text: &str, columns: usize) -> (&str, &str) {
     let mut used = 0;
-    for (index, character) in text.char_indices() {
+    for (index, grapheme) in text.grapheme_indices(true) {
         if used >= columns {
             return text.split_at(index);
         }
-        used += character.width().unwrap_or(0);
+        used += grapheme.width();
     }
     (text, "")
 }
@@ -1949,6 +1946,37 @@ mod tests {
         line.truncate(4);
         assert_eq!(line.text(), "ab中");
         assert_eq!(line.spans[1].role, Some(Role::Error));
+    }
+
+    #[test]
+    fn truncation_and_background_boundaries_preserve_graphemes_and_following_details() {
+        let theme = Theme::new(ThemeName::ClaudeCodeDark);
+        for grapheme in ["👩‍💻", "👍🏽", "🇨🇳", "e\u{301}"] {
+            let width = grapheme.width();
+            let mut clipped = RoleLine::role(grapheme, Role::Text);
+            clipped.truncate(width - 1);
+            assert!(clipped.text().is_empty());
+            let mut line = RoleLine::role(grapheme, Role::Text)
+                .with("  14s", Role::MutedText)
+                .banded(0..1, Role::UseFlashStrong);
+            line.truncate(width + 5);
+            assert_eq!(line.text(), format!("{grapheme}  14s"));
+            let resolved = line.resolve(theme, width + 5);
+            assert_eq!(
+                resolved
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                line.text()
+            );
+            assert_eq!(resolved.spans[0].text, grapheme);
+            assert_eq!(
+                resolved.spans[0].style.background,
+                theme.style(Role::UseFlashStrong).background
+            );
+            assert_eq!(resolved.spans.last().unwrap().style.background, None);
+        }
     }
 
     /// The vector the Claude Code source calls out: the brand orange must not
