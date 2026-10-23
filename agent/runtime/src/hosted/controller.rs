@@ -936,7 +936,6 @@ impl HostController {
         let mut command = std::process::Command::new(executable);
         command
             .arg(tickhost::cli::RUN_COMMAND)
-            .env(tickhost::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

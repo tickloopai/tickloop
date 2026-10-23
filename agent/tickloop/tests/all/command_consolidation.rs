@@ -29,9 +29,8 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         "/trigger feed {}",
         "/clear-trigger",
     ];
-    let runtime_directory = support::cli_runtime::directory();
+    let runtime_directory = support::cli_runtime::adopt(&directory.path().join("state"));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .current_dir(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))

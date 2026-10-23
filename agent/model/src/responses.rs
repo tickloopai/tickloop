@@ -155,6 +155,8 @@ pub(super) struct ResponsesStream {
     items: BTreeMap<u64, ResponseItem>,
     usage: Usage,
     is_codex: bool,
+    /// What the Codex client appends to each call's id once the stream ended.
+    codex_origin: Option<String>,
     rotating_item_ids: bool,
 }
 
@@ -224,6 +226,14 @@ impl ResponsesStream {
         Self {
             is_codex: true,
             ..Self::default()
+        }
+    }
+
+    /// Announces each started call with the id the Codex client gives it after this origin.
+    pub(super) fn with_codex_origin(self, origin: &str) -> Self {
+        Self {
+            codex_origin: Some(origin.into()),
+            ..self
         }
     }
 
@@ -322,6 +332,23 @@ impl ResponsesStream {
                     summary_text: BTreeMap::new(),
                 };
                 tracked.recover_readable_reasoning(item, events)?;
+                if item["type"] == "function_call"
+                    && let (Some(call_id), Some(name)) =
+                        (item["call_id"].as_str(), item["name"].as_str())
+                    && !call_id.is_empty()
+                    && !name.is_empty()
+                {
+                    // The same identity the completed output gives the call.
+                    let id = match (self.is_codex, &self.codex_origin) {
+                        (true, Some(origin)) => format!("{call_id}|{id}|{origin}"),
+                        (true, None) => format!("{call_id}|{id}"),
+                        (false, _) => call_id.to_owned(),
+                    };
+                    let _ = events.send(ModelDelta::ToolUseStarted {
+                        id,
+                        name: name.to_owned(),
+                    });
+                }
                 self.items.insert(index, tracked);
             }
             "response.output_text.delta" | "response.reasoning_text.delta" => {

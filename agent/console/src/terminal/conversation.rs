@@ -526,6 +526,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         },
         EventKind::AssistantMessageCommitted { .. }
         | EventKind::ResponseStarted { .. }
+        | EventKind::ToolUseStarted { .. }
         | EventKind::Started
         | EventKind::ModelRetry { .. }
         | EventKind::InputMerged { .. }

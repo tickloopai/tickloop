@@ -42,7 +42,7 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 | `agent/tickloop/` | 可执行文件 `tickloop`：分派 Console、`daemon run`／`daemon stop`、`worker`、`monitor` 与 `tick`（Tick 包的 install／uninstall／login／logout／list，安装与登录经 `agent/packages`）；端到端测试与 cli_fixture |
 | `agent/console/` | Agent Console（terminal、agent_console、Monitor 行，含 `/ticks` 面板），只经 AgentAccess 访问 Agent，不依赖 runtime 与 daemon；Tick 包经 `agent/packages` 管理 |
 | `agent/packages/` | Tick 市场的读取与下载（https，市场在本机时才接受本机 http），`/ticks` 与 `tickloop tick` 共用的安装、更新、卸载、登录与退出登录（OAuth 经 tick/oauth，按 base 的 HTTP 策略建客户端）；依赖 base、tick/packages 与 tick/oauth |
-| `agent/client/` | AgentAccess 客户端：Unix socket 传输、断线恢复、查找或启动本机 daemon；只依赖 protocol |
+| `agent/client/` | AgentAccess 客户端：Unix socket 传输、断线恢复、查找或启动本机 daemon（运行目录只由配置根推导，一个配置根一个 daemon）；只依赖 protocol 与 tick/packages（配置根） |
 | `agent/daemon/` | daemon 与 worker 进程：AgentAccess 服务端、嵌入式 Agent、worker 监督与 hosted 控制通道 |
 | `agent/runtime/` | Agent runtime：Loop、Subagent、Transcript 存储与装载（TranscriptStore、JSONL）、Tick 订阅流、宿主工具、hosted 与 MCP |
 | `agent/transcript/` | Transcript 记录格式：`Line` 及各 entry、行类型头部识别与显示投影 `display`；只依赖 protocol 与 serde 一类基础库，供 runtime 与只读写记录格式、不需要 runtime 的使用方共用 |

@@ -11,11 +11,13 @@ const PROCESS_DIRECTORY_PREFIX: &str = "tlt-";
 
 static REMOVE_ABANDONED: Once = Once::new();
 
-/// A private daemon runtime directory, `/tmp/tlt-<pid>/<random>`, removed when dropped.
+/// A private directory, `/tmp/tlt-<pid>/<random>`, removed when dropped: a daemon runtime
+/// directory or a config root.
 ///
 /// A daemon steps down once its runtime directory is removed, so dropping this ends whatever
 /// daemon a test left in it. The first call in each test process removes the directories of test
-/// processes that died without dropping theirs, such as ones killed by a timeout, which ends
+/// processes that died without dropping theirs, such as ones killed by a timeout, together with
+/// the daemon and Tickhost runtime directories derived from them as config roots, which ends
 /// their daemons too.
 pub fn runtime_dir() -> tempfile::TempDir {
     REMOVE_ABANDONED.call_once(remove_directories_of_dead_processes);
@@ -50,8 +52,22 @@ fn remove_directories_of_dead_processes() {
             && is_dead(process_id)
             && is_own_directory(&entry.path())
         {
+            remove_runtimes_of_config_roots(&entry.path());
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+fn remove_runtimes_of_config_roots(process_directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(process_directory) else {
+        return;
+    };
+    for config_root in entries.flatten().map(|entry| entry.path()) {
+        let daemon =
+            tickloop_agent_client::daemon_endpoint::runtime_directory_of(Some(&config_root));
+        let host = tickhost::paths::HostPaths::of_config_root(Some(&config_root)).runtime;
+        let _ = std::fs::remove_dir_all(daemon);
+        let _ = std::fs::remove_dir_all(host);
     }
 }
 

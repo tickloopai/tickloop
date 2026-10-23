@@ -28,11 +28,11 @@ use crate::{
         HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
         PreparedHostCall, WorkspaceHostContext,
     },
-    mcp_http::McpHttpClient,
+    mcp_http::{McpHttpClient, REQUEST_TIMED_OUT, request_failure},
 };
 use tickloop_agent_artifacts::{
-    ArtifactClient, ArtifactError, CredentialSnapshot, IMAGE_ARTIFACT_FORMAT, MAX_IMAGE_BYTES,
-    artifact_image_type, artifact_type, artifact_type_for_tool, mcp_endpoint,
+    ArtifactClient, ArtifactError, ArtifactMetadata, CredentialSnapshot, IMAGE_ARTIFACT_FORMAT,
+    MAX_IMAGE_BYTES, artifact_image_type, artifact_type, artifact_type_for_tool, mcp_endpoint,
 };
 use tickloop_agent_protocol::{
     ArtifactAudience, ArtifactPublication, ChatId, HostEndpointIdentity, HostToolAuthority,
@@ -189,7 +189,9 @@ struct PreparedMcpCall {
     fingerprint: [u8; 32],
     arguments: Value,
     publication: Option<ArtifactPublication>,
-    read_owned: Option<bool>,
+    /// The role on the named Artifact this call needs, verified at preparation and again before
+    /// dispatch.
+    needed_role: Option<ArtifactRole>,
 }
 
 /// One approved image upload: exactly the bytes read and reviewed at preparation, sent once under
@@ -246,6 +248,41 @@ fn artifact_read_id<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
     (name == ARTIFACT_READ_TOOL && matches!(input["action"].as_str(), Some("read" | "threads")))
         .then(|| bounded_identifier(input.get("artifact_id")))
         .flatten()
+}
+
+/// An account's role on one Artifact, as the service reports it. An Agent acts with its user's
+/// own role: a viewer reads and comments, an editor or the owner also changes the Artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ArtifactRole {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl ArtifactRole {
+    fn parse(role: &str) -> Option<Self> {
+        match role {
+            "viewer" => Some(Self::Viewer),
+            "editor" => Some(Self::Editor),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+}
+
+/// The existing Artifact a call reads or writes and the role it needs there: reading content or
+/// threads and commenting need view access, any other `ArtifactEdit` action than create needs
+/// edit access.
+fn artifact_access_needed<'a>(name: &str, input: &'a Value) -> Option<(&'a str, ArtifactRole)> {
+    if let Some(id) = artifact_read_id(name, input) {
+        return Some((id, ArtifactRole::Viewer));
+    }
+    let needed = match name {
+        ARTIFACT_COMMENT_TOOL => ArtifactRole::Viewer,
+        ARTIFACT_EDIT_TOOL if !has_action(input, "create") => ArtifactRole::Editor,
+        _ => return None,
+    };
+    bounded_identifier(input.get("artifact_id")).map(|id| (id, needed))
 }
 
 fn bounded_identifier(value: Option<&Value>) -> Option<&str> {
@@ -315,23 +352,43 @@ impl Drop for McpHostToolProvider {
 }
 
 impl McpHostToolProvider {
-    async fn artifact_read_is_owned(
+    /// The metadata of Artifact `id` once the service confirms this account holds at least
+    /// `needed` on it. A call the account may not make, or whose access cannot be verified now,
+    /// is refused instead of asked about: no approval grants access the user does not have.
+    async fn verified_artifact(
         &self,
         id: &str,
+        needed: ArtifactRole,
         credential: &CredentialSnapshot,
         cancel: CancellationToken,
-    ) -> Result<bool, String> {
-        tokio::select! {
-            () = cancel.cancelled() => Err("MCP call cancelled".into()),
-            result = self.artifact.read_with_credential(id, credential) => match result {
-                Ok(metadata) if !tickloop_agent_artifacts::artifact_ids_match(id, &metadata.id) => Err("Artifact metadata identity does not match the requested artifact".into()),
-                Ok(metadata) => Ok(metadata.access_role == "owner"),
-                Err(ArtifactError::Connection | ArtifactError::InvalidResponse
-                    | ArtifactError::Service { status: 500..=599, .. }
-                    | ArtifactError::Http(500..=599)) => Ok(false),
-                Err(_) => Err("Artifact access could not be verified for this account".into()),
+    ) -> Result<ArtifactMetadata, String> {
+        let metadata = tokio::select! {
+            () = cancel.cancelled() => return Err("MCP call cancelled".into()),
+            result = self.artifact.read_with_credential(id, credential) => result,
+        };
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(
+                ArtifactError::Service {
+                    status: 403 | 404, ..
+                }
+                | ArtifactError::Http(403 | 404),
+            ) => return Err(format!("This account has no access to artifact {id}")),
+            Err(error) => {
+                return Err(format!(
+                    "Access to artifact {id} could not be verified for this account: {error}"
+                ));
             }
+        };
+        let role = ArtifactRole::parse(&metadata.access_role).ok_or_else(|| {
+            format!("Access to artifact {id} could not be verified for this account: the service reported an unknown role")
+        })?;
+        if role < needed {
+            return Err(format!(
+                "This account can view artifact {id} and comment on it but not edit it"
+            ));
         }
+        Ok(metadata)
     }
 
     /// The permission of a write to `artifact` in this Chat, when its metadata reports a private
@@ -700,11 +757,12 @@ impl McpHostToolProvider {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        let resource_uri = params["uri"].as_str().map(str::to_owned);
         let request = ClientRequest::CustomRequest(CustomRequest::new(method, Some(params)));
         let result = tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().send_request(request))
             .await
-            .map_err(|_| "MCP request timed out")?
-            .map_err(|_| "MCP request failed")?;
+            .map_err(|_| REQUEST_TIMED_OUT)?
+            .map_err(|error| request_failure(&error, resource_uri.as_deref()))?;
         serde_json::to_value(result).map_err(|_| "invalid MCP response".into())
     }
 
@@ -1008,12 +1066,9 @@ impl McpHostToolProvider {
             .map_err(|error| error.to_string())?;
         let content_type = artifact_image_type(&file.bytes)
             .map_err(|reason| format!("{} cannot be uploaded: {reason}", file.path.display()))?;
-        let metadata = tokio::select! {
-            () = cancel.cancelled() => return Err("ArtifactUpload was cancelled".into()),
-            result = self.artifact.read_with_credential(requested, &credential) => {
-                result.map_err(|error| format!("Artifact unavailable: {error}"))?
-            }
-        };
+        let metadata = self
+            .verified_artifact(requested, ArtifactRole::Editor, &credential, cancel)
+            .await?;
         if metadata.format != IMAGE_ARTIFACT_FORMAT {
             return Err(format!(
                 "ArtifactUpload adds images to Slides only; this artifact is a {}",
@@ -1094,12 +1149,9 @@ impl McpHostToolProvider {
         {
             return Err("Artifact account changed before the upload".into());
         }
-        let metadata = tokio::select! {
-            () = cancel.cancelled() => return Err("ArtifactUpload was cancelled".into()),
-            result = self.artifact.read_with_credential(&upload.artifact_id, &current) => {
-                result.map_err(|error| format!("Artifact unavailable: {error}"))?
-            }
-        };
+        let metadata = self
+            .verified_artifact(&upload.artifact_id, ArtifactRole::Editor, &current, cancel)
+            .await?;
         if metadata.publication != upload.publication {
             return Err(
                 "Artifact audience changed before the upload; prepare and check permission again"
@@ -1331,45 +1383,25 @@ impl McpHostToolProvider {
         if self.credential_key(&credential) != expected_key {
             return Err("Artifact account changed before MCP preparation".into());
         }
-        let read_owned = if let Some(id) = artifact_read_id(name, input) {
-            Some(
-                self.artifact_read_is_owned(id, &credential, cancel.clone())
+        let access = artifact_access_needed(name, input);
+        let metadata = match access {
+            Some((id, needed)) => Some(
+                self.verified_artifact(id, needed, &credential, cancel.clone())
                     .await?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
-        let publication = if let Some(id) = artifact_update_id(name, input) {
-            tokio::select! {
-                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
-                result = self.artifact.read_with_credential(id, &credential) => {
-                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?.publication
-                }
-            }
-        } else {
-            None
-        };
-        let permission = if let Some(owned) = read_owned {
-            if owned {
-                HostToolPermission::ReadOnly
-            } else {
-                HostToolPermission::Confirmation
-            }
-        } else {
-            artifact_update_id(name, input)
-                .and_then(|artifact| {
-                    self.audience_permission(chat_id, &credential, artifact, publication.as_ref())
-                })
-                .unwrap_or_else(|| Self::operation_permission(&tool, input))
-        };
+        let publication = artifact_update_id(name, input)
+            .and(metadata)
+            .and_then(|metadata| metadata.publication);
+        let permission = artifact_update_id(name, input)
+            .and_then(|artifact| {
+                self.audience_permission(chat_id, &credential, artifact, publication.as_ref())
+            })
+            .unwrap_or_else(|| Self::operation_permission(&tool, input));
         let summary = if name == ARTIFACT_EDIT_TOOL && has_action(input, "create") {
             format!(
                 "Call {name} at {}; the created artifact joins this Chat's Monitor and is linked to the current Loop for @tickloop requests",
-                credential.origin
-            )
-        } else if read_owned == Some(false) {
-            format!(
-                "Read artifact content at {}; ownership or a trusted organization could not be confirmed",
                 credential.origin
             )
         } else {
@@ -1403,7 +1435,7 @@ impl McpHostToolProvider {
             fingerprint,
             arguments: input.clone(),
             publication,
-            read_owned,
+            needed_role: access.map(|(_, needed)| needed),
         }))
     }
 
@@ -1442,32 +1474,19 @@ impl McpHostToolProvider {
         }) {
             return Err("Feedback input belongs to another Artifact account".into());
         }
-        if let Some(expected) = prepared.read_owned {
-            let id = artifact_read_id(call.name(), &prepared.arguments)
-                .ok_or("Artifact read identity changed")?;
-            if self
-                .artifact_read_is_owned(id, &current, cancel.clone())
-                .await?
-                != expected
-            {
-                return Err("Artifact read ownership changed before dispatch; prepare and check permission again".into());
-            }
-        }
-        if let Some(expected) = &prepared.publication {
-            let id = artifact_update_id(call.name(), &prepared.arguments)
-                .ok_or("Artifact update identity changed")?;
-            let current = tokio::select! {
-                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
-                result = self.artifact.read_with_credential(id, &current) => {
-                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?
-                }
-            };
-            if current.publication.as_ref() != Some(expected) {
-                return Err(
-                    "Artifact audience changed before dispatch; prepare and check permission again"
-                        .into(),
-                );
-            }
+        let Some(needed) = prepared.needed_role else {
+            return Ok(());
+        };
+        let (id, _) = artifact_access_needed(call.name(), &prepared.arguments)
+            .ok_or("Artifact call identity changed")?;
+        let metadata = self.verified_artifact(id, needed, &current, cancel).await?;
+        if let Some(expected) = &prepared.publication
+            && metadata.publication.as_ref() != Some(expected)
+        {
+            return Err(
+                "Artifact audience changed before dispatch; prepare and check permission again"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1545,11 +1564,16 @@ impl McpHostToolProvider {
                         .into(),
                 );
             }
-            _ => {
-                return HostCallResult::OutcomeUnknown(
-                    "MCP response unavailable after dispatch; read the artifact again before deciding"
-                        .into(),
-                );
+            Ok(Err(error)) => {
+                let failure = request_failure(&error, None);
+                return HostCallResult::OutcomeUnknown(format!(
+                    "{failure} after dispatch; read the artifact again before deciding"
+                ));
+            }
+            Err(_) => {
+                return HostCallResult::OutcomeUnknown(format!(
+                    "{REQUEST_TIMED_OUT} after dispatch; read the artifact again before deciding"
+                ));
             }
         };
         let effect = match name.as_str() {

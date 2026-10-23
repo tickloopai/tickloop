@@ -13,6 +13,16 @@ use uuid::Uuid;
 /// short enough that a host a killed test left behind exits soon after its Ticks go idle.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A real Tickhost launched with this fixture's config root, including when a controller starts
+/// it without a command environment of its own.
+pub fn executable_in(config_root: &Path) -> PathBuf {
+    let executable = config_root.join("fixture-tickhost");
+    if !executable.exists() {
+        super::cli_runtime::adopt(config_root);
+    }
+    super::cli_runtime::executable_in(config_root, &super::fixture_cli::tickhost())
+}
+
 /// The environment a hosted test Tick runs with.
 pub fn tick_environment() -> Vec<(String, String)> {
     vec![("PATH".into(), "/usr/bin:/bin".into())]

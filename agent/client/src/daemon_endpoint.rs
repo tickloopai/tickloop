@@ -14,28 +14,19 @@ pub const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
 
+/// The runtime directory of the daemon that serves this process's config root.
 pub fn runtime_directory() -> PathBuf {
-    std::env::var_os("TICKLOOP_DAEMON_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_runtime_directory)
+    runtime_directory_of(tick_packages::default_config_root().as_deref())
 }
 
-/// The per-user runtime directory of the daemon nothing else selects.
-pub fn default_runtime_directory() -> PathBuf {
-    PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
-        libc::geteuid()
-    }))
-}
-
-/// Whether `directory` is the default daemon's, however it is spelled.
-pub fn is_default_runtime_directory(directory: &Path) -> bool {
-    let default = default_runtime_directory();
-    directory == default
-        || directory.canonicalize().is_ok_and(|directory| {
-            default
-                .canonicalize()
-                .is_ok_and(|default| directory == default)
-        })
+/// The runtime directory of the one daemon of `config_root`: the per-user directory for
+/// `~/.tickloop` or when there is no root, and one named by the root's key for any other.
+pub fn runtime_directory_of(config_root: Option<&Path>) -> PathBuf {
+    let user_directory = format!("/tmp/tickloop-daemon-{}", unsafe { libc::geteuid() });
+    match config_root.and_then(tick_packages::config_root_runtime_key) {
+        Some(key) => PathBuf::from(format!("{user_directory}-{key}")),
+        None => PathBuf::from(user_directory),
+    }
 }
 
 pub fn validate_directory(directory: &Path) -> Result<(), String> {

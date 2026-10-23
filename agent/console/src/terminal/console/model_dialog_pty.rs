@@ -127,6 +127,10 @@ fn model_dialog_pty_matches_question_permission_chrome_and_restores_agent_picker
         .flat_map(|(width, height)| ["dark", "light"].map(|theme| (width, height, theme)))
     {
         let directory = tempfile::tempdir().unwrap();
+        let _runtime_directories =
+            crate::terminal::test_runtime::RuntimeDirectories::of_config_root(
+                &directory.path().join("config"),
+            );
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: height,
@@ -146,10 +150,6 @@ fn model_dialog_pty_matches_question_permission_chrome_and_restores_agent_picker
         command.env(DIRECTORY, directory.path());
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
-        command.env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            directory.path().join("runtime"),
-        );
         command.env("TICKLOOP_TMPDIR", directory.path());
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         command.env("TICKLOOP_MODEL_DIALOG_THEME", theme);

@@ -195,7 +195,7 @@ async fn incompatible_startup_confirmation_opens_the_new_daemon_with_original_op
                 frame.contains("Stop the running daemon and continue?")
             })
             .await;
-        assert!(!frame.contains("TICKLOOP_DAEMON_RUNTIME_DIR="));
+        assert!(!frame.contains("TICKLOOP_CONFIG_DIR="));
         assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 0);
         view.send(b"k\r");
         view.wait_for(
@@ -321,7 +321,7 @@ async fn explicit_daemon_stop_stays_stopped_with_a_live_view_until_a_new_launch(
         let original_epoch = client.daemon_epoch();
         let output = support::fixture_cli::tokio_command()
             .args(["daemon", "stop"])
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"))
+            .env("TICKLOOP_CONFIG_DIR", fixture.path("config"))
             .output()
             .await
             .unwrap();
@@ -348,7 +348,10 @@ async fn explicit_daemon_stop_stays_stopped_with_a_live_view_until_a_new_launch(
 
         let replacement = tickloop_agent_client::connect_or_start_at(
             fixture.path("runtime"),
-            support::fixture_cli::executable(),
+            support::cli_runtime::executable_in(
+                &fixture.path("config"),
+                &support::fixture_cli::executable(),
+            ),
         )
         .await
         .unwrap();
@@ -409,7 +412,6 @@ async fn update_status_reports_the_incompatible_daemon_without_migrating_or_open
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", fixture.path("home"))
             .env("TICKLOOP_CONFIG_DIR", fixture.path("config"))
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"))
             .kill_on_drop(true)
             .output(),
     )

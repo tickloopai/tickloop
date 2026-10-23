@@ -172,7 +172,7 @@ async fn signed_google_tool_roundtrip_survives_foreign_request_and_serialized_re
         .unwrap();
     let mut request = request();
     request.tools.push(ToolDefinition { name:"Echo".into(), description:"Fixture".into(), input_schema:json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}) });
-    let (events, _) = mpsc::unbounded_channel();
+    let (events, mut receiver) = mpsc::unbounded_channel();
     let first = client
         .complete(request.clone(), events.clone(), CancellationToken::new())
         .await
@@ -188,6 +188,12 @@ async fn signed_google_tool_roundtrip_survives_foreign_request_and_serialized_re
             }
         })
         .unwrap();
+    assert_eq!(
+        crate::model_protocols::started_tool_uses(&crate::model_protocols::sent_deltas(
+            &mut receiver
+        )),
+        [(id.clone(), "Echo".to_owned())]
+    );
     assert_eq!(first.stop_reason, "tool_use");
     request.messages.push(Message {
         role: Role::Assistant,

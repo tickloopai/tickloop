@@ -212,7 +212,11 @@ impl ArtifactClient {
             .await;
         match outcome {
             Ok(_) => Ok(()),
-            Err(ArtifactError::Connection | ArtifactError::InvalidResponse)
+            Err(
+                ArtifactError::Connection
+                | ArtifactError::TimedOut
+                | ArtifactError::InvalidResponse,
+            )
             | Err(ArtifactError::Service {
                 status: 500..=599, ..
             }) => {
@@ -295,7 +299,11 @@ impl ArtifactClient {
             Ok(operation) if operation.status == "unknown" => {
                 self.check_operation(&base, operation_id).await
             }
-            Err(ArtifactError::Connection | ArtifactError::InvalidResponse)
+            Err(
+                ArtifactError::Connection
+                | ArtifactError::TimedOut
+                | ArtifactError::InvalidResponse,
+            )
             | Err(ArtifactError::Service {
                 status: 500..=599, ..
             }) => self.check_operation(&base, operation_id).await,

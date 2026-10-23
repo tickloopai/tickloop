@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICKHOST_RUNTIME_DIR";
 pub const SOCKET_NAME: &str = "host.sock";
 pub const LOCK_NAME: &str = "host.lock";
 /// Holds one private directory per Tick, where its launcher binds the Tick Session socket.
@@ -25,14 +24,22 @@ pub struct HostPaths {
 }
 
 impl HostPaths {
-    /// The runtime directory from the environment or the per-user default under /tmp.
+    /// The runtime directory of the Tickhost that serves this process's config root.
     pub fn from_environment() -> Self {
+        Self::of_config_root(tick_packages::default_config_root().as_deref())
+    }
+
+    /// The runtime directory of the one Tickhost of `config_root`: the per-user directory for
+    /// `~/.tickloop` or when there is no root, and for any other a short one named by the root's
+    /// key, so the session sockets beneath it still fit.
+    pub fn of_config_root(config_root: Option<&Path>) -> Self {
+        let uid = current_uid();
+        let runtime = match config_root.and_then(tick_packages::config_root_runtime_key) {
+            Some(key) => format!("/tmp/tlh-{uid}-{key}"),
+            None => format!("/tmp/tickloop-tickhost-{uid}"),
+        };
         Self {
-            runtime: std::env::var_os(RUNTIME_DIR_ENV)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(format!("/tmp/tickloop-tickhost-{}", current_uid()))
-                }),
+            runtime: PathBuf::from(runtime),
         }
     }
 

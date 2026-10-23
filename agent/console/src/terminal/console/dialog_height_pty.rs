@@ -93,6 +93,7 @@ fn dialog_height_pty_fixture() {
 }
 
 struct Fixture {
+    _runtime_directories: crate::terminal::test_runtime::RuntimeDirectories,
     directory: tempfile::TempDir,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -104,6 +105,9 @@ struct Fixture {
 impl Fixture {
     fn start(renderer: &str, rows: u16) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let runtime_directories = crate::terminal::test_runtime::RuntimeDirectories::of_config_root(
+            &directory.path().join("config"),
+        );
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -123,10 +127,6 @@ impl Fixture {
         command.env(DIRECTORY, directory.path());
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
-        command.env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            directory.path().join("runtime"),
-        );
         command.env("TICKLOOP_TMPDIR", directory.path());
         command.env("TICKLOOP_AGENT_TUI", renderer);
         command.env("TERM", "xterm-256color");
@@ -146,6 +146,7 @@ impl Fixture {
             }
         });
         let fixture = Self {
+            _runtime_directories: runtime_directories,
             directory,
             child,
             master: pair.master,

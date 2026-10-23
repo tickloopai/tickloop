@@ -210,6 +210,7 @@ struct ToolCall {
     id: String,
     name: String,
     arguments: String,
+    is_announced: bool,
 }
 
 impl ChatStream {
@@ -316,6 +317,7 @@ impl ChatStream {
                             id: id.into(),
                             name: String::new(),
                             arguments: String::new(),
+                            is_announced: false,
                         },
                     );
                 }
@@ -329,6 +331,14 @@ impl ChatStream {
                 }
                 if let Some(arguments) = call["function"]["arguments"].as_str() {
                     tool.arguments.push_str(arguments);
+                }
+                // A name may arrive in pieces; it is whole once its arguments begin.
+                if !tool.is_announced && !tool.name.is_empty() && !tool.arguments.is_empty() {
+                    tool.is_announced = true;
+                    let _ = events.send(ModelDelta::ToolUseStarted {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                    });
                 }
             }
         }

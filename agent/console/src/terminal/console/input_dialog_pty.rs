@@ -110,6 +110,7 @@ fn input_dialog_tick_paste_pty_fixture() {
 }
 
 pub(super) struct Fixture {
+    _runtime_directories: crate::terminal::test_runtime::RuntimeDirectories,
     pub(super) child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -125,6 +126,8 @@ impl Fixture {
         height: u16,
         fixture_name: &str,
     ) -> Self {
+        let runtime_directories =
+            crate::terminal::test_runtime::RuntimeDirectories::of_config_root(directory);
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: height,
@@ -139,7 +142,6 @@ impl Fixture {
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         command.env("TERM", "xterm-256color");
         command.env("TICKLOOP_CONFIG_DIR", directory);
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", directory);
         command.env("TICKLOOP_TMPDIR", directory);
         command.cwd(directory);
         let child = pair.slave.spawn_command(command).unwrap();
@@ -158,6 +160,7 @@ impl Fixture {
             }
         });
         Self {
+            _runtime_directories: runtime_directories,
             child,
             writer,
             output,

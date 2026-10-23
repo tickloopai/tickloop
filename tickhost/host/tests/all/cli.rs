@@ -34,26 +34,41 @@ fn release_identity_and_host_content_identity_are_reported_separately() {
 
 /// A `tickhost run` started the way the Agent daemon starts it, and its controller.
 struct Service {
-    directory: tempfile::TempDir,
-    paths: HostPaths,
+    config_root: ConfigRoot,
     process: std::process::Child,
     controller: Option<HostConnection>,
     daemon_epoch: uuid::Uuid,
 }
 
-impl Service {
-    async fn start() -> Self {
+struct ConfigRoot {
+    directory: tempfile::TempDir,
+    paths: HostPaths,
+}
+
+impl ConfigRoot {
+    fn new() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("thc")
             .tempdir_in(crate::SHORT_TEMP_ROOT)
             .unwrap();
-        let paths = HostPaths {
-            runtime: directory.path().join("h"),
-        };
+        let paths = HostPaths::of_config_root(Some(directory.path()));
+        Self { directory, paths }
+    }
+}
+
+impl Drop for ConfigRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.paths.runtime);
+    }
+}
+
+impl Service {
+    async fn start() -> Self {
+        let config_root = ConfigRoot::new();
         let key = host::random_token();
         let mut process = tickhost()
             .arg(tickhost::cli::RUN_COMMAND)
-            .env(tickhost::paths::RUNTIME_DIR_ENV, &paths.runtime)
+            .env("TICKLOOP_CONFIG_DIR", config_root.directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -73,8 +88,12 @@ impl Service {
         };
         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
         let controller = loop {
-            match HostConnection::connect(&paths.socket(), role.clone(), &[CAPABILITY_LIFECYCLE])
-                .await
+            match HostConnection::connect(
+                &config_root.paths.socket(),
+                role.clone(),
+                &[CAPABILITY_LIFECYCLE],
+            )
+            .await
             {
                 Ok(connection) => break connection,
                 Err(_) if tokio::time::Instant::now() < deadline => {
@@ -84,8 +103,7 @@ impl Service {
             }
         };
         Self {
-            directory,
-            paths,
+            config_root,
             process,
             controller: Some(controller),
             daemon_epoch,
@@ -95,7 +113,7 @@ impl Service {
     fn stop(&self) -> std::process::Output {
         tickhost()
             .arg("stop")
-            .env(tickhost::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
+            .env("TICKLOOP_CONFIG_DIR", self.config_root.directory.path())
             .output()
             .unwrap()
     }
@@ -145,7 +163,7 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
         approval: ShellApproval {
             shell: "/bin/sh".into(),
             command: command.into(),
-            cwd: service.directory.path().to_path_buf(),
+            cwd: service.config_root.directory.path().to_path_buf(),
             environment: shell::environment_digest(&[]),
         },
     };
@@ -165,7 +183,7 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
         .unwrap();
     let mut submitted = Some(
         shell::submit(
-            &service.paths.socket(),
+            &service.config_root.paths.socket(),
             &serde_json::from_value(grant).unwrap(),
             &SpawnRequest {
                 binding,
@@ -183,7 +201,7 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
     let _group = OwnedGroup(pid);
     if interrupted_handoff {
         let successor = shell::adopt(&shell::ShellHandoff {
-            endpoint: service.paths.socket(),
+            endpoint: service.config_root.paths.socket(),
             instance: spawned.instance,
             owner_token: spawned.owner_token,
             handoff: uuid::Uuid::new_v4(),
@@ -195,7 +213,8 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
     let child_pid = if command.contains("child.pid") {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(pid) = std::fs::read_to_string(service.directory.path().join("child.pid"))
+            if let Ok(pid) =
+                std::fs::read_to_string(service.config_root.directory.path().join("child.pid"))
                 && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
             {
                 break Some(pid);
@@ -224,8 +243,8 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
         "stop reported success while tickhost run was alive"
     );
     assert!(!shell::process_group_exists(pid));
-    assert!(!service.paths.socket().exists());
-    assert!(!service.paths.host_running().unwrap());
+    assert!(!service.config_root.paths.socket().exists());
+    assert!(!service.config_root.paths.host_running().unwrap());
     assert!(stopping.elapsed() < Duration::from_secs(5));
     if let Some(pid) = child_pid {
         assert_ne!(
@@ -255,8 +274,8 @@ async fn stop_forces_a_host_that_cannot_handle_sigterm_and_reports_incomplete_cl
     assert!(String::from_utf8_lossy(&stopped.stderr).contains("required SIGKILL"));
     assert!(!String::from_utf8_lossy(&stopped.stdout).contains("its Ticks have ended"));
     assert!(service.process.try_wait().unwrap().is_some());
-    assert!(!service.paths.host_running().unwrap());
-    assert!(!service.paths.socket().exists());
+    assert!(!service.config_root.paths.host_running().unwrap());
+    assert!(!service.config_root.paths.socket().exists());
     assert!(stopping.elapsed() < Duration::from_secs(15));
 }
 
@@ -269,7 +288,7 @@ async fn stop_waits_for_the_process_even_if_the_lock_becomes_available_first() {
     );
     let mut stopping = tickhost()
         .arg("stop")
-        .env(tickhost::paths::RUNTIME_DIR_ENV, &service.paths.runtime)
+        .env("TICKLOOP_CONFIG_DIR", service.config_root.directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -277,12 +296,16 @@ async fn stop_waits_for_the_process_even_if_the_lock_becomes_available_first() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(stopping.try_wait().unwrap().is_none());
     std::fs::rename(
-        service.paths.lock(),
-        service.paths.runtime.join("held.lock"),
+        service.config_root.paths.lock(),
+        service.config_root.paths.runtime.join("held.lock"),
     )
     .unwrap();
-    std::fs::write(service.paths.lock(), service.process.id().to_string()).unwrap();
-    assert!(!service.paths.host_running().unwrap());
+    std::fs::write(
+        service.config_root.paths.lock(),
+        service.process.id().to_string(),
+    )
+    .unwrap();
+    assert!(!service.config_root.paths.host_running().unwrap());
     tokio::time::sleep(Duration::from_millis(200)).await;
     let premature = stopping.try_wait().unwrap().is_some();
     assert_eq!(
@@ -300,7 +323,7 @@ async fn stop_waits_for_the_process_even_if_the_lock_becomes_available_first() {
         String::from_utf8_lossy(&stopped.stderr)
     );
     assert!(service.process.try_wait().unwrap().is_some());
-    assert!(!service.paths.socket().exists());
+    assert!(!service.config_root.paths.socket().exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -329,7 +352,7 @@ async fn stop_ends_every_hosted_tick_and_leaves_them_lost_to_the_daemon() {
         .join("../../tick/examples/counter.py")
         .canonicalize()
         .unwrap();
-    let wrapper = service.directory.path().join("counter.py");
+    let wrapper = service.config_root.directory.path().join("counter.py");
     std::fs::write(
         &wrapper,
         r#"
@@ -354,7 +377,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                 "owner_revision": 0,
                 "adapter": "protocol",
                 "command": [env!("CARGO_BIN_EXE_tickhost"), tickhost::cli::LAUNCH_COMMAND, "--", "/usr/bin/python3", "-u", wrapper, counter],
-                "cwd": service.directory.path(),
+                "cwd": service.config_root.directory.path(),
                 "environment": std::env::vars().collect::<Vec<_>>(),
                 "title": null,
             }),
@@ -370,7 +393,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
         "owner_revision": 0,
         "adapter": "terminal",
         "command": ["/bin/sh", "-c", "trap '' TERM HUP; sleep 30 & echo $! > terminal-child.pid; wait"],
-        "cwd": service.directory.path(),
+        "cwd": service.config_root.directory.path(),
         "environment": std::env::vars().collect::<Vec<_>>(),
         "title": null,
     }), CONTROL_TIMEOUT).await.unwrap();
@@ -378,21 +401,30 @@ runpy.run_path(sys.argv[1], run_name="__main__")
     let _terminal_group = OwnedGroup(terminal_pid);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let terminal_child = loop {
-        if let Ok(pid) =
-            std::fs::read_to_string(service.directory.path().join("terminal-child.pid"))
-            && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+        if let Ok(pid) = std::fs::read_to_string(
+            service
+                .config_root
+                .directory
+                .path()
+                .join("terminal-child.pid"),
+        ) && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
         {
             break pid;
         }
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    let protocol_child =
-        std::fs::read_to_string(service.directory.path().join("protocol-child.pid"))
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+    let protocol_child = std::fs::read_to_string(
+        service
+            .config_root
+            .directory
+            .path()
+            .join("protocol-child.pid"),
+    )
+    .unwrap()
+    .trim()
+    .parse::<libc::pid_t>()
+    .unwrap();
     let epoch = service.controller.as_ref().unwrap().epoch();
 
     let stopped = service.stop();
@@ -403,8 +435,8 @@ runpy.run_path(sys.argv[1], run_name="__main__")
     );
     assert!(String::from_utf8_lossy(&stopped.stdout).contains("Stopped the Tickhost"));
     assert!(service.process.wait().unwrap().success());
-    assert!(!service.paths.host_running().unwrap());
-    assert!(!service.paths.socket().exists());
+    assert!(!service.config_root.paths.host_running().unwrap());
+    assert!(!service.config_root.paths.socket().exists());
     assert_ne!(unsafe { libc::kill(business, 0) }, 0, "the Tick has ended");
     for pid in [protocol_child, terminal_child, terminal_pid as libc::pid_t] {
         assert_ne!(
@@ -414,7 +446,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
         );
     }
     assert!(
-        !service.paths.was_emptied(epoch),
+        !service.config_root.paths.was_emptied(epoch),
         "a stopped host leaves no empty-host mark, so the daemon counts its Ticks as lost"
     );
 
@@ -434,20 +466,15 @@ impl Drop for OwnedGroup {
 #[test]
 fn stop_never_signals_a_process_the_host_lock_names_unless_it_is_the_live_tickhost_run() {
     use std::os::fd::AsRawFd;
-    let directory = tempfile::Builder::new()
-        .prefix("ths")
-        .tempdir_in(crate::SHORT_TEMP_ROOT)
-        .unwrap();
-    let paths = HostPaths {
-        runtime: directory.path().join("h"),
-    };
+    let config_root = ConfigRoot::new();
+    let paths = &config_root.paths;
     paths.prepare().unwrap();
     let mut unrelated = Command::new("/bin/sleep").arg("600").spawn().unwrap();
     std::fs::write(paths.lock(), unrelated.id().to_string()).unwrap();
     let stop = || {
         tickhost()
             .arg("stop")
-            .env(tickhost::paths::RUNTIME_DIR_ENV, &paths.runtime)
+            .env("TICKLOOP_CONFIG_DIR", config_root.directory.path())
             .output()
             .unwrap()
     };

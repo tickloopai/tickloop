@@ -428,9 +428,7 @@ async fn an_open_that_reached_the_host_is_never_sent_again() {
 async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped() {
     use std::os::unix::fs::PermissionsExt;
     let directory = private_directory("hbv");
-    let paths = HostPaths {
-        runtime: directory.path().join("h"),
-    };
+    let paths = HostPaths::of_config_root(Some(directory.path()));
     let first_runtime = directory.path().join("first");
     std::fs::create_dir(&first_runtime).unwrap();
     let _stop = StopHost {
@@ -441,7 +439,7 @@ async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped()
         &first_runtime,
         paths.clone(),
         Uuid::new_v4(),
-        support::fixture_cli::tickhost(),
+        support::hosted::executable_in(directory.path()),
         support::hosted::IDLE_TIMEOUT,
     );
     let owner = TickOwner {

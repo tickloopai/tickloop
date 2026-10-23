@@ -90,6 +90,8 @@ mod style;
 mod subagent_panel;
 mod subscription_detail;
 mod task_access;
+#[cfg(test)]
+mod test_runtime;
 mod thinking_preview;
 pub mod tick_actions;
 mod tick_labels;
@@ -851,7 +853,7 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
-Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
+Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
 monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, logs one in or out of its data source, or lists those installed or in the marketplace; tickloop tick --help explains them.
@@ -4160,7 +4162,7 @@ async fn interact_with_herdr(
                     if stopped_thinking {
                         thinking_previews.remove(&event.run_id);
                     }
-                    status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_)) || stopped_thinking;
+                    status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_) | EventKind::ToolUseStarted { .. }) || stopped_thinking;
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
@@ -4401,7 +4403,7 @@ async fn interact_with_herdr(
                                 outln!(console, "Queued input joined run {into_run_id}.");
                             }
                         },
-                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } => {},
+                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } | EventKind::ToolUseStarted { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
                         EventKind::Started => {
                             pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});

@@ -170,7 +170,7 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
         .unwrap();
     let config_path = root.join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":origin,"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let runtime_directory = support::cli_runtime::directory();
+    let runtime_directory = support::cli_runtime::adopt(&config_root);
     let home = root.join("home");
     std::fs::create_dir(&home).unwrap();
     std::fs::set_permissions(
@@ -182,7 +182,6 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--mode",

@@ -109,6 +109,8 @@ pub enum ArtifactError {
     Login(tick_oauth::LoginError),
     #[error("Tickloop Artifacts connection failed")]
     Connection,
+    #[error("Tickloop Artifacts request timed out")]
+    TimedOut,
     #[error("Tickloop Artifacts returned an invalid response")]
     InvalidResponse,
     #[error("Tickloop Accounts authorization was denied")]

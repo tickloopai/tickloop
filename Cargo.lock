@@ -3912,7 +3912,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-artifacts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "libc",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-base"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "base64 0.22.1",
  "hyper-util",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-client"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4008,6 +4008,7 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tickloop-agent-protocol",
+ "tickloop-tick-packages",
  "tokio",
  "tokio-util",
  "uuid",
@@ -4015,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-config"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -4035,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-console"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "arboard",
  "async-trait",
@@ -4070,6 +4071,7 @@ dependencies = [
  "tickloop-agent-updater",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
+ "tickloop-tickhost",
  "tickloop-tickhost-connect",
  "tickloop-ui",
  "time",
@@ -4083,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-cron"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4094,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-daemon"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4131,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-model"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4167,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-packages"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -4182,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-protocol"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "serde",
@@ -4196,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-runtime"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4244,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-test-support"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4266,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-tools"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "grep-printer",
@@ -4294,7 +4296,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-transcript"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -4305,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-agent-updater"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4324,7 +4326,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-oauth"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -4340,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-oauth-test-server"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde_json",
  "url",
@@ -4348,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-packages"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "flate2",
  "serde",
@@ -4363,7 +4365,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-protocol"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "jsonschema",
  "serde",
@@ -4374,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-sdk"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "futures-util",
  "schemars",
@@ -4386,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tickhost"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "clap",
  "libc",
@@ -4394,6 +4396,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost-connect",
  "tokio",
@@ -4406,7 +4409,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tickhost-connect"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "async-trait",
  "libc",
@@ -4425,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-ui"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "lru",
  "pulldown-cmark",

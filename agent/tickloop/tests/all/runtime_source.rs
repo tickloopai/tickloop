@@ -13,10 +13,7 @@ use serde_json::{Value, json};
 use tickloop_agent_client::LocalAgentClient;
 use tickloop_agent_protocol::{AgentAccess, AgentCommand, RuntimeBinaryInfo};
 
-use crate::{
-    graceful_upgrade::{PrivateRuntime, command, copy_bundle, version},
-    support,
-};
+use crate::graceful_upgrade::{PrivateRuntime, command, copy_bundle, version};
 
 fn installation(directory: &Path, source: Value, product_version: &str) {
     std::fs::write(
@@ -61,7 +58,7 @@ async fn isolated_daemon(
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(runtime.0.path().join("daemon.lock"))
+        .open(runtime.path().join("daemon.lock"))
         .unwrap();
     let descriptor = lock.as_raw_fd();
     assert_eq!(
@@ -71,11 +68,10 @@ async fn isolated_daemon(
     let mut process = tokio::process::Command::new(executable);
     process
         .args(["daemon", "run"])
-        .arg(runtime.0.path())
+        .arg(runtime.path())
         .arg(descriptor.to_string())
         .env("HOME", home)
-        .env_remove("TICKLOOP_TICKHOST_RUNTIME_DIR")
-        .env_remove("TICKLOOP_CONFIG_DIR")
+        .env("TICKLOOP_CONFIG_DIR", runtime.config_root())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -94,8 +90,7 @@ async fn isolated_daemon(
                 process.try_wait().unwrap().is_none(),
                 "private daemon exited during startup"
             );
-            if let Ok(client) =
-                LocalAgentClient::connect(runtime.0.path().join("daemon.sock")).await
+            if let Ok(client) = LocalAgentClient::connect(runtime.path().join("daemon.sock")).await
             {
                 break client;
             }
@@ -114,7 +109,7 @@ fn quoted(path: &Path) -> String {
 
 #[tokio::test]
 async fn managed_daemon_rejects_foreign_sources_before_running_the_candidate_probe() {
-    let runtime = PrivateRuntime(support::runtime_dir());
+    let runtime = PrivateRuntime::new();
     let scratch = tempfile::tempdir().unwrap();
     let home = scratch.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -190,7 +185,7 @@ async fn managed_daemon_rejects_foreign_sources_before_running_the_candidate_pro
 
 #[tokio::test]
 async fn daemon_can_transfer_between_version_directories_of_its_native_source() {
-    let runtime = PrivateRuntime(support::runtime_dir());
+    let runtime = PrivateRuntime::new();
     let scratch = tempfile::tempdir().unwrap();
     let home = scratch.path().join("home");
     std::fs::create_dir(&home).unwrap();

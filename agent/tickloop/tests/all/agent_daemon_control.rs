@@ -51,8 +51,8 @@ impl DaemonFixture {
     fn new() -> Self {
         let directory = support::runtime_dir();
         let root = directory.path().canonicalize().unwrap();
-        let runtime = root.join("runtime");
         let config = root.join("config");
+        let runtime = support::cli_runtime::adopt(&config);
         for path in [&runtime, &config] {
             std::fs::create_dir(path).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -75,7 +75,6 @@ impl DaemonFixture {
             .env("HOME", self.directory.path())
             .env("NO_COLOR", "1")
             .env("TICKLOOP_CONFIG_DIR", &self.config)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         command

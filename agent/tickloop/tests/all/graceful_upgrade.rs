@@ -13,10 +13,42 @@ use uuid::Uuid;
 
 use crate::support;
 
-pub(super) struct PrivateRuntime(pub(super) tempfile::TempDir);
+pub(super) struct PrivateRuntime {
+    _config_root: tempfile::TempDir,
+    config_root: PathBuf,
+    directory: PathBuf,
+}
+
+impl PrivateRuntime {
+    pub(super) fn new() -> Self {
+        let owned_config_root = support::runtime_dir();
+        let config_root = owned_config_root.path().canonicalize().unwrap();
+        let directory = support::cli_runtime::adopt(&config_root);
+        tickloop_agent_client::daemon_endpoint::validate_directory(&directory).unwrap();
+        Self {
+            _config_root: owned_config_root,
+            config_root,
+            directory,
+        }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(super) fn config_root(&self) -> &Path {
+        &self.config_root
+    }
+
+    pub(super) fn executable(&self, executable: &Path) -> PathBuf {
+        support::cli_runtime::executable_in(self.config_root(), executable)
+    }
+}
+
 impl Drop for PrivateRuntime {
     fn drop(&mut self) {
-        let directory = self.0.path().to_path_buf();
+        let directory = self.directory.clone();
+        let host = tickhost::paths::HostPaths::of_config_root(Some(self.config_root())).runtime;
         let _ = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -27,7 +59,7 @@ impl Drop for PrivateRuntime {
                     let _ = client.shutdown_daemon().await;
                 }
             });
-            support::stop_tickhost(&directory.join("tickhost"), &directory.join("tickhost.key"));
+            support::stop_tickhost(&host, &directory.join("tickhost.key"));
         })
         .join();
     }
@@ -112,7 +144,7 @@ async fn daemon_and_worker_upgrade_preserve_background_shell_and_receipts() {
 }
 
 pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
-    let runtime = PrivateRuntime(support::runtime_dir());
+    let runtime = PrivateRuntime::new();
     let bundles = tempfile::tempdir().unwrap();
     let workdir = tempfile::tempdir().unwrap();
     let reply = |text: &str| {
@@ -139,13 +171,17 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     std::fs::write(&transport_path, serde_json::to_vec(&transport).unwrap()).unwrap();
     let old_executable = copy_bundle(old_source, &bundles.path().join("old"));
     let new_executable = copy_bundle(new_source, &bundles.path().join("new"));
-    let old = connect_or_start_at(runtime.0.path().to_path_buf(), old_executable.clone())
-        .await
-        .unwrap();
+    let old = connect_or_start_at(
+        runtime.path().to_path_buf(),
+        runtime.executable(&old_executable),
+    )
+    .await
+    .unwrap();
     let old_daemon_pid = old.server_process_id();
     let original_session = old.session_id();
     let epoch = old.daemon_epoch();
     let mut launch = LaunchSpec::embedded(workdir.path().to_path_buf());
+    launch.config_root = Some(runtime.config_root().to_path_buf());
     launch.session_persistence = false;
     launch.host_options.execution_mode_override =
         Some(tickloop_agent_protocol::ExecutionMode::FullAccess);
@@ -250,8 +286,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     .unwrap();
     let upgraded_daemon = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(client) =
-                LocalAgentClient::connect(runtime.0.path().join("daemon.sock")).await
+            if let Ok(client) = LocalAgentClient::connect(runtime.path().join("daemon.sock")).await
                 && client.server_process_id() != old_daemon_pid
             {
                 break client;
@@ -268,8 +303,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     finish_first_turn.send(()).unwrap();
     let replacement = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(client) =
-                LocalAgentClient::connect(runtime.0.path().join("daemon.sock")).await
+            if let Ok(client) = LocalAgentClient::connect(runtime.path().join("daemon.sock")).await
                 && client.server_process_id() != old_daemon_pid
             {
                 let state = version(&client).await;

@@ -34,11 +34,9 @@ impl Host {
             .unwrap();
         let controller = HostController::new(
             directory.path(),
-            tickhost::paths::HostPaths {
-                runtime: directory.path().join("h"),
-            },
+            tickhost::paths::HostPaths::of_config_root(Some(directory.path())),
             Uuid::new_v4(),
-            support::fixture_cli::tickhost(),
+            support::hosted::executable_in(directory.path()),
             support::hosted::IDLE_TIMEOUT,
         );
         Self {
@@ -84,7 +82,7 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         support::stop_tickhost(
-            &self.directory.path().join("h"),
+            &tickhost::paths::HostPaths::of_config_root(Some(self.directory.path())).runtime,
             &self.directory.path().join("tickhost.key"),
         );
     }

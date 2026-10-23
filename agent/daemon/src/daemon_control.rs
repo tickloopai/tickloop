@@ -7,7 +7,7 @@ Stop the local Agent daemon and all of its workers, which ends every running Age
 Saved history is kept. Ticks in the Tickhost keep running.\n\
 The next tickloop launch starts this build.\n\
   -h, --help  Show this help.\n\n\
-TICKLOOP_DAEMON_RUNTIME_DIR selects the local daemon.";
+Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.";
 
 pub async fn run(arguments: &[OsString]) -> Result<(), String> {
     let Some(command) = arguments.first().and_then(|value| value.to_str()) else {

@@ -126,9 +126,9 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let root = directory.path().canonicalize().unwrap();
     let observed = Arc::new(Observed::default());
     let server_observed = observed.clone();
-    let host_runtime = root.join("h");
-    let server_host_runtime = host_runtime.clone();
     let config_root = root.join("state");
+    let host_runtime = tickhost::paths::HostPaths::of_config_root(Some(&config_root)).runtime;
+    let server_host_runtime = host_runtime.clone();
     support::hosted::install_counter_package(&config_root, &root);
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
@@ -175,7 +175,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     });
     let config_path = root.join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":origin,"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let runtime_directory = support::cli_runtime::directory();
+    let runtime_directory = support::cli_runtime::adopt(&config_root);
     let home = root.join("home");
     std::fs::create_dir(&home).unwrap();
     std::fs::set_permissions(
@@ -187,8 +187,6 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
-        .env("TICKLOOP_TICKHOST_RUNTIME_DIR", &host_runtime)
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .args([
             "--working-directory-is-trusted",
@@ -491,11 +489,9 @@ mod channel {
             let epoch = Uuid::new_v4();
             let controller = Arc::new(HostController::new(
                 &root,
-                tickhost::paths::HostPaths {
-                    runtime: root.join("h"),
-                },
+                tickhost::paths::HostPaths::of_config_root(Some(&config_root)),
                 epoch,
-                super::support::fixture_cli::tickhost(),
+                super::support::hosted::executable_in(&config_root),
                 idle_timeout,
             ));
             let control = Arc::new(WorkerControl::new(&root, epoch, controller.clone()));
@@ -618,7 +614,10 @@ mod channel {
 
     impl Drop for Daemon {
         fn drop(&mut self) {
-            super::support::stop_tickhost(&self.root.join("h"), &self.root.join("tickhost.key"));
+            super::support::stop_tickhost(
+                &tickhost::paths::HostPaths::of_config_root(Some(&self.root.join("state"))).runtime,
+                &self.root.join("tickhost.key"),
+            );
         }
     }
 
@@ -730,7 +729,9 @@ mod channel {
         assert_eq!(listed["total"], 0);
         assert_eq!(
             listed["endpoint"],
-            serde_json::json!(root.join("h/host.sock"))
+            serde_json::json!(
+                tickhost::paths::HostPaths::of_config_root(Some(&root.join("state"))).socket()
+            )
         );
         let listed = DaemonControl::new(second.clone())
             .request(list(chats[1]))
@@ -785,7 +786,9 @@ mod channel {
             "a worker has no reconcile or other management method: {reconcile}"
         );
         assert!(
-            !root.join("h/host.lock").exists(),
+            !tickhost::paths::HostPaths::of_config_root(Some(&root.join("state")))
+                .lock()
+                .exists(),
             "no request but an admitted open starts a Tickhost"
         );
     }
@@ -2830,9 +2833,8 @@ for line in sys.stdin:
         let host = tickhost::process::sample(launcher).unwrap().parent;
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
         assert!(super::gone(business_pid).await);
-        let host_paths = tickhost::paths::HostPaths {
-            runtime: daemon.root.join("h"),
-        };
+        let host_paths =
+            tickhost::paths::HostPaths::of_config_root(Some(&daemon.root.join("state")));
 
         model.enqueue(tickloop_agent_test_support::call(
             "reopen",
@@ -3455,7 +3457,10 @@ for line in sys.stdin:
             );
         }
 
-        super::support::stop_tickhost(&daemon.root.join("h"), &daemon.root.join("tickhost.key"));
+        super::support::stop_tickhost(
+            &tickhost::paths::HostPaths::of_config_root(Some(&daemon.root.join("state"))).runtime,
+            &daemon.root.join("tickhost.key"),
+        );
         for tick in &opened {
             assert!(super::gone(tick.business_pid).await, "every Tick ends");
         }
@@ -3559,9 +3564,8 @@ for line in sys.stdin:
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         let launcher = tickhost::process::sample(business_pid).unwrap().parent;
         let host = tickhost::process::sample(launcher).unwrap().parent;
-        let host_paths = tickhost::paths::HostPaths {
-            runtime: daemon.root.join("h"),
-        };
+        let host_paths =
+            tickhost::paths::HostPaths::of_config_root(Some(&daemon.root.join("state")));
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
         let members = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3784,9 +3788,7 @@ for line in sys.stdin:
                 .prefix("thl")
                 .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
                 .unwrap();
-            let paths = HostPaths {
-                runtime: directory.path().join("h"),
-            };
+            let paths = HostPaths::of_config_root(Some(directory.path()));
             Self {
                 directory,
                 paths,
@@ -3804,7 +3806,7 @@ for line in sys.stdin:
                 self.directory.path(),
                 self.paths.clone(),
                 Uuid::new_v4(),
-                super::support::fixture_cli::tickhost(),
+                super::support::hosted::executable_in(self.directory.path()),
                 self.idle_timeout,
             )
         }
@@ -4262,7 +4264,7 @@ for line in sys.stdin:
         let mut command = std::process::Command::new(super::support::fixture_cli::tickhost());
         command
             .arg(tickhost::cli::RUN_COMMAND)
-            .env(tickhost::paths::RUNTIME_DIR_ENV, &fixture.paths.runtime)
+            .env("TICKLOOP_CONFIG_DIR", fixture.directory.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

@@ -717,10 +717,6 @@ fn goal_ui_pty_records_monitor_menu_and_escape() {
         command.env("TICKLOOP_DIALOG_HEIGHT_FIXTURE_DIR", directory.path());
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
-        command.env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            directory.path().join("runtime"),
-        );
         command.env("TICKLOOP_TMPDIR", directory.path());
         command.env("TICKLOOP_AGENT_TUI", renderer);
         command.env("TERM", "xterm-256color");

@@ -29,7 +29,6 @@ const TERMINAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) struct Fixture {
     _directory: tempfile::TempDir,
     pub(crate) root: PathBuf,
-    pub(crate) runtime: PathBuf,
 }
 
 impl Fixture {
@@ -37,10 +36,10 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         fs::create_dir(root.join("home")).unwrap();
+        support::cli_runtime::adopt(&root.join("config"));
         Self {
             _directory: directory,
             root,
-            runtime: support::cli_runtime::directory(),
         }
     }
 
@@ -67,7 +66,6 @@ impl Fixture {
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
         command.env("TICKLOOP_CONFIG_DIR", self.root.join("config"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -108,7 +106,6 @@ impl Fixture {
             .env("HOME", self.root.join("home"))
             .env("NO_COLOR", "1")
             .env("TICKLOOP_CONFIG_DIR", self.root.join("config"))
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .current_dir(&self.root)
             .stdin(Stdio::null());
         command

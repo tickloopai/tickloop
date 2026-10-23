@@ -99,11 +99,10 @@ pub const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_secs(1);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Random bytes in every key and token the host issues.
 const TOKEN_BYTES: usize = 32;
-const INHERITED_CONTEXT: [&str; 4] = [
+const INHERITED_CONTEXT: [&str; 3] = [
     tick_protocol::INSTANCE_ID_ENV,
     hosted::LAUNCH_ENV,
     tickhost_connect::session::RUNTIME_DIR_ENV,
-    paths::RUNTIME_DIR_ENV,
 ];
 const HERDR_ENVIRONMENT_PREFIX: &str = "HERDR_";
 

@@ -55,4 +55,5 @@ portable-pty = "0.9"
 tickloop-agent-daemon = { path = "../daemon" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }
+tickloop-tickhost = { path = "../../tickhost/host" }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -6,17 +6,36 @@ export
 
 ARGS ?=
 
+# The Tickloop Cloud that make dev talks to: prod (the default), pre, or dev, whose origin is the
+# Makefile-only .env key TICKLOOP_DEV_ARTIFACT_ORIGIN; the Agent never reads that name. make dev
+# always sets the Agent's TICKLOOP_ARTIFACT_ORIGIN, which also gives the Accounts issuer and the MCP
+# endpoint. Only a command-line `ENV=...` selects it; an exported shell variable of the same name
+# is ignored so a leftover export cannot redirect the Agent, and it is never passed on, since sh
+# reads $ENV as a startup file.
+ENV := prod
+unexport ENV TICKLOOP_DEV_ARTIFACT_ORIGIN
+DEV_ENVIRONMENTS := prod pre dev
+DEV_CLOUD_ORIGIN_prod := https://tickloop.ai
+DEV_CLOUD_ORIGIN_pre := https://pre.tickloop.ai
+DEV_CLOUD_ORIGIN_dev := $(TICKLOOP_DEV_ARTIFACT_ORIGIN)
+DEV_ENV_IS_KNOWN = $(and $(filter 1,$(words $(ENV))),$(filter $(DEV_ENVIRONMENTS),$(ENV)))
+
 CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
 .PHONY: dev build install package test test-workspace check check-workspace release release-publish
 
-## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
-# Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
-# TICKLOOP_TICKHOST_RUNTIME_DIR independently overrides Tickhost. Explicit overrides may share services.
-# An explicit CARGO_TARGET_DIR gets a worktree+branch subdirectory to keep build artifacts isolated.
+## Start this checkout's build in the current directory, with the same config root, daemon and Tickhost
+## as an installed tickloop, against Tickloop Cloud ENV=prod (default), ENV=pre or ENV=dev.
+## Example: make dev ENV=pre ARGS="-c"
+# ENV=dev needs TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin> in .env. Every ENV replaces any
+# TICKLOOP_ARTIFACT_ORIGIN from .env or the environment.
+dev: override TICKLOOP_ARTIFACT_ORIGIN := $(DEV_CLOUD_ORIGIN_$(ENV))
 dev:
+	$(if $(DEV_ENV_IS_KNOWN),,$(error Unknown ENV '$(ENV)'; use ENV=prod (the default), ENV=pre or ENV=dev))
+	$(if $(TICKLOOP_ARTIFACT_ORIGIN),,$(error ENV=dev needs your dev Tickloop Cloud: put TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin> in .env))
+	@printf 'Tickloop Cloud: %s (ENV=%s)\n' "$$TICKLOOP_ARTIFACT_ORIGIN" '$(ENV)' >&2
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:

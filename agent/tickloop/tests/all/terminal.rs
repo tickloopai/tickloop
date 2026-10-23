@@ -23,30 +23,21 @@ fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::P
 
 fn trusted_agent_command() -> Command {
     let mut command = support::fixture_cli::command();
-    command.env(
-        "TICKLOOP_DAEMON_RUNTIME_DIR",
-        support::cli_runtime::directory(),
-    );
+    command.env("TICKLOOP_CONFIG_DIR", support::cli_runtime::config_root());
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
     command
 }
 
 fn trusted_async_agent_command() -> tokio::process::Command {
     let mut command = support::fixture_cli::tokio_command();
-    command.env(
-        "TICKLOOP_DAEMON_RUNTIME_DIR",
-        support::cli_runtime::directory(),
-    );
+    command.env("TICKLOOP_CONFIG_DIR", support::cli_runtime::config_root());
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
     command
 }
 
 fn product_async_agent_command() -> tokio::process::Command {
     let mut command = support::fixture_cli::tokio_command();
-    command.env(
-        "TICKLOOP_DAEMON_RUNTIME_DIR",
-        support::cli_runtime::directory(),
-    );
+    command.env("TICKLOOP_CONFIG_DIR", support::cli_runtime::config_root());
     command.arg("--working-directory-is-trusted");
     command
 }
@@ -55,13 +46,10 @@ fn product_async_agent_command() -> tokio::process::Command {
 fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(config_root.join("settings.json"), r#"{"autoApproval":{"rules":{"softDeny":{"includeBuiltins":false,"custom":[{"id":"invalid","text":"rule"}]}}}}"#).unwrap();
     let output = support::fixture_cli::command()
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .current_dir(directory.path())
@@ -106,6 +94,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     let home = directory.path().join("home");
     let scratch = directory.path().join("scratch");
     std::fs::create_dir(&home).unwrap();
@@ -130,10 +119,6 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     let reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-    command.env(
-        "TICKLOOP_DAEMON_RUNTIME_DIR",
-        support::cli_runtime::directory(),
-    );
     command.cwd(directory.path());
     command.env("TICKLOOP_CONFIG_DIR", &config_root);
     command.env("HOME", &home);
@@ -217,6 +202,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
 #[test]
 fn startup_rejects_invalid_working_directories_before_creating_storage() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let missing = directory.path().join("missing");
     let file = directory.path().join("file.txt");
     std::fs::write(&file, "not a directory").unwrap();
@@ -242,11 +228,8 @@ fn startup_rejects_invalid_working_directories_before_creating_storage() {
 #[test]
 fn noninteractive_startup_rejects_an_untrusted_current_directory() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .current_dir(directory.path())
         .env_remove("DEEPSEEK_API_KEY")
@@ -265,6 +248,7 @@ fn noninteractive_startup_rejects_an_untrusted_current_directory() {
 #[tokio::test]
 async fn product_terminal_defaults_to_auto_and_explains_legacy_mode_names() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let mut child = product_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--cwd")
@@ -307,6 +291,7 @@ async fn product_terminal_defaults_to_auto_and_explains_legacy_mode_names() {
 #[test]
 fn advanced_prompt_policies_are_explicit_mutually_exclusive_and_warn_when_unrestricted() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let conflict = trusted_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--cwd")
@@ -341,7 +326,9 @@ fn advanced_prompt_policies_are_explicit_mutually_exclusive_and_warn_when_unrest
 #[test]
 fn startup_storage_errors_identify_the_config_root_and_available_options() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let state = directory.path().join("state");
+    support::cli_runtime::adopt(&state);
     std::fs::write(&state, "not a directory").unwrap();
     let output = trusted_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &state)
@@ -414,12 +401,9 @@ fn terminal_explains_how_to_start_without_credentials() {
 #[test]
 fn chat_id_opens_the_exact_chat_identity() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let chat_id = "00000000-0000-4000-8000-000000000123";
     let output = support::fixture_cli::command()
-        .env(
-            "TICKLOOP_DAEMON_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--working-directory-is-trusted")
         .arg("--cwd")
@@ -441,6 +425,7 @@ fn chat_id_opens_the_exact_chat_identity() {
 #[tokio::test]
 async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--cwd")
@@ -504,6 +489,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
 async fn effort_picker_saves_a_supported_level_without_model_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .arg("--cwd")
@@ -554,6 +540,7 @@ async fn effort_picker_saves_a_supported_level_without_model_credentials() {
 async fn thinking_toggle_is_separate_from_effort() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .arg("--cwd")
@@ -610,6 +597,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
         request
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
@@ -654,6 +642,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
 async fn a_glyph_set_an_earlier_version_saved_starts_without_a_warning() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     std::fs::create_dir(&config_root).unwrap();
     std::fs::write(
         config_root.join("settings.json"),
@@ -712,6 +701,7 @@ async fn piped_bang_input_stays_a_model_prompt_and_cannot_enter_direct_shell_mod
         request
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let marker = directory.path().join("must-not-exist");
     let config_path = directory.path().join("model.json");
     std::fs::write(
@@ -789,6 +779,7 @@ async fn piped_follow_up_keeps_context_and_waits_for_both_replies_before_eof_exi
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("model.json");
     std::fs::write(
         &config_path,
@@ -867,6 +858,7 @@ async fn piped_branch_switches_to_an_independent_child_with_the_source_context()
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("model.json");
     std::fs::write(
         &config_path,
@@ -992,6 +984,7 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
         socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("model.json");
     std::fs::write(
         &config_path,
@@ -1049,6 +1042,7 @@ async fn piped_agent_creation_failure_is_reported_on_stderr_and_fails_the_proces
 
 async fn assert_piped_creation_refused(piped_input: &str) {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("model.json");
     std::fs::write(
         &config_path,
@@ -1116,6 +1110,7 @@ async fn assert_piped_creation_refused(piped_input: &str) {
 #[test]
 fn removed_configuration_flag_is_actionable_without_echoing_its_contents() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("broken.json");
     std::fs::write(&config_path, "{\"api_key\":\"private-value\"").unwrap();
     let output = trusted_agent_command()
@@ -1146,6 +1141,7 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(
         directory.path().join("model.json"),
         serde_json::to_vec(&json!({
@@ -1166,6 +1162,11 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
         .lines()
         .find_map(|line| line.strip_prefix("Chat: "))
         .unwrap();
+    support::cli_runtime::shutdown_daemon(&support::cli_runtime::daemon_directory_of(
+        &directory.path().join("config-root"),
+    ))
+    .await
+    .unwrap();
     let second = run_with_config(directory.path(), &[], "/resume\ncancel\n").await;
     assert!(second.status.success());
     let second_text = String::from_utf8(second.stdout).unwrap();
@@ -1231,11 +1232,12 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         let _ = arrived.send(socket);
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     local_model_config(directory.path(), address);
     let mut command = trusted_async_agent_command();
+    command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
@@ -1364,6 +1366,7 @@ async fn resuming_history_does_not_restore_a_failed_partial_reply() {
         socket.write_all(body.as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(
         directory.path().join("model.json"),
         serde_json::to_vec(&json!({
@@ -1424,6 +1427,7 @@ async fn terminal_accepts_a_follow_up_while_the_first_reply_is_still_running() {
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -1490,6 +1494,7 @@ async fn terminal_waits_for_explicit_permission_before_reading_an_external_file(
         final_request
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -1553,6 +1558,7 @@ async fn terminal_can_stop_a_running_turn_and_show_the_paused_loop() {
         std::future::pending::<()>().await;
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -1608,6 +1614,7 @@ async fn terminal_can_choose_accept_edits_with_an_explicit_write_rule_before_the
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let output = run_with_config(
         directory.path(),
@@ -1638,6 +1645,7 @@ async fn terminal_directory_controls_apply_to_subsequent_file_operations() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::create_dir(directory.path().join("data")).unwrap();
     std::fs::write(
         directory.path().join("data/note.txt"),
@@ -1709,6 +1717,7 @@ async fn no_session_persistence_writes_no_files_into_the_working_directory() {
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let workdir = directory.path().join("work");
     std::fs::create_dir(&workdir).unwrap();
     let config_path = directory.path().join("model.json");
@@ -1778,6 +1787,7 @@ async fn terminal_deny_rule_still_wins_over_an_explicit_wildcard_allow() {
             .unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let output = run_with_config(
         directory.path(),
@@ -1821,6 +1831,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let output = run_with_config(
@@ -1861,10 +1872,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
 fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
     for flag in ["--auto-reviewer-config", "--permission-checker-config"] {
         let output = support::fixture_cli::command()
-            .env(
-                "TICKLOOP_DAEMON_RUNTIME_DIR",
-                support::cli_runtime::directory(),
-            )
+            .env("TICKLOOP_CONFIG_DIR", support::cli_runtime::config_root())
             .args([flag, "legacy.json"])
             .output()
             .unwrap();
@@ -1881,6 +1889,7 @@ fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
 fn invalid_settings_are_reported_once_without_starting_a_default_model() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(
         config_root.join("settings.json"),
@@ -1938,6 +1947,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -2014,6 +2024,7 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -2129,6 +2140,7 @@ async fn terminal_can_configure_a_search_service_and_return_source_links() {
         socket.write_all(body.as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let search_config = tickloop_agent_protocol::SearchConfig {
         provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
@@ -2180,6 +2192,7 @@ async fn terminal_can_compact_history_and_continue_using_the_summary() {
         requests
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -2277,6 +2290,7 @@ async fn a_chat_cleared_away_keeps_running_without_writing_into_the_foreground()
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut command = trusted_async_agent_command();
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
@@ -2367,6 +2381,7 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(
         &config,
@@ -2378,9 +2393,9 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     )
     .unwrap();
     let mut command = trusted_async_agent_command();
+    command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
@@ -2461,12 +2476,13 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
         socket.write_all(body.as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut command = trusted_async_agent_command();
+    command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
@@ -2562,6 +2578,7 @@ async fn ordinary_terminal_input_answers_the_visible_questions_one_line_each() {
         request
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
@@ -2629,9 +2646,9 @@ async fn run_with_config(
 ) -> std::process::Output {
     trust_working_directory(&directory.join("config-root"), directory);
     let mut command = trusted_async_agent_command();
+    command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
-        .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_SOCKET_PATH")
@@ -2668,6 +2685,7 @@ async fn run_with_config(
 #[tokio::test]
 async fn the_removed_rewind_acknowledgement_is_unknown_without_calling_the_model() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(
         directory.path().join("model.json"),
         serde_json::to_vec(&json!({
@@ -2718,6 +2736,7 @@ async fn model_control_sequences_cannot_change_terminal_state() {
         socket.write_all(body.as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let config_path = directory.path().join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({
         "name":"local\u{1b}[2J fixture", "protocol":"messages", "base_url":format!("http://{address}"),
@@ -2872,6 +2891,7 @@ async fn two_terminal_processes_share_a_config_dir_without_lock_errors() {
         prompts
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(
         directory.path().join("model.json"),
         serde_json::to_vec(&json!({
@@ -2963,6 +2983,7 @@ fn saved_transcript(directory: &std::path::Path, chat: &str) -> std::path::PathB
 #[tokio::test]
 async fn continue_resumes_the_most_recent_chat_and_fork_session_needs_a_resume_flag() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     local_model_config(directory.path(), listener.local_addr().unwrap());
     let server = tokio::spawn(answer_requests(
@@ -3017,6 +3038,7 @@ async fn continue_resumes_the_most_recent_chat_and_fork_session_needs_a_resume_f
 #[tokio::test]
 async fn resume_picker_and_fork_session_open_a_chat_created_by_another_process() {
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     local_model_config(directory.path(), listener.local_addr().unwrap());
     let server = tokio::spawn(answer_requests(
@@ -3113,6 +3135,7 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     local_model_config(directory.path(), address);
     let started = std::time::Instant::now();
     let mut child = trusted_async_agent_command()
@@ -3211,6 +3234,7 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
 async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     let sessions = config_root.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let mut exited = Command::new("true").spawn().unwrap();
@@ -3386,6 +3410,7 @@ async fn a_background_chat_permission_request_is_announced_and_answered_by_reque
         accept_skipping_new_agent(&listener).await;
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     local_model_config(directory.path(), address);
     let mut child = spawn_piped_terminal(directory.path());
     let mut input = child.stdin.take().unwrap();
@@ -3556,6 +3581,7 @@ async fn a_background_permission_answered_during_a_partial_foreground_reply_gets
         }
     });
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     local_model_config(directory.path(), address);
     let mut child = spawn_piped_terminal(directory.path());
     let mut input = child.stdin.take().unwrap();
@@ -3632,6 +3658,7 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("note.txt"), "local note").unwrap();
     let tool_input = json!({"file_path":directory.path().join("note.txt")});
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -3702,6 +3729,7 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
 fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(
         config_root.join("settings.json"),
@@ -3757,6 +3785,7 @@ async fn daemon_catalog(
 async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
     let mut command = trusted_async_agent_command();
     command
         .env("TICKLOOP_CONFIG_DIR", &config_root)
@@ -3795,7 +3824,6 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
     );
 
     let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .arg("--cwd")
         .arg(directory.path())

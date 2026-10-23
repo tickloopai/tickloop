@@ -323,7 +323,8 @@ impl CodexModelClient {
             cancel,
             super::structured_response::StructuredResponsePolicy::for_codex_body(body),
             Adapter::CodexResponses,
-            false,
+            super::responses::ResponsesStream::for_codex()
+                .with_codex_origin(&codex_origin(&self.config.model, account_id)),
         )
         .await
     }
@@ -1486,13 +1487,29 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let output = client
             .complete(simple_request(), events, CancellationToken::new())
             .await
             .expect("completed arguments are authoritative when no delta was streamed");
         captured.await.unwrap();
         assert_eq!(output.stop_reason, "tool_use");
+        let started = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|delta| match delta {
+                ModelDelta::ToolUseStarted { id, name } => Some((id, name)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let output_calls = output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started, output_calls);
         let calls = output
             .content
             .iter()

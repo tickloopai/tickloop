@@ -44,7 +44,7 @@ impl Terminal {
     ) -> Self {
         fs::create_dir_all(workdir.join("home")).unwrap();
         fs::create_dir_all(workdir.join("tmp")).unwrap();
-        let runtime = support::cli_runtime::directory();
+        let runtime = support::cli_runtime::adopt(&workdir.join("state"));
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 38,
@@ -54,7 +54,6 @@ impl Terminal {
             })
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(workdir);
@@ -266,7 +265,6 @@ impl Drop for Terminal {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("TICKLOOP_CONFIG_DIR", &self.config_root)
-            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .output();
         if !result.is_ok_and(|output| output.status.success()) {
             eprintln!(

@@ -3,14 +3,13 @@ use std::{fs, path::Path};
 
 fn command(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"));
-    let runtime = support::cli_runtime::directory();
+    support::cli_runtime::adopt(&root.join("state"));
     fs::create_dir_all(root.join("home")).unwrap();
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("TICKLOOP_CONFIG_DIR", root.join("state"))
-        .env("TICKLOOP_DAEMON_RUNTIME_DIR", runtime)
         .current_dir(root);
     command
 }
