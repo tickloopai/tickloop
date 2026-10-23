@@ -109,6 +109,10 @@ pub enum Retention {
     Unknown,
     /// Stands for every retained Line before it.
     Snapshot,
+    /// A Trigger source's own state, which only the Chat's lease holder writes, again after a
+    /// compaction: no retained snapshot stands for it, so none written by another process
+    /// carries a stale copy. The kinds of the Goal and the scheduled tasks are such.
+    SourceState,
 }
 
 /// The kind of a Line read from its top-level `type` alone, without parsing the rest of it.

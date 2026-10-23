@@ -1812,10 +1812,11 @@ fn records_of(lines: &[tickloop_agent_transcript::Line], record: &str) -> usize 
 
 /// A source's own state is taken over from the store with a newly taken lease, before anything
 /// is accepted under it: what another process recorded decides whether the delivery that took
-/// the lease goes in.
+/// the lease goes in, and what the source records as it takes over is stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     const STOP_ELSEWHERE: &str = "stop receiving";
+    const TAKEN_OVER: &str = "taken over";
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let model = ContractModel::new();
@@ -1829,11 +1830,13 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     // stops receiving, which holds every delivery back.
     taker.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
         take_over: Some(Box::new(|snapshot, stored| {
-            if records_of(stored, STOP_ELSEWHERE) > 0 {
-                snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
-                    reason: tickloop_agent_protocol::PauseReason::Stopped,
-                };
+            if records_of(stored, STOP_ELSEWHERE) == 0 {
+                return Vec::new();
             }
+            snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                reason: tickloop_agent_protocol::PauseReason::Stopped,
+            };
+            vec![source_record(snapshot.id, TAKEN_OVER)]
         })),
         ..Default::default()
     });
@@ -1861,6 +1864,12 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     );
     tokio::time::sleep(SETTLE).await;
     assert_eq!(taker_model.seen("held-back"), 0);
+    taker.flush_transcripts().await;
+    assert_eq!(
+        records_of(&stored_lines(&root, chat), TAKEN_OVER),
+        1,
+        "what the source records as it takes over is stored"
+    );
     taker.shutdown().await;
 }
 
@@ -1942,6 +1951,37 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     setup.model.release_held_turn();
     setup.elsewhere.shutdown().await;
     here.shutdown().await;
+}
+
+/// A stop where another live process holds the lease cannot stop the sources here, and says
+/// so: they stop there once that process learns of the stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_away_from_the_lease_says_the_sources_did_not_stop_here() {
+    let setup = WaitingInput::new().await;
+    let chat = setup.chat;
+    setup.elsewhere.register_trigger_source_state_for_tests(
+        tickloop_agent_runtime::TestSourceState {
+            on_stop: Some(Box::new(|snapshot| {
+                vec![source_record(snapshot.id, "stopped elsewhere")]
+            })),
+            ..Default::default()
+        },
+    );
+    setup.elsewhere.stop(chat).await.unwrap();
+    let notices = setup.elsewhere.loop_trigger_notices();
+    assert!(
+        notices.iter().any(|notice| notice.chat_id == chat
+            && notice.kind == LoopTriggerNoticeKind::Warning
+            && notice.message.contains("did not stop here")),
+        "{notices:?}"
+    );
+    assert_eq!(
+        records_of(&stored_lines(&setup.root, chat), "stopped elsewhere"),
+        0
+    );
+    setup.model.release_held_turn();
+    setup.elsewhere.shutdown().await;
+    setup.here.shutdown().await;
 }
 
 /// A Continue lets the sources resume with the Loop under the lease it takes, recorded by the
@@ -2026,6 +2066,64 @@ async fn a_compaction_has_the_holder_write_the_source_records_again() {
     .await
     .expect("the records are written again after the compaction");
     agent.shutdown().await;
+}
+
+/// The lease holder's compaction carries the sources' records itself: an exit right after it,
+/// while the Chat's boundary is still taken, leaves them after the compaction in the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_by_the_holder_keeps_the_source_records_through_an_exit() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+        records: Some(Box::new(|snapshot| {
+            vec![source_record(snapshot.id, "as it stands")]
+        })),
+        ..Default::default()
+    });
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), "takes-the-lease")
+        .await
+        .unwrap();
+    model.wait_seen("takes-the-lease", 1).await;
+    wait_for_state(&agent, chat, tickloop_agent_protocol::LoopState::Idle).await;
+    // A stop holds the boundary with the lease, its pause recorded and the lease not yet back.
+    let recorded = agent.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
+    let stop = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.stop(chat).await }
+    });
+    tokio::time::timeout(WAIT, recorded.entered)
+        .await
+        .expect("the stop holds the boundary")
+        .unwrap();
+    tokio::time::timeout(WAIT, agent.compact(chat))
+        .await
+        .expect("compacts")
+        .unwrap();
+    let shutdown = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.shutdown().await }
+    });
+    tokio::time::sleep(SETTLE).await;
+    drop(recorded.release);
+    stop.await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, shutdown)
+        .await
+        .expect("shuts down")
+        .unwrap();
+    let stored = stored_lines(&root, chat);
+    let boundary = stored
+        .iter()
+        .rposition(|line| {
+            line.chain_entry()
+                .is_some_and(tickloop_agent_transcript::ChainEntry::restarts_chain)
+        })
+        .expect("the compaction is stored");
+    assert_eq!(records_of(&stored[boundary..], "as it stands"), 1);
 }
 
 /// Trigger input waiting while only the lease keeps it out, here a lock another host wrote, runs

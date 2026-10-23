@@ -184,6 +184,14 @@ pub(super) enum LeaseRefused {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LeaseHolding(Option<u64>);
 
+impl LeaseHolding {
+    /// Whether another process may take the lease once it goes back: what must reach the store
+    /// before it does waits for the store.
+    pub(super) fn passes_on(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// How long a Chat whose Trigger input waits on a failed permit waits before the first retry,
 /// doubling with each failure up to the longest.
 const PERMIT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
@@ -636,6 +644,21 @@ impl Agent {
         self.inner.chat_leases.boundary(chat_id).lock_owned().await
     }
 
+    /// Whether this process holds the Chat's lease and took the Chat over under it, so it alone
+    /// writes the records of the Trigger sources' state. A host that keeps waits durably, or
+    /// keeps no Transcript, always does until it closes.
+    pub(super) fn holds_trigger_lease(&self, chat_id: ChatId) -> bool {
+        let leases = &self.inner.chat_leases;
+        if leases.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.recorder.is_none()
+            || self.inner.waits == super::WaitHosting::Durable
+            || leases
+                .holding(chat_id)
+                .is_some_and(|holding| leases.stands(chat_id, holding))
+    }
+
     /// Enters the Chat's Trigger boundary for a source, as long as it is free soon enough;
     /// `None` while it stays held.
     pub(super) async fn enter_trigger_boundary_for_source(
@@ -668,6 +691,14 @@ impl Agent {
         chat_id: ChatId,
         _within: &TriggerBoundary,
     ) -> Result<LeaseTaken, LeaseRefused> {
+        if self
+            .inner
+            .chat_leases
+            .closing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LeaseRefused::Closing);
+        }
         // A host that keeps waits durably holds the Chat's whole family under its lease: no
         // other process delivers to it.
         if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
@@ -881,13 +912,28 @@ impl Agent {
         match change {
             ReceivingChange::Paused => {
                 // The sources stop with the Loop where the lease is, before it goes back.
-                if let Ok(taken) = self.take_lease(chat_id, &within).await {
-                    let holding = match taken {
-                        LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding) => holding,
-                    };
-                    self.switch_sources(chat_id, holding, change).await;
-                }
+                let refused = match self.take_lease(chat_id, &within).await {
+                    Ok(LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding)) => {
+                        self.switch_sources(chat_id, holding, change).await;
+                        None
+                    }
+                    Err(refused) => Some(refused),
+                };
                 self.inner.chat_leases.release(chat_id);
+                if let Some(refused) = refused
+                    && self.has_trigger_source_states()
+                {
+                    self.inner.chat_leases.set_notice(
+                        chat_id,
+                        LoopTriggerNoticeKind::Warning,
+                        format!(
+                            "this Chat's Trigger sources, such as its goal or scheduled tasks, \
+                             did not stop here: {}; they stop where the lease is held once that \
+                             process learns of the stop",
+                            super::wakeup::SourceChangeError::from(refused)
+                        ),
+                    );
+                }
             }
             ReceivingChange::Resumed => {
                 // The sources resume with the Loop under the lease. One taken for that alone

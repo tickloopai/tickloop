@@ -45,8 +45,9 @@ pub(super) trait TriggerSourceState: Send + Sync {
     /// Takes the source's state over from `stored`, the Chat's stored Lines, under a newly taken
     /// lease: within the Chat's boundary and under the Chats lock, right after the ledger's
     /// Trigger records, before anything is accepted or started under the lease, so eligibility
-    /// reads the newest state another process left.
-    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]);
+    /// reads the newest state another process left. What it records through `change` is
+    /// queued in one group with the takeover's ledger records.
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]);
 
     /// The records of the source's state as it stands, which the lease holder writes again
     /// after a compaction, so a load from the compaction finds them.
@@ -650,9 +651,11 @@ impl Agent {
                 }
             }
             let states = self.inner.trigger_source_states.read().unwrap().clone();
+            let change = SourceChange::new(self);
             for state in states {
-                state.take_over(self, chat, &lines);
+                state.take_over(&change, chat, &lines);
             }
+            change.queue_with(chat);
             let lifecycle = &chat.bookkeeping.lifecycle;
             let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut chat.snapshot.pending_inputs)
@@ -801,14 +804,19 @@ impl Agent {
             self.save(&chat.snapshot);
             result
         };
-        let receiving = {
-            let chats = self.inner.chats.lock().await;
-            let chat = chats.get(&chat_id).ok_or(SourceChangeError::NotLoaded)?;
-            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-                .await
-                .map_err(SourceChangeError::Unrecorded)?;
-            chat.snapshot.chat_loop.receiving
-        };
+        self.commit_queued(chat_id)
+            .await
+            .map_err(SourceChangeError::Unrecorded)?;
+        let receiving = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(SourceChangeError::NotLoaded)?
+            .snapshot
+            .chat_loop
+            .receiving;
         match receiving {
             Receiving::Receiving
             | Receiving::Paused {
@@ -823,8 +831,9 @@ impl Agent {
     }
 
     /// The sources' part of a turn of the receiving switch, where the lease `holding` is and
-    /// within the boundary, recorded with it: for a pause before the lease goes back. Whether
-    /// what they did is recorded.
+    /// within the boundary, recorded with it: for a pause before the lease goes back, without
+    /// holding the Chats while the store takes it. Whether what they did is recorded, or queued
+    /// where no other process takes the lease.
     pub(super) async fn switch_sources(
         &self,
         chat_id: ChatId,
@@ -835,23 +844,27 @@ impl Agent {
         if states.is_empty() || !self.inner.chat_leases.stands(chat_id, holding) {
             return true;
         }
-        let mut chats = self.inner.chats.lock().await;
-        let Some(chat) = chats.get_mut(&chat_id) else {
-            return true;
-        };
-        let change = SourceChange::new(self);
-        for state in &states {
-            match switched {
-                ReceivingChange::Paused => state.on_stop(&change, chat),
-                ReceivingChange::Resumed => state.on_resume(&change, chat),
-            }
-        }
-        change.queue_with(chat);
-        self.save(&chat.snapshot);
-        if let Err(error) = self
-            .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-            .await
         {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&chat_id) else {
+                return true;
+            };
+            let change = SourceChange::new(self);
+            for state in &states {
+                match switched {
+                    ReceivingChange::Paused => state.on_stop(&change, chat),
+                    ReceivingChange::Resumed => state.on_resume(&change, chat),
+                }
+            }
+            change.queue_with(chat);
+            self.save(&chat.snapshot);
+        }
+        // Where no other process takes the lease, nothing waits on the records: they are written
+        // with the Chat's next flush.
+        if !holding.passes_on() {
+            return true;
+        }
+        if let Err(error) = self.commit_queued(chat_id).await {
             let notice = match switched {
                 ReceivingChange::Paused => format!(
                     "what this Chat's Trigger sources did as it stopped could not be recorded \
@@ -872,13 +885,27 @@ impl Agent {
         true
     }
 
-    /// After a compaction, the lease holder writes the sources' records again, within the
-    /// boundary; a process another live one holds the lease from leaves them to it, and every
-    /// takeover reads them from the whole store.
-    pub(super) fn rewrite_source_records_after_compaction(&self, chat_id: ChatId) {
+    /// The records of the sources' state a compaction writes in its own group, after its
+    /// snapshot, so a load from the compaction finds them: the lease holder's, as they stand.
+    /// A process that does not hold the lease writes them again after the compaction if it can
+    /// take the lease; one another live process holds it from leaves them to that one, and
+    /// every takeover reads them from the whole store.
+    pub(super) fn source_records_for_compaction(&self, chat: &Chat) -> Vec<Line> {
         if !self.has_trigger_source_states() {
-            return;
+            return Vec::new();
         }
+        if !self.holds_trigger_lease(chat.snapshot.id) {
+            self.rewrite_source_records_after_compaction(chat.snapshot.id);
+            return Vec::new();
+        }
+        let states = self.inner.trigger_source_states.read().unwrap().clone();
+        states
+            .iter()
+            .flat_map(|state| state.records(chat))
+            .collect()
+    }
+
+    fn rewrite_source_records_after_compaction(&self, chat_id: ChatId) {
         let agent = self.clone();
         self.inner.tasks.spawn(Box::pin(async move {
             loop {
@@ -1243,7 +1270,8 @@ impl Agent {
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct TestSourceState {
-    pub take_over: Option<Box<dyn Fn(&mut ChatSnapshot, &[Line]) + Send + Sync>>,
+    /// The Lines it records as it takes the state over.
+    pub take_over: Option<Box<dyn Fn(&mut ChatSnapshot, &[Line]) -> Vec<Line> + Send + Sync>>,
     pub records: Option<Box<dyn Fn(&ChatSnapshot) -> Vec<Line> + Send + Sync>>,
     /// The Lines it records as the Chat stops.
     pub on_stop: Option<Box<dyn Fn(&mut ChatSnapshot) -> Vec<Line> + Send + Sync>>,
@@ -1253,9 +1281,11 @@ pub struct TestSourceState {
 
 #[cfg(any(test, feature = "test-support"))]
 impl TriggerSourceState for TestSourceState {
-    fn take_over(&self, _agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]) {
         if let Some(take_over) = &self.take_over {
-            take_over(&mut chat.snapshot, stored);
+            for line in take_over(&mut chat.snapshot, stored) {
+                change.record_source_state(line);
+            }
         }
     }
 

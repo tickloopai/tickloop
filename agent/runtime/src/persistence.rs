@@ -741,6 +741,7 @@ impl ChatRecorder {
         compacted_bookkeeping: &ChatBookkeeping,
         layout: &CompactionLayout,
         renamed_snapshots: &[FileHistorySnapshot],
+        source_states: Vec<Line>,
     ) {
         let Some(mut lines) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
             return;
@@ -772,7 +773,8 @@ impl ChatRecorder {
                 replacements,
             }));
         }
-        self.outbox.enqueue(compacted.id, lines, events_through);
+        self.outbox
+            .enqueue_group(compacted.id, lines, source_states, events_through);
     }
 
     /// 压缩后对话中需要新写的链上条目，同时把已写出条目的对应表换成压缩后的对话。已写出的条目
@@ -2665,14 +2667,24 @@ impl Agent {
             return Ok(());
         }
         recorder.enqueue_sync(snapshot, bookkeeping);
-        if !recorder.outbox.is_materialized(snapshot.id)
-            || recorder.outbox.refusal(snapshot.id).is_some()
-        {
+        self.commit_queued(snapshot.id).await
+    }
+
+    /// Commits what the Chat has queued for its Transcript, without holding the Chats while it
+    /// waits for the store: what the caller queued under them stands queued already.
+    pub(super) async fn commit_queued(&self, chat_id: ChatId) -> Result<(), String> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        if !recorder.logs.lock().unwrap().contains_key(&chat_id) {
+            return Ok(());
+        }
+        if !recorder.outbox.is_materialized(chat_id) || recorder.outbox.refusal(chat_id).is_some() {
             return Err("Transcript is unavailable for a connection checkpoint".into());
         }
         let _appends = recorder.appends.lock().await;
         recorder
-            .append_queued(snapshot.id, true)
+            .append_queued(chat_id, true)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
