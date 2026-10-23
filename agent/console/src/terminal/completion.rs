@@ -85,6 +85,7 @@ impl CommandSpec {
                     Some(CHILD_AUTHORIZATION_FIXED)
                 }
                 "/plan" => Some(CHILD_PLAN_REPORTED),
+                "/loop" => Some("scheduled tasks belong to the root Agent"),
                 _ => None,
             },
         }
@@ -139,6 +140,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/tickloop",
         arguments: "[REQUEST]",
         description: "Loads the Tickloop Skill.",
+        menu_group: Some(CommandGroup::Skills),
+    },
+    CommandSpec {
+        command: "/loop",
+        arguments: "[INTERVAL] [INSTRUCTION]",
+        description: "Repeats an instruction on a fixed interval or at a self-paced cadence; without instructions uses loop.md or maintenance guidance.",
         menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
@@ -595,8 +602,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 24);
-        assert_eq!(builtin_commands().len(), 40);
+        assert_eq!(completion.candidates().len(), 25);
+        assert_eq!(builtin_commands().len(), 41);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -610,6 +617,7 @@ mod tests {
             "/cwd",
             "/details",
             "/tickloop",
+            "/loop",
             "/slides",
             "/artifacts",
             "/ticks",
