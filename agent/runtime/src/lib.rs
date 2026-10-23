@@ -598,8 +598,8 @@ enum TriggerTake {
 }
 
 /// Why a take of `pending` stops before it starts the input, as another take of it may have
-/// started it meanwhile; `None` while it waits in the Chat's queue as it was found there,
-/// accepted and not started.
+/// started it meanwhile; `None` while it waits in the Chat's queue as it was found there and
+/// the ledger has not started it.
 fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
     let queued = chat.snapshot.pending_inputs.iter().any(|queued| {
         queued.receipt.run_id == pending.receipt.run_id
@@ -609,12 +609,11 @@ fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
     if !queued {
         return Some(TriggerTake::LookAgain);
     }
-    // Queued but not waiting in the ledger: looking again would find it again.
-    (!chat
-        .bookkeeping
+    // Still queued while the ledger has it started: looking again would find it again.
+    chat.bookkeeping
         .lifecycle
-        .waits_to_start(pending.receipt.run_id))
-    .then_some(TriggerTake::Waits)
+        .is_started(pending.receipt.run_id)
+        .then_some(TriggerTake::Waits)
 }
 
 /// Queues a Run that continues the conversation without a message of its own.
