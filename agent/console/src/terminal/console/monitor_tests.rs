@@ -1,7 +1,8 @@
 use super::*;
 use crate::terminal::monitor::{MonitorEntry, TickGroup};
 use tickloop_agent_protocol::{
-    ChatSnapshot, ChatStatus, MonitorMember, MonitorMembership, TickSubscriptionStatus,
+    ChatSnapshot, ChatStatus, MonitorMember, MonitorMembership, ShellTaskState,
+    TickSubscriptionStatus,
 };
 
 fn remove_key() -> KeyEvent {
@@ -4102,4 +4103,335 @@ fn monitor_confirmation_names_the_subscriptions_it_will_cancel() {
             .ends_with("and cancel 2 subscriptions")
     );
     assert!(state.monitor.detail.is_none());
+}
+
+fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::MonitorSources {
+    let mut snapshot = chat_snapshot(chat);
+    let mut shells = tests::task_snapshot(chat, 0);
+    let mut subscriptions = Vec::new();
+    match content {
+        "goal" => {
+            snapshot.goal = Some(
+                serde_json::from_value(serde_json::json!({
+                    "id": Uuid::new_v4(), "objective": "Verify Monitor behavior",
+                    "objective_revision": 1, "set_by": "user", "status": {"state": "active"},
+                    "tokens_used": 0, "time_used_ms": 0, "quiet_turns": 0,
+                    "created_at_ms": 0, "updated_at_ms": 0
+                }))
+                .unwrap(),
+            );
+        }
+        "scheduled" => {
+            snapshot.scheduled_tasks = serde_json::from_value(serde_json::json!([{
+                "id": "0123abcd", "kind": {"type": "recurring", "cron": "* * * * *"},
+                "prompt": "check progress", "creator": "user", "time_zone": "Asia/Shanghai",
+                "created_at_ms": 0, "next_fire_at_ms": 60000, "scheduled_for_ms": 60000,
+                "jitter_ms": 0, "skipped": 0
+            }]))
+            .unwrap();
+        }
+        "hosted" | "terminal" => snapshot.monitor.members.push(MonitorMember {
+            instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
+            is_terminal: content == "terminal",
+            title: Some("New Tick".into()),
+        }),
+        "artifact" => snapshot
+            .artifact_ticks
+            .push(tickloop_agent_protocol::ArtifactTick {
+                artifact_id: "doc".into(),
+                origin: "https://docs.example".into(),
+                title: "New Artifact".into(),
+                format: "markdown".into(),
+                url: "https://docs.example/a/doc".into(),
+                access_role: "owner".into(),
+                added_at_ms: 1,
+            }),
+        "shell" => {
+            shells = tests::task_snapshot(chat, 1);
+            shells.tasks[0].state = ShellTaskState::Background;
+            shells.tasks[0].was_background = true;
+        }
+        "subscription" => subscriptions.push(tests::subscription_row(1)),
+        "empty" => {}
+        _ => panic!("unknown Monitor fixture: {content}"),
+    }
+    crate::terminal::monitor::MonitorSources {
+        chat: Arc::new(ChatStatus::of(&snapshot)),
+        shells,
+        subscriptions: Some(subscriptions),
+    }
+}
+
+#[test]
+fn first_new_monitor_content_reveals_once_without_taking_input_focus_even_when_hidden() {
+    use tickloop_agent_config::MonitorPreference;
+    for preference in [MonitorPreference::Auto, MonitorPreference::Hidden] {
+        for content in [
+            "goal",
+            "scheduled",
+            "hosted",
+            "terminal",
+            "artifact",
+            "shell",
+            "subscription",
+        ] {
+            let chat = Uuid::new_v4();
+            let console = Console::test_interactive_for_chat(chat);
+            console.set_monitor_preference(preference).unwrap();
+            console
+                .refresh_monitor(auto_reveal_sources(chat, "empty"))
+                .unwrap();
+            {
+                let mut state = console.state.lock().unwrap();
+                state.editor.replace_draft("keep typing".into(), 4);
+                assert!(!state.monitor_visible());
+            }
+            console
+                .refresh_monitor(auto_reveal_sources(chat, content))
+                .unwrap();
+            {
+                let mut state = console.state.lock().unwrap();
+                assert!(state.monitor_visible(), "{preference:?}: {content}");
+                assert!(!state.monitor.overlay);
+                assert!(!state.monitor.focused);
+                assert_eq!(state.monitor_preference, preference);
+                assert_eq!(state.editor.draft(), "keep typing");
+                assert_eq!(state.editor.cursor(), 4);
+                state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                assert_eq!(state.editor.draft(), "keepx typing");
+            }
+            console
+                .set_monitor_preference(MonitorPreference::Hidden)
+                .unwrap();
+            console
+                .refresh_monitor(auto_reveal_sources(chat, "empty"))
+                .unwrap();
+            console
+                .refresh_monitor(auto_reveal_sources(chat, "goal"))
+                .unwrap();
+            let state = console.state.lock().unwrap();
+            assert!(!state.monitor_visible(), "must stay hidden after {content}");
+            assert!(state.monitor.entry_flash_at_ms.is_none());
+        }
+    }
+}
+
+#[test]
+fn narrow_terminal_flashes_monitor_entry_once_without_overlay_or_focus_change() {
+    for preference in [
+        tickloop_agent_config::MonitorPreference::Auto,
+        tickloop_agent_config::MonitorPreference::Hidden,
+    ] {
+        let chat = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(chat);
+        console.state.lock().unwrap().width = 60;
+        console.set_monitor_preference(preference).unwrap();
+        console
+            .refresh_monitor(auto_reveal_sources(chat, "empty"))
+            .unwrap();
+        console
+            .refresh_monitor(auto_reveal_sources(chat, "goal"))
+            .unwrap();
+        let since = {
+            let mut state = console.state.lock().unwrap();
+            assert!(!state.monitor_visible());
+            assert!(!state.monitor.overlay);
+            assert!(!state.monitor.focused);
+            let since = state.monitor.entry_flash_at_ms.unwrap();
+            assert!(state.next_row_clock(since).is_some());
+            let (lines, _, _) = state.styled_frame();
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.text == "◉ Monitor 1" && span.role == Some(Role::Permission)
+            }));
+            state.monitor.entry_flash_at_ms = Some(since.saturating_sub(10_000));
+            let (lines, _, _) = state.styled_frame();
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.text == "◉ Monitor 1" && span.role == Some(Role::MutedText)
+            }));
+            state.monitor.entry_flash_at_ms = Some(since);
+            since
+        };
+        console
+            .refresh_monitor(auto_reveal_sources(chat, "scheduled"))
+            .unwrap();
+        let state = console.state.lock().unwrap();
+        assert_eq!(state.monitor.entry_flash_at_ms, Some(since));
+        assert!(!state.monitor_visible());
+        assert!(!state.monitor.overlay);
+    }
+}
+
+#[test]
+fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
+    for content in [
+        "goal",
+        "scheduled",
+        "hosted",
+        "terminal",
+        "artifact",
+        "shell",
+        "subscription",
+    ] {
+        let chat = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(chat);
+        console
+            .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+            .unwrap();
+        console
+            .refresh_monitor(auto_reveal_sources(chat, content))
+            .unwrap();
+        {
+            let state = console.state.lock().unwrap();
+            assert!(
+                !state.monitor_visible(),
+                "initial {content} must stay hidden"
+            );
+            assert!(state.monitor.entry_flash_at_ms.is_none());
+        }
+        let mut sources = auto_reveal_sources(chat, "scheduled");
+        sources.chat = console
+            .state
+            .lock()
+            .unwrap()
+            .monitor
+            .chat_status
+            .clone()
+            .unwrap();
+        Arc::make_mut(&mut sources.chat)
+            .monitor
+            .members
+            .push(MonitorMember {
+                instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
+                is_terminal: false,
+                title: Some("Later Tick".into()),
+            });
+        console.refresh_monitor(sources).unwrap();
+        assert!(
+            console.monitor_is_visible().unwrap(),
+            "new Tick after {content}"
+        );
+    }
+}
+
+#[test]
+fn monitor_reveal_budget_survives_chat_switches_and_is_independent_for_each_chat() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(first);
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    console
+        .refresh_monitor(auto_reveal_sources(first, "empty"))
+        .unwrap();
+    console
+        .refresh_monitor(auto_reveal_sources(first, "goal"))
+        .unwrap();
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    console.state.lock().unwrap().switch_view_chat(Some(second));
+    console
+        .refresh_monitor(auto_reveal_sources(second, "empty"))
+        .unwrap();
+    console
+        .refresh_monitor(auto_reveal_sources(second, "scheduled"))
+        .unwrap();
+    assert!(console.monitor_is_visible().unwrap());
+    console.state.lock().unwrap().switch_view_chat(Some(first));
+    console
+        .refresh_monitor(auto_reveal_sources(first, "hosted"))
+        .unwrap();
+    assert!(!console.monitor_is_visible().unwrap());
+}
+
+#[test]
+fn backgrounding_a_foreground_shell_reveals_monitor_on_tick_refresh() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    let mut sources = auto_reveal_sources(chat, "empty");
+    sources.shells = tests::task_snapshot(chat, 1);
+    console.refresh_monitor(sources).unwrap();
+    let mut shells = tests::task_snapshot(chat, 1);
+    shells.tasks[0].state = ShellTaskState::Background;
+    console.refresh_monitor_ticks(shells, None).unwrap();
+    let state = console.state.lock().unwrap();
+    assert!(state.monitor_visible());
+    assert!(!state.monitor.focused);
+    assert!(!state.monitor.overlay);
+}
+
+#[test]
+fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monitor() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    let mut sources = auto_reveal_sources(chat, "goal");
+    let row = tests::subscription_row(1);
+    Arc::make_mut(&mut sources.chat)
+        .monitor
+        .members
+        .push(MonitorMember {
+            instance: row.instance.clone(),
+            is_terminal: false,
+            title: None,
+        });
+    console.refresh_monitor(sources).unwrap();
+    console.update_subscribed_ticks(chat, &[row]).unwrap();
+    let mut status = console
+        .state
+        .lock()
+        .unwrap()
+        .monitor
+        .chat_status
+        .as_deref()
+        .unwrap()
+        .clone();
+    status.goal.as_mut().unwrap().tokens_used += 1;
+    console.update_monitor_chat(status).unwrap();
+    assert!(!console.monitor_is_visible().unwrap());
+}
+
+#[test]
+fn narrow_shell_refresh_draws_the_entry_flash_and_schedules_its_frames() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console.state.lock().unwrap().width = 60;
+    console
+        .refresh_monitor(auto_reveal_sources(chat, "empty"))
+        .unwrap();
+    let before = console.state.lock().unwrap().frames_drawn;
+    let shells = auto_reveal_sources(chat, "shell").shells;
+    console.refresh_monitor_ticks(shells, None).unwrap();
+    let state = console.state.lock().unwrap();
+    assert!(state.frames_drawn > before);
+    assert!(state.monitor.entry_flash_at_ms.is_some());
+    assert!(state.row_clock_at.is_some());
+    assert!(!state.monitor_visible());
+    assert!(!state.monitor.overlay);
+}
+
+#[test]
+fn initial_monitor_sources_arriving_separately_do_not_reveal_existing_content() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console
+        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .unwrap();
+    let sources = auto_reveal_sources(chat, "shell");
+    console.update_monitor_chat(sources.chat).unwrap();
+    console.refresh_monitor_ticks(sources.shells, None).unwrap();
+    console
+        .update_subscribed_ticks(chat, &[tests::subscription_row(1)])
+        .unwrap();
+    assert!(!console.monitor_is_visible().unwrap());
+    console
+        .update_monitor_chat(auto_reveal_sources(chat, "goal").chat)
+        .unwrap();
+    assert!(console.monitor_is_visible().unwrap());
 }

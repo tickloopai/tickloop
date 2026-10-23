@@ -1534,9 +1534,9 @@ impl Console {
     ) -> Result<(), String> {
         let status = status.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state
-            .monitor_for_chat_mut(status.id)
-            .set_chat_status(status);
+        let chat = status.id;
+        state.monitor_for_chat_mut(chat).set_chat_status(status);
+        state.auto_reveal_monitor(chat);
         Ok(())
     }
     /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
@@ -1550,7 +1550,8 @@ impl Console {
         state
             .monitor_for_chat_mut(chat)
             .refresh_ticks(shells, subscriptions);
-        if state.chat != Some(chat) || !state.monitor_visible() {
+        let revealed = state.auto_reveal_monitor(chat);
+        if state.chat != Some(chat) || !state.monitor_visible() && !revealed {
             return Ok(());
         }
         state
@@ -1563,9 +1564,9 @@ impl Console {
         sources: super::monitor::MonitorSources,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state
-            .monitor_for_chat_mut(sources.chat.id)
-            .refresh_sources(sources);
+        let chat = sources.chat.id;
+        state.monitor_for_chat_mut(chat).refresh_sources(sources);
+        state.auto_reveal_monitor(chat);
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -1675,6 +1676,7 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_for_chat_mut(chat).set_membership(membership);
+        state.auto_reveal_monitor(chat);
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -1687,8 +1689,9 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let monitor = state.monitor_for_chat_mut(chat);
-        monitor.subscriptions = rows.to_vec();
+        monitor.set_subscriptions(rows.to_vec());
         monitor.rebuild();
+        state.auto_reveal_monitor(chat);
         Ok(())
     }
     pub(super) fn forget_requested_subscription(
@@ -1813,6 +1816,10 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_preference = preference;
+        state.monitor.auto_shown = false;
+        for view in state.view_cache.values_mut() {
+            view.monitor.auto_shown = false;
+        }
         state.monitor.overlay = false;
         state.monitor.focused = false;
         state.rendered_region = None;
@@ -5605,6 +5612,9 @@ impl State {
         self.view_cache.insert(previous_chat, previous);
         let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
         self.monitor.settle_flashes(now_ms);
+        if let Some(chat) = chat {
+            self.auto_reveal_monitor(chat);
+        }
         self.scrollback.settle_flashes(now_ms);
         self.hide_diff_screen();
         if let Some((dialog, suspended)) = self.dialog_cache.remove(&chat) {
@@ -6692,6 +6702,7 @@ impl State {
     fn monitor_overlay(&self) -> bool {
         self.monitor_side_columns().is_none()
             || self.monitor_preference == tickloop_agent_config::MonitorPreference::Hidden
+                && !self.monitor.auto_shown
     }
 
     fn monitor_visible(&self) -> bool {
@@ -6712,7 +6723,22 @@ impl State {
             && !self.full_review
             && (self.monitor.overlay
                 || self.monitor_side_columns().is_some()
-                    && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
+                    && (self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto
+                        || self.monitor.auto_shown))
+    }
+
+    fn auto_reveal_monitor(&mut self, chat: Uuid) -> bool {
+        if self.chat != Some(chat) || !self.monitor.take_auto_reveal() || self.monitor_visible() {
+            return false;
+        }
+        if self.monitor_side_columns().is_none() {
+            self.monitor.entry_flash_at_ms =
+                Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
+        } else {
+            self.monitor.auto_shown = true;
+        }
+        self.rendered_region = None;
+        true
     }
 
     /// The columns and rows the open Monitor detail draws in: Monitor's column above the input
@@ -6807,6 +6833,11 @@ impl State {
             .chain(panel)
             .chain(conversation)
             .chain(update)
+            .chain(
+                self.monitor
+                    .entry_flash_at_ms
+                    .and_then(|since| self.display.next_flash_change_ms(since, now_ms)),
+            )
             .min()
     }
 
@@ -8103,23 +8134,21 @@ impl State {
                     .background_status_notice
                     .as_ref()
                     .is_some_and(|notice| notice.necessary);
-        let goal_status = self.monitor.chat_status.as_ref().and_then(|chat| {
-            let goal = self.monitor.goal();
-            super::goal_view::status_line(
-                goal.as_ref(),
+        let receiving_status = self.monitor.chat_status.as_ref().and_then(|chat| {
+            super::goal_view::receiving_status_line(
                 !chat.chat_loop.receiving.is_receiving(),
                 self.width,
             )
         });
         let core_status = self.status_area.status_line_with_indicator(
-            if goal_status.is_some() {
+            if receiving_status.is_some() {
                 self.width
             } else {
                 usize::MAX
             },
             "",
             None,
-            goal_status.clone(),
+            receiving_status.clone(),
         );
         let float_core_status = !short
             && !overview
@@ -8434,11 +8463,20 @@ impl State {
                     line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                     line.push(
                         label,
-                        Some(if self.monitor_visible() {
-                            Role::Permission
-                        } else {
-                            Role::MutedText
-                        }),
+                        Some(
+                            if self.monitor_visible()
+                                || self.monitor.entry_flash_at_ms.is_some_and(|since| {
+                                    self.display.flash_strong(
+                                        since,
+                                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                                    ) == Some(true)
+                                })
+                            {
+                                Role::Permission
+                            } else {
+                                Role::MutedText
+                            },
+                        ),
                     );
                     if monitor_edge_width > 0 {
                         line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
@@ -8603,7 +8641,7 @@ impl State {
                     self.width,
                     &notice,
                     background,
-                    goal_status,
+                    receiving_status,
                 )
             } else {
                 let showing_update_notice = notice.is_empty()
