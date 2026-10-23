@@ -9048,7 +9048,10 @@ mod tests {
             );
             assert!(!help_text().contains(command), "{command}");
         }
-        assert!(help_text().contains("Monitor lists this Chat's background Shells"));
+        assert!(help_text().contains(
+            "Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks"
+        ));
+        assert!(help_text().contains("opens Monitor once without moving input focus"));
     }
 
     #[test]

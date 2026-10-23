@@ -336,7 +336,10 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             .iter()
             .position(|line| line.text() == "Scheduled (1)")
             .unwrap();
-        assert_eq!(frame.lines[scheduled_heading - 1].text(), *footer);
+        assert!(frame.lines[scheduled_heading - 1].text().is_empty());
+        if !footer.is_empty() {
+            assert_eq!(frame.lines[scheduled_heading - 2].text(), *footer);
+        }
         let row = frame
             .lines
             .iter()
@@ -3609,7 +3612,6 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
     for (text, title) in [
         ("◷", "1m"),
         ("提醒我看天气", "提醒我看天气"),
-        ("Pursuing goal", "Pursuing goal"),
         ("记录验收证据", "记录验收证据"),
     ] {
         let line = find(text);
@@ -3619,7 +3621,8 @@ fn monitor_keeps_tick_columns_and_left_aligns_scheduled_and_goal_icons() {
             "{line}"
         );
     }
-    assert!(find("Pursuing goal").starts_with("◎ "));
+    assert!(find("Pursuing goal").starts_with("Pursuing goal"));
+    assert!(find("记录验收证据").starts_with("◎ "));
     assert!(screen.iter().any(|line| line == "Scheduled (1)"));
     assert!(find("Pursuing goal").ends_with("1m"));
 }
@@ -3716,12 +3719,8 @@ fn scheduled_and_goal_stay_docked_while_ticks_page_and_shrink_at_narrow_heights(
     for height in [4, 5, 6, 7, 8, 10, 12, 16] {
         let frame = state.monitor.frame(30, height, state.display, 0);
         assert_eq!(frame.lines.len(), height);
-        assert!(
-            frame.lines[height - 2]
-                .text()
-                .starts_with("◎ Pursuing goal")
-        );
-        assert!(frame.lines[height - 1].text().starts_with("  Finish"));
+        assert!(frame.lines[height - 2].text().starts_with("Pursuing goal"));
+        assert!(frame.lines[height - 1].text().starts_with("◎ Finish"));
         assert!(frame.lines.iter().any(|line| line.text().starts_with("◷ ")));
         assert!(
             frame
@@ -4434,4 +4433,115 @@ fn initial_monitor_sources_arriving_separately_do_not_reveal_existing_content() 
         .update_monitor_chat(auto_reveal_sources(chat, "goal").chat)
         .unwrap();
     assert!(console.monitor_is_visible().unwrap());
+}
+
+#[test]
+fn monitor_section_spacing_keeps_ticks_scheduled_and_goal_as_peers() {
+    let state = docked_monitor_fixture(1, 30);
+    let frame = state.monitor.frame(48, 15, state.display, 0);
+    let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+    let scheduled = lines
+        .iter()
+        .position(|line| line == "Scheduled (1)")
+        .unwrap();
+    let goal = lines
+        .iter()
+        .position(|line| line.contains("Pursuing goal"))
+        .unwrap();
+    assert!(lines[scheduled - 1].trim().is_empty(), "{lines:#?}");
+    assert!(!lines[scheduled - 2].trim().is_empty(), "{lines:#?}");
+    assert!(lines[goal - 1].trim().is_empty(), "{lines:#?}");
+    assert!(!lines[goal - 2].trim().is_empty(), "{lines:#?}");
+    assert!(lines[goal].starts_with("Pursuing goal"));
+    assert!(lines[goal + 1].starts_with("◎ Finish"));
+}
+
+#[test]
+fn monitor_separator_continues_through_queued_input_to_input_divider() {
+    let mut state = docked_monitor_fixture(1, 1);
+    state.monitor.focused = false;
+    state.activity_interruptible = true;
+    state
+        .scrollback
+        .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
+    state.queued_inputs = vec![tickloop_agent_protocol::QueuedInput {
+        id: Uuid::new_v4(),
+        chat_id: state.chat.unwrap(),
+        loop_id: Some(Uuid::new_v4()),
+        kind: tickloop_agent_protocol::QueuedInputKind::Message,
+        text: "/loop 每分钟看看 qqq.us 的股价是多少".into(),
+        contexts: Vec::new(),
+        queued_sequence: 1,
+        armed: true,
+    }];
+    let mut output = Vec::new();
+    state.draw_frame(&mut output).unwrap();
+    let terminal = tickloop_agent_test_support::screen::visible_screen(
+        &String::from_utf8_lossy(&output),
+        state.width,
+        state.height,
+    );
+    let queue = state
+        .rendered_screen
+        .iter()
+        .position(|line| line.contains("/loop 每分钟"))
+        .unwrap();
+    let divider = state
+        .rendered_screen
+        .iter()
+        .enumerate()
+        .skip(queue)
+        .find(|(_, line)| line.starts_with('─'))
+        .unwrap()
+        .0;
+    let separator = state.width - state.monitor_columns();
+    assert!(terminal.contains("ctrl+enter to send now"), "{terminal}");
+    let terminal_rows = terminal.lines().collect::<Vec<_>>();
+    for row in &terminal_rows[queue..divider] {
+        assert_eq!(
+            row.chars().find(|character| *character == '│'),
+            Some('│'),
+            "{row}"
+        );
+        let at = row.find('│').unwrap();
+        assert_eq!(display_width(&row[..at]), separator, "{row}");
+    }
+}
+
+#[test]
+fn monitor_removes_section_gaps_before_compressing_scheduled_content() {
+    let state = docked_monitor_fixture(3, 30);
+    for height in [13, 14, 15] {
+        let frame = state.monitor.frame(48, height, state.display, 0);
+        let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+        assert_eq!(lines.len(), height);
+        for index in 1..=3 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("Scheduled instruction {index}"))),
+                "height {height}: {lines:#?}"
+            );
+        }
+        let goal = lines
+            .iter()
+            .position(|line| line.starts_with("Pursuing goal"))
+            .unwrap();
+        if height == 13 {
+            assert!(!lines[goal - 1].trim().is_empty());
+        }
+        if height == 15 {
+            assert!(lines[goal - 1].trim().is_empty());
+        }
+    }
+}
+
+#[test]
+fn goal_only_monitor_has_no_extra_section_separator() {
+    let mut state = docked_monitor_fixture(0, 0);
+    state.monitor.focused = false;
+    let frame = state.monitor.frame(48, 2, state.display, 0);
+    assert_eq!(frame.lines.len(), 2);
+    assert!(frame.lines[0].text().starts_with("Pursuing goal"));
+    assert!(frame.lines[1].text().starts_with("◎ Finish"));
 }

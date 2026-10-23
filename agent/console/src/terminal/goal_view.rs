@@ -109,17 +109,13 @@ impl<'a> GoalView<'a> {
             display.glyph(Glyph::Goal)
         };
         let indent = list_row::compact_name_column(glyph).min(width);
-        let time = ellipsize(&format_elapsed(self.elapsed_ms), width - indent);
+        let time = ellipsize(&format_elapsed(self.elapsed_ms), width);
         let title = ellipsize(
             self.state.title(),
-            width.saturating_sub(indent + unicode_width::UnicodeWidthStr::width(time.as_str()) + 1),
+            width.saturating_sub(unicode_width::UnicodeWidthStr::width(time.as_str()) + 1),
         );
-        let mut header = RoleLine::role(glyph, self.state.role());
-        if width > unicode_width::UnicodeWidthStr::width(glyph) {
-            header.push(" ", Some(self.state.role()));
-        }
+        let mut header = RoleLine::role(title, self.state.role());
         header.preserve_selection_colours = true;
-        header.push(title, Some(self.state.role()));
         header.push(
             " ".repeat(width.saturating_sub(
                 unicode_width::UnicodeWidthStr::width(header.text().as_str())
@@ -128,7 +124,11 @@ impl<'a> GoalView<'a> {
             None,
         );
         header.push(time, Some(Role::MutedText));
-        let mut condition = RoleLine::role(" ".repeat(indent), Role::MutedText);
+        let mut condition = RoleLine::role(glyph, self.state.role());
+        condition.preserve_selection_colours = true;
+        if width > unicode_width::UnicodeWidthStr::width(glyph) {
+            condition.push(" ", Some(self.state.role()));
+        }
         condition.push(
             ellipsize(&super::safe_line(self.condition), width - indent),
             Some(if selected {
@@ -148,7 +148,7 @@ impl<'a> GoalView<'a> {
                 if selected {
                     line.filled(Role::Selection)
                 } else if let Some(fill) = fill {
-                    line.filled_from(fill, indent)
+                    line.filled(fill)
                 } else {
                     line
                 }

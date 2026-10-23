@@ -3413,10 +3413,12 @@ impl Console {
         &self,
         call_key: &str,
         runs: &[(String, Option<Role>)],
+        clip_summary: bool,
     ) -> Result<(), String> {
         self.write_pieces(&[ConversationPiece::ToolResult {
             call_key: call_key.to_owned(),
             runs: runs.to_vec(),
+            clip_summary,
         }])
     }
 
@@ -3499,16 +3501,15 @@ impl Console {
     }
 
     /// Ends one call or the remaining calls of the originating Run.
-    /// Marks one call of `run_id` finished, and whether it failed, or every unfinished call of
-    /// the run when the run ended.
+    /// Records one call's final display state, or finishes the run's remaining calls.
     pub(super) fn finish_tool_call(
         &self,
         run_id: Uuid,
-        call: Option<(&str, bool)>,
+        call: Option<(&str, ToolCallState)>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         match call {
-            Some((call_id, failed)) => state.scrollback.finish_tool_call(run_id, call_id, failed),
+            Some((call_id, outcome)) => state.scrollback.finish_tool_call(run_id, call_id, outcome),
             None => state.scrollback.finish_tool_calls(run_id),
         }
         Ok(())
@@ -5141,6 +5142,7 @@ pub(super) enum ConversationPiece {
     ToolResult {
         call_key: String,
         runs: Vec<(String, Option<Role>)>,
+        clip_summary: bool,
     },
 }
 
@@ -5185,7 +5187,11 @@ impl ConversationPiece {
                 collapse,
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone()),
-            Self::ToolResult { call_key, runs } => scrollback.append_tool_result(call_key, runs),
+            Self::ToolResult {
+                call_key,
+                runs,
+                clip_summary,
+            } => scrollback.append_tool_result(call_key, runs, *clip_summary),
             Self::Response(runs) => scrollback.append_response(runs),
             Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
@@ -6744,10 +6750,15 @@ impl State {
     /// The columns and rows the open Monitor detail draws in: Monitor's column above the input
     /// area.
     fn detail_area(&mut self) -> (usize, usize) {
-        (
-            self.monitor_columns().saturating_sub(2),
-            self.height.saturating_sub(self.styled_frame().0.len()),
-        )
+        let body_rows = self.height.saturating_sub(self.styled_frame().0.len());
+        let height = if self.monitor.overlay {
+            body_rows
+        } else {
+            self.monitor_toggle_target
+                .as_ref()
+                .map_or(body_rows, |target| target.row)
+        };
+        (self.monitor_columns().saturating_sub(2), height)
     }
 
     #[cfg(test)]
@@ -6981,12 +6992,20 @@ impl State {
             }
         };
         let side_columns = self.monitor_columns();
+        let monitor_end = if self.monitor_visible() && !self.monitor.overlay {
+            self.monitor_toggle_target
+                .as_ref()
+                .map_or(start, |target| target.row)
+        } else {
+            start
+        };
+        let prelude_rows = monitor_end.saturating_sub(start);
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
                 return detail
                     .lines(
                         side_columns.saturating_sub(2),
-                        start,
+                        monitor_end,
                         tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     )
                     .into_iter()
@@ -6995,7 +7014,7 @@ impl State {
             }
             let frame = self.monitor.frame(
                 side_columns.saturating_sub(2),
-                start,
+                monitor_end,
                 self.display,
                 tickloop_agent_base::private_fs::unix_time_milliseconds(),
             );
@@ -7015,7 +7034,8 @@ impl State {
             frame.lines
         });
         if monitor_lines.is_some() && !self.monitor.overlay {
-            self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
+            self.monitor_separator =
+                Some((self.width.saturating_sub(side_columns), 0..monitor_end));
         }
         // The viewport maps screen rows onto content rows one to one, so it ends at the gap; a
         // row below the gap is selected as part of the screen.
@@ -7034,7 +7054,7 @@ impl State {
             },
             first_row: body.top,
         });
-        let rows: Vec<String> = (0..start)
+        let rows: Vec<String> = (0..monitor_end)
             .map(|row| {
                 let pinned = if row == 0 {
                     sticky_prompt.as_ref()
@@ -7053,8 +7073,11 @@ impl State {
                     .unwrap_or_default();
                 if let Some(monitor_lines) = &monitor_lines {
                     let left_columns = self.width.saturating_sub(side_columns);
-                    let mut left = pinned
+                    let mut left = row
+                        .checked_sub(start)
+                        .and_then(|index| lines.get(index))
                         .cloned()
+                        .or_else(|| pinned.cloned())
                         .or_else(|| line_index.and_then(|index| body.styled.get(index)).cloned())
                         .unwrap_or_else(|| RoleLine::plain(line));
                     left.truncate(left_columns);
@@ -7081,13 +7104,19 @@ impl State {
                     self.with_selection(row, resolved).render(self.colour_depth)
                 }
             })
-            .chain(lines.iter().enumerate().map(|(index, line)| {
-                self.with_selection(
-                    start + index,
-                    line.resolve(self.display.theme(), self.width),
-                )
-                .render(self.colour_depth)
-            }))
+            .chain(
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(prelude_rows)
+                    .map(|(index, line)| {
+                        self.with_selection(
+                            start + index,
+                            line.resolve(self.display.theme(), self.width),
+                        )
+                        .render(self.colour_depth)
+                    }),
+            )
             .collect();
         let scroll_rows = if sticky_prompt.is_none() && !self.monitor_visible() {
             start
@@ -7100,9 +7129,11 @@ impl State {
             rows,
             scroll_rows,
         )?;
-        self.rendered_screen = (0..start)
+        self.rendered_screen = (0..monitor_end)
             .map(|row| {
-                let line = if row == 0
+                let line = if row >= start {
+                    lines[row - start].text()
+                } else if row == 0
                     && let Some(prompt) = &sticky_prompt
                 {
                     prompt.text()
@@ -7127,7 +7158,7 @@ impl State {
                     line
                 }
             })
-            .chain(lines.iter().map(RoleLine::text))
+            .chain(lines.iter().skip(prelude_rows).map(RoleLine::text))
             .collect();
         queue!(
             output,

@@ -773,7 +773,7 @@ fn goal_ui_pty_records_monitor_menu_and_escape() {
             std::thread::sleep(Duration::from_millis(150));
             writer.write_all(b"/goal pause\r").unwrap();
             writer.flush().unwrap();
-            let frame = wait("◎ Goal paused")?;
+            let frame = wait("Goal paused")?;
             assert!(!frame.contains("Goal paused (/goal resume)"), "{frame}");
             println!("GOAL_PTY_{renderer}_PAUSED\n{frame}");
             Ok(())
@@ -808,8 +808,8 @@ fn goal_monitor_render_evidence() {
             "",
             "",
             "",
-            "◎ Pursuing goal                               1m",
-            "  Verify the release and record acceptance evid…"
+            "Pursuing goal                                 1m",
+            "◎ Verify the release and record acceptance evid…"
         ]
     );
     assert!(

@@ -1355,6 +1355,12 @@ fn append_public_message(
                     Some(run) => history.pieces.push(ConversationPiece::ToolResult {
                         call_key: presentation::tool_call_key(run, tool_use_id),
                         runs,
+                        clip_summary: presentation::goal_completion_rejection_reason(
+                            name,
+                            &result.content,
+                            result.is_error,
+                        )
+                        .is_some(),
                     }),
                     None => history.push_response(runs),
                 }

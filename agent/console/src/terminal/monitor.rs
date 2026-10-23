@@ -26,6 +26,7 @@ const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 const MAX_PINNED_TASKS: usize = 3;
 const TASK_ROWS: usize = 2;
 const GOAL_ROWS: usize = 2;
+const MINIMUM_TICK_SECTION_ROWS: usize = 3;
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 
 /// Monitor's column beside a content area `width` columns wide: the user's preferred width or
@@ -1214,19 +1215,43 @@ impl Monitor {
             })
             .unwrap_or_default();
         goal_lines.truncate(height.min(GOAL_ROWS));
+        let has_ticks = !self.entries.is_empty();
+        let has_tasks = !self.tasks().is_empty();
+        let has_goal = !goal_lines.is_empty();
+        let gap_count =
+            usize::from(has_ticks && (has_tasks || has_goal)) + usize::from(has_tasks && has_goal);
+        let full_dock_rows = goal_lines.len()
+            + self.preview_count() * TASK_ROWS
+            + usize::from(has_tasks)
+            + usize::from(self.tasks().len() > MAX_PINNED_TASKS);
+        let spacing_budget = height
+            .saturating_sub(
+                full_dock_rows
+                    + 1
+                    + if has_ticks {
+                        MINIMUM_TICK_SECTION_ROWS
+                    } else {
+                        0
+                    },
+            )
+            .min(gap_count);
+        let goal_gap = has_tasks && has_goal && spacing_budget > 0;
+        let tick_gap =
+            has_ticks && (has_tasks || has_goal) && spacing_budget > usize::from(goal_gap);
+        let content_height = height - usize::from(goal_gap) - usize::from(tick_gap);
         let minimum_tasks = if self.tasks().is_empty() {
             0
         } else {
-            TASK_ROWS.min(height.saturating_sub(goal_lines.len()))
+            TASK_ROWS.min(content_height.saturating_sub(goal_lines.len()))
         };
-        let mut extra = height.saturating_sub(goal_lines.len() + minimum_tasks);
+        let mut extra = content_height.saturating_sub(goal_lines.len() + minimum_tasks);
         let scheduled_heading = !self.tasks().is_empty() && extra > 0;
         extra = extra.saturating_sub(usize::from(scheduled_heading));
         let more = self.tasks().len() > MAX_PINNED_TASKS && extra > 0;
         extra = extra.saturating_sub(usize::from(more));
         let show_heading = extra > 0;
         extra = extra.saturating_sub(usize::from(show_heading));
-        let show_footer = extra > 0;
+        let show_footer = extra > 0 && !self.selected_status().is_empty();
         let mut lines = if show_heading {
             vec![RoleLine::role(
                 heading,
@@ -1239,8 +1264,8 @@ impl Monitor {
         } else {
             Vec::new()
         };
-        let fixed_budget =
-            height.saturating_sub(lines.len() + goal_lines.len() + usize::from(show_footer));
+        let fixed_budget = content_height
+            .saturating_sub(lines.len() + goal_lines.len() + usize::from(show_footer));
         let task_budget =
             fixed_budget.saturating_sub(usize::from(scheduled_heading) + usize::from(more));
         let visible_tasks = if minimum_tasks > 0 {
@@ -1339,6 +1364,9 @@ impl Monitor {
         if show_footer {
             lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
         }
+        if tick_gap {
+            lines.push(RoleLine::default());
+        }
         let scheduled_end = lines.len() + scheduled_rows;
         if scheduled_heading {
             lines.push(RoleLine::role(
@@ -1383,6 +1411,9 @@ impl Monitor {
             lines.push(line);
         }
         lines.truncate(scheduled_end);
+        if goal_gap {
+            lines.push(RoleLine::default());
+        }
         lines.extend(goal_lines);
         lines.truncate(height);
         for line in &mut lines {

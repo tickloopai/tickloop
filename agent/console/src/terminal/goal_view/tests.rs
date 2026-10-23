@@ -33,11 +33,7 @@ fn monitor_uses_state_titles_and_colours_for_every_goal_state() {
             ..example_goal()
         };
         let monitor = goal.monitor_lines(100, false, DisplayProfile::default(), false, 0);
-        assert!(
-            monitor[0]
-                .text()
-                .starts_with(&format!("◎ {}", state.title()))
-        );
+        assert!(monitor[0].text().starts_with(state.title()));
         assert!(
             monitor[0]
                 .spans
@@ -65,7 +61,7 @@ fn monitor_has_state_title_right_aligned_time_and_one_condition_line() {
         ..example_goal()
     };
     let lines = goal.monitor_lines(12, false, DisplayProfile::default(), false, 0);
-    assert_eq!(text(&lines), ["◎ Pursui… 1m", "  第一行条…"]);
+    assert_eq!(text(&lines), ["Pursuing… 1m", "◎ 第一行条…"]);
     assert!(lines.iter().all(|line| line.text().width() <= 12));
     assert!(
         lines
@@ -76,7 +72,7 @@ fn monitor_has_state_title_right_aligned_time_and_one_condition_line() {
     assert_eq!(short.len(), 2);
     assert_eq!(short[0].text().width(), 60);
     assert!(short[0].text().ends_with("1m"));
-    assert_eq!(short[1].text(), "  Ship the verified release");
+    assert_eq!(short[1].text(), "◎ Ship the verified release");
     assert!(
         short
             .iter()
@@ -88,10 +84,10 @@ fn monitor_has_state_title_right_aligned_time_and_one_condition_line() {
 fn monitor_summary_truncation_preserves_whole_graphemes() {
     for grapheme in ["👩‍💻", "👍🏽", "🇨🇳"] {
         for (condition, width, expected) in [
-            (format!("{grapheme}abc"), 5, format!("  {grapheme}…")),
-            (format!("{grapheme}abcde"), 4, "  …".into()),
-            (grapheme.to_owned(), 4, format!("  {grapheme}")),
-            (format!("abc\ndef\n{grapheme}xy"), 6, "  abc…".into()),
+            (format!("{grapheme}abc"), 5, format!("◎ {grapheme}…")),
+            (format!("{grapheme}abcde"), 4, "◎ …".into()),
+            (grapheme.to_owned(), 4, format!("◎ {grapheme}")),
+            (format!("abc\ndef\n{grapheme}xy"), 6, "◎ abc…".into()),
         ] {
             let goal = GoalView {
                 condition: &condition,
@@ -121,8 +117,7 @@ fn monitor_selection_wins_over_flash_and_keeps_text_indent() {
                     Role::TakeInFlashStrong
                 })));
             assert!(lines.iter().all(|line| line.text().width() <= width));
-            assert!(lines[0].text().starts_with('◎'));
-            assert!(lines[1].text().starts_with(&" ".repeat(width.min(2))));
+            assert!(lines[1].text().starts_with('◎'));
         }
     }
 }
@@ -330,13 +325,22 @@ fn selected_monitor_title_keeps_state_colour_on_the_selection_background() {
 fn goal_glyph_has_an_ascii_fallback_with_matching_indentation_and_state_colour() {
     for ascii in [false, true] {
         let lines = example_goal().monitor_lines(48, false, DisplayProfile::default(), ascii, 0);
-        assert!(lines[0].text().starts_with(if ascii {
-            "o Pursuing goal"
-        } else {
-            "◎ Pursuing goal"
-        }));
+        assert!(lines[0].text().starts_with("Pursuing goal"));
+        assert!(
+            lines[1]
+                .text()
+                .starts_with(if ascii { "o Ship" } else { "◎ Ship" })
+        );
         assert_eq!(lines[0].spans[0].role, Some(Role::Accent));
-        assert!(lines[1].text().starts_with("  Ship"));
+        assert_eq!(lines[1].spans[0].role, Some(Role::Accent));
         assert_eq!(lines[0].text().width(), 48);
     }
+}
+
+#[test]
+fn goal_section_has_status_header_and_icon_on_condition_row() {
+    let lines = example_goal().monitor_lines(40, false, DisplayProfile::default(), false, 0);
+    assert!(lines[0].text().starts_with("Pursuing goal"));
+    assert!(lines[0].text().ends_with("1m"));
+    assert_eq!(lines[1].text(), "◎ Ship the verified release");
 }

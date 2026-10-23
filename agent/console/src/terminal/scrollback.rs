@@ -113,6 +113,7 @@ pub(super) enum ToolCallState {
     Finished,
     /// Finished with an error result, including a call the user declined.
     Failed,
+    Warning,
     Stopped,
 }
 
@@ -121,23 +122,24 @@ impl ToolCallState {
         match self {
             Self::Queued => Self::Stopped,
             Self::Running => Self::Finished,
-            Self::Finished | Self::Failed | Self::Stopped => self,
+            Self::Finished | Self::Failed | Self::Warning | Self::Stopped => self,
         }
     }
     pub(super) fn suffix(self) -> &'static str {
         match self {
             Self::Queued => " · Queued",
             Self::Stopped => " · Stopped",
-            Self::Running | Self::Finished | Self::Failed => "",
+            Self::Running | Self::Finished | Self::Failed | Self::Warning => "",
         }
     }
     /// The colour of the call's `⏺`, as Claude Code's `ToolUseLoader` paints it: muted until a
-    /// result arrives, then the success or the error colour.
-    fn dot_role(self) -> Role {
+    /// result arrives, then the success, warning or error colour.
+    pub(super) fn dot_role(self) -> Role {
         match self {
             Self::Queued | Self::Running | Self::Stopped => Role::MutedText,
             Self::Finished => Role::Success,
             Self::Failed => Role::Error,
+            Self::Warning => Role::Warning,
         }
     }
 }
@@ -642,9 +644,17 @@ impl Scrollback {
     /// Draws a call's result under the call's own row and the result rows it already has, so
     /// parallel calls each keep their results. A result of a collapsed read or search shows only
     /// in the detailed transcript; one whose call is not shown goes to the end.
-    pub(super) fn append_tool_result(&mut self, call_id: &str, runs: &[(String, Option<Role>)]) {
+    pub(super) fn append_tool_result(
+        &mut self,
+        call_id: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+    ) {
         let Some(header) = self.tool_call_headers.get(call_id) else {
             self.append_response(runs);
+            if clip_summary {
+                self.clip_last_response_line();
+            }
             return;
         };
         if header.collapse.is_some() {
@@ -653,11 +663,20 @@ impl Scrollback {
         let at = header.results_end;
         let mut result = Scrollback::new();
         result.append_response(runs);
+        if clip_summary {
+            result.clip_last_response_line();
+        }
         if result.lines.last().is_some_and(String::is_empty) && result.lines.len() > 1 {
             result.lines.pop();
             result.line_styles.pop();
         }
         self.insert_lines(at, result.lines, result.line_styles);
+    }
+
+    fn clip_last_response_line(&mut self) {
+        if let Some(index) = self.lines.iter().rposition(|line| !line.is_empty()) {
+            self.line_styles[index].clipped = Some(Role::MutedText);
+        }
     }
 
     /// Inserts logical lines before line `at`, moving every recorded line position behind it.
@@ -1045,18 +1064,13 @@ impl Scrollback {
         self.dirty_from = Some(self.dirty_from.map_or(line, |existing| existing.min(line)));
     }
 
-    pub(super) fn finish_tool_call(&mut self, run_id: Uuid, call_id: &str, failed: bool) {
+    pub(super) fn finish_tool_call(&mut self, run_id: Uuid, call_id: &str, state: ToolCallState) {
         if let Some(header) = self
             .tool_call_headers
             .get(call_id)
             .filter(|header| header.run_id == run_id)
         {
             let spans = header.spans.clone();
-            let state = if failed {
-                ToolCallState::Failed
-            } else {
-                ToolCallState::Finished
-            };
             self.set_tool_call(run_id, call_id, &spans, state, None);
         }
     }
@@ -2541,7 +2555,7 @@ mod tests {
             None,
         );
         scrollback.set_model_retry(run, kind, 1, &[("old attempt".into(), None)]);
-        scrollback.append_tool_result("call", &[("Tool result\n".into(), None)]);
+        scrollback.append_tool_result("call", &[("Tool result\n".into(), None)], false);
         scrollback.set_model_retry(run, kind, 2, &[("latest attempt".into(), None)]);
         let text = scrollback.frame(80, 20).lines.join("\n");
         assert!(text.contains("Tool result"), "{text}");
@@ -2607,7 +2621,7 @@ mod tests {
         );
         assert_eq!(running.styled[3].spans[0].role, Some(Role::MutedText));
 
-        scrollback.finish_tool_call(Uuid::from_u128(1), "call", false);
+        scrollback.finish_tool_call(Uuid::from_u128(1), "call", ToolCallState::Finished);
         assert_eq!(
             scrollback.frame(20, 5).styled[2]
                 .spans
@@ -2858,7 +2872,7 @@ mod tests {
         scrollback.append_markdown("A reply.", "⏺ ", true);
         // A call right after a reply, which still ends on its Markdown line.
         scrollback.set_tool_call(run, "a", &call_spans("Bash"), ToolCallState::Running, None);
-        scrollback.append_tool_result("a", &result("done"));
+        scrollback.append_tool_result("a", &result("done"), false);
         // Writers that open with several newlines still leave one blank row.
         scrollback.append("\n\n\n");
         scrollback.append_completion_notice(&[("⏺ Done".into(), None), ("\n".into(), None)]);
@@ -2935,11 +2949,11 @@ mod tests {
             ToolCallState::Running,
             None,
         );
-        scrollback.append_tool_result("b", &result("second result"));
-        scrollback.append_tool_result("a", &result("first result"));
-        scrollback.append_tool_result("a", &result("first again"));
-        scrollback.finish_tool_call(run, "a", false);
-        scrollback.finish_tool_call(run, "b", false);
+        scrollback.append_tool_result("b", &result("second result"), false);
+        scrollback.append_tool_result("a", &result("first result"), false);
+        scrollback.append_tool_result("a", &result("first again"), false);
+        scrollback.finish_tool_call(run, "a", ToolCallState::Finished);
+        scrollback.finish_tool_call(run, "b", ToolCallState::Finished);
         scrollback.append_markdown("After both.", "⏺ ", true);
         assert_eq!(
             scrollback.frame(40, 20).lines,
@@ -2980,15 +2994,15 @@ mod tests {
                 ""
             ]
         );
-        scrollback.append_tool_result("a", &result("file content"));
-        scrollback.finish_tool_call(run, "a", false);
-        scrollback.finish_tool_call(run, "b", false);
+        scrollback.append_tool_result("a", &result("file content"), false);
+        scrollback.finish_tool_call(run, "a", ToolCallState::Finished);
+        scrollback.finish_tool_call(run, "b", ToolCallState::Finished);
         // A thinking label passes the group; the same file read again counts once.
         scrollback.append_aside("∴ Thinking\n", None);
         scrollback.set_tool_call(run, "c", &read_spans, ToolCallState::Running, read("a.txt"));
         scrollback.set_tool_call(run, "d", &read_spans, ToolCallState::Running, read("b.txt"));
-        scrollback.finish_tool_call(run, "c", false);
-        scrollback.finish_tool_call(run, "d", true);
+        scrollback.finish_tool_call(run, "c", ToolCallState::Finished);
+        scrollback.finish_tool_call(run, "d", ToolCallState::Failed);
         scrollback.append_markdown("Text ends the group.", "⏺ ", true);
         scrollback.set_tool_call(
             run,
@@ -3018,7 +3032,7 @@ mod tests {
         let run = Uuid::from_u128(1);
         let mut scrollback = Scrollback::new();
         scrollback.set_tool_call(run, "a", &call_spans("Bash"), ToolCallState::Running, None);
-        scrollback.append_tool_result("a", &result("alpha beta gamma delta epsilon"));
+        scrollback.append_tool_result("a", &result("alpha beta gamma delta epsilon"), false);
         scrollback.start_block();
         scrollback.append_hanging("! ", None, Some(Role::ShellMessageBg), None, 2);
         scrollback.append_hanging(
