@@ -3895,7 +3895,16 @@ impl Agent {
         .await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let admission = self.select_next_run(chat, Some(pending))?;
+        let admission = match self.select_next_run(chat, Some(pending)) {
+            Ok(admission) => admission,
+            Err(error) => {
+                // A selection that fails changes nothing of the Chat: the input never started,
+                // and waits again.
+                chat.bookkeeping.lifecycle.take_start_back(pending);
+                self.save(&chat.snapshot);
+                return Err(error);
+            }
+        };
         if !matches!(&admission, RunAdmission::Ready(receipt, ..) if receipt.run_id == pending.receipt.run_id)
         {
             // Something else came first: the start is taken back, and the input waits again.

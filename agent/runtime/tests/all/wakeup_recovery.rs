@@ -1713,6 +1713,45 @@ async fn a_take_finding_its_input_started_by_another_leaves_it_alone() {
     restarted.shutdown().await;
 }
 
+/// Trigger input whose start is recorded and whose run then cannot begin, its working
+/// directory gone, waits again: once the directory is back it runs, in the same process.
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_input_whose_run_cannot_begin_waits_again() {
+    const MARKER: &str = "runs-once-its-directory-is-back";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let work = directory.path().join("work");
+    let away = directory.path().join("work-away");
+    std::fs::create_dir(&work).unwrap();
+    let model = ContractModel::new();
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(work.clone()).await.unwrap();
+    complete_turn(&agent, chat, "get ready").await;
+    hold_a_turn(&agent, chat, &model).await;
+    agent
+        .deliver_trigger_for_tests(chat, scheduled("task", 1), MARKER)
+        .await
+        .unwrap();
+    agent.flush_transcripts().await;
+    let recorded = agent.pause_next_for_tests(chat, PausePoint::TriggerStartRecorded);
+    model.release_held_turn();
+    tokio::time::timeout(WAIT, recorded.entered)
+        .await
+        .expect("the start is recorded")
+        .unwrap();
+    std::fs::rename(&work, &away).unwrap();
+    drop(recorded.release);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen(MARKER), 0, "its run cannot begin");
+
+    std::fs::rename(&away, &work).unwrap();
+    complete_turn(&agent, chat, "carry on").await;
+    model.wait_seen(MARKER, 1).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(model.seen(MARKER), 1);
+    agent.shutdown().await;
+}
+
 /// A custom title Line, the record the example sources of these tests keep their state in.
 fn source_record(chat: Uuid, record: &str) -> tickloop_agent_transcript::Line {
     tickloop_agent_transcript::Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {
