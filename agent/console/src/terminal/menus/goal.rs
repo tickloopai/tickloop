@@ -118,8 +118,11 @@ impl Menus {
                         id: Uuid::new_v4(),
                         title: "Replace unfinished Goal?".into(),
                         context: vec![
-                            format!("Current: {}", snapshot.goal.as_ref().unwrap().objective),
-                            format!("New: {objective}"),
+                            safe_text(&format!(
+                                "Current: {}",
+                                snapshot.goal.as_ref().unwrap().objective
+                            )),
+                            safe_text(&format!("New: {objective}")),
                         ],
                         options: vec!["Replace Goal".into(), "Keep current Goal".into()],
                         selected: 0,
@@ -156,7 +159,7 @@ impl Menus {
             .detail_lines(100, 0, usize::MAX)
             .iter()
             .skip(1)
-            .map(|line| line.text())
+            .map(|line| safe_text(&line.text()))
             .collect();
         if goal.status.is_finished() {
             return self.show(
@@ -291,7 +294,7 @@ impl Menus {
             "Trigger receiving is active.".into()
         }];
         if let Some(goal) = status.goal.as_ref().filter(|_| resume_goal) {
-            context.push(format!("Goal: {}", goal.objective));
+            context.push(safe_text(&format!("Goal: {}", goal.objective)));
         }
         self.continue_offered.insert(status.id);
         self.show(
