@@ -200,3 +200,20 @@ fn a_preview_shows_the_latest_prompt_and_never_a_host_note() {
         Some("Build the page")
     );
 }
+
+#[test]
+fn scheduled_tasks_are_available_without_reading_the_conversation() {
+    let mut snapshot = busy_chat();
+    let task = serde_json::from_value(serde_json::json!({
+        "id":"0123abcd", "kind":{"type":"recurring", "cron":"* * * * *"},
+        "prompt":"weather", "creator":"user", "time_zone":"UTC", "created_at_ms":0,
+        "next_fire_at_ms":60000, "jitter_ms":0, "skipped":0
+    }))
+    .unwrap();
+    snapshot.scheduled_tasks = vec![task];
+    let status = ChatStatus::of(&snapshot);
+    assert_eq!(status.scheduled_tasks, snapshot.scheduled_tasks);
+    let wire = serde_json::to_value(&status).unwrap();
+    let decoded: ChatStatus = serde_json::from_value(wire).unwrap();
+    assert_eq!(decoded.scheduled_tasks, snapshot.scheduled_tasks);
+}

@@ -398,6 +398,9 @@ pub(super) fn transcript_document(
                 );
             }
             ConversationBlockKind::Outcome(ConversationOutcome::Completed) => {}
+            ConversationBlockKind::WakeupCancelled => {
+                writer.block_text("Pending wakeup cancelled\n", Some(Role::MutedText))
+            }
             ConversationBlockKind::Command { command } => {
                 let dot = match command.state {
                     CommandState::Completed if command.exit_code == Some(0) => Role::Success,
@@ -2300,6 +2303,14 @@ fn compact_result_runs(
             format!("Sent {} guidance", safe_text(intent)),
             Some(Role::MutedText),
         )]);
+        return rows.runs;
+    }
+    if !result.is_error
+        && let Some(lines) = super::scheduled_tasks::result_lines(name, input, &result.content)
+    {
+        for line in lines {
+            rows.row([(line, Some(Role::MutedText))]);
+        }
         return rows.runs;
     }
     if name == BASH_TOOL_NAME {
@@ -4738,5 +4749,35 @@ mod tests {
                 during_tool_use: false
             }
         );
+    }
+    #[test]
+    fn scheduling_tool_results_use_compact_rows_and_preserve_failures() {
+        let display = DisplayProfile::default();
+        let value = json!({"id":"0123abcd", "schedule":"*/5 * * * *", "prompt":"weather", "next_run":"2026-10-23 12:05:00 CST"});
+        let render = |name: &str, content: String, is_error| {
+            let result = ToolResult {
+                content,
+                is_error,
+                output_ref: None,
+            };
+            joined(&archived_tool_result(
+                name,
+                None,
+                &result,
+                Path::new(""),
+                display,
+                &CallFacts::default(),
+            ))
+        };
+        assert!(render("CronCreate", value.to_string(), false).contains("next run 12:05"));
+        let list = render(
+            "CronList",
+            json!({"tasks":[value.clone(),value]}).to_string(),
+            false,
+        );
+        assert_eq!(list.matches("next run 12:05").count(), 2);
+        let failure = render("CronCreate", "invalid cron".into(), true);
+        assert!(failure.contains("Failed"));
+        assert!(failure.contains("invalid cron"));
     }
 }

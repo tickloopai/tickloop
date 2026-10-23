@@ -3283,3 +3283,176 @@ async fn closing_and_reopening_a_hosted_tick_ask_first_and_name_its_subscription
     );
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn scheduled_task_details_and_delete_use_the_live_agent_and_require_confirmation() {
+    use crate::terminal::{
+        execution::ConsoleExecution,
+        tick_actions::{TickActionContext, execute},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+    );
+    let agent =
+        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let task = core
+        .schedule_task(chat, "* * * * *", "remind me about weather".into(), true)
+        .await
+        .unwrap();
+    let console = Console::test_for_chat(chat);
+    console
+        .update_monitor_chat(agent.status(chat).await.unwrap())
+        .unwrap();
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let press = |code| {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(code, KeyModifiers::NONE))
+        else {
+            panic!("no scheduled task action")
+        };
+        action
+    };
+    execute(press(KeyCode::Enter), context).await.unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        let detail = state.monitor.detail.as_mut().unwrap();
+        let text = detail
+            .lines(80, 20, 0)
+            .into_iter()
+            .map(|line| line.line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Cron: * * * * *",
+            "remind me about weather",
+            "Created:",
+            "Expires:",
+            "Skipped: 0",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.monitor.detail.is_none());
+    }
+    execute(press(KeyCode::Char('x')), context).await.unwrap();
+    assert_eq!(
+        core.snapshot(chat).await.unwrap().scheduled_tasks,
+        vec![task.clone()]
+    );
+    {
+        let mut state = console.state.lock().unwrap();
+        assert!(
+            state
+                .monitor
+                .confirmation
+                .as_ref()
+                .unwrap()
+                .prompt
+                .contains(&task.id)
+        );
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+    assert_eq!(core.snapshot(chat).await.unwrap().scheduled_tasks.len(), 1);
+    execute(press(KeyCode::Char('x')), context).await.unwrap();
+    execute(press(KeyCode::Enter), context).await.unwrap();
+    assert!(
+        core.snapshot(chat)
+            .await
+            .unwrap()
+            .scheduled_tasks
+            .is_empty()
+    );
+    assert!(!console.monitor_has_entries().unwrap());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
+    use crate::terminal::execution::ConsoleExecution;
+    use tickloop_agent_protocol::{Content, EventKind};
+    for folder in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+            tickloop_agent_test_support::text("ready"),
+            tickloop_agent_test_support::text("ready"),
+            tickloop_agent_test_support::text("ready"),
+        ]));
+        let mut options =
+            tickloop_agent_runtime::HarnessOptions::local(tickloop_agent_test_support::config());
+        if !folder {
+            options.waits = tickloop_agent_runtime::WaitHosting::Durable;
+            options.host.prompt_policy = tickloop_agent_protocol::PromptPolicy::DenyOnPrompt;
+            options.tools = tickloop_agent_runtime::ToolPolicy {
+                user_skills: true,
+                ..tickloop_agent_runtime::ToolPolicy::durable_chat()
+            };
+        }
+        let core = tickloop_agent_runtime::Agent::with_seams(
+            tickloop_agent_runtime::HarnessSeams {
+                transcripts: None,
+                environment: folder.then(|| {
+                    Arc::new(tickloop_agent_runtime::environment::LocalEnvironment::bare())
+                        as Arc<dyn tickloop_agent_runtime::environment::ExecutionEnvironment>
+                }),
+                models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
+            },
+            options,
+        )
+        .unwrap();
+        let agent =
+            ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+        let chat = if folder {
+            agent.create_chat(directory.path().into()).await.unwrap()
+        } else {
+            core.create_chat_without_folder().await.unwrap()
+        };
+        let mut events = core.subscribe();
+        for (arguments, expected) in [
+            ("1m 提醒我看天气", "Form: fixed interval"),
+            ("提醒我看天气", "Form: self-paced"),
+            ("", "built-in maintenance instructions"),
+        ] {
+            let receipt = if folder {
+                agent.invoke_skill(chat, "loop", arguments).await.unwrap()
+            } else {
+                core.invoke_skill(chat, "loop", arguments).await.unwrap()
+            };
+            loop {
+                let event = tickloop_agent_test_support::next_event(&mut events).await;
+                if event.run_id != receipt.run_id {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            let requests = model.requests.lock().unwrap();
+            let text = requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{text}");
+        }
+        core.shutdown().await;
+    }
+}

@@ -144,6 +144,7 @@ pub(super) enum ConversationBlockKind {
     Question,
     Plan,
     Outcome(ConversationOutcome),
+    WakeupCancelled,
     FamilyInput {
         record: FamilyInputRecord,
     },
@@ -479,6 +480,16 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             },
         ),
         EventKind::Interrupted => outcome_block(event, ConversationOutcome::Interrupted),
+        EventKind::ScheduledTasksChanged {
+            notice: Some(tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled { .. }),
+        } => ConversationBlock {
+            id: ConversationBlockId::Event {
+                chat_id: event.chat_id,
+                sequence: event.sequence,
+            },
+            metadata: event_metadata,
+            kind: ConversationBlockKind::WakeupCancelled,
+        },
         EventKind::CommandUpdated { command } => ConversationBlock {
             id: ConversationBlockId::Command {
                 chat_id: event.chat_id,
@@ -1076,5 +1087,24 @@ mod tests {
             projection.blocks[outcome_index].metadata.run_id,
             Some(failed_run)
         );
+    }
+    #[test]
+    fn wakeup_cancellation_is_projected_once_as_a_conversation_notice() {
+        let event = Event {
+            sequence: 7,
+            chat_id: Uuid::nil(),
+            loop_id: Uuid::nil(),
+            run_id: Uuid::new_v4(),
+            kind: EventKind::ScheduledTasksChanged {
+                notice: Some(
+                    tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled {
+                        task_id: "0123abcd".into(),
+                    },
+                ),
+            },
+        };
+        let block = project_event(&event).unwrap();
+        assert!(matches!(block.kind, ConversationBlockKind::WakeupCancelled));
+        assert_eq!(block.id, project_event(&event).unwrap().id);
     }
 }

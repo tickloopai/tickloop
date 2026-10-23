@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tickets 07 and 09 wire the views")
-)]
-
 use time::OffsetDateTime;
 
 use super::{
