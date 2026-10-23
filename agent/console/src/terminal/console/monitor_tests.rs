@@ -412,50 +412,6 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
 }
 
 #[test]
-fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
-    for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
-        for metadata in [false, true] {
-            let mut state = click_fixture(140, false, group);
-            let previous = "artifact:https://docs.example/previous".to_owned();
-            state.monitor.confirmation = Some(crate::terminal::monitor::TickConfirmation {
-                instance: previous.clone(),
-                action: crate::terminal::tick_actions::builtin::artifact(&previous, 'X'),
-                prompt: "Remove artifact?".into(),
-                option: None,
-            });
-            state.monitor.focus(false, None);
-            state.draw_frame(&mut Vec::new()).unwrap();
-            let target = &state.monitor_row_targets
-                [usize::from(metadata).min(state.monitor_row_targets.len() - 1)];
-            state.pointer(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    row: target.row as u16,
-                    column: target.columns.start as u16,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &mut Vec::new(),
-            );
-            assert!(
-                state.pointer_input.is_none(),
-                "row click must never confirm removal"
-            );
-            assert_eq!(
-                state
-                    .monitor
-                    .confirmation
-                    .as_ref()
-                    .map(|confirmation| &confirmation.instance),
-                Some(&previous)
-            );
-            assert!(
-                matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickAction {action,..}) if action.instance==previous && action.key=='X')
-            );
-        }
-    }
-}
-
-#[test]
 fn monitor_row_clicks_ignore_non_targets_and_other_input_surfaces() {
     let mut state = click_fixture(140, false, TickGroup::Artifacts);
     let title_row = state
@@ -598,7 +554,7 @@ fn an_artifact_row_routes_copy_and_feedback_to_artifact_actions() {
     entry.actions = fixture_actions(&entry.instance);
     state.monitor.replace(TickGroup::Artifacts, vec![entry]);
     state.monitor.focus(false, None);
-    for action in ['c', 'f'] {
+    for action in ['c', 'f', 'h'] {
         assert!(
             matches!(state.key(KeyEvent::new(KeyCode::Char(action), KeyModifiers::NONE)), Some(InputEvent::TickAction { action: received, .. }) if received.key == action)
         );
@@ -2452,7 +2408,7 @@ fn the_subscription_footer_stays_at_the_panel_bottom() {
 }
 
 #[tokio::test]
-async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
+async fn removing_a_subscribed_row_directly_cancels_its_subscriptions_and_reports_it() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, TickActionUi, builtin, execute},
@@ -2532,30 +2488,16 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
         .unwrap()
     };
     execute(removal, context).await.unwrap();
-    assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap().len(),
-        1,
-        "nothing changes before the user confirms"
-    );
-    let confirmed = {
+    {
         let mut state = console.state.lock().unwrap();
-        assert!(
-            state
-                .monitor
-                .confirmation
-                .as_ref()
-                .is_some_and(|confirmation| confirmation
-                    .prompt
-                    .starts_with("Remove from Monitor and cancel its 1 Tick Subscription?"))
-        );
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("confirming did not run the removal");
-        };
-        action
-    };
-    execute(confirmed, context).await.unwrap();
+        state.refresh_status("Working");
+        assert!(state.status_held);
+    }
+
+    assert_eq!(
+        console.test_status_text(),
+        "Removed from Monitor · 1 Tick Subscription cancelled"
+    );
     assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
     assert!(
         agent
@@ -2696,10 +2638,9 @@ fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
     );
 }
 
-/// A running Shell is stopped from its Monitor row: `s` asks first, Esc keeps it running, and
-/// once confirmed the Shell's own control stops it and its row shows it ended.
+/// A running Shell is stopped from its Monitor row and its row shows it ended.
 #[tokio::test]
-async fn a_running_shell_is_stopped_from_its_row_once_confirmed() {
+async fn a_running_shell_is_stopped_from_its_row_directly_with_feedback() {
     use crate::terminal::{
         execution::ConsoleExecution,
         task_access::ShellTaskCenter,
@@ -2770,37 +2711,13 @@ async fn a_running_shell_is_stopped_from_its_row_once_confirmed() {
             .key(KeyEvent::new(code, KeyModifiers::NONE))
     };
     console.state.lock().unwrap().monitor.focus(false, None);
-    for confirms in [false, true] {
-        let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Char('s')) else {
-            panic!("s did not ask to stop the Shell");
-        };
-        assert_eq!(action.instance, shell.to_string());
-        execute(action, context).await.unwrap();
-        {
-            let state = console.state.lock().unwrap();
-            assert!(
-                state.status.contains("Stop this Shell?"),
-                "{}",
-                state.status
-            );
-            assert!(state.monitor.detail.is_none(), "nothing opens in Monitor");
-        }
-        assert!(
-            !task_state(&center.snapshot(chat).await.unwrap())
-                .unwrap()
-                .is_terminal(),
-            "asking stops nothing"
-        );
-        if !confirms {
-            assert!(press(KeyCode::Esc).is_none());
-            assert!(console.state.lock().unwrap().monitor.confirmation.is_none());
-            continue;
-        }
-        let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
-            panic!("confirming did not stop the Shell");
-        };
-        execute(action, context).await.unwrap();
-    }
+    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Char('s')) else {
+        panic!("s did not stop the Shell");
+    };
+    assert_eq!(action.instance, shell.to_string());
+    execute(action, context).await.unwrap();
+    assert_eq!(console.test_status_text(), "Shell stopped");
+    assert!(console.state.lock().unwrap().monitor.detail.is_none());
     tokio::time::timeout(Duration::from_secs(5), async {
         while !task_state(&center.snapshot(chat).await.unwrap())
             .unwrap()
@@ -2904,7 +2821,8 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
             ('o', "open"),
             ('x', "unlink"),
             ('c', "copy"),
-            ('f', "feedback")
+            ('f', "feedback"),
+            ('h', "include earlier feedback")
         ]
     );
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('x'))), 'x');
@@ -2927,7 +2845,8 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
             ('o', "open"),
             ('x', "unlink"),
             ('c', "copy"),
-            ('f', "feedback")
+            ('f', "feedback"),
+            ('h', "include earlier feedback")
         ]
     );
 }
@@ -3073,55 +2992,6 @@ fn monitor_groups_list_artifacts_then_ticks_then_shells() {
         .filter(|line| line.ends_with("(1)"))
         .collect::<Vec<_>>();
     assert_eq!(headings, ["Artifacts (1)", "Ticks (1)", "Shells (1)"]);
-}
-
-#[test]
-fn a_confirmation_option_shows_checked_and_space_turns_it_off_before_enter() {
-    let mut state = State::new(true, 100, 25);
-    let chat = Uuid::new_v4();
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let instance = "hosted:00000000-0000-0000-0000-000000000001".to_owned();
-    state.monitor.confirmation = Some(crate::terminal::monitor::TickConfirmation {
-        instance: instance.clone(),
-        action: crate::terminal::tick_actions::builtin::artifact(&instance, 'A'),
-        prompt: "Open a new instance?".into(),
-        option: Some(crate::terminal::monitor::ConfirmationOption {
-            label: "Also restore its 1 Tick Subscription at their frequencies".into(),
-            is_chosen: true,
-            action_without: crate::terminal::tick_actions::builtin::artifact(&instance, 'B'),
-        }),
-    });
-    let screen = |state: &mut State| {
-        state.draw_frame(&mut Vec::new()).unwrap();
-        state.rendered_screen.join("\n")
-    };
-    let text = screen(&mut state);
-    assert!(
-        text.contains("  [x] Also restore its 1 Tick Subscription at their frequencies"),
-        "{text}"
-    );
-    assert!(
-        text.contains("enter confirm · space toggle · esc back"),
-        "{text}"
-    );
-    assert!(
-        state
-            .key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
-            .is_none()
-    );
-    let text = screen(&mut state);
-    assert!(text.contains("  [ ] Also restore"), "{text}");
-    let Some(InputEvent::TickAction { action, .. }) =
-        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-    else {
-        panic!("confirming runs an action");
-    };
-    assert_eq!(
-        action.key, 'B',
-        "the option turned off runs the action without it"
-    );
-    assert!(state.monitor.confirmation.is_none());
 }
 
 /// An embedded Agent whose Chat has one Loop subscribed to `cal:watched`, with a Console showing
@@ -3348,30 +3218,88 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
 }
 
 #[tokio::test]
-async fn closing_and_reopening_a_hosted_tick_ask_first_and_name_its_subscriptions() {
+async fn closing_and_reopening_a_hosted_tick_execute_directly_and_report_the_result() {
     use crate::monitor_rows::TickIntent;
+    use crate::terminal::execution::ConsoleExecution;
+    use tickloop_agent_daemon::EmbeddedAgentAccess;
+    use tickloop_agent_protocol::*;
+
+    struct HostedRemote {
+        inner: EmbeddedAgentAccess,
+        commands: Mutex<Vec<AgentCommand>>,
+        reopened: tick_protocol::InstanceRef,
+    }
+    #[async_trait::async_trait]
+    impl AgentAccess for HostedRemote {
+        async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
+            self.inner.observe(request).await
+        }
+        async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            let result = match &envelope.command {
+                AgentCommand::CloseHostedTick { .. } => Some(CommandResult::Done),
+                AgentCommand::ReopenHostedTick { .. } => Some(CommandResult::HostedTickReopened {
+                    instance: self.reopened.clone(),
+                    membership: MonitorMembership::default(),
+                    restore_error: None,
+                }),
+                _ => None,
+            };
+            if let Some(result) = result {
+                self.commands.lock().unwrap().push(envelope.command.clone());
+                let mut receipt = self
+                    .inner
+                    .execute(CommandEnvelope {
+                        command: AgentCommand::FlushTranscripts,
+                        ..envelope
+                    })
+                    .await?;
+                receipt.result = Some(result);
+                return Ok(receipt);
+            }
+            self.inner.execute(envelope).await
+        }
+        async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            self.inner.show_view(update).await
+        }
+    }
     let directory = tempfile::tempdir().unwrap();
-    let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+    );
+    let remote = Arc::new(HostedRemote {
+        inner: EmbeddedAgentAccess::new(core.clone()),
+        commands: Mutex::new(Vec::new()),
+        reopened: tick_protocol::InstanceRef::new("hosted", &Uuid::new_v4().to_string()).unwrap(),
+    });
+    let agent = ConsoleExecution::from_access_for_test(
+        remote.clone(),
+        remote.inner.daemon_epoch(),
+        ViewRef {
+            session_id: Uuid::new_v4(),
+            view_id: Uuid::new_v4(),
+        },
+        LaunchSpec::embedded(directory.path().into()),
+        None,
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let console = Console::test_for_chat(chat);
     let context = crate::terminal::tick_actions::TickActionContext {
         agent: &agent,
         console: &console,
         root: Some(directory.path()),
         chat,
     };
-    let watched = tick_protocol::InstanceRef::new("cal", "watched").unwrap();
-    let confirmation = || {
-        let state = console.state.lock().unwrap();
-        state.monitor.confirmation.as_ref().map(|confirmation| {
-            (
-                confirmation.prompt.clone(),
-                confirmation
-                    .option
-                    .as_ref()
-                    .map(|option| (option.label.clone(), option.is_chosen)),
-            )
-        })
-    };
-
+    let watched = tick_protocol::InstanceRef::new("hosted", &Uuid::new_v4().to_string()).unwrap();
+    run_intent(context, TickIntent::ReopenHosted(watched.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(remote.commands.lock().unwrap().as_slice(),
+        [AgentCommand::ReopenHostedTick { instance, restore_subscriptions: true, .. }] if instance == &watched));
+    assert_eq!(
+        console.test_status_text(),
+        format!("Reopened {watched} as {}", remote.reopened)
+    );
     run_intent(
         context,
         TickIntent::CloseHosted {
@@ -3381,41 +3309,24 @@ async fn closing_and_reopening_a_hosted_tick_ask_first_and_name_its_subscription
     )
     .await
     .unwrap();
+    assert!(matches!(&remote.commands.lock().unwrap()[1],
+        AgentCommand::CloseHostedTick { instance, .. } if instance == &watched));
     assert_eq!(
-        confirmation(),
-        Some((
-            "Close this Tick, end its process and cancel its 1 Tick Subscription? enter confirm · esc cancel"
-                .into(),
-            None
-        ))
+        console.test_status_text(),
+        "Tick closed · Removed from Monitor"
     );
-    console.state.lock().unwrap().monitor.confirmation = None;
-
-    run_intent(context, TickIntent::ReopenHosted(watched.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        confirmation(),
-        Some((
-            "Open a new instance of this Tick with its command? It takes this row's place. enter confirm · esc cancel"
-                .into(),
-            Some((
-                "Also restore its 1 Tick Subscription at their frequencies".into(),
-                true
-            ))
-        )),
-        "restoring the subscriptions is offered, checked"
-    );
-    assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap().len(),
-        1,
-        "nothing changes before the user confirms"
+    assert!(
+        core.snapshot(chat)
+            .await
+            .unwrap()
+            .monitor
+            .is_removed(&watched)
     );
     core.shutdown().await;
 }
 
 #[tokio::test]
-async fn scheduled_task_details_and_delete_use_the_live_agent_and_require_confirmation() {
+async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_deletion() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
@@ -3428,8 +3339,7 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_require_confir
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let task = core
-        .schedule_task(chat, "* * * * *", "remind me about weather".into(), true)
+    core.schedule_task(chat, "* * * * *", "remind me about weather".into(), true)
         .await
         .unwrap();
     let console = Console::test_for_chat(chat);
@@ -3475,26 +3385,7 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_require_confir
         assert!(state.monitor.detail.is_none());
     }
     execute(press(KeyCode::Char('x')), context).await.unwrap();
-    assert_eq!(
-        core.snapshot(chat).await.unwrap().scheduled_tasks,
-        vec![task.clone()]
-    );
-    {
-        let mut state = console.state.lock().unwrap();
-        assert!(
-            state
-                .monitor
-                .confirmation
-                .as_ref()
-                .unwrap()
-                .prompt
-                .contains(&task.id)
-        );
-        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    }
-    assert_eq!(core.snapshot(chat).await.unwrap().scheduled_tasks.len(), 1);
-    execute(press(KeyCode::Char('x')), context).await.unwrap();
-    execute(press(KeyCode::Enter), context).await.unwrap();
+    assert_eq!(console.test_status_text(), "Scheduled task deleted");
     assert!(
         core.snapshot(chat)
             .await

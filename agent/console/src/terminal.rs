@@ -880,7 +880,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell after confirmation; x does what its hint says: it closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, keeping its subscriptions unless unchecked; f subscribes a Tick at high.
+enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell immediately; x does what its hint says: it closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. All Monitor actions apply immediately and report their result on the status line. x deletes a scheduled task or unlinks an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -2735,7 +2735,7 @@ async fn interact_with_herdr(
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
-                        if let Err(error) = tick_actions::execute(action,context).await { console.set_status(&safe_text(&error))?; }
+                        if let Err(error) = tick_actions::execute(action,context).await { console.hold_status(&safe_text(&error))?; }
                         status_dirty=true;
                         continue;
                     }
@@ -9714,6 +9714,15 @@ mod status_agents_help_tests {
         let help = super::help_text();
         assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
         assert!(help.contains("tickloop monitor attach"));
+        for expected in [
+            "All Monitor actions apply immediately",
+            "restoring its subscriptions at their frequencies",
+            "x deletes a scheduled task or unlinks an Artifact",
+            "h includes earlier feedback",
+        ] {
+            assert!(help.contains(expected), "missing: {expected}");
+        }
+
         assert!(help.contains(
             "a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick"
         ));

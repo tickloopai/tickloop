@@ -401,7 +401,7 @@ Agent 让 Tickhost 在终端（PTY）中运行的、不讲 Tick 协议的交互�
 _Avoid_：终端观察（Terminal Observation，已取消）
 
 **Shell Tick**：
-Agent 执行的一次 shell 命令形成的 Tick，由 Tickhost 以管道运行（不使用终端），生存期跟随启动它的 Worker；命令的输出与退出结果是它的内容，只在退出时形成 Tick Update，订阅固定为及时；长任务的中间进度由 Agent 主动 Read 输出文件获得，订阅只负责“结束”这一件事；Monitor 只显示放到后台的执行，运行中的一直显示，可在行上确认后停止；结束后保留到本 Chat 处理它的结束，再短暂显示结果后离开列表；前台执行无论是否在运行都不进入列表，只留在对话中。它以描述（Description）为名：Agent 调用 Bash 时给出的描述，或没有描述的执行放到后台时生成的描述。Monitor 行显示从命令提取的关键命令（如 `make test`），描述、完整命令、目录、状态与实时输出在 Tickhost 提供的附着视图中。它不占用 Pane，与 Terminal Tick 分别处理。
+Agent 执行的一次 shell 命令形成的 Tick，由 Tickhost 以管道运行（不使用终端），生存期跟随启动它的 Worker；命令的输出与退出结果是它的内容，只在退出时形成 Tick Update，订阅固定为及时；长任务的中间进度由 Agent 主动 Read 输出文件获得，订阅只负责“结束”这一件事；Monitor 只显示放到后台的执行，运行中的一直显示，可在行上直接停止；结束后保留到本 Chat 处理它的结束，再短暂显示结果后离开列表；前台执行无论是否在运行都不进入列表，只留在对话中。它以描述（Description）为名：Agent 调用 Bash 时给出的描述，或没有描述的执行放到后台时生成的描述。Monitor 行显示从命令提取的关键命令（如 `make test`），描述、完整命令、目录、状态与实时输出在 Tickhost 提供的附着视图中。它不占用 Pane，与 Terminal Tick 分别处理。
 _Avoid_：后台任务、Task（只描述执行方式）
 
 **Artifact Tick（Artifact Tick）**：

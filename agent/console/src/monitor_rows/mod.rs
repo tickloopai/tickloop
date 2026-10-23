@@ -7,7 +7,7 @@ mod probe;
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
 pub use builtin::{ArtifactRows, HostedRows, ShellRows};
-pub(crate) use builtin::{REMOVE_KEY, SHELL_STOP_KEY, SUBSCRIBE_KEY, feedback_binding};
+pub(crate) use builtin::{REMOVE_KEY, SHELL_STOP_KEY, SUBSCRIBE_KEY};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{
@@ -61,27 +61,25 @@ pub enum TickIntent {
     /// Shows a notice instead of acting.
     Notify(String),
     ShowDetails(InstanceRef),
-    /// Hides the row in this Chat only and keeps every other fact. A row its Loops subscribe to
-    /// is hidden only after the user confirms cancelling those subscriptions.
+    /// Hides the row in this Chat and cancels its Tick Subscriptions.
     RemoveFromMonitor(InstanceRef),
     /// Opens the attached view of a local Tick the Tickhost runs, a hosted Tick or a Shell: a
     /// Herdr popup inside Herdr, otherwise full screen in this terminal.
     OpenView(InstanceRef),
     /// Ends a hosted Tick this Chat opened, or forgets the record of one that already ended, and
-    /// takes its row out with the Tick Subscriptions on it. The Console asks first when that ends
-    /// a running process or cancels subscriptions.
+    /// takes its row out with the Tick Subscriptions on it.
     CloseHosted {
         instance: InstanceRef,
         ends_process: bool,
     },
     /// Starts a new instance in place of a hosted Tick that no longer runs, in its row's place;
-    /// the Console asks first, offering to restore the old instance's Tick Subscriptions.
+    /// restores the old instance's Tick Subscriptions.
     ReopenHosted(InstanceRef),
     /// Subscribes the Chat to an extension or terminal Tick at the default frequency, or, once one
     /// of its Loops subscribes to it, cycles that subscription through high, medium and low.
     Subscribe(InstanceRef),
     SendUpdate(InstanceRef),
-    /// Stops a running Shell; the Console asks for confirmation first.
+    /// Stops a running Shell.
     StopShell {
         task: Uuid,
     },

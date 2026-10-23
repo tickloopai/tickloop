@@ -663,14 +663,6 @@ impl State {
             4
         } else if let Some(surface) = &self.permissions_surface {
             surface.minimum_frame_rows(self.width)
-        } else if self.monitor.confirmation.is_some()
-            || self
-                .monitor
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.confirmation().is_some())
-        {
-            4
         } else {
             3
         };
@@ -741,14 +733,6 @@ impl State {
             surface.content_rows(self.width, maximum)
         } else if self.help_open {
             1 + agent_layout::help_lines(self.width, self.width + 1, None).len()
-        } else if self.monitor.confirmation.is_some()
-            || self
-                .monitor
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.confirmation().is_some())
-        {
-            4
         } else {
             return maximum;
         };
@@ -763,12 +747,6 @@ impl State {
             || self.ticks_panel.is_some()
             || self.conversation_picker.is_some()
             || self.help_open && self.overview.projection.is_none()
-            || self.monitor.confirmation.is_some()
-            || self
-                .monitor
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.confirmation().is_some())
     }
 
     pub(super) fn input_dialog_body_height(&self) -> usize {
@@ -855,65 +833,6 @@ impl State {
             lines.extend(body.into_iter().skip(self.help_offset).take(available));
             lines.resize(capacity.saturating_sub(1), RoleLine::default());
             lines.push(RoleLine::role("esc / ? close help", Role::MutedText));
-        } else {
-            let detail = self
-                .monitor
-                .detail
-                .as_ref()
-                .and_then(|detail| detail.confirmation());
-            let is_detail_confirmation = detail.is_some();
-            let (title, message, label) = detail
-                .map(|view| (view.title, view.message, view.label))
-                .unwrap_or_else(|| {
-                    (
-                        "Tick action".into(),
-                        self.monitor
-                            .confirmation
-                            .as_ref()
-                            .map(|c| c.prompt.clone())
-                            .unwrap_or_default(),
-                        "Confirm".into(),
-                    )
-                });
-            // A detail's own confirmation offers no option.
-            let option = self
-                .monitor
-                .confirmation
-                .as_ref()
-                .filter(|_| !is_detail_confirmation)
-                .and_then(|confirmation| confirmation.option.as_ref());
-            lines.push(RoleLine::role(title, Role::DialogTitle));
-            lines.push(RoleLine::plain(message));
-            if let Some(option) = option {
-                lines.push(RoleLine::role(
-                    format!(
-                        "{}[{}] {}",
-                        crate::terminal::list_row::ROW_INDENT,
-                        if option.is_chosen { "x" } else { " " },
-                        option.label
-                    ),
-                    Role::Text,
-                ));
-            }
-            let confirm_row = lines.len();
-            lines.push(
-                RoleLine::role(
-                    format!("{}{label}", crate::terminal::list_row::ROW_INDENT),
-                    Role::Text,
-                )
-                .filled(Role::Selection),
-            );
-            self.dialog_option_rows
-                .push((confirm_row..confirm_row + 1, 0));
-            lines.resize(capacity.saturating_sub(1), RoleLine::default());
-            lines.push(RoleLine::role(
-                if option.is_some() {
-                    "enter confirm · space toggle · esc back"
-                } else {
-                    "enter confirm · esc back"
-                },
-                Role::MutedText,
-            ));
         }
         lines.truncate(capacity);
         for line in &mut lines {

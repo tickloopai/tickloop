@@ -1560,37 +1560,6 @@ impl Console {
             .write(url, &mut io::stdout().lock())
             .map(|_| ())
     }
-    pub(super) fn confirm_tick_action(
-        &self,
-        chat: Uuid,
-        instance: String,
-        action: Arc<dyn super::tick_actions::TickActionExecutor>,
-        message: &str,
-    ) -> Result<(), String> {
-        self.confirm_tick_action_with_option(chat, instance, action, message, None)
-    }
-    /// Asks before `action` runs, offering `option`, which space turns off and on.
-    pub(super) fn confirm_tick_action_with_option(
-        &self,
-        chat: Uuid,
-        instance: String,
-        action: Arc<dyn super::tick_actions::TickActionExecutor>,
-        message: &str,
-        option: Option<super::monitor::ConfirmationOption>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat != Some(chat) {
-            return Ok(());
-        }
-        state.monitor.confirmation = Some(super::monitor::TickConfirmation {
-            instance,
-            action,
-            prompt: message.into(),
-            option,
-        });
-        state.status = message.into();
-        Ok(())
-    }
     /// Adds the probe of one more access's members.
     pub(super) fn add_member_probe(
         &self,
@@ -6201,7 +6170,6 @@ impl State {
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.input_dialog_visible()
                     && self.monitor_visible()
-                    && self.monitor.confirmation.is_none()
                     && !self.menu_submission_is_pending()
                     && !self.branch_submission_owns_input()
                     && let Some(instance) = self
@@ -11541,51 +11509,7 @@ impl State {
         if self.menu.is_none() && self.conversation_picker.is_some() {
             return self.conversation_picker_key(key);
         }
-        if self.menu.is_none()
-            && self.input_dialog_body_height() < 3
-            && key.code == KeyCode::Enter
-            && (self.monitor.confirmation.is_some()
-                || self
-                    .monitor
-                    .detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.confirmation().is_some()))
-        {
-            return None;
-        }
-        if self.menu.is_none() && self.monitor.confirmation.is_some() {
-            if key.code == KeyCode::Esc {
-                self.monitor.confirmation = None;
-            } else if key.code == KeyCode::Char(' ')
-                && let Some(option) = self
-                    .monitor
-                    .confirmation
-                    .as_mut()
-                    .and_then(|confirmation| confirmation.option.as_mut())
-            {
-                option.is_chosen = !option.is_chosen;
-            } else if key.code == KeyCode::Enter {
-                let confirmation = self.monitor.confirmation.take().unwrap();
-                let chat = self.chat?;
-                match confirmation
-                    .chosen_action()
-                    .prepare(&mut super::tick_actions::TickActionUi { state: self })
-                {
-                    Ok(action) => {
-                        debug_assert_eq!(action.instance, confirmation.instance);
-                        return Some(InputEvent::TickAction { chat, action });
-                    }
-                    Err(error) => self.hold_status(&error),
-                }
-            }
-            return None;
-        }
-        if (!self.input_dialog_visible()
-            || self
-                .monitor
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.confirmation().is_some()))
+        if !self.input_dialog_visible()
             && self.menu.is_none()
             && !self.help_open
             && self.monitor_visible()

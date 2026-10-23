@@ -1,7 +1,5 @@
 use super::super::{
-    artifact_ui,
-    monitor::ConfirmationOption,
-    safe_text,
+    artifact_ui, safe_text,
     subscription_detail::{SubscriptionDetail, SubscriptionRequest},
     task_access::ShellTaskCenter,
 };
@@ -14,10 +12,7 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
     let executor: Arc<dyn TickActionExecutor> = match intent.clone() {
         TickIntent::Notify(_) => return None,
         TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
-        TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor {
-            instance,
-            is_confirmed: false,
-        }),
+        TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
         TickIntent::OpenView(instance) => Arc::new(OpenView { instance }),
         TickIntent::CloseHosted {
             instance,
@@ -25,18 +20,11 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         } => Arc::new(CloseHosted {
             instance,
             ends_process,
-            is_confirmed: false,
         }),
-        TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted {
-            instance,
-            confirmed: None,
-        }),
+        TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted { instance }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
-        TickIntent::StopShell { task } => Arc::new(StopShell {
-            task,
-            is_confirmed: false,
-        }),
+        TickIntent::StopShell { task } => Arc::new(StopShell { task }),
         TickIntent::Artifact { id, key } => artifact(&id, key),
         TickIntent::RefreshArtifacts => artifact("", 'r'),
         TickIntent::ManageSubscriptions {
@@ -475,11 +463,9 @@ pub(in crate::terminal) fn seen(row: tick_protocol::InstanceRef) -> PreparedTick
     )
     .opening(row)
 }
-/// Hides a row in this Chat. A row its Loops subscribe to asks first, then cancels those
-/// subscriptions, so nothing keeps delivering from a Tick the user no longer sees.
+/// Hides a row in this Chat and cancels its Tick Subscriptions.
 struct RemoveFromMonitor {
     instance: tick_protocol::InstanceRef,
-    is_confirmed: bool,
 }
 impl TickActionExecutor for RemoveFromMonitor {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -488,7 +474,6 @@ impl TickActionExecutor for RemoveFromMonitor {
             'x',
             Arc::new(RemoveFromMonitor {
                 instance: self.instance.clone(),
-                is_confirmed: self.is_confirmed,
             }),
         ))
     }
@@ -503,18 +488,6 @@ impl TickActionBackend for RemoveFromMonitor {
                 .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?,
             &self.instance,
         );
-        if !subscriptions.is_empty() && !self.is_confirmed {
-            ctx.console.confirm_tick_action(
-                ctx.chat,
-                self.instance.to_string(),
-                Arc::new(RemoveFromMonitor {
-                    instance: self.instance.clone(),
-                    is_confirmed: true,
-                }),
-                &remove_subscribed_prompt(subscriptions.len()),
-            )?;
-            return Ok(());
-        }
         for subscription in &subscriptions {
             ctx.agent
                 .update_tick_subscription(
@@ -535,17 +508,19 @@ impl TickActionBackend for RemoveFromMonitor {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
-        Ok(())
+        ctx.notify(&removed_message(subscriptions.len()))
     }
 }
-fn remove_subscribed_prompt(subscriptions: usize) -> String {
-    format!(
-        "Remove from Monitor and cancel its {}? enter confirm · esc cancel",
-        tick_subscriptions(subscriptions)
-    )
+fn removed_message(subscriptions: usize) -> String {
+    if subscriptions == 0 {
+        "Removed from Monitor".into()
+    } else {
+        format!(
+            "Removed from Monitor · {} cancelled",
+            tick_subscriptions(subscriptions)
+        )
+    }
 }
-const ARTIFACT_UNLINK_PROMPT: &str =
-    "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel";
 fn tick_subscriptions(count: usize) -> String {
     format!(
         "{count} Tick {}",
@@ -556,28 +531,10 @@ fn tick_subscriptions(count: usize) -> String {
         }
     )
 }
-const STOP_SHELL_PROMPT: &str = "Stop this Shell? enter confirm · esc cancel";
-const REOPEN_HOSTED_PROMPT: &str = "Open a new instance of this Tick with its command? It takes this row's place. enter confirm · esc cancel";
-
-/// What closing a hosted Tick asks before it runs.
-fn close_hosted_prompt(subscriptions: usize) -> String {
-    match subscriptions {
-        0 => "Close this Tick and end its process? enter confirm · esc cancel".into(),
-        count => format!(
-            "Close this Tick, end its process and cancel its {}? enter confirm · esc cancel",
-            tick_subscriptions(count)
-        ),
-    }
-}
-
-/// Ends a hosted Tick this Chat opened and takes its row out with the Tick Subscriptions on it,
-/// once confirmed where that ends a running process or cancels subscriptions. An exited
-/// terminal Tick is closed as it leaves, so its last screen does not stay behind unseen, and one
-/// that no longer runs takes its launch record with it.
+/// Ends a hosted Tick this Chat opened and removes its row and Tick Subscriptions.
 struct CloseHosted {
     instance: tick_protocol::InstanceRef,
     ends_process: bool,
-    is_confirmed: bool,
 }
 impl TickActionExecutor for CloseHosted {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -587,7 +544,6 @@ impl TickActionExecutor for CloseHosted {
             Arc::new(CloseHosted {
                 instance: self.instance.clone(),
                 ends_process: self.ends_process,
-                is_confirmed: self.is_confirmed,
             }),
         ))
     }
@@ -602,24 +558,6 @@ impl TickActionBackend for CloseHosted {
                 .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?,
             &self.instance,
         );
-        if (self.ends_process || !subscriptions.is_empty()) && !self.is_confirmed {
-            let prompt = if self.ends_process {
-                close_hosted_prompt(subscriptions.len())
-            } else {
-                remove_subscribed_prompt(subscriptions.len())
-            };
-            ctx.console.confirm_tick_action(
-                ctx.chat,
-                self.instance.to_string(),
-                Arc::new(CloseHosted {
-                    instance: self.instance.clone(),
-                    ends_process: self.ends_process,
-                    is_confirmed: true,
-                }),
-                &prompt,
-            )?;
-            return Ok(());
-        }
         ctx.agent
             .close_hosted_tick(ctx.chat, self.instance.clone())
             .await
@@ -644,20 +582,17 @@ impl TickActionBackend for CloseHosted {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
-        if self.ends_process {
-            ctx.notify(&format!("Closed {}", self.instance))?;
-        }
-        Ok(())
+        ctx.notify(&if self.ends_process {
+            format!("Tick closed · {}", removed_message(subscriptions.len()))
+        } else {
+            removed_message(subscriptions.len())
+        })
     }
 }
 
-/// Starts a new instance with the recorded command in place of a hosted Tick that no longer
-/// runs, once confirmed; it takes the old row's place. The confirmation offers, checked, to
-/// restore the old instance's Tick Subscriptions at their frequencies; unchecked, they end.
+/// Starts a new instance with the recorded command and restores its Tick Subscriptions.
 struct ReopenHosted {
     instance: tick_protocol::InstanceRef,
-    /// `Some` once confirmed, with whether the subscriptions follow the new instance.
-    confirmed: Option<bool>,
 }
 impl TickActionExecutor for ReopenHosted {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -666,7 +601,6 @@ impl TickActionExecutor for ReopenHosted {
             crate::monitor_rows::MONITOR_ENTER_KEY,
             Arc::new(ReopenHosted {
                 instance: self.instance.clone(),
-                confirmed: self.confirmed,
             }),
         ))
     }
@@ -674,40 +608,9 @@ impl TickActionExecutor for ReopenHosted {
 #[async_trait]
 impl TickActionBackend for ReopenHosted {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        let Some(restore_subscriptions) = self.confirmed else {
-            let subscriptions = crate::monitor_rows::subscriptions_on(
-                &ctx.agent
-                    .tick_subscriptions(ctx.chat)
-                    .await
-                    .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?,
-                &self.instance,
-            );
-            let reopen = |restore| {
-                Arc::new(ReopenHosted {
-                    instance: self.instance.clone(),
-                    confirmed: Some(restore),
-                }) as Arc<dyn TickActionExecutor>
-            };
-            let option = (!subscriptions.is_empty()).then(|| ConfirmationOption {
-                label: format!(
-                    "Also restore its {} at their frequencies",
-                    tick_subscriptions(subscriptions.len())
-                ),
-                is_chosen: true,
-                action_without: reopen(false),
-            });
-            ctx.console.confirm_tick_action_with_option(
-                ctx.chat,
-                self.instance.to_string(),
-                reopen(true),
-                REOPEN_HOSTED_PROMPT,
-                option,
-            )?;
-            return Ok(());
-        };
         let (reopened, membership, restore_error) = ctx
             .agent
-            .reopen_hosted_tick(ctx.chat, self.instance.clone(), restore_subscriptions)
+            .reopen_hosted_tick(ctx.chat, self.instance.clone(), true)
             .await
             .map_err(|error| format!("Cannot reopen {}: {error}", self.instance))?;
         ctx.console
@@ -811,39 +714,23 @@ impl TickActionBackend for Subscribe {
         Ok(())
     }
 }
-/// Stops a running Shell from its Monitor row once confirmed, under the Shell's own controls:
+/// Stops a running Shell from its Monitor row under the Shell's own controls:
 /// only a Shell its owner lets this View stop. Its row shows how it ended.
 struct StopShell {
     task: Uuid,
-    is_confirmed: bool,
 }
 impl TickActionExecutor for StopShell {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         Ok(PreparedTickAction::new(
             tick_protocol::InstanceRef::shell(self.task).to_string(),
             SHELL_STOP_KEY,
-            Arc::new(StopShell {
-                task: self.task,
-                is_confirmed: self.is_confirmed,
-            }),
+            Arc::new(StopShell { task: self.task }),
         ))
     }
 }
 #[async_trait]
 impl TickActionBackend for StopShell {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        if !self.is_confirmed {
-            ctx.console.confirm_tick_action(
-                ctx.chat,
-                tick_protocol::InstanceRef::shell(self.task).to_string(),
-                Arc::new(StopShell {
-                    task: self.task,
-                    is_confirmed: true,
-                }),
-                STOP_SHELL_PROMPT,
-            )?;
-            return Ok(());
-        }
         let center = ShellTaskCenter::new(ctx.agent.clone());
         center
             .dispatch(
@@ -857,7 +744,8 @@ impl TickActionBackend for StopShell {
             .snapshot(ctx.chat)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.console.refresh_monitor_ticks(snapshot, None)
+        ctx.console.refresh_monitor_ticks(snapshot, None)?;
+        ctx.notify("Shell stopped")
     }
 }
 struct Refresh {
@@ -887,34 +775,5 @@ impl TickActionBackend for RefreshBackend {
             action.backend.execute(ctx).await?;
         }
         Ok(())
-    }
-}
-impl Console {
-    pub(in crate::terminal) fn confirm_artifact_feedback(
-        &self,
-        chat: Uuid,
-        id: String,
-    ) -> Result<(), String> {
-        self.confirm_tick_action_with_option(
-            chat,
-            id.clone(),
-            artifact(&id, 'H'),
-            "Receive this artifact's feedback here?",
-            Some(super::super::monitor::ConfirmationOption {
-                label: "Include earlier feedback".into(),
-                is_chosen: false,
-                action_without: artifact(&id, 'F'),
-            }),
-        )
-    }
-
-    /// Asks before `x` takes out an artifact whose association still delivers here; confirming
-    /// unlinks it.
-    pub(in crate::terminal) fn confirm_artifact_unlink(
-        &self,
-        chat: Uuid,
-        id: String,
-    ) -> Result<(), String> {
-        self.confirm_tick_action(chat, id.clone(), artifact(&id, 'X'), ARTIFACT_UNLINK_PROMPT)
     }
 }

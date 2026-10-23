@@ -393,11 +393,10 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     )
     .await;
     pty.send(b"s");
-    pty.wait_for("Tick Shell stop is confirmed", |frame| {
-        frame.contains("Stop this Shell?")
+    pty.wait_for("Tick Shell stop reports its result", |frame| {
+        frame.contains("Shell stopped")
     })
     .await;
-    pty.send(b"\r");
     let stopped = wait_shell_tasks(
         &client,
         execution,

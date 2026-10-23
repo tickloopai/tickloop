@@ -102,34 +102,6 @@ impl MonitorEntry {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct TickConfirmation {
-    pub(super) instance: String,
-    pub(super) action: std::sync::Arc<dyn super::tick_actions::TickActionExecutor>,
-    pub(super) prompt: String,
-    pub(super) option: Option<ConfirmationOption>,
-}
-
-impl TickConfirmation {
-    /// The action confirming runs: without the option when the user turned it off.
-    pub(super) fn chosen_action(
-        &self,
-    ) -> std::sync::Arc<dyn super::tick_actions::TickActionExecutor> {
-        match &self.option {
-            Some(option) if !option.is_chosen => option.action_without.clone(),
-            _ => self.action.clone(),
-        }
-    }
-}
-
-/// A choice a confirmation offers, which the user can turn off before confirming.
-#[derive(Clone)]
-pub(crate) struct ConfirmationOption {
-    pub(crate) label: String,
-    pub(crate) is_chosen: bool,
-    /// What confirming runs once the option is off.
-    pub(crate) action_without: std::sync::Arc<dyn super::tick_actions::TickActionExecutor>,
-}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MonitorTarget {
     Tick(InstanceRef),
@@ -146,7 +118,6 @@ pub(super) struct Monitor {
     pub(super) metadata: HashMap<String, Option<tickloop_agent_artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
     pub(super) member_findings: crate::monitor_rows::MemberFindings,
-    pub(super) confirmation: Option<TickConfirmation>,
     /// The visible page; the complete set is `total` rows.
     entries: Vec<MonitorEntry>,
     total: usize,

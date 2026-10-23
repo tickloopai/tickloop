@@ -87,7 +87,6 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             "artifacts",
             "permissions",
             "trust",
-            "tick confirmation",
         ] {
             let mut state = State::new(true, 80, 24);
             state.chat = Some(chat);
@@ -151,18 +150,6 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                     console.state.lock().unwrap().workspace_trust =
                         Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")))
                 }
-                "tick confirmation" => {
-                    console.state.lock().unwrap().monitor.confirmation =
-                        Some(super::super::monitor::TickConfirmation {
-                            instance: "fixture-tick".into(),
-                            action: crate::terminal::tick_actions::builtin::artifact(
-                                "fixture-tick",
-                                'o',
-                            ),
-                            prompt: "Confirm fixture action?".into(),
-                            option: None,
-                        });
-                }
                 _ => unreachable!(),
             }
             let mut state = console.state.lock().unwrap();
@@ -174,9 +161,9 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             let (lines, row, _) = state.styled_frame();
             let expected = match surface {
                 "permission" | "question" | "plan" | "plan feedback" | "trust" => 12,
-                "help" => 13,
+                "help" => 15,
                 "settings" | "login" | "resume" => 6,
-                "artifacts" | "tick confirmation" => 5,
+                "artifacts" => 5,
                 "permissions" => 4,
                 _ => unreachable!(),
             };
