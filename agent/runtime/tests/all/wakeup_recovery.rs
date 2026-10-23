@@ -668,36 +668,41 @@ async fn an_accepted_tick_update_runs_after_a_crash_through_the_new_watch() {
     let model = ContractModel::new();
     let (agent, shell, chat) =
         subscribed_process(&root, directory.path(), task, model.clone()).await;
-    agent
-        .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    // A foreground `!` command keeps the accepted update from starting.
-    agent
-        .submit_user_shell(chat, "sleep 30".into(), false)
-        .await
-        .unwrap();
+    let old_watch = *shell.stream.watches().keys().next().unwrap();
+    let checked = agent.pause_next_for_tests(chat, PausePoint::TriggerChecked);
     shell.update(1, "accepted-not-started");
-    tokio::time::timeout(WAIT, async {
-        while !agent
+    tokio::time::timeout(WAIT, checked.entered)
+        .await
+        .expect("the accepted update reaches the boundary before it starts")
+        .unwrap();
+    assert!(
+        agent
             .snapshot(chat)
             .await
             .unwrap()
             .pending_inputs
             .iter()
             .any(|pending| pending.trigger_source.is_some())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the update waits behind the command");
+    );
     agent.flush_transcripts().await;
     let image = crash_image(&root, directory.path());
-    agent.shutdown().await;
+    let deliveries = stored_trigger_deliveries(&image, chat);
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0].state,
+        tickloop_agent_transcript::InputState::Accepted,
+        "the crash image retains the update before it starts"
+    );
+    // Begin shutdown before releasing the take, so this process cannot start the update.
+    let mut shutdown = Box::pin(agent.shutdown());
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    drop(checked.release);
+    shutdown.await;
 
     let restarted_model = ContractModel::new();
-    let (restarted, _shell) = resumed_process(&image, chat, task, restarted_model.clone()).await;
+    let (restarted, restarted_shell) =
+        resumed_process(&image, chat, task, restarted_model.clone()).await;
+    assert!(!restarted_shell.stream.watches().contains_key(&old_watch));
     restarted_model.wait_seen("accepted-not-started", 1).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(restarted_model.seen("accepted-not-started"), 1);
