@@ -163,7 +163,9 @@ async fn environment_setup_preview_and_save(fixture: &PrivateFixture) {
     .await;
     view.send(b"\x1b");
     view.wait_for("Environment settings return to Auto overview", |frame| {
-        frame.contains("Permissions · [Auto mode]") && frame.contains("Reviewer")
+        frame.contains("Permissions ·")
+            && frame.contains("[Auto mode]")
+            && frame.contains("Reviewer")
     })
     .await;
     view.send(b"\x1b");

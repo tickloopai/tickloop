@@ -2293,9 +2293,9 @@ async fn a_chat_cleared_away_keeps_running_without_writing_into_the_foreground()
     support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut command = trusted_async_agent_command();
+    command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
