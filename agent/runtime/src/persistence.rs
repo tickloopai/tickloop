@@ -2110,7 +2110,8 @@ struct RecoveredSnapshot {
 }
 
 /// 由对话链与元数据重建 Chat：工作目录取链上最后一个条目的 `cwd`，Branch 来源取 `branch-origin`
-/// 与标题元数据。`removed` 是本次恢复照 Claude Code 删除的消息。
+/// 与标题元数据。`removed` 是本次恢复照 Claude Code 删除的消息；`scheduled_now` 是定时任务所用的时钟。
+#[allow(clippy::too_many_arguments)]
 fn recover_transcript(
     chat_id: ChatId,
     loaded: &LoadedTranscript,
