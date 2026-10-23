@@ -1,6 +1,54 @@
 use super::*;
 use tickloop_agent_protocol::{GoalSnapshot, GoalStatus};
 
+#[test]
+fn continue_prompt_preserves_typed_and_pasted_messages_before_menu_cancellation_finishes() {
+    for pasted in [false, true] {
+        for draft in [
+            "Which answer did you give?",
+            "yes, inspect notes",
+            "no, try again",
+            "中文追问",
+        ] {
+            let chat = Uuid::new_v4();
+            let console = Console::test_interactive_for_chat(chat);
+            let mut status =
+                tickloop_agent_protocol::ChatStatus::of(&super::monitor_tests::chat_snapshot(chat));
+            status.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                reason: tickloop_agent_protocol::PauseReason::HistoryLoaded,
+            };
+            let mut menus = super::super::menus::Menus::default();
+            menus.offer_continue(&console, &status).unwrap();
+            let id = menus.id().unwrap();
+            let mut state = console.state.lock().unwrap();
+            state.prompt_enabled = true;
+            let event = if pasted {
+                state.paste(draft)
+            } else {
+                let mut characters = draft.chars();
+                let event = state.key(KeyEvent::new(
+                    KeyCode::Char(characters.next().unwrap()),
+                    KeyModifiers::NONE,
+                ));
+                for character in characters {
+                    assert!(
+                        state
+                            .key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                            .is_none()
+                    );
+                }
+                event
+            };
+            assert!(matches!(event, Some(InputEvent::Cancel { menu_id }) if menu_id == id));
+            assert!(state.menu.is_none());
+            assert_eq!(state.editor.draft(), draft);
+            assert!(
+                matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Prompt { text, .. }) if text == draft)
+            );
+        }
+    }
+}
+
 fn goal() -> GoalSnapshot {
     serde_json::from_value(serde_json::json!({
         "id": Uuid::from_u128(707), "objective": "Verify the release and record acceptance evidence",

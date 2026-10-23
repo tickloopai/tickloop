@@ -40,6 +40,7 @@ pub(super) struct DialogState {
     menu_review: Option<MenuReviewState>,
     full_review: bool,
     menu_plan: bool,
+    menu_continue: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
     question_menu: Option<QuestionMenu>,
@@ -107,6 +108,7 @@ impl DialogState {
         self.menu_review = None;
         self.full_review = false;
         self.menu_plan = false;
+        self.menu_continue = false;
         self.menu_comment = None;
         self.menu_expand_options.clear();
         self.question_menu = None;
@@ -237,6 +239,7 @@ impl State {
             menu_link: std::mem::replace(&mut self.menu_link, next.menu_link),
             full_review: std::mem::replace(&mut self.full_review, next.full_review),
             menu_plan: std::mem::replace(&mut self.menu_plan, next.menu_plan),
+            menu_continue: std::mem::replace(&mut self.menu_continue, next.menu_continue),
             menu_review: std::mem::replace(&mut self.menu_review, next.menu_review),
             menu_comment: std::mem::replace(&mut self.menu_comment, next.menu_comment),
             menu_expand_options: std::mem::replace(

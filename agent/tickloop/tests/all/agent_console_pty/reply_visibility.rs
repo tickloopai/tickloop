@@ -813,6 +813,8 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
             "loading history must not request the model"
         );
         eprintln!("[retention restarted]\n{restarted}");
+        resumed.keep_history_paused().await;
+        assert!(requests.try_recv().is_err());
         resumed.close().await;
     }
 }

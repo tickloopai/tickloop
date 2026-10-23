@@ -174,7 +174,8 @@ impl Session {
             let editor_has_focus = completed
                 .is_some_and(|output| output.rfind(CURSOR_VISIBLE) > output.rfind(CURSOR_HIDDEN));
             if editor_has_focus
-                && frame.contains("⏵⏵ ")
+                && (frame.contains("⏵⏵ ")
+                    || frame.contains("Triggers paused · send a message to resume"))
                 && frame.lines().any(|line| line.trim() == "❯")
             {
                 return;
@@ -185,6 +186,13 @@ impl Session {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+    fn keep_history_paused(&mut self) {
+        self.wait("Continue Chat?");
+        self.send(b"\x1b");
+        self.wait_without("Continue Chat?");
+        self.wait("Triggers paused · send a message to resume");
+        self.wait_for_editor();
     }
     fn exit(&mut self) {
         self.wait_for_editor();
@@ -422,7 +430,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
         });
 
     let mut session = Session::resume(&workdir, chat);
-    session.wait_for_editor();
+    session.keep_history_paused();
     session.wait("Monitor 1");
     session.wait("calendar:pty-member");
     session.send(b"jk");
@@ -447,7 +455,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     drop(session);
 
     let mut restarted = Session::resume(&workdir, chat);
-    restarted.wait_for_editor();
+    restarted.keep_history_paused();
     thread::sleep(Duration::from_millis(500));
     let frame = restarted.frame();
     assert!(

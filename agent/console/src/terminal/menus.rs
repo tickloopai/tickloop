@@ -1015,6 +1015,9 @@ impl Menus {
                 || matches!(&selection, Selection::Permission { request, .. } if request.name == ENTER_PLAN_MODE_TOOL_NAME);
             if plan_dialog {
                 console.show_plan_menu(menu, plan_feedback)?;
+            } else if matches!(&selection, Selection::Goal { actions, .. } if actions.iter().any(|action| matches!(action, goal::GoalMenuAction::Continue { .. })))
+            {
+                console.show_continue_menu(menu)?;
             } else if matches!(&selection, Selection::Provider { .. }) {
                 console.show_picker_menu(menu, PickerKind::Provider)?;
             } else if matches!(

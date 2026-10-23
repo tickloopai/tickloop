@@ -348,6 +348,21 @@ impl PtyView {
         .await;
     }
 
+    async fn keep_history_paused(&mut self) {
+        self.wait_for("history offers Continue", |frame| {
+            frame.contains("Continue Chat?") && frame.contains("Keep paused")
+        })
+        .await;
+        self.send(b"\x1b");
+        self.wait_for_editor("Esc returns to the history editor", Some(""))
+            .await;
+        self.wait_for("Esc keeps Trigger receiving paused", |frame| {
+            !frame.contains("Continue Chat?")
+                && frame.contains("Triggers paused · send a message to resume")
+        })
+        .await;
+    }
+
     async fn close(&mut self) {
         self.wait_for_editor("editor owns the close input", None)
             .await;

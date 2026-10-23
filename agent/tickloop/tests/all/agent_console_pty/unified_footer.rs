@@ -144,6 +144,8 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
         )
         .await;
     assert!(requests.try_recv().is_err());
+    resumed.keep_history_paused().await;
+    assert!(requests.try_recv().is_err());
     resumed.close().await;
 }
 

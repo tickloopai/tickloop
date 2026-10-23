@@ -314,7 +314,7 @@ impl Menus {
                     "Keep paused".into(),
                 ],
                 selected: 0,
-                confirmation: true,
+                confirmation: false,
             },
             Selection::Goal {
                 chat: status.id,

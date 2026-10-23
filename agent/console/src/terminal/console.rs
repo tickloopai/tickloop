@@ -596,6 +596,7 @@ pub(super) struct PickerPresentation {
 enum MenuFocus {
     WhenInputEmpty,
     Menu,
+    Continue,
     Plan,
     MenuWithLink(String),
     Secret(String),
@@ -848,6 +849,7 @@ pub(super) struct State {
     menu_review: Option<MenuReviewState>,
     full_review: bool,
     menu_plan: bool,
+    menu_continue: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
     question_menu: Option<QuestionMenu>,
@@ -3971,6 +3973,10 @@ impl Console {
         self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Menu)
     }
 
+    pub(super) fn show_continue_menu(&self, menu: Menu) -> Result<(), String> {
+        self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Continue)
+    }
+
     pub(super) fn show_picker_menu(&self, menu: Menu, kind: PickerKind) -> Result<(), String> {
         self.show_menu_with_comments(
             menu,
@@ -4325,6 +4331,7 @@ impl Console {
                             state.editor.draft().is_empty()
                         }
                         MenuFocus::Menu
+                        | MenuFocus::Continue
                         | MenuFocus::Plan
                         | MenuFocus::MenuWithLink(_)
                         | MenuFocus::Secret(_)
@@ -4337,6 +4344,7 @@ impl Console {
         state.review_focused = false;
         state.menu_rule_role = matches!(focus, MenuFocus::Plan).then_some(Role::PlanMode);
         state.menu_plan = matches!(focus, MenuFocus::Plan);
+        state.menu_continue = matches!(focus, MenuFocus::Continue);
         state.request_menu = state.request_layout.map(|_| menu.id);
         state.shell_background_chord_started_at = None;
         state.completion.dismiss();
@@ -4408,6 +4416,7 @@ impl Console {
             MenuFocus::MenuWithLink(address) => Some((menu.id, address)),
             MenuFocus::WhenInputEmpty
             | MenuFocus::Menu
+            | MenuFocus::Continue
             | MenuFocus::Plan
             | MenuFocus::Secret(_)
             | MenuFocus::Input(_)
@@ -5814,6 +5823,7 @@ impl State {
             menu_review: None,
             full_review: false,
             menu_plan: false,
+            menu_continue: false,
             menu_comment: None,
             menu_expand_options: Vec::new(),
             question_menu: None,
@@ -7687,6 +7697,8 @@ impl State {
                 "pgup/pgdn review · tab actions · esc deny".into()
             } else if let Some(question) = &self.question_menu {
                 question_menu_hint(question, selected)
+            } else if self.menu_continue {
+                "enter choose · type a message · esc keep paused".into()
             } else if menu.confirmation {
                 if self.selected_menu_can_expand() {
                     "enter/y exact · tab prefixes · n/esc deny".into()
@@ -9771,6 +9783,21 @@ impl State {
         };
     }
 
+    fn dismiss_continue_for_input(&mut self) -> Option<Uuid> {
+        if !self.menu_continue
+            || !self.prompt_enabled
+            || !self.menu_is_visible()
+            || self.menu_submission_is_pending()
+            || self.branch_submission_owns_input()
+        {
+            return None;
+        }
+        let id = self.menu.as_ref()?.id;
+        // Release the editor before handling Cancel so a burst of message input stays intact.
+        self.clear_menu(id);
+        Some(id)
+    }
+
     fn clear_menu(&mut self, id: Uuid) -> bool {
         if self.clear_hidden_menu(id) {
             return true;
@@ -10316,6 +10343,12 @@ impl State {
         }
         if self.input_dialog_requires_resize() {
             return None;
+        }
+        if !text.is_empty()
+            && let Some(menu_id) = self.dismiss_continue_for_input()
+        {
+            self.paste(text);
+            return Some(InputEvent::Cancel { menu_id });
         }
         if self.ordinary_input_is_visible() {
             self.clear_prompt_suggestion();
@@ -11983,6 +12016,16 @@ impl State {
             return None;
         }
         let menu_is_visible = self.menu_is_visible();
+        if let KeyCode::Char(character) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !matches!(character, 'j' | 'k')
+            && let Some(menu_id) = self.dismiss_continue_for_input()
+        {
+            self.insert(&character.to_string());
+            return Some(InputEvent::Cancel { menu_id });
+        }
         if self.menu_focused
             && menu_is_visible
             && let Some(event) = self.question_menu_key(key)

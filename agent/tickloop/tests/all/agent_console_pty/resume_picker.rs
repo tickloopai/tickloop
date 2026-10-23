@@ -179,9 +179,11 @@ async fn run_resume_picker(fixture: &PrivateFixture) {
         "opening saved history must not call the model"
     );
 
+    view.keep_history_paused().await;
+    assert!(requests.try_recv().is_err(), "Esc must not call the model");
     view.send(format!("{FOLLOW_UP}\r").as_bytes());
     view.wait_for("explicit follow-up answered", |frame| {
-        frame.contains(FOLLOW_UP_REPLY)
+        frame.contains(FOLLOW_UP_REPLY) && !frame.contains("Triggers paused")
     })
     .await;
     let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
@@ -193,6 +195,54 @@ async fn run_resume_picker(fixture: &PrivateFixture) {
     assert!(sent.contains(FOLLOW_UP), "{sent}");
     assert!(!sent.contains(NEWER_DUPLICATE_REPLY), "{sent}");
     view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_typing_into_continue_prompt_preserves_the_message_and_resumes_receiving() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let chats = save_conversations(&fixture).await;
+        let (base_url, mut requests) =
+            model_http_support::serve_responses(vec![(200, chat_reply(None, FOLLOW_UP_REPLY))])
+                .await;
+        fixture.set_chat_model(&base_url);
+        let chat = chats[1].to_string();
+        let mut view = PtyView::launch(&fixture, &["--resume", &chat], &[], true);
+        view.wait_for("history offers Continue before typing", |frame| {
+            frame.contains("Continue Chat?") && frame.contains(OLDER_DUPLICATE_REPLY)
+        })
+        .await;
+        assert!(requests.try_recv().is_err());
+        let follow_up = format!("no, {FOLLOW_UP}");
+        view.send(follow_up.as_bytes());
+        view.wait_for_editor("typing preserves the full draft", Some(&follow_up))
+            .await;
+        assert!(view.frame().contains("Triggers paused"));
+        assert!(
+            requests.try_recv().is_err(),
+            "a draft must not resume execution"
+        );
+        view.send(b"\r");
+        view.wait_for("typed follow-up answered and receiving resumed", |frame| {
+            frame.contains(FOLLOW_UP_REPLY) && !frame.contains("Triggers paused")
+        })
+        .await;
+        let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = request["messages"].to_string();
+        assert!(sent.contains(&follow_up), "{sent}");
+        assert!(sent.contains(OLDER_DUPLICATE_REPLY), "{sent}");
+        assert!(!sent.contains(NEWER_DUPLICATE_REPLY), "{sent}");
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
