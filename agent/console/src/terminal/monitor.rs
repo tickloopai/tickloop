@@ -126,7 +126,7 @@ pub(super) struct Monitor {
     listed_instances: BTreeSet<InstanceRef>,
     pub(super) auto_shown: bool,
     pub(super) entry_flash_at_ms: Option<u64>,
-    entry_signal: Option<(MonitorFlash, u64)>,
+    entry_signal: Option<(RowFlash, u64)>,
     received: HashMap<InstanceRef, u64>,
     task_fires: HashMap<String, Option<u64>>,
     task_flashes: HashMap<String, u64>,
@@ -194,12 +194,6 @@ pub(super) struct MonitorFrame {
     pub(super) lines: Vec<RoleLine>,
     pub(super) targets: Vec<(usize, MonitorTarget)>,
     pub(super) tick_rows: std::ops::Range<usize>,
-}
-
-#[derive(Clone, Copy)]
-enum MonitorFlash {
-    Row(RowFlash),
-    Update,
 }
 
 struct TickLines {
@@ -464,7 +458,7 @@ impl Monitor {
             {
                 let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
                 self.goal_continued_at_ms = Some(now_ms);
-                self.note_entry_flash(MonitorFlash::Row(RowFlash::TakeIn), now_ms);
+                self.note_entry_flash(RowFlash::TakeIn, now_ms);
             }
         }
         if previous.is_none() {
@@ -620,7 +614,7 @@ impl Monitor {
                 .insert(task.id.clone(), task.last_fired_at_ms);
             if previous.is_some_and(|previous| task.last_fired_at_ms > previous) {
                 self.task_flashes.insert(task.id.clone(), now_ms);
-                self.note_entry_flash(MonitorFlash::Row(RowFlash::TakeIn), now_ms);
+                self.note_entry_flash(RowFlash::TakeIn, now_ms);
             }
         }
         self.task_fires
@@ -685,7 +679,7 @@ impl Monitor {
                 let previous = self.used.get(&entry.instance).copied();
                 if previous.is_none_or(|previous| used > previous) {
                     self.used.insert(entry.instance.clone(), used);
-                    signals.push((MonitorFlash::Row(RowFlash::Use), used));
+                    signals.push((RowFlash::Use, used));
                 }
             }
             if let Some(taken_in) = membership
@@ -700,7 +694,7 @@ impl Monitor {
                 let previous = self.seen_take_ins.insert(entry.instance.clone(), taken_in);
                 if previous != Some(taken_in) && taken_in >= flashes_since {
                     self.taken_in.insert(entry.instance.clone(), taken_in);
-                    signals.push((MonitorFlash::Row(RowFlash::TakeIn), taken_in));
+                    signals.push((RowFlash::TakeIn, taken_in));
                 }
             }
             let at_ms = entry.update.as_ref().map(|update| update.at_ms);
@@ -715,17 +709,9 @@ impl Monitor {
                     continue;
                 }
                 self.update_flashes.insert(entry.instance.clone(), now_ms);
-                if entry.subscription.is_some_and(|mark| mark.is_waiting)
-                    || entry
-                        .update
-                        .as_ref()
-                        .is_some_and(|update| update.unread.is_some())
-                {
-                    signals.push((MonitorFlash::Update, now_ms));
-                }
                 if native_content && at_ms.is_some_and(|at| at >= flashes_since) {
                     self.received.insert(entry.instance.clone(), now_ms);
-                    signals.push((MonitorFlash::Row(RowFlash::TakeIn), now_ms));
+                    signals.push((RowFlash::TakeIn, now_ms));
                 }
             }
             listed_updates.insert(entry.instance.clone(), at_ms);
@@ -870,12 +856,12 @@ impl Monitor {
     /// update in and the Agent using its instance, so a flash that starts covers one under way.
     pub(super) fn flash_use(&mut self, instance: InstanceRef, since_ms: u64) {
         self.used.insert(instance, since_ms);
-        self.note_entry_flash(MonitorFlash::Row(RowFlash::Use), since_ms);
+        self.note_entry_flash(RowFlash::Use, since_ms);
     }
 
     pub(super) fn flash_received(&mut self, instance: InstanceRef, since_ms: u64) {
         self.received.insert(instance, since_ms);
-        self.note_entry_flash(MonitorFlash::Row(RowFlash::TakeIn), since_ms);
+        self.note_entry_flash(RowFlash::TakeIn, since_ms);
     }
 
     pub(super) fn flash_trigger(
@@ -892,10 +878,10 @@ impl Monitor {
             }
             _ => return,
         }
-        self.note_entry_flash(MonitorFlash::Row(RowFlash::TakeIn), since_ms);
+        self.note_entry_flash(RowFlash::TakeIn, since_ms);
     }
 
-    fn note_entry_flash(&mut self, flash: MonitorFlash, since_ms: u64) {
+    fn note_entry_flash(&mut self, flash: RowFlash, since_ms: u64) {
         if self
             .entry_signal
             .is_none_or(|(_, previous)| since_ms >= previous)
@@ -908,12 +894,7 @@ impl Monitor {
         if let Some((flash, since)) = self.entry_signal
             && display.flash_strong(since, now_ms).is_some()
         {
-            return match flash {
-                MonitorFlash::Row(flash) => {
-                    list_row::flash_fill(Some((flash, since)), display, now_ms)
-                }
-                MonitorFlash::Update => Some(list_row::update_mark(Some(since), display, now_ms)),
-            };
+            return list_row::flash_fill(Some((flash, since)), display, now_ms);
         }
         self.entry_flash_at_ms
             .filter(|since| display.flash_strong(*since, now_ms) == Some(true))
@@ -2120,11 +2101,10 @@ mod signal_tests {
     }
 
     #[test]
-    fn collapsed_entry_shares_update_glyph_phases_and_never_replays_a_refresh() {
+    fn an_update_not_yet_in_the_stream_flashes_its_glyph_but_not_the_collapsed_entry() {
         let (mut monitor, update) = updated_monitor(Some(chat()));
         let display = DisplayProfile::default();
         monitor.rebuild_at(UPDATED_AT);
-        assert_eq!(monitor.entry_flash_role(display, UPDATED_AT), None);
         *update.lock().unwrap() = Some(UPDATED_AT + 100);
         let since = UPDATED_AT + 200;
         monitor.rebuild_at(since);
@@ -2133,19 +2113,10 @@ mod signal_tests {
             (400, Role::UpdateMarkDim),
             (800, Role::UpdateMark),
         ] {
-            assert_eq!(
-                monitor.entry_flash_role(display, since + elapsed),
-                Some(role)
-            );
             assert_eq!(glyph(&monitor, display, since + elapsed), Some(role));
+            assert_eq!(monitor.entry_flash_role(display, since + elapsed), None);
         }
-        assert_eq!(
-            monitor.next_entry_flash_ms(display, since + 900),
-            Some(since + 1200)
-        );
-        monitor.rebuild_at(since + 1500);
-        assert_eq!(monitor.entry_flash_role(display, since + 1500), None);
-        assert_eq!(monitor.next_entry_flash_ms(display, since + 1500), None);
+        assert_eq!(monitor.next_entry_flash_ms(display, since), None);
     }
 
     #[test]
