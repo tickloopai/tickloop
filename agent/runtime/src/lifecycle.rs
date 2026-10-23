@@ -101,17 +101,11 @@ pub(crate) struct Lifecycle {
     revision: u64,
 }
 
+/// The revisions of a ledger's Trigger records at one moment.
+pub(crate) struct TriggerRevisions(HashMap<InputId, u64>);
+
 fn now() -> String {
     format_timestamp(unix_time_milliseconds())
-}
-
-/// How far an input got: accepted, started, settled.
-fn progress(state: &InputState) -> u8 {
-    match state {
-        InputState::Accepted => 0,
-        InputState::Started => 1,
-        InputState::Settled { .. } => 2,
-    }
 }
 
 impl Lifecycle {
@@ -276,8 +270,9 @@ impl Lifecycle {
             .is_some_and(|input| input.state == InputState::Started)
     }
 
-    /// Takes back the start of `queued`'s input, which has not run: a newer record has it
-    /// accepted and waiting again, with its content, whatever lands of the start before it.
+    /// Takes back the start of `queued`'s input made ahead of it: a newer record has it
+    /// accepted and waiting again, with its content, whatever lands of the start before it. A
+    /// start the input itself followed, its content in the conversation, is never taken back.
     pub(crate) fn take_start_back(&mut self, queued: &PendingInput) {
         let Some(id) = self.open_inputs.get(&queued.receipt.run_id).copied() else {
             return;
@@ -285,6 +280,7 @@ impl Lifecycle {
         let revision = self.next_revision();
         if let Some(input) = self.inputs.get_mut(&id)
             && input.record.state == InputState::Started
+            && input.record.queued.is_some()
         {
             input.record.state = InputState::Accepted;
             input.record.queued =
@@ -835,11 +831,10 @@ impl Lifecycle {
     }
 
     /// The store's latest record of each Trigger input in `lines`, in place of this ledger's,
-    /// as a load reads them: what another process accepted, started or settled is known here as
-    /// it is there. This ledger's record stays where it is further along, and where it started
-    /// here and the store only says another loader found it started and interrupted it, which
-    /// ran nothing. The adopted records keep revision 0: the store holds them already, so no
-    /// recorder writes them again.
+    /// as the lease holder reads them: the record written last stands, whoever wrote it and
+    /// however far along this ledger had the input, so what another holder took back stands
+    /// over what it had started. The adopted records keep revision 0: the store holds them
+    /// already, so no recorder writes them again.
     pub(crate) fn adopt_trigger_records<'a>(&mut self, lines: impl IntoIterator<Item = &'a Line>) {
         let mut stored: HashMap<InputId, &InputEntry> = HashMap::new();
         for line in lines {
@@ -850,25 +845,15 @@ impl Lifecycle {
             }
         }
         for (id, entry) in stored {
-            if let Some(known) = self.inputs.get(&id) {
-                let interrupted_by_a_loader = known.record.state == InputState::Started
-                    && entry.state
-                        == (InputState::Settled {
-                            outcome: SettledOutcome::Interrupted {
-                                by: InterruptedBy::Host,
-                            },
-                        });
-                if known.record == *entry
-                    || interrupted_by_a_loader
-                    || progress(&known.record.state) > progress(&entry.state)
-                {
-                    continue;
-                }
-                if self.open_inputs.get(&known.record.run_id) == Some(&id) {
-                    self.open_inputs.remove(&known.record.run_id);
-                }
+            if self
+                .inputs
+                .get(&id)
+                .is_some_and(|known| known.record == *entry)
+            {
+                continue;
             }
-            if entry.state == InputState::Accepted {
+            self.open_inputs.retain(|_, open| *open != id);
+            if !matches!(entry.state, InputState::Settled { .. }) {
                 self.open_inputs.insert(entry.run_id, id);
             }
             self.inputs.insert(
@@ -878,6 +863,45 @@ impl Lifecycle {
                     revision: 0,
                 },
             );
+        }
+    }
+
+    /// The Runs of Trigger input recorded as begun, its content in the conversation, and not
+    /// settled: what a holder gone since left running.
+    pub(crate) fn begun_trigger_runs(&self) -> Vec<RunId> {
+        self.inputs
+            .values()
+            .map(|input| &input.record)
+            .filter(|input| {
+                input.trigger.is_some()
+                    && input.state == InputState::Started
+                    && input.queued.is_none()
+            })
+            .map(|input| input.run_id)
+            .collect()
+    }
+
+    /// The revision of each Trigger record now, which [`Self::leave_trigger_guesses_unrecorded`]
+    /// puts back.
+    pub(crate) fn trigger_revisions(&self) -> TriggerRevisions {
+        TriggerRevisions(
+            self.inputs
+                .iter()
+                .filter(|(_, input)| input.record.trigger.is_some())
+                .map(|(id, input)| (*id, input.revision))
+                .collect(),
+        )
+    }
+
+    /// Whatever changed Trigger records since `before` is a guess at what the Chat's lease
+    /// holder will find, as a load makes without the lease: no recorder writes it, so the
+    /// store keeps the records as their holder wrote them, and the next holder adopts those
+    /// over the guess.
+    pub(crate) fn leave_trigger_guesses_unrecorded(&mut self, before: TriggerRevisions) {
+        for (id, input) in &mut self.inputs {
+            if input.record.trigger.is_some() {
+                input.revision = before.0.get(id).copied().unwrap_or(0);
+            }
         }
     }
 

@@ -59,6 +59,9 @@ const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
 const RECEIVING_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
+/// How long a source waits to enter the Chat's Trigger boundary before it hears the Chat is
+/// busy: a take holds the boundary while the record of its start is retried.
+const SOURCE_BOUNDARY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const HELD_ELSEWHERE_MESSAGE: &str =
     "another Tickloop process holds this Chat's Trigger; the event was not delivered";
 
@@ -633,6 +636,17 @@ impl Agent {
         self.inner.chat_leases.boundary(chat_id).lock_owned().await
     }
 
+    /// Enters the Chat's Trigger boundary for a source, as long as it is free soon enough;
+    /// `None` while it stays held.
+    pub(super) async fn enter_trigger_boundary_for_source(
+        &self,
+        chat_id: ChatId,
+    ) -> Option<TriggerBoundary> {
+        tokio::time::timeout(SOURCE_BOUNDARY_WAIT, self.enter_trigger_boundary(chat_id))
+            .await
+            .ok()
+    }
+
     /// How many wait to enter the Chat's Trigger boundary now.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
@@ -871,11 +885,22 @@ impl Agent {
                     let holding = match taken {
                         LeaseTaken::Held(holding) | LeaseTaken::PausedElsewhere(holding) => holding,
                     };
-                    self.stop_sources(chat_id, holding).await;
+                    self.switch_sources(chat_id, holding, change).await;
                 }
                 self.inner.chat_leases.release(chat_id);
             }
-            ReceivingChange::Resumed => {}
+            ReceivingChange::Resumed => {
+                // The sources resume with the Loop under the lease. One taken for that alone
+                // goes back once they are recorded, for the first delivery to take as before.
+                let held_before = self.inner.chat_leases.holding(chat_id).is_some();
+                if self.has_trigger_source_states()
+                    && let Ok(LeaseTaken::Held(holding)) = self.take_lease(chat_id, &within).await
+                    && self.switch_sources(chat_id, holding, change).await
+                    && !held_before
+                {
+                    self.inner.chat_leases.release(chat_id);
+                }
+            }
         }
         if let Err(error) = recorded {
             self.inner.chat_leases.set_notice(

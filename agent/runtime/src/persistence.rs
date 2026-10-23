@@ -353,23 +353,11 @@ impl ChatRecorder {
     pub(super) fn record_family_message_hold(&self, chat: &Chat, stopped_runs: HashSet<RunId>) {
         // Sync advances the lifecycle revision baseline with the records queued alongside the
         // hold. An append already in progress may drain this group before the next dirty flush.
-        let Some(mut lines) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
-            return;
-        };
-        lines.push(Line::FamilyMessageHold(
-            tickloop_agent_transcript::FamilyMessageHoldEntry {
-                chat_id: chat.snapshot.id,
-                stopped_runs,
-            },
-        ));
-        self.outbox.set_display_leaf(
-            chat.snapshot.id,
-            chat.bookkeeping
-                .lifecycle
-                .display_leaf(&chat.snapshot, &chat.bookkeeping.message_responses),
-        );
-        self.outbox
-            .enqueue(chat.snapshot.id, lines, Some(chat.snapshot.last_sequence));
+        let hold = Line::FamilyMessageHold(tickloop_agent_transcript::FamilyMessageHoldEntry {
+            chat_id: chat.snapshot.id,
+            stopped_runs,
+        });
+        self.enqueue_with_sync(&chat.snapshot, &chat.bookkeeping, vec![hold], Vec::new());
     }
 
     pub(super) fn record_family_inputs(
@@ -980,16 +968,34 @@ impl ChatRecorder {
     }
 
     fn enqueue_sync(&self, snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) {
-        if let Some(lines) = self.sync_chat(snapshot, bookkeeping) {
-            self.outbox.set_display_leaf(
-                snapshot.id,
-                bookkeeping
-                    .lifecycle
-                    .display_leaf(snapshot, &bookkeeping.message_responses),
-            );
-            self.outbox
-                .enqueue(snapshot.id, lines, Some(snapshot.last_sequence));
-        }
+        self.enqueue_with_sync(snapshot, bookkeeping, Vec::new(), Vec::new());
+    }
+
+    /// Queues what the Chat changed since its last sync, then `lines` and the Trigger source
+    /// records `source_states`, as one group the store takes whole.
+    fn enqueue_with_sync(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        lines: Vec<Line>,
+        source_states: Vec<Line>,
+    ) {
+        let Some(mut synced) = self.sync_chat(snapshot, bookkeeping) else {
+            return;
+        };
+        synced.extend(lines);
+        self.outbox.set_display_leaf(
+            snapshot.id,
+            bookkeeping
+                .lifecycle
+                .display_leaf(snapshot, &bookkeeping.message_responses),
+        );
+        self.outbox.enqueue_group(
+            snapshot.id,
+            synced,
+            source_states,
+            Some(snapshot.last_sequence),
+        );
     }
 
     /// 差分依据：运行时对消息只有三种修改：追加新消息；向最后一条消息追加内容块（并行工具
@@ -2619,22 +2625,16 @@ impl Agent {
         Ok(())
     }
 
-    /// Queues a record of a Trigger source's own state, for its lease holder.
-    pub(super) fn queue_source_state(&self, chat_id: ChatId, line: Line) {
-        let Some(recorder) = &self.inner.recorder else {
-            return;
-        };
-        if !recorder.logs.lock().unwrap().contains_key(&chat_id) {
-            return;
-        }
-        recorder.outbox.enqueue_source_state(chat_id, line);
-        recorder.notify.notify_one();
-        self.ensure_flush_loop(recorder);
-    }
-
-    /// Queues for the Chat's Transcript what it changed so far, ahead of whatever is recorded of
-    /// it next.
-    pub(super) fn queue_for_transcript(&self, chat: &Chat) {
+    /// Queues for the Chat's Transcript what it changed so far, then the metadata `lines` and
+    /// the records `source_states` a Trigger source made of its own state with that change: one
+    /// group the store takes whole, so no crash keeps the change without the source's part, or
+    /// the source's part without the change.
+    pub(super) fn queue_with_source_states(
+        &self,
+        chat: &Chat,
+        lines: Vec<Line>,
+        source_states: Vec<Line>,
+    ) {
         if let Some(recorder) = &self.inner.recorder
             && recorder
                 .logs
@@ -2642,12 +2642,10 @@ impl Agent {
                 .unwrap()
                 .contains_key(&chat.snapshot.id)
         {
-            recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
+            recorder.enqueue_with_sync(&chat.snapshot, &chat.bookkeeping, lines, source_states);
         }
     }
 
-    /// Whether the store holds anything of the Chat yet: a process host records nothing ahead of
-    /// its conversation.
     pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {
         self.inner
             .recorder
