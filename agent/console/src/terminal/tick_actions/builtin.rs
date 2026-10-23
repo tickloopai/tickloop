@@ -14,13 +14,7 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
         TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
         TickIntent::OpenView(instance) => Arc::new(OpenView { instance }),
-        TickIntent::CloseHosted {
-            instance,
-            ends_process,
-        } => Arc::new(CloseHosted {
-            instance,
-            ends_process,
-        }),
+        TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
         TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted { instance }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
@@ -124,7 +118,7 @@ async fn refresh_subscriptions(ctx: &TickActionContext<'_>) -> Result<(), String
     ctx.console.update_subscribed_ticks(ctx.chat, &rows)
 }
 /// Changes or cancels one subscription. A refusal shows in the subscription detail `panel` while
-/// it is open, else on the status line, and Monitor stops showing a frequency the Agent refused;
+/// it is open, else in Monitor’s bottom status row, and Monitor stops showing a frequency the Agent refused;
 /// either way Monitor then shows the subscriptions as the Agent holds them.
 pub(in crate::terminal) fn change_subscription(
     panel: Option<Uuid>,
@@ -421,13 +415,13 @@ async fn settle_float(
 ) -> Result<(), String> {
     match floated {
         Ok(()) => {}
-        Err(NotFloated::Busy) => ctx.console.hold_status(HERDR_BUSY)?,
-        Err(NotFloated::Unknown(reason)) => ctx.console.hold_status(&format!(
+        Err(NotFloated::Busy) => ctx.notify(HERDR_BUSY)?,
+        Err(NotFloated::Unknown(reason)) => ctx.notify(&format!(
             "The Herdr popup may have opened ({reason}); look in Herdr before opening again"
         ))?,
-        Err(NotFloated::RegistrationFailed(reason)) => ctx
-            .console
-            .hold_status(&format!("Cannot register Tickloop's Herdr popup: {reason}"))?,
+        Err(NotFloated::RegistrationFailed(reason)) => {
+            ctx.notify(&format!("Cannot register Tickloop's Herdr popup: {reason}"))?
+        }
         Err(_) => return open_full_screen(ctx, instance).await,
     }
     Ok(())
@@ -508,33 +502,12 @@ impl TickActionBackend for RemoveFromMonitor {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
-        ctx.notify(&removed_message(subscriptions.len()))
+        Ok(())
     }
-}
-fn removed_message(subscriptions: usize) -> String {
-    if subscriptions == 0 {
-        "Removed from Monitor".into()
-    } else {
-        format!(
-            "Removed from Monitor · {} cancelled",
-            tick_subscriptions(subscriptions)
-        )
-    }
-}
-fn tick_subscriptions(count: usize) -> String {
-    format!(
-        "{count} Tick {}",
-        if count == 1 {
-            "Subscription"
-        } else {
-            "Subscriptions"
-        }
-    )
 }
 /// Ends a hosted Tick this Chat opened and removes its row and Tick Subscriptions.
 struct CloseHosted {
     instance: tick_protocol::InstanceRef,
-    ends_process: bool,
 }
 impl TickActionExecutor for CloseHosted {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -543,7 +516,6 @@ impl TickActionExecutor for CloseHosted {
             REMOVE_KEY,
             Arc::new(CloseHosted {
                 instance: self.instance.clone(),
-                ends_process: self.ends_process,
             }),
         ))
     }
@@ -582,11 +554,7 @@ impl TickActionBackend for CloseHosted {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
-        ctx.notify(&if self.ends_process {
-            format!("Tick closed · {}", removed_message(subscriptions.len()))
-        } else {
-            removed_message(subscriptions.len())
-        })
+        Ok(())
     }
 }
 
@@ -616,14 +584,9 @@ impl TickActionBackend for ReopenHosted {
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
         refresh_subscriptions(&ctx).await?;
-        ctx.notify(&match restore_error {
-            Some(error) => format!(
-                "Reopened {} as {reopened}; {}",
-                self.instance,
-                safe_text(&error)
-            ),
-            None => format!("Reopened {} as {reopened}", self.instance),
-        })?;
+        if let Some(error) = restore_error {
+            ctx.notify(&format!("Reopened as {reopened}; {}", safe_text(&error)))?;
+        }
         Ok(())
     }
 }
@@ -745,7 +708,7 @@ impl TickActionBackend for StopShell {
             .await
             .map_err(|error| error.to_string())?;
         ctx.console.refresh_monitor_ticks(snapshot, None)?;
-        ctx.notify("Shell stopped")
+        Ok(())
     }
 }
 struct Refresh {

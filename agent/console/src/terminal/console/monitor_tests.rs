@@ -416,6 +416,9 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                     .iter()
                     .map(|target| target.row)
                     .collect::<Vec<_>>();
+                let heading = format!("{} (1)", group.title());
+                assert!(state.rendered_screen[0].contains(&heading));
+                assert_eq!(rows[0], 1, "the first entry follows its group heading");
                 assert_eq!(
                     rows[0],
                     state
@@ -633,7 +636,25 @@ async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifi
         let state = console.state.lock().unwrap();
         assert_eq!(state.monitor.entries()[0].title, "Cached title");
         assert!(state.monitor.entries()[0].status.contains("refresh failed"));
-        assert!(state.status.contains("Artifact refresh failed"));
+        assert!(state.status.is_empty());
+        assert!(
+            state
+                .monitor
+                .action_error
+                .as_ref()
+                .unwrap()
+                .contains("Artifact refresh failed")
+        );
+        assert!(
+            state
+                .monitor
+                .frame(80, 12, state.display, 0)
+                .lines
+                .last()
+                .unwrap()
+                .text()
+                .contains("Artifact refresh failed")
+        );
     }
     core.shutdown().await;
 }
@@ -2477,7 +2498,7 @@ fn the_subscription_footer_stays_at_the_panel_bottom() {
 }
 
 #[tokio::test]
-async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_and_reports_it() {
+async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_silently() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
@@ -2556,16 +2577,13 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
         action
     };
     execute(removal, context).await.unwrap();
+    assert!(console.test_status_text().is_empty());
     {
         let mut state = console.state.lock().unwrap();
+        assert!(!state.status_held);
         state.refresh_status("Working");
-        assert!(state.status_held);
+        assert_eq!(state.status, "Working");
     }
-
-    assert_eq!(
-        console.test_status_text(),
-        "Removed from Monitor · 1 Tick Subscription cancelled"
-    );
     assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
     assert!(
         agent
@@ -2708,7 +2726,7 @@ fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
 
 /// A running Shell is stopped from its Monitor row and its row shows it ended.
 #[tokio::test]
-async fn a_running_shell_is_stopped_from_its_row_after_confirmation_with_feedback() {
+async fn a_running_shell_is_stopped_from_its_row_after_confirmation_silently() {
     use crate::terminal::{
         execution::ConsoleExecution,
         task_access::ShellTaskCenter,
@@ -2779,7 +2797,7 @@ async fn a_running_shell_is_stopped_from_its_row_after_confirmation_with_feedbac
     };
     assert_eq!(action.instance, shell.to_string());
     execute(action, context).await.unwrap();
-    assert_eq!(console.test_status_text(), "Shell stopped");
+    assert!(console.test_status_text().is_empty());
     assert!(console.state.lock().unwrap().monitor.detail.is_none());
     tokio::time::timeout(Duration::from_secs(5), async {
         while !task_state(&center.snapshot(chat).await.unwrap())
@@ -3284,7 +3302,7 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
 }
 
 #[tokio::test]
-async fn closing_and_reopening_a_hosted_tick_execute_directly_and_report_the_result() {
+async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
     use crate::monitor_rows::TickIntent;
     use crate::terminal::execution::ConsoleExecution;
     use tickloop_agent_daemon::EmbeddedAgentAccess;
@@ -3362,10 +3380,7 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_report_the_res
         .unwrap();
     assert!(matches!(remote.commands.lock().unwrap().as_slice(),
         [AgentCommand::ReopenHostedTick { instance, restore_subscriptions: true, .. }] if instance == &watched));
-    assert_eq!(
-        console.test_status_text(),
-        format!("Reopened {watched} as {}", remote.reopened)
-    );
+    assert!(console.test_status_text().is_empty());
     run_intent(
         context,
         TickIntent::CloseHosted {
@@ -3377,10 +3392,7 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_report_the_res
     .unwrap();
     assert!(matches!(&remote.commands.lock().unwrap()[1],
         AgentCommand::CloseHostedTick { instance, .. } if instance == &watched));
-    assert_eq!(
-        console.test_status_text(),
-        "Tick closed · Removed from Monitor"
-    );
+    assert!(console.test_status_text().is_empty());
     assert!(
         core.snapshot(chat)
             .await
@@ -3456,7 +3468,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
         panic!("no deletion action")
     };
     execute(action, context).await.unwrap();
-    assert_eq!(console.test_status_text(), "Scheduled task removed");
+    assert!(console.test_status_text().is_empty());
     assert!(
         core.snapshot(chat)
             .await
@@ -3502,7 +3514,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
         assert!(state.monitor.detail.is_none());
         assert!(state.monitor.task_list_is_open());
     }
-    assert_eq!(console.test_status_text(), "Scheduled task removed");
+    assert!(console.test_status_text().is_empty());
     assert_eq!(core.snapshot(chat).await.unwrap().scheduled_tasks.len(), 3);
     core.shutdown().await;
 }
@@ -3643,9 +3655,10 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert_eq!(screen[0], "Monitor");
-        assert!(screen[1].is_empty());
-        assert_eq!(screen[2], "Ticks (2)");
+        assert_eq!(screen[0], "Ticks (2)");
+        let shells = screen.iter().position(|line| line == "Shells (1)").unwrap();
+        assert!(screen[shells - 1].is_empty());
+        assert!(!frame.targets.iter().any(|(row, _)| *row == shells - 1));
         let shell_row = screen
             .iter()
             .position(|line| line.starts_with("$ sleep 900"))
@@ -3655,7 +3668,7 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
             .position(|line| line == "Scheduled (1)")
             .unwrap();
         let padding = shell_row + 1..frame.tick_rows.end;
-        assert_eq!(padding.len(), height - 14, "{screen:#?}");
+        assert_eq!(padding.len(), height - 13, "{screen:#?}");
         assert!(
             screen[padding.clone()].iter().all(String::is_empty),
             "{screen:#?}"
@@ -3673,7 +3686,7 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
             frame
                 .targets
                 .iter()
-                .all(|(row, _)| *row != 1 && !padding.contains(row) && *row != frame.tick_rows.end)
+                .all(|(row, _)| *row != 0 && !padding.contains(row) && *row != frame.tick_rows.end)
         );
         let find = |text: &str| screen.iter().find(|line| line.contains(text)).unwrap();
         assert!(find("Quote · TSLA.US").starts_with("◉ "));
@@ -3952,7 +3965,7 @@ fn tick_status_keeps_existing_compression_priorities_at_narrow_heights() {
                 .iter()
                 .all(|line| display_width(&line.text()) <= 30)
         );
-        assert_eq!(footer, height >= 8);
+        assert_eq!(footer, height >= 7);
     }
 }
 
@@ -3993,7 +4006,8 @@ fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_height
     assert!(text.contains("Scheduled instruction 3"));
     assert!(!text.contains("Scheduled instruction 4"));
     assert!(text.contains("+2 more"));
-    assert!(text.starts_with("Monitor\n"));
+    assert!(!text.lines().any(|line| line == "Monitor"));
+    assert_eq!(after.tick_rows.start, 0);
     assert!(!text.contains("of 130"));
     for height in [4, 5, 6, 7, 8, 10, 12, 16] {
         let frame = state.monitor.frame(30, height, state.display, 0);
@@ -4715,9 +4729,67 @@ fn initial_monitor_sources_arriving_separately_do_not_reveal_existing_content() 
 }
 
 #[test]
+fn monitor_group_gaps_yield_before_dock_gaps_and_content() {
+    let mut state = docked_monitor_fixture(3, 1);
+    state.monitor.replace(
+        TickGroup::Shells,
+        vec![shell(Uuid::from_u128(100), "Shell command")],
+    );
+    let mut artifact = shell(Uuid::from_u128(101), "Brief");
+    artifact.instance = "artifact:https://docs.example/brief".parse().unwrap();
+    artifact.group = TickGroup::Artifacts;
+    artifact.glyph = Glyph::ArtifactTick;
+    state.monitor.replace(TickGroup::Artifacts, vec![artifact]);
+    let first = state.monitor.entries()[0].instance.clone();
+    state.monitor.select(&first);
+    for height in 12..=20 {
+        let frame = state.monitor.frame(48, height, state.display, 0);
+        let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+        assert!(lines[0].starts_with("Artifacts (1)"), "{lines:#?}");
+        let group_gaps = lines[frame.tick_rows.clone()]
+            .iter()
+            .filter(|line| line.trim_end_matches(['│', '┃']).trim().is_empty())
+            .count();
+        if height < 16 {
+            assert_eq!(group_gaps, 0, "{height}: {lines:#?}");
+        } else {
+            assert!(group_gaps > 0, "{height}: {lines:#?}");
+        }
+        for index in 1..=3 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("Scheduled instruction {index}")))
+            );
+        }
+        let scheduled = lines
+            .iter()
+            .position(|line| line == "Scheduled (3)")
+            .unwrap();
+        let goal = lines
+            .iter()
+            .position(|line| line.starts_with("Pursuing goal"))
+            .unwrap();
+        assert_eq!(lines[scheduled - 1].is_empty(), height >= 14, "{lines:#?}");
+        assert_eq!(lines[goal - 1].is_empty(), height >= 13, "{lines:#?}");
+        assert_eq!(frame.targets[0].0, 1);
+    }
+    let frame = state.monitor.frame(48, 20, state.display, 0);
+    for group in ["Ticks (1)", "Shells (1)"] {
+        let row = frame
+            .lines
+            .iter()
+            .position(|line| line.text() == group)
+            .unwrap();
+        assert!(frame.lines[row - 1].text().is_empty());
+        assert!(!frame.targets.iter().any(|(at, _)| *at == row - 1));
+    }
+}
+
+#[test]
 fn monitor_section_spacing_keeps_ticks_scheduled_and_goal_as_peers() {
     let state = docked_monitor_fixture(1, 30);
-    let frame = state.monitor.frame(48, 15, state.display, 0);
+    let frame = state.monitor.frame(48, 14, state.display, 0);
     let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
     let scheduled = lines
         .iter()
@@ -4797,21 +4869,17 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
 }
 
 #[test]
-fn monitor_heading_gap_yields_before_section_gaps_footer_and_content() {
+fn monitor_without_heading_preserves_section_gap_compression_and_target_rows() {
     let mut state = docked_monitor_fixture(3, 1);
     let tick = state.monitor.entries()[0].instance.clone();
     state.monitor.select(&tick);
-    for height in 13..=16 {
+    for height in 12..=15 {
         let frame = state.monitor.frame(48, height, state.display, 0);
         let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
         assert_eq!(lines.len(), height);
-        assert_eq!(lines[0], "Monitor");
-        let has_heading_gap = height == 16;
-        assert_eq!(lines[1].is_empty(), has_heading_gap, "{height}: {lines:#?}");
-        let ticks = 1 + usize::from(has_heading_gap);
-        assert_eq!(lines[ticks], "Ticks (1)");
-        assert_eq!(frame.tick_rows.start, ticks);
-        assert_eq!(frame.targets[0].0, ticks + 1);
+        assert_eq!(lines[0], "Ticks (1)");
+        assert_eq!(frame.tick_rows.start, 0);
+        assert_eq!(frame.targets[0].0, 1);
         assert!(lines.last().unwrap().starts_with("exit 0"), "{lines:#?}");
         for index in 1..=3 {
             assert!(
@@ -4829,14 +4897,14 @@ fn monitor_heading_gap_yields_before_section_gaps_footer_and_content() {
             .iter()
             .position(|line| line.starts_with("Pursuing goal"))
             .unwrap();
-        assert_eq!(lines[scheduled - 1].is_empty(), height >= 15, "{lines:#?}");
-        assert_eq!(lines[goal - 1].is_empty(), height >= 14, "{lines:#?}");
+        assert_eq!(lines[scheduled - 1].is_empty(), height >= 14, "{lines:#?}");
+        assert_eq!(lines[goal - 1].is_empty(), height >= 13, "{lines:#?}");
         assert!(lines[goal + 1].starts_with("◎ Finish"));
     }
 }
 
 #[test]
-fn monitor_heading_gap_precedes_any_first_section_and_keeps_small_frames_bounded() {
+fn monitor_has_no_heading_or_heading_gap_and_keeps_small_frames_bounded() {
     for (tasks, ticks, first_section) in [
         (0, 1, "Ticks (1)"),
         (1, 0, "Scheduled (1)"),
@@ -4845,12 +4913,10 @@ fn monitor_heading_gap_precedes_any_first_section_and_keeps_small_frames_bounded
         let state = docked_monitor_fixture(tasks, ticks);
         let frame = state.monitor.frame(48, 20, state.display, 0);
         let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
-        assert_eq!(lines[0], "Monitor");
-        assert!(lines[1].is_empty());
+        assert!(!lines.iter().any(|line| line == "Monitor"));
         assert!(
             lines
                 .iter()
-                .skip(2)
                 .find(|line| !line.is_empty())
                 .unwrap()
                 .starts_with(first_section),
@@ -4875,14 +4941,13 @@ fn monitor_heading_gap_precedes_any_first_section_and_keeps_small_frames_bounded
     }
     let empty =
         crate::terminal::monitor::Monitor::default().frame(48, 6, DisplayProfile::default(), 0);
-    assert_eq!(empty.lines[0].text(), "Monitor");
-    assert!(!empty.lines[1].text().is_empty());
+    assert_eq!(empty.lines[0].text(), "Nothing to monitor");
 }
 
 #[test]
 fn monitor_removes_section_gaps_before_compressing_scheduled_content() {
     let state = docked_monitor_fixture(3, 30);
-    for height in [13, 14, 15] {
+    for height in [12, 13, 14] {
         let frame = state.monitor.frame(48, height, state.display, 0);
         let lines = frame.lines.iter().map(RoleLine::text).collect::<Vec<_>>();
         assert_eq!(lines.len(), height);
@@ -4898,10 +4963,10 @@ fn monitor_removes_section_gaps_before_compressing_scheduled_content() {
             .iter()
             .position(|line| line.starts_with("Pursuing goal"))
             .unwrap();
-        if height == 13 {
+        if height == 12 {
             assert!(!lines[goal - 1].trim().is_empty());
         }
-        if height == 15 {
+        if height == 14 {
             assert!(lines[goal - 1].trim().is_empty());
         }
     }
@@ -5076,7 +5141,7 @@ fn side_monitor_leaves_a_bottom_row_above_the_chat_title_and_yields_it_when_shor
             let rows = terminal.lines().collect::<Vec<_>>();
             let divider = state.monitor_toggle_target.as_ref().unwrap().row;
             let last = rows[divider - 1].split_once('│').unwrap().1.trim();
-            if divider > 3 {
+            if divider > 2 {
                 assert!(last.is_empty(), "{width}x{height}: {terminal}");
                 assert!(rows[divider - 2].contains("◎ Finish"), "{terminal}");
             } else {
@@ -5091,7 +5156,7 @@ fn side_monitor_leaves_a_bottom_row_above_the_chat_title_and_yields_it_when_shor
 fn side_monitor_bottom_padding_yields_before_section_gaps_and_pinned_content() {
     let mut state = docked_monitor_fixture(3, 1);
     let width = 48;
-    let minimum = 15;
+    let minimum = 14;
     for select_goal in [false, true] {
         if select_goal {
             state
@@ -5926,5 +5991,97 @@ fn single_line_monitor_render_output_preserves_paused_rows_and_pinned_sections()
             title
         );
         println!("[single-line Monitor, paused={paused}]\n{screen}");
+    }
+}
+
+#[test]
+fn monitor_errors_replace_the_selected_status_and_leave_the_input_area_quiet() {
+    let console = Console::test_for_chat(Uuid::new_v4());
+    let chat = console.state.lock().unwrap().chat.unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state
+            .monitor
+            .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "sleep 900")]);
+        state.monitor.focus(false, None);
+    }
+    console
+        .report_monitor_error(chat, "Cannot stop the Shell: denied")
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.refresh_status("");
+        assert!(state.status.is_empty());
+        let frame = state.monitor.frame(48, 12, state.display, 0);
+        assert_eq!(
+            frame.lines.last().unwrap().text(),
+            "Cannot stop the Shell: denied"
+        );
+        assert_eq!(
+            frame
+                .lines
+                .iter()
+                .filter(|line| line.text().contains("denied"))
+                .count(),
+            1
+        );
+        assert!(frame.targets.iter().all(|(row, _)| *row < 11));
+        state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(state.monitor.action_error.is_none());
+        assert!(state.status.is_empty());
+    }
+    let other_chat = Uuid::new_v4();
+    console
+        .report_monitor_error(other_chat, "Cannot remove from Monitor: denied")
+        .unwrap();
+    let state = console.state.lock().unwrap();
+    assert!(
+        state.monitor.action_error.is_none(),
+        "another Chat's error stays in that Chat"
+    );
+    assert!(state.status.is_empty());
+}
+
+#[test]
+fn monitor_failures_stay_at_the_bottom_of_side_overlay_and_detail_views() {
+    for width in [60, 80, 140] {
+        for detail in [false, true] {
+            let mut state = docked_subscribed_monitor_fixture(2, 30);
+            state.resize(width, 30);
+            state.monitor.overlay = width == 60;
+            if detail {
+                state.monitor.detail =
+                    Some(Box::new(crate::terminal::monitor::MonitorDetail::new(
+                        state.chat.unwrap(),
+                        state.monitor.selected().unwrap().clone(),
+                    )));
+            }
+            state.monitor.action_error = Some("Cannot close Tick: denied".into());
+            let mut output = Vec::new();
+            state.draw_frame(&mut output).unwrap();
+            let terminal = tickloop_agent_test_support::screen::visible_screen(
+                &String::from_utf8_lossy(&output),
+                state.width,
+                state.height,
+            );
+            let rows = terminal.lines().collect::<Vec<_>>();
+            let divider = state.monitor_toggle_target.as_ref().unwrap().row;
+            assert!(
+                rows[divider - 1].ends_with("Cannot close Tick: denied"),
+                "{width}, detail={detail}: {terminal}"
+            );
+            assert_eq!(terminal.matches("Cannot close Tick: denied").count(), 1);
+            assert!(state.status.is_empty());
+            if !state.monitor.overlay {
+                assert!(
+                    rows[divider - 1]
+                        .split_once('│')
+                        .unwrap()
+                        .0
+                        .trim()
+                        .is_empty()
+                );
+            }
+        }
     }
 }

@@ -58,8 +58,7 @@ async fn view_with_keys_ticks_progress(
     view
 }
 
-/// The screen line of the selected hosted row. The selection mark takes the row's first column,
-/// or its second when the first holds `↻`.
+/// The screen line of the selected hosted row, with its glyph preserved by the selection mark.
 fn selected_row(frame: &str) -> Option<usize> {
     frame.lines().position(|line| {
         line.contains(&format!("{SELECTED_MARK} ◉")) || line.contains(&format!("{SELECTED_MARK}◉"))
@@ -127,9 +126,9 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
             .wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         assert!(!first.contains("snapshot"), "{first}");
-        let first_row = first
-            .lines()
-            .position(|line| line.contains(" ◉"))
+        let first_row = hosted_rows(&first)
+            .into_iter()
+            .next()
             .expect("a hosted row");
         view.send(if selected_row(&first) == Some(first_row) {
             b"j"
@@ -415,10 +414,6 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
 
         select_row(&mut view, "↻").await;
         view.send(b"\r");
-        view.wait_for("reopening reports the new instance", |frame| {
-            frame.contains("Reopened hosted:")
-        })
-        .await;
         let reopened = eventually("the reopened Tick running", || async {
             hosted_members(&client, execution)
                 .await
@@ -427,6 +422,11 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         })
         .await;
         let reopened_pid = reopened.resources.as_ref().unwrap().business_pid;
+        assert!(
+            !view.frame().contains("Reopened hosted:"),
+            "{}",
+            view.frame()
+        );
         assert!(!first_pids.contains(&reopened_pid), "a new process");
         assert_ne!(reopened.instance, subscribed.instance, "a new instance");
         let restored = eventually("the restored subscription", || async {
@@ -470,10 +470,6 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         .await;
         assert_eq!(hosted_members(&client, execution).await.len(), 1);
         view.send(b"\x18");
-        view.wait_for("closing reports its result", |frame| {
-            frame.contains("Tick closed")
-        })
-        .await;
         view.wait_for("the reopened row leaves", |frame| {
             !frame.contains("Monitor 1") && !frame.contains("◉ Keys")
         })
@@ -483,6 +479,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             0,
             "closing the reopened Tick forgets the record it was reopened from too"
         );
+        assert!(!view.frame().contains("Tick closed"), "{}", view.frame());
         assert!(hosted_members(&client, execution).await.is_empty());
         assert!(tick_subscriptions(&client, execution).await.is_empty());
         view.close().await;
@@ -673,7 +670,8 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_with_automatic_re
             .lines()
             .enumerate()
             .find_map(|(row, line)| {
-                line.contains(&format!("{SELECTED_MARK} ◉"))
+                monitor_part(line)
+                    .is_some_and(|part| part.contains(SELECTED_MARK) && part.contains('◉'))
                     .then(|| line.chars().position(|character| character == '◉'))
                     .flatten()
                     .map(|column| (row + 1, column + 1))
@@ -967,7 +965,7 @@ fn monitor_hint(frame: &str) -> &str {
 
 /// The part of a screen line in the Monitor pane, right of its border.
 fn monitor_part(line: &str) -> Option<&str> {
-    line.rsplit_once("│ ").map(|(_, part)| part)
+    line.split_once('│').map(|(_, part)| part)
 }
 
 /// The screen line of the selected Monitor row.
@@ -1107,19 +1105,15 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
                 .any(|line| line.starts_with("Press ctrl+x again to stop this Shell"))
         );
         view.send(b"\x18");
-        view.wait_for("stopping reports its result", |frame| {
-            frame.contains("Shell stopped")
-        })
-        .await;
         view.wait_for("the stopped Shell shows how it ended", |frame| {
             frame.lines().any(|line| {
-                line.split_once(&format!("{SELECTED_MARK} "))
-                    .is_some_and(|(_, row)| {
-                        row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
-                    })
+                line.split_once(SELECTED_MARK).is_some_and(|(_, row)| {
+                    row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
+                })
             }) && !monitor_hint(frame).contains("ctrl+x stop")
         })
         .await;
+        assert!(!view.frame().contains("Shell stopped"), "{}", view.frame());
         assert!(!input_focused(&view.frame()), "{}", view.frame());
         view.send(b"\x1b");
         view.wait_for("input focused again", input_focused).await;

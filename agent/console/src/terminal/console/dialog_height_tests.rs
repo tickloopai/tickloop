@@ -1036,7 +1036,7 @@ fn content_height_pinned_message_and_monitor_column_share_the_upper_remainder() 
         state.draw(&mut Vec::new()).unwrap();
         assert_eq!(state.input_dialog_height(), 22);
         assert!(state.rendered_screen[0].starts_with("❯ Height pinned message"));
-        assert!(state.rendered_screen[0].contains("│ Monitor"));
+        assert!(state.rendered_screen[0].contains("│ Artifacts (2)"));
         assert_eq!(state.rendered_screen[2], "▔".repeat(state.width));
         assert!(
             !state.rendered_screen[2..]
@@ -1079,7 +1079,7 @@ fn merged_monitor_column_and_overlay_stop_at_the_content_sized_dialog_rule() {
                     state.draw(&mut Vec::new()).unwrap();
                     let remainder = state.height - state.input_dialog_height();
                     assert!(remainder >= 2);
-                    assert!(state.rendered_screen[0].contains("│ Monitor"));
+                    assert!(state.rendered_screen[0].contains("│ Artifacts (2)"));
                     assert_eq!(state.rendered_screen[remainder], "▔".repeat(state.width));
                     assert!(
                         !state.rendered_screen[remainder..]

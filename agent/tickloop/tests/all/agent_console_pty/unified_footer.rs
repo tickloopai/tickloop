@@ -404,10 +404,6 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
             .any(|task| task.id == second && !task.state.is_terminal())
     );
     pty.send(b"\x18");
-    pty.wait_for("Tick Shell stop reports its result", |frame| {
-        frame.contains("Shell stopped")
-    })
-    .await;
     let stopped = wait_shell_tasks(
         &client,
         execution,
@@ -438,6 +434,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         |frame| frame.contains("Shells (2)") && frame.lines().any(|line| line.contains("SIGTERM")),
     )
     .await;
+    assert!(!pty.frame().contains("Shell stopped"), "{}", pty.frame());
     pty.send(b"\x1b");
     pty.wait_for_editor("Monitor closes to input", Some(""))
         .await;

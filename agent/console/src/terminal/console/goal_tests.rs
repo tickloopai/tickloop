@@ -801,7 +801,7 @@ fn goal_monitor_render_evidence() {
     assert_eq!(
         screen,
         [
-            "Monitor",
+            "",
             "",
             "",
             "",
