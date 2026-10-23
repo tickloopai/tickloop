@@ -2750,6 +2750,9 @@ async fn base62_feedback_is_claimed_acknowledged_and_delivered_once() {
     let model = Arc::new(ScriptedModel::new(vec![text("Received.")]));
     let (agent, chat, _loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     eventually(async || service.finished() == [(feedback.into(), "received".into())]).await;
+    // The service records the ack before the agent hands the staged feedback to its Loop, and a
+    // fresh Loop is already Idle, so wait for the model call before waiting for the Loop to idle.
+    eventually(async || !model.requests.lock().unwrap().is_empty()).await;
     wait_for_loop_state(&agent, chat, LoopState::Idle).await;
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     assert_eq!(
