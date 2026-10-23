@@ -1021,9 +1021,9 @@ impl Monitor {
         }
         if self.selected_task().is_some() {
             return if self.expanded_tasks {
-                "enter details · x remove · j/k select · esc back"
+                "enter details · Ctrl+X remove · j/k select · esc back"
             } else {
-                "enter details · x remove · esc input"
+                "enter details · Ctrl+X remove · esc input"
             }
             .into();
         }
@@ -1038,6 +1038,8 @@ impl Monitor {
                             "{} {}",
                             if action.key == crate::monitor_rows::MONITOR_ENTER_KEY {
                                 "enter".into()
+                            } else if action.key == crate::monitor_rows::REMOVE_KEY {
+                                "Ctrl+X".into()
                             } else {
                                 action.key.to_string()
                             },

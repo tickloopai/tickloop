@@ -272,6 +272,8 @@ const MIN_SCROLL_ROWS: usize = 2;
 const MIN_MENU_BODY_ROWS: usize = 5;
 const MIN_MENU_TERMINAL_ROWS: usize = FOOTER_ROWS + MIN_SCROLL_ROWS + MIN_MENU_BODY_ROWS;
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
+const MONITOR_CONFIRMATION_WINDOW: Duration = Duration::from_secs(3);
+const MONITOR_NOTICE_WINDOW: Duration = Duration::from_secs(2);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
 /// Claude Code `PROGRESS_THRESHOLD_MS`: how long the model's foreground Bash runs before ctrl+b
@@ -747,7 +749,7 @@ pub(super) struct State {
     left_button_down: bool,
     opener: Opener,
     /// What the last copy did, shown in the status line until it expires.
-    copy_notice: Option<CopyNotice>,
+    copy_notice: Option<TimedNotice>,
     pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
@@ -924,6 +926,8 @@ pub(super) struct State {
     status_held: bool,
     exit_confirmation: Option<ExitConfirmation>,
     escape_confirmation: Option<EscapeConfirmation>,
+    monitor_confirmation: Option<PendingKeyAction<MonitorRemoval>>,
+    monitor_notice: Option<TimedNotice>,
 }
 
 /// The size and view `rendered_rows` were written under. A frame of the same
@@ -962,27 +966,52 @@ struct Click {
     count: u8,
 }
 
-struct CopyNotice {
+struct TimedNotice {
     text: String,
     until: Instant,
 }
 
 #[derive(Clone, Copy)]
-struct ExitConfirmation {
-    control: char,
+struct PendingKeyAction<T> {
+    action: T,
     requested_at: Instant,
+}
+
+impl<T: PartialEq> PendingKeyAction<T> {
+    fn pending(&self, window: Duration) -> Option<&T> {
+        (self.requested_at.elapsed() <= window).then_some(&self.action)
+    }
+
+    fn request(pending: &mut Option<Self>, action: T, window: Duration) -> bool {
+        if pending.as_ref().and_then(|pending| pending.pending(window)) == Some(&action) {
+            *pending = None;
+            true
+        } else {
+            *pending = Some(Self {
+                action,
+                requested_at: Instant::now(),
+            });
+            false
+        }
+    }
+}
+
+type ExitConfirmation = PendingKeyAction<char>;
+type EscapeConfirmation = PendingKeyAction<EscapeAction>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MonitorRemoval {
+    chat: Uuid,
+    target: super::monitor::MonitorTarget,
+    detail: Option<Uuid>,
+    intent: Option<crate::monitor_rows::TickIntent>,
+    hint: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EscapeAction {
     ClearDraft,
     OpenRewind,
-}
-
-#[derive(Clone, Copy)]
-struct EscapeConfirmation {
-    action: EscapeAction,
-    requested_at: Instant,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -5542,6 +5571,8 @@ impl State {
     }
 
     fn switch_view_chat(&mut self, chat: Option<Uuid>) {
+        self.monitor_confirmation = None;
+        self.monitor_notice = None;
         if self.chat == chat {
             return;
         }
@@ -5875,6 +5906,8 @@ impl State {
             status_held: false,
             exit_confirmation: None,
             escape_confirmation: None,
+            monitor_confirmation: None,
+            monitor_notice: None,
         }
     }
 
@@ -5919,6 +5952,10 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        if !matches!(event.kind, MouseEventKind::Moved) {
+            self.monitor_confirmation = None;
+            self.monitor_notice = None;
+        }
         let at = Cell {
             row: usize::from(event.row),
             column: usize::from(event.column),
@@ -6414,7 +6451,7 @@ impl State {
     }
 
     fn show_copy_notice(&mut self, text: String, duration: Duration) {
-        self.copy_notice = Some(CopyNotice {
+        self.copy_notice = Some(TimedNotice {
             text,
             until: Instant::now() + duration,
         });
@@ -8701,6 +8738,16 @@ impl State {
                 line.push(" · ", Some(Role::MutedText));
                 line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
             }
+            if let Some(hint) = self.monitor_key_notice() {
+                line = RoleLine::role(
+                    truncate_width(hint, self.width),
+                    if self.pending_monitor_removal().is_some() {
+                        Role::Error
+                    } else {
+                        Role::StatusBar
+                    },
+                );
+            }
             hint_row = Some(line);
         }
         let mut footer_bar_row = None;
@@ -10348,6 +10395,8 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) -> Option<InputEvent> {
+        self.monitor_confirmation = None;
+        self.monitor_notice = None;
         self.shell_background_chord_started_at = None;
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.paste(text);
@@ -11070,8 +11119,9 @@ impl State {
 
     fn pending_exit_control(&self) -> Option<char> {
         self.exit_confirmation
-            .filter(|confirmation| confirmation.requested_at.elapsed() <= EXIT_CONFIRMATION_WINDOW)
-            .map(|confirmation| confirmation.control)
+            .as_ref()?
+            .pending(EXIT_CONFIRMATION_WINDOW)
+            .copied()
     }
 
     /// Whether this View may leave now; unsent local messages hold it.
@@ -11088,29 +11138,184 @@ impl State {
         if !self.may_leave() {
             return false;
         }
-        if self.pending_exit_control() == Some(control) {
-            self.exit_confirmation = None;
-            true
-        } else {
-            self.exit_confirmation = Some(ExitConfirmation {
-                control,
-                requested_at: Instant::now(),
-            });
-            false
-        }
+        PendingKeyAction::request(
+            &mut self.exit_confirmation,
+            control,
+            EXIT_CONFIRMATION_WINDOW,
+        )
     }
 
     fn pending_escape_action(&self) -> Option<EscapeAction> {
         self.escape_confirmation
-            .filter(|confirmation| {
-                confirmation.requested_at.elapsed() <= ESCAPE_CONFIRMATION_WINDOW
-            })
-            .map(|confirmation| confirmation.action)
+            .as_ref()?
+            .pending(ESCAPE_CONFIRMATION_WINDOW)
+            .copied()
     }
 
-    /// The key confirmation in progress. It stays visible whichever footer is
-    /// drawn, since a press without a visible effect reads as no reaction.
+    fn monitor_owns_keys(&self) -> bool {
+        !self.input_dialog_visible()
+            && self.menu.is_none()
+            && !self.help_open
+            && self.monitor_visible()
+            && self.monitor.focused
+    }
+
+    fn monitor_removal(&self) -> Option<MonitorRemoval> {
+        use super::monitor::MonitorTarget;
+        use crate::monitor_rows::TickIntent;
+        if !self.monitor_owns_keys() {
+            return None;
+        }
+        let detail = self.monitor.detail.as_ref().map(|detail| detail.id());
+        let (target, intent, consequence) = if let Some(task) = self.monitor.selected_task() {
+            (
+                MonitorTarget::ScheduledTask(task.id.clone()),
+                None,
+                "delete this scheduled task".into(),
+            )
+        } else {
+            if detail.is_some() {
+                return None;
+            }
+            let entry = self.monitor.selected()?;
+            let intent = entry
+                .actions
+                .iter()
+                .find(|action| action.key == crate::monitor_rows::REMOVE_KEY)?
+                .intent
+                .clone();
+            let verb = match &intent {
+                TickIntent::StopShell { .. } => "stop this Shell".into(),
+                TickIntent::CloseHosted {
+                    ends_process: true, ..
+                } => format!("close {}", entry.title),
+                TickIntent::CloseHosted { .. } | TickIntent::RemoveFromMonitor(_) => {
+                    format!("remove {} from Monitor", entry.title)
+                }
+                TickIntent::Artifact { key: 'x', .. } => format!(
+                    "{} {}",
+                    entry
+                        .actions
+                        .iter()
+                        .find(|action| action.key == crate::monitor_rows::REMOVE_KEY)?
+                        .label,
+                    entry.title
+                ),
+                _ => return None,
+            };
+            let count = crate::monitor_rows::subscriptions_on(
+                &self.monitor.shown_subscriptions(),
+                &entry.instance,
+            )
+            .len();
+            let consequence = if count == 0 {
+                verb
+            } else {
+                format!(
+                    "{verb} and cancel {count} {}",
+                    if count == 1 {
+                        "subscription"
+                    } else {
+                        "subscriptions"
+                    }
+                )
+            };
+            (
+                MonitorTarget::Tick(entry.instance.clone()),
+                Some(intent),
+                consequence,
+            )
+        };
+        Some(MonitorRemoval {
+            chat: self.chat?,
+            target,
+            detail,
+            intent,
+            hint: format!("Press Ctrl+X again to {consequence}"),
+        })
+    }
+
+    fn pending_monitor_removal(&self) -> Option<&MonitorRemoval> {
+        let pending = self
+            .monitor_confirmation
+            .as_ref()?
+            .pending(MONITOR_CONFIRMATION_WINDOW)?;
+        (self.monitor_removal().as_ref() == Some(pending)).then_some(pending)
+    }
+
+    fn monitor_key_notice(&self) -> Option<&str> {
+        self.pending_monitor_removal()
+            .map(|pending| pending.hint.as_str())
+            .or_else(|| {
+                self.monitor_notice
+                    .as_ref()
+                    .filter(|notice| self.monitor_owns_keys() && Instant::now() <= notice.until)
+                    .map(|notice| notice.text.as_str())
+            })
+    }
+
+    fn request_monitor_removal(&mut self) -> Option<InputEvent> {
+        let Some(removal) = self.monitor_removal() else {
+            self.monitor_confirmation = None;
+            let message = self
+                .monitor
+                .selected()
+                .and_then(|entry| {
+                    entry
+                        .actions
+                        .iter()
+                        .find_map(|action| match &action.intent {
+                            crate::monitor_rows::TickIntent::Notify(message)
+                                if action.key == crate::monitor_rows::REMOVE_KEY =>
+                            {
+                                Some(message.clone())
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or_else(|| "No removable Monitor item selected".into());
+            self.monitor_notice = Some(TimedNotice {
+                text: message,
+                until: Instant::now() + MONITOR_NOTICE_WINDOW,
+            });
+            return None;
+        };
+        if self.pending_monitor_removal().is_none() {
+            self.monitor_confirmation = None;
+        }
+        if !PendingKeyAction::request(
+            &mut self.monitor_confirmation,
+            removal.clone(),
+            MONITOR_CONFIRMATION_WINDOW,
+        ) {
+            return None;
+        }
+        let executor: Arc<dyn super::tick_actions::TickActionExecutor> =
+            if let Some(intent) = &removal.intent {
+                super::tick_actions::builtin::executor(intent)?
+            } else {
+                Arc::new(super::scheduled_tasks::TaskAction::new(
+                    self.monitor.selected_task()?.clone(),
+                    true,
+                ))
+            };
+        match executor.prepare(&mut super::tick_actions::TickActionUi { state: self }) {
+            Ok(action) => Some(InputEvent::TickAction {
+                chat: removal.chat,
+                action,
+            }),
+            Err(error) => {
+                self.hold_status(&error);
+                None
+            }
+        }
+    }
+
+    /// The key confirmation stays visible whichever footer is drawn.
     fn confirmation_hint(&self) -> Option<String> {
+        if let Some(hint) = self.monitor_key_notice() {
+            return Some(hint.into());
+        }
         if let Some(control) = self.pending_exit_control() {
             return Some(if control == 'C' {
                 "Press ctrl+c again to exit".into()
@@ -11125,6 +11330,9 @@ impl State {
     }
 
     fn status_notice(&self, status: &str) -> String {
+        if let Some(hint) = self.monitor_key_notice() {
+            return truncate_width(hint, self.width);
+        }
         let with_failure = match &self.provider_failure {
             Some(failure) if status.is_empty() => failure.clone(),
             Some(failure) => format!("{status} · {failure}"),
@@ -11204,20 +11412,29 @@ impl State {
         if copy_notice_expired {
             self.copy_notice = None;
         }
-        exit_expired || escape_expired || copy_notice_expired
+        let monitor_expired =
+            self.monitor_confirmation.is_some() && self.pending_monitor_removal().is_none();
+        if monitor_expired {
+            self.monitor_confirmation = None;
+        }
+        let monitor_notice_expired =
+            self.monitor_notice.is_some() && self.monitor_key_notice().is_none();
+        if monitor_notice_expired {
+            self.monitor_notice = None;
+        }
+        exit_expired
+            || escape_expired
+            || copy_notice_expired
+            || monitor_expired
+            || monitor_notice_expired
     }
 
     fn request_escape(&mut self, action: EscapeAction) -> bool {
-        if self.pending_escape_action() == Some(action) {
-            self.escape_confirmation = None;
-            true
-        } else {
-            self.escape_confirmation = Some(EscapeConfirmation {
-                action,
-                requested_at: Instant::now(),
-            });
-            false
-        }
+        PendingKeyAction::request(
+            &mut self.escape_confirmation,
+            action,
+            ESCAPE_CONFIRMATION_WINDOW,
+        )
     }
 
     fn clear_draft_to_history(&mut self) {
@@ -11415,6 +11632,13 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        if key.code != KeyCode::Char('x')
+            || key.modifiers != KeyModifiers::CONTROL
+            || !self.monitor_owns_keys()
+        {
+            self.monitor_confirmation = None;
+        }
+        self.monitor_notice = None;
         if self.input_dialog_requires_resize() && key.code != KeyCode::Esc {
             return None;
         }
@@ -11533,6 +11757,10 @@ impl State {
             && self.monitor_visible()
             && self.monitor.focused
         {
+            self.shell_background_chord_started_at = None;
+            if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
+                return self.request_monitor_removal();
+            }
             let (width, height) = self.detail_area();
             if let Some(detail) = self.monitor.detail.as_mut() {
                 let chat = detail.chat();
@@ -11592,16 +11820,9 @@ impl State {
                     self.monitor.open_task_list();
                     self.rendered_region = None;
                 }
-                (KeyCode::Char('x'), KeyModifiers::NONE) if self.monitor.is_more_selected() => {}
-                (KeyCode::Char('x'), KeyModifiers::NONE) if self.monitor.is_goal_selected() => {}
-                (KeyCode::Enter | KeyCode::Char('x'), _)
-                    if self.monitor.selected_task().is_some() =>
-                {
+                (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.selected_task().is_some() => {
                     let task = self.monitor.selected_task()?.clone();
-                    let executor = super::scheduled_tasks::TaskAction::new(
-                        task,
-                        key.code == KeyCode::Char('x'),
-                    );
+                    let executor = super::scheduled_tasks::TaskAction::new(task, false);
                     let chat = self.chat?;
                     match super::tick_actions::TickActionExecutor::prepare(
                         &executor,
@@ -11615,7 +11836,8 @@ impl State {
                 // the list and is typed into the input instead of being swallowed.
                 (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT)
                     if !self.monitor.selected().is_some_and(|entry| {
-                        entry.actions.iter().any(|action| action.key == character)
+                        character != crate::monitor_rows::REMOVE_KEY
+                            && entry.actions.iter().any(|action| action.key == character)
                     }) =>
                 {
                     self.monitor.focused = false;
@@ -16992,7 +17214,7 @@ mod tests {
             }
             let mut state = console.state.lock().unwrap();
             state.exit_confirmation = Some(ExitConfirmation {
-                control: 'C',
+                action: 'C',
                 requested_at: Instant::now(),
             });
             if !plan {
@@ -18591,7 +18813,7 @@ mod tests {
         let mut state = State::new(true, 80, 24);
         assert!(!state.expire_key_confirmations());
         state.exit_confirmation = Some(ExitConfirmation {
-            control: 'C',
+            action: 'C',
             requested_at: Instant::now() - EXIT_CONFIRMATION_WINDOW - Duration::from_millis(1),
         });
         state.escape_confirmation = Some(EscapeConfirmation {
@@ -20035,7 +20257,7 @@ mod tests {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         state.exit_confirmation = Some(ExitConfirmation {
-            control: 'D',
+            action: 'D',
             requested_at: Instant::now() - EXIT_CONFIRMATION_WINDOW - Duration::from_millis(1),
         });
 

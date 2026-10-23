@@ -4,7 +4,7 @@ use super::super::{
     task_access::ShellTaskCenter,
 };
 use super::*;
-use crate::monitor_rows::{REMOVE_KEY, SHELL_STOP_KEY, SUBSCRIBE_KEY, TickIntent};
+use crate::monitor_rows::{REMOVE_KEY, SUBSCRIBE_KEY, TickIntent};
 
 /// The Console executor that carries out a Monitor row's intent. A notice has none: the Console
 /// only shows it.
@@ -723,7 +723,7 @@ impl TickActionExecutor for StopShell {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         Ok(PreparedTickAction::new(
             tick_protocol::InstanceRef::shell(self.task).to_string(),
-            SHELL_STOP_KEY,
+            REMOVE_KEY,
             Arc::new(StopShell { task: self.task }),
         ))
     }

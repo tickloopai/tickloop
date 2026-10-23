@@ -1,11 +1,9 @@
 use super::*;
 use tickloop_agent_protocol::{EventSourceBinding, ShellTask, ShellTaskState, TickLinkState};
 
-/// Stops a running Shell from its Monitor row.
-pub(crate) const SHELL_STOP_KEY: char = 's';
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 's';
-/// The one key that takes a row out, doing what its state calls for.
+/// The row action ID dispatched by Ctrl+X.
 pub(crate) const REMOVE_KEY: char = 'x';
 
 /// Ticks in the dedicated Tickhost: those this Chat opened, which belong to it, and those only
@@ -130,8 +128,8 @@ enum HostedRun {
     Ended,
 }
 
-/// A hosted Tick row's Enter and `x`. Enter opens the view of a Tick that still has a screen,
-/// and reopens one this Chat opened that no longer runs. `x` closes a Tick this Chat opened, so
+/// A hosted Tick row's Enter and Ctrl+X. Enter opens the view of a Tick that still has a screen,
+/// and reopens one this Chat opened that no longer runs. Ctrl+X closes a Tick this Chat opened, so
 /// nothing it opened keeps running out of sight and the record of one that ended goes with its
 /// row, and otherwise only takes the row out with this Chat's subscriptions, never ending another
 /// Chat's Tick.
@@ -339,26 +337,23 @@ fn shell_actions(task: &ShellTask, instance: &InstanceRef) -> Vec<MonitorAction>
         actions.push(remove_from_monitor(instance));
         return actions;
     }
-    let removal = if task.capabilities.can_stop {
-        actions.push(MonitorAction {
-            key: SHELL_STOP_KEY,
-            label: "stop",
-            intent: TickIntent::StopShell { task: task.id },
-        });
-        STOPPABLE_SHELL_REMOVAL
-    } else {
-        RUNNING_SHELL_REMOVAL
-    };
     actions.push(MonitorAction {
         key: REMOVE_KEY,
-        label: "remove",
-        intent: TickIntent::Notify(removal.into()),
+        label: if task.capabilities.can_stop {
+            "stop"
+        } else {
+            "remove"
+        },
+        intent: if task.capabilities.can_stop {
+            TickIntent::StopShell { task: task.id }
+        } else {
+            TickIntent::Notify(RUNNING_SHELL_REMOVAL.into())
+        },
     });
     actions
 }
 
-/// Why `x` does not take out a running Shell.
-const STOPPABLE_SHELL_REMOVAL: &str = "Press s to stop this Shell before removing it";
+/// A running Shell that this Chat cannot stop stays visible until it ends.
 const RUNNING_SHELL_REMOVAL: &str = "This Shell leaves Monitor once it ends";
 
 /// Enter on a local Tick's row opens its attached view.
@@ -722,8 +717,8 @@ pub(crate) fn feedback_binding<'a>(
         .find(|binding| binding.origin == origin && binding.artifact_id == artifact_id)
 }
 
-/// An artifact row's actions. Its `x` reads `unlink` while this Chat holds the artifact's
-/// association, which `x` ends along with the row; otherwise it only removes the row.
+/// An artifact row's actions. Its Ctrl+X reads `unlink` while this Chat holds the artifact's
+/// association, which Ctrl+X ends along with the row; otherwise it only removes the row.
 pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<MonitorAction> {
     [
         (MONITOR_ENTER_KEY, "open"),

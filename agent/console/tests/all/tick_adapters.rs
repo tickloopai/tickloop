@@ -439,12 +439,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         actions(&running_instance),
         [
             action('o', "open", TickIntent::OpenView(running_instance.clone())),
-            action('s', "stop", TickIntent::StopShell { task: running.id }),
-            action(
-                'x',
-                "remove",
-                TickIntent::Notify("Press s to stop this Shell before removing it".into()),
-            ),
+            action('x', "stop", TickIntent::StopShell { task: running.id }),
         ]
     );
     let unstoppable_instance = InstanceRef::shell(unstoppable.id);
