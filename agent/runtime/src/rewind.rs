@@ -748,6 +748,7 @@ mod tests {
                 tickloop_agent_protocol::TriggerSource::ScheduledTask {
                     task_id: "rewind".into(),
                     scheduled_for_ms: 1,
+                    wrappers: Vec::new(),
                 },
                 "event check",
             )

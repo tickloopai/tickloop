@@ -10,9 +10,10 @@ use serde_json::{Value, json};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, EventKind, OperationRecord, OperationState, PromptPolicy, Receipt,
-    ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision,
-    ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation, ToolResult, TriggerSource,
-    final_scheduled_run_prompt, loop_instructions_error_prompt, scheduled_skill_prompt,
+    ScheduledInputWrapper, ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskCreator,
+    ScheduledTaskDecision, ScheduledTaskKind, ScheduledTaskNotice, ScheduledTaskRevocation,
+    ToolResult, TriggerSource, final_scheduled_run_prompt, loop_instructions_error_prompt,
+    scheduled_skill_prompt,
 };
 use tickloop_agent_transcript::{DiscardReason, Line, ScheduledTasksEntry};
 
@@ -79,12 +80,25 @@ pub(crate) fn resolve_zone(name: Option<&str>) -> Result<Zone, String> {
 /// The scheduled run's input: the Chat's loop instructions, read again now, for a `/loop`
 /// without a prompt; a Skill the Agent may invoke on its own when the instruction names one with
 /// `/`; and anything else as plain text.
-fn run_input(chat: &Chat, task: &ScheduledTask, config_root: Option<&std::path::Path>) -> String {
+fn run_input(
+    chat: &Chat,
+    task: &ScheduledTask,
+    config_root: Option<&std::path::Path>,
+) -> (String, Vec<ScheduledInputWrapper>) {
     let prompt = task.prompt.trim();
     if prompt == DEFAULT_INSTRUCTIONS_PROMPT {
         return match LoopFiles::new(chat.snapshot.folder.as_deref(), config_root).instructions() {
-            Ok(instructions) => instructions.prompt(),
-            Err(error) => loop_instructions_error_prompt(&task.id, &error.to_string()),
+            Ok(instructions) => (
+                instructions.prompt(),
+                vec![ScheduledInputWrapper::LoopInstructions {
+                    origin: instructions.origin(),
+                    instructions: instructions.text,
+                }],
+            ),
+            Err(error) => (
+                loop_instructions_error_prompt(&task.id, &error.to_string()),
+                vec![ScheduledInputWrapper::LoopInstructionsError],
+            ),
         };
     }
     if let Some(command) = prompt.strip_prefix('/') {
@@ -92,10 +106,15 @@ fn run_input(chat: &Chat, task: &ScheduledTask, config_root: Option<&std::path::
             .split_once(char::is_whitespace)
             .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
         if chat.skills.contains(name) && !chat.skills.is_user_only(name) {
-            return scheduled_skill_prompt(&task.id, name, arguments);
+            return (
+                scheduled_skill_prompt(&task.id, name, arguments),
+                vec![ScheduledInputWrapper::Skill {
+                    instruction: task.prompt.clone(),
+                }],
+            );
         }
     }
-    task.prompt.clone()
+    (task.prompt.clone(), Vec::new())
 }
 
 /// A time as the user reads it in the task's zone.
@@ -247,6 +266,7 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
             &tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
                 task_id: task.id.clone(),
                 scheduled_for_ms,
+                wrappers: Vec::new(),
             },
         );
         chat.bookkeeping
@@ -298,6 +318,7 @@ impl Agent {
         let TriggerSource::ScheduledTask {
             task_id,
             scheduled_for_ms,
+            ..
         } = source
         else {
             return;
@@ -816,15 +837,18 @@ impl Agent {
                         .iter()
                         .find(|task| task.id == fired.task.id)?
                         .clone();
-                    let mut input = run_input(chat, &fired.task, self.inner.config_root.as_deref());
+                    let (mut input, mut wrappers) =
+                        run_input(chat, &fired.task, self.inner.config_root.as_deref());
                     if fired.is_last
                         && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
                     {
                         input = final_scheduled_run_prompt(&input);
+                        wrappers.push(ScheduledInputWrapper::FinalRun);
                     }
                     let source = TriggerSource::ScheduledTask {
                         task_id: before.id.clone(),
                         scheduled_for_ms: fired.scheduled_for_ms,
+                        wrappers,
                     };
                     let run = DueRun { before, fired };
                     Some(TriggerDelivery {

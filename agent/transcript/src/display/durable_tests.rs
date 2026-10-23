@@ -340,6 +340,7 @@ fn scheduled_run() -> tickloop_agent_protocol::TriggerSource {
     tickloop_agent_protocol::TriggerSource::ScheduledTask {
         task_id: "0a1b2c3d".into(),
         scheduled_for_ms: 1_000,
+        wrappers: Vec::new(),
     }
 }
 
@@ -396,7 +397,18 @@ fn scheduled_input_projection_hides_the_skill_wrapper() {
         text: "Scheduled task 0a1b2c3d: invoke the `review` Skill with the Skill tool with the arguments `main`.".into(),
     }]);
     prompt.run_id = Some(response.run_id);
-    let nodes = project(&[input(&response, InputOp::Trigger), Line::User(prompt)]);
+    let Line::Input(mut input) = input(&response, InputOp::Trigger) else {
+        unreachable!()
+    };
+    input.trigger.as_mut().unwrap().identity =
+        tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
+            task_id: "0a1b2c3d".into(),
+            scheduled_for_ms: 1_000,
+            wrappers: vec![tickloop_agent_protocol::ScheduledInputWrapper::Skill {
+                instruction: "/review main".into(),
+            }],
+        };
+    let nodes = project(&[Line::Input(input), Line::User(prompt)]);
     assert_eq!(
         nodes[0].blocks,
         [DisplayBlock::Text {
@@ -410,6 +422,36 @@ fn scheduled_input_projection_hides_the_skill_wrapper() {
             ..
         }
     ));
+}
+
+#[test]
+fn scheduled_projection_preserves_unrecorded_wrappers_through_retained_replay() {
+    for instruction in [
+        tickloop_agent_protocol::scheduled_skill_prompt("0a1b2c3d", "review", "main"),
+        tickloop_agent_protocol::loop_instructions_prompt(
+            "loop.md. Hidden instruction",
+            "Visible instruction",
+        ),
+        tickloop_agent_protocol::loop_instructions_error_prompt("0a1b2c3d", "permission denied"),
+        tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
+    ] {
+        let response = response(ResponseState::Started);
+        let mut prompt = entry(
+            Role::User,
+            vec![Content::Text {
+                text: instruction.clone(),
+            }],
+        );
+        prompt.run_id = Some(response.run_id);
+        let lines = vec![input(&response, InputOp::Trigger), Line::User(prompt)];
+        let nodes = project(&lines);
+        assert_eq!(nodes[0].blocks, [DisplayBlock::Text { text: instruction }]);
+        let retained = Line::RetainedSnapshot(crate::RetainedSnapshotEntry {
+            chat_id: Uuid::nil(),
+            lines,
+        });
+        assert_eq!(project(&[retained]), nodes);
+    }
 }
 
 #[test]
@@ -471,6 +513,7 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
                 identity: tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
                     task_id: "0a1b2c3d".into(),
                     scheduled_for_ms: 1_000,
+                    wrappers: Vec::new(),
                 },
                 authority: tickloop_agent_protocol::Authority::Instruction,
                 merged: 1,

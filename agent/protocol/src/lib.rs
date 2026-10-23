@@ -190,10 +190,9 @@ pub use tools::{
     WebSearchSuggestion,
 };
 pub use trigger_display::{
-    GOAL_CONTINUATION_EVENT, final_scheduled_run_prompt, loop_instructions_error_prompt,
-    loop_instructions_prompt, scheduled_skill_prompt, strip_final_scheduled_run_prompt,
-    strip_loop_instructions_error_prompt, strip_loop_instructions_prompt,
-    strip_scheduled_skill_prompt,
+    GOAL_CONTINUATION_EVENT, ScheduledInputWrapper, final_scheduled_run_prompt,
+    loop_instructions_error_prompt, loop_instructions_prompt, scheduled_skill_prompt,
+    strip_final_scheduled_run_prompt, strip_loop_instructions_error_prompt,
 };
 pub use usage::{
     CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,

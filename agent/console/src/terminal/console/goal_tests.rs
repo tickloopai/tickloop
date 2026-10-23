@@ -296,6 +296,12 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
         TriggerIdentity::ScheduledTask {
             task_id: "12345678".into(),
             scheduled_for_ms: 1,
+            wrappers: vec![
+                tickloop_agent_protocol::ScheduledInputWrapper::Skill {
+                    instruction: "/review main".into(),
+                },
+                tickloop_agent_protocol::ScheduledInputWrapper::FinalRun,
+            ],
         },
     );
     for history in [false, true] {
@@ -309,6 +315,55 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
         assert!(!text.contains("Skill tool"));
         assert!(!text.contains("final run"));
         assert_eq!(text.matches("/review main").count(), 1);
+    }
+}
+
+#[test]
+fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
+    use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    for instruction in [
+        tickloop_agent_protocol::scheduled_skill_prompt("12345678", "review", "main"),
+        tickloop_agent_protocol::loop_instructions_prompt(
+            "loop.md. Hidden instruction",
+            "Visible instruction",
+        ),
+        tickloop_agent_protocol::loop_instructions_error_prompt("12345678", "permission denied"),
+        tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
+    ] {
+        let chat = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let mut snapshot = super::monitor_tests::chat_snapshot(chat);
+        snapshot.messages = vec![Message {
+            role: MessageRole::User,
+            content: vec![Content::Text {
+                text: instruction.clone(),
+            }],
+        }];
+        snapshot.message_runs.insert(0, run);
+        snapshot.trigger_origins.insert(
+            run,
+            TriggerIdentity::ScheduledTask {
+                task_id: "12345678".into(),
+                scheduled_for_ms: 1,
+                wrappers: Vec::new(),
+            },
+        );
+        let mut original = snapshot.clone();
+        original.trigger_origins.clear();
+        for history in [false, true] {
+            let console = Console::test_interactive_for_chat(chat);
+            let expected = Console::test_interactive_for_chat(chat);
+            if history {
+                super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+                super::super::workflows::write_public_history(&expected, &original).unwrap();
+            }
+            super::super::consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+            super::super::consume_input_echo_from_snapshot(&expected, &original, run).unwrap();
+            assert_eq!(
+                console.test_conversation_text(),
+                expected.test_conversation_text()
+            );
+        }
     }
 }
 

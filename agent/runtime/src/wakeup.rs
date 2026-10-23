@@ -349,6 +349,7 @@ impl Agent {
             TriggerSource::ScheduledTask {
                 task_id,
                 scheduled_for_ms,
+                ..
             } => self.scheduled_run_eligibility(snapshot, task_id, *scheduled_for_ms),
         };
         match (source_condition, snapshot.chat_loop.receiving) {
@@ -394,6 +395,7 @@ impl Agent {
             TriggerSource::ScheduledTask {
                 task_id,
                 scheduled_for_ms,
+                ..
             } => super::scheduled_tasks::is_current_run(&chat.snapshot, task_id, *scheduled_for_ms),
             TriggerSource::TickUpdate { .. }
             | TriggerSource::TickManual { .. }

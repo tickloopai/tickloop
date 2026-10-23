@@ -148,6 +148,8 @@ pub enum TriggerSource {
     ScheduledTask {
         task_id: String,
         scheduled_for_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wrappers: Vec<crate::ScheduledInputWrapper>,
     },
 }
 
@@ -188,6 +190,8 @@ pub enum TriggerIdentity {
     ScheduledTask {
         task_id: String,
         scheduled_for_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wrappers: Vec<crate::ScheduledInputWrapper>,
     },
 }
 
@@ -301,9 +305,11 @@ impl TriggerSource {
             Self::ScheduledTask {
                 task_id,
                 scheduled_for_ms,
+                wrappers,
             } => TriggerIdentity::ScheduledTask {
                 task_id: task_id.clone(),
                 scheduled_for_ms: *scheduled_for_ms,
+                wrappers: wrappers.clone(),
             },
         }
     }

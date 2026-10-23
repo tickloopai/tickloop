@@ -91,6 +91,7 @@ async fn event_loop_after_logout_fails_and_does_not_resume_automatically() {
             tickloop_agent_protocol::TriggerSource::ScheduledTask {
                 task_id: "evidence".into(),
                 scheduled_for_ms: 1,
+                wrappers: Vec::new(),
             },
             "Check fresh evidence",
         )

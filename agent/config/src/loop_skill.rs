@@ -128,15 +128,18 @@ impl LoopInstructions {
     /// The instructions as a run receives them: wrapped as data naming where they come from, so
     /// nothing in a loop.md can pass for the host's scheduling fields.
     pub fn prompt(&self) -> String {
-        let origin = match &self.source {
+        tickloop_agent_protocol::loop_instructions_prompt(&self.origin(), &self.text)
+    }
+
+    pub fn origin(&self) -> String {
+        match &self.source {
             LoopInstructionsSource::Project(path) | LoopInstructionsSource::User(path) => {
                 path.display().to_string()
             }
             LoopInstructionsSource::Maintenance => {
                 "built-in maintenance instructions; no loop.md exists".to_owned()
             }
-        };
-        tickloop_agent_protocol::loop_instructions_prompt(&origin, &self.text)
+        }
     }
 }
 
