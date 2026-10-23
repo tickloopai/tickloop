@@ -39,6 +39,8 @@ pub(super) enum Glyph {
     TurnSummary,
     ScrollUp,
     ScrollDown,
+    ScrollTrack,
+    ScrollThumb,
     /// Agent states in the overview list; each pairs with its status word.
     AgentNeedsInput,
     AgentRunning,
@@ -109,6 +111,8 @@ impl DisplayProfile {
             Glyph::Warning => "!",
             Glyph::ScrollUp => "↑",
             Glyph::ScrollDown => "↓",
+            Glyph::ScrollTrack => "│",
+            Glyph::ScrollThumb => "┃",
             Glyph::AgentNeedsInput => "◆",
             Glyph::AgentRunning => TICK_SPINNER_FRAMES[0],
             Glyph::AgentWaiting => "◷",
@@ -119,6 +123,14 @@ impl DisplayProfile {
             Glyph::AgentViewed => "●",
             Glyph::Collapsed => "▸",
             Glyph::Expanded => "▾",
+        }
+    }
+
+    pub(super) const fn scrollbar_glyph(self, glyph: Glyph, ascii: bool) -> &'static str {
+        match (glyph, ascii) {
+            (Glyph::ScrollTrack, true) => "|",
+            (Glyph::ScrollThumb, true) => "#",
+            _ => self.glyph(glyph),
         }
     }
 
@@ -297,6 +309,8 @@ mod tests {
             Glyph::TurnSummary,
             Glyph::ScrollUp,
             Glyph::ScrollDown,
+            Glyph::ScrollTrack,
+            Glyph::ScrollThumb,
             Glyph::AgentNeedsInput,
             Glyph::AgentRunning,
             Glyph::AgentWaiting,

@@ -780,6 +780,7 @@ pub(super) struct State {
     back_to_bottom_pressed: bool,
     monitor_toggle_target: Option<BackToBottomTarget>,
     monitor_row_targets: Vec<MonitorRowTarget>,
+    monitor_tick_area: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     /// When time alone next changes the drawn frame's Monitor or Subagents rows: a running glyph
     /// blinking, a run time ticking or an age changing.
     row_clock_at: Option<u64>,
@@ -5825,6 +5826,7 @@ impl State {
             back_to_bottom_pressed: false,
             monitor_toggle_target: None,
             monitor_row_targets: Vec::new(),
+            monitor_tick_area: None,
             row_clock_at: None,
             footer_bar_target: None,
             pointer_input: None,
@@ -6233,6 +6235,24 @@ impl State {
         }
         match event.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.monitor_visible()
+                    && self.monitor.detail.is_none()
+                    && self
+                        .monitor_tick_area
+                        .as_ref()
+                        .is_some_and(|(rows, columns)| {
+                            rows.contains(&at.row) && columns.contains(&at.column)
+                        })
+                {
+                    let delta = renderer::WHEEL_SCROLL_LINES as isize;
+                    self.monitor
+                        .scroll_ticks(if event.kind == MouseEventKind::ScrollUp {
+                            -delta
+                        } else {
+                            delta
+                        });
+                    return true;
+                }
                 if self.monitor_visible()
                     && self.monitor.task_list_is_open()
                     && self.monitor.detail.is_none()
@@ -6879,6 +6899,7 @@ impl State {
             self.frames_drawn += 1;
         }
         self.monitor_row_targets.clear();
+        self.monitor_tick_area = None;
         self.monitor_separator = None;
         self.content_viewport = None;
         self.row_clock_at =
@@ -7043,11 +7064,13 @@ impl State {
                     .map(|line| line.line)
                     .collect();
             }
+            self.monitor.prepare_ticks(height);
             let frame =
                 self.monitor
                     .frame(side_columns.saturating_sub(2), height, self.display, now_ms);
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
+                self.monitor_tick_area = Some((frame.tick_rows.clone(), columns.clone()));
                 self.monitor_row_targets = frame
                     .targets
                     .into_iter()

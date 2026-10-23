@@ -330,7 +330,8 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             }
         }
         assert_eq!(state.monitor.hint(), *hint);
-        let frame = state.monitor.frame(80, 15, state.display, 0);
+        let height = state.monitor.side_content_height(80, 15, state.display, 0);
+        let frame = state.monitor.frame(80, height, state.display, 0);
         let scheduled_heading = frame
             .lines
             .iter()
@@ -338,7 +339,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             .unwrap();
         assert!(frame.lines[scheduled_heading - 1].text().is_empty());
         if !footer.is_empty() {
-            assert_eq!(frame.lines[scheduled_heading - 2].text(), *footer);
+            assert_eq!(frame.lines.last().unwrap().text(), *footer);
         }
         let row = frame
             .lines
@@ -1548,42 +1549,66 @@ fn screen(state: &mut State) -> String {
 }
 
 #[test]
-fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
-    let mut state = State::new(true, 140, 25);
-    let chat = Uuid::new_v4();
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let mut snapshot = chat_status(chat);
-    for index in 0..130 {
-        snapshot.monitor.members.push(MonitorMember {
-            is_terminal: false,
-            instance: format!("calendar:member-{index:03}").parse().unwrap(),
-            title: None,
-        });
+fn monitor_scrolls_continuously_across_pages_and_caches_earlier_rows() {
+    let mut state = docked_monitor_fixture(0, 0);
+    Arc::make_mut(state.monitor.chat_status.as_mut().unwrap()).goal = None;
+    for index in 0..270 {
+        Arc::make_mut(state.monitor.chat_status.as_mut().unwrap())
+            .monitor
+            .members
+            .push(MonitorMember {
+                is_terminal: false,
+                instance: format!("calendar:member-{index:03}").parse().unwrap(),
+                title: Some(format!("Tick {index:03}")),
+            });
     }
-    state.monitor.chat_status = Some(Arc::new(snapshot));
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 128);
-    assert_eq!(state.monitor.total(), 130);
+    assert_eq!(state.monitor.total(), 270);
     let rendered = screen(&mut state);
-    assert!(rendered.contains("Monitor 130"), "{rendered}");
-    assert!(rendered.contains("Monitor 1–128 of 130"), "{rendered}");
-    state.monitor.focus(false, None);
-    let mut seen = std::collections::BTreeSet::new();
-    for _ in 0..140 {
-        seen.insert(state.monitor.selected().unwrap().instance.clone());
+    assert!(rendered.contains("Ticks (270)"), "{rendered}");
+    assert!(!rendered.contains("of 270"), "{rendered}");
+    let initial = state.monitor.entries()[0].instance.clone();
+    for index in 0..269 {
+        assert_eq!(
+            state.monitor.selected().unwrap().title,
+            format!("Tick {index:03}")
+        );
+        let before = state.monitor.frame(40, 12, state.display, 0);
         state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let after = state.monitor.frame(40, 12, state.display, 0);
+        let before_ticks = before.targets.iter().map(|(_, id)| id).collect::<Vec<_>>();
+        assert!(
+            after
+                .targets
+                .iter()
+                .any(|(_, id)| before_ticks.contains(&id)),
+            "crossing a page keeps neighbouring rows visible at {index}"
+        );
+        if index == 120 {
+            assert_eq!(
+                state.monitor.entries().len(),
+                256,
+                "prefetch before reaching the loaded end"
+            );
+            assert_eq!(state.monitor.entries()[0].instance, initial);
+        }
     }
-    assert_eq!(seen.len(), 130, "j walks across pages to every row once");
-    assert_eq!(state.monitor.entries().len(), 2);
-    assert!(screen(&mut state).contains("Monitor 129–130 of 130"));
-    state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-    state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(state.monitor.entries().len(), 270);
+    for index in (0..269).rev() {
+        state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            state.monitor.selected().unwrap().title,
+            format!("Tick {index:03}")
+        );
+        state.monitor.frame(40, 12, state.display, 0);
+    }
     assert_eq!(
         state.monitor.entries().len(),
-        128,
-        "k returns to the earlier page"
+        270,
+        "upward scrolling reuses cached pages"
     );
+    assert!(screen(&mut state).contains("Ticks (270)"));
 }
 
 #[test]
@@ -3669,10 +3694,26 @@ fn docked_monitor_fixture(task_count: usize, tick_count: usize) -> State {
     state
 }
 
+fn docked_subscribed_monitor_fixture(task_count: usize, tick_count: usize) -> State {
+    let mut state = docked_monitor_fixture(task_count, tick_count);
+    let mut entries = state.monitor.entries().to_vec();
+    entries[0].tone = crate::monitor_rows::StatusTone::Live;
+    entries[0].status = "live".into();
+    entries[0].subscription = Some(crate::monitor_rows::SubscriptionMark {
+        frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+        is_waiting: false,
+        next_check: None,
+    });
+    let selected = entries[0].instance.clone();
+    state.monitor.replace(TickGroup::Ticks, entries);
+    state.monitor.select(&selected);
+    state
+}
+
 #[test]
-fn round3_monitor_render_evidence() {
-    let state = docked_monitor_fixture(5, 8);
-    let frame = state.monitor.frame(48, 16, state.display, 0);
+fn selected_tick_status_below_goal_render_evidence() {
+    let state = docked_subscribed_monitor_fixture(2, 30);
+    let frame = state.monitor.frame(48, 20, state.display, 0);
     println!(
         "{}",
         frame
@@ -3682,11 +3723,160 @@ fn round3_monitor_render_evidence() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    assert_eq!(frame.lines.len(), 16);
+    assert_eq!(frame.lines.len(), 20);
+    assert_eq!(frame.lines[19].text(), "Live · Every 1 min");
+    assert!(frame.lines[18].text().starts_with("◎ Finish"));
+    assert!(
+        frame.lines[frame.tick_rows.clone()]
+            .iter()
+            .any(|line| line.text().ends_with('┃'))
+    );
+    assert!(
+        frame
+            .lines
+            .iter()
+            .any(|line| line.fill == Some(Role::Selection) && line.text().contains("Tick 01"))
+    );
 }
 
 #[test]
-fn scheduled_and_goal_stay_docked_while_ticks_page_and_shrink_at_narrow_heights() {
+fn tick_status_replaces_side_padding_below_goal_without_moving_docked_sections() {
+    use crate::terminal::monitor::MonitorTarget;
+    let mut state = docked_subscribed_monitor_fixture(2, 30);
+    let tick = state.monitor.entries()[0].instance.clone();
+    for height in [14, 20] {
+        state.monitor.select(&tick);
+        let content_height = state
+            .monitor
+            .side_content_height(48, height, state.display, 0);
+        assert_eq!(
+            content_height, height,
+            "status occupies the former padding row"
+        );
+        let selected = state.monitor.frame(48, content_height, state.display, 0);
+        assert_eq!(selected.lines.last().unwrap().text(), "Live · Every 1 min");
+        let goal = selected
+            .lines
+            .iter()
+            .position(|line| line.text().starts_with("Pursuing goal"))
+            .unwrap();
+        let scheduled = selected
+            .lines
+            .iter()
+            .position(|line| line.text() == "Scheduled (2)")
+            .unwrap();
+        assert!(selected.lines[goal - 1].text().is_empty());
+        assert!(selected.lines[scheduled - 1].text().is_empty());
+        assert!(
+            selected
+                .lines
+                .iter()
+                .any(|line| line.text().contains("Scheduled instruction 2"))
+        );
+        assert!(selected.targets.iter().all(|(row, _)| *row < height - 1));
+        let footer = selected.lines.last().unwrap();
+        assert_eq!(footer.spans[0].role, Some(Role::MutedText));
+        assert!(!footer.text().contains(['│', '┃']));
+        for target in [
+            MonitorTarget::ScheduledTask("00000000".into()),
+            MonitorTarget::Goal,
+        ] {
+            state.monitor.select_target(&target);
+            let content_height = state
+                .monitor
+                .side_content_height(48, height, state.display, 0);
+            assert_eq!(content_height, height - 1);
+            let frame = state.monitor.frame(48, content_height, state.display, 0);
+            assert_eq!(
+                frame
+                    .lines
+                    .iter()
+                    .position(|line| line.text().starts_with("Pursuing goal")),
+                Some(goal)
+            );
+            assert_eq!(
+                frame
+                    .lines
+                    .iter()
+                    .position(|line| line.text() == "Scheduled (2)"),
+                Some(scheduled)
+            );
+            assert!(
+                !frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text().contains("Scheduled task ")
+                        || line.text().contains("Every 1 min"))
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_tick_status_is_immediately_above_the_input_divider_in_side_and_overlay_views() {
+    for width in [60, 80, 140] {
+        let mut state = docked_subscribed_monitor_fixture(2, 30);
+        state.resize(width, 30);
+        state.monitor.overlay = width == 60;
+        state.task_title = Some("Chat title".into());
+        let mut output = Vec::new();
+        state.draw_frame(&mut output).unwrap();
+        let terminal = tickloop_agent_test_support::screen::visible_screen(
+            &String::from_utf8_lossy(&output),
+            state.width,
+            state.height,
+        );
+        let rows = terminal.lines().collect::<Vec<_>>();
+        let divider = state.monitor_toggle_target.as_ref().unwrap().row;
+        assert!(
+            rows[divider - 1].contains("Live · Every 1 min"),
+            "{width}: {terminal}"
+        );
+        assert!(
+            rows[divider - 2].contains("◎ Finish"),
+            "{width}: {terminal}"
+        );
+        assert!(
+            rows[divider - 3].contains("Pursuing goal"),
+            "{width}: {terminal}"
+        );
+        assert!(rows[divider].contains("Chat title"), "{width}: {terminal}");
+    }
+}
+
+#[test]
+fn tick_status_keeps_existing_compression_priorities_at_narrow_heights() {
+    let state = docked_subscribed_monitor_fixture(5, 30);
+    for height in [4, 5, 6, 7, 8, 10, 12, 16] {
+        let frame = state.monitor.frame(30, height, state.display, 0);
+        assert_eq!(frame.lines.len(), height);
+        let footer = frame.lines.last().unwrap().text() == "Live · Every 1 min";
+        let goal_end = height - usize::from(footer);
+        assert!(
+            frame.lines[goal_end - 2]
+                .text()
+                .starts_with("Pursuing goal")
+        );
+        assert!(frame.lines[goal_end - 1].text().starts_with("◎ Finish"));
+        assert!(frame.lines.iter().any(|line| line.text().starts_with("◷ ")));
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text().starts_with("  Scheduled instruction"))
+        );
+        assert!(
+            frame
+                .lines
+                .iter()
+                .all(|line| display_width(&line.text()) <= 30)
+        );
+        assert_eq!(footer, height >= 8);
+    }
+}
+
+#[test]
+fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_heights() {
     let mut state = docked_monitor_fixture(5, 0);
     {
         let status = Arc::make_mut(state.monitor.chat_status.as_mut().unwrap());
@@ -3706,12 +3896,12 @@ fn scheduled_and_goal_stay_docked_while_ticks_page_and_shrink_at_narrow_heights(
     for _ in 0..128 {
         state.monitor.move_selection(1);
     }
-    assert_eq!(state.monitor.entries().len(), 2);
+    assert_eq!(state.monitor.entries().len(), 130);
     let after = state.monitor.frame(48, 16, state.display, 0);
     assert_eq!(
         &before.lines[6..],
         &after.lines[6..],
-        "the dock does not move with Tick pages"
+        "the dock does not move with Tick scrolling"
     );
     let text = after
         .lines
@@ -3722,7 +3912,8 @@ fn scheduled_and_goal_stay_docked_while_ticks_page_and_shrink_at_narrow_heights(
     assert!(text.contains("Scheduled instruction 3"));
     assert!(!text.contains("Scheduled instruction 4"));
     assert!(text.contains("+2 more"));
-    assert!(text.contains("Monitor 129–130 of 130"));
+    assert!(text.starts_with("Monitor\n"));
+    assert!(!text.contains("of 130"));
     for height in [4, 5, 6, 7, 8, 10, 12, 16] {
         let frame = state.monitor.frame(30, height, state.display, 0);
         assert_eq!(frame.lines.len(), height);
@@ -4789,8 +4980,14 @@ fn side_monitor_bottom_padding_preserves_a_wrapped_selected_tick() {
         let content_height = state
             .monitor
             .side_content_height(48, height, state.display, 0);
-        assert_eq!(content_height, minimum);
+        assert_eq!(content_height, height);
         let frame = state.monitor.frame(48, content_height, state.display, 0);
+        assert_eq!(frame.lines.last().unwrap().text(), "exit 0");
+        assert!(
+            frame.lines[content_height - 2]
+                .text()
+                .starts_with("◎ Finish")
+        );
         assert_eq!(
             frame.targets.len(),
             2,
@@ -4814,4 +5011,65 @@ fn monitor_bottom_padding_does_not_reduce_the_overlay() {
     let rows = terminal.lines().collect::<Vec<_>>();
     let divider = state.monitor_toggle_target.as_ref().unwrap().row;
     assert!(rows[divider - 1].contains("◎ Finish"), "{terminal}");
+}
+
+#[test]
+fn wheel_scrolls_only_the_tick_viewport_without_moving_selection_or_the_dock() {
+    for overlay in [false, true] {
+        let mut state = docked_monitor_fixture(2, 40);
+        let selected = state.monitor.entries()[0].instance.clone();
+        state.monitor.select(&selected);
+        if overlay {
+            state.width = 70;
+            state.monitor.overlay = true;
+        }
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let selected = state.monitor.selected().unwrap().instance.clone();
+        let (rows, columns) = state.monitor_tick_area.clone().unwrap();
+        let before = state.monitor.frame(40, 16, state.display, 0);
+        let wheel = |kind, row| MouseEvent {
+            kind,
+            row,
+            column: columns.start as u16 + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(state.pointer(
+            wheel(MouseEventKind::ScrollDown, rows.start as u16),
+            &mut Vec::new()
+        ));
+        let after = state.monitor.frame(40, 16, state.display, 0);
+        assert_eq!(state.monitor.selected().unwrap().instance, selected);
+        assert_ne!(
+            before.lines[before.tick_rows.clone()],
+            after.lines[after.tick_rows.clone()]
+        );
+        assert_eq!(
+            before.lines[before.tick_rows.end..],
+            after.lines[after.tick_rows.end..]
+        );
+        assert!(state.pointer(
+            wheel(MouseEventKind::ScrollUp, rows.start as u16),
+            &mut Vec::new()
+        ));
+        let returned = state.monitor.frame(40, 16, state.display, 0);
+        assert_eq!(before.lines, returned.lines);
+        state.pointer(
+            wheel(MouseEventKind::ScrollDown, rows.end as u16 + 1),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            before.lines,
+            state.monitor.frame(40, 16, state.display, 0).lines
+        );
+        state.pointer(
+            wheel(MouseEventKind::ScrollDown, rows.start as u16),
+            &mut Vec::new(),
+        );
+        state.monitor.move_selection(1);
+        let resumed = state.monitor.frame(40, 16, state.display, 0);
+        let selected = crate::terminal::monitor::MonitorTarget::Tick(
+            state.monitor.selected().unwrap().instance.clone(),
+        );
+        assert!(resumed.targets.iter().any(|(_, id)| id == &selected));
+    }
 }
