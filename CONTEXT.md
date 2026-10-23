@@ -76,7 +76,7 @@ _Avoid_：事件触发、定时器、钟点规则
 - 停止：Esc 撤销自定节奏的下一次唤醒与兜底唤醒；固定间隔与一次性任务不受 Esc 影响，只能用 CronDelete 或在 Monitor 中取消。`/stop` 暂停接收，继续后按下一个计划时刻触发；离开界面照常触发。
 - 分支与回退：从 Chat 分支出的新 Chat 不继承 Goal 与定时任务；回退（rewind）只改对话，不改变 Goal 与定时任务。
 - 历史装载：自定节奏的 `/loop` 不恢复；未过期的重复任务保留，恢复接收后按晚于恢复时刻的下一个计划时刻触发；时刻已过的一次性任务和已过期的重复任务删除。
-- Monitor 中每个定时任务占一行，显示间隔与下次触发时间，用进度条表示到下次触发的进度（到点等待 Loop 空闲时停在满格，暂停接收时变灰），触发时提示一次，`x` 取消。定时任务不是 Tick。
+- Monitor 中每个定时任务占一行，显示间隔与下次触发时间，用进度条表示到下次触发的进度（到点等待 Loop 空闲时停在满格，暂停接收时变灰），触发时提示一次，按两次 `Ctrl+X` 删除。定时任务不是 Tick。
 _Avoid_：钟点规则、StartGoal、定时 Tick
 
 **Goal（目标）**：
@@ -116,7 +116,7 @@ _Avoid_：owner、owner daemon、Agent 执行服务
 由 Daemon 为每个根 Agent 启动的进程，运行该 Agent 的模型调用、工具、审批、Trigger 与 Transcript；其 Shell 命令经审批后交给 Tickhost 运行，生存期仍跟随本 Worker。其子 Agent 与分支复用同一 Worker。Worker 以 Daemon 为生命线，明确停止或未计划的生命线丢失时结束。计划交接保留生命线；完整 Worker 家族到达安全点后，通过专用活状态检查点换成新版，不调用普通历史恢复。Worker 以库的方式调用 Harness；其他宿主中运行 Harness 的进程不称 Worker。
 
 **Monitor（观察列表）**：
-Agent 界面中本 Chat 打开、订阅的 Tick Instance、Artifact、后台 Shell 与定时任务的统一入口，同一实例只占一行。成员关系与订阅、所有权分别管理，离开视图不结束实例。周期订阅用 `↻` 表示，类型图标为扩展 Tick `◉`、Terminal Tick `>`、Shell `$`、Artifact `↗`。选中扩展或终端 Tick 时，面板固定底栏显示选中实例的运行状态、已有订阅频率和未读状态；`s subscriptions` 与未订阅扩展／终端 Tick 的 `u send update` 放在全局按键提示栏；`s` 依次切换未订阅、1 分钟、10 分钟、30 分钟、未订阅，立即生效，不确认。Shell 的 `s` 仍为停止；Artifact 的关联保持原生入口。首份待送内容到达后，名称区域显示进度条直到交付，后续更新不重置起点；订阅和类型图标不被进度色覆盖。按 Enter 直接附着已有 Tick 的视图，隐藏视图不结束实例；结束进程与关闭视图分别操作。删除／停止进程的确认保留。定时任务各占一行；Goal 不是成员，固定显示在面板底部。详细交互见 Monitor signals 规格。
+Agent 界面中本 Chat 打开、订阅的 Tick Instance、Artifact、后台 Shell 与定时任务的统一入口，同一实例只占一行。成员关系与订阅、所有权分别管理，离开视图不结束实例。周期订阅用 `↻` 表示，类型图标为扩展 Tick `◉`、Terminal Tick `>`、Shell `$`、Artifact `↗`。选中扩展或终端 Tick 时，面板固定底栏显示选中实例的运行状态、已有订阅频率和未读状态；`s subscriptions` 与未订阅扩展／终端 Tick 的 `u send update` 放在全局按键提示栏；`s` 依次切换未订阅、1 分钟、10 分钟、30 分钟、未订阅，立即生效，不确认。Shell 停止统一按两次 `Ctrl+X`；Artifact 的关联保持原生入口。首份待送内容到达后，名称区域显示进度条直到交付，后续更新不重置起点；订阅和类型图标不被进度色覆盖。按 Enter 直接附着已有 Tick 的视图，隐藏视图不结束实例；结束进程与关闭视图分别操作。移出／关闭 Tick、停止 Shell、解除 Artifact 关联和删除定时任务统一按两次 `Ctrl+X`：首次在底部按键提示区显示红色提示，3 秒内同一行再次按下才执行；到期、移动选中、其他按键或离开 Monitor 时取消。已结束 Tick 按 Enter 直接重新打开。定时任务各占一行；Goal 不是成员，固定显示在面板底部。详细交互见 Monitor signals 规格。
 
 **未读更新（Unread Update）**：
 Monitor 中一个实例最近一次内容更新晚于当前 Chat 最后一次处理它的时间时的状态。 未读属于当前 Chat 中的 Tick Instance，不属于订阅；调频和取消订阅不等同于处理。取消自动交付后保留已知未读，未订阅时不显示周期进度。用户可用“发送更新”（Send Update，`u`）把未订阅的扩展或 Terminal Tick 当前内容一次性交给 Agent，不建立订阅；仅排队不清未读，真正接收后处理所发送的快照，后续变化仍未读。处理指更新进入了本 Chat Agent 的回合（订阅投递、读取工具或完成通知），或者用户在 Monitor 中打开了这一行；仅排队未运行不算处理。Agent 自己造成的变化不算更新。Shell 只以结束为更新，Terminal Tick 只在被订阅时才判断；人修改 Artifact 正文不是 Tick Update，但刷新该行的最近更新时间，也使它未读。行上不显示更新时间与条数（频繁更新的 Tick 会让它们不停变化），最近更新时间与未处理条数在行的详情中查看。未读以行首类型图标的颜色表示：有未处理的更新时，类型图标改用更新颜色（不再用背景色方块），每来一次更新图标闪一下（亮暗闪烁），处理后恢复表示状态的颜色（Agent 回合取用与用户打开都算处理）。有本 Chat 周期订阅的行，订阅已有待送内容时另有进度条，表示多久后交给 Agent；更新经订阅投递、完成通知或认领的反馈请求进入本 Chat Agent 的回合时，名称区域以更新颜色的暖色闪一下表示交给 Agent，同时图标恢复状态颜色、进度条消失；检查时没有要送的内容则直接消失，不闪。Agent 在本 Chat 的回合中用工具读取或操作这个实例（TickRead、TickCall、TickManage 输入、Read 任务输出文件、ArtifactRead、ArtifactComment、ArtifactEdit）并成功时，名称区域以冷色闪一下表示 Agent 正在用它，与交给 Agent 的暖色闪烁节奏相同、颜色不同；实时内容流中的 Tick Update 来源标签与 TickRead 调用标签分别同步暖色与冷色闪动，历史回放不重播；每次使用都闪，不论有无新更新，两者接连发生时后发生的盖过前一个。读取算处理，操作不算。用户打开这一行时图标直接恢复状态颜色，不闪。未读的结束 Shell 保留到被处理后才离开列表。
@@ -401,11 +401,11 @@ Agent 让 Tickhost 在终端（PTY）中运行的、不讲 Tick 协议的交互�
 _Avoid_：终端观察（Terminal Observation，已取消）
 
 **Shell Tick**：
-Agent 执行的一次 shell 命令形成的 Tick，由 Tickhost 以管道运行（不使用终端），生存期跟随启动它的 Worker；命令的输出与退出结果是它的内容，只在退出时形成 Tick Update，订阅固定为及时；长任务的中间进度由 Agent 主动 Read 输出文件获得，订阅只负责“结束”这一件事；Monitor 只显示放到后台的执行，运行中的一直显示，可在行上直接停止；结束后保留到本 Chat 处理它的结束，再短暂显示结果后离开列表；前台执行无论是否在运行都不进入列表，只留在对话中。它以描述（Description）为名：Agent 调用 Bash 时给出的描述，或没有描述的执行放到后台时生成的描述。Monitor 行显示从命令提取的关键命令（如 `make test`），描述、完整命令、目录、状态与实时输出在 Tickhost 提供的附着视图中。它不占用 Pane，与 Terminal Tick 分别处理。
+Agent 执行的一次 shell 命令形成的 Tick，由 Tickhost 以管道运行（不使用终端），生存期跟随启动它的 Worker；命令的输出与退出结果是它的内容，只在退出时形成 Tick Update，订阅固定为及时；长任务的中间进度由 Agent 主动 Read 输出文件获得，订阅只负责“结束”这一件事；Monitor 只显示放到后台的执行，运行中的一直显示，可在行上按两次 `Ctrl+X` 停止；结束后保留到本 Chat 处理它的结束，再短暂显示结果后离开列表；前台执行无论是否在运行都不进入列表，只留在对话中。它以描述（Description）为名：Agent 调用 Bash 时给出的描述，或没有描述的执行放到后台时生成的描述。Monitor 行显示从命令提取的关键命令（如 `make test`），描述、完整命令、目录、状态与实时输出在 Tickhost 提供的附着视图中。它不占用 Pane，与 Terminal Tick 分别处理。
 _Avoid_：后台任务、Task（只描述执行方式）
 
 **Artifact Tick（Artifact Tick）**：
-以 Artifacts 服务中的一个 Artifact 为实例的 Tick。Agent 成功读取正文后，Artifact 作为成员出现在当前 Chat 的 Monitor；同一来源服务的同一 Artifact 在一个 Chat 中只保留一行，重复或分页读取不会创建副本。只读展示不建立 Artifact 关联，也不改变已有的关联。用户在 `/artifacts` 选择 Artifact 或在 Monitor 中关联它，或 Agent 在当前 Chat 创建 Artifact 时，才为该账号建立 Artifact 关联，因而被关联的 Loop 订阅。只有 Artifact 反馈请求是该实例的更新，经 Artifact 关联逐条交给 Loop，不因最新值合并而丢失；人修改正文与任何 Agent 的修改都不是 Tick Update，不叫醒 Loop；人的修改只更新该实例的最近更新时间，并让 Monitor 中该行显示未读。Artifact 行一直留在 Monitor，不因时间、Artifact 不可用、关联暂停或改到别处而离开；只有用户 unlink（Monitor 中的 `x`）才结束本 Chat 的 Artifact 关联并移出 Monitor，后续读取不会撤销这次移除，Artifact 本身不受影响。
+以 Artifacts 服务中的一个 Artifact 为实例的 Tick。Agent 成功读取正文后，Artifact 作为成员出现在当前 Chat 的 Monitor；同一来源服务的同一 Artifact 在一个 Chat 中只保留一行，重复或分页读取不会创建副本。只读展示不建立 Artifact 关联，也不改变已有的关联。用户在 `/artifacts` 选择 Artifact 或在 Monitor 中关联它，或 Agent 在当前 Chat 创建 Artifact 时，才为该账号建立 Artifact 关联，因而被关联的 Loop 订阅。只有 Artifact 反馈请求是该实例的更新，经 Artifact 关联逐条交给 Loop，不因最新值合并而丢失；人修改正文与任何 Agent 的修改都不是 Tick Update，不叫醒 Loop；人的修改只更新该实例的最近更新时间，并让 Monitor 中该行显示未读。Artifact 行一直留在 Monitor，不因时间、Artifact 不可用、关联暂停或改到别处而离开；只有用户 unlink（Monitor 中按两次 `Ctrl+X`）才结束本 Chat 的 Artifact 关联并移出 Monitor，后续读取不会撤销这次移除，Artifact 本身不受影响。
 _Avoid_：关联 Artifact（Artifact 关联专指反馈关系）
 
 ### 工作台外观

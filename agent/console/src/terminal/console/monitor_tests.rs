@@ -4,6 +4,26 @@ use tickloop_agent_protocol::{
     ChatSnapshot, ChatStatus, MonitorMember, MonitorMembership, TickSubscriptionStatus,
 };
 
+fn remove_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+}
+
+fn confirm_removal(state: &mut State) -> Option<InputEvent> {
+    assert!(
+        state.key(remove_key()).is_none(),
+        "the first press only prompts"
+    );
+    assert!(
+        state
+            .confirmation_hint()
+            .unwrap()
+            .starts_with("Press Ctrl+X again to ")
+    );
+    let event = state.key(remove_key());
+    assert!(state.monitor_confirmation.is_none());
+    event
+}
+
 fn shell(id: Uuid, title: &str) -> MonitorEntry {
     MonitorEntry {
         instance: tick_protocol::InstanceRef::shell(id),
@@ -73,7 +93,7 @@ fn shell_tick_enter_opens_its_view_and_no_monitor_detail() {
 }
 
 #[test]
-fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
+fn shell_ticks_only_list_background_executions_and_ctrl_x_twice_removes_a_finished_one() {
     use tickloop_agent_protocol::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
     for origin in [ShellTaskOrigin::Agent, ShellTaskOrigin::User] {
         let chat = Uuid::new_v4();
@@ -126,10 +146,10 @@ fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
         {
             let mut state = console.state.lock().unwrap();
             state.monitor.focus(true, None);
-            let removal = state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            let removal = confirm_removal(&mut state);
             assert!(
                 matches!(&removal, Some(InputEvent::TickAction { action, .. }) if action.key == 'x' && action.instance == task.to_string()),
-                "x asks the Agent to record the removal"
+                "Ctrl+X twice asks the Agent to record the removal"
             );
             assert_eq!(state.monitor.entries().len(), 1);
         }
@@ -273,12 +293,12 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::Tick(tick.instance.clone()),
             "exit 0",
-            "enter open · x remove · esc input",
+            "enter open · Ctrl+X remove · esc input",
         ),
         (
             MonitorTarget::ScheduledTask("0123abcd".into()),
             "Scheduled task 0123abcd",
-            "enter details · x remove · esc input",
+            "enter details · Ctrl+X remove · esc input",
         ),
         (
             MonitorTarget::Goal,
@@ -364,11 +384,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
             .is_none()
     );
-    assert!(
-        state
-            .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-            .is_none()
-    );
+    assert!(state.key(remove_key()).is_none());
     assert!(state.monitor.is_goal_selected());
     assert!(state.monitor.focused);
     assert!(state.editor.draft().is_empty());
@@ -957,9 +973,9 @@ fn shell_tick_renders_in_right_list_and_finished_remove_keeps_other_rows() {
             .any(|line| line.contains("echo shell tick"))
     );
     state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-    let removal = state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let removal = confirm_removal(&mut state);
     let Some(InputEvent::TickAction { action, .. }) = removal else {
-        panic!("x must ask the Agent to remove the row");
+        panic!("Ctrl+X twice must ask the Agent to remove the row");
     };
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.chat_status = Some(Arc::new(chat_status(state.chat.unwrap())));
@@ -1630,7 +1646,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.focus(false, None);
-    assert!(screen(&mut state).contains("enter details · x remove"));
+    assert!(screen(&mut state).contains("enter details · Ctrl+X remove"));
     assert!(matches!(
         state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         Some(InputEvent::TickAction { .. })
@@ -2418,10 +2434,10 @@ fn the_subscription_footer_stays_at_the_panel_bottom() {
 }
 
 #[tokio::test]
-async fn removing_a_subscribed_row_directly_cancels_its_subscriptions_and_reports_it() {
+async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_and_reports_it() {
     use crate::terminal::{
         execution::ConsoleExecution,
-        tick_actions::{TickActionContext, TickActionUi, builtin, execute},
+        tick_actions::{TickActionContext, execute},
     };
     use tickloop_agent_runtime::{
         tick_adapter::{TickAdapter, TickAdapters},
@@ -2490,12 +2506,11 @@ async fn removing_a_subscribed_row_directly_cancels_its_subscriptions_and_report
     };
     let removal = {
         let mut state = console.state.lock().unwrap();
-        builtin::executor(&crate::monitor_rows::TickIntent::RemoveFromMonitor(
-            watched.clone(),
-        ))
-        .unwrap()
-        .prepare(&mut TickActionUi { state: &mut state })
-        .unwrap()
+        state.monitor.focus(false, None);
+        let Some(InputEvent::TickAction { action, .. }) = confirm_removal(&mut state) else {
+            panic!("no removal action")
+        };
+        action
     };
     execute(removal, context).await.unwrap();
     {
@@ -2650,7 +2665,7 @@ fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
 
 /// A running Shell is stopped from its Monitor row and its row shows it ended.
 #[tokio::test]
-async fn a_running_shell_is_stopped_from_its_row_directly_with_feedback() {
+async fn a_running_shell_is_stopped_from_its_row_after_confirmation_with_feedback() {
     use crate::terminal::{
         execution::ConsoleExecution,
         task_access::ShellTaskCenter,
@@ -2713,16 +2728,11 @@ async fn a_running_shell_is_stopped_from_its_row_directly_with_feedback() {
         root: Some(directory.path()),
         chat,
     };
-    let press = |code| {
-        console
-            .state
-            .lock()
-            .unwrap()
-            .key(KeyEvent::new(code, KeyModifiers::NONE))
-    };
     console.state.lock().unwrap().monitor.focus(false, None);
-    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Char('s')) else {
-        panic!("s did not stop the Shell");
+    let Some(InputEvent::TickAction { action, .. }) =
+        confirm_removal(&mut console.state.lock().unwrap())
+    else {
+        panic!("Ctrl+X twice did not stop the Shell");
     };
     assert_eq!(action.instance, shell.to_string());
     execute(action, context).await.unwrap();
@@ -2752,7 +2762,10 @@ async fn a_running_shell_is_stopped_from_its_row_directly_with_feedback() {
         .actions
         .clone();
     assert!(
-        actions.iter().all(|action| action.key != 's'),
+        actions.iter().all(|action| !matches!(
+            action.intent,
+            crate::monitor_rows::TickIntent::StopShell { .. }
+        )),
         "an ended Shell has nothing to stop"
     );
     std::fs::write(&gate, "").unwrap();
@@ -2817,7 +2830,7 @@ fn action_labels(state: &State) -> Vec<(char, &'static str)> {
 }
 
 #[test]
-fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
+fn an_artifact_linked_here_shows_no_subscription_mark_and_ctrl_x_twice_unlinks_it() {
     let (mut state, artifact) = linked_artifact_fixture(false);
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
@@ -2835,7 +2848,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
             ('h', "include earlier feedback")
         ]
     );
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('x'))), 'x');
+    assert_eq!(requested_key(confirm_removal(&mut state)), 'x');
 
     let mut subscription = tests::subscription_row(3);
     subscription.instance = artifact;
@@ -3336,7 +3349,7 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_report_the_res
 }
 
 #[tokio::test]
-async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_deletion() {
+async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
@@ -3394,7 +3407,12 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_
         state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.monitor.detail.is_none());
     }
-    execute(press(KeyCode::Char('x')), context).await.unwrap();
+    let Some(InputEvent::TickAction { action, .. }) =
+        confirm_removal(&mut console.state.lock().unwrap())
+    else {
+        panic!("no deletion action")
+    };
+    execute(action, context).await.unwrap();
     assert_eq!(console.test_status_text(), "Scheduled task removed");
     assert!(
         core.snapshot(chat)
@@ -3426,7 +3444,12 @@ async fn scheduled_task_details_and_delete_use_the_live_agent_and_report_direct_
         assert!(state.monitor.task_list_is_open());
     }
     execute(press(KeyCode::Enter), context).await.unwrap();
-    execute(press(KeyCode::Char('x')), context).await.unwrap();
+    let Some(InputEvent::TickAction { action, .. }) =
+        confirm_removal(&mut console.state.lock().unwrap())
+    else {
+        panic!("no deletion action")
+    };
+    execute(action, context).await.unwrap();
     {
         let state = console.state.lock().unwrap();
         assert!(
@@ -3857,4 +3880,226 @@ fn returning_from_the_full_task_list_keeps_selection_when_removal_eliminates_ove
     assert_eq!(state.monitor.selected_task().unwrap().id, "00000000");
     let frame = state.monitor.frame(48, 16, state.display, 0);
     assert!(!frame.lines.iter().any(|line| line.text().contains("more")));
+}
+
+fn removal_fixture(intent: crate::monitor_rows::TickIntent) -> State {
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    let mut entry = shell(Uuid::new_v4(), "News · TSLA.US");
+    entry.actions = vec![crate::monitor_rows::MonitorAction {
+        key: 'x',
+        label: "remove",
+        intent,
+    }];
+    state.monitor.replace(TickGroup::Shells, vec![entry]);
+    state.monitor.focus(false, None);
+    state
+}
+
+#[test]
+fn destructive_monitor_intents_require_two_control_x_presses_and_show_a_red_footer() {
+    use crate::monitor_rows::TickIntent;
+    let instance: tick_protocol::InstanceRef = "hosted:watched".parse().unwrap();
+    for (intent, consequence) in [
+        (
+            TickIntent::RemoveFromMonitor(instance.clone()),
+            "remove News · TSLA.US from Monitor",
+        ),
+        (
+            TickIntent::CloseHosted {
+                instance: instance.clone(),
+                ends_process: true,
+            },
+            "close News · TSLA.US",
+        ),
+        (
+            TickIntent::CloseHosted {
+                instance,
+                ends_process: false,
+            },
+            "remove News · TSLA.US from Monitor",
+        ),
+        (
+            TickIntent::StopShell {
+                task: Uuid::new_v4(),
+            },
+            "stop this Shell",
+        ),
+        (
+            TickIntent::Artifact {
+                id: "doc".into(),
+                key: 'x',
+            },
+            "remove News · TSLA.US",
+        ),
+    ] {
+        let mut state = removal_fixture(intent);
+        assert!(state.key(remove_key()).is_none());
+        let expected = format!("Press Ctrl+X again to {consequence}");
+        assert_eq!(
+            state.confirmation_hint().as_deref(),
+            Some(expected.as_str())
+        );
+        let (lines, _, _) = state.styled_frame();
+        let footer = lines.last().unwrap();
+        assert_eq!(footer.text(), expected);
+        assert!(
+            footer
+                .spans
+                .iter()
+                .all(|span| span.role == Some(Role::Error))
+        );
+        assert_eq!(state.monitor.entries().len(), 1);
+        state.monitor_confirmation.as_mut().unwrap().requested_at -= Duration::from_secs(2);
+        assert!(matches!(
+            state.key(remove_key()),
+            Some(InputEvent::TickAction { .. })
+        ));
+        assert!(state.confirmation_hint().is_none());
+    }
+}
+
+#[test]
+fn monitor_confirmation_cancels_on_timeout_other_keys_escape_selection_and_disappearance() {
+    use crate::monitor_rows::TickIntent;
+    let instance: tick_protocol::InstanceRef = "hosted:watched".parse().unwrap();
+    for key in [
+        KeyCode::Down,
+        KeyCode::Char('j'),
+        KeyCode::Char('r'),
+        KeyCode::Esc,
+        KeyCode::Left,
+    ] {
+        let mut state = removal_fixture(TickIntent::RemoveFromMonitor(instance.clone()));
+        state.key(remove_key());
+        state.key(KeyEvent::new(key, KeyModifiers::NONE));
+        assert!(state.monitor_confirmation.is_none(), "{key:?}");
+        assert!(state.confirmation_hint().is_none());
+    }
+    let mut state = removal_fixture(TickIntent::RemoveFromMonitor(instance.clone()));
+    state.key(remove_key());
+    state.monitor_confirmation.as_mut().unwrap().requested_at -=
+        MONITOR_CONFIRMATION_WINDOW + Duration::from_millis(1);
+    assert!(state.confirmation_hint().is_none());
+    assert!(state.expire_key_confirmations());
+    assert!(!state.expire_key_confirmations());
+    assert!(
+        state.key(remove_key()).is_none(),
+        "an expired second press starts over"
+    );
+    state.monitor.replace(TickGroup::Shells, Vec::new());
+    assert!(state.confirmation_hint().is_none(), "the target vanished");
+    assert!(state.expire_key_confirmations());
+    assert!(!state.monitor.focused, "an empty Monitor releases focus");
+    let mut state = docked_monitor_fixture(0, 0);
+    assert!(state.monitor.is_goal_selected());
+    assert!(state.key(remove_key()).is_none());
+    assert_eq!(
+        state.confirmation_hint().as_deref(),
+        Some("No removable Monitor item selected")
+    );
+    state.monitor_notice.as_mut().unwrap().until = Instant::now() - Duration::from_millis(1);
+    assert!(state.expire_key_confirmations());
+    assert!(state.confirmation_hint().is_none());
+}
+
+#[test]
+fn control_x_confirmation_follows_row_identity_and_plain_x_cannot_remove() {
+    use crate::monitor_rows::TickIntent;
+    let mut state = removal_fixture(TickIntent::RemoveFromMonitor(
+        "hosted:first".parse().unwrap(),
+    ));
+    state.key(remove_key());
+    let second = shell(Uuid::new_v4(), "Second");
+    state
+        .monitor
+        .replace(TickGroup::Shells, vec![second.clone()]);
+    assert!(state.confirmation_hint().is_none());
+    assert!(
+        state.key(remove_key()).is_none(),
+        "a new row needs its own first press"
+    );
+    assert!(state.confirmation_hint().unwrap().contains("Second"));
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.monitor_confirmation.is_none());
+    assert_eq!(state.monitor.entries().len(), 1);
+    assert_eq!(state.editor.draft(), "x");
+}
+
+#[test]
+fn monitor_control_x_does_not_start_or_complete_the_foreground_shell_chord() {
+    use crate::monitor_rows::TickIntent;
+    let mut state = removal_fixture(TickIntent::RemoveFromMonitor(
+        "hosted:first".parse().unwrap(),
+    ));
+    state.set_foreground_shell(true);
+    state.monitor.focus(false, None);
+    assert!(state.key(remove_key()).is_none());
+    assert!(state.shell_background_chord_started_at.is_none());
+    assert!(state.monitor_confirmation.is_some());
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .is_none()
+    );
+    assert!(state.monitor_confirmation.is_none());
+    state.monitor.focused = false;
+    assert!(state.key(remove_key()).is_none());
+    assert!(state.monitor_confirmation.is_none());
+    assert!(state.shell_background_chord_started_at.is_some());
+    state.monitor.focus(false, None);
+    assert!(
+        state.key(remove_key()).is_none(),
+        "Monitor takes focus from the chord"
+    );
+    assert!(state.shell_background_chord_started_at.is_none());
+    assert!(state.monitor_confirmation.is_some());
+    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    state.key(remove_key());
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+        Some(InputEvent::BackgroundForegroundShell)
+    ));
+}
+
+#[test]
+fn scheduled_task_deletion_from_list_and_detail_requires_the_same_double_press() {
+    for detail in [false, true] {
+        let mut state = docked_monitor_fixture(1, 0);
+        state.monitor.focus(false, None);
+        if detail {
+            assert!(matches!(
+                state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(InputEvent::TickAction { .. })
+            ));
+        }
+        let id = state.monitor.selected_task().unwrap().id.clone();
+        assert!(state.key(remove_key()).is_none());
+        assert_eq!(
+            state.confirmation_hint().as_deref(),
+            Some("Press Ctrl+X again to delete this scheduled task")
+        );
+        assert_eq!(state.monitor.selected_task().unwrap().id, id);
+        assert!(
+            matches!(state.key(remove_key()), Some(InputEvent::TickAction { action, .. }) if action.instance == id && action.key == 'x')
+        );
+    }
+}
+
+#[test]
+fn monitor_confirmation_names_the_subscriptions_it_will_cancel() {
+    let mut state = subscribed_fixture(2);
+    state.key(remove_key());
+    assert!(
+        state
+            .confirmation_hint()
+            .unwrap()
+            .ends_with("and cancel 2 subscriptions")
+    );
+    assert!(state.monitor.detail.is_none());
 }

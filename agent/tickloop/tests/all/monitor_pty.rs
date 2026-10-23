@@ -236,7 +236,10 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     // A clean exit adds no words or time to the row; its unread end colours its glyph.
     session.wait_for_unread_shell();
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
-    session.send(b"\x1b[Cx");
+    session.send(b"\x1b[C\x18");
+    session.wait("Press Ctrl+X again to remove");
+    assert!(session.frame().contains("Shells (1)"));
+    session.send(b"\x18");
     session.wait_without("Shells (1)");
     // The emptied column stays, so the conversation keeps its width; /monitor hides it.
     session.wait("Nothing to monitor");
@@ -387,8 +390,11 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             std::fs::read_to_string(log).unwrap().trim(),
             "https://docs.example/a/test"
         );
-        session.wait("x unlink");
-        session.send(b"x");
+        session.wait("Ctrl+X unlink");
+        session.send(b"\x18");
+        session.wait("Press Ctrl+X again to unlink");
+        assert!(session.frame().contains("PTY Research"));
+        session.send(b"\x18");
         session.wait("Artifact unlinked");
         session.wait("Nothing to monitor");
         session.exit();
@@ -441,13 +447,27 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.send(b"\x7f\x7f");
     session.wait_without("❯\u{a0}jk");
     session.send(b"\x1b[C");
-    session.wait("enter details · x remove · s subscriptions · esc input");
+    session.wait("enter details · Ctrl+X remove · s subscriptions · esc input");
     session.send(b"\r");
     session.wait("Owner     this Chat");
     session.wait("Resources unavailable");
     session.send(b"\x1b");
     session.wait_without("Owner     this Chat");
-    session.send(b"x");
+    session.send(b"\x18");
+    session.wait("Press Ctrl+X again to remove");
+    assert!(session.frame().contains("calendar:pty-member"));
+    session.send(b"\x1b[B");
+    session.wait_without("Press Ctrl+X again");
+    session.send(b"\x18");
+    session.wait("Press Ctrl+X again to remove");
+    session.wait_without("Press Ctrl+X again");
+    assert!(
+        session.frame().contains("calendar:pty-member"),
+        "expiry keeps the row"
+    );
+    session.send(b"\x18");
+    session.wait("Press Ctrl+X again to remove");
+    session.send(b"\x18");
     session.wait_without("calendar:pty-member");
     session.wait_without("Monitor 1");
     session.exit();
@@ -462,4 +482,66 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
         "the removal survives a restart: {frame}"
     );
     restarted.exit();
+}
+
+#[test]
+fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_in_a_real_pty() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_agent_runtime::Agent::open_embedded(
+                workdir.join("state"),
+                tickloop_agent_test_support::config(),
+                Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+                    tickloop_agent_test_support::text("Ready"),
+                ])),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            let mut events = agent.subscribe();
+            agent
+                .submit(chat, "Prepare reminders".into())
+                .await
+                .unwrap();
+            loop {
+                match tickloop_agent_test_support::next_event(&mut events)
+                    .await
+                    .kind
+                {
+                    tickloop_agent_protocol::EventKind::Completed { .. } => break,
+                    tickloop_agent_protocol::EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            for prompt in ["First PTY reminder", "Second PTY reminder"] {
+                agent
+                    .schedule_task(chat, "* * * * *", prompt.into(), true)
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+            chat
+        });
+    let mut session = Session::resume(&workdir, chat);
+    session.keep_history_paused();
+    session.wait("Scheduled (2)");
+    session.send(b"\x1b[C\r");
+    session.wait("Cron: * * * * *");
+    session.send(b"\x18");
+    session.wait("Press Ctrl+X again to delete this scheduled task");
+    assert!(session.frame().contains("Cron: * * * * *"));
+    session.send(b"\x18");
+    session.wait("Scheduled task removed");
+    session.wait("Scheduled (1)");
+    session.send(b"\x18");
+    session.wait("Press Ctrl+X again to delete this scheduled task");
+    assert!(session.frame().contains("Scheduled (1)"));
+    session.send(b"\x18");
+    session.wait_without("Scheduled (1)");
+    session.wait("Nothing to monitor");
+    session.exit();
 }

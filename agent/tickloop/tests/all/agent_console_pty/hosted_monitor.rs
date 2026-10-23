@@ -236,7 +236,7 @@ fn launch_record_count(fixture: &PrivateFixture) -> usize {
 fn selected_row_is_gone(frame: &str) -> bool {
     frame
         .lines()
-        .any(|line| line.starts_with("enter reopen · x remove"))
+        .any(|line| line.starts_with("enter reopen · Ctrl+X remove"))
 }
 
 /// The screen lines of the hosted Tick rows in Monitor.
@@ -272,7 +272,7 @@ async fn select_committed_hosted_state(view: &mut PtyView, subscribed: bool, gon
                 let is_gone = selected_row_is_gone(&frame);
                 let is_running = frame
                     .lines()
-                    .any(|line| line.starts_with("enter open · x close"));
+                    .any(|line| line.starts_with("enter open · Ctrl+X close"));
                 if is_gone || is_running {
                     let target = hosted_rows(&frame).into_iter().find(|row| {
                         frame
@@ -349,7 +349,7 @@ const MEMBER_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// until its user removes it, across the Console's later probes and refreshes.
 /// Enter reopens it in its row's place from that record directly, restoring its
 /// subscription by default; `x` takes a gone row out with its record at once, and closes a
-/// reopened one, with the record it was reopened from and its subscription, directly.
+/// reopened one, with the record it was reopened from and its subscription, after confirmation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens_it() {
     use tickloop_agent_protocol::{HostedMemberState, TickSubscriptionFrequency};
@@ -446,9 +446,15 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         select_committed_hosted_state(&mut view, true, false).await;
         let selected_gone = select_committed_hosted_state(&mut view, false, true).await;
         assert!(selected_row_is_gone(&selected_gone), "{selected_gone}");
-        view.send(b"x");
-        view.wait_for("the gone row leaves at once", |frame| {
-            frame.contains("Monitor 1") && frame.contains("enter open · x close")
+        view.send(b"\x18");
+        view.wait_for("the gone row needs confirmation", |frame| {
+            frame.contains("Press Ctrl+X again to remove")
+        })
+        .await;
+        assert!(view.frame().contains("Monitor 2"));
+        view.send(b"\x18");
+        view.wait_for("the confirmed gone row leaves", |frame| {
+            frame.contains("Monitor 1") && frame.contains("enter open · Ctrl+X close")
         })
         .await;
         assert_eq!(
@@ -457,7 +463,13 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             "its launch record goes with the row"
         );
 
-        view.send(b"x");
+        view.send(b"\x18");
+        view.wait_for("closing needs confirmation", |frame| {
+            frame.contains("Press Ctrl+X again to close")
+        })
+        .await;
+        assert_eq!(hosted_members(&client, execution).await.len(), 1);
+        view.send(b"\x18");
         view.wait_for("closing reports its result", |frame| {
             frame.contains("Tick closed")
         })
@@ -1027,7 +1039,7 @@ async fn back_from(view: &PtyView, shown: &str) {
 /// Outside Herdr, Enter opens a terminal Tick and a Shell full screen too, and Esc gives the
 /// terminal back to the Monitor list while each keeps running. The terminal Tick takes keys; the
 /// Shell's view shows its description, full command, directory and status over its live output,
-/// takes no input and shows how it ended. A running Shell is stopped from its row directly.
+/// takes no input and shows how it ended. A running Shell needs two presses to stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_stops_a_shell() {
     let fixture = PrivateFixture::new();
@@ -1081,10 +1093,20 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
 
         select_row(&mut view, LONG_SHELL_COMMAND).await;
         view.wait_for("the running Shell's row offers stop", |frame| {
-            monitor_hint(frame).contains("s stop")
+            monitor_hint(frame).contains("Ctrl+X stop")
         })
         .await;
-        view.send(b"s");
+        view.send(b"\x18");
+        view.wait_for("stopping needs confirmation", |frame| {
+            frame.contains("Press Ctrl+X again to stop this Shell")
+        })
+        .await;
+        assert!(
+            view.frame()
+                .lines()
+                .any(|line| line.starts_with("Press Ctrl+X again to stop this Shell"))
+        );
+        view.send(b"\x18");
         view.wait_for("stopping reports its result", |frame| {
             frame.contains("Shell stopped")
         })
@@ -1095,7 +1117,7 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
                     .is_some_and(|(_, row)| {
                         row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
                     })
-            }) && !monitor_hint(frame).contains("s stop")
+            }) && !monitor_hint(frame).contains("Ctrl+X stop")
         })
         .await;
         assert!(!input_focused(&view.frame()), "{}", view.frame());

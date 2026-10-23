@@ -7,7 +7,7 @@ mod probe;
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
 pub use builtin::{ArtifactRows, HostedRows, ShellRows};
-pub(crate) use builtin::{REMOVE_KEY, SHELL_STOP_KEY, SUBSCRIBE_KEY};
+pub(crate) use builtin::{REMOVE_KEY, SUBSCRIBE_KEY};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{

@@ -177,7 +177,7 @@ impl TickDetailView for TaskDetail {
         self
     }
     fn hint(&self) -> String {
-        "j/k scroll · x remove · esc back".into()
+        "j/k scroll · Ctrl+X remove · esc back".into()
     }
     fn lines(&mut self, width: usize, height: usize, _now: u64) -> Vec<TickDetailLine> {
         let view = view(&self.task, false, None, false);
@@ -191,9 +191,6 @@ impl TickDetailView for TaskDetail {
     fn key(&mut self, key: KeyEvent, width: usize, height: usize) -> TickDetailKey {
         match (key.code, key.modifiers) {
             (KeyCode::Esc | KeyCode::Left, _) => return TickDetailKey::Back,
-            (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                return TickDetailKey::Prepare(Arc::new(TaskAction::new(self.task.clone(), true)));
-            }
             (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.top = self.top.saturating_add(1),
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
