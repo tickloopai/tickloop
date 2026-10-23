@@ -650,6 +650,10 @@ fn plan_flow_pty_a_restarted_daemon_reopens_the_pending_approval_and_continues_e
     );
 
     flow.fixture.send(b"j\r");
+    flow.wait("the receiving continuation prompt", |frame, _| {
+        frame.contains("Continue Chat?") && frame.contains("Continue receiving")
+    });
+    flow.fixture.send(b"\r");
     let (_, state) = flow.wait("the restored continuation in Ask", |frame, state| {
         frame.contains("Restored implementation started.")
             && frame.contains("⏵⏵ Ask · DeepSeek Flash")

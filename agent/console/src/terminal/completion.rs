@@ -85,6 +85,7 @@ impl CommandSpec {
                     Some(CHILD_AUTHORIZATION_FIXED)
                 }
                 "/plan" => Some(CHILD_PLAN_REPORTED),
+                "/goal" => Some("only the root Agent owns a Goal"),
                 _ => None,
             },
         }
@@ -123,6 +124,12 @@ impl CommandSpec {
 }
 
 const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "/goal",
+        arguments: "[CONDITION|edit|pause|resume|clear]",
+        description: "Set a Goal or open its status, edit, pause, resume, clear and token budget menu; Ctrl+G edits the condition externally.",
+        menu_group: Some(CommandGroup::PlanAndExecution),
+    },
     CommandSpec {
         command: "/monitor",
         arguments: "",
@@ -595,8 +602,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 24);
-        assert_eq!(builtin_commands().len(), 40);
+        assert_eq!(completion.candidates().len(), 25);
+        assert_eq!(builtin_commands().len(), 41);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -607,6 +614,7 @@ mod tests {
         assert_eq!(completion.selected_index(), None);
         for command in [
             "/help",
+            "/goal",
             "/cwd",
             "/details",
             "/tickloop",
@@ -633,7 +641,6 @@ mod tests {
     fn retired_names_are_neither_registered_nor_completed() {
         for command in [
             "/new",
-            "/goal",
             "/loops",
             "/theme",
             "/logout",

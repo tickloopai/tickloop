@@ -278,3 +278,33 @@ fn narrow_and_wide_unicode_views_fit_and_resolve_in_both_themes() {
         }
     }
 }
+
+#[test]
+fn goal_notices_use_semantic_roles_and_keep_untrusted_reasons_on_one_line() {
+    use tickloop_agent_protocol::{GoalBlock, GoalNotice, GoalPause};
+    for (notice, role) in [
+        (GoalNotice::Set, Role::Accent),
+        (GoalNotice::Completed, Role::Success),
+        (
+            GoalNotice::Blocked {
+                by: GoalBlock::Reported {
+                    reason: "blocked\nreason\x1b[3J".into(),
+                },
+            },
+            Role::Warning,
+        ),
+        (GoalNotice::BudgetLimited, Role::Warning),
+        (
+            GoalNotice::Paused {
+                by: GoalPause::User,
+            },
+            Role::MutedText,
+        ),
+        (GoalNotice::Cleared, Role::MutedText),
+    ] {
+        let runs = notice_runs(&notice);
+        assert_eq!(runs[0].1, Some(role));
+        assert_eq!(runs[0].0.lines().count(), 2);
+        assert!(!runs[0].0.contains('\x1b'));
+    }
+}

@@ -1,4 +1,5 @@
 use super::execution::ConsoleExecution as Agent;
+mod goal;
 mod judgment;
 pub(super) mod providers;
 pub(super) use providers::ProviderUpdate;
@@ -54,6 +55,10 @@ const TASK_TOOLS_SETTING_INDEX: usize = 14;
 const SEARCH_SETTING_INDEX: usize = 15;
 
 enum Selection {
+    Goal {
+        chat: Uuid,
+        actions: Vec<goal::GoalMenuAction>,
+    },
     Search {
         target: ConfigTarget,
         return_to_settings: bool,
@@ -311,6 +316,10 @@ impl RewindPoint {
 impl Selection {
     fn configuration_retry(&self) -> Option<Self> {
         Some(match self {
+            Self::Goal { chat, actions } => Self::Goal {
+                chat: *chat,
+                actions: actions.clone(),
+            },
             Self::Settings { target } => Self::Settings { target: *target },
             Self::Search {
                 target,
@@ -415,7 +424,8 @@ impl Selection {
     fn chat(&self) -> Option<Uuid> {
         self.config_target().map_or_else(
             || match self {
-                Self::Permission { chat, .. }
+                Self::Goal { chat, .. }
+                | Self::Permission { chat, .. }
                 | Self::PermissionRule { chat, .. }
                 | Self::Rewind { chat, .. }
                 | Self::RewindActions { chat, .. } => Some(*chat),
@@ -472,6 +482,7 @@ struct SettingsPosition {
 pub(super) struct Menus {
     active: Option<(Uuid, Selection)>,
     dialog_chat: Option<Uuid>,
+    continue_offered: std::collections::HashSet<Uuid>,
     active_cache: HashMap<Option<Uuid>, Option<(Uuid, Selection)>>,
     settings_positions: HashMap<Option<Uuid>, SettingsPosition>,
     provider_chat: Option<Option<Uuid>>,
@@ -504,6 +515,7 @@ impl Menus {
         Self {
             active: None,
             dialog_chat: None,
+            continue_offered: Default::default(),
             active_cache: HashMap::new(),
             settings_positions: HashMap::new(),
             provider_chat: None,
@@ -864,6 +876,9 @@ impl Menus {
                 .insert(self.dialog_chat, self.active.take());
             self.active = self.active_cache.remove(&chat).flatten();
             self.dialog_chat = chat;
+            if let Some(chat) = chat {
+                self.continue_offered.remove(&chat);
+            }
         }
         if self.active.is_none()
             && self
@@ -1144,7 +1159,7 @@ impl Menus {
                 )?;
             } else if matches!(
                 &selection,
-                Selection::Rewind { .. } | Selection::RewindActions { .. }
+                Selection::Rewind { .. } | Selection::RewindActions { .. } | Selection::Goal { .. }
             ) {
                 console.show_focused_menu(menu)?;
             } else {
@@ -2387,6 +2402,9 @@ impl Menus {
         };
         let outcome: Result<MenuOutcome, String> = Box::pin(async {
             match selection {
+                Selection::Goal { chat, actions } => {
+                    return self.choose_goal(agent, console, chat, &actions, index, comment).await;
+                }
                 Selection::Locations { generation, views } => {
                     if let Some(index) = index {
                         let view = views.get(index).ok_or("location no longer exists")?.view;

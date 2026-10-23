@@ -45,6 +45,9 @@ mod dialog_height_tests;
 #[cfg(test)]
 #[path = "console/foreground_command_tests.rs"]
 mod foreground_command_tests;
+#[cfg(test)]
+#[path = "console/goal_tests.rs"]
+mod goal_tests;
 mod input_dialog;
 #[cfg(test)]
 mod input_dialog_pty;
@@ -1820,7 +1823,7 @@ impl Console {
     }
     pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.monitor.overlay = state.monitor.total() > 0 && state.monitor_side_columns().is_none();
+        state.monitor.overlay = state.monitor.is_shown() && state.monitor_side_columns().is_none();
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -8032,9 +8035,19 @@ impl State {
                     .background_status_notice
                     .as_ref()
                     .is_some_and(|notice| notice.necessary);
-        let core_status = self
-            .status_area
-            .status_line_with_background(usize::MAX, "", None);
+        let goal_status = self.monitor.chat_status.as_ref().and_then(|chat| {
+            let goal = self.monitor.goal();
+            super::goal_view::status_line(
+                goal.as_ref(),
+                !chat.chat_loop.receiving.is_receiving(),
+                self.width,
+            )
+        });
+        let has_goal_status = goal_status.is_some();
+        let core_status = goal_status.unwrap_or_else(|| {
+            self.status_area
+                .status_line_with_background(usize::MAX, "", None)
+        });
         let float_core_status = !short
             && !overview
             && !self.help_open
@@ -8441,7 +8454,7 @@ impl State {
             );
             if float_core_status {
                 divider.push(" ", None);
-                divider.spans.extend(core_status.spans);
+                divider.spans.extend(core_status.spans.clone());
                 if core_edge_width > 0 {
                     divider.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                     divider.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));
@@ -8496,10 +8509,7 @@ impl State {
                     status_lines.push(line.filled(Role::StatusBar));
                 }
             } else if core_status_row && above_rows > 0 {
-                status_lines.push(
-                    self.status_area
-                        .status_line_with_background(self.width, "", None),
-                );
+                status_lines.push(core_status.clone());
             }
             // While a list owns the keys, its hints take the row instead.
             let core_in_hint_row = short
@@ -8516,8 +8526,17 @@ impl State {
                 && compact_pending.is_none();
             let mut line = if core_in_hint_row {
                 // A short screen has room for one status row, and it keeps the core status.
-                self.status_area
-                    .status_line_with_background(self.width, &notice, background)
+                if has_goal_status && background.is_none() {
+                    let mut line = core_status.clone();
+                    if !notice.is_empty() {
+                        line.push(format!(" · {notice}"), Some(Role::MutedText));
+                    }
+                    line.truncate(self.width);
+                    line
+                } else {
+                    self.status_area
+                        .status_line_with_background(self.width, &notice, background)
+                }
             } else {
                 let showing_update_notice = notice.is_empty()
                     && background.is_none()
@@ -8570,12 +8589,12 @@ impl State {
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
                     let navigation_hint = if self.visible_prompt_suggestion().is_some()
-                        && self.monitor.total() > 0
+                        && (self.monitor.total() > 0 || self.monitor.goal().is_some())
                     {
                         "← Agents · → Monitor · tab accept · ? help · ctrl+o details · ctrl+g editor"
                     } else if self.visible_prompt_suggestion().is_some() {
                         "← Agents · tab accept · ? help · ctrl+o details · ctrl+g editor"
-                    } else if self.monitor.total() == 0 {
+                    } else if self.monitor.total() == 0 && self.monitor.goal().is_none() {
                         "← Agents · ? help · ctrl+o details · ctrl+g editor"
                     } else {
                         "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor"
@@ -10630,7 +10649,14 @@ impl State {
             ExternalEditorOutcome::Updated { content } => {
                 if menu_input {
                     let content = content.trim();
-                    if content.chars().any(char::is_control) {
+                    let multiline_goal = self
+                        .menu_comment
+                        .as_ref()
+                        .is_some_and(|comment| comment.label == "Condition");
+                    if content.chars().any(|character| {
+                        character.is_control()
+                            && !(multiline_goal && matches!(character, '\n' | '\t'))
+                    }) {
                         self.status = "Enter a single value without control characters.".into();
                         return;
                     }
@@ -11560,6 +11586,9 @@ impl State {
                     self.rendered_region = None;
                     types_into_input = true;
                 }
+                (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.goal_selected => {
+                    return Some(InputEvent::Line("/goal".into()));
+                }
                 (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
@@ -11613,7 +11642,7 @@ impl State {
             return None;
         }
         if self.chat.is_some()
-            && self.monitor.total() > 0
+            && (self.monitor.total() > 0 || self.monitor.goal().is_some())
             && self.ordinary_input_is_visible()
             && !self.conversation_focused
             && self.footer.selected().is_none()

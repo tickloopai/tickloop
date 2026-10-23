@@ -32,7 +32,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
     }
 }
 
-fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
+pub(super) fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
     serde_json::from_value(serde_json::json!({
         "id": chat,
         "folder": "/fixture",

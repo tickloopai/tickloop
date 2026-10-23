@@ -146,6 +146,8 @@ pub(super) struct Monitor {
     earlier_pages: Vec<Option<PageCursor>>,
     next_page: Option<PageCursor>,
     selected: Option<InstanceRef>,
+    pub(super) goal_selected: bool,
+    goal_continued_at_ms: Option<u64>,
     rows: Option<MonitorRowsRegistry>,
     pub(super) chat_status: Option<Arc<ChatStatus>>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
@@ -194,6 +196,35 @@ pub(super) struct MonitorFrame {
 }
 
 impl Monitor {
+    pub(super) fn goal(&self) -> Option<super::goal_view::GoalView<'_>> {
+        let mut view =
+            super::goal_view::GoalView::from_snapshot(self.chat_status.as_ref()?.goal.as_ref()?);
+        view.continued_at_ms = self.goal_continued_at_ms;
+        if let Some(status) = &self.chat_status
+            && matches!(
+                status.goal.as_ref()?.status,
+                tickloop_agent_protocol::GoalStatus::Active
+            )
+            && matches!(
+                status.chat_loop.state,
+                tickloop_agent_protocol::LoopState::Running
+                    | tickloop_agent_protocol::LoopState::WaitingPermission
+                    | tickloop_agent_protocol::LoopState::WaitingQuestion
+                    | tickloop_agent_protocol::LoopState::WaitingPlan
+            )
+        {
+            let since = status
+                .goal
+                .as_ref()?
+                .updated_at_ms
+                .max(status.chat_loop.run_started_at.unwrap_or(u64::MAX));
+            view.elapsed_ms = view.elapsed_ms.saturating_add(
+                tickloop_agent_base::private_fs::unix_time_milliseconds().saturating_sub(since),
+            );
+        }
+        Some(view)
+    }
+
     pub(super) fn refresh_action(
         &mut self,
     ) -> std::sync::Arc<dyn super::tick_actions::TickActionExecutor> {
@@ -228,7 +259,7 @@ impl Monitor {
     }
     /// Whether the column has shown rows in this Chat, so it stays on screen when empty.
     pub(super) fn is_shown(&self) -> bool {
-        self.shown
+        self.shown || self.goal().is_some()
     }
     /// Rebuilds the list when time alone changed it, and says whether it did.
     pub(super) fn refresh_due(&mut self, now_ms: u64) -> bool {
@@ -273,6 +304,27 @@ impl Monitor {
     /// that one.
     fn adopt_chat_status(&mut self, status: Arc<ChatStatus>) {
         let previous = self.chat_status.take();
+        if let Some(previous) = &previous {
+            if previous.goal.as_ref().map(|goal| goal.id)
+                != status.goal.as_ref().map(|goal| goal.id)
+            {
+                self.goal_continued_at_ms = None;
+            }
+            let continued = status
+                .goal
+                .as_ref()
+                .and_then(|goal| goal.last_continued_at_ms);
+            if continued.is_some()
+                && continued
+                    != previous
+                        .goal
+                        .as_ref()
+                        .and_then(|goal| goal.last_continued_at_ms)
+            {
+                self.goal_continued_at_ms =
+                    Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
+            }
+        }
         for tick in &status.artifact_ticks {
             let id = tick.instance_id();
             let is_renamed = previous.as_ref().is_some_and(|previous| {
@@ -491,6 +543,7 @@ impl Monitor {
         self.update_flashes.clear();
         self.listed_updates.clear();
         self.flashes_since = Some(now_ms);
+        self.goal_continued_at_ms = None;
     }
     /// When time alone next changes the list: the next finished Shell to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
@@ -548,6 +601,10 @@ impl Monitor {
             .into_iter()
             .chain(flashing)
             .chain(counting_down)
+            .chain(
+                self.goal_continued_at_ms
+                    .and_then(|since| display.next_flash_change_ms(since, now_ms)),
+            )
             .min()
     }
     /// What `entry`'s whole row flashes for, and since when: the later of an Agent turn taking its
@@ -604,7 +661,14 @@ impl Monitor {
         self.reconcile_selection();
     }
     fn reconcile_selection(&mut self) {
+        if self.goal().is_none() {
+            self.goal_selected = false;
+        }
         if self.entries.is_empty() {
+            self.detail = None;
+            self.goal_selected = self.goal().is_some();
+        }
+        if self.entries.is_empty() && self.goal().is_none() {
             self.detail = None;
             self.focused = false;
             self.overlay = false;
@@ -626,6 +690,7 @@ impl Monitor {
         self.reconcile_selection();
     }
     pub(super) fn select(&mut self, instance: &InstanceRef) {
+        self.goal_selected = false;
         if self.entries.iter().any(|entry| &entry.instance == instance) {
             self.selected = Some(instance.clone());
         }
@@ -657,11 +722,18 @@ impl Monitor {
             }
         }
         if let Some(entry) = self.entries.iter().find(|entry| entry.group == group) {
+            self.goal_selected = false;
             self.selected = Some(entry.instance.clone());
         }
     }
     /// Moves within the page; past its last or first row the next or earlier page opens.
     pub(super) fn move_selection(&mut self, delta: isize) {
+        if self.goal_selected {
+            if delta < 0 && !self.entries.is_empty() {
+                self.goal_selected = false;
+            }
+            return;
+        }
         let index = self
             .entries
             .iter()
@@ -674,6 +746,10 @@ impl Monitor {
             self.earlier_pages.push(self.page_start.replace(next));
             self.rebuild();
             self.selected = self.entries.first().map(|entry| entry.instance.clone());
+            return;
+        }
+        if target >= self.entries.len() as isize && self.goal().is_some() {
+            self.goal_selected = true;
             return;
         }
         if target < 0
@@ -754,6 +830,9 @@ impl Monitor {
 
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
+        if self.goal_selected {
+            return "enter Goal details · j/k select · esc return to input".into();
+        }
         let mut hints = self
             .selected()
             .map(|entry| {
@@ -818,7 +897,9 @@ impl Monitor {
             .iter()
             .zip(&titles)
             .map(|(entry, title)| ListRow {
-                selected: self.focused && self.selected.as_ref() == Some(&entry.instance),
+                selected: self.focused
+                    && !self.goal_selected
+                    && self.selected.as_ref() == Some(&entry.instance),
                 glyph: display.glyph(entry.glyph),
                 glyph_role: self.glyph_role(entry, display, now_ms),
                 name: title,
@@ -867,11 +948,31 @@ impl Monitor {
                 }
             }
         }
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && self.goal().is_none() {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
             row_ids.push(None);
         }
-        let capacity = height.saturating_sub(2);
+        let mut goal_lines = self
+            .goal()
+            .map(|goal| goal.monitor_lines(width, display, now_ms))
+            .unwrap_or_default();
+        goal_lines.truncate(height.saturating_sub(1));
+        if self.goal_selected
+            && self.focused
+            && list_row::flash_fill(
+                self.goal_continued_at_ms
+                    .map(|since| (RowFlash::TakeIn, since)),
+                display,
+                now_ms,
+            )
+            .is_none()
+        {
+            goal_lines = goal_lines
+                .into_iter()
+                .map(|line| line.filled(Role::Selection))
+                .collect();
+        }
+        let capacity = height.saturating_sub(2 + goal_lines.len());
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
         let targets = row_ids
             .into_iter()
@@ -882,8 +983,19 @@ impl Monitor {
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
         if height > 1 {
-            lines.resize(height - 1, RoleLine::default());
-            lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
+            lines.resize(
+                height.saturating_sub(1 + goal_lines.len()),
+                RoleLine::default(),
+            );
+            lines.extend(goal_lines);
+            lines.push(RoleLine::role(
+                if self.goal_selected {
+                    "Enter Goal details".into()
+                } else {
+                    self.selected_status()
+                },
+                Role::MutedText,
+            ));
         }
         lines.truncate(height);
         for line in &mut lines {

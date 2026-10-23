@@ -420,6 +420,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/rules"
                 | "/plan"
                 | "/interrupt"
+                | "/goal"
                 | "/stop"
                 | "/allow"
                 | "/deny"
@@ -882,8 +883,12 @@ enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Her
 The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
-esc interrupts the current turn; Tick Subscriptions and Artifact feedback keep arriving.
-/stop interrupts the current turn, discards queued messages and pauses Triggers until your next message.
+esc interrupts the current turn and pauses an active Goal; Tick Subscriptions and Artifact feedback keep arriving.
+/stop interrupts the current turn, pauses an active Goal and pauses Triggers until Continue or your next message.
+/goal CONDITION sets the Chat's Goal, confirming replacement of an unfinished Goal; conditions are limited to 4000 characters, with longer content in a file or Artifact.
+/goal opens status, full condition, usage, the last completion check, and edit, pause/resume, clear and token budget controls; /goal edit supports Ctrl+G in the external editor.
+/goal pause, /goal resume and /goal clear act without resuming paused Trigger receiving; Continue restores receiving separately.
+Monitor keeps Goal at the bottom, outside its member list; select it and press enter for details. The status bar shows Goal usage or runtime and paused/resume guidance.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
@@ -2136,6 +2141,7 @@ async fn interact_with_herdr(
                 })?;
                 console.set_provider_failures(chat, &status.provider_failures)?;
                 menus.note_provider_failures(chat, &status.provider_failures);
+                menus.offer_continue(console, &status)?;
                 console.set_provider_failure(
                     status
                         .provider_failures
@@ -3846,10 +3852,18 @@ async fn interact_with_herdr(
                                 for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
                             } else { outln!(console, "No Chat is selected."); }
                         },
+                        _ if line == "/goal" || line.starts_with("/goal ") => {
+                            let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
+                            if let Err(error) = menus.goal_command(agent, console, chat, &line).await {
+                                outln!(console, "Cannot manage Goal: {}", safe_text(&error));
+                            }
+                            status_dirty = true;
+                        },
                         "/stop" => {
                             if let Some(chat) = selected_chat {
                                 match agent.stop(chat).await {
                                     Ok(operations) => {
+                                        menus.reoffer_continue(chat);
                                         outln!(console, "{STOPPED_NOTICE}");
                                         for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
                                     },
@@ -4403,7 +4417,10 @@ async fn interact_with_herdr(
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
                         },
-                        EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::GoalUpdated {..} => {},
+                        EventKind::GoalUpdated {notice, ..} => {
+                            if let Some(notice) = notice { console.write_roles(&goal_view::notice_runs(&notice))?; }
+                        },
+                        EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
                             outln!(console, "\nContext compaction: {status:?}");
                             if let Some(error)=error {outln!(console, "{}",safe_text(&error));}

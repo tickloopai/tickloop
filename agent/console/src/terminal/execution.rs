@@ -1576,16 +1576,62 @@ impl ConsoleExecution {
         }
     }
 
+    async fn fill_goal_history(&self, snapshot: &mut LiveChatSnapshot) {
+        if !snapshot.conversation.goal_history.is_empty() {
+            return;
+        }
+        let cached = self
+            .inner
+            .snapshots
+            .read()
+            .unwrap()
+            .get(&snapshot.conversation.id)
+            .map(|cached| cached.conversation.goal_history.clone());
+        if let Some(history) = cached {
+            snapshot.conversation.goal_history = history;
+            return;
+        }
+        let Some(root) = &self.inner.launch.config_root else {
+            return;
+        };
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::Transcript {
+                record: TranscriptRef {
+                    store_root: root.clone(),
+                    chat_id: snapshot.conversation.id,
+                },
+                page: Page {
+                    offset: 0,
+                    limit: 1,
+                },
+            })
+            .await
+        {
+            Ok(observation) => {
+                if let ObservationValue::Transcript(record) = observation.initial {
+                    snapshot.conversation.goal_history = record.goal_history;
+                }
+            }
+            Err(error) if error.code == AccessErrorCode::NotFound => {}
+            Err(error) => snapshot
+                .warnings
+                .push(format!("Goal history unavailable: {error}")),
+        }
+    }
+
     /// Caches an Agent snapshot the daemon just reported and keeps following its execution.
     async fn adopt_snapshot(
         &self,
         execution: ExecutionRef,
         value: ObservationValue,
     ) -> Result<Box<LiveChatSnapshot>, AccessError> {
-        let ObservationValue::Agent(snapshot) = value else {
+        let ObservationValue::Agent(mut snapshot) = value else {
             return Err(unexpected());
         };
         *self.inner.disconnected.lock().unwrap() = None;
+        self.fill_goal_history(&mut snapshot).await;
         let snapshot = self.inner.cache_snapshot(snapshot, Some(execution));
         self.watch(snapshot.execution).await?;
         Ok(snapshot)
@@ -3678,7 +3724,8 @@ impl ConsoleExecution {
             )
             .await?;
         match result {
-            CommandResult::Loaded { snapshot, .. } => {
+            CommandResult::Loaded { mut snapshot, .. } => {
+                self.fill_goal_history(&mut snapshot).await;
                 let execution = snapshot.execution;
                 self.inner.cache_snapshot(snapshot.clone(), None);
                 self.watch(execution).await?;
