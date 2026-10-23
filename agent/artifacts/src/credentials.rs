@@ -188,10 +188,13 @@ impl ArtifactClient {
             request
                 .headers_mut()
                 .insert(header::AUTHORIZATION, bearer(&current.access_token)?);
-            let response = http
-                .execute(request)
-                .await
-                .map_err(|_| ArtifactError::Connection)?;
+            let response = http.execute(request).await.map_err(|error| {
+                if error.is_timeout() {
+                    ArtifactError::TimedOut
+                } else {
+                    ArtifactError::Connection
+                }
+            })?;
             if response.status() != StatusCode::UNAUTHORIZED {
                 return Ok(response);
             }

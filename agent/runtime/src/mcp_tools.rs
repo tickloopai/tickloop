@@ -28,7 +28,7 @@ use crate::{
         HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
         PreparedHostCall, WorkspaceHostContext,
     },
-    mcp_http::McpHttpClient,
+    mcp_http::{McpHttpClient, REQUEST_TIMED_OUT, request_failure},
 };
 use tickloop_agent_artifacts::{
     ArtifactClient, ArtifactError, ArtifactMetadata, CredentialSnapshot, IMAGE_ARTIFACT_FORMAT,
@@ -757,11 +757,12 @@ impl McpHostToolProvider {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        let resource_uri = params["uri"].as_str().map(str::to_owned);
         let request = ClientRequest::CustomRequest(CustomRequest::new(method, Some(params)));
         let result = tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().send_request(request))
             .await
-            .map_err(|_| "MCP request timed out")?
-            .map_err(|_| "MCP request failed")?;
+            .map_err(|_| REQUEST_TIMED_OUT)?
+            .map_err(|error| request_failure(&error, resource_uri.as_deref()))?;
         serde_json::to_value(result).map_err(|_| "invalid MCP response".into())
     }
 
@@ -1563,11 +1564,16 @@ impl McpHostToolProvider {
                         .into(),
                 );
             }
-            _ => {
-                return HostCallResult::OutcomeUnknown(
-                    "MCP response unavailable after dispatch; read the artifact again before deciding"
-                        .into(),
-                );
+            Ok(Err(error)) => {
+                let failure = request_failure(&error, None);
+                return HostCallResult::OutcomeUnknown(format!(
+                    "{failure} after dispatch; read the artifact again before deciding"
+                ));
+            }
+            Err(_) => {
+                return HostCallResult::OutcomeUnknown(format!(
+                    "{REQUEST_TIMED_OUT} after dispatch; read the artifact again before deciding"
+                ));
             }
         };
         let effect = match name.as_str() {

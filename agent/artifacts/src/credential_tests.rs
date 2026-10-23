@@ -150,6 +150,26 @@ async fn host_credential_cache_keys_are_private_to_the_constructed_chat_client()
     ));
 }
 
+#[tokio::test]
+async fn a_silent_service_times_out_rather_than_failing_to_connect() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _connection = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let client = ArtifactClient::with_credentials(&origin, "verified-user", tokens()).unwrap();
+    let credential = client.access_snapshot().await.unwrap().unwrap();
+    let request = client
+        .request(Method::GET, "/artifact/mcp")
+        .unwrap()
+        .timeout(std::time::Duration::from_millis(200));
+    assert!(matches!(
+        client.send_authenticated(request, &credential).await,
+        Err(ArtifactError::TimedOut)
+    ));
+}
+
 /// A source that scopes tokens by Chat, as a cloud host does for a family's members.
 struct ChatTokens {
     chat: Option<Uuid>,

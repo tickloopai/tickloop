@@ -27,7 +27,9 @@ use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 #[path = "support/artifact_service.rs"]
 pub(super) mod artifact_service;
-use artifact_service::{ArtifactService, CREATED_ARTIFACT};
+use artifact_service::{
+    ArtifactService, CREATED_ARTIFACT, FAILING_RESOURCE, FORBIDDEN_RESOURCE, GARBLED_RESOURCE,
+};
 
 use crate::support::{assert_extends, guidance_in_effect, mentions};
 
@@ -235,6 +237,60 @@ async fn mcp_resources_list_and_read_work_without_the_skills_extension_and_follo
         1
     );
     assert!(!methods.iter().any(|method| method == "skills/list"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_resource_reads_say_why_without_echoing_the_service() {
+    let service = ArtifactService::start().await;
+    service
+        .control
+        .resources_enabled
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let missing = "fixture://tickloop-artifacts/missing";
+    let reads = [
+        ("missing", missing),
+        ("failing", FAILING_RESOURCE),
+        ("forbidden", FORBIDDEN_RESOURCE),
+        ("garbled", GARBLED_RESOURCE),
+    ];
+    let mut script = reads
+        .iter()
+        .map(|(id, uri)| {
+            call(
+                id,
+                "ReadMcpResourceTool",
+                json!({"server":"tickloop-artifacts","uri":uri}),
+            )
+        })
+        .collect::<Vec<_>>();
+    script.push(text("done"));
+    let model = Arc::new(ScriptedModel::new(script));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Read the resources").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        for (id, expected) in [
+            ("missing", format!("MCP resource not found: {missing}")),
+            ("failing", "MCP server error -32603".into()),
+            ("forbidden", "MCP access forbidden (HTTP 403)".into()),
+            ("garbled", "invalid MCP response".into()),
+        ] {
+            let result = tool_result_text(last, id);
+            assert!(result.contains(&expected), "{id}: {result}");
+            for echoed in [
+                "test-service-token",
+                "Resource not found",
+                "Internal error",
+                "ignore",
+            ] {
+                assert!(!result.contains(echoed), "{id}: {result}");
+            }
+        }
+    }
     agent.shutdown().await;
 }
 
