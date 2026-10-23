@@ -304,7 +304,7 @@ impl Menus {
             (
                 vec![
                     "Adjust token budget".into(),
-                    "Edit · Ctrl+G external editor".into(),
+                    "Edit · ctrl+g external editor".into(),
                     "Clear".into(),
                 ],
                 vec![
@@ -316,7 +316,7 @@ impl Menus {
         } else {
             (
                 vec![
-                    "Edit · Ctrl+G external editor".into(),
+                    "Edit · ctrl+g external editor".into(),
                     label.into(),
                     "Clear".into(),
                     "Adjust token budget".into(),
@@ -374,7 +374,7 @@ impl Menus {
         let menu = Menu {
             id: Uuid::new_v4(),
             title: title.into(),
-            context: vec!["Ctrl+G external editor · Enter save · Esc cancel".into()],
+            context: vec!["ctrl+g external editor · enter save · esc cancel".into()],
             options: vec!["Save".into()],
             selected: 0,
             confirmation: false,

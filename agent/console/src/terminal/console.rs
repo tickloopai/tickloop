@@ -11468,7 +11468,7 @@ impl State {
             target,
             detail,
             intent,
-            hint: format!("Press Ctrl+X again to {consequence}"),
+            hint: format!("Press ctrl+x again to {consequence}"),
         })
     }
 

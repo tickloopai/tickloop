@@ -3,7 +3,7 @@ use tickloop_agent_protocol::{EventSourceBinding, ShellTask, ShellTaskState, Tic
 
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 's';
-/// The row action ID dispatched by Ctrl+X.
+/// The row action ID dispatched by ctrl+x.
 pub(crate) const REMOVE_KEY: char = 'x';
 
 /// Ticks in the dedicated Tickhost: those this Chat opened, which belong to it, and those only
@@ -128,8 +128,8 @@ enum HostedRun {
     Ended,
 }
 
-/// A hosted Tick row's Enter and Ctrl+X. Enter opens the view of a Tick that still has a screen,
-/// and reopens one this Chat opened that no longer runs. Ctrl+X closes a Tick this Chat opened, so
+/// A hosted Tick row's Enter and ctrl+x. Enter opens the view of a Tick that still has a screen,
+/// and reopens one this Chat opened that no longer runs. ctrl+x closes a Tick this Chat opened, so
 /// nothing it opened keeps running out of sight and the record of one that ended goes with its
 /// row, and otherwise only takes the row out with this Chat's subscriptions, never ending another
 /// Chat's Tick.
@@ -717,8 +717,8 @@ pub(crate) fn feedback_binding<'a>(
         .find(|binding| binding.origin == origin && binding.artifact_id == artifact_id)
 }
 
-/// An artifact row's actions. Its Ctrl+X reads `unlink` while this Chat holds the artifact's
-/// association, which Ctrl+X ends along with the row; otherwise it only removes the row.
+/// An artifact row's actions. Its ctrl+x reads `unlink` while this Chat holds the artifact's
+/// association, which ctrl+x ends along with the row; otherwise it only removes the row.
 pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<MonitorAction> {
     [
         (MONITOR_ENTER_KEY, "open"),

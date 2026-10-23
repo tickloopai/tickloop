@@ -482,7 +482,7 @@ fn exhausted_goal_menu_prioritizes_budget_and_offers_resume_after_budget_is_rais
                 menu.options,
                 [
                     "Adjust token budget",
-                    "Edit · Ctrl+G external editor",
+                    "Edit · ctrl+g external editor",
                     "Clear"
                 ]
             );
@@ -493,7 +493,7 @@ fn exhausted_goal_menu_prioritizes_budget_and_offers_resume_after_budget_is_rais
             assert_eq!(
                 menu.options,
                 [
-                    "Edit · Ctrl+G external editor",
+                    "Edit · ctrl+g external editor",
                     "Resume",
                     "Clear",
                     "Adjust token budget"

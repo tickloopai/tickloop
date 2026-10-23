@@ -236,7 +236,7 @@ fn launch_record_count(fixture: &PrivateFixture) -> usize {
 fn selected_row_is_gone(frame: &str) -> bool {
     frame
         .lines()
-        .any(|line| line.starts_with("enter reopen · Ctrl+X remove"))
+        .any(|line| line.starts_with("enter reopen · ctrl+x remove"))
 }
 
 /// The screen lines of the hosted Tick rows in Monitor.
@@ -272,7 +272,7 @@ async fn select_committed_hosted_state(view: &mut PtyView, subscribed: bool, gon
                 let is_gone = selected_row_is_gone(&frame);
                 let is_running = frame
                     .lines()
-                    .any(|line| line.starts_with("enter open · Ctrl+X close"));
+                    .any(|line| line.starts_with("enter open · ctrl+x close"));
                 if is_gone || is_running {
                     let target = hosted_rows(&frame).into_iter().find(|row| {
                         frame
@@ -448,13 +448,13 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         assert!(selected_row_is_gone(&selected_gone), "{selected_gone}");
         view.send(b"\x18");
         view.wait_for("the gone row needs confirmation", |frame| {
-            frame.contains("Press Ctrl+X again to remove")
+            frame.contains("Press ctrl+x again to remove")
         })
         .await;
         assert!(view.frame().contains("Monitor 2"));
         view.send(b"\x18");
         view.wait_for("the confirmed gone row leaves", |frame| {
-            frame.contains("Monitor 1") && frame.contains("enter open · Ctrl+X close")
+            frame.contains("Monitor 1") && frame.contains("enter open · ctrl+x close")
         })
         .await;
         assert_eq!(
@@ -465,7 +465,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
 
         view.send(b"\x18");
         view.wait_for("closing needs confirmation", |frame| {
-            frame.contains("Press Ctrl+X again to close")
+            frame.contains("Press ctrl+x again to close")
         })
         .await;
         assert_eq!(hosted_members(&client, execution).await.len(), 1);
@@ -1093,18 +1093,18 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
 
         select_row(&mut view, LONG_SHELL_COMMAND).await;
         view.wait_for("the running Shell's row offers stop", |frame| {
-            monitor_hint(frame).contains("Ctrl+X stop")
+            monitor_hint(frame).contains("ctrl+x stop")
         })
         .await;
         view.send(b"\x18");
         view.wait_for("stopping needs confirmation", |frame| {
-            frame.contains("Press Ctrl+X again to stop this Shell")
+            frame.contains("Press ctrl+x again to stop this Shell")
         })
         .await;
         assert!(
             view.frame()
                 .lines()
-                .any(|line| line.starts_with("Press Ctrl+X again to stop this Shell"))
+                .any(|line| line.starts_with("Press ctrl+x again to stop this Shell"))
         );
         view.send(b"\x18");
         view.wait_for("stopping reports its result", |frame| {
@@ -1117,7 +1117,7 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
                     .is_some_and(|(_, row)| {
                         row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
                     })
-            }) && !monitor_hint(frame).contains("Ctrl+X stop")
+            }) && !monitor_hint(frame).contains("ctrl+x stop")
         })
         .await;
         assert!(!input_focused(&view.frame()), "{}", view.frame());

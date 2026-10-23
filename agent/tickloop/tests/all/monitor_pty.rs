@@ -237,7 +237,7 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.wait_for_unread_shell();
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
     session.send(b"\x1b[C\x18");
-    session.wait("Press Ctrl+X again to remove");
+    session.wait("Press ctrl+x again to remove");
     assert!(session.frame().contains("Shells (1)"));
     session.send(b"\x18");
     session.wait_without("Shells (1)");
@@ -390,9 +390,9 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             std::fs::read_to_string(log).unwrap().trim(),
             "https://docs.example/a/test"
         );
-        session.wait("Ctrl+X unlink");
+        session.wait("ctrl+x unlink");
         session.send(b"\x18");
-        session.wait("Press Ctrl+X again to unlink");
+        session.wait("Press ctrl+x again to unlink");
         assert!(session.frame().contains("PTY Research"));
         session.send(b"\x18");
         session.wait("Artifact unlinked");
@@ -447,26 +447,26 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.send(b"\x7f\x7f");
     session.wait_without("❯\u{a0}jk");
     session.send(b"\x1b[C");
-    session.wait("enter details · Ctrl+X remove · s subscriptions · esc input");
+    session.wait("enter details · ctrl+x remove · s subscriptions · esc input");
     session.send(b"\r");
     session.wait("Owner     this Chat");
     session.wait("Resources unavailable");
     session.send(b"\x1b");
     session.wait_without("Owner     this Chat");
     session.send(b"\x18");
-    session.wait("Press Ctrl+X again to remove");
+    session.wait("Press ctrl+x again to remove");
     assert!(session.frame().contains("calendar:pty-member"));
     session.send(b"\x1b[B");
-    session.wait_without("Press Ctrl+X again");
+    session.wait_without("Press ctrl+x again");
     session.send(b"\x18");
-    session.wait("Press Ctrl+X again to remove");
-    session.wait_without("Press Ctrl+X again");
+    session.wait("Press ctrl+x again to remove");
+    session.wait_without("Press ctrl+x again");
     assert!(
         session.frame().contains("calendar:pty-member"),
         "expiry keeps the row"
     );
     session.send(b"\x18");
-    session.wait("Press Ctrl+X again to remove");
+    session.wait("Press ctrl+x again to remove");
     session.send(b"\x18");
     session.wait_without("calendar:pty-member");
     session.wait_without("Monitor 1");
@@ -532,13 +532,13 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
     session.send(b"\x1b[C\r");
     session.wait("Cron: * * * * *");
     session.send(b"\x18");
-    session.wait("Press Ctrl+X again to delete this scheduled task");
+    session.wait("Press ctrl+x again to delete this scheduled task");
     assert!(session.frame().contains("Cron: * * * * *"));
     session.send(b"\x18");
     session.wait("Scheduled task removed");
     session.wait("Scheduled (1)");
     session.send(b"\x18");
-    session.wait("Press Ctrl+X again to delete this scheduled task");
+    session.wait("Press ctrl+x again to delete this scheduled task");
     assert!(session.frame().contains("Scheduled (1)"));
     session.send(b"\x18");
     session.wait_without("Scheduled (1)");

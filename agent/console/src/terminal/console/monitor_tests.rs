@@ -18,7 +18,7 @@ fn confirm_removal(state: &mut State) -> Option<InputEvent> {
         state
             .confirmation_hint()
             .unwrap()
-            .starts_with("Press Ctrl+X again to ")
+            .starts_with("Press ctrl+x again to ")
     );
     let event = state.key(remove_key());
     assert!(state.monitor_confirmation.is_none());
@@ -150,7 +150,7 @@ fn shell_ticks_only_list_background_executions_and_ctrl_x_twice_removes_a_finish
             let removal = confirm_removal(&mut state);
             assert!(
                 matches!(&removal, Some(InputEvent::TickAction { action, .. }) if action.key == 'x' && action.instance == task.to_string()),
-                "Ctrl+X twice asks the Agent to record the removal"
+                "ctrl+x twice asks the Agent to record the removal"
             );
             assert_eq!(state.monitor.entries().len(), 1);
         }
@@ -294,12 +294,12 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::Tick(tick.instance.clone()),
             "exit 0",
-            "enter open · Ctrl+X remove · esc input",
+            "enter open · ctrl+x remove · esc input",
         ),
         (
             MonitorTarget::ScheduledTask("0123abcd".into()),
             "",
-            "p pause · enter details · Ctrl+X remove · esc input",
+            "p pause · enter details · ctrl+x remove · esc input",
         ),
         (
             MonitorTarget::Goal,
@@ -986,7 +986,7 @@ fn shell_tick_renders_in_right_list_and_finished_remove_keeps_other_rows() {
     state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     let removal = confirm_removal(&mut state);
     let Some(InputEvent::TickAction { action, .. }) = removal else {
-        panic!("Ctrl+X twice must ask the Agent to remove the row");
+        panic!("ctrl+x twice must ask the Agent to remove the row");
     };
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.chat_status = Some(Arc::new(chat_status(state.chat.unwrap())));
@@ -1682,7 +1682,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.focus(false, None);
-    assert!(screen(&mut state).contains("enter details · Ctrl+X remove"));
+    assert!(screen(&mut state).contains("enter details · ctrl+x remove"));
     assert!(matches!(
         state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         Some(InputEvent::TickAction { .. })
@@ -2773,7 +2773,7 @@ async fn a_running_shell_is_stopped_from_its_row_after_confirmation_with_feedbac
     let Some(InputEvent::TickAction { action, .. }) =
         confirm_removal(&mut console.state.lock().unwrap())
     else {
-        panic!("Ctrl+X twice did not stop the Shell");
+        panic!("ctrl+x twice did not stop the Shell");
     };
     assert_eq!(action.instance, shell.to_string());
     execute(action, context).await.unwrap();
@@ -4141,7 +4141,7 @@ fn destructive_monitor_intents_require_two_control_x_presses_and_show_a_red_foot
     ] {
         let mut state = removal_fixture(intent);
         assert!(state.key(remove_key()).is_none());
-        let expected = format!("Press Ctrl+X again to {consequence}");
+        let expected = format!("Press ctrl+x again to {consequence}");
         assert_eq!(
             state.confirmation_hint().as_deref(),
             Some(expected.as_str())
@@ -4287,7 +4287,7 @@ fn scheduled_task_deletion_from_list_and_detail_requires_the_same_double_press()
         assert!(state.key(remove_key()).is_none());
         assert_eq!(
             state.confirmation_hint().as_deref(),
-            Some("Press Ctrl+X again to delete this scheduled task")
+            Some("Press ctrl+x again to delete this scheduled task")
         );
         assert_eq!(state.monitor.selected_task().unwrap().id, id);
         assert!(
