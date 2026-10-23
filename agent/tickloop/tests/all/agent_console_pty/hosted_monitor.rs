@@ -347,9 +347,9 @@ const MEMBER_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An extension Tick whose process ended by itself keeps its Monitor row, and its launch record,
 /// until its user removes it, across the Console's later probes and refreshes.
-/// Enter reopens it in its row's place from that record once confirmed, restoring its
+/// Enter reopens it in its row's place from that record directly, restoring its
 /// subscription by default; `x` takes a gone row out with its record at once, and closes a
-/// reopened one, with the record it was reopened from and its subscription, once confirmed.
+/// reopened one, with the record it was reopened from and its subscription, directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens_it() {
     use tickloop_agent_protocol::{HostedMemberState, TickSubscriptionFrequency};
@@ -415,15 +415,10 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
 
         select_row(&mut view, "↻").await;
         view.send(b"\r");
-        view.wait_for(
-            "the reopen asks first, restoring its subscription",
-            |frame| {
-                frame.contains("Open a new instance of this Tick with its command?")
-                    && frame.contains("Also restore its 1 Tick Subscription")
-            },
-        )
+        view.wait_for("reopening reports the new instance", |frame| {
+            frame.contains("Reopened hosted:")
+        })
         .await;
-        view.send(b"\r");
         let reopened = eventually("the reopened Tick running", || async {
             hosted_members(&client, execution)
                 .await
@@ -463,11 +458,10 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         );
 
         view.send(b"x");
-        view.wait_for("closing the running Tick asks first", |frame| {
-            frame.contains("Close this Tick, end its process and cancel its 1 Tick Subscription?")
+        view.wait_for("closing reports its result", |frame| {
+            frame.contains("Tick closed")
         })
         .await;
-        view.send(b"\r");
         view.wait_for("the reopened row leaves", |frame| {
             !frame.contains("Monitor 1") && !frame.contains("◉ Keys")
         })
@@ -1033,7 +1027,7 @@ async fn back_from(view: &PtyView, shown: &str) {
 /// Outside Herdr, Enter opens a terminal Tick and a Shell full screen too, and Esc gives the
 /// terminal back to the Monitor list while each keeps running. The terminal Tick takes keys; the
 /// Shell's view shows its description, full command, directory and status over its live output,
-/// takes no input and shows how it ended. A running Shell is stopped from its row once confirmed.
+/// takes no input and shows how it ended. A running Shell is stopped from its row directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_stops_a_shell() {
     let fixture = PrivateFixture::new();
@@ -1091,11 +1085,10 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
         })
         .await;
         view.send(b"s");
-        view.wait_for("stopping asks first", |frame| {
-            frame.contains("Stop this Shell?")
+        view.wait_for("stopping reports its result", |frame| {
+            frame.contains("Shell stopped")
         })
         .await;
-        view.send(b"\r");
         view.wait_for("the stopped Shell shows how it ended", |frame| {
             frame.lines().any(|line| {
                 line.split_once(&format!("{SELECTED_MARK} "))

@@ -29,16 +29,7 @@ pub enum TickDetailKey {
     /// An action the Console prepares with its own state, as it prepares a row key's.
     Prepare(Arc<dyn TickActionExecutor>),
 }
-pub struct TickConfirmationView {
-    pub title: String,
-    pub message: String,
-    pub label: String,
-}
 pub trait TickDetailView: Send + Any {
-    fn confirmation(&self) -> Option<TickConfirmationView> {
-        None
-    }
-
     fn id(&self) -> Uuid;
     fn chat(&self) -> Uuid;
     /// The Monitor row this view shows; that row stays listed while the view is open.
@@ -172,7 +163,7 @@ impl TickActionContext<'_> {
         self.chat
     }
     pub fn notify(&self, message: &str) -> Result<(), String> {
-        self.console.set_status(message)
+        self.console.hold_status(message)
     }
     pub fn update_detail<T: TickDetailView, R>(
         &self,

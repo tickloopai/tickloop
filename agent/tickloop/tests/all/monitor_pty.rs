@@ -389,8 +389,7 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         );
         session.wait("x unlink");
         session.send(b"x");
-        session.wait("Unlink this artifact and stop its @tickloop requests here?");
-        session.send(b"\r");
+        session.wait("Artifact unlinked");
         session.wait("Nothing to monitor");
         session.exit();
     });

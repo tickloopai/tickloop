@@ -62,8 +62,8 @@ pub(super) async fn tick_action(
         refresh(agent, console, root, chat).await?;
         return Ok(());
     }
-    if matches!(action, 'x' | 'X') {
-        return unlink(agent, console, chat, &id, action == 'X').await;
+    if action == 'x' {
+        return remove_local_artifact(agent, console, chat, &id).await;
     }
     let ticks = agent
         .artifact_ticks(chat)
@@ -79,13 +79,12 @@ pub(super) async fn tick_action(
             }
         }
         'c' => console.copy_artifact_link(&tick.url)?,
-        'f' => return console.confirm_artifact_feedback(chat, id),
-        'F' | 'H' => {
+        'f' | 'h' => {
             agent
                 .link_artifact(
                     chat,
                     tick,
-                    if action == 'H' {
+                    if action == 'h' {
                         tickloop_agent_protocol::ArtifactFeedbackHistory::All
                     } else {
                         tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly
@@ -93,39 +92,11 @@ pub(super) async fn tick_action(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            console.set_status("Artifact feedback linked here")?;
+            console.hold_status("Artifact feedback linked here")?;
         }
         _ => {}
     }
     Ok(())
-}
-
-/// Takes the artifact out of this Chat. While its association still delivers here, the user
-/// confirms first; unlinking ends it.
-async fn unlink(
-    agent: &ConsoleExecution,
-    console: &Console,
-    chat: Uuid,
-    id: &str,
-    is_confirmed: bool,
-) -> Result<(), String> {
-    if !is_confirmed {
-        let instance = id.parse::<tick_protocol::InstanceRef>()?;
-        let status = agent
-            .status(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let is_linked_here = instance
-            .artifact_parts()
-            .and_then(|(origin, artifact_id)| {
-                crate::monitor_rows::feedback_binding(&status, origin, artifact_id)
-            })
-            .is_some_and(|binding| !binding.resume_required);
-        if is_linked_here {
-            return console.confirm_artifact_unlink(chat, id.to_owned());
-        }
-    }
-    remove_local_artifact(agent, console, chat, id).await
 }
 
 async fn remove_local_artifact(
@@ -143,7 +114,8 @@ async fn remove_local_artifact(
             .status(chat)
             .await
             .map_err(|error| error.to_string())?,
-    )
+    )?;
+    console.hold_status("Artifact unlinked")
 }
 
 pub(super) async fn open(
@@ -471,7 +443,7 @@ mod tests {
             console.test_clipboard_contents(),
             vec![format!("{origin}/a/doc")]
         );
-        tick_action(&agent, &console, Some(&root), chat, id, 'F')
+        tick_action(&agent, &console, Some(&root), chat, id, 'f')
             .await
             .unwrap();
         assert!(
@@ -585,7 +557,7 @@ mod tests {
                 .await
                 .unwrap();
             } else {
-                tick_action(&agent, &console, Some(&root), chat, tick.instance_id(), 'X')
+                tick_action(&agent, &console, Some(&root), chat, tick.instance_id(), 'x')
                     .await
                     .unwrap();
                 assert!(
@@ -642,7 +614,7 @@ mod tests {
             Some(directory.path()),
             chat,
             tick.instance_id(),
-            'F',
+            'f',
         )
         .await;
         assert!(
@@ -663,7 +635,12 @@ mod tests {
 
     struct FeedbackRemote {
         inner: EmbeddedAgentAccess,
-        linked: Mutex<Vec<tickloop_agent_protocol::ArtifactTick>>,
+        linked: Mutex<
+            Vec<(
+                tickloop_agent_protocol::ArtifactTick,
+                tickloop_agent_protocol::ArtifactFeedbackHistory,
+            )>,
+        >,
     }
     #[async_trait::async_trait]
     impl AgentAccess for FeedbackRemote {
@@ -671,8 +648,8 @@ mod tests {
             self.inner.observe(request).await
         }
         async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-            if let AgentCommand::LinkArtifact { tick, .. } = &envelope.command {
-                self.linked.lock().unwrap().push(tick.clone());
+            if let AgentCommand::LinkArtifact { tick, history, .. } = &envelope.command {
+                self.linked.lock().unwrap().push((tick.clone(), *history));
                 let mut receipt = self
                     .inner
                     .execute(CommandEnvelope {
@@ -691,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feedback_key_asks_for_history_before_linking_the_artifact() {
+    async fn feedback_key_links_the_artifact_directly() {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
         let runtime = tickloop_agent_runtime::Agent::new_embedded(
@@ -728,22 +705,27 @@ mod tests {
         tick_action(&agent, &console, None, chat, tick.instance_id(), 'f')
             .await
             .unwrap();
-        assert!(remote.linked.lock().unwrap().is_empty());
         assert_eq!(
-            console.test_status_text(),
-            "Receive this artifact's feedback here?"
+            *remote.linked.lock().unwrap(),
+            vec![(
+                tick.clone(),
+                tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly
+            )]
         );
-        tick_action(&agent, &console, None, chat, tick.instance_id(), 'F')
+        tick_action(&agent, &console, None, chat, tick.instance_id(), 'h')
             .await
             .unwrap();
-        assert_eq!(*remote.linked.lock().unwrap(), vec![tick]);
+        assert_eq!(
+            remote.linked.lock().unwrap()[1],
+            (tick, tickloop_agent_protocol::ArtifactFeedbackHistory::All)
+        );
         assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         assert!(model.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
 
     #[tokio::test]
-    async fn x_asks_before_unlinking_an_artifact_linked_here_then_ends_its_feedback_and_row() {
+    async fn x_directly_unlinks_an_artifact_and_reports_it() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (origin, server, _requests) = artifact_service().await;
@@ -753,28 +735,14 @@ mod tests {
         let id = tick.instance_id();
         agent.add_artifact_tick(chat, tick).await.unwrap();
         let console = Console::test_for_chat(chat);
-        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'F')
+        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'f')
             .await
             .unwrap();
 
         tick_action(&agent, &console, Some(&root), chat, id.clone(), 'x')
             .await
             .unwrap();
-        assert_eq!(
-            console.test_status_text(),
-            "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel"
-        );
-        let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(
-            snapshot.chat_loop.event_sources.len(),
-            1,
-            "asking unlinks nothing"
-        );
-        assert_eq!(snapshot.artifact_ticks.len(), 1);
-
-        tick_action(&agent, &console, Some(&root), chat, id, 'X')
-            .await
-            .unwrap();
+        assert_eq!(console.test_status_text(), "Artifact unlinked");
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert!(snapshot.chat_loop.event_sources.is_empty());
         assert!(snapshot.artifact_ticks.is_empty());
@@ -812,7 +780,7 @@ mod tests {
         tick_action(&agent, &console, None, chat, tick.instance_id(), 'x')
             .await
             .unwrap();
-        assert!(console.test_status_text().is_empty());
+        assert_eq!(console.test_status_text(), "Artifact unlinked");
         assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
         core.shutdown().await;
     }

@@ -104,15 +104,10 @@ pub(super) fn view(
 pub(super) struct TaskAction {
     pub(super) task: ScheduledTask,
     pub(super) delete: bool,
-    confirmed: bool,
 }
 impl TaskAction {
     pub(super) fn new(task: ScheduledTask, delete: bool) -> Self {
-        Self {
-            task,
-            delete,
-            confirmed: false,
-        }
+        Self { task, delete }
     }
 }
 impl TickActionExecutor for TaskAction {
@@ -138,16 +133,6 @@ impl TickActionBackend for TaskAction {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         if !self.delete {
             return Ok(());
-        }
-        if !self.confirmed {
-            let mut confirmed = self.clone();
-            confirmed.confirmed = true;
-            return ctx.console.confirm_tick_action(
-                ctx.chat,
-                self.task.id.clone(),
-                Arc::new(confirmed),
-                &format!("Delete scheduled task {}?", self.task.id),
-            );
         }
         ctx.agent
             .delete_scheduled_task(ctx.chat, self.task.id.clone())

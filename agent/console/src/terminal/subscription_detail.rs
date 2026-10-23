@@ -474,7 +474,6 @@ mod tests {
             step(&mut detail, KeyCode::Char('s')),
             DetailStep::CycleSubscription(Uuid::from_u128(4))
         );
-        assert!(detail.confirmation().is_none(), "no confirmation follows");
 
         for code in [KeyCode::Char('e'), KeyCode::Enter] {
             assert_eq!(step(&mut detail, code), DetailStep::Stay, "{code:?}");
@@ -516,7 +515,6 @@ mod tests {
             detail.apply_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
             DetailStep::Cancel(Uuid::from_u128(4))
         );
-        assert!(detail.confirmation().is_none());
         assert!(matches!(
             press(&mut detail, KeyCode::Esc),
             TickDetailKey::Back
@@ -529,7 +527,6 @@ mod tests {
             vec![row(3, TickSubscriptionFrequency::Immediate)],
             SubscriptionOperation::Cancel,
         );
-        assert!(detail.confirmation().is_none());
         assert_eq!(requested(press(&mut detail, KeyCode::Char('u'))), Some('u'));
     }
 
@@ -544,7 +541,6 @@ mod tests {
         );
         press(&mut detail, KeyCode::Down);
         press(&mut detail, KeyCode::Char('u'));
-        assert!(detail.confirmation().is_none());
 
         detail.update(
             "Fixture run".into(),

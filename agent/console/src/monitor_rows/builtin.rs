@@ -1,7 +1,7 @@
 use super::*;
 use tickloop_agent_protocol::{EventSourceBinding, ShellTask, ShellTaskState, TickLinkState};
 
-/// Stops a running Shell from its Monitor row after confirmation.
+/// Stops a running Shell from its Monitor row.
 pub(crate) const SHELL_STOP_KEY: char = 's';
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 's';
@@ -737,6 +737,7 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
         ),
         ('c', "copy"),
         ('f', "feedback"),
+        ('h', "include earlier feedback"),
     ]
     .into_iter()
     .map(|(key, label)| MonitorAction {
