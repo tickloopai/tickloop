@@ -44,6 +44,8 @@ pub struct ChatStatus {
     pub thinking_enabled: bool,
     pub policy: PermissionPolicy,
     pub chat_loop: LoopSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::GoalSnapshot>,
     /// What the conversation was first asked, which titles the Chat until it has a title of its
     /// own.
     pub first_prompt: Option<String>,
@@ -174,6 +176,7 @@ impl ChatStatus {
             thinking_enabled: process.thinking_enabled,
             policy: process.policy.clone(),
             chat_loop: conversation.chat_loop.clone(),
+            goal: conversation.goal.clone(),
             first_prompt: first_prompt(conversation, process.pending_inputs),
             plans: conversation.plans.clone(),
             progress: conversation.progress.clone(),

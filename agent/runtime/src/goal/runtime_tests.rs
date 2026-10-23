@@ -93,6 +93,7 @@ fn a_report_of_the_goal_adds_its_remaining_budget() {
         time_used_ms: 0,
         last_check: None,
         quiet_turns: 0,
+        last_continued_at_ms: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

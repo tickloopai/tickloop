@@ -62,9 +62,10 @@ use crate::{
 /// it paused, and its Tick Subscriptions; a delivery names its source by type; the explicit
 /// Trigger commands are gone.
 /// 28.1 adds the Chat's goal: its snapshot on the Chat, `ManageGoal`, goal updates and the
-/// completion check's requests.
+/// completion check's requests. 28.2 adds Goal display history, continuation times and the
+/// Goal on the lightweight Chat status.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -144,6 +145,8 @@ pub struct RecordedMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecordedTranscript {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_history: Vec<crate::GoalHistoryEntry>,
     pub record: TranscriptRef,
     pub title: Option<String>,
     pub folder: PathBuf,

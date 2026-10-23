@@ -39,6 +39,7 @@ struct ControlledFeed {
 
 fn transcript_initial(text: String) -> ObservationValue {
     ObservationValue::Transcript(Box::new(RecordedTranscript {
+        goal_history: Vec::new(),
         record: TranscriptRef {
             store_root: "/tmp/transcripts".into(),
             chat_id: Uuid::new_v4(),

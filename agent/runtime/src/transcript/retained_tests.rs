@@ -674,6 +674,7 @@ fn goal_events_survive_every_snapshot_in_order() {
     let chat = Uuid::new_v4();
     let event = |notice: tickloop_agent_protocol::GoalNotice| {
         Line::GoalEvent(tickloop_agent_transcript::GoalEventEntry {
+            after_message_id: None,
             chat_id: chat,
             goal_id: Uuid::nil(),
             objective: "Ship it".into(),

@@ -25,6 +25,8 @@ pub struct GoalSnapshot {
     pub last_check: Option<GoalCheck>,
     /// Consecutive goal continuations that neither called a tool nor gave a substantive reply.
     pub quiet_turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_continued_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -149,4 +151,12 @@ pub enum GoalAction {
         /// `None` removes the budget.
         token_budget: Option<u64>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GoalHistoryEntry {
+    pub after_message_id: Option<Uuid>,
+    pub objective: String,
+    pub notice: GoalNotice,
+    pub timestamp: String,
 }

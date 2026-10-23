@@ -124,6 +124,7 @@ impl Agent {
             task_boards: BTreeMap::new(),
             task_board: None,
             goal: None,
+            goal_history: Vec::new(),
             family_inputs: BTreeMap::new(),
             sent_agent_messages: BTreeMap::new(),
             generated_title: None,

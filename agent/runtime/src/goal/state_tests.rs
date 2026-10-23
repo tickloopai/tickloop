@@ -106,6 +106,7 @@ fn setting_a_goal_starts_it_active_with_fresh_usage() {
             time_used_ms: 0,
             last_check: None,
             quiet_turns: 0,
+            last_continued_at_ms: None,
             created_at_ms: SET_AT,
             updated_at_ms: SET_AT,
         })
