@@ -424,3 +424,19 @@ async fn shutdown(fixture: Fixture) {
         .unwrap();
     assert!(!fixture.paths.socket().exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_closes_connections_waiting_for_a_hello_before_releasing_the_host() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = start().await;
+    let mut unfinished = UnixStream::connect(fixture.paths.socket()).await.unwrap();
+    unfinished.write_all(b"{").await.unwrap();
+    shutdown(fixture).await;
+    let mut byte = [0];
+    let read = tokio::time::timeout(Duration::from_millis(100), unfinished.read(&mut byte))
+        .await
+        .expect("a pending hello must not retain its connection after host shutdown")
+        .unwrap();
+    assert_eq!(read, 0);
+}
