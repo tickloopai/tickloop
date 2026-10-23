@@ -773,6 +773,7 @@ pub(super) struct State {
     agent_colors: AgentColors,
     pub(super) chat: Option<Uuid>,
     activity_interruptible: bool,
+    idle_loop_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
     back_to_bottom_pressed: bool,
     monitor_toggle_target: Option<BackToBottomTarget>,
@@ -3611,6 +3612,14 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn set_idle_loop_interruptible(&self, interruptible: bool) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .idle_loop_interruptible = interruptible;
+        Ok(())
+    }
+
     /// Shows why an action did nothing, kept across periodic status refreshes until the next key.
     pub(super) fn hold_status(&self, text: &str) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -5556,6 +5565,7 @@ impl State {
         self.clear_prompt_suggestion();
         self.visible_delegated = false;
         self.activity_interruptible = false;
+        self.idle_loop_interruptible = false;
         self.back_to_bottom_target = None;
         self.back_to_bottom_pressed = false;
 
@@ -5764,6 +5774,7 @@ impl State {
             agent_colors: AgentColors::default(),
             chat: None,
             activity_interruptible: false,
+            idle_loop_interruptible: false,
             back_to_bottom_target: None,
             back_to_bottom_pressed: false,
             monitor_toggle_target: None,
@@ -11293,7 +11304,9 @@ impl State {
                 self.escape_confirmation = None;
                 return None;
             }
-            if self.can_interrupt_activity() {
+            if self.can_interrupt_activity()
+                || (self.idle_loop_interruptible && self.editor.draft().is_empty())
+            {
                 self.escape_confirmation = None;
                 return Some(InputEvent::InterruptActivity);
             }

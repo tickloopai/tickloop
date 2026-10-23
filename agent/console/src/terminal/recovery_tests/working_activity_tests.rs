@@ -8,6 +8,7 @@ const ACTIVITY_QUERIES: &str = "activity-queries";
 const ACTIVITY_ANIMATION: &str = "activity-animation.json";
 const ANIMATION_MEASUREMENT_STAGE: &str = "measure-animation";
 const ANIMATION_FRAME_SAMPLE: usize = 6;
+const ACTIVITY_INTERRUPTS: &str = "activity-interrupts.json";
 const ACTIVITY_PHASE: &str = "activity-phase.json";
 const ACTIVITY_EXECUTIONS: &str = "activity-executions.json";
 const ACTIVITY_CREATED: &str = "activity-created.json";
@@ -74,6 +75,7 @@ impl ModelClient for ActivityModel {
 struct ActivityAccess {
     daemon: EmbeddedAgentAccess,
     queries: AtomicUsize,
+    interrupts: AtomicUsize,
     probe: mpsc::UnboundedSender<RecoveryFact>,
 }
 
@@ -119,7 +121,37 @@ impl AgentAccess for ActivityAccess {
         Ok(observation)
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let interrupted = match &command.command {
+            AgentCommand::ManageLoop {
+                execution,
+                action: tickloop_agent_protocol::LoopAction::Interrupt,
+            } => Some(*execution),
+            _ => None,
+        };
         let receipt = self.daemon.execute(command).await?;
+        if let Some(execution) = interrupted {
+            let observation = self
+                .daemon
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await?;
+            let ObservationValue::Agent(snapshot) = observation.initial else {
+                panic!("the interrupted Chat snapshot");
+            };
+            let count = self.interrupts.fetch_add(1, Ordering::SeqCst) + 1;
+            std::fs::write(
+                ACTIVITY_INTERRUPTS,
+                serde_json::json!({
+                    "phase": "interrupted", "count": count,
+                    "snapshot": snapshot.conversation,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
         if let Some(CommandResult::Created {
             execution,
             snapshot,
@@ -205,11 +237,13 @@ fn working_activity_pty_fixture() {
                 );
                 let (probe, mut facts) = mpsc::unbounded_channel();
                 let access = Arc::new(ActivityAccess {
-                    daemon: EmbeddedAgentAccess::new(core),
+                    daemon: EmbeddedAgentAccess::new(core.clone()),
                     queries: AtomicUsize::new(0),
+                    interrupts: AtomicUsize::new(0),
                     probe: probe.clone(),
                 });
                 std::fs::write(ACTIVITY_QUERIES, "0").unwrap();
+                std::fs::write(ACTIVITY_INTERRUPTS, r#"{"phase":"ready","count":0}"#).unwrap();
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
                 launch.model = Some(tickloop_agent_test_support::config());
@@ -266,6 +300,16 @@ fn working_activity_pty_fixture() {
                 });
                 let chat = agent.create_chat(workdir.clone()).await.unwrap();
                 let other = agent.create_chat(workdir.clone()).await.unwrap();
+                let route = std::env::var(ACTIVITY_ROUTE).unwrap();
+                if route == "idle-goal" || route == "idle-both" {
+                    core.set_execution_mode(chat, ExecutionMode::Plan).await.unwrap();
+                    core.manage_goal(chat, tickloop_agent_protocol::GoalAction::Set {
+                        objective: "Verify idle Escape".into(), token_budget: None, replace: false,
+                    }).await.unwrap();
+                }
+                if route == "attach-paused" {
+                    core.stop(chat).await.unwrap();
+                }
                 std::fs::write(ACTIVITY_EXECUTIONS, serde_json::json!({"execution":agent.reference(chat).await.unwrap(),"other":agent.reference(other).await.unwrap()}).to_string()).unwrap();
                 if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("attach") {
                     agent
@@ -281,9 +325,9 @@ fn working_activity_pty_fixture() {
                     launch_arguments: Vec::new(),
                     chat: StartupChat::Resumed(
                         Box::new(agent.snapshot(chat).await.unwrap()),
-                        false,
+                        route.starts_with("attach-"),
                     ),
-                                user_settings: None,
+                    user_settings: None,
                 };
                 let (console, input) = Console::start_with_display(true, tickloop_agent_config::DisplayPreferences {
                     prefers_reduced_motion: std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only"),
@@ -594,4 +638,84 @@ fn a_run_whose_end_event_was_lost_stops_working_once_the_snapshot_shows_it_ended
     let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
     assert_eq!(frame.matches("Activity reply 1").count(), 1, "{frame}");
     fixture.send(b"\x04\x04");
+}
+
+#[test]
+fn idle_escape_pauses_an_active_goal_without_a_running_turn() {
+    let (mut fixture, directory) = start_activity_fixture("idle-goal");
+    fixture.wait_until_shown("active idle Goal", |frame| {
+        frame.contains("active") && !frame.contains("Working (")
+    });
+    fixture.send(b"\x1b");
+    let proof = fixture.wait_for_phase(&directory.path().join(ACTIVITY_INTERRUPTS), "interrupted");
+    assert_eq!(proof["count"], 1);
+    assert_eq!(proof["snapshot"]["goal"]["status"]["state"], "paused");
+    assert_eq!(proof["snapshot"]["goal"]["status"]["by"], "interrupted");
+    fixture.wait_for("Goal paused");
+}
+
+#[test]
+fn idle_escape_cancels_a_self_paced_wakeup_and_also_pauses_an_active_goal() {
+    for route in ["live", "idle-both"] {
+        let (mut fixture, directory) = start_activity_fixture(route);
+        fixture.wait_for("Enter a message to");
+        fixture.send(b"/loop Check the controlled activity\r");
+        fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-1");
+        std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
+        fixture.wait_until_shown("self-paced fallback waiting while idle", |frame| {
+            frame.contains("Activity reply 1") && !frame.contains("Working (")
+        });
+        fixture.send(b"\x1b");
+        let proof =
+            fixture.wait_for_phase(&directory.path().join(ACTIVITY_INTERRUPTS), "interrupted");
+        assert_eq!(proof["count"], 1, "{route}: {proof}");
+        assert_eq!(
+            proof["snapshot"]["scheduled_tasks"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            proof["snapshot"]["chat_loop"]["receiving"]["state"],
+            "receiving"
+        );
+        if route == "idle-both" {
+            assert_eq!(proof["snapshot"]["goal"]["status"]["state"], "paused");
+        }
+        fixture.wait_for("Pending wakeup cancelled");
+    }
+}
+
+#[test]
+fn idle_escape_without_a_goal_or_wakeup_sends_no_interrupt() {
+    let (mut fixture, directory) = start_activity_fixture("live");
+    fixture.wait_for("Enter a message to");
+    fixture.send(b"\x1b");
+    fixture.wait_for("Press esc again");
+    fixture.send(b"idle Escape processed");
+    fixture.wait_until_shown("input after idle Esc", |frame| {
+        frame.contains("idle Escape processed")
+    });
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join(ACTIVITY_INTERRUPTS)).unwrap())
+            .unwrap();
+    assert_eq!(proof["count"], 0);
+}
+
+#[test]
+fn attaching_history_only_promises_to_resume_triggers_when_receiving_is_paused() {
+    for route in ["attach-receiving", "attach-paused"] {
+        let (mut fixture, _directory) = start_activity_fixture(route);
+        fixture.wait_for("History opened.");
+        fixture.repaint_after_recovery("attached history", |frame| {
+            frame.contains("History opened.")
+        });
+        let output = fixture.raw_output();
+        assert_eq!(
+            output.contains("sending it resumes"),
+            route == "attach-paused",
+            "{route}: {output}"
+        );
+    }
 }
