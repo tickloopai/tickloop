@@ -184,6 +184,14 @@ pub(super) enum LeaseRefused {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LeaseHolding(Option<u64>);
 
+impl LeaseHolding {
+    /// Whether another process may take the lease once it goes back: what must reach the store
+    /// before it does waits for the store.
+    pub(super) fn passes_on(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// How long a Chat whose Trigger input waits on a failed permit waits before the first retry,
 /// doubling with each failure up to the longest.
 const PERMIT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);

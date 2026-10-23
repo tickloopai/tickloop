@@ -2646,14 +2646,24 @@ impl Agent {
             return Ok(());
         }
         recorder.enqueue_sync(snapshot, bookkeeping);
-        if !recorder.outbox.is_materialized(snapshot.id)
-            || recorder.outbox.refusal(snapshot.id).is_some()
-        {
+        self.commit_queued(snapshot.id).await
+    }
+
+    /// Commits what the Chat has queued for its Transcript, without holding the Chats while it
+    /// waits for the store: what the caller queued under them stands queued already.
+    pub(super) async fn commit_queued(&self, chat_id: ChatId) -> Result<(), String> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        if !recorder.logs.lock().unwrap().contains_key(&chat_id) {
+            return Ok(());
+        }
+        if !recorder.outbox.is_materialized(chat_id) || recorder.outbox.refusal(chat_id).is_some() {
             return Err("Transcript is unavailable for a connection checkpoint".into());
         }
         let _appends = recorder.appends.lock().await;
         recorder
-            .append_queued(snapshot.id, true)
+            .append_queued(chat_id, true)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

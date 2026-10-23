@@ -786,14 +786,19 @@ impl Agent {
             self.save(&chat.snapshot);
             result
         };
-        let receiving = {
-            let chats = self.inner.chats.lock().await;
-            let chat = chats.get(&chat_id).ok_or(SourceChangeError::NotLoaded)?;
-            self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-                .await
-                .map_err(SourceChangeError::Unrecorded)?;
-            chat.snapshot.chat_loop.receiving
-        };
+        self.commit_queued(chat_id)
+            .await
+            .map_err(SourceChangeError::Unrecorded)?;
+        let receiving = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(SourceChangeError::NotLoaded)?
+            .snapshot
+            .chat_loop
+            .receiving;
         match receiving {
             Receiving::Receiving
             | Receiving::Paused {
@@ -808,8 +813,9 @@ impl Agent {
     }
 
     /// The sources' part of a turn of the receiving switch, where the lease `holding` is and
-    /// within the boundary, recorded with it: for a pause before the lease goes back. Whether
-    /// what they did is recorded.
+    /// within the boundary, recorded with it: for a pause before the lease goes back, without
+    /// holding the Chats while the store takes it. Whether what they did is recorded, or queued
+    /// where no other process takes the lease.
     pub(super) async fn switch_sources(
         &self,
         chat_id: ChatId,
@@ -820,23 +826,27 @@ impl Agent {
         if states.is_empty() || !self.inner.chat_leases.stands(chat_id, holding) {
             return true;
         }
-        let mut chats = self.inner.chats.lock().await;
-        let Some(chat) = chats.get_mut(&chat_id) else {
-            return true;
-        };
-        let change = SourceChange::new(self);
-        for state in &states {
-            match switched {
-                ReceivingChange::Paused => state.on_stop(&change, chat),
-                ReceivingChange::Resumed => state.on_resume(&change, chat),
-            }
-        }
-        change.queue_with(chat);
-        self.save(&chat.snapshot);
-        if let Err(error) = self
-            .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
-            .await
         {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&chat_id) else {
+                return true;
+            };
+            let change = SourceChange::new(self);
+            for state in &states {
+                match switched {
+                    ReceivingChange::Paused => state.on_stop(&change, chat),
+                    ReceivingChange::Resumed => state.on_resume(&change, chat),
+                }
+            }
+            change.queue_with(chat);
+            self.save(&chat.snapshot);
+        }
+        // Where no other process takes the lease, nothing waits on the records: they are written
+        // with the Chat's next flush.
+        if !holding.passes_on() {
+            return true;
+        }
+        if let Err(error) = self.commit_queued(chat_id).await {
             let notice = match switched {
                 ReceivingChange::Paused => format!(
                     "what this Chat's Trigger sources did as it stopped could not be recorded \

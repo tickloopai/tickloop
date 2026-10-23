@@ -1839,9 +1839,21 @@ impl TranscriptStore for FamilyAppendStore {
     }
 }
 
-async fn assert_family_hold_crash_during_append(continuing: bool) {
+async fn assert_family_hold_crash_during_append(continuing: bool, with_source_state: bool) {
     let store = Arc::new(FamilyAppendStore::default());
     let (original, root, _, _) = queued_message_family(false, store.clone()).await;
+    if with_source_state {
+        // A source whose part of each turn of the switch is a record.
+        original.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+            on_stop: Some(Box::new(|snapshot| {
+                vec![source_record(snapshot.id, "stopped")]
+            })),
+            on_resume: Some(Box::new(|snapshot| {
+                vec![source_record(snapshot.id, "resumed")]
+            })),
+            ..Default::default()
+        });
+    }
     if continuing {
         original.stop(root).await.unwrap();
     }
@@ -1950,12 +1962,31 @@ async fn assert_family_hold_crash_during_append(continuing: bool) {
 
 #[tokio::test]
 async fn durable_stop_hold_and_ledger_survive_crash_during_append() {
-    assert_family_hold_crash_during_append(false).await;
+    assert_family_hold_crash_during_append(false, false).await;
 }
 
 #[tokio::test]
 async fn durable_continue_hold_and_ledger_survive_crash_during_append() {
-    assert_family_hold_crash_during_append(true).await;
+    assert_family_hold_crash_during_append(true, false).await;
+}
+
+/// The same with a source whose part of the stop or the Continue is recorded: it waits for the
+/// store without holding the Chats, so the append it waits behind goes on.
+#[tokio::test]
+async fn durable_stop_hold_survives_crash_during_append_with_a_source_state() {
+    assert_family_hold_crash_during_append(false, true).await;
+}
+
+#[tokio::test]
+async fn durable_continue_hold_survives_crash_during_append_with_a_source_state() {
+    assert_family_hold_crash_during_append(true, true).await;
+}
+
+fn source_record(chat: ChatId, record: &str) -> Line {
+    Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {
+        chat_id: chat,
+        custom_title: record.into(),
+    })
 }
 
 /// A durable host that shut down changes no source's state: the change answers that the host
