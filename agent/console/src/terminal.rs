@@ -6639,6 +6639,7 @@ fn consume_input_echo_from_snapshot(
     ) {
         let _frame_hold = console.hold_frames()?;
         console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+        console.flash_trigger_input(snapshot, input)?;
         console.write_roles(&goal_view::continuation_runs())?;
         console.mark_input_echoes(snapshot.id, [input])?;
         return Ok(None);
@@ -6676,6 +6677,7 @@ fn consume_input_echo_from_snapshot(
             // The input leaves the queue in the frame that shows it sent.
             let _frame_hold = console.hold_frames()?;
             console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+            console.flash_trigger_input(snapshot, input)?;
             console.record_consumed_input(snapshot.id, input, &safe_text(&text))
         }
         None => {
