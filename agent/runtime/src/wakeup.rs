@@ -806,7 +806,7 @@ impl Agent {
             } => {}
             Receiving::Paused {
                 reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
-            } => self.inner.chat_leases.release(chat_id),
+            } => self.release_trigger_lease(chat_id),
         }
         drop(boundary);
         Ok(result)
@@ -914,7 +914,7 @@ impl Agent {
             self.pause_here_for_a_pause_elsewhere(chat_id, holding)
                 .await;
         }
-        self.inner.chat_leases.release(chat_id);
+        self.release_trigger_lease(chat_id);
     }
 
     /// Pauses receiving here, as another process did, and stops the sources with it, the

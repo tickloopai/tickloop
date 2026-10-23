@@ -1953,6 +1953,57 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     here.shutdown().await;
 }
 
+/// A stop whose sources' records the store refuses keeps the lease until they are in: another
+/// process changing the sources' state meanwhile is refused, so the records written once the
+/// store takes writes again never land after that process's newer ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_whose_source_records_are_refused_keeps_the_lease_until_they_are_in() {
+    const STOPPED: &str = "stopped by the first";
+    const CHANGED: &str = "changed by the second";
+    let processes = FaultyProcesses::new().await;
+    let (first, second, chat) = (
+        processes.first.clone(),
+        processes.second.clone(),
+        processes.chat,
+    );
+    first.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
+        on_stop: Some(Box::new(|snapshot| {
+            vec![source_record(snapshot.id, STOPPED)]
+        })),
+        ..Default::default()
+    });
+    processes.first_store.fail_appends();
+    first.stop(chat).await.unwrap();
+    let change = |second: Agent| async move {
+        second
+            .run_source_change_for_tests(chat, |snapshot| vec![source_record(snapshot.id, CHANGED)])
+            .await
+    };
+    assert_eq!(
+        change(second.clone()).await,
+        Err("held elsewhere".into()),
+        "the stop keeps the lease while its records are out"
+    );
+    processes.first_store.heal();
+    first.flush_transcripts().await;
+    first.shutdown().await;
+    change(second.clone()).await.unwrap();
+    let stored = stored_lines(&processes.root, chat);
+    let position = |record: &str| {
+        stored.iter().rposition(|line| {
+            matches!(line, tickloop_agent_transcript::Line::CustomTitle(entry)
+                if entry.custom_title == record)
+        })
+    };
+    assert!(
+        position(STOPPED) < position(CHANGED) && records_of(&stored, CHANGED) == 1,
+        "the newer state stands: {:?} {:?}",
+        position(STOPPED),
+        position(CHANGED)
+    );
+    second.shutdown().await;
+}
+
 /// A stop where another live process holds the lease cannot stop the sources here, and says
 /// so: they stop there once that process learns of the stop.
 #[tokio::test(flavor = "multi_thread")]

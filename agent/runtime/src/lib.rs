@@ -5129,8 +5129,10 @@ impl Agent {
                 reviewer.close_chat(chat_id).await;
             }
         }
-        self.inner.chat_leases.release_all();
+        // The last writes land before the leases go back: none lands after another process took
+        // a Chat over.
         self.close_transcripts().await;
+        self.inner.chat_leases.release_all();
     }
 }
 

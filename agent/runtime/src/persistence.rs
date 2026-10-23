@@ -2629,6 +2629,15 @@ impl Agent {
         }
     }
 
+    /// Whether a batch of the Chat's Transcript the store failed to take waits to be appended
+    /// again.
+    pub(super) fn transcript_holds_failed_batch(&self, chat_id: ChatId) -> bool {
+        self.inner
+            .recorder
+            .as_ref()
+            .is_some_and(|recorder| recorder.outbox.holds_failed_batch(chat_id))
+    }
+
     pub(super) fn transcript_materialized(&self, chat_id: ChatId) -> bool {
         self.inner
             .recorder

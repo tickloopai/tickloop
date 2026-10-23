@@ -331,6 +331,15 @@ impl TranscriptOutbox {
         self.fenced.load(Ordering::SeqCst)
     }
 
+    /// Whether a batch of the Chat the store failed to take waits to be appended again.
+    pub(crate) fn holds_failed_batch(&self, chat: ChatId) -> bool {
+        self.chats
+            .lock()
+            .unwrap()
+            .get(&chat)
+            .is_some_and(|outbox| outbox.pending.is_some() && outbox.write_failure.is_some())
+    }
+
     pub(crate) fn has_queued(&self, chat: ChatId) -> bool {
         self.chats
             .lock()

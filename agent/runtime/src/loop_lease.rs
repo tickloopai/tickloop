@@ -659,6 +659,17 @@ impl Agent {
                 .is_some_and(|holding| leases.stands(chat_id, holding))
     }
 
+    /// Gives the Chat's lease back, unless a batch of its Transcript the store failed to take
+    /// still waits to be appended again: appended after another process took the lease over, it
+    /// would land after that process's records, as a source's stale state among them. The lease
+    /// goes back with a later release once the batch is in, or with the process.
+    pub(super) fn release_trigger_lease(&self, chat_id: ChatId) {
+        if self.transcript_holds_failed_batch(chat_id) {
+            return;
+        }
+        self.inner.chat_leases.release(chat_id);
+    }
+
     /// Enters the Chat's Trigger boundary for a source, as long as it is free soon enough;
     /// `None` while it stays held.
     pub(super) async fn enter_trigger_boundary_for_source(
@@ -840,7 +851,7 @@ impl Agent {
                 reason: PauseReason::Stopped | PauseReason::HistoryLoaded,
             })
             | None => {
-                leases.release(chat_id);
+                self.release_trigger_lease(chat_id);
                 return TriggerPermit::Wait {
                     reason: "this Chat's Loop is not receiving".into(),
                     recoverable: false,
@@ -919,7 +930,7 @@ impl Agent {
                     }
                     Err(refused) => Some(refused),
                 };
-                self.inner.chat_leases.release(chat_id);
+                self.release_trigger_lease(chat_id);
                 if let Some(refused) = refused
                     && self.has_trigger_source_states()
                 {
@@ -944,7 +955,7 @@ impl Agent {
                     && self.switch_sources(chat_id, holding, change).await
                     && !held_before
                 {
-                    self.inner.chat_leases.release(chat_id);
+                    self.release_trigger_lease(chat_id);
                 }
             }
         }
