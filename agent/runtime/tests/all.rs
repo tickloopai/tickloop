@@ -222,3 +222,6 @@ mod workspace_host_context;
 
 #[path = "all/shared_tasks.rs"]
 mod shared_tasks;
+
+#[path = "all/native_task_auto.rs"]
+mod native_task_auto;
