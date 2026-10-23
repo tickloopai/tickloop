@@ -45,8 +45,9 @@ pub(super) trait TriggerSourceState: Send + Sync {
     /// Takes the source's state over from `stored`, the Chat's stored Lines, under a newly taken
     /// lease: within the Chat's boundary and under the Chats lock, right after the ledger's
     /// Trigger records, before anything is accepted or started under the lease, so eligibility
-    /// reads the newest state another process left.
-    fn take_over(&self, agent: &Agent, chat: &mut Chat, stored: &[Line]);
+    /// reads the newest state another process left. What it records through `change` is
+    /// queued in one group with the takeover's ledger records.
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]);
 
     /// The records of the source's state as it stands, which the lease holder writes again
     /// after a compaction, so a load from the compaction finds them.
@@ -632,9 +633,11 @@ impl Agent {
                 }
             }
             let states = self.inner.trigger_source_states.read().unwrap().clone();
+            let change = SourceChange::new(self);
             for state in states {
-                state.take_over(self, chat, &lines);
+                state.take_over(&change, chat, &lines);
             }
+            change.queue_with(chat);
             let lifecycle = &chat.bookkeeping.lifecycle;
             let (kept, taken_elsewhere): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut chat.snapshot.pending_inputs)
@@ -1223,7 +1226,8 @@ impl Agent {
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct TestSourceState {
-    pub take_over: Option<Box<dyn Fn(&mut ChatSnapshot, &[Line]) + Send + Sync>>,
+    /// The Lines it records as it takes the state over.
+    pub take_over: Option<Box<dyn Fn(&mut ChatSnapshot, &[Line]) -> Vec<Line> + Send + Sync>>,
     pub records: Option<Box<dyn Fn(&ChatSnapshot) -> Vec<Line> + Send + Sync>>,
     /// The Lines it records as the Chat stops.
     pub on_stop: Option<Box<dyn Fn(&mut ChatSnapshot) -> Vec<Line> + Send + Sync>>,
@@ -1233,9 +1237,11 @@ pub struct TestSourceState {
 
 #[cfg(any(test, feature = "test-support"))]
 impl TriggerSourceState for TestSourceState {
-    fn take_over(&self, _agent: &Agent, chat: &mut Chat, stored: &[Line]) {
+    fn take_over(&self, change: &SourceChange, chat: &mut Chat, stored: &[Line]) {
         if let Some(take_over) = &self.take_over {
-            take_over(&mut chat.snapshot, stored);
+            for line in take_over(&mut chat.snapshot, stored) {
+                change.record_source_state(line);
+            }
         }
     }
 

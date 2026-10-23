@@ -1812,10 +1812,11 @@ fn records_of(lines: &[tickloop_agent_transcript::Line], record: &str) -> usize 
 
 /// A source's own state is taken over from the store with a newly taken lease, before anything
 /// is accepted under it: what another process recorded decides whether the delivery that took
-/// the lease goes in.
+/// the lease goes in, and what the source records as it takes over is stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     const STOP_ELSEWHERE: &str = "stop receiving";
+    const TAKEN_OVER: &str = "taken over";
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let model = ContractModel::new();
@@ -1829,11 +1830,13 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     // stops receiving, which holds every delivery back.
     taker.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
         take_over: Some(Box::new(|snapshot, stored| {
-            if records_of(stored, STOP_ELSEWHERE) > 0 {
-                snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
-                    reason: tickloop_agent_protocol::PauseReason::Stopped,
-                };
+            if records_of(stored, STOP_ELSEWHERE) == 0 {
+                return Vec::new();
             }
+            snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
+                reason: tickloop_agent_protocol::PauseReason::Stopped,
+            };
+            vec![source_record(snapshot.id, TAKEN_OVER)]
         })),
         ..Default::default()
     });
@@ -1861,6 +1864,12 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     );
     tokio::time::sleep(SETTLE).await;
     assert_eq!(taker_model.seen("held-back"), 0);
+    taker.flush_transcripts().await;
+    assert_eq!(
+        records_of(&stored_lines(&root, chat), TAKEN_OVER),
+        1,
+        "what the source records as it takes over is stored"
+    );
     taker.shutdown().await;
 }
 
