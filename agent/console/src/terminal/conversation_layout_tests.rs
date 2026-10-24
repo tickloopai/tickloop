@@ -155,7 +155,7 @@ fn followed_view(
     render_restored_observation(
         &console,
         &mut tools,
-        chat,
+        chat.into(),
         0,
         &mut HashMap::new(),
         &mut MessageGroups::default(),
@@ -711,7 +711,7 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
         .family_completions
         .iter()
         .find(|completion| completion.handle == "logs")
-        .and_then(|completion| colors[&completion.child_chat_id])
+        .and_then(|completion| colors[&completion.child_chat_id.uuid()])
         .expect("the runtime gave the child an Agent Color");
     for view in [&followed, &reopened] {
         let rows = view.test_conversation_rows();
@@ -906,8 +906,8 @@ async fn a_finished_user_shell_shows_the_result_the_agent_records() {
 
 fn notification(status: TaskNotificationStatus, summary: &str) -> TaskNotification {
     TaskNotification {
-        chat_id: Uuid::new_v4(),
-        task_id: Uuid::new_v4(),
+        chat_id: Uuid::new_v4().into(),
+        task_id: Uuid::new_v4().into(),
         tool_use_id: None,
         output_file: "/tmp/task.log".into(),
         status,
@@ -921,7 +921,7 @@ fn notices_warnings_and_compaction_are_blocks_of_their_own() {
     let console = Console::test_interactive_for_chat(chat);
     console.write("Earlier output\n").unwrap();
     write_warning(&console, "Settings could not be read").unwrap();
-    write_compaction_notice(&console, chat, "summary").unwrap();
+    write_compaction_notice(&console, chat.into(), "summary").unwrap();
     console
         .write_roles(&task_notification_line(
             &notification(
@@ -988,9 +988,9 @@ fn parallel_calls_settle_as_their_results_arrive_and_unstarted_ones_stop_with_th
     let mut present = |kind: EventKind| {
         sequence += 1;
         let event = Event {
-            chat_id: chat,
-            loop_id,
-            run_id: run,
+            chat_id: chat.into(),
+            loop_id: loop_id.into(),
+            run_id: run.into(),
             sequence,
             kind,
         };

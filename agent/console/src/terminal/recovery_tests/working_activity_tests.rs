@@ -302,13 +302,13 @@ fn working_activity_pty_fixture() {
                 let other = agent.create_chat(workdir.clone()).await.unwrap();
                 let route = std::env::var(ACTIVITY_ROUTE).unwrap();
                 if route == "idle-goal" || route == "idle-both" {
-                    core.set_execution_mode(chat, ExecutionMode::Plan).await.unwrap();
-                    core.manage_goal(chat, tickloop_agent_protocol::GoalAction::Set {
+                    core.set_execution_mode(chat.into(), ExecutionMode::Plan).await.unwrap();
+                    core.manage_goal(chat.into(), tickloop_agent_protocol::GoalAction::Set {
                         objective: "Verify idle Escape".into(), token_budget: None, replace: false,
                     }).await.unwrap();
                 }
                 if route == "attach-paused" {
-                    core.stop(chat).await.unwrap();
+                    core.stop(chat.into()).await.unwrap();
                 }
                 std::fs::write(ACTIVITY_EXECUTIONS, serde_json::json!({"execution":agent.reference(chat).await.unwrap(),"other":agent.reference(other).await.unwrap()}).to_string()).unwrap();
                 if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("attach") {

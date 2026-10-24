@@ -381,9 +381,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
     let chat = Uuid::new_v4();
     let shell = |state| ShellTask {
         id: Uuid::new_v4(),
-        chat_id: chat,
+        chat_id: chat.into(),
         origin: ShellTaskOrigin::User,
-        owner: ShellTaskOwner::User { chat_id: chat },
+        owner: ShellTaskOwner::User {
+            chat_id: chat.into(),
+        },
         call_id: None,
         command: "sleep 30".into(),
         description: None,
@@ -420,7 +422,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
             tickloop_agent_protocol::ChatStatus::of(&snapshot),
         )),
         shells: Some(ShellTaskSnapshot {
-            chat_id: chat,
+            chat_id: chat.into(),
             live_revision: 0,
             tasks: vec![running.clone(), unstoppable.clone(), finished.clone()],
         }),
@@ -588,20 +590,20 @@ async fn shell_subscription_refuses_a_foreign_chat_before_its_baseline() {
     let target = InstanceRef::shell(task.command_id);
     assert!(
         shell_stream
-            .revalidate_watch(observer, &target, None)
+            .revalidate_watch(observer.into(), &target, None)
             .await
             .is_err()
     );
     assert!(
         shell_stream
-            .revalidate_watch(owner, &target, None)
+            .revalidate_watch(owner.into(), &target, None)
             .await
             .is_ok()
     );
     assert!(
         shell_stream
             .revalidate_watch(
-                owner,
+                owner.into(),
                 &target,
                 Some(&tickloop_agent_protocol::HostToolAuthority::Mcp {
                     server_id: "https://unrelated.example".into(),

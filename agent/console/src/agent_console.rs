@@ -336,7 +336,7 @@ impl AgentConsole {
                     }
                 };
                 let effect = NavigationEffect {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     generation: self.generation,
                     target,
                     destination,
@@ -608,7 +608,7 @@ impl AgentConsole {
         self.created = None;
         launch.folder = self.directory.clone();
         launch.exact_chat = None;
-        let command_id = Uuid::new_v4();
+        let command_id = tickloop_ids::generate();
         match self
             .access
             .execute(CommandEnvelope {

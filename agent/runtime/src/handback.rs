@@ -57,7 +57,9 @@ pub(super) fn remind(chat: &mut Chat, receipt: &Receipt) -> bool {
     *reminders += 1;
     let index = chat.snapshot.messages.len();
     chat.snapshot.message_runs.insert(index, receipt.run_id);
-    chat.snapshot.message_ids.insert(index, Uuid::new_v4());
+    chat.snapshot
+        .message_ids
+        .insert(index, tickloop_ids::generate());
     chat.snapshot.messages.push(Message { role:Role::User, content:vec![Content::Text { text:
         "Finish by calling SubagentHandback with your complete report. Plain final text is not delivered to your caller; this reminder does not authorize any new work.".into()
     }] });
@@ -66,10 +68,10 @@ pub(super) fn remind(chat: &mut Chat, receipt: &Receipt) -> bool {
 }
 
 pub(super) fn completion_text(snapshot: &ChatSnapshot, run: Uuid) -> String {
-    match snapshot.subagent_reports.get(&run) {
+    match snapshot.subagent_reports.get(&tickloop_ids::Id::from(run)) {
         Some(SubagentReport::Pending { .. }) => SUBAGENT_MISSING_REPORT.into(),
         Some(SubagentReport::Delivered { .. }) => SUBAGENT_REPORT_RECEIPT.into(),
-        None => snapshot.run_response_text(run).unwrap_or_default(),
+        None => snapshot.run_response_text(run.into()).unwrap_or_default(),
     }
 }
 
@@ -143,7 +145,7 @@ impl Agent {
             )
             .await
             .map_err(|error| error.message)?;
-        if target.policy_input()["to"] != parent.parent_chat_id.to_string() {
+        if target.target() != parent.parent_chat_id {
             return Err("SubagentHandback caller binding changed".into());
         }
         Ok(PreparedHandback {
@@ -210,7 +212,7 @@ impl Agent {
         chat.snapshot.subagent_reports.insert(
             receipt.run_id,
             SubagentReport::Delivered {
-                message_id: receipt.run_id,
+                message_id: receipt.run_id.into(),
                 report,
                 review: Box::new(assessment.details),
             },

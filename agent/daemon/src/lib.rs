@@ -166,7 +166,9 @@ impl WorkerFactory for ProcessWorkerFactory {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AccessError::unavailable("Agent daemon is shutting down"));
         }
-        let endpoint = self.directory.join(format!("w-{}.sock", Uuid::new_v4()));
+        let endpoint = self
+            .directory
+            .join(format!("w-{}.sock", tickloop_ids::generate()));
         check_socket_length(&endpoint).map_err(AccessError::unavailable)?;
         check_socket_length(&worker_upgrade::endpoint(&endpoint))
             .map_err(AccessError::unavailable)?;
@@ -373,7 +375,7 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
         upgrade::duplicate(listener.as_raw_fd()).map_err(|error| error.to_string())?;
     let epoch = handoff
         .as_ref()
-        .map_or_else(Uuid::new_v4, |handoff| handoff.epoch);
+        .map_or_else(tickloop_ids::generate, |handoff| handoff.epoch);
     let tickhost = std::env::current_exe()
         .and_then(|executable| executable.canonicalize())
         .map_err(|error| error.to_string())?
@@ -792,8 +794,8 @@ fn remove_owned_socket(endpoint: &Path, identity: (u64, u64)) -> Result<(), Stri
 fn private_listener(endpoint: &Path) -> Result<(UnixListener, (u64, u64)), String> {
     const TEMPORARY_SOCKET_NAME_LENGTH: usize = 8;
     check_socket_length(endpoint)?;
-    let temporary = endpoint
-        .with_file_name(&Uuid::new_v4().simple().to_string()[..TEMPORARY_SOCKET_NAME_LENGTH]);
+    let temporary =
+        endpoint.with_file_name(&tickloop_ids::random_token()[..TEMPORARY_SOCKET_NAME_LENGTH]);
     let listener = UnixListener::bind(&temporary).map_err(|error| error.to_string())?;
     let metadata = std::fs::symlink_metadata(&temporary).map_err(|error| error.to_string())?;
     let identity = (metadata.dev(), metadata.ino());

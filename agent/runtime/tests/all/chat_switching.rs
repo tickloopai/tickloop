@@ -47,13 +47,15 @@ async fn forking_a_saved_chat_writes_a_new_transcript_and_leaves_the_source_unch
     complete_turn(&agent, source, "Remember cedar.").await;
     agent.shutdown().await;
     drop(agent);
-    let source_path = transcript_file(&root, source);
+    let source_path = transcript_file(&root, source.uuid());
     let source_bytes = std::fs::read(&source_path).unwrap();
 
     let model = Arc::new(ScriptedModel::new(vec![text("The word was cedar.")]));
     let copying = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     assert!(matches!(
-        copying.resume_as_new_chat(Uuid::new_v4()).await,
+        copying
+            .resume_as_new_chat(tickloop_ids::Id::from(Uuid::new_v4()))
+            .await,
         Err(AgentError::NotFound)
     ));
     let copy = copying.resume_as_new_chat(source).await.unwrap();
@@ -75,7 +77,7 @@ async fn forking_a_saved_chat_writes_a_new_transcript_and_leaves_the_source_unch
     drop(copying);
 
     assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
-    let copy_path = transcript_file(&root, copy.id);
+    let copy_path = transcript_file(&root, copy.id.uuid());
     assert_ne!(copy_path, source_path);
     let copy_file = std::fs::read_to_string(&copy_path).unwrap();
     assert!(copy_file.contains("Remember cedar."));
@@ -152,8 +154,10 @@ async fn a_triggered_loop_in_a_background_chat_keeps_running_and_writes_only_to_
     agent.shutdown().await;
     drop(agent);
 
-    let background_file = std::fs::read_to_string(transcript_file(&root, background)).unwrap();
-    let foreground_file = std::fs::read_to_string(transcript_file(&root, foreground)).unwrap();
+    let background_file =
+        std::fs::read_to_string(transcript_file(&root, background.uuid())).unwrap();
+    let foreground_file =
+        std::fs::read_to_string(transcript_file(&root, foreground.uuid())).unwrap();
     assert!(background_file.contains("BACKGROUND-TICK-TWO"));
     assert!(!foreground_file.contains("BACKGROUND-TICK"));
     assert!(!foreground_file.contains("scheduled market check"));

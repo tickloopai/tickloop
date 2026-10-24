@@ -2,12 +2,16 @@ use serde_json::{Value, json};
 
 use super::*;
 use tickloop_agent_protocol::local_messages;
+use tickloop_agent_protocol::model_ids::model_json;
+use tickloop_agent_protocol::{AgentMessageId, AgentMessageKind, ChatKind, DelegationId};
 use tickloop_agent_protocol::{
     AgentMessageSource, ChatSnapshot, ChildRunStatus, DelegationMetadata, EventKind,
     FamilyCompletion, FamilyMessageRejection, FamilyMessageRejectionCode, LoopId, LoopState,
     MessageCause, PendingInput, Receipt, SEND_AGENT_MESSAGE_TOOL_NAME, SubagentRegistration,
     ToolDefinition, ToolResult, VerifiedUserRelay, chat_display_title,
 };
+use tickloop_ids::IdContext;
+use tickloop_ids::ModelRef;
 
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";
 pub const STOP_SUBAGENT_TOOL_NAME: &str = "StopSubagent";
@@ -33,6 +37,13 @@ pub(super) enum PreparedFamilyCall {
     Stop(PreparedFamilyStop),
 }
 impl PreparedFamilyCall {
+    pub(super) fn target(&self) -> ChatId {
+        match self {
+            Self::Message(message) => message.target,
+            Self::Stop(stop) => stop.target,
+        }
+    }
+
     pub(super) fn policy_input(&self) -> &Value {
         match self {
             Self::Message(message) => &message.policy_input,
@@ -138,8 +149,14 @@ fn peer_target(
                         .is_some_and(|delegation| delegation.root_chat_id() == root)
             })
             .map(|entry| entry.child_chat_id)
-            .or_else(|| Uuid::parse_str(target).ok())
-            .ok_or("use a family handle or complete family Chat identity")?
+            .or_else(|| {
+                source
+                    .ids
+                    .resolve(&ModelRef::<ChatKind>::from(target))
+                    .ok()
+                    .filter(|id| chats.contains_key(id))
+            })
+            .ok_or_else(|| tickloop_ids::not_found::<ChatKind>(target))?
     };
     if target_id == sender.chat_id {
         return Err("an Agent cannot send a message to itself".into());
@@ -184,6 +201,7 @@ fn peer_target(
 /// function of the family's records alone, so a parent rebuilt in another instance gets what it
 /// would have in the process that delegated. `None` without the child's registration.
 pub(super) fn child_run_result(
+    ids: &IdContext,
     completion: &FamilyCompletion,
     delegation: &DelegationMetadata,
     registration: Option<&SubagentRegistration>,
@@ -192,9 +210,9 @@ pub(super) fn child_run_result(
     let registration = registration?;
     let status = completion.status();
     Some(ToolResult {
-        content: json!({"delegation_id":delegation.delegation_id,"child_chat_id":completion.child_chat_id,
+        content: json!({"delegation_id":ids.model_text(DelegationId::from(delegation.delegation_id)),"child_chat_id":ids.model_text(completion.child_chat_id),
             "handle":registration.handle,"description":registration.description,"created_at":registration.created_at,
-            "child_loop_id":completion.child_loop_id,"child_run_id":completion.child_run_id,"parent_chat_id":parent_chat,
+            "child_loop_id":ids.model_text(completion.child_loop_id),"child_run_id":ids.model_text(completion.child_run_id),"parent_chat_id":ids.model_text(parent_chat),
             "status":status.label(),"child_state":format!("{:?}", completion.state).to_lowercase(),"result":completion.result,"error":completion.error,
             "usage":completion.usage}).to_string(),
         is_error: status != ChildRunStatus::Completed,
@@ -244,6 +262,7 @@ pub(super) fn child_run_status(
 /// result was a function of records; the records must give the same.
 #[cfg(test)]
 pub(super) fn child_run_result_from_events(
+    ids: &IdContext,
     snapshot: &ChatSnapshot,
     child: &Receipt,
     parent: &Receipt,
@@ -251,12 +270,12 @@ pub(super) fn child_run_result_from_events(
 ) -> Option<ToolResult> {
     let chat_loop = &snapshot.chat_loop;
     let (status, error) = child_run_status(snapshot, child.run_id)?;
-    let text = crate::handback::completion_text(snapshot, child.run_id);
+    let text = crate::handback::completion_text(snapshot, child.run_id.into());
     let metadata = snapshot.delegation.as_ref()?;
     Some(ToolResult {
-        content: json!({"delegation_id":metadata.delegation_id,"child_chat_id":child.chat_id,
+        content: json!({"delegation_id":ids.model_text(DelegationId::from(metadata.delegation_id)),"child_chat_id":ids.model_text(child.chat_id),
             "handle":registration?.handle,"description":registration?.description,"created_at":registration?.created_at,
-            "child_loop_id":child.loop_id,"child_run_id":child.run_id,"parent_chat_id":parent.chat_id,
+            "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),"parent_chat_id":ids.model_text(parent.chat_id),
             "status":status.label(),"child_state":format!("{:?}", chat_loop.state).to_lowercase(),"result":text,"error":error,
             "usage":snapshot.request_usage.run_conversation_usage(child.run_id).unwrap_or_default()}).to_string(),
         is_error:status != ChildRunStatus::Completed, output_ref:None,
@@ -319,9 +338,13 @@ impl Agent {
             .iter()
             .map(|id| (*id, chats[id].family_generation))
             .collect();
+        let ids = chats[&sender.chat_id].ids;
         let mut policy_input = input.clone();
-        policy_input["to"] = target.to_string().into();
-        policy_input["affected_members"] = json!(targets);
+        policy_input["to"] = ids.model_text(target).into();
+        policy_input["affected_members"] = targets
+            .iter()
+            .map(|member| ids.model_text(*member))
+            .collect();
         Ok(PreparedFamilyCall::Stop(PreparedFamilyStop {
             policy_input,
             target,
@@ -387,7 +410,7 @@ impl Agent {
                     )
                 })?;
                 Ok(VerifiedUserRelay {
-                    original_chat_id: original.chat_id,
+                    original_chat_id: original.chat_id.into(),
                     original_message_id: original.message_id,
                     forwarded_verbatim: input["message"].as_str() == Some(original.text.as_str()),
                     original_text: original.text,
@@ -395,7 +418,7 @@ impl Agent {
             })
             .transpose()?;
         let mut policy_input = input.clone();
-        policy_input["to"] = target.to_string().into();
+        policy_input["to"] = chats[&sender.chat_id].ids.model_text(target).into();
         let cause = family_mailbox::current_cause(
             &chats[&sender.chat_id].snapshot,
             &chats[&sender.chat_id].bookkeeping,
@@ -428,11 +451,15 @@ impl Agent {
                 };
                 self.stop_family_child(receipt, stop, &cancel).await
             }
-            LIST_SUBAGENTS_TOOL_NAME => self
-                .family_agents(receipt.chat_id)
-                .await
-                .map(|members| result(json!({"status":"ok","members":members})))
-                .map_err(|error| error.to_string()),
+            LIST_SUBAGENTS_TOOL_NAME => {
+                let ids = self.chat_ids(receipt.chat_id).await;
+                self.family_agents(receipt.chat_id)
+                    .await
+                    .map(|members| {
+                        result(model_json(&ids, json!({"status":"ok","members":members})))
+                    })
+                    .map_err(|error| error.to_string())
+            }
             SEND_AGENT_MESSAGE_TOOL_NAME => {
                 let message = input["message"]
                     .as_str()
@@ -470,14 +497,20 @@ impl Agent {
         }
         let is_handback = matches!(&delivery, FamilyDelivery::Handback { .. });
         let (target, message, is_result, prepared) = match delivery {
-            FamilyDelivery::Message { prepared, body } => {
-                (prepared.target.to_string(), body, false, Some(prepared))
-            }
-            FamilyDelivery::Handback { prepared, body } => {
-                (prepared.target.to_string(), body, true, Some(prepared))
-            }
+            FamilyDelivery::Message { prepared, body } => (
+                prepared.target.uuid().to_string(),
+                body,
+                false,
+                Some(prepared),
+            ),
+            FamilyDelivery::Handback { prepared, body } => (
+                prepared.target.uuid().to_string(),
+                body,
+                true,
+                Some(prepared),
+            ),
             FamilyDelivery::Completion { parent, body } => {
-                (parent.chat_id.to_string(), body, true, None)
+                (parent.chat_id.uuid().to_string(), body, true, None)
             }
         };
         let source_registration = self
@@ -489,6 +522,7 @@ impl Agent {
             .map_err(|error| error.to_string())?;
         let mut mailbox = self.inner.family_mailbox.lock().await;
         let mut chats = self.inner.chats.lock().await;
+        let ids = chats[&sender.chat_id].ids;
         for chat in chats.values() {
             mailbox.synchronize(&chat.snapshot);
         }
@@ -535,7 +569,7 @@ impl Agent {
                 })
             {
                 return Ok(result(
-                    json!({"status":"accepted","message_id":message_id,"delivery":"already_accepted"}),
+                    json!({"status":"accepted","message_id":ids.model_text(AgentMessageId::from(message_id)),"delivery":"already_accepted"}),
                 ));
             }
         }
@@ -557,12 +591,12 @@ impl Agent {
             && (chats[&target_id]
                 .snapshot
                 .agent_message_origins
-                .contains_key(&sender.run_id)
+                .contains_key(&sender.run_id.uuid())
                 || chats[&target_id]
                     .snapshot
                     .agent_message_origins
                     .values()
-                    .any(|source| source["message_id"] == sender.run_id.to_string())
+                    .any(|source| source["message_id"] == sender.run_id.uuid().to_string())
                 || chats[&target_id]
                     .snapshot
                     .pending_inputs
@@ -577,10 +611,10 @@ impl Agent {
                 || chats[&target_id]
                     .bookkeeping
                     .lifecycle
-                    .is_input(sender.run_id))
+                    .is_input(sender.run_id.into()))
         {
             return Ok(result(
-                json!({"status":"accepted","message_id":sender.run_id,"target_chat_id":target_id,"delivery":"already_accepted"}),
+                json!({"status":"accepted","message_id":ids.model_text(sender.run_id.cast::<AgentMessageKind>()),"target_chat_id":ids.model_text(target_id),"delivery":"already_accepted"}),
             ));
         }
         if !is_result && chats[&sender.chat_id].active_run != Some(sender.run_id) {
@@ -608,13 +642,13 @@ impl Agent {
         // A message's id names the answer and call that sent it, so the same send is one input
         // on every host; another attempt at the answer sends anew.
         let message_id = if is_result {
-            sender.run_id
+            sender.run_id.uuid()
         } else {
             task_message_id.unwrap_or_else(|| {
-                sender_response.map_or_else(Uuid::new_v4, |response| {
+                sender_response.map_or_else(tickloop_ids::generate, |response| {
                     tickloop_agent_transcript::input_ids::family_message(
-                        sender.chat_id,
-                        response,
+                        sender.chat_id.into(),
+                        response.into(),
                         call_id,
                     )
                 })
@@ -623,7 +657,7 @@ impl Agent {
         // A message the receiver already accepted, on this host or an earlier one, is sent.
         if !is_result && chats[&target_id].bookkeeping.lifecycle.is_input(message_id) {
             return Ok(result(
-                json!({"status":"accepted","message_id":message_id,"target_chat_id":target_id,"delivery":"already_accepted"}),
+                json!({"status":"accepted","message_id":ids.model_text(AgentMessageId::from(message_id)),"target_chat_id":ids.model_text(target_id),"delivery":"already_accepted"}),
             ));
         }
         let held = mailbox
@@ -695,14 +729,14 @@ impl Agent {
         let receipt = Receipt {
             chat_id: target_id,
             loop_id,
-            run_id: Uuid::new_v4(),
+            run_id: tickloop_ids::generate().into(),
         };
         receiver.snapshot.last_queue_sequence += 1;
         let queued_sequence = receiver.snapshot.last_queue_sequence;
         let input = if is_result && !is_handback {
             message.to_owned()
         } else {
-            local_messages::agent_message(&source, message)
+            local_messages::agent_message(&receiver.ids, &source, message)
         };
         let index = receiver
             .snapshot
@@ -726,7 +760,7 @@ impl Agent {
         };
         receiver.bookkeeping.lifecycle.accept(
             &super::lifecycle::LedgerInput::new(
-                source.message_id,
+                source.message_id.into(),
                 tickloop_agent_transcript::InputOp::AgentMessage,
                 &queued.input,
             ),
@@ -770,8 +804,8 @@ impl Agent {
             }
         }
         let delivered = result(
-            json!({"status":"accepted","message_id":source.message_id,"target_chat_id":target_id,
-            "target_run_id":receipt.run_id,"target_label":target_label,"target_relationship":match relationship {"parent"=>"child","child"=>"parent",_=>"sibling"},"delivery":"queued_at_tool_boundary"}),
+            json!({"status":"accepted","message_id":ids.model_text(AgentMessageId::from(source.message_id)),"target_chat_id":ids.model_text(target_id),
+            "target_run_id":ids.model_text(receipt.run_id),"target_label":target_label,"target_relationship":match relationship {"parent"=>"child","child"=>"parent",_=>"sibling"},"delivery":"queued_at_tool_boundary"}),
         );
         mailbox.sent.insert(
             key,
@@ -830,7 +864,8 @@ impl Agent {
         parent: &Receipt,
         completion: &FamilyCompletion,
     ) -> Result<ToolResult, String> {
-        let body = local_messages::subagent_notification(completion);
+        let ids = self.chat_ids(parent.chat_id).await;
+        let body = local_messages::subagent_notification(&ids, completion);
         self.deliver_agent_message(
             child,
             "subagent-completion",
@@ -867,9 +902,10 @@ impl Agent {
         stopped_members.push(sender.chat_id);
         self.make_durable(&stopped_members).await?;
         let failed = !stopped.failures.is_empty();
+        let ids = self.chat_ids(sender.chat_id).await;
         Ok(ToolResult {
-            content: json!({"status":if failed {"partial_failure"} else {"stopped"},"child_chat_id":prepared.target,
-                "unresolved_operations":stopped.operations,"failures":stopped.failures}).to_string(),
+            content: model_json(&ids, json!({"status":if failed {"partial_failure"} else {"stopped"},"child_chat_id":prepared.target,
+                "unresolved_operations":stopped.operations,"failures":stopped.failures})).to_string(),
             is_error: failed, output_ref: None,
         })
     }
@@ -974,9 +1010,14 @@ mod child_result_tests {
         };
         let child_snapshot = agent.snapshot(child.chat_id).await.unwrap();
         let registration = agent.subagent_registration(child.chat_id).await.unwrap();
-        let from_events =
-            child_run_result_from_events(&child_snapshot, &child, &receipt, registration.as_ref())
-                .unwrap();
+        let from_events = child_run_result_from_events(
+            &tickloop_ids::IdContext::new(),
+            &child_snapshot,
+            &child,
+            &receipt,
+            registration.as_ref(),
+        )
+        .unwrap();
         agent.shutdown().await;
         (
             returned,

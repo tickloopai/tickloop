@@ -533,7 +533,7 @@ impl TickActionBackend for CloseHosted {
         ctx.agent
             .close_hosted_tick(ctx.chat, self.instance.clone())
             .await
-            .map_err(|error| format!("Cannot close {}: {error}", self.instance))?;
+            .map_err(|error| format!("Cannot close {}: {error}", self.instance.public()))?;
         for subscription in &subscriptions {
             ctx.agent
                 .update_tick_subscription(
@@ -580,7 +580,7 @@ impl TickActionBackend for ReopenHosted {
             .agent
             .reopen_hosted_tick(ctx.chat, self.instance.clone(), true)
             .await
-            .map_err(|error| format!("Cannot reopen {}: {error}", self.instance))?;
+            .map_err(|error| format!("Cannot reopen {}: {error}", self.instance.public()))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
         refresh_subscriptions(&ctx).await?;

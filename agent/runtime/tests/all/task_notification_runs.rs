@@ -125,7 +125,9 @@ async fn background_agent_command_completion_continues_its_goal() {
         tool_result_text(&started, "background-shell"),
         format!(
             "Command running in background with ID: {}. Output is being written to: {}",
-            command.operation_id,
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                command.operation_id
+            )),
             command.output_ref.display()
         )
     );
@@ -148,7 +150,7 @@ async fn background_agent_command_completion_continues_its_goal() {
         "{notification}"
     );
     for expected in [
-        format!("<task-id>{}</task-id>", command.operation_id),
+        format!("<task-id>{}</task-id>", tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(command.operation_id))),
         "<tool-use-id>background-shell</tool-use-id>".into(),
         format!("<output-file>{}</output-file>", command.output_ref.display()),
         "<summary>Background command \"Wait for the release gate\" completed (exit code 0)</summary>"
@@ -196,7 +198,9 @@ async fn a_foreground_command_past_its_timeout_moves_to_the_background_and_notif
         tool_result_text(&moved, "slow-shell"),
         format!(
             "Command running in background with ID: {}. Output is being written to: {}",
-            command.operation_id,
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                command.operation_id
+            )),
             command.output_ref.display()
         )
     );
@@ -214,7 +218,7 @@ async fn a_foreground_command_past_its_timeout_moves_to_the_background_and_notif
         .find(|text| text.starts_with("<task-notification>"))
         .expect("task notification message");
     for expected in [
-        format!("<task-id>{}</task-id>", command.operation_id),
+        format!("<task-id>{}</task-id>", tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(command.operation_id))),
         "<tool-use-id>slow-shell</tool-use-id>".into(),
         "<status>completed</status>".into(),
         "<summary>Background command \"Wait for the release gate\" completed (exit code 0)</summary>"
@@ -273,7 +277,9 @@ async fn a_foreground_command_the_user_backgrounds_returns_at_once_and_notifies_
         tool_result_text(&moved, "long-shell"),
         format!(
             "Command was manually backgrounded by user with ID: {}. Output is being written to: {}",
-            running.operation_id,
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                running.operation_id
+            )),
             running.output_ref.display()
         )
     );
@@ -297,7 +303,7 @@ async fn a_foreground_command_the_user_backgrounds_returns_at_once_and_notifies_
         .find(|text| text.starts_with("<task-notification>"))
         .expect("task notification message");
     for expected in [
-        format!("<task-id>{}</task-id>", running.operation_id),
+        format!("<task-id>{}</task-id>", tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(running.operation_id))),
         "<tool-use-id>long-shell</tool-use-id>".into(),
         "<status>completed</status>".into(),
         "<summary>Background command \"Wait for the release gate\" completed (exit code 0)</summary>"

@@ -625,6 +625,7 @@ async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_n
     assert!(tools.family_temp_directory().is_none());
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             WEB_FETCH_TOOL_NAME,
             &json!({"url": "https://example.com/a", "prompt": "p"}),
@@ -642,6 +643,7 @@ async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_n
             matches!(
                 tools
                     .prepare(
+                        &tickloop_ids::IdContext::new(),
                         &workspace,
                         WEB_FETCH_TOOL_NAME,
                         &json!({"url": url, "prompt": "p"})
@@ -663,7 +665,7 @@ async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_n
     ] {
         assert!(
             matches!(
-                tools.prepare(&workspace, name, &input).await,
+                tools.prepare(&tickloop_ids::IdContext::new(), &workspace, name, &input).await,
                 Err(ToolError::Rejected(message)) if message.contains("no Folder")
             ),
             "{name}"
@@ -686,7 +688,12 @@ async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
     let tools = crate::Tools::folderless(Reach::PublicAddresses)
         .with_search_configuration(Some(config), None);
     let prepared = tools
-        .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            WEB_SEARCH_TOOL_NAME,
+            &input,
+        )
         .await
         .unwrap();
     assert!(prepared.requires_permission && !prepared.in_workspace);
@@ -699,7 +706,7 @@ async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
     let disabled =
         crate::Tools::folderless(Reach::PublicAddresses).with_search_configuration(None, None);
     assert!(matches!(
-        disabled.prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input).await,
+        disabled.prepare(&tickloop_ids::IdContext::new(), &workspace, WEB_SEARCH_TOOL_NAME, &input).await,
         Err(ToolError::Network(message)) if message == web_search::DISABLED_MESSAGE
     ));
 }
@@ -719,6 +726,7 @@ async fn folderless_tools_fetch_a_private_address_only_when_the_host_chooses_any
     };
     let input = json!({"url": format!("http://localhost:{port}/delivery"), "prompt": "When?"});
     let context = || crate::ExecutionContext {
+        ids: tickloop_ids::IdContext::new(),
         operation_id: uuid::Uuid::new_v4(),
         loop_id: uuid::Uuid::nil(),
         accepts_images: false,
@@ -727,7 +735,12 @@ async fn folderless_tools_fetch_a_private_address_only_when_the_host_chooses_any
 
     let public_only = crate::Tools::folderless(Reach::PublicAddresses);
     let prepared = public_only
-        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            WEB_FETCH_TOOL_NAME,
+            &input,
+        )
         .await
         .unwrap();
     let refused = public_only
@@ -747,7 +760,12 @@ async fn folderless_tools_fetch_a_private_address_only_when_the_host_chooses_any
 
     let anywhere = crate::Tools::folderless(Reach::Anywhere);
     let prepared = anywhere
-        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            WEB_FETCH_TOOL_NAME,
+            &input,
+        )
         .await
         .unwrap();
     let fetched = anywhere
@@ -782,7 +800,12 @@ async fn folderless_web_search_requests_the_hosts_search_service_whatever_the_re
         };
         let tools = crate::Tools::folderless(reach).with_search_configuration(Some(config), None);
         let prepared = tools
-            .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                WEB_SEARCH_TOOL_NAME,
+                &input,
+            )
             .await
             .unwrap();
         let result = tools

@@ -21,7 +21,10 @@ pub async fn verify_admission_policy(
     cases: &[AdmissionCase],
 ) {
     for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
-        agent.set_execution_mode(chat, mode).await.unwrap();
+        agent
+            .set_execution_mode(tickloop_ids::Id::from(chat), mode)
+            .await
+            .unwrap();
         for (decision, revoke) in [
             (Decision::Deny, false),
             (Decision::Ask, false),
@@ -41,17 +44,23 @@ pub async fn verify_admission_policy(
                     persistent: false,
                 };
                 agent
-                    .set_permission_rules(chat, vec![rule(decision)])
+                    .set_permission_rules(tickloop_ids::Id::from(chat), vec![rule(decision)])
                     .await
                     .unwrap();
-                let before = agent.tick_subscriptions(chat).await.unwrap();
+                let before = agent
+                    .tick_subscriptions(tickloop_ids::Id::from(chat))
+                    .await
+                    .unwrap();
                 model.enqueue(call("admission", case.name, case.input.clone()));
                 if !revoke {
                     model.enqueue(text("done"));
                 }
                 let mut events = agent.subscribe();
                 agent
-                    .submit(chat, format!("{mode:?}: {}", case.name))
+                    .submit(
+                        tickloop_ids::Id::from(chat),
+                        format!("{mode:?}: {}", case.name),
+                    )
                     .await
                     .unwrap();
                 let mut asked = 0;
@@ -66,12 +75,15 @@ pub async fn verify_admission_policy(
                             assert_eq!(request.input, case.policy_input, "{}", case.name);
                             if revoke {
                                 agent
-                                    .set_permission_rules(chat, vec![rule(Decision::Deny)])
+                                    .set_permission_rules(
+                                        tickloop_ids::Id::from(chat),
+                                        vec![rule(Decision::Deny)],
+                                    )
                                     .await
                                     .unwrap();
                             }
                             agent
-                                .answer_permission(chat, request.id, true)
+                                .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                                 .await
                                 .unwrap();
                         }
@@ -115,7 +127,10 @@ pub async fn verify_admission_policy(
                         case.name, result.content
                     );
                 }
-                let after = agent.tick_subscriptions(chat).await.unwrap();
+                let after = agent
+                    .tick_subscriptions(tickloop_ids::Id::from(chat))
+                    .await
+                    .unwrap();
                 assert_eq!(
                     after.len(),
                     before.len()
@@ -134,7 +149,11 @@ pub async fn verify_admission_policy(
                     .filter(|row| before.iter().all(|kept| kept.id != row.id))
                 {
                     agent
-                        .update_tick_subscription(chat, added.id, TickSubscriptionChange::Cancel)
+                        .update_tick_subscription(
+                            tickloop_ids::Id::from(chat),
+                            added.id,
+                            TickSubscriptionChange::Cancel,
+                        )
                         .await
                         .unwrap();
                 }

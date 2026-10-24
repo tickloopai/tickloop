@@ -52,9 +52,9 @@ fn wait(response: &ResponseEntry) -> WaitEntry {
         kind: WaitKind::Question {
             request: QuestionRequest {
                 id,
-                chat_id: Uuid::nil(),
-                loop_id: response.loop_id,
-                run_id: response.run_id,
+                chat_id: tickloop_ids::Id::from(Uuid::nil()),
+                loop_id: tickloop_ids::Id::from(response.loop_id),
+                run_id: tickloop_ids::Id::from(response.run_id),
                 call_id: "call".into(),
                 questions: vec![Question {
                     question: "Which?".into(),
@@ -272,7 +272,7 @@ fn subagent_cards_link_foreground_and_background_members_when_registration_arriv
         let registration = Line::Subagents(crate::SubagentsEntry {
             chat_id: Uuid::nil(),
             subagents: vec![SubagentRegistration {
-                child_chat_id: child,
+                child_chat_id: tickloop_ids::Id::from(child),
                 handle: "research".into(),
                 description: "Research".into(),
                 created_at: 0,
@@ -359,7 +359,7 @@ fn goal_continuation_shows_one_event_without_its_model_prompt() {
     input.trigger = Some(crate::TriggerRecord::of(
         &tickloop_agent_protocol::TriggerSource::GoalContinuation {
             goal_id: Uuid::new_v4(),
-            after_run: Uuid::new_v4(),
+            after_run: tickloop_ids::Id::from(Uuid::new_v4()),
             objective_revision: 1,
         },
     ));
@@ -434,12 +434,15 @@ fn scheduled_input_projection_hides_the_skill_wrapper() {
 #[test]
 fn scheduled_projection_preserves_unrecorded_wrappers_through_retained_replay() {
     for instruction in [
-        tickloop_agent_protocol::scheduled_skill_prompt(&TASK, "review", "main"),
+        tickloop_agent_protocol::scheduled_skill_prompt(&TASK.to_string(), "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        tickloop_agent_protocol::loop_instructions_error_prompt(&TASK, "permission denied"),
+        tickloop_agent_protocol::loop_instructions_error_prompt(
+            &TASK.to_string(),
+            "permission denied",
+        ),
         tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
     ] {
         let response = response(ResponseState::Started);
@@ -528,10 +531,12 @@ fn all_prompt_origins_survive_metadata_order_and_retained_replay() {
             InputOp::Feedback => PromptOrigin::Feedback {
                 artifact: "doc".into(),
             },
-            InputOp::AgentMessage if source.unwrap().1 => {
-                PromptOrigin::SubagentNotification { child: sender }
-            }
-            InputOp::AgentMessage => PromptOrigin::AgentMessage { from: sender },
+            InputOp::AgentMessage if source.unwrap().1 => PromptOrigin::SubagentNotification {
+                child: tickloop_ids::Id::from(sender),
+            },
+            InputOp::AgentMessage => PromptOrigin::AgentMessage {
+                from: tickloop_ids::Id::from(sender),
+            },
             _ => PromptOrigin::User,
         };
         let prompt_id = prompt.uuid;
@@ -610,7 +615,7 @@ fn loop_projection_uses_the_latest_current_record_and_skips_the_old_format() {
 fn task_projection_obeys_host_switch_latest_boards_and_clear() {
     let chat = Uuid::new_v4();
     let goal = Uuid::new_v4();
-    let mut board = TaskBoard::new(chat, goal);
+    let mut board = TaskBoard::new(chat.into(), goal.into());
     board.task_number_offset = 10;
     board.tasks = serde_json::from_value(json!([{
         "id": Uuid::new_v4(), "title": "Research", "description": "Check", "dependencies": [],

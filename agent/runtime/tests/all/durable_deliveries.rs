@@ -93,7 +93,7 @@ async fn ready_chat(agent: &Agent) -> (ChatId, LoopId) {
     let chat = agent.create_chat_without_folder().await.unwrap();
     let ready = prompt("get ready", ParentSelection::CurrentLeaf);
     let turn = agent.advance(chat, ready.clone()).await.unwrap();
-    settled(agent, chat, ready.input_id).await;
+    settled(agent, chat, ready.input_id.uuid()).await;
     (chat, turn.receipt().loop_id)
 }
 
@@ -217,11 +217,11 @@ async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once()
     next.sync().await.unwrap();
     assert_eq!(
         feedback_inputs(&store.lines(chat)),
-        HashSet::from([request.input_id]),
+        HashSet::from([request.input_id.uuid()]),
         "one ledger input under the id the delivery names"
     );
     let mut renamed = request;
-    renamed.input_id = Uuid::new_v4();
+    renamed.input_id = tickloop_ids::Id::from(Uuid::new_v4());
     assert!(matches!(
         next.advance(chat, renamed).await,
         Err(AgentError::Invalid(_))
@@ -240,7 +240,7 @@ async fn interrupted_failed_and_completed_turns_take_a_delivery_and_a_paused_loo
         .unwrap();
     model.until_holding().await;
     agent.interrupt(chat).await.unwrap();
-    settled(&agent, chat, long.input_id()).await;
+    settled(&agent, chat, (long.input_id()).uuid()).await;
     assert_eq!(loop_state(&agent, chat).await, LoopState::Interrupted);
     let request = TurnRequest::deliver(delivery("after-interrupt"));
     assert!(matches!(
@@ -262,7 +262,7 @@ async fn interrupted_failed_and_completed_turns_take_a_delivery_and_a_paused_loo
     let broken = prompt("a broken task", ParentSelection::CurrentLeaf);
     agent.advance(chat, broken.clone()).await.unwrap();
     assert!(matches!(
-        settled(&agent, chat, broken.input_id).await,
+        settled(&agent, chat, broken.input_id.uuid()).await,
         SettledOutcome::Failed { .. }
     ));
     assert_eq!(loop_state(&agent, chat).await, LoopState::Failed);
@@ -308,10 +308,10 @@ async fn interrupted_failed_and_completed_turns_take_a_delivery_and_a_paused_loo
         "a paused Loop runs nothing"
     );
     agent.sync().await.unwrap();
-    assert_eq!(input_state(&store.lines(chat), late.input_id), None);
+    assert_eq!(input_state(&store.lines(chat), late.input_id.uuid()), None);
     let resume = prompt("go on", ParentSelection::CurrentLeaf);
     agent.advance(chat, resume.clone()).await.unwrap();
-    settled(&agent, chat, resume.input_id).await;
+    settled(&agent, chat, resume.input_id.uuid()).await;
     assert!(matches!(
         outcome(&agent, chat, late).await,
         TurnOutcome::Completed { .. }
@@ -340,7 +340,7 @@ async fn deliveries_queue_behind_the_work_a_load_restores() {
     first.advance(chat, queued_prompt.clone()).await.unwrap();
     let store = lost_holder(&first, &store, chat).await;
     assert_eq!(
-        input_state(&store.lines(chat), queued_delivery.input_id),
+        input_state(&store.lines(chat), queued_delivery.input_id.uuid()),
         Some(InputState::Accepted),
         "the queued delivery is accepted with its content"
     );
@@ -356,7 +356,7 @@ async fn deliveries_queue_behind_the_work_a_load_restores() {
         later.input_id,
     ] {
         assert!(matches!(
-            settled(&next, chat, input).await,
+            settled(&next, chat, input.uuid()).await,
             SettledOutcome::Completed { .. }
         ));
     }
@@ -440,7 +440,7 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
     let task = prompt("delegate the watching", ParentSelection::CurrentLeaf);
     delegating.advance(root, task.clone()).await.unwrap();
     assert!(matches!(
-        settled(&delegating, root, task.input_id).await,
+        settled(&delegating, root, task.input_id.uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let member = delegating.snapshot(root).await.unwrap().family_completions[0].clone();
@@ -463,7 +463,7 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
         .await
         .unwrap();
     assert!(matches!(
-        settled(&next, member.child_chat_id, request.input_id).await,
+        settled(&next, member.child_chat_id, request.input_id.uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     assert!(

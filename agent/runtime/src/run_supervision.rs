@@ -125,8 +125,12 @@ impl Agent {
             .request_usage
             .fail_in_flight_requests(receipt.run_id, RequestFailure::Internal);
         self.clear_run_interactions(chat, receipt.run_id).await;
-        let history_recovered =
-            recovery::close_dangling_tool_calls(&mut chat.snapshot, Some(receipt.run_id)).is_ok();
+        let history_recovered = recovery::close_dangling_tool_calls(
+            &chat.ids,
+            &mut chat.snapshot,
+            Some(receipt.run_id),
+        )
+        .is_ok();
         let chat_loop = &mut chat.snapshot.chat_loop;
         if chat_loop.run_id == Some(receipt.run_id) {
             chat_loop.set_state(LoopState::Failed);
@@ -195,8 +199,8 @@ mod tests {
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         let receipt = Receipt {
             chat_id,
-            loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4().into(),
+            run_id: Uuid::new_v4().into(),
         };
         let cancel = CancellationToken::new();
         {

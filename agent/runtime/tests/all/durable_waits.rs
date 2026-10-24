@@ -74,7 +74,7 @@ fn asks() -> Vec<Content> {
 
 fn prompt(text: &str, after: ParentSelection, delivery: Delivery) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after,
             message: UserMessage {
@@ -89,7 +89,7 @@ fn prompt(text: &str, after: ParentSelection, delivery: Delivery) -> TurnRequest
 
 fn answer(request: &QuestionRequest, reply: QuestionReply) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Answer {
             request: request.id,
             reply,
@@ -197,7 +197,7 @@ async fn a_durable_shutdown_leaves_the_question_suspended_and_another_instance_a
     let run = turn.receipt().run_id;
     let lines = store.lines(chat);
     assert_eq!(
-        response_states(&lines, run).last().unwrap().1,
+        response_states(&lines, run.uuid()).last().unwrap().1,
         ResponseState::Suspended
     );
     assert_eq!(wait_states(&lines), ["open"]);
@@ -224,7 +224,7 @@ async fn a_durable_shutdown_leaves_the_question_suspended_and_another_instance_a
     answering.sync().await.unwrap();
     let lines = store.lines(chat);
     // One attempt throughout; `Resumed` and the end may reach the store in one change.
-    let states = response_states(&lines, run);
+    let states = response_states(&lines, run.uuid());
     assert!(
         states.iter().all(|(attempt, _)| *attempt == 1),
         "{states:?}"
@@ -352,7 +352,7 @@ async fn a_prompt_sent_now_interrupts_a_rebuilt_question_as_it_does_the_asking_r
         "the prompt sent now finished its own turn"
     );
     next.sync().await.unwrap();
-    let states = response_states(&store.lines(chat), turn.receipt().run_id);
+    let states = response_states(&store.lines(chat), (turn.receipt().run_id).uuid());
     assert_eq!(
         states.last().unwrap().1,
         ResponseState::Ended {
@@ -395,7 +395,10 @@ async fn a_worker_restarted_mid_question_ends_it_as_a_lost_host_as_before() {
     worker.sync().await.unwrap();
     let run = turn.receipt().run_id;
     assert_eq!(
-        response_states(&store.lines(chat), run).last().unwrap().1,
+        response_states(&store.lines(chat), run.uuid())
+            .last()
+            .unwrap()
+            .1,
         ResponseState::Suspended
     );
     // The Worker dies without shutting down; a new one loads what the store holds.
@@ -414,7 +417,7 @@ async fn a_worker_restarted_mid_question_ends_it_as_a_lost_host_as_before() {
     restarted.sync().await.unwrap();
     let lines = crashed.lines(chat);
     assert_eq!(
-        response_states(&lines, run).last().unwrap().1,
+        response_states(&lines, run.uuid()).last().unwrap().1,
         ResponseState::Ended {
             ending: ResponseEnding::Interrupted {
                 by: InterruptedBy::Host

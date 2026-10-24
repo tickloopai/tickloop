@@ -74,7 +74,7 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     verify_admission_policy(
         &agent,
         &model,
-        chat,
+        chat.uuid(),
         &[AdmissionCase {
             plan_denied: false,
             name: "TickManage",
@@ -160,12 +160,12 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
     let adapters = TickAdapters::builtin(agent.clone(), None);
     let mut stream = adapters.open(&StreamTasks::default());
     let instance = InstanceRef::shell(task.command_id);
-    let first = Uuid::new_v4();
-    adapters.set_watch_chats(BTreeMap::from([(first, chat)]));
+    let first = tickloop_agent_runtime::tick_stream::WatchId::new();
+    adapters.set_watch_chats(BTreeMap::from([(first, chat.uuid())]));
     stream
         .desired
         .send_replace(BTreeMap::from([(first, instance.clone())]));
-    wait_until_ready(&mut stream, first).await;
+    wait_until_ready(&mut stream, first.into()).await;
 
     std::fs::write(directory.path().join("output"), "").unwrap();
     wait_for_output("baseline live-output".len()).await;
@@ -180,13 +180,13 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
     assert_eq!(exit.data["output"], "baseline live-output");
     assert_quiet(&mut stream, "a Shell updates once").await;
 
-    let late = Uuid::new_v4();
-    adapters.set_watch_chats(BTreeMap::from([(first, chat), (late, chat)]));
+    let late = tickloop_agent_runtime::tick_stream::WatchId::new();
+    adapters.set_watch_chats(BTreeMap::from([(first, chat.uuid()), (late, chat.uuid())]));
     stream.desired.send_replace(BTreeMap::from([
         (first, instance.clone()),
         (late, instance),
     ]));
-    wait_until_ready(&mut stream, late).await;
+    wait_until_ready(&mut stream, late.into()).await;
     assert_quiet(
         &mut stream,
         "a late watch received the exit it started after",
@@ -214,21 +214,24 @@ async fn a_shells_exit_update_is_the_end_its_record_tells() {
         .unwrap();
     let adapters = TickAdapters::builtin(agent.clone(), None);
     let mut stream = adapters.open(&StreamTasks::default());
-    let watch = Uuid::new_v4();
-    adapters.set_watch_chats(BTreeMap::from([(watch, chat)]));
+    let watch = tickloop_agent_runtime::tick_stream::WatchId::new();
+    adapters.set_watch_chats(BTreeMap::from([(watch, chat.uuid())]));
     stream.desired.send_replace(BTreeMap::from([(
         watch,
         InstanceRef::shell(task.command_id),
     )]));
-    wait_until_ready(&mut stream, watch).await;
+    wait_until_ready(&mut stream, watch.into()).await;
     let instance = InstanceRef::shell(task.command_id);
-    assert_eq!(adapters.read_current(chat, &instance).await, Ok(None));
+    assert_eq!(
+        adapters.read_current(chat.uuid(), &instance).await,
+        Ok(None)
+    );
     std::fs::write(directory.path().join("finish"), "").unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(5), next_update(&mut stream))
         .await
         .expect("the exit is an update");
     let read_again = adapters
-        .read_current(chat, &instance)
+        .read_current(chat.uuid(), &instance)
         .await
         .unwrap()
         .expect("an ended task reads its end again");

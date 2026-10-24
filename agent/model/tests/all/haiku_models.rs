@@ -209,7 +209,7 @@ async fn haiku_adaptive_effort_schema_sampling_and_per_request_output_budget_fol
             let context = ModelRequestContext::new(1).with_output_token_limit(4096);
             client
                 .complete_for_chat_with_context(
-                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4().into(),
                     query,
                     events,
                     CancellationToken::new(),

@@ -129,7 +129,7 @@ fn script(batch: &[Content]) -> Vec<Vec<Content>> {
 
 fn prompt() -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Continue {
             after: ParentSelection::Root,
             message: UserMessage {
@@ -144,7 +144,7 @@ fn prompt() -> TurnRequest {
 
 fn answer(request: &QuestionRequest) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Answer {
             request: request.id,
             reply: QuestionReply::Answered(vec![QuestionAnswer::other(format!(
@@ -171,9 +171,10 @@ fn normalized_requests(model: &ScriptedModel) -> Vec<String> {
 
 pub(super) fn normalized(text: &str) -> String {
     const UUID_LENGTH: usize = 36;
+    let text = tickloop_agent_test_support::model_ids_as_uuids(text);
     let mut ids = Vec::new();
     let mut normalized = String::new();
-    let mut rest = text;
+    let mut rest = text.as_str();
     while !rest.is_empty() {
         match rest
             .get(..UUID_LENGTH)
@@ -388,7 +389,7 @@ async fn a_reply_whose_holder_died_before_the_result_committed_is_redelivered_on
         Some(TurnOutcome::Merged { .. })
     ));
     assert_eq!(redelivered.waiting, None);
-    assert_eq!(chats.acknowledgements(chat, reply.input_id), 1);
+    assert_eq!(chats.acknowledgements(chat, reply.input_id.into()), 1);
     let lines = chats.history(chat).lines;
     assert!(lines.iter().any(|line| matches!(
         line,

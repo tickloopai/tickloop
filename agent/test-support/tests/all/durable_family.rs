@@ -145,7 +145,7 @@ impl Cloud {
 
 fn prompt(text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -160,7 +160,7 @@ fn prompt(text: &str) -> TurnRequest {
 
 fn answer(request: &QuestionRequest) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Answer {
             request: request.id,
             reply: QuestionReply::Answered(vec![QuestionAnswer::other("Weekly")]),
@@ -477,7 +477,10 @@ async fn a_crash_after_a_child_launch_before_its_result_neither_loses_nor_repeat
     let lines = cloud.root_lines();
     let [launched] = results_of(&lines, "delegate").try_into().unwrap();
     assert_eq!(launched["status"], "async_launched");
-    assert_eq!(launched["child_chat_id"], child.to_string());
+    assert_eq!(
+        launched["child_chat_id"],
+        tickloop_ids::IdContext::new().model_text(child)
+    );
     let child_tasks = cloud
         .chats
         .member_lines(child)

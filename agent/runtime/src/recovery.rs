@@ -2,12 +2,14 @@ use std::collections::HashSet;
 
 use super::AgentError;
 use tickloop_agent_model::validate_model_for_resume_in_root;
+use tickloop_agent_protocol::OperationId;
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
     ChatSnapshot, Content, LoopId, Message, OperationState, Role, RunId, ToolCallRecovery,
     ToolResult,
 };
 use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
+use tickloop_ids::IdContext;
 
 pub(super) fn before_resume(
     snapshot: &mut ChatSnapshot,
@@ -54,23 +56,26 @@ pub(super) type CallReconciler<'a> =
     dyn Fn(&ChatSnapshot, &projection::HistoryCall) -> Option<ToolResult> + 'a;
 
 pub(super) fn close_dangling_tool_calls(
+    ids: &IdContext,
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
 ) -> Result<(), AgentError> {
-    close_calls(snapshot, only_run, &HashSet::new(), &|_, _| None)
+    close_calls(ids, snapshot, only_run, &HashSet::new(), &|_, _| None)
 }
 
 /// Closes the dangling calls of every Run except those in `kept`, whose Runs are rebuilt; a call
 /// `reconcile` finds the result of gets that result instead of an unknown outcome.
 pub(super) fn close_dangling_tool_calls_except(
+    ids: &IdContext,
     snapshot: &mut ChatSnapshot,
     kept: &HashSet<RunId>,
     reconcile: &CallReconciler<'_>,
 ) -> Result<(), AgentError> {
-    close_calls(snapshot, None, kept, reconcile)
+    close_calls(ids, snapshot, None, kept, reconcile)
 }
 
 fn close_calls(
+    ids: &IdContext,
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
     kept: &HashSet<RunId>,
@@ -163,7 +168,7 @@ fn close_calls(
                 Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
                 Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {
                     operation.state = OperationState::Unknown;
-                    ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", operation.id), is_error: true, output_ref: None }
+                    ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", ids.model_text(OperationId::from(operation.id))), is_error: true, output_ref: None }
             }
             Some(operation) => {
                 let result = interrupted_before_admission();

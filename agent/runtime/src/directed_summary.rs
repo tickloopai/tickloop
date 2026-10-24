@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{
     Agent, AgentError, Chat, ChatBookkeeping,
@@ -37,7 +36,7 @@ struct DirectedSummaryPlan {
     pre_tokens: usize,
     original_model: ModelConfig,
     original_messages: Vec<Message>,
-    original_message_runs: std::collections::BTreeMap<usize, Uuid>,
+    original_message_runs: std::collections::BTreeMap<usize, tickloop_agent_protocol::RunId>,
     original_message_contexts: std::collections::BTreeMap<usize, Vec<InputContext>>,
     draft: Option<DirectedSummaryDraft>,
 }
@@ -576,10 +575,10 @@ mod tests {
                 )
                 .unwrap();
                 chat.snapshot.delegation = Some(tickloop_agent_protocol::DelegationMetadata {
-                    delegation_id: Uuid::new_v4(),
+                    delegation_id: uuid::Uuid::new_v4(),
                     parent_chat_id: id,
-                    parent_loop_id: Uuid::new_v4(),
-                    parent_run_id: Uuid::new_v4(),
+                    parent_loop_id: tickloop_agent_protocol::LoopId::new(),
+                    parent_run_id: tickloop_agent_protocol::RunId::new(),
                     parent_call_id: "invalid-ancestry".into(),
                     ancestors: Vec::new(),
                     task: String::new(),

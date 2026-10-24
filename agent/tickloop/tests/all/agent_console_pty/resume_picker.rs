@@ -55,7 +55,10 @@ async fn save_conversations(fixture: &PrivateFixture) -> Vec<ChatId> {
     for (chat, age) in chats.iter().zip([10_800, 7_200, 60]) {
         std::fs::File::options()
             .write(true)
-            .open(tickloop_agent_test_support::transcript_file(&root, *chat))
+            .open(tickloop_agent_test_support::transcript_file(
+                &root,
+                (*chat).into(),
+            ))
             .unwrap()
             .set_modified(now - Duration::from_secs(age))
             .unwrap();
@@ -75,7 +78,7 @@ fn assert_compact_picker(frame: &str, width: usize, chats: &[ChatId]) {
         );
     }
     for chat in chats {
-        let id = chat.to_string();
+        let id = chat.uuid().to_string();
         assert!(
             !frame.contains(&id) && !frame.contains(&id[..8]),
             "the picker must not show full or short IDs: {frame}"
@@ -206,7 +209,7 @@ async fn actual_cli_typing_into_continue_prompt_preserves_the_message_and_resume
             model_http_support::serve_responses(vec![(200, chat_reply(None, FOLLOW_UP_REPLY))])
                 .await;
         fixture.set_chat_model(&base_url);
-        let chat = chats[1].to_string();
+        let chat = chats[1].uuid().to_string();
         let mut view = PtyView::launch(&fixture, &["--resume", &chat], &[], true);
         view.wait_for("history offers Continue before typing", |frame| {
             frame.contains("Continue Chat?") && frame.contains(OLDER_DUPLICATE_REPLY)

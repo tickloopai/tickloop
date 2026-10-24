@@ -160,7 +160,7 @@ async fn disabled_history_does_not_block_normal_work_but_reenable_requires_recon
         .await
         .unwrap();
     let next = Receipt {
-        run_id: Uuid::new_v4(),
+        run_id: Uuid::new_v4().into(),
         ..receipts[1].clone()
     };
     {
@@ -372,7 +372,10 @@ async fn a_new_member_reuses_the_existing_solo_board_and_task() {
     assert_eq!(root.task_boards.len(), 1);
     let board = &root.task_boards[&receipt.loop_id];
     assert!(board.is_team);
-    assert_eq!(created["task"]["id"], board.tasks[0].id.to_string());
+    assert_eq!(
+        created["task"]["id"],
+        tickloop_ids::IdContext::new().model_text(board.tasks[0].id)
+    );
     let child = core.subagents(chat).await.unwrap()[0].child_chat_id;
     assert_eq!(
         core.snapshot(child)
@@ -549,7 +552,7 @@ async fn host_admission_rechecks_task_binding_after_waiting_for_the_commit_lock(
     )
     .unwrap();
     let evaluation = core.inner.session_permissions.lock().await.evaluate(
-        PermissionOwner::new(receipt.chat_id, receipt.loop_id).unwrap(),
+        PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into()).unwrap(),
         &session_operation,
     );
     let admission = core.admit_host_operation(

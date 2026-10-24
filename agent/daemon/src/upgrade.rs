@@ -547,7 +547,7 @@ async fn transfer_daemon(
     let Some(_control_admission) = factory.control.try_pause() else {
         return Err("waiting for the current Tickhost request to finish".into());
     };
-    let transfer_id = Uuid::new_v4();
+    let transfer_id = tickloop_ids::generate();
     let mut quiescence = factory.ingress.quiesce(transfer_id).await?;
     let workers = factory.workers.lock().await;
     if workers.iter().any(|worker| worker.preparation_uncertain) {
@@ -932,7 +932,7 @@ mod tests {
             replacement
                 .verify_worker_chat(
                     match replay.result.unwrap() {
-                        CommandResult::Created { snapshot, .. } => snapshot.conversation.id,
+                        CommandResult::Created { snapshot, .. } => snapshot.conversation.id.into(),
                         _ => unreachable!(),
                     },
                     &worker

@@ -425,8 +425,10 @@ fn chat_snapshot() -> ChatSnapshot {
     snapshot.additional_directories = vec!["/work/shared".into()];
     snapshot.last_sequence = 9;
     snapshot.context_window_tokens = Some(200_000);
-    snapshot.last_model_run = Some(id(0x20));
-    snapshot.pending_thinking.insert(id(0x20), "Reading".into());
+    snapshot.last_model_run = Some(tickloop_ids::Id::from(id(0x20)));
+    snapshot
+        .pending_thinking
+        .insert(tickloop_ids::Id::from(id(0x20)), "Reading".into());
     snapshot
 }
 
@@ -731,7 +733,7 @@ fn observation_values_keep_their_recorded_wire() {
         chat_id: id(0xc1),
         folder: Some("/work/project".into()),
         state: tickloop_agent_protocol::LoopState::Running,
-        run_id: Some(id(0x20)),
+        run_id: Some(tickloop_ids::Id::from(id(0x20))),
         title: "Counter check".into(),
         subagent: None,
         has_work: Some(true),
@@ -803,8 +805,8 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::Operation(Some(Box::new(OperationRecord {
                 task_binding: None,
                 id: id(0x50),
-                loop_id: id(0x10),
-                run_id: id(0x20),
+                loop_id: tickloop_ids::Id::from(id(0x10)),
+                run_id: tickloop_ids::Id::from(id(0x20)),
                 call_id: "call-edit".into(),
                 name: "Edit".into(),
                 input: json!({"file_path": "src/counter.rs"}),
@@ -818,9 +820,9 @@ fn observation_values_keep_their_recorded_wire() {
             }))),
             ObservationValue::Events(vec![Event {
                 sequence: 10,
-                chat_id: id(0xc1),
-                loop_id: id(0x10),
-                run_id: id(0x20),
+                chat_id: tickloop_ids::Id::from(id(0xc1)),
+                loop_id: tickloop_ids::Id::from(id(0x10)),
+                run_id: tickloop_ids::Id::from(id(0x20)),
                 kind: EventKind::ToolCompleted {
                     sources: Vec::new(),
                     call_id: "call-read".into(),
@@ -1147,7 +1149,7 @@ fn server_messages_keep_their_recorded_wire() {
 
 #[test]
 fn task_board_mode_preserves_legacy_teams_and_new_solo_boards() {
-    let mut board = tickloop_agent_protocol::TaskBoard::new(id(0xc1), id(0x10));
+    let mut board = tickloop_agent_protocol::TaskBoard::new(id(0xc1).into(), id(0x10).into());
     assert!(!board.is_team);
     let mut legacy = serde_json::to_value(&board).unwrap();
     legacy.as_object_mut().unwrap().remove("is_team");

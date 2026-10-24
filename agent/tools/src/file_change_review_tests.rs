@@ -18,6 +18,7 @@ fn workspace(path: &std::path::Path) -> Workspace {
 async fn read(tools: &Tools, directory: &std::path::Path, file_path: &str) {
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory),
             "Read",
             &json!({"file_path": file_path}),
@@ -37,6 +38,7 @@ async fn create_prepare_persists_a_complete_review_before_execution() {
     let tools = Tools::new(output.path().join("chat-output"));
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"new.txt","content":"one\n二\n"}),
@@ -79,6 +81,7 @@ async fn create_prepare_persists_a_complete_review_before_execution() {
 
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"another.txt","content":"created by write"}),
@@ -108,6 +111,7 @@ async fn overwrite_review_reaches_changes_after_the_old_preview_limit() {
     read(&tools, directory.path(), "large.txt").await;
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"large.txt","content":after}),
@@ -153,7 +157,7 @@ async fn edit_and_replace_all_are_distinct_and_execute_the_reviewed_result() {
     let tools = Tools::new(output.path().join("chat-output"));
     read(&tools, directory.path(), "notes.txt").await;
     let prepared = tools
-        .prepare(
+        .prepare(&tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Edit",
             &json!({"file_path":"notes.txt","old_string":"old","new_string":"new","replace_all":true}),
@@ -175,6 +179,7 @@ async fn edit_and_replace_all_are_distinct_and_execute_the_reviewed_result() {
 
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Edit",
             &json!({"file_path":"notes.txt","old_string":"middle","new_string":"center"}),
@@ -197,6 +202,7 @@ async fn changed_identity_rejects_execution_without_changing_the_prepared_review
     read(&tools, directory.path(), "notes.txt").await;
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"notes.txt","content":"approved\n"}),
@@ -228,13 +234,23 @@ async fn identical_bound_content_and_identity_produce_identical_typed_reviews() 
     read(&tools, directory.path(), "notes.txt").await;
     let input = json!({"file_path":"notes.txt","content":"after\n"});
     let first = tools
-        .prepare(&workspace(directory.path()), "Write", &input)
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace(directory.path()),
+            "Write",
+            &input,
+        )
         .await
         .unwrap()
         .file_change
         .unwrap();
     let second = tools
-        .prepare(&workspace(directory.path()), "Write", &input)
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace(directory.path()),
+            "Write",
+            &input,
+        )
         .await
         .unwrap()
         .file_change
@@ -257,6 +273,7 @@ async fn oversized_existing_file_fails_before_a_review_is_created() {
     let tools = Tools::new(output.path().join("chat-output"));
     let error = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"large.txt","content":"small"}),
@@ -284,6 +301,7 @@ async fn artifact_failure_aborts_preparation_before_the_target_is_changed() {
     let tools = Tools::new(output_dir);
     let error = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"new.txt","content":"never written"}),

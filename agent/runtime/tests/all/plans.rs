@@ -172,7 +172,7 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
         plan_file
             .to_str()
             .unwrap()
-            .ends_with(&format!("-loop-{goal}.md"))
+            .ends_with(&format!("-loop-{}.md", goal.uuid()))
     );
     for expected in [
         "Plan mode is active.",
@@ -610,7 +610,7 @@ fn plan_state(snapshot: &ChatSnapshot) -> Vec<LoopPlanState> {
 
 /// `<root>/plans` 中以该 Loop 结尾的计划文件路径。
 fn plan_file_paths(root: &Path, loop_id: LoopId) -> Vec<PathBuf> {
-    let suffix = format!("-loop-{loop_id}.md");
+    let suffix = format!("-loop-{}.md", loop_id.uuid());
     let mut paths = std::fs::read_dir(root.join("plans"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -651,7 +651,7 @@ fn plan_of(snapshot: &ChatSnapshot, loop_id: LoopId) -> (u64, String) {
         .plans
         .iter()
         .find(|plan| plan.loop_id == loop_id)
-        .unwrap_or_else(|| panic!("Loop {loop_id} has no plan"));
+        .unwrap_or_else(|| panic!("Loop {loop_id:?} has no plan"));
     (plan.version, plan.markdown.clone())
 }
 
@@ -741,7 +741,7 @@ async fn branched_and_forked_chats_revise_independent_plan_files() {
             plan_state(&restored),
             plan_state(before),
             "Chat {}",
-            before.id
+            before.id.uuid()
         );
     }
     assert!(
@@ -843,7 +843,7 @@ fn plan_slug(path: &Path, loop_id: LoopId) -> String {
         .unwrap()
         .to_str()
         .unwrap()
-        .strip_suffix(&format!("-loop-{loop_id}.md"))
+        .strip_suffix(&format!("-loop-{}.md", loop_id.uuid()))
         .unwrap()
         .to_owned()
 }
@@ -867,7 +867,7 @@ async fn a_plan_without_its_tool_result_restores_the_durable_pending_version() {
     )
     .await;
     // The pending version is durable before ExitPlanMode receives a user decision.
-    truncate_transcript_before(&transcript_file(&root, chat), |line| {
+    truncate_transcript_before(&transcript_file(&root, chat.uuid()), |line| {
         is_tool_result_line(line, "plan-3")
     });
 
@@ -1103,7 +1103,7 @@ async fn tampered_plan_slugs_cannot_reach_outside_the_plans_directory() {
         let original = only_plan_file(&root, goal);
         let original_text = std::fs::read_to_string(&original).unwrap();
         let slug = plan_slug(&original, goal);
-        let transcript = transcript_file(&root, chat);
+        let transcript = transcript_file(&root, chat.uuid());
         let recorded = format!("\"slug\":\"{slug}\"");
         let transcript_text = std::fs::read_to_string(&transcript).unwrap();
         assert!(transcript_text.contains(&recorded));
@@ -1118,7 +1118,7 @@ async fn tampered_plan_slugs_cannot_reach_outside_the_plans_directory() {
         // 按篡改后的 slug 直接拼接路径时会读到的计划文件。
         let decoy = root
             .join("plans")
-            .join(format!("{tampered}-loop-{goal}.md"));
+            .join(format!("{tampered}-loop-{}.md", goal.uuid()));
         let decoy_text = original_text.replace("Original plan.", "Injected plan.");
         let has_decoy = decoy.parent().is_some_and(Path::is_dir);
         if has_decoy {

@@ -149,7 +149,7 @@ impl ConversationPicker {
     pub(super) fn new(purpose: ConversationPickerPurpose, entries: Vec<ConversationEntry>) -> Self {
         let matches = (0..entries.len()).collect();
         Self {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             purpose,
             entries,
             query_editor: Editor::new(),

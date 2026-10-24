@@ -10,15 +10,15 @@ use uuid::Uuid;
 
 fn scenario(prompt: &str, command: &str) -> (ChatSnapshot, ChatBookkeeping, OperationRecord) {
     let mut snapshot = empty_snapshot(
-        Uuid::new_v4(),
+        Uuid::new_v4().into(),
         Some("/work/project".into()),
         tickloop_agent_model::cards::built_in_model_profiles().remove(0),
     );
     let loop_id = Uuid::new_v4();
     let run_id = Uuid::new_v4();
     let mut bookkeeping = ChatBookkeeping::default();
-    bookkeeping.run_loops.insert(run_id, loop_id);
-    snapshot.message_runs.insert(0, run_id);
+    bookkeeping.run_loops.insert(run_id.into(), loop_id.into());
+    snapshot.message_runs.insert(0, run_id.into());
     snapshot.message_ids.insert(0, Uuid::new_v4());
     snapshot
         .prompt_execution_modes
@@ -32,8 +32,8 @@ fn scenario(prompt: &str, command: &str) -> (ChatSnapshot, ChatBookkeeping, Oper
     let operation = OperationRecord {
         task_binding: None,
         id: Uuid::new_v4(),
-        loop_id,
-        run_id,
+        loop_id: loop_id.into(),
+        run_id: run_id.into(),
         call_id: "next".into(),
         name: "Bash".into(),
         input: json!({"command": command}),
@@ -50,6 +50,7 @@ fn review_request(
     operation: &OperationRecord,
 ) -> Result<EvaluationRequest, AutoReview> {
     let context = super::super::approval_context::capture(
+        &tickloop_ids::IdContext::new(),
         snapshot,
         bookkeeping,
         operation,
@@ -63,6 +64,7 @@ fn review_request(
         reason: "Original user authorization is unavailable".into(),
     })?;
     super::review_request(
+        &tickloop_ids::IdContext::new(),
         &context,
         tickloop_agent_protocol::ApprovalStage::Authorization,
     )
@@ -138,8 +140,10 @@ fn choose(evaluation: &mut Evaluation, id: &str, selected: &str) {
 fn evidence_excludes_other_loops_assistant_prose_results_and_later_messages() {
     let (mut snapshot, mut bookkeeping, operation) = scenario("Inspect the project", "cargo test");
     let other_run = Uuid::new_v4();
-    bookkeeping.run_loops.insert(other_run, Uuid::new_v4());
-    snapshot.message_runs.insert(1, other_run);
+    bookkeeping
+        .run_loops
+        .insert(other_run.into(), Uuid::new_v4().into());
+    snapshot.message_runs.insert(1, other_run.into());
     snapshot.messages.push(Message {
         role: Role::User,
         content: vec![Content::Text {
@@ -273,6 +277,7 @@ fn block_categories_preserve_hard_and_user_boundaries_without_fabricated_finding
 fn both_reviewers_receive_identical_state_and_policy_guidance() {
     let (snapshot, bookkeeping, operation) = scenario("Run tests", "cargo test --locked");
     let context = crate::approval_context::capture(
+        &tickloop_ids::IdContext::new(),
         &snapshot,
         &bookkeeping,
         &operation,
@@ -283,10 +288,12 @@ fn both_reviewers_receive_identical_state_and_policy_guidance() {
     )
     .unwrap();
     let llm = crate::auto_mode::classifier_request(
+        &tickloop_ids::IdContext::new(),
         &context,
         tickloop_agent_protocol::ApprovalStage::Authorization,
     );
     let jev = super::review_request(
+        &tickloop_ids::IdContext::new(),
         &context,
         tickloop_agent_protocol::ApprovalStage::Authorization,
     )
@@ -321,6 +328,7 @@ fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
             "the local payload guard still rejects an unfitted snapshot"
         );
         let complete = crate::approval_context::capture(
+            &tickloop_ids::IdContext::new(),
             &snapshot,
             &bookkeeping,
             &operation,
@@ -333,6 +341,7 @@ fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
         let evidence =
             crate::approval_context::ReviewEvidence::new(&complete, review_budget_bytes());
         let request = super::review_request(
+            &tickloop_ids::IdContext::new(),
             evidence.snapshot(),
             tickloop_agent_protocol::ApprovalStage::Authorization,
         )
@@ -524,6 +533,7 @@ async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
         "npm test",
     );
     let mut context = crate::approval_context::capture(
+        &tickloop_ids::IdContext::new(),
         &snapshot,
         &bookkeeping,
         &operation,
@@ -562,8 +572,8 @@ async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
     let client = JevClient::bind(JevConfig::default(), Some(root.into())).unwrap();
     let mut allowed = false;
     for stage in [ApprovalStage::RiskScreen, ApprovalStage::Authorization] {
-        let request =
-            super::review_request(&context, stage).expect("complete policy must reach Jev");
+        let request = super::review_request(&tickloop_ids::IdContext::new(), &context, stage)
+            .expect("complete policy must reach Jev");
         let request_bytes = serde_json::to_vec(&request).unwrap().len();
         assert!(request_bytes > 80_000);
         assert_eq!(request.questions.len(), 1);

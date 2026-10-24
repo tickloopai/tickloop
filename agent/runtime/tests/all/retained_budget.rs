@@ -116,7 +116,7 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     let chat = agent.create_chat_without_folder().await.unwrap();
     let mut events = agent.subscribe();
     let turn = agent.advance(chat, check_feed()).await.unwrap();
-    until_completed(&mut events, turn.receipt().run_id).await;
+    until_completed(&mut events, (turn.receipt().run_id).uuid()).await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
     store.seed(
@@ -142,7 +142,7 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
                 .advance(chat, TurnRequest::deliver(delivery))
                 .await
                 .unwrap();
-            until_completed(&mut events, turn.receipt().run_id).await;
+            until_completed(&mut events, (turn.receipt().run_id).uuid()).await;
             if fire % FIRES_PER_COMPACTION == FIRES_PER_COMPACTION - 1 {
                 agent.compact(chat).await.unwrap();
             }
@@ -161,7 +161,7 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
 
 fn check_feed() -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {

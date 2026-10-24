@@ -96,10 +96,13 @@ fn tool_results(request: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The `hosted:` instance an open result names, as the model read it.
 fn hosted_instance(results: &[String]) -> Option<String> {
     results.iter().find_map(|result| {
-        let start = result.find("hosted:")?;
-        Some(result[start..start + "hosted:".len() + 36].to_owned())
+        let instance = serde_json::from_str::<Value>(result).ok()?["tick_instance_id"]
+            .as_str()?
+            .to_owned();
+        instance.starts_with("hosted:").then_some(instance)
     })
 }
 
@@ -531,7 +534,7 @@ mod channel {
                 else {
                     panic!("create failed: {created:?}");
                 };
-                created_chats.push(snapshot.conversation.id);
+                created_chats.push(snapshot.conversation.id.into());
                 executions.push(execution);
             }
             let grants = factory.grants.lock().await.clone();
@@ -630,11 +633,11 @@ mod channel {
         input: Value,
     ) -> HostCallResult {
         let prepared = tools
-            .prepare_call(chat, name, &input, CancellationToken::new())
+            .prepare_call(chat.into(), name, &input, CancellationToken::new())
             .await
             .unwrap();
         tools
-            .execute_prepared(chat, prepared, CancellationToken::new())
+            .execute_prepared(chat.into(), prepared, CancellationToken::new())
             .await
     }
 
@@ -663,7 +666,7 @@ mod channel {
     /// of that run and of any child it delegated to in the foreground.
     async fn run_turn(runtime: &Agent, chat: Uuid, text: &str) -> BTreeMap<String, ToolResult> {
         let mut events = runtime.subscribe();
-        let receipt = runtime.submit(chat, text.into()).await.unwrap();
+        let receipt = runtime.submit(chat.into(), text.into()).await.unwrap();
         let mut results = BTreeMap::new();
         loop {
             let event =
@@ -814,7 +817,7 @@ mod channel {
         let chat = Uuid::new_v4();
         let approved = tools
             .prepare_call(
-                chat,
+                chat.into(),
                 "TickManage",
                 &json!({"action":"open","command":["/bin/sh"],"cwd":work,"placement":{"type":"hidden"}}),
                 CancellationToken::new(),
@@ -827,19 +830,19 @@ mod channel {
         )
         .unwrap();
         tools
-            .revalidate_call(chat, &approved, CancellationToken::new())
+            .revalidate_call(chat.into(), &approved, CancellationToken::new())
             .await
             .expect("new entries do not replace the directory");
         std::fs::rename(&work, directory.path().join("work-aside")).unwrap();
         std::fs::create_dir(&work).unwrap();
         let replaced = tools
-            .revalidate_call(chat, &approved, CancellationToken::new())
+            .revalidate_call(chat.into(), &approved, CancellationToken::new())
             .await
             .unwrap_err();
         assert!(replaced.contains("working directory changed"), "{replaced}");
         assert!(matches!(
             tools
-                .execute_prepared(chat, approved, CancellationToken::new())
+                .execute_prepared(chat.into(), approved, CancellationToken::new())
                 .await,
             HostCallResult::NotDispatched(_)
         ));
@@ -1004,7 +1007,7 @@ for line in sys.stdin:
         assert_eq!(records[0]["instance"], instance);
         let approved = tools
             .prepare_call(
-                chat,
+                chat.into(),
                 "TickCall",
                 &json!({"tick_instance_id":instance,"tool":"increment","args":{}}),
                 CancellationToken::new(),
@@ -1028,7 +1031,7 @@ for line in sys.stdin:
         )
         .await;
         let HostCallResult::NotDispatched(changed) = tools
-            .execute_prepared(chat, approved, CancellationToken::new())
+            .execute_prepared(chat.into(), approved, CancellationToken::new())
             .await
         else {
             panic!("a call prepared against the earlier catalog revision is refused unrun");
@@ -1195,7 +1198,7 @@ for line in sys.stdin:
 
         packages.uninstall("counter").unwrap();
         let refused = tools
-            .prepare_call(chat, "TickManage", &open, CancellationToken::new())
+            .prepare_call(chat.into(), "TickManage", &open, CancellationToken::new())
             .await
             .unwrap_err();
         assert!(
@@ -1281,7 +1284,7 @@ for line in sys.stdin:
         let keyed = packages.credentials("keyed").unwrap();
         keyed.save_api_key(&ApiKey::new(KEY).unwrap()).unwrap();
         runtime
-            .set_execution_mode(chat, ExecutionMode::Auto)
+            .set_execution_mode(chat.into(), ExecutionMode::Auto)
             .await
             .unwrap();
         let reviewer = Arc::new(ScriptedModel::new(vec![
@@ -1316,8 +1319,8 @@ for line in sys.stdin:
             serde_json::to_string(&results).unwrap(),
             format!("{:?}", reviewer.requests.lock().unwrap()),
             format!("{:?}", model.requests.lock().unwrap()),
-            serde_json::to_string(&runtime.snapshot(chat).await.unwrap()).unwrap(),
-            serde_json::to_string(&daemon.tools().members(chat).await.unwrap()).unwrap(),
+            serde_json::to_string(&runtime.snapshot(chat.into()).await.unwrap()).unwrap(),
+            serde_json::to_string(&daemon.tools().members(chat.into()).await.unwrap()).unwrap(),
         ];
         assert!(
             reviewer.requests.lock().unwrap().len() == 2,
@@ -1356,7 +1359,7 @@ for line in sys.stdin:
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         runtime
-            .set_execution_mode(chat, ExecutionMode::Auto)
+            .set_execution_mode(chat.into(), ExecutionMode::Auto)
             .await
             .unwrap();
         let cleanup = auto_classification(false);
@@ -1385,7 +1388,7 @@ for line in sys.stdin:
         model.enqueue(text("closed"));
         let mut events = runtime.subscribe();
         let receipt = runtime
-            .submit(chat, "Close the task counter".into())
+            .submit(chat.into(), "Close the task counter".into())
             .await
             .unwrap();
         let mut prompted = false;
@@ -1395,7 +1398,7 @@ for line in sys.stdin:
                 EventKind::PermissionRequested { request } => {
                     prompted = true;
                     runtime
-                        .answer_permission(chat, request.id, false)
+                        .answer_permission(chat.into(), request.id, false)
                         .await
                         .unwrap();
                 }
@@ -1506,7 +1509,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, "Watch the counter".into())
+            .submit(chat.into(), "Watch the counter".into())
             .await
             .unwrap();
         loop {
@@ -1519,7 +1522,7 @@ for line in sys.stdin:
                 _ => {}
             }
         }
-        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        let subscriptions = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
 
         tokio::time::sleep(Duration::from_millis(5500)).await;
@@ -1566,9 +1569,9 @@ for line in sys.stdin:
         )
         .await;
         let terminal_pid = terminal["business_pid"].as_u64().unwrap() as u32;
-        runtime.stop(chat).await.unwrap();
+        runtime.stop(chat.into()).await.unwrap();
         assert_eq!(
-            runtime.tick_subscriptions(chat).await.unwrap().len(),
+            runtime.tick_subscriptions(chat.into()).await.unwrap().len(),
             1,
             "stopping pauses the subscription and keeps it"
         );
@@ -1672,7 +1675,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, "Watch the candles".into())
+            .submit(chat.into(), "Watch the candles".into())
             .await
             .unwrap();
         loop {
@@ -1749,7 +1752,7 @@ for line in sys.stdin:
         wanted: impl Fn(&Value) -> bool,
     ) -> tickloop_agent_runtime::tick_stream::TickObservation {
         for _ in 0..400 {
-            if let Some(sampled) = stream.sample(watch, instance).await
+            if let Some(sampled) = stream.sample(tickloop_ids::Id::from(watch), instance).await
                 && wanted(&sampled.data)
             {
                 return sampled;
@@ -1799,7 +1802,7 @@ for line in sys.stdin:
         assert_eq!(read["data"]["exit"], Value::Null);
         let refused = tools
             .prepare_call(
-                chat,
+                chat.into(),
                 "TickCall",
                 &json!({"tick_instance_id":instance,"tool":"increment","args":{}}),
                 CancellationToken::new(),
@@ -1809,7 +1812,10 @@ for line in sys.stdin:
             .unwrap();
         assert!(refused.contains("terminal Tick"), "{refused}");
 
-        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let (first, second) = (
+            tickloop_agent_runtime::tick_stream::WatchId::new(),
+            tickloop_agent_runtime::tick_stream::WatchId::new(),
+        );
         let stream = HostedTickStream::new(tools.clone());
         let authority = tools
             .tool_authorities("TickRead")
@@ -1832,7 +1838,7 @@ for line in sys.stdin:
             &mut seen,
             0,
             "the first baseline",
-            |event| is_ready(event, first),
+            |event| is_ready(event, first.into()),
         )
         .await;
         assert!(
@@ -1854,10 +1860,10 @@ for line in sys.stdin:
             &mut seen,
             typed_at,
             "the first Watch's pending change",
-            |event| is_screen_change(event, first, true),
+            |event| is_screen_change(event, first.into(), true),
         )
         .await;
-        let changed = sample_until(&stream, first, &target, |data| {
+        let changed = sample_until(&stream, first.into(), &target, |data| {
             data["text"]
                 .as_str()
                 .unwrap()
@@ -1903,7 +1909,7 @@ for line in sys.stdin:
             &mut seen,
             joined,
             "the second baseline",
-            |event| is_ready(event, second),
+            |event| is_ready(event, second.into()),
         )
         .await;
         assert!(
@@ -1930,8 +1936,10 @@ for line in sys.stdin:
             .await;
         }
         for watch in [first, second] {
-            let exited =
-                sample_until(&stream, watch, &target, |data| data["exit"] != Value::Null).await;
+            let exited = sample_until(&stream, watch.into(), &target, |data| {
+                data["exit"] != Value::Null
+            })
+            .await;
             assert_eq!(exited.data["exit"], json!({"code":0,"signal":null}));
             assert!(
                 exited.data["text"]
@@ -1941,7 +1949,7 @@ for line in sys.stdin:
             );
         }
         let member = tools
-            .members(chat)
+            .members(chat.into())
             .await
             .unwrap()
             .into_iter()
@@ -1985,7 +1993,7 @@ for line in sys.stdin:
                 &mut seen,
                 closed,
                 "the Tick's end",
-                |event| is_state(event, watch, TickConnectionState::Gone),
+                |event| is_state(event, watch.into(), TickConnectionState::Gone),
             )
             .await;
         }
@@ -2009,7 +2017,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, "Watch this terminal".into())
+            .submit(chat.into(), "Watch this terminal".into())
             .await
             .unwrap();
         loop {
@@ -2025,7 +2033,11 @@ for line in sys.stdin:
         run_tool(&tools, chat, "TickManage", json!({"action":"send_input","tick_instance_id":instance,"text":"pending update","keys":["Enter"]})).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let before = loop {
-            let status = runtime.tick_subscriptions(chat).await.unwrap().remove(0);
+            let status = runtime
+                .tick_subscriptions(chat.into())
+                .await
+                .unwrap()
+                .remove(0);
             if status.has_pending_change {
                 break status;
             }
@@ -2042,7 +2054,7 @@ for line in sys.stdin:
         ] {
             runtime
                 .update_tick_subscription(
-                    chat,
+                    chat.into(),
                     before.id,
                     TickSubscriptionChange::Frequency(frequency),
                 )
@@ -2050,7 +2062,11 @@ for line in sys.stdin:
                 .unwrap();
             for _ in 0..10 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
-                let status = runtime.tick_subscriptions(chat).await.unwrap().remove(0);
+                let status = runtime
+                    .tick_subscriptions(chat.into())
+                    .await
+                    .unwrap()
+                    .remove(0);
                 assert!(
                     status.has_pending_change,
                     "changing to {frequency:?} cleared the unread screen: {status:?}"
@@ -2081,7 +2097,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, "Watch the terminal".into())
+            .submit(chat.into(), "Watch the terminal".into())
             .await
             .unwrap();
         loop {
@@ -2094,7 +2110,7 @@ for line in sys.stdin:
                 _ => {}
             }
         }
-        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        let subscriptions = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(
             subscriptions[0].frequency,
             tickloop_agent_protocol::TickSubscriptionFrequency::High
@@ -2158,7 +2174,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
-            .submit(chat, "Watch the quote script".into())
+            .submit(chat.into(), "Watch the quote script".into())
             .await
             .unwrap();
         loop {
@@ -2308,17 +2324,27 @@ for line in sys.stdin:
             "a hidden open asks Herdr nothing: {:?}",
             herdr.methods()
         );
-        let members = runtime.snapshot(chat).await.unwrap().monitor.members;
+        let members = runtime.snapshot(chat.into()).await.unwrap().monitor.members;
         assert_eq!(
             members
                 .iter()
                 .map(|member| (member.instance.as_str(), member.title.as_deref()))
                 .collect::<Vec<_>>(),
-            vec![(instance.as_str(), Some("Counter"))],
+            vec![(
+                instance
+                    .parse::<tick_protocol::InstanceRef>()
+                    .unwrap()
+                    .as_str(),
+                Some("Counter")
+            )],
             "the hidden Tick joins this Chat's Monitor under its declared title"
         );
         assert!(
-            runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
+            runtime
+                .tick_subscriptions(chat.into())
+                .await
+                .unwrap()
+                .is_empty(),
             "opening never subscribes"
         );
 
@@ -2334,7 +2360,10 @@ for line in sys.stdin:
             "{}",
             results["subscribe"].content
         );
-        assert_eq!(runtime.tick_subscriptions(chat).await.unwrap().len(), 1);
+        assert_eq!(
+            runtime.tick_subscriptions(chat.into()).await.unwrap().len(),
+            1
+        );
         let mut events = runtime.subscribe();
         model.enqueue(tickloop_agent_test_support::text("update observed"));
         run_tool(
@@ -2844,7 +2873,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::text("reopened"));
         let mut events = runtime.subscribe();
         let receipt = runtime
-            .submit(chat, "Reopen the counter".into())
+            .submit(chat.into(), "Reopen the counter".into())
             .await
             .unwrap();
         let mut result = None;
@@ -2858,7 +2887,7 @@ for line in sys.stdin:
                         "nothing starts before approval"
                     );
                     runtime
-                        .answer_permission(chat, request.id, true)
+                        .answer_permission(chat.into(), request.id, true)
                         .await
                         .unwrap();
                 }
@@ -2875,18 +2904,22 @@ for line in sys.stdin:
         let reopened: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(reopened["status"], "opened", "{reopened}");
         assert_eq!(reopened["visibility"], "hidden");
-        assert_eq!(reopened["replaces"], lost);
-        let instance = reopened["tick_instance_id"].as_str().unwrap();
-        assert_ne!(instance, lost, "a new instance");
+        let stored = |text: &str| text.parse::<tick_protocol::InstanceRef>().unwrap();
+        assert_eq!(
+            stored(reopened["replaces"].as_str().unwrap()),
+            stored(&lost)
+        );
+        let instance = stored(reopened["tick_instance_id"].as_str().unwrap());
+        assert_ne!(instance, stored(&lost), "a new instance");
         assert_ne!(reopened["business_pid"], opened["business_pid"]);
         let member = runtime
-            .snapshot(chat)
+            .snapshot(chat.into())
             .await
             .unwrap()
             .monitor
             .members
             .into_iter()
-            .find(|member| member.instance.as_str() == instance)
+            .find(|member| member.instance == instance)
             .expect("the reopened Tick joins Monitor");
         assert!(lost_title.is_string(), "the lost Tick keeps a title");
         assert_eq!(
@@ -2895,7 +2928,11 @@ for line in sys.stdin:
             "the reopened Tick is named by its declaration: {member:?}"
         );
         assert!(
-            runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
+            runtime
+                .tick_subscriptions(chat.into())
+                .await
+                .unwrap()
+                .is_empty(),
             "no subscription follows a reopen"
         );
         run_tool(
@@ -2925,14 +2962,17 @@ for line in sys.stdin:
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
-        let receipt = runtime.submit(chat, "Watch it".into()).await.unwrap();
+        let receipt = runtime
+            .submit(chat.into(), "Watch it".into())
+            .await
+            .unwrap();
         loop {
             let event = tickloop_agent_test_support::next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
                 break;
             }
         }
-        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        let subscriptions = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
 
         let before = model.requests.lock().unwrap().len();
@@ -2964,7 +3004,7 @@ for line in sys.stdin:
         let mut is_gone = false;
         for _ in 0..120 {
             let link = runtime
-                .tick_subscriptions(chat)
+                .tick_subscriptions(chat.into())
                 .await
                 .unwrap()
                 .into_iter()
@@ -3073,14 +3113,14 @@ for line in sys.stdin:
             served_before,
             "a Watch out of reconnects never tries the recovered Tick"
         );
-        let rows = runtime.tick_subscriptions(chat).await.unwrap();
+        let rows = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].link, TickLinkState::Disconnected);
         assert_eq!(model.requests.lock().unwrap().len(), 2, "nothing woke");
         assert!(super::alive(business_pid), "the Tick keeps running");
 
         runtime
-            .update_tick_subscription(chat, rows[0].id, TickSubscriptionChange::Cancel)
+            .update_tick_subscription(chat.into(), rows[0].id, TickSubscriptionChange::Cancel)
             .await
             .unwrap();
         model.enqueue(tickloop_agent_test_support::call(
@@ -3097,7 +3137,7 @@ for line in sys.stdin:
             served_before + 1,
             "the new Watch registered at once"
         );
-        let rows = runtime.tick_subscriptions(chat).await.unwrap();
+        let rows = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].link, TickLinkState::Live);
     }
@@ -3153,11 +3193,11 @@ for line in sys.stdin:
     }
 
     fn is_state(event: &TickStreamEvent, watch: Uuid, wanted: TickConnectionState) -> bool {
-        matches!(event, TickStreamEvent::State { state, audience, .. } if *state == wanted && audience.contains(&watch))
+        matches!(event, TickStreamEvent::State { state, audience, .. } if *state == wanted && audience.contains(&tickloop_ids::Id::from(watch)))
     }
 
     fn is_screen_change(event: &TickStreamEvent, watch: Uuid, pending: bool) -> bool {
-        matches!(event, TickStreamEvent::ScreenChange { audience, is_pending, .. } if *is_pending == pending && audience.contains(&watch))
+        matches!(event, TickStreamEvent::ScreenChange { audience, is_pending, .. } if *is_pending == pending && audience.contains(&tickloop_ids::Id::from(watch)))
     }
 
     /// An update over the 512 KiB limit once encoded, though its line is within it, is a
@@ -3183,7 +3223,10 @@ for line in sys.stdin:
         )
         .await;
         let counter = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
-        let (large, small) = (Uuid::new_v4(), Uuid::new_v4());
+        let (large, small) = (
+            tickloop_agent_runtime::tick_stream::WatchId::new(),
+            tickloop_agent_runtime::tick_stream::WatchId::new(),
+        );
         let stream = HostedTickStream::new(tools.clone());
         let authority = tools
             .tool_authorities("TickRead")
@@ -3213,7 +3256,7 @@ for line in sys.stdin:
                 &mut seen,
                 0,
                 "a Watch's baseline",
-                |event| is_ready(event, watch),
+                |event| is_ready(event, watch.into()),
             )
             .await;
         }
@@ -3265,8 +3308,8 @@ for line in sys.stdin:
             grown,
             "the violating Tick's link ending",
             |event| {
-                is_state(event, large, TickConnectionState::IdentityUncertain)
-                    || is_state(event, large, TickConnectionState::Gone)
+                is_state(event, large.into(), TickConnectionState::IdentityUncertain)
+                    || is_state(event, large.into(), TickConnectionState::Gone)
             },
         )
         .await;
@@ -3434,7 +3477,7 @@ for line in sys.stdin:
         assert_eq!(paged.into_iter().collect::<HashSet<_>>(), expected);
 
         let tools = daemon.tools();
-        let members = tools.members(chat).await.unwrap();
+        let members = tools.members(chat.into()).await.unwrap();
         let CommandResult::HostedTicks(viewed) = daemon
             .command(AgentCommand::ListHostedTicks { execution })
             .await
@@ -3549,7 +3592,10 @@ for line in sys.stdin:
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
-        runtime.submit(chat, "Watch it".into()).await.unwrap();
+        runtime
+            .submit(chat.into(), "Watch it".into())
+            .await
+            .unwrap();
         loop {
             if matches!(
                 tickloop_agent_test_support::next_event(&mut events)
@@ -3639,7 +3685,7 @@ for line in sys.stdin:
                 .any(|record| record["state"] == "reopened" && record["instance"] == json!(lost))
         );
 
-        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        let subscriptions = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(
             subscriptions
                 .iter()

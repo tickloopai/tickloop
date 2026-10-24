@@ -413,7 +413,7 @@ fn view_from_snapshot(
         auto_settings_revision,
         jev_key_status,
         auto_reviewer_health,
-        selected_loop_id: Some(snapshot.chat_loop.id),
+        selected_loop_id: Some(snapshot.chat_loop.id.into()),
         rules,
         working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::TriggerIdentity;
+use crate::{ScheduledTaskId, TriggerIdentity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,7 +16,12 @@ pub enum ScheduledInputWrapper {
         origin: String,
         instructions: String,
     },
-    LoopInstructionsError,
+    /// The run could not read the loop instructions. `task_text` is the task's id as the model
+    /// text wrote it; records written before it was kept have none.
+    LoopInstructionsError {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_text: Option<String>,
+    },
     FinalRun,
 }
 
@@ -41,14 +46,15 @@ const LOOP_INSTRUCTIONS_OPENING_TAG: &str = "<loop-instructions>";
 const LOOP_INSTRUCTIONS_CLOSING_TAG: &str = "</loop-instructions>";
 const ESCAPED_LOOP_INSTRUCTIONS_CLOSING_TAG: &str = "<\\/loop-instructions>";
 
-pub fn scheduled_skill_prompt(task_id: &Uuid, name: &str, arguments: &str) -> String {
+/// `task_text` is the task's id as the Loop writes it into model text.
+pub fn scheduled_skill_prompt(task_text: &str, name: &str, arguments: &str) -> String {
     let arguments = if arguments.is_empty() {
         String::new()
     } else {
         format!("{SKILL_ARGUMENTS_PREFIX}{arguments}{SKILL_ARGUMENTS_SUFFIX}")
     };
     format!(
-        "{SCHEDULED_TASK_PREFIX}{task_id}{SKILL_PREFIX}{name}{SKILL_SUFFIX}{arguments}{SENTENCE_END}"
+        "{SCHEDULED_TASK_PREFIX}{task_text}{SKILL_PREFIX}{name}{SKILL_SUFFIX}{arguments}{SENTENCE_END}"
     )
 }
 
@@ -74,13 +80,15 @@ pub fn strip_final_scheduled_run_prompt(text: &str) -> Option<&str> {
         .map(|start| &text[..start])
 }
 
-pub fn loop_instructions_error_prompt(task_id: &Uuid, error: &str) -> String {
-    format!("{SCHEDULED_TASK_PREFIX}{task_id}{LOOP_ERROR_PREFIX}{error}{LOOP_ERROR_SUFFIX}")
+/// `task_text` is the task's id as the Loop writes it into model text.
+pub fn loop_instructions_error_prompt(task_text: &str, error: &str) -> String {
+    format!("{SCHEDULED_TASK_PREFIX}{task_text}{LOOP_ERROR_PREFIX}{error}{LOOP_ERROR_SUFFIX}")
 }
 
-pub fn strip_loop_instructions_error_prompt<'a>(task_id: &Uuid, text: &'a str) -> Option<&'a str> {
+/// The error of a prompt [`loop_instructions_error_prompt`] wrote with `task_text`.
+pub fn strip_loop_instructions_error_prompt<'a>(task_text: &str, text: &'a str) -> Option<&'a str> {
     text.strip_prefix(&format!(
-        "{SCHEDULED_TASK_PREFIX}{task_id}{LOOP_ERROR_PREFIX}"
+        "{SCHEDULED_TASK_PREFIX}{task_text}{LOOP_ERROR_PREFIX}"
     ))?
     .strip_suffix(LOOP_ERROR_SUFFIX)
 }
@@ -125,10 +133,22 @@ fn scheduled_input<'a>(
                 origin,
                 instructions,
             } => Some(format!("{origin}: {instructions}")),
-            ScheduledInputWrapper::LoopInstructionsError => {
-                strip_loop_instructions_error_prompt(task_id, &visible).map(|error| {
-                    format!("Scheduled task {task_id}: loop instructions unavailable ({error})")
-                })
+            ScheduledInputWrapper::LoopInstructionsError { task_text } => {
+                // A record without the written id text names the task as it was written then:
+                // a UUID before ids were written in base62, base62 since.
+                let written = match task_text {
+                    Some(text) => vec![text.clone()],
+                    None => vec![task_id.to_string(), tickloop_ids::base62::encode(*task_id)],
+                };
+                written
+                    .iter()
+                    .find_map(|text| strip_loop_instructions_error_prompt(text, &visible))
+                    .map(|error| {
+                        format!(
+                            "Scheduled task {}: loop instructions unavailable ({error})",
+                            ScheduledTaskId::from(*task_id).public()
+                        )
+                    })
             }
         };
         let Some(unwrapped) = unwrapped else {

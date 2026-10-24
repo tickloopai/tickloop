@@ -85,7 +85,12 @@ impl Fixture {
 
     async fn prepare(&self, input: Value) -> PreparedTool {
         self.tools
-            .prepare(&self.workspace, "Bash", &input)
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &self.workspace,
+                "Bash",
+                &input,
+            )
             .await
             .unwrap()
     }
@@ -104,6 +109,7 @@ impl Fixture {
                 prepared,
                 CancellationToken::new(),
                 ExecutionContext {
+                    ids: tickloop_ids::IdContext::new(),
                     operation_id,
                     loop_id: Uuid::new_v4(),
                     accepts_images: false,
@@ -132,7 +138,9 @@ fn task_id(result: &ToolResult) -> Uuid {
         .nth(1)
         .and_then(|rest| rest.split('.').next())
         .unwrap_or_else(|| panic!("no task ID in {}", result.content));
-    Uuid::parse_str(id).unwrap()
+    tickloop_agent_protocol::ShellTaskId::parse(id)
+        .unwrap()
+        .uuid()
 }
 
 #[tokio::test]
@@ -466,12 +474,12 @@ async fn ended_user_shell(
     background: bool,
 ) -> InstanceRef {
     let receipt = agent
-        .submit_user_shell(chat, command.into(), background)
+        .submit_user_shell(tickloop_ids::Id::from(chat), command.into(), background)
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !agent
-        .snapshot(chat)
+        .snapshot(tickloop_ids::Id::from(chat))
         .await
         .unwrap()
         .user_shells
@@ -500,13 +508,13 @@ async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
     );
     agent.install_shell_grants(Arc::new(OwnTickhost::with_idle_timeout(VIEW_IDLE_TIMEOUT)));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let background = ended_user_shell(&agent, chat, "printf background", true).await;
-    let foreground = ended_user_shell(&agent, chat, "printf foreground", false).await;
+    let background = ended_user_shell(&agent, chat.uuid(), "printf background", true).await;
+    let foreground = ended_user_shell(&agent, chat.uuid(), "printf foreground", false).await;
     // Nobody views either, for far longer than the Tickhost keeps an ended command nobody holds.
     tokio::time::sleep(VIEW_IDLE_TIMEOUT * 6).await;
     // Its end is unread, so Monitor still lists it; a foreground command it never lists.
-    assert!(opens(&agent, chat, &background).await);
-    assert!(!opens(&agent, chat, &foreground).await);
+    assert!(opens(&agent, chat.uuid(), &background).await);
+    assert!(!opens(&agent, chat.uuid(), &foreground).await);
 
     // Once its end was handled Monitor shows it a while longer, past the worker's next check.
     agent
@@ -514,14 +522,14 @@ async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
-    assert!(opens(&agent, chat, &background).await);
+    assert!(opens(&agent, chat.uuid(), &background).await);
 
     agent
         .remove_monitor_member(chat, background.clone())
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while opens(&agent, chat, &background).await {
+    while opens(&agent, chat.uuid(), &background).await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the Tickhost still keeps a Shell Monitor no longer lists"

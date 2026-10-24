@@ -198,7 +198,7 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
 
 fn prompt(input: Uuid, after: ParentSelection, text: &str, delivery: Delivery) -> TurnRequest {
     TurnRequest {
-        input_id: input,
+        input_id: tickloop_ids::Id::from(input),
         op: TurnOp::Continue {
             after,
             message: UserMessage {
@@ -257,6 +257,7 @@ async fn answer(agent: &Agent, turn: &Turn) -> MessageId {
         .last()
         .unwrap()
         .response_id
+        .into()
 }
 
 fn node(nodes: &[DisplayNode], id: Uuid) -> &DisplayNode {
@@ -319,11 +320,11 @@ async fn a_root_starts_an_empty_chat_and_repeating_its_input_returns_the_outcome
     // The answer starts in the change that appends its prompt, so every batch shows it.
     assert!(!leaves.is_empty());
     assert!(
-        leaves.iter().all(|leaf| *leaf == Some(answer)),
+        leaves.iter().all(|leaf| *leaf == Some(answer.into())),
         "{leaves:?}"
     );
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, turn.input_id()).parent, None);
+    assert_eq!(node(&nodes, (turn.input_id()).uuid()).parent, None);
     agent.shutdown().await;
 }
 
@@ -378,8 +379,8 @@ async fn an_explicit_parent_is_refused_while_busy_unless_sent_now() {
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
     assert_eq!(
-        node(&nodes, follow_up.input_id()).parent,
-        Some(second_answer),
+        node(&nodes, (follow_up.input_id()).uuid()).parent,
+        Some(Into::into(second_answer)),
         "the interrupted answer became the follow-up's parent"
     );
     agent.shutdown().await;
@@ -412,8 +413,14 @@ async fn an_older_sibling_is_continued_in_place_after_a_store_switch_and_after_r
     );
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, three.input_id()).parent, Some(answer_one));
-    assert_eq!(node(&nodes, four.input_id()).parent, Some(answer_two));
+    assert_eq!(
+        node(&nodes, (three.input_id()).uuid()).parent,
+        Some(Into::into(answer_one))
+    );
+    assert_eq!(
+        node(&nodes, (four.input_id()).uuid()).parent,
+        Some(Into::into(answer_two))
+    );
     agent.shutdown().await;
     drop(agent);
 
@@ -428,7 +435,10 @@ async fn an_older_sibling_is_continued_in_place_after_a_store_switch_and_after_r
     );
     next.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, five.input_id()).parent, Some(answer_three));
+    assert_eq!(
+        node(&nodes, (five.input_id()).uuid()).parent,
+        Some(Into::into(answer_three))
+    );
     next.shutdown().await;
 }
 
@@ -459,7 +469,10 @@ async fn a_leaf_before_the_latest_compaction_boundary_is_continued_after_reload(
     );
     next.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, branch.input_id()).parent, Some(answer_one));
+    assert_eq!(
+        node(&nodes, (branch.input_id()).uuid()).parent,
+        Some(Into::into(answer_one))
+    );
     next.shutdown().await;
 }
 
@@ -473,7 +486,7 @@ async fn a_repeated_regeneration_adds_exactly_one_sibling_answer() {
     let asked = complete(&agent, chat, after_leaf("the question")).await;
     let first_take = answer(&agent, &asked).await;
     let regenerate = TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::RegenerateAnswer { answer: first_take },
         delivery: Delivery::Queue,
         host_context: None,
@@ -492,7 +505,7 @@ async fn a_repeated_regeneration_adds_exactly_one_sibling_answer() {
 
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    let siblings = answers_under(&nodes, asked.input_id());
+    let siblings = answers_under(&nodes, (asked.input_id()).uuid());
     assert_eq!(siblings.len(), 2, "{nodes:#?}");
     let second_take = answer(&agent, &regenerated).await;
     assert!(siblings.iter().any(|answer| answer.id == second_take));
@@ -524,7 +537,7 @@ async fn an_answer_to_a_prompt_a_directed_summary_rewrote_is_regenerated() {
         .summarize_checkpoint(
             chat,
             DirectedSummaryRequest {
-                message_id: three.input_id(),
+                message_id: (three.input_id()).uuid(),
                 direction: SummaryDirection::UpToHere,
                 guidance: None,
             },
@@ -532,7 +545,7 @@ async fn an_answer_to_a_prompt_a_directed_summary_rewrote_is_regenerated() {
         .await
         .unwrap();
     let rewritten = agent
-        .physical_endpoint(chat, three.input_id())
+        .physical_endpoint(chat, (three.input_id()).uuid())
         .await
         .unwrap()
         .unwrap();
@@ -542,7 +555,7 @@ async fn an_answer_to_a_prompt_a_directed_summary_rewrote_is_regenerated() {
         &agent,
         chat,
         TurnRequest {
-            input_id: Uuid::new_v4(),
+            input_id: tickloop_ids::Id::from(Uuid::new_v4()),
             op: TurnOp::RegenerateAnswer {
                 answer: answer_three,
             },
@@ -561,13 +574,13 @@ async fn an_answer_to_a_prompt_a_directed_summary_rewrote_is_regenerated() {
     assert_eq!(model.last_messages().last().unwrap().role, Role::User);
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    let siblings = answers_under(&nodes, three.input_id());
+    let siblings = answers_under(&nodes, (three.input_id()).uuid());
     assert_eq!(siblings.len(), 2, "{nodes:#?}");
     assert!(
         siblings.iter().any(|node| node.id == answer_three)
             && siblings.iter().any(|node| node.kind
                 == DisplayKind::Answer {
-                    input_id: Some(regenerated.input_id()),
+                    input_id: Some((regenerated.input_id()).uuid()),
                     attempt: 1
                 })
     );
@@ -588,9 +601,9 @@ async fn a_replaced_prompt_gets_a_sibling() {
         &agent,
         chat,
         TurnRequest {
-            input_id: Uuid::new_v4(),
+            input_id: tickloop_ids::Id::from(Uuid::new_v4()),
             op: TurnOp::ReplacePrompt {
-                prompt: two.input_id(),
+                prompt: (two.input_id()).uuid().into(),
                 message: UserMessage {
                     text: "prompt two, edited".into(),
                     ..Default::default()
@@ -605,8 +618,14 @@ async fn a_replaced_prompt_gets_a_sibling() {
     assert!(request.contains("answer one") && !request.contains("answer two"));
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, edit.input_id()).parent, Some(answer_one));
-    assert_eq!(node(&nodes, two.input_id()).parent, Some(answer_one));
+    assert_eq!(
+        node(&nodes, (edit.input_id()).uuid()).parent,
+        Some(Into::into(answer_one))
+    );
+    assert_eq!(
+        node(&nodes, (two.input_id()).uuid()).parent,
+        Some(Into::into(answer_one))
+    );
     agent.shutdown().await;
 }
 
@@ -771,7 +790,7 @@ async fn an_input_whose_answer_lost_its_host_continues_as_a_sibling_attempt() {
         vec![
             (
                 1,
-                Some(turn.input_id()),
+                Some(turn.input_id().uuid()),
                 ResponseState::Ended {
                     ending: ResponseEnding::Interrupted {
                         by: InterruptedBy::Host
@@ -780,7 +799,7 @@ async fn an_input_whose_answer_lost_its_host_continues_as_a_sibling_attempt() {
             ),
             (
                 2,
-                Some(turn.input_id()),
+                Some(turn.input_id().uuid()),
                 ResponseState::Ended {
                     ending: ResponseEnding::Completed
                 }
@@ -796,7 +815,7 @@ async fn an_input_whose_answer_lost_its_host_continues_as_a_sibling_attempt() {
     assert_eq!(model.requests(), 1);
     next.sync().await.unwrap();
     let nodes = project(&crashed.lines(chat));
-    assert_eq!(answers_under(&nodes, turn.input_id()).len(), 2);
+    assert_eq!(answers_under(&nodes, (turn.input_id()).uuid()).len(), 2);
     next.shutdown().await;
     first.shutdown().await;
     assert!(matches!(
@@ -964,7 +983,7 @@ async fn continuing_after_an_older_answer_to_the_same_prompt_switches_to_its_bra
         &agent,
         chat,
         TurnRequest {
-            input_id: Uuid::new_v4(),
+            input_id: tickloop_ids::Id::from(Uuid::new_v4()),
             op: TurnOp::RegenerateAnswer { answer: first_take },
             delivery: Delivery::Queue,
             host_context: None,
@@ -979,7 +998,10 @@ async fn continuing_after_an_older_answer_to_the_same_prompt_switches_to_its_bra
     );
     agent.sync().await.unwrap();
     let nodes = project(&store.lines(chat));
-    assert_eq!(node(&nodes, follow_up.input_id()).parent, Some(first_take));
+    assert_eq!(
+        node(&nodes, (follow_up.input_id()).uuid()).parent,
+        Some(Into::into(first_take))
+    );
     agent.shutdown().await;
 }
 
@@ -1129,8 +1151,8 @@ async fn assert_still_after_answer_three(
     agent.sync().await.unwrap();
     let nodes = project(&lines());
     assert_eq!(
-        node(&nodes, next.input_id()).parent,
-        Some(branches.answer_three)
+        node(&nodes, (next.input_id()).uuid()).parent,
+        Some(Into::into(branches.answer_three))
     );
 }
 
@@ -1194,11 +1216,14 @@ async fn a_branch_switch_reserves_the_chat_before_it_reads_the_branch() {
     assert!(!format!("{lines:?}").contains("racing"));
     let nodes = project(&lines);
     assert_eq!(
-        node(&nodes, four.input_id()).parent,
-        Some(branches.answer_two)
+        node(&nodes, (four.input_id()).uuid()).parent,
+        Some(Into::into(branches.answer_two))
     );
     let answer_four = answer(&agent, &four).await;
-    assert_eq!(node(&nodes, next.input_id()).parent, Some(answer_four));
+    assert_eq!(
+        node(&nodes, (next.input_id()).uuid()).parent,
+        Some(Into::into(answer_four))
+    );
     agent.shutdown().await;
 }
 
@@ -1298,7 +1323,7 @@ async fn a_refused_input_off_the_current_chain_leaves_the_conversation_where_it_
         Delivery::Queue,
     );
     let unknown_skill = TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Skill {
             after: ParentSelection::Message(branches.answer_two),
             skill: tickloop_agent_runtime::SkillInvocation {
@@ -1310,7 +1335,7 @@ async fn a_refused_input_off_the_current_chain_leaves_the_conversation_where_it_
         host_context: None,
     };
     let missing_attachment = TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after: ParentSelection::Message(branches.answer_two),
             message: UserMessage {
@@ -1348,7 +1373,7 @@ async fn the_display_leaf_is_an_answer_awaiting_its_first_delta() {
         .find(|batch| !batch.lines.is_empty())
         .unwrap()
         .display_leaf;
-    assert_eq!(leaf, Some(started));
+    assert_eq!(leaf, Some(Into::into(started)));
     agent.shutdown().await;
 }
 
@@ -1372,7 +1397,7 @@ async fn an_answer_that_failed_without_content_is_the_display_leaf_to_continue_a
         .display_leaf
         .expect("a leaf");
     assert_eq!(leaf, failed);
-    complete(&agent, chat, after(leaf, "again")).await;
+    complete(&agent, chat, after(leaf.into(), "again")).await;
     agent.shutdown().await;
 }
 
@@ -1407,7 +1432,7 @@ async fn compaction_and_a_new_holder_keep_the_display_leaf() {
         .collect::<Vec<_>>();
     assert!(!leaves.is_empty());
     assert!(
-        leaves.iter().all(|leaf| *leaf == Some(answer_two)),
+        leaves.iter().all(|leaf| *leaf == Some(answer_two.into())),
         "{leaves:?}"
     );
     next.shutdown().await;

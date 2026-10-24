@@ -638,10 +638,17 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
         ));
     }
     lines.extend([
-        detail_entry(DetailGroup::Reference, format!("Chat: {}", record.chat_id)),
         detail_entry(
             DetailGroup::Reference,
-            format!("Loop: {} · Run: {}", record.loop_id, record.run_id),
+            format!("Chat: {}", record.chat_id.public()),
+        ),
+        detail_entry(
+            DetailGroup::Reference,
+            format!(
+                "Loop: {} · Run: {}",
+                record.loop_id.public(),
+                record.run_id.public()
+            ),
         ),
         detail_entry(
             DetailGroup::Reference,
@@ -650,7 +657,10 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
                 record.operation_id, record.call_id
             ),
         ),
-        detail_entry(DetailGroup::Reference, format!("Record: {}", record.id)),
+        detail_entry(
+            DetailGroup::Reference,
+            format!("Record: {}", tickloop_ids::base62::encode(record.id)),
+        ),
     ]);
     if record.outcome == ApprovalResult::Deny {
         lines.push(detail_entry(
@@ -806,9 +816,9 @@ mod tests {
     fn record(outcome: ApprovalResult) -> ApprovalRecord {
         ApprovalRecord {
             id: Uuid::new_v4(),
-            chat_id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
+            chat_id: Uuid::new_v4().into(),
+            loop_id: Uuid::new_v4().into(),
+            run_id: Uuid::new_v4().into(),
             operation_id: Uuid::new_v4(),
             call_id: "call".into(),
             at_ms: 1,

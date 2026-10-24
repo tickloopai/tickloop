@@ -152,7 +152,7 @@ impl LongChat {
         let created = access
             .execute(CommandEnvelope {
                 daemon_epoch: access.daemon_epoch(),
-                command_id: Uuid::new_v4(),
+                command_id: tickloop_ids::generate(),
                 command: AgentCommand::Create {
                     launch: LaunchSpec::embedded(PathBuf::from("/tmp")),
                     initial: None,
@@ -174,7 +174,7 @@ impl LongChat {
             access
                 .execute(CommandEnvelope {
                     daemon_epoch: access.daemon_epoch(),
-                    command_id: Uuid::new_v4(),
+                    command_id: tickloop_ids::generate(),
                     command: AgentCommand::Submit {
                         execution,
                         input: UserInput::Text {
@@ -208,7 +208,7 @@ impl LongChat {
             runtime,
             access,
             execution,
-            chat,
+            chat: chat.into(),
             model,
         }
     }
@@ -267,7 +267,7 @@ async fn reads_between_turns_copy_none_of_a_long_chats_history() {
             "{read} copied {bytes} bytes of a Chat whose history holds {snapshot_bytes}"
         );
     }
-    let (bytes, status) = allocated_by(long.runtime.status(long.chat)).await;
+    let (bytes, status) = allocated_by(long.runtime.status(long.chat.into())).await;
     assert!(bytes < READ_WITHOUT_HISTORY_BYTES, "{bytes}");
     assert_eq!(
         serde_json::to_value(status.unwrap()).unwrap(),
@@ -315,15 +315,15 @@ async fn a_status_query_answers_what_a_snapshot_of_the_same_moment_holds() {
 fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
     let update = ObservationUpdate {
         cursor: Cursor {
-            daemon_epoch: Uuid::new_v4(),
+            daemon_epoch: tickloop_ids::generate(),
             execution: None,
             sequence: 1,
         },
         change: tickloop_agent_protocol::ObservationChange::Event(Event {
             sequence: 1,
-            chat_id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
+            chat_id: tickloop_ids::generate().into(),
+            loop_id: tickloop_ids::generate().into(),
+            run_id: tickloop_ids::generate().into(),
             kind: EventKind::ToolCompleted {
                 sources: Vec::new(),
                 call_id: "read".into(),
@@ -343,11 +343,11 @@ fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
 
 fn opened(initial: ObservationValue) -> ServerMessage {
     ServerMessage::Opened {
-        request_id: Uuid::new_v4(),
-        observation_id: Uuid::new_v4(),
+        request_id: tickloop_ids::generate(),
+        observation_id: tickloop_ids::generate(),
         initial,
         cursor: Cursor {
-            daemon_epoch: Uuid::new_v4(),
+            daemon_epoch: tickloop_ids::generate(),
             execution: None,
             sequence: 0,
         },
@@ -427,7 +427,7 @@ async fn status_refresh_of_a_long_busy_chat() {
         built.elapsed().as_secs_f64()
     );
 
-    let (clone_ms, snapshot) = measure(|| long.runtime.snapshot(long.chat)).await;
+    let (clone_ms, snapshot) = measure(|| long.runtime.snapshot(long.chat.into())).await;
     let snapshot = snapshot.unwrap();
     println!(
         "chat: {} messages, {} replay events, {} bytes pending thinking",
@@ -439,8 +439,8 @@ async fn status_refresh_of_a_long_busy_chat() {
             .map(String::len)
             .sum::<usize>()
     );
-    let (status_lock_ms, _) = measure(|| long.runtime.status(long.chat)).await;
-    let (summary_lock_ms, _) = measure(|| long.runtime.summary(long.chat)).await;
+    let (status_lock_ms, _) = measure(|| long.runtime.status(long.chat.into())).await;
+    let (summary_lock_ms, _) = measure(|| long.runtime.summary(long.chat.into())).await;
     println!(
         "chats lock held: full snapshot clone {clone_ms:.3} ms · status {status_lock_ms:.3} ms · Overview summary {summary_lock_ms:.3} ms"
     );
@@ -472,9 +472,9 @@ async fn status_refresh_of_a_long_busy_chat() {
     let (events_observe_ms, _) = measure(|| long.observe(AgentDetailQuery::Events { after })).await;
     let long_result = ObservationValue::Events(vec![Event {
         sequence: after + 1,
-        chat_id: long.chat,
-        loop_id: Uuid::new_v4(),
-        run_id: Uuid::new_v4(),
+        chat_id: long.chat.into(),
+        loop_id: tickloop_ids::generate().into(),
+        run_id: tickloop_ids::generate().into(),
         kind: EventKind::ToolCompleted {
             sources: Vec::new(),
             call_id: "read".into(),

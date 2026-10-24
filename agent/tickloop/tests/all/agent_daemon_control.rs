@@ -689,7 +689,7 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
     );
     let record = TranscriptRef {
         store_root: fixture.config.clone(),
-        chat_id: snapshot.conversation.id,
+        chat_id: snapshot.conversation.id.into(),
     };
     verify_stopped_and_restart(
         &mut fixture,

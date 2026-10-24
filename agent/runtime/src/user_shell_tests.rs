@@ -153,7 +153,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
             receipt: Receipt {
                 chat_id,
                 loop_id,
-                run_id: uuid::Uuid::new_v4(),
+                run_id: uuid::Uuid::new_v4().into(),
             },
             input: "check after restart".into(),
             contexts: Vec::new(),
@@ -379,7 +379,7 @@ async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
             UserCommandSnapshot {
                 updated_at_ms: None,
                 operation_id: receipt.command_id,
-                chat_id: chat,
+                chat_id: chat.into(),
                 command: terminal.command.clone(),
                 cwd: terminal.cwd.clone(),
                 pid: terminal.pid,
@@ -476,12 +476,16 @@ async fn a_user_shell_can_be_backgrounded_and_stopped_without_a_loop_identity() 
             "<bash-input>while :; do printf x; sleep 0.02; done</bash-input>".to_string(),
             format!(
                 "<bash-stdout>Command was manually backgrounded by user with ID: {}. Output is being written to: {}</bash-stdout><bash-stderr></bash-stderr>",
-                receipt.command_id,
+                tickloop_ids::IdContext::new().model_text(
+                    tickloop_agent_protocol::ShellTaskId::from(receipt.command_id)
+                ),
                 output_ref.display()
             ),
             format!(
                 "<task-notification>\n<task-id>{}</task-id>\n<output-file>{}</output-file>\n<status>killed</status>\n<summary>Background command \"while :; do printf x; sleep 0.02; done\" was stopped</summary>\n</task-notification>",
-                receipt.command_id,
+                tickloop_ids::IdContext::new().model_text(
+                    tickloop_agent_protocol::ShellTaskId::from(receipt.command_id)
+                ),
                 output_ref.display()
             ),
         ]
@@ -517,7 +521,7 @@ async fn a_user_shell_moved_by_its_timeout_is_announced_as_running_in_the_backgr
             UserCommandSnapshot {
                 updated_at_ms: None,
                 operation_id: receipt.command_id,
-                chat_id: chat,
+                chat_id: chat.into(),
                 command: command.into(),
                 cwd: running.cwd.clone(),
                 pid: running.pid,
@@ -539,7 +543,9 @@ async fn a_user_shell_moved_by_its_timeout_is_announced_as_running_in_the_backgr
             format!("<bash-input>{command}</bash-input>"),
             format!(
                 "<bash-stdout>Command running in background with ID: {}. Output is being written to: {}</bash-stdout><bash-stderr></bash-stderr>",
-                receipt.command_id,
+                tickloop_ids::IdContext::new().model_text(
+                    tickloop_agent_protocol::ShellTaskId::from(receipt.command_id)
+                ),
                 output_ref.display()
             ),
         ]

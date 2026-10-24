@@ -134,7 +134,13 @@ pub(super) struct StatusArea {
     context: Option<(u64, usize)>,
     tasks: Option<TaskBoard>,
     task_view: TaskViewState,
-    task_views: HashMap<(Uuid, Uuid), TaskViewState>,
+    task_views: HashMap<
+        (
+            tickloop_agent_protocol::ChatId,
+            tickloop_agent_protocol::LoopId,
+        ),
+        TaskViewState,
+    >,
     tasks_focused: bool,
     task_focus_available: Option<bool>,
     task_details: bool,
@@ -854,7 +860,7 @@ impl StatusArea {
                             SharedTaskStatus::NeedsAttention => "needs attention",
                             SharedTaskStatus::Cancelled => "cancelled",
                         },
-                        task.id
+                        task.id.public()
                     ),
                     task.description.clone(),
                     format!(
@@ -871,7 +877,7 @@ impl StatusArea {
                                         .enumerate()
                                         .find(|(_, dependency)| dependency.id == *id)
                                         .map_or_else(
-                                            || id.to_string(),
+                                            || id.public(),
                                             |(index, dependency)| {
                                                 format!(
                                                     "#{} {}",
@@ -1084,18 +1090,18 @@ impl StatusArea {
 
 #[cfg(test)]
 pub(super) fn test_task_board(titles: &[&str]) -> TaskBoard {
-    let mut board = TaskBoard::new(Uuid::from_u128(1010), Uuid::from_u128(1012));
+    let mut board = TaskBoard::new(Uuid::from_u128(1010).into(), Uuid::from_u128(1012).into());
     board.tasks = titles
         .iter()
         .enumerate()
         .map(|(index, title)| tickloop_agent_protocol::SharedTask {
-            id: Uuid::from_u128(2000 + index as u128),
+            id: Uuid::from_u128(2000 + index as u128).into(),
             title: (*title).into(),
             description: "Verify the task".into(),
             dependencies: vec![],
             status: SharedTaskStatus::InProgress,
             owner: Some(tickloop_agent_protocol::TaskOwner {
-                chat_id: Uuid::from_u128(1010),
+                chat_id: Uuid::from_u128(1010).into(),
                 name: "main".into(),
             }),
             claim: None,
@@ -1131,7 +1137,7 @@ mod tests {
             updated_at: None,
             run_started_at: None,
             subagent: parent.map(|_| tickloop_agent_protocol::SubagentRegistration {
-                child_chat_id: Uuid::from_u128(id),
+                child_chat_id: Uuid::from_u128(id).into(),
                 handle: title.into(),
                 description: title.into(),
                 created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
@@ -1179,7 +1185,7 @@ mod tests {
             updated_at: None,
             run_started_at: Some(0),
             subagent: Some(tickloop_agent_protocol::SubagentRegistration {
-                child_chat_id: Uuid::from_u128(2),
+                child_chat_id: Uuid::from_u128(2).into(),
                 handle: "👩‍💻中文 mixed long name".into(),
                 description: "Mixed 描述 👩‍💻 long description".repeat(10),
                 created_at: 0,
@@ -1226,7 +1232,7 @@ mod tests {
             updated_at: Some(100_000),
             run_started_at: Some(100_000),
             subagent: parent.map(|_| tickloop_agent_protocol::SubagentRegistration {
-                child_chat_id: id,
+                child_chat_id: id.into(),
                 handle: title.into(),
                 description: "Run sleep 30".into(),
                 created_at: 10_000,
@@ -1585,7 +1591,7 @@ mod tests {
             updated_at: Some(64_000),
             run_started_at: None,
             subagent: (id != 1).then(|| SubagentRegistration {
-                child_chat_id: Uuid::from_u128(id),
+                child_chat_id: Uuid::from_u128(id).into(),
                 handle: format!("member-{id}"),
                 description: "work".into(),
                 created_at: 1_000,
@@ -1748,7 +1754,7 @@ mod shared_task_tests {
         let owner_chat = Uuid::from_u128(9000);
         for index in [0, 1] {
             board.tasks[index].owner = Some(tickloop_agent_protocol::TaskOwner {
-                chat_id: owner_chat,
+                chat_id: owner_chat.into(),
                 name: "reader".into(),
             });
         }
@@ -1769,7 +1775,7 @@ mod shared_task_tests {
                 updated_at: None,
                 run_started_at: None,
                 subagent: Some(tickloop_agent_protocol::SubagentRegistration {
-                    child_chat_id: owner_chat,
+                    child_chat_id: owner_chat.into(),
                     handle: "reader".into(),
                     description: "Read notes".into(),
                     created_at: 0,
@@ -1852,7 +1858,7 @@ mod shared_task_tests {
             "  ◻ Dependent ▸ blocked by #1, #3"
         );
         let mut added = board.tasks[0].clone();
-        added.id = Uuid::new_v4();
+        added.id = Uuid::new_v4().into();
         added.title = "Added later".into();
         board.tasks.push(added);
         board.tasks[0].status = SharedTaskStatus::Completed;
@@ -1884,7 +1890,7 @@ mod shared_task_tests {
         let lines = area.task_lines(160, 40, DisplayProfile::default());
         assert!(lines.iter().any(|line| {
             line.text()
-                .contains(&format!("Task #4 · pending · {dependent_id}"))
+                .contains(&format!("Task #4 · pending · {}", dependent_id.public()))
         }));
         assert!(lines.iter().any(|line| {
             line.text()
@@ -2069,7 +2075,7 @@ mod shared_task_tests {
         assert_eq!(area.task_lines(80, 24, DisplayProfile::default()).len(), 1);
         area.update("Auto".into(), "model".into(), None, None);
         let mut other = board.clone();
-        other.root_loop_id = Uuid::from_u128(9999);
+        other.root_loop_id = Uuid::from_u128(9999).into();
         area.update("Auto".into(), "model".into(), None, Some(other));
         assert_eq!(area.task_lines(80, 24, DisplayProfile::default()).len(), 3);
         area.update("Auto".into(), "model".into(), None, Some(board.clone()));

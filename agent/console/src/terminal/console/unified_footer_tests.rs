@@ -24,7 +24,7 @@ fn task(content: &str) -> tickloop_agent_protocol::SharedTask {
 
 fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> ShellTaskSnapshot {
     ShellTaskSnapshot {
-        chat_id: CHAT,
+        chat_id: CHAT.into(),
         live_revision: revision,
         tasks: tasks
             .into_iter()
@@ -32,9 +32,11 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Sh
                 updated_at_ms: None,
                 ended_at_ms: None,
                 id,
-                chat_id: CHAT,
+                chat_id: CHAT.into(),
                 origin: ShellTaskOrigin::User,
-                owner: ShellTaskOwner::User { chat_id: CHAT },
+                owner: ShellTaskOwner::User {
+                    chat_id: CHAT.into(),
+                },
                 call_id: None,
                 command: command.into(),
                 description: None,
@@ -108,7 +110,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
         updated_at: None,
         run_started_at: None,
         subagent: parent.map(|_| SubagentRegistration {
-            child_chat_id: Uuid::from_u128(id),
+            child_chat_id: Uuid::from_u128(id).into(),
             handle: if title.contains(' ') {
                 format!("child-{id}")
             } else {

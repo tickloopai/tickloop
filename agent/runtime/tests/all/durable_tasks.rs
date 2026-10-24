@@ -39,7 +39,7 @@ fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
 
 fn prompt() -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -223,7 +223,7 @@ async fn durable_reload_preserves_claim_board_and_receipts_and_disabled_owner_ca
         .advance(
             chat,
             TurnRequest {
-                input_id: Uuid::new_v4(),
+                input_id: tickloop_ids::Id::from(Uuid::new_v4()),
                 op: TurnOp::Answer {
                     request: question.id,
                     reply: QuestionReply::Answered(vec![QuestionAnswer::other("Weekly")]),
@@ -310,9 +310,9 @@ async fn durable_reload_marks_claims_without_a_restored_owner_run_needs_attentio
         let receipts = board.mutations.clone();
         let previous_revision = board.tasks[0].revision;
         if missing_member {
-            board.tasks[0].owner.as_mut().unwrap().chat_id = Uuid::new_v4();
+            board.tasks[0].owner.as_mut().unwrap().chat_id = tickloop_ids::Id::from(Uuid::new_v4());
         } else {
-            board.tasks[0].claim.as_mut().unwrap().run_id = Uuid::new_v4();
+            board.tasks[0].claim.as_mut().unwrap().run_id = tickloop_ids::Id::from(Uuid::new_v4());
         }
         let store = Arc::new(InMemoryTranscriptStore::new());
         store.seed(chat, lines, StorePosition(1000));

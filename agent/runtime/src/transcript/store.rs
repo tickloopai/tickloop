@@ -64,7 +64,7 @@ pub struct BatchId(pub Uuid);
 
 impl BatchId {
     pub fn new() -> Self {
-        Self(Uuid::new_v4())
+        Self(tickloop_ids::generate())
     }
 }
 

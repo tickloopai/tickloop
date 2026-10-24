@@ -126,7 +126,7 @@ impl MessageGroups {
         let run = event.run_id;
         let key = match &event.kind {
             EventKind::Text(_) | EventKind::Thinking(_) => {
-                let (index, after_tool) = self.replies.entry(run).or_default();
+                let (index, after_tool) = self.replies.entry(run.into()).or_default();
                 if *after_tool {
                     *index += 1;
                     *after_tool = false;
@@ -138,22 +138,26 @@ impl MessageGroups {
                 }
             }
             EventKind::ToolStarted { call_id, .. } | EventKind::ToolCompleted { call_id, .. } => {
-                self.replies.entry(run).or_default().1 = true;
+                self.replies.entry(run.into()).or_default().1 = true;
                 format!("tool:{call_id}")
             }
             EventKind::PermissionRequested { request } => {
                 format!("tool:{}", request.execution.call_key())
             }
             EventKind::QuestionAsked { request } => format!("question:{}", request.id),
-            EventKind::PlanUpdated { plan } => format!("plan:{}:{}", plan.loop_id, plan.version),
-            EventKind::ProgressUpdated { progress } => format!("progress:{}", progress.loop_id),
+            EventKind::PlanUpdated { plan } => {
+                format!("plan:{}:{}", plan.loop_id.public(), plan.version)
+            }
+            EventKind::ProgressUpdated { progress } => {
+                format!("progress:{}", progress.loop_id.public())
+            }
             EventKind::CommandUpdated { command } => {
                 format!("command:{}:{:?}", command.operation_id, command.state)
             }
             EventKind::Failed(_) | EventKind::Interrupted => "outcome".into(),
             _ => return None,
         };
-        Some(format!("{run}:{key}"))
+        Some(format!("{}:{key}", run.uuid()))
     }
 }
 
@@ -241,7 +245,7 @@ pub(super) fn transcript_document(
                             );
                         }
                         let text = safe_text(text);
-                        writer.prompt(&text, &image_links.in_text(snapshot.id, &text));
+                        writer.prompt(&text, &image_links.in_text(snapshot.id.into(), &text));
                     }
                 }
             }
@@ -1069,9 +1073,9 @@ impl ToolPresentation {
             EventKind::ToolCompleted {
                 call_id, result, ..
             } => console.finish_tool_call(
-                event.run_id,
+                event.run_id.into(),
                 Some((
-                    &tool_call_key(event.run_id, call_id),
+                    &tool_call_key(event.run_id.into(), call_id),
                     tool_result_state(
                         self.started_call(event, call_id).0,
                         &result.content,
@@ -1080,7 +1084,7 @@ impl ToolPresentation {
                 )),
             )?,
             EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
-                console.finish_tool_call(event.run_id, None)?
+                console.finish_tool_call(event.run_id.into(), None)?
             }
             EventKind::AssistantMessageCommitted { tool_calls, .. } if console.is_interactive() => {
                 let _frame_hold = console.hold_frames()?;
@@ -1088,9 +1092,9 @@ impl ToolPresentation {
                     if has_no_call_row(&call.name) {
                         continue;
                     }
-                    let key = tool_call_key(event.run_id, &call.call_id);
+                    let key = tool_call_key(event.run_id.into(), &call.call_id);
                     console.for_message(Some(key.clone())).write_tool_call(
-                        event.run_id,
+                        event.run_id.into(),
                         &key,
                         &tool_call_roles(&call.name, &call.input, &cwd, display, &self.tick_labels),
                         ToolCallState::Queued,
@@ -1129,8 +1133,8 @@ impl ToolPresentation {
                 input,
             } if console.is_interactive() && !has_no_call_row(name) => {
                 console.write_tool_call(
-                    event.run_id,
-                    &tool_call_key(event.run_id, call_id),
+                    event.run_id.into(),
+                    &tool_call_key(event.run_id.into(), call_id),
                     &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                     ToolCallState::Running,
                     self.collapse(name, input),
@@ -1148,7 +1152,7 @@ impl ToolPresentation {
             EventKind::ToolCompleted {
                 call_id, result, ..
             } if !self.detailed => {
-                let key = tool_call_key(event.run_id, call_id);
+                let key = tool_call_key(event.run_id.into(), call_id);
                 let state = tool_result_state(
                     self.started_call(event, call_id).0,
                     &result.content,
@@ -1160,7 +1164,7 @@ impl ToolPresentation {
                         if result.is_error && has_no_call_row(name) && console.is_interactive() =>
                     {
                         console.write_tool_call(
-                            event.run_id,
+                            event.run_id.into(),
                             &key,
                             &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                             state,
@@ -1170,7 +1174,7 @@ impl ToolPresentation {
                     (SUBAGENT_TOOL_NAME, Some(input)) if console.is_interactive() => {
                         let launch = serde_json::from_str::<Value>(&result.content).ok();
                         console.write_tool_call(
-                            event.run_id,
+                            event.run_id.into(),
                             &key,
                             &agent_messaging::subagent_call_runs(
                                 input,
@@ -1203,7 +1207,7 @@ impl ToolPresentation {
                             .flatten()
                     })
         {
-            console.flash_tick_use(&tool_call_key(event.run_id, call_id), instance)?;
+            console.flash_tick_use(&tool_call_key(event.run_id.into(), call_id), instance)?;
         }
         Ok(true)
     }
@@ -1255,7 +1259,7 @@ impl ToolPresentation {
         };
         match self.started_call(event, call_id).0 {
             EDIT_TOOL_NAME if !result.is_error => CallFacts {
-                review: file_change_review(snapshot, event.run_id, call_id),
+                review: file_change_review(snapshot, event.run_id.into(), call_id),
                 report: None,
             },
             SUBAGENT_TOOL_NAME => CallFacts {
@@ -1534,7 +1538,7 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
             OperationState::Admitted => ToolCallState::Running,
             _ => ToolCallState::Finished,
         };
-        states.insert((operation.run_id, operation.call_id.clone()), state);
+        states.insert((operation.run_id.uuid(), operation.call_id.clone()), state);
     }
     for (index, message) in snapshot.messages.iter().enumerate() {
         let Some(run) = snapshot.message_runs.get(&index).copied() else {
@@ -1545,7 +1549,7 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                 Content::ToolUse { id, name, .. } => {
                     names.insert((run, id.clone()), name.clone());
                     states
-                        .entry((run, id.clone()))
+                        .entry((run.into(), id.clone()))
                         .or_insert(if active_run == Some(run) {
                             ToolCallState::Queued
                         } else {
@@ -1566,7 +1570,7 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                         *is_error,
                     );
                     states
-                        .entry((run, tool_use_id.clone()))
+                        .entry((run.into(), tool_use_id.clone()))
                         .and_modify(|state| {
                             if *state != ToolCallState::Stopped {
                                 *state = finished;
@@ -1581,7 +1585,7 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
     for recovery in &snapshot.tool_call_recoveries {
         if let Some(run) = recovery.run_id {
             states.insert(
-                (run, recovery.call_id.clone()),
+                (run.into(), recovery.call_id.clone()),
                 if recovery.was_admitted == Some(true) {
                     ToolCallState::Finished
                 } else {
@@ -1596,18 +1600,24 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
         match &event.kind {
             EventKind::AssistantMessageCommitted { tool_calls, .. } => {
                 for call in tool_calls {
-                    states.insert((event.run_id, call.call_id.clone()), ToolCallState::Queued);
+                    states.insert(
+                        (event.run_id.into(), call.call_id.clone()),
+                        ToolCallState::Queued,
+                    );
                 }
             }
             EventKind::ToolStarted { call_id, name, .. } => {
                 names.insert((event.run_id, call_id.clone()), name.clone());
-                states.insert((event.run_id, call_id.clone()), ToolCallState::Running);
+                states.insert(
+                    (event.run_id.into(), call_id.clone()),
+                    ToolCallState::Running,
+                );
             }
             EventKind::ToolCompleted {
                 call_id, result, ..
             } => {
                 states.insert(
-                    (event.run_id, call_id.clone()),
+                    (event.run_id.into(), call_id.clone()),
                     tool_result_state(
                         names
                             .get(&(event.run_id, call_id.clone()))
@@ -2487,7 +2497,7 @@ fn background_launch_id(content: &str) -> Option<Uuid> {
     if path.trim().is_empty() {
         return None;
     }
-    Uuid::parse_str(id).ok()
+    tickloop_agent_protocol::ShellTaskId::parse(id).map(|task| task.uuid())
 }
 
 const GOAL_COMPLETION_REJECTION_PREFIX: &str = "The completion check did not accept the report, so the goal stays active. Its reason, to verify against the current state: ";
@@ -2928,13 +2938,13 @@ mod tests {
         let loop_id = snapshot.chat_loop.id;
         let run_id = Uuid::new_v4();
         snapshot.chat_loop.state = tickloop_agent_protocol::LoopState::Running;
-        snapshot.chat_loop.run_id = Some(run_id);
+        snapshot.chat_loop.run_id = Some(run_id.into());
         snapshot.last_sequence += 1;
         snapshot.events.push(Event {
             sequence: snapshot.last_sequence,
             chat_id: snapshot.id,
             loop_id,
-            run_id,
+            run_id: run_id.into(),
             kind: EventKind::Text(text.into()),
         });
     }
@@ -2942,9 +2952,9 @@ mod tests {
     fn event(run_id: Uuid, kind: EventKind) -> Event {
         Event {
             sequence: 1,
-            chat_id: Uuid::nil(),
-            loop_id: Uuid::nil(),
-            run_id,
+            chat_id: Uuid::nil().into(),
+            loop_id: Uuid::nil().into(),
+            run_id: run_id.into(),
             kind,
         }
     }
@@ -3105,9 +3115,9 @@ mod tests {
             EventKind::PermissionRequested {
                 request: PermissionRequest {
                     id: Uuid::new_v4(),
-                    loop_id: Uuid::nil(),
+                    loop_id: Uuid::nil().into(),
                     execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                        run_id: run,
+                        run_id: run.into(),
                         call_id: "read-one".into(),
                     },
                     name: "Read".into(),
@@ -3357,7 +3367,7 @@ mod tests {
         .unwrap();
         snapshot
             .pending_thinking
-            .insert(run_id, "First check\nThen compare".into());
+            .insert(run_id.into(), "First check\nThen compare".into());
 
         let text = transcript_text(&snapshot);
         assert!(text.contains("∴ Thinking…\n\n  First check\n  Then compare"));
@@ -3468,7 +3478,7 @@ mod tests {
         );
         let mut snapshot:ChatSnapshot=serde_json::from_value(json!({"id":Uuid::new_v4(),"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":forged}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
         let run = Uuid::new_v4();
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         assert_eq!(
             super::super::consumed_input_text(&snapshot, run).as_deref(),
             Some(forged.as_str()),
@@ -3600,9 +3610,9 @@ mod tests {
         .unwrap();
         snapshot.permissions.push(PermissionRequest {
             id: Uuid::new_v4(),
-            loop_id,
+            loop_id: loop_id.into(),
             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                run_id,
+                run_id: run_id.into(),
                 call_id: "call-2".into(),
             },
             name: "Bash".into(),
@@ -3613,9 +3623,9 @@ mod tests {
         });
         snapshot.questions.push(QuestionRequest {
             id: Uuid::new_v4(),
-            chat_id,
-            loop_id,
-            run_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             call_id: "call-3".into(),
             questions: vec![Question {
                 question: "Continue?".into(),
@@ -3629,7 +3639,7 @@ mod tests {
             }],
         });
         snapshot.plans.push(Plan {
-            loop_id,
+            loop_id: loop_id.into(),
             version: 1,
             markdown: "private plan".into(),
             approved_execution_mode: None,
@@ -3637,9 +3647,9 @@ mod tests {
         });
         snapshot.events.push(Event {
             sequence: 1,
-            chat_id,
-            loop_id,
-            run_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             kind: EventKind::Failed("connection lost".into()),
         });
 
@@ -3685,9 +3695,9 @@ mod tests {
         let path = directory.path().join("note.txt");
         let request = PermissionRequest {
             id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4().into(),
             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                run_id: Uuid::new_v4(),
+                run_id: Uuid::new_v4().into(),
                 call_id: "write".into(),
             },
             name: "Write".into(),
@@ -4570,9 +4580,9 @@ mod tests {
         );
         let request = PermissionRequest {
             id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4().into(),
             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                run_id: Uuid::new_v4(),
+                run_id: Uuid::new_v4().into(),
                 call_id: "read".into(),
             },
             name: "Read".into(),
@@ -4591,9 +4601,9 @@ mod tests {
         let command = format!("printf {} ; rm important.txt", "long".repeat(2000));
         let mut request = PermissionRequest {
             id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4().into(),
             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                run_id: Uuid::new_v4(),
+                run_id: Uuid::new_v4().into(),
                 call_id: "call".into(),
             },
             name: "Bash".into(),
@@ -4989,7 +4999,7 @@ mod tests {
             {"role":"assistant","content":[{"type":"tool_use","id":"goal-check","name":"UpdateGoal","input":{"status":"complete"}}]},
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"goal-check","content":content,"is_error":true}]}
         ])).unwrap();
-        snapshot.message_runs = [(0, run), (1, run)].into();
+        snapshot.message_runs = [(0, run.into()), (1, run.into())].into();
         assert_eq!(
             tool_call_states(&snapshot)[&(run, "goal-check".into())],
             ToolCallState::Warning

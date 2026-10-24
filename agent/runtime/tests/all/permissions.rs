@@ -257,7 +257,7 @@ async fn invalid_auto_review_request_is_concise_and_not_retried() {
 async fn require_workspace_write_approval(agent: &Agent, chat: Uuid) {
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: Uuid::new_v4(),
                 decision: Decision::Ask,
@@ -1601,7 +1601,7 @@ async fn headless_auto_denies_an_explicit_ask_without_reviewing_or_writing() {
     );
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_workspace_write_approval(&agent, chat).await;
+    require_workspace_write_approval(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     agent.submit(chat, "Write the report".into()).await.unwrap();
     loop {
@@ -2229,7 +2229,7 @@ async fn an_allow_comment_reaches_the_model_after_the_tool_result_without_adding
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_workspace_write_approval(&agent, chat).await;
+    require_workspace_write_approval(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Create the requested file".into())
@@ -2310,7 +2310,7 @@ async fn interrupting_a_pending_permission_preserves_its_unadmitted_recovery_fac
         )])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_workspace_write_approval(&agent, chat).await;
+    require_workspace_write_approval(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, "Create it".into()).await.unwrap();
     loop {
@@ -2429,7 +2429,7 @@ async fn a_deny_comment_explains_the_rejection_and_continues_but_empty_denial_st
         let model = Arc::new(ScriptedModel::new(replies));
         let agent = Agent::new_embedded(config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        require_workspace_write_approval(&agent, chat).await;
+        require_workspace_write_approval(&agent, chat.uuid()).await;
         let mut events = agent.subscribe();
         agent.submit(chat, "Create it".into()).await.unwrap();
         let request = loop {
@@ -2491,7 +2491,7 @@ async fn permission_comments_cannot_create_session_or_persistent_authority() {
             )])),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        require_workspace_write_approval(&agent, chat).await;
+        require_workspace_write_approval(&agent, chat.uuid()).await;
         let mut events = agent.subscribe();
         agent.submit(chat, "Create it".into()).await.unwrap();
         let request = loop {

@@ -45,19 +45,20 @@ fn tool_result(id: &str) -> Content {
 fn run_scenario(recording: &dyn Recording, chat: Uuid, folder: &Path) {
     let run = Uuid::from_u128(0x100);
     let loop_id = Uuid::from_u128(0x200);
-    let mut snapshot = crate::empty_snapshot(chat, Some(folder.into()), ModelConfig::unselected());
+    let mut snapshot =
+        crate::empty_snapshot(chat.into(), Some(folder.into()), ModelConfig::unselected());
     let mut bookkeeping = ChatBookkeeping::default();
     snapshot.messages.push(message(Role::User, "first prompt"));
     snapshot.message_ids.insert(0, Uuid::from_u128(0x1));
-    snapshot.message_runs.insert(0, run);
+    snapshot.message_runs.insert(0, run.into());
     snapshot.chat_loop = LoopSnapshot {
         state: LoopState::Running,
-        run_id: Some(run),
+        run_id: Some(run.into()),
         run_started_at: Some(1),
         state_since: Some(2),
-        ..LoopSnapshot::new(loop_id)
+        ..LoopSnapshot::new(loop_id.into())
     };
-    bookkeeping.run_loops.insert(run, loop_id);
+    bookkeeping.run_loops.insert(run.into(), loop_id.into());
     recording.sync(&snapshot, &bookkeeping);
     recording.flush();
 
@@ -80,20 +81,20 @@ fn run_scenario(recording: &dyn Recording, chat: Uuid, folder: &Path) {
         ],
     });
     snapshot.message_ids.insert(1, Uuid::from_u128(0x2));
-    snapshot.message_runs.insert(1, run);
+    snapshot.message_runs.insert(1, run.into());
     snapshot.messages.push(Message {
         role: Role::User,
         content: vec![tool_result("call-1")],
     });
     snapshot.message_ids.insert(2, Uuid::from_u128(0x3));
-    snapshot.message_runs.insert(2, run);
+    snapshot.message_runs.insert(2, run.into());
     recording.sync(&snapshot, &bookkeeping);
     recording.flush();
 
     snapshot.messages[2].content.push(tool_result("call-2"));
     snapshot.messages.push(message(Role::Assistant, "done"));
     snapshot.message_ids.insert(3, Uuid::from_u128(0x4));
-    snapshot.message_runs.insert(3, run);
+    snapshot.message_runs.insert(3, run.into());
     snapshot.chat_loop.state = LoopState::Idle;
     snapshot.chat_loop.state_since = Some(3);
     recording.sync(&snapshot, &bookkeeping);
@@ -113,7 +114,7 @@ fn run_scenario(recording: &dyn Recording, chat: Uuid, folder: &Path) {
         .messages
         .push(message(Role::Assistant, "rewound answer"));
     snapshot.message_ids = BTreeMap::from([(0, Uuid::from_u128(0x1)), (1, Uuid::from_u128(0x5))]);
-    snapshot.message_runs = BTreeMap::from([(0, run), (1, run)]);
+    snapshot.message_runs = BTreeMap::from([(0, run.into()), (1, run.into())]);
     snapshot
         .messages
         .push(message(Role::System, "summary boundary"));
@@ -222,11 +223,12 @@ impl Recording for StoreRecording {
     }
 
     fn ai_title(&self, chat: Uuid, title: &str) {
-        self.recorder.record_ai_title(chat, title.into());
+        self.recorder.record_ai_title(chat.into(), title.into());
     }
 
     fn replacements(&self, chat: Uuid, records: Vec<ContentReplacementRecord>) {
-        self.recorder.enqueue_content_replacements(chat, records);
+        self.recorder
+            .enqueue_content_replacements(chat.into(), records);
     }
 
     fn truncate(&self, snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping, count: usize) {
@@ -235,7 +237,7 @@ impl Recording for StoreRecording {
 
     fn close(&self, chat: Uuid) {
         self.runtime.block_on(async {
-            self.recorder.queue_metadata_again(chat).await;
+            self.recorder.queue_metadata_again(chat.into()).await;
             self.recorder.flush().await;
         });
     }
@@ -256,10 +258,10 @@ fn the_local_store_writes_the_golden_jsonl() {
         .unwrap();
     let recorder = ChatRecorder::new(Arc::new(store.clone()));
     runtime
-        .block_on(recorder.register_chat(chat, Some(&folder)))
+        .block_on(recorder.register_chat(chat.into(), Some(&folder)))
         .unwrap();
     let recording = StoreRecording { recorder, runtime };
     run_scenario(&recording, chat, &folder);
-    let path = store.chat_path(chat).unwrap();
+    let path = store.chat_path(chat.into()).unwrap();
     assert_golden(&std::fs::read_to_string(path).unwrap(), &folder);
 }

@@ -128,7 +128,7 @@ async fn complete_input(
     };
     tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
-            let snapshot = core.snapshot(chat).await.unwrap();
+            let snapshot = core.snapshot(chat.into()).await.unwrap();
             if snapshot.chat_loop.id == receipt.loop_id
                 && snapshot.chat_loop.run_id == Some(receipt.run_id)
                 && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
@@ -239,7 +239,7 @@ async fn run_cached_navigation_fixture() {
         |fact| matches!(fact, RecoveryFact::AgentOpened { chat } if *chat == target),
     )
     .await;
-    let cached_sequence = core.snapshot(target).await.unwrap().last_sequence;
+    let cached_sequence = core.snapshot(target.into()).await.unwrap().last_sequence;
     write_phase(serde_json::json!({"phase":"target-cached"}));
     wait_for_control("return-source").await;
     forward
@@ -262,7 +262,7 @@ async fn run_cached_navigation_fixture() {
         "NAV-TARGET-ADVANCE",
     )
     .await;
-    let advanced_sequence = core.snapshot(target).await.unwrap().last_sequence;
+    let advanced_sequence = core.snapshot(target.into()).await.unwrap().last_sequence;
     assert!(advanced_sequence > cached_sequence);
     access.armed.store(true, Ordering::SeqCst);
     forward
@@ -289,8 +289,8 @@ async fn run_cached_navigation_fixture() {
     })
     .await
     .unwrap();
-    let source_snapshot = core.snapshot(source).await.unwrap();
-    let target_snapshot = core.snapshot(target).await.unwrap();
+    let source_snapshot = core.snapshot(source.into()).await.unwrap();
+    let target_snapshot = core.snapshot(target.into()).await.unwrap();
     let ObservationValue::Overview(rows) = access
         .daemon
         .observe(ObservationRequest::Overview {

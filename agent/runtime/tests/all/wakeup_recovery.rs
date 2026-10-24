@@ -179,8 +179,8 @@ async fn a_merged_delivery_is_recorded_durably() {
         .deliver_trigger_for_tests(chat, merged.clone(), "merges")
         .await
         .unwrap();
-    let merged_id = tickloop_agent_transcript::input_ids::trigger(chat, &merged.identity());
-    let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
+    let merged_id = tickloop_agent_transcript::input_ids::trigger(chat.uuid(), &merged.identity());
+    let transcript = tickloop_agent_test_support::transcript_file(&root, chat.uuid());
     tokio::time::timeout(WAIT, async {
         loop {
             let recorded = std::fs::read_to_string(&transcript)
@@ -261,12 +261,13 @@ async fn a_triggered_prompt_shows_the_source_it_came_from() {
     model.wait_seen("scheduled-prompt", 1).await;
     agent.shutdown().await;
 
-    let lines: Vec<tickloop_agent_transcript::Line> =
-        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+    let lines: Vec<tickloop_agent_transcript::Line> = std::fs::read_to_string(
+        tickloop_agent_test_support::transcript_file(&root, chat.uuid()),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str(line).ok())
+    .collect();
     let origins: Vec<_> = tickloop_agent_transcript::display::project(&lines)
         .into_iter()
         .filter_map(|node| match node.kind {
@@ -287,7 +288,7 @@ async fn a_triggered_prompt_shows_the_source_it_came_from() {
     assert_eq!(delivery[0].run_id, receipt.run_id);
     assert_eq!(
         delivery[0].input_id,
-        tickloop_agent_transcript::input_ids::trigger(chat, &source.identity())
+        tickloop_agent_transcript::input_ids::trigger(chat.uuid(), &source.identity())
     );
 }
 
@@ -506,7 +507,7 @@ async fn a_takeover_that_cannot_read_the_store_delivers_nothing_until_it_can() {
     wait_for_state(&holder, chat, tickloop_agent_protocol::LoopState::Idle).await;
     holder.shutdown().await;
 
-    let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
+    let transcript = tickloop_agent_test_support::transcript_file(&root, chat.uuid());
     std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
     let refused = other
         .deliver_trigger_for_tests(chat, scheduled("task", 1), "ran-by-the-holder")
@@ -638,8 +639,10 @@ async fn a_process_that_only_loaded_the_chat_ran_nothing_of_it() {
     );
     assert_eq!(model.seen("queued-trigger"), 1, "{:?}", model.prompts());
     holder.flush_transcripts().await;
-    let running =
-        tickloop_agent_transcript::input_ids::trigger(chat, &scheduled("running", 1).identity());
+    let running = tickloop_agent_transcript::input_ids::trigger(
+        chat.uuid(),
+        &scheduled("running", 1).identity(),
+    );
     let deliveries = stored_trigger_deliveries(&root, chat);
     let running = deliveries
         .iter()
@@ -745,7 +748,7 @@ impl WaitingInput {
         Self {
             _directory: directory,
             root,
-            chat,
+            chat: chat.uuid(),
             here,
             model,
             elsewhere,
@@ -758,12 +761,25 @@ impl WaitingInput {
     async fn continue_elsewhere(&self) {
         let _ = self
             .elsewhere
-            .deliver_trigger_for_tests(self.chat, scheduled("other", 1), "delivered-elsewhere")
+            .deliver_trigger_for_tests(
+                tickloop_ids::Id::from(self.chat),
+                scheduled("other", 1),
+                "delivered-elsewhere",
+            )
             .await;
-        complete_turn(&self.elsewhere, self.chat, "continue elsewhere").await;
+        complete_turn(
+            &self.elsewhere,
+            tickloop_ids::Id::from(self.chat),
+            "continue elsewhere",
+        )
+        .await;
         let _ = self
             .elsewhere
-            .deliver_trigger_for_tests(self.chat, scheduled("other", 1), "delivered-elsewhere")
+            .deliver_trigger_for_tests(
+                tickloop_ids::Id::from(self.chat),
+                scheduled("other", 1),
+                "delivered-elsewhere",
+            )
             .await;
     }
 
@@ -797,7 +813,8 @@ async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
     let (here, chat) = (setup.here.clone(), setup.chat);
     // The next permit here takes the lease anew, reads the store and stops before applying it.
     take_the_lease_away(&setup.root);
-    let takeover = here.pause_next_for_tests(chat, PausePoint::TakeoverRead);
+    let takeover =
+        here.pause_next_for_tests(tickloop_ids::Id::from(chat), PausePoint::TakeoverRead);
     setup.model.release_held_turn();
     tokio::time::timeout(WAIT, takeover.entered)
         .await
@@ -806,14 +823,14 @@ async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
 
     let stop = tokio::spawn({
         let here = here.clone();
-        async move { here.stop(chat).await.unwrap() }
+        async move { here.stop(tickloop_ids::Id::from(chat)).await.unwrap() }
     });
     // The stop waits for the takeover before it records and releases anything.
     boundary_waiters(&here, chat, 1).await;
     drop(takeover.release);
     stop.await.unwrap();
     setup.continue_elsewhere().await;
-    complete_turn(&here, chat, "continue here").await;
+    complete_turn(&here, tickloop_ids::Id::from(chat), "continue here").await;
     setup.ran_once().await;
 }
 
@@ -824,11 +841,13 @@ async fn a_stop_during_a_takeover_runs_the_waiting_input_once() {
 async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
-    let stop_tail = here.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
-    let checked = here.pause_next_for_tests(chat, PausePoint::TriggerChecked);
+    let stop_tail =
+        here.pause_next_for_tests(tickloop_ids::Id::from(chat), PausePoint::ReceivingRecorded);
+    let checked =
+        here.pause_next_for_tests(tickloop_ids::Id::from(chat), PausePoint::TriggerChecked);
     let stop = tokio::spawn({
         let here = here.clone();
-        async move { here.stop(chat).await.unwrap() }
+        async move { here.stop(tickloop_ids::Id::from(chat)).await.unwrap() }
     });
     tokio::time::timeout(WAIT, stop_tail.entered)
         .await
@@ -838,7 +857,11 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
     // stop, and the waiting input with it.
     let continued = tokio::spawn({
         let here = here.clone();
-        async move { here.submit(chat, "continue here".into()).await.unwrap() }
+        async move {
+            here.submit(tickloop_ids::Id::from(chat), "continue here".into())
+                .await
+                .unwrap()
+        }
     });
     boundary_waiters(&here, chat, 1).await;
     drop(stop_tail.release);
@@ -861,10 +884,11 @@ async fn an_old_stop_finishing_late_runs_the_waiting_input_once() {
 async fn waiting_trigger_input_starts_once_receiving_is_back_on() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
-    let stop_tail = here.pause_next_for_tests(chat, PausePoint::ReceivingRecorded);
+    let stop_tail =
+        here.pause_next_for_tests(tickloop_ids::Id::from(chat), PausePoint::ReceivingRecorded);
     let stop = tokio::spawn({
         let here = here.clone();
-        async move { here.stop(chat).await.unwrap() }
+        async move { here.stop(tickloop_ids::Id::from(chat)).await.unwrap() }
     });
     tokio::time::timeout(WAIT, stop_tail.entered)
         .await
@@ -872,11 +896,20 @@ async fn waiting_trigger_input_starts_once_receiving_is_back_on() {
         .unwrap();
     let continued = tokio::spawn({
         let here = here.clone();
-        async move { here.submit(chat, "continue here".into()).await.unwrap() }
+        async move {
+            here.submit(tickloop_ids::Id::from(chat), "continue here".into())
+                .await
+                .unwrap()
+        }
     });
     // The Continue's turn ends while its change of the switch waits for the stop.
     setup.model.wait_seen("continue here", 1).await;
-    wait_for_state(&here, chat, tickloop_agent_protocol::LoopState::Idle).await;
+    wait_for_state(
+        &here,
+        tickloop_ids::Id::from(chat),
+        tickloop_agent_protocol::LoopState::Idle,
+    )
+    .await;
     boundary_waiters(&here, chat, 1).await;
     drop(stop_tail.release);
     stop.await.unwrap();
@@ -888,7 +921,7 @@ async fn waiting_trigger_input_starts_once_receiving_is_back_on() {
 /// Waits until `count` wait to enter the Chat's Trigger boundary.
 async fn boundary_waiters(agent: &Agent, chat: Uuid, count: usize) {
     tokio::time::timeout(WAIT, async {
-        while agent.trigger_boundary_waiters_for_tests(chat) != count {
+        while agent.trigger_boundary_waiters_for_tests(tickloop_ids::Id::from(chat)) != count {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
@@ -896,7 +929,7 @@ async fn boundary_waiters(agent: &Agent, chat: Uuid, count: usize) {
     .unwrap_or_else(|_| {
         panic!(
             "{count} wait(s) to enter the boundary, not {}",
-            agent.trigger_boundary_waiters_for_tests(chat)
+            agent.trigger_boundary_waiters_for_tests(tickloop_ids::Id::from(chat))
         )
     });
 }
@@ -936,7 +969,7 @@ async fn a_stop_and_a_continue_leave_the_switch_and_its_record_alike() {
         let agent = agent.clone();
         async move { agent.continue_loop(chat).await.unwrap() }
     });
-    boundary_waiters(&agent, chat, 1).await;
+    boundary_waiters(&agent, chat.uuid(), 1).await;
     drop(changed.release);
     stop.await.unwrap();
     continued.await.unwrap();
@@ -1085,7 +1118,7 @@ impl FaultyProcesses {
         Self {
             _directory: directory,
             root,
-            chat,
+            chat: chat.uuid(),
             first,
             first_store,
             first_model,
@@ -1098,7 +1131,12 @@ impl FaultyProcesses {
     async fn start_while_the_store_refuses(&self) {
         self.first_store.fail_appends();
         self.first_model.release_held_turn();
-        wait_for_notice(&self.first, self.chat, LoopTriggerNoticeKind::Warning).await;
+        wait_for_notice(
+            &self.first,
+            tickloop_ids::Id::from(self.chat),
+            LoopTriggerNoticeKind::Warning,
+        )
+        .await;
         tokio::time::sleep(SETTLE).await;
         assert_eq!(
             self.first_model.seen(Self::MARKER),
@@ -1110,7 +1148,11 @@ impl FaultyProcesses {
     /// The second process takes the lease over, and the input ran once across both.
     async fn taken_over_ran_once(self) {
         self.second
-            .deliver_trigger_for_tests(self.chat, scheduled("after", 1), "taken-over")
+            .deliver_trigger_for_tests(
+                tickloop_ids::Id::from(self.chat),
+                scheduled("after", 1),
+                "taken-over",
+            )
             .await
             .unwrap();
         self.second_model.wait_seen("taken-over", 1).await;
@@ -1164,9 +1206,10 @@ async fn an_abandoned_start_keeps_the_chats_other_records_when_the_store_recover
     let processes = FaultyProcesses::new().await;
     // The held turn ends with its answer while the store refuses writes.
     processes.start_while_the_store_refuses().await;
-    let abandoned = processes
-        .first
-        .pause_next_for_tests(processes.chat, PausePoint::TriggerStartAbandoned);
+    let abandoned = processes.first.pause_next_for_tests(
+        tickloop_ids::Id::from(processes.chat),
+        PausePoint::TriggerStartAbandoned,
+    );
     let shutdown = tokio::spawn({
         let first = processes.first.clone();
         async move { first.shutdown().await }
@@ -1220,7 +1263,10 @@ async fn an_abandoned_start_keeps_the_chats_other_records_when_the_store_recover
 async fn an_abandoned_start_already_being_written_is_taken_back_after_it() {
     let processes = FaultyProcesses::new().await;
     let (first, chat) = (processes.first.clone(), processes.chat);
-    let retrying = first.pause_next_for_tests(chat, PausePoint::TriggerStartRetrying);
+    let retrying = first.pause_next_for_tests(
+        tickloop_ids::Id::from(chat),
+        PausePoint::TriggerStartRetrying,
+    );
     processes.start_while_the_store_refuses().await;
     tokio::time::timeout(WAIT, retrying.entered)
         .await
@@ -1240,7 +1286,10 @@ async fn an_abandoned_start_already_being_written_is_taken_back_after_it() {
     })
     .await
     .expect("the write waits in the store");
-    let abandoned = first.pause_next_for_tests(chat, PausePoint::TriggerStartAbandoned);
+    let abandoned = first.pause_next_for_tests(
+        tickloop_ids::Id::from(chat),
+        PausePoint::TriggerStartAbandoned,
+    );
     let shutdown = tokio::spawn({
         let first = first.clone();
         async move { first.shutdown().await }
@@ -1270,7 +1319,14 @@ async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease
         reason: tickloop_agent_protocol::PauseReason::TranscriptUnavailable,
     };
     tokio::time::timeout(WAIT, async {
-        while first.snapshot(chat).await.unwrap().chat_loop.receiving != paused {
+        while first
+            .snapshot(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .chat_loop
+            .receiving
+            != paused
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
@@ -1279,15 +1335,22 @@ async fn a_start_unrecorded_past_the_budget_pauses_receiving_and_keeps_the_lease
     assert!(
         processes
             .second
-            .deliver_trigger_for_tests(chat, scheduled("elsewhere", 1), "kept-out")
+            .deliver_trigger_for_tests(
+                tickloop_ids::Id::from(chat),
+                scheduled("elsewhere", 1),
+                "kept-out"
+            )
             .await
             .is_err(),
         "the lease stays here"
     );
-    tokio::time::timeout(WAIT, first.submit(chat, "carry on".into()))
-        .await
-        .expect("the user's input is taken meanwhile")
-        .unwrap();
+    tokio::time::timeout(
+        WAIT,
+        first.submit(tickloop_ids::Id::from(chat), "carry on".into()),
+    )
+    .await
+    .expect("the user's input is taken meanwhile")
+    .unwrap();
     processes.first_store.heal();
     processes
         .first_model
@@ -1312,8 +1375,12 @@ async fn a_source_hears_the_chat_is_busy_while_a_start_waits_to_be_recorded() {
     let (delivered, changed) = tokio::time::timeout(
         WAIT,
         futures_util::future::join(
-            first.deliver_trigger_for_tests(chat, scheduled("other", 1), "waits-at-its-source"),
-            first.run_source_change_for_tests(chat, |_| Vec::new()),
+            first.deliver_trigger_for_tests(
+                tickloop_ids::Id::from(chat),
+                scheduled("other", 1),
+                "waits-at-its-source",
+            ),
+            first.run_source_change_for_tests(tickloop_ids::Id::from(chat), |_| Vec::new()),
         ),
     )
     .await
@@ -1339,11 +1406,19 @@ async fn a_source_hears_the_chat_is_busy_while_a_start_waits_to_be_recorded() {
 async fn trigger_input_stopped_before_its_start_is_recorded_waits_for_the_continue() {
     let processes = FaultyProcesses::new().await;
     processes.start_while_the_store_refuses().await;
-    processes.first.stop(processes.chat).await.unwrap();
+    processes
+        .first
+        .stop(tickloop_ids::Id::from(processes.chat))
+        .await
+        .unwrap();
     tokio::time::sleep(SETTLE).await;
     assert_eq!(processes.first_model.seen(FaultyProcesses::MARKER), 0);
     processes.first_store.heal();
-    processes.first.continue_loop(processes.chat).await.unwrap();
+    processes
+        .first
+        .continue_loop(tickloop_ids::Id::from(processes.chat))
+        .await
+        .unwrap();
     processes
         .first_model
         .wait_seen(FaultyProcesses::MARKER, 1)
@@ -1404,11 +1479,12 @@ async fn a_continue_dropped_midway_still_records_the_switch() {
 async fn a_continue_dropped_midway_still_starts_what_waited() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
-    here.stop(chat).await.unwrap();
-    let changed = here.pause_next_for_tests(chat, PausePoint::ReceivingChanged);
+    here.stop(tickloop_ids::Id::from(chat)).await.unwrap();
+    let changed =
+        here.pause_next_for_tests(tickloop_ids::Id::from(chat), PausePoint::ReceivingChanged);
     let continued = tokio::spawn({
         let here = here.clone();
-        async move { here.continue_loop(chat).await }
+        async move { here.continue_loop(tickloop_ids::Id::from(chat)).await }
     });
     tokio::time::timeout(WAIT, changed.entered)
         .await
@@ -1476,7 +1552,7 @@ async fn a_source_change_made_with_an_acceptance_lands_before_its_turn() {
                 *committed_under.lock().unwrap() = Some(receipt.run_id);
                 vec![tickloop_agent_transcript::Line::CustomTitle(
                     tickloop_agent_transcript::CustomTitleEntry {
-                        chat_id: snapshot.id,
+                        chat_id: snapshot.id.uuid(),
                         custom_title: "advanced with the acceptance".into(),
                     },
                 )]
@@ -1486,13 +1562,14 @@ async fn a_source_change_made_with_an_acceptance_lands_before_its_turn() {
         .unwrap();
     model.wait_held("turn").await;
     assert_eq!(*committed_under.lock().unwrap(), Some(receipt.run_id));
-    let accepted = tickloop_agent_transcript::input_ids::trigger(chat, &source.identity());
-    let stored: Vec<tickloop_agent_transcript::Line> =
-        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+    let accepted = tickloop_agent_transcript::input_ids::trigger(chat.uuid(), &source.identity());
+    let stored: Vec<tickloop_agent_transcript::Line> = std::fs::read_to_string(
+        tickloop_agent_test_support::transcript_file(&root, chat.uuid()),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str(line).ok())
+    .collect();
     let acceptance = stored.iter().position(|line| {
         matches!(line, tickloop_agent_transcript::Line::Input(entry) if entry.input_id == accepted)
     });
@@ -1558,7 +1635,10 @@ async fn an_acceptance_is_never_stored_without_its_source_change() {
                     move |snapshot, _| {
                         entered.send(()).unwrap();
                         let _ = going_on.recv();
-                        vec![source_record(snapshot.id, "advanced with the acceptance")]
+                        vec![source_record(
+                            snapshot.id.uuid(),
+                            "advanced with the acceptance",
+                        )]
                     }
                 })
                 .await
@@ -1580,14 +1660,14 @@ async fn an_acceptance_is_never_stored_without_its_source_change() {
     .await
     .expect("the write goes on");
     tokio::time::sleep(SETTLE).await;
-    let accepted = tickloop_agent_transcript::input_ids::trigger(chat, &source.identity());
+    let accepted = tickloop_agent_transcript::input_ids::trigger(chat.uuid(), &source.identity());
     let acceptance_stored = |lines: &[tickloop_agent_transcript::Line]| {
         lines.iter().any(|line| {
             matches!(line, tickloop_agent_transcript::Line::Input(entry)
                 if entry.input_id == accepted)
         })
     };
-    let crash_image = stored_lines(&root, chat);
+    let crash_image = stored_lines(&root, chat.uuid());
     assert_eq!(
         acceptance_stored(&crash_image),
         records_of(&crash_image, "advanced with the acceptance") == 1,
@@ -1598,7 +1678,7 @@ async fn an_acceptance_is_never_stored_without_its_source_change() {
     delivered.await.unwrap().unwrap();
     in_flight.await.unwrap();
     agent.flush_transcripts().await;
-    let stored = stored_lines(&root, chat);
+    let stored = stored_lines(&root, chat.uuid());
     assert!(acceptance_stored(&stored));
     assert_eq!(records_of(&stored, "advanced with the acceptance"), 1);
     model.release_held_turn();
@@ -1670,9 +1750,15 @@ async fn a_start_taken_back_after_a_load_runs_in_the_loader_taking_over() {
         faulty_store(&processes.root),
         loader_model.clone(),
     );
-    loader.resume_chat(chat).await.unwrap();
+    loader
+        .resume_chat(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
 
-    let abandoned = first.pause_next_for_tests(chat, PausePoint::TriggerStartAbandoned);
+    let abandoned = first.pause_next_for_tests(
+        tickloop_ids::Id::from(chat),
+        PausePoint::TriggerStartAbandoned,
+    );
     let shutdown = tokio::spawn({
         let first = first.clone();
         async move { first.shutdown().await }
@@ -1685,7 +1771,7 @@ async fn a_start_taken_back_after_a_load_runs_in_the_loader_taking_over() {
     drop(abandoned.release);
     shutdown.await.unwrap();
 
-    complete_turn(&loader, chat, "taken-over").await;
+    complete_turn(&loader, tickloop_ids::Id::from(chat), "taken-over").await;
     loader_model.wait_seen(FaultyProcesses::MARKER, 1).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(
@@ -1726,7 +1812,7 @@ async fn a_take_finding_its_input_started_by_another_leaves_it_alone() {
         let agent = agent.clone();
         async move { agent.submit(chat, "after the race".into()).await }
     });
-    boundary_waiters(&agent, chat, 2).await;
+    boundary_waiters(&agent, chat.uuid(), 2).await;
     drop(checked.release);
     model.wait_held("raced").await;
     second.await.unwrap().unwrap();
@@ -1841,7 +1927,7 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
             snapshot.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
                 reason: tickloop_agent_protocol::PauseReason::Stopped,
             };
-            vec![source_record(snapshot.id, TAKEN_OVER)]
+            vec![source_record(snapshot.id.uuid(), TAKEN_OVER)]
         })),
         ..Default::default()
     });
@@ -1853,7 +1939,7 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
             chat,
             scheduled("records", 1),
             "recorded-here",
-            move |_, _| vec![source_record(chat, STOP_ELSEWHERE)],
+            move |_, _| vec![source_record(chat.uuid(), STOP_ELSEWHERE)],
         )
         .await
         .unwrap();
@@ -1871,7 +1957,7 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
     assert_eq!(taker_model.seen("held-back"), 0);
     taker.flush_transcripts().await;
     assert_eq!(
-        records_of(&stored_lines(&root, chat), TAKEN_OVER),
+        records_of(&stored_lines(&root, chat.uuid()), TAKEN_OVER),
         1,
         "what the source records as it takes over is stored"
     );
@@ -1884,10 +1970,12 @@ async fn a_source_state_is_taken_over_with_the_lease_before_eligibility() {
 async fn a_source_change_holds_the_lease_while_the_loop_does_not_receive() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
-    here.stop(chat).await.unwrap();
-    here.run_source_change_for_tests(chat, move |_| vec![source_record(chat, "paused goal")])
-        .await
-        .unwrap();
+    here.stop(tickloop_ids::Id::from(chat)).await.unwrap();
+    here.run_source_change_for_tests(tickloop_ids::Id::from(chat), move |_| {
+        vec![source_record(chat, "paused goal")]
+    })
+    .await
+    .unwrap();
     assert_eq!(
         records_of(&stored_lines(&setup.root, chat), "paused goal"),
         1
@@ -1895,7 +1983,9 @@ async fn a_source_change_holds_the_lease_while_the_loop_does_not_receive() {
     // The lease went back: the other process takes it for a change of its own.
     setup
         .elsewhere
-        .run_source_change_for_tests(chat, move |_| vec![source_record(chat, "elsewhere")])
+        .run_source_change_for_tests(tickloop_ids::Id::from(chat), move |_| {
+            vec![source_record(chat, "elsewhere")]
+        })
         .await
         .unwrap();
     setup.model.release_held_turn();
@@ -1910,7 +2000,9 @@ async fn a_source_change_is_refused_while_another_process_holds_the_lease() {
     let (here, chat) = (setup.here.clone(), setup.chat);
     let refused = setup
         .elsewhere
-        .run_source_change_for_tests(chat, move |_| vec![source_record(chat, "refused")])
+        .run_source_change_for_tests(tickloop_ids::Id::from(chat), move |_| {
+            vec![source_record(chat, "refused")]
+        })
         .await;
     assert_eq!(refused, Err("held elsewhere".into()));
     setup.model.release_held_turn();
@@ -1926,7 +2018,7 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     let (here, chat) = (setup.here.clone(), setup.chat);
     let stopping = |record: &'static str| tickloop_agent_runtime::TestSourceState {
         on_stop: Some(Box::new(move |snapshot| {
-            vec![source_record(snapshot.id, record)]
+            vec![source_record(snapshot.id.uuid(), record)]
         })),
         ..Default::default()
     };
@@ -1934,7 +2026,7 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     setup
         .elsewhere
         .register_trigger_source_state_for_tests(stopping("stopped elsewhere"));
-    here.stop(chat).await.unwrap();
+    here.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     assert_eq!(
         records_of(&stored_lines(&setup.root, chat), "stopped here"),
         1
@@ -1946,7 +2038,11 @@ async fn a_stop_lets_the_sources_stop_where_the_lease_is() {
     // The other process learns of the stop as it next takes the lease.
     let withdrawn = setup
         .elsewhere
-        .deliver_trigger_for_tests(chat, scheduled("other", 1), "after-the-stop")
+        .deliver_trigger_for_tests(
+            tickloop_ids::Id::from(chat),
+            scheduled("other", 1),
+            "after-the-stop",
+        )
         .await;
     assert!(withdrawn.is_err(), "{withdrawn:?}");
     assert_eq!(
@@ -1973,15 +2069,17 @@ async fn a_stop_whose_source_records_are_refused_keeps_the_lease_until_they_are_
     );
     first.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
         on_stop: Some(Box::new(|snapshot| {
-            vec![source_record(snapshot.id, STOPPED)]
+            vec![source_record(snapshot.id.uuid(), STOPPED)]
         })),
         ..Default::default()
     });
     processes.first_store.fail_appends();
-    first.stop(chat).await.unwrap();
+    first.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     let change = |second: Agent| async move {
         second
-            .run_source_change_for_tests(chat, |snapshot| vec![source_record(snapshot.id, CHANGED)])
+            .run_source_change_for_tests(tickloop_ids::Id::from(chat), |snapshot| {
+                vec![source_record(snapshot.id.uuid(), CHANGED)]
+            })
             .await
     };
     assert_eq!(
@@ -2018,12 +2116,16 @@ async fn a_stop_away_from_the_lease_says_the_sources_did_not_stop_here() {
     setup.elsewhere.register_trigger_source_state_for_tests(
         tickloop_agent_runtime::TestSourceState {
             on_stop: Some(Box::new(|snapshot| {
-                vec![source_record(snapshot.id, "stopped elsewhere")]
+                vec![source_record(snapshot.id.uuid(), "stopped elsewhere")]
             })),
             ..Default::default()
         },
     );
-    setup.elsewhere.stop(chat).await.unwrap();
+    setup
+        .elsewhere
+        .stop(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     let notices = setup.elsewhere.loop_trigger_notices();
     assert!(
         notices.iter().any(|notice| notice.chat_id == chat
@@ -2049,7 +2151,7 @@ async fn a_continue_lets_the_sources_resume_under_the_lease() {
     let (here, chat) = (setup.here.clone(), setup.chat);
     let resuming = |record: &'static str| tickloop_agent_runtime::TestSourceState {
         on_resume: Some(Box::new(move |snapshot| {
-            vec![source_record(snapshot.id, record)]
+            vec![source_record(snapshot.id.uuid(), record)]
         })),
         ..Default::default()
     };
@@ -2057,12 +2159,14 @@ async fn a_continue_lets_the_sources_resume_under_the_lease() {
     setup
         .elsewhere
         .register_trigger_source_state_for_tests(resuming("resumed elsewhere"));
-    here.stop(chat).await.unwrap();
+    here.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     assert_eq!(
         records_of(&stored_lines(&setup.root, chat), "resumed here"),
         0
     );
-    here.continue_loop(chat).await.unwrap();
+    here.continue_loop(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(
         records_of(&stored_lines(&setup.root, chat), "resumed here"),
         1
@@ -2081,9 +2185,11 @@ async fn a_continue_lets_the_sources_resume_under_the_lease() {
 async fn a_source_record_is_not_written_again_at_exit() {
     let setup = WaitingInput::new().await;
     let (here, chat) = (setup.here.clone(), setup.chat);
-    here.run_source_change_for_tests(chat, move |_| vec![source_record(chat, "recorded once")])
-        .await
-        .unwrap();
+    here.run_source_change_for_tests(tickloop_ids::Id::from(chat), move |_| {
+        vec![source_record(chat, "recorded once")]
+    })
+    .await
+    .unwrap();
     setup.model.release_held_turn();
     setup.elsewhere.shutdown().await;
     here.shutdown().await;
@@ -2102,7 +2208,7 @@ async fn a_compaction_has_the_holder_write_the_source_records_again() {
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     agent.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
         records: Some(Box::new(|snapshot| {
-            vec![source_record(snapshot.id, "as it stands")]
+            vec![source_record(snapshot.id.uuid(), "as it stands")]
         })),
         ..Default::default()
     });
@@ -2113,7 +2219,7 @@ async fn a_compaction_has_the_holder_write_the_source_records_again() {
     tokio::time::timeout(WAIT, async {
         loop {
             agent.flush_transcripts().await;
-            if records_of(&stored_lines(&root, chat), "as it stands") == 1 {
+            if records_of(&stored_lines(&root, chat.uuid()), "as it stands") == 1 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2134,7 +2240,7 @@ async fn a_compaction_by_the_holder_keeps_the_source_records_through_an_exit() {
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
     agent.register_trigger_source_state_for_tests(tickloop_agent_runtime::TestSourceState {
         records: Some(Box::new(|snapshot| {
-            vec![source_record(snapshot.id, "as it stands")]
+            vec![source_record(snapshot.id.uuid(), "as it stands")]
         })),
         ..Default::default()
     });
@@ -2171,7 +2277,7 @@ async fn a_compaction_by_the_holder_keeps_the_source_records_through_an_exit() {
         .await
         .expect("shuts down")
         .unwrap();
-    let stored = stored_lines(&root, chat);
+    let stored = stored_lines(&root, chat.uuid());
     let boundary = stored
         .iter()
         .rposition(|line| {
@@ -2237,7 +2343,7 @@ async fn waiting_trigger_input_runs_once_the_store_reads_again() {
         .unwrap();
     agent.flush_transcripts().await;
     take_the_lease_away(&root);
-    let transcript = tickloop_agent_test_support::transcript_file(&root, chat);
+    let transcript = tickloop_agent_test_support::transcript_file(&root, chat.uuid());
     std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
     model.release_held_turn();
     wait_for_notice(&agent, chat, LoopTriggerNoticeKind::Warning).await;

@@ -155,7 +155,7 @@ pub(super) fn current_cause(
         let Some(id) = snapshot.message_ids.get(&index) else {
             if Some(index) == primary_input {
                 return Ok(MessageCause {
-                    chain_id: receipt.run_id,
+                    chain_id: receipt.run_id.into(),
                     depth: 0,
                     reply_to: None,
                 });
@@ -188,7 +188,7 @@ pub(super) fn current_cause(
         }
     }
     Ok(MessageCause {
-        chain_id: receipt.run_id,
+        chain_id: receipt.run_id.into(),
         depth: 0,
         reply_to: None,
     })
@@ -206,9 +206,9 @@ mod tests {
             message_id: Uuid::new_v4(),
             call_id: Some("send".into()),
             created_at,
-            sender_chat_id: sender,
-            sender_loop_id: Uuid::new_v4(),
-            sender_run_id: Uuid::new_v4(),
+            sender_chat_id: sender.into(),
+            sender_loop_id: Uuid::new_v4().into(),
+            sender_run_id: Uuid::new_v4().into(),
             sender_relationship: "sibling".into(),
             sender_label: "Evidence".into(),
             sender_handle: "audit".into(),
@@ -221,7 +221,7 @@ mod tests {
             is_result: false,
         };
         let mut snapshot = empty_snapshot(
-            Uuid::new_v4(),
+            Uuid::new_v4().into(),
             Some(PathBuf::from("/tmp")),
             ModelConfig::unselected(),
         );
@@ -241,10 +241,13 @@ mod tests {
             reply_to: None,
         };
         assert!(matches!(
-            mailbox.check(sender, &cause, 0, 59999).unwrap_err().code,
+            mailbox
+                .check(sender.into(), &cause, 0, 59999)
+                .unwrap_err()
+                .code,
             FamilyMessageRejectionCode::SenderRateLimit
         ));
-        assert!(mailbox.check(sender, &cause, 0, 60000).is_ok());
+        assert!(mailbox.check(sender.into(), &cause, 0, 60000).is_ok());
     }
 
     #[test]
@@ -257,36 +260,42 @@ mod tests {
             reply_to: None,
         };
         assert!(matches!(
-            mailbox.check(sender, &cause, 0, 0).unwrap_err().code,
+            mailbox.check(sender.into(), &cause, 0, 0).unwrap_err().code,
             FamilyMessageRejectionCode::DepthLimit
         ));
         cause.depth = 8;
         assert!(matches!(
-            mailbox.check(sender, &cause, 128, 0).unwrap_err().code,
+            mailbox
+                .check(sender.into(), &cause, 128, 0)
+                .unwrap_err()
+                .code,
             FamilyMessageRejectionCode::InboxFull
         ));
         for _ in 0..20 {
-            mailbox.check(sender, &cause, 127, 0).unwrap();
-            mailbox.record(sender, &cause, 0);
-        }
-        assert!(matches!(
-            mailbox.check(sender, &cause, 0, 59_999).unwrap_err().code,
-            FamilyMessageRejectionCode::SenderRateLimit
-        ));
-        mailbox.check(sender, &cause, 0, 60_000).unwrap();
-        for index in 20..64 {
-            let peer = Uuid::from_u128(index as u128 + 100);
-            mailbox.check(peer, &cause, 0, 60_000).unwrap();
-            mailbox.record(peer, &cause, 60_000);
+            mailbox.check(sender.into(), &cause, 127, 0).unwrap();
+            mailbox.record(sender.into(), &cause, 0);
         }
         assert!(matches!(
             mailbox
-                .check(Uuid::new_v4(), &cause, 0, 60_000)
+                .check(sender.into(), &cause, 0, 59_999)
+                .unwrap_err()
+                .code,
+            FamilyMessageRejectionCode::SenderRateLimit
+        ));
+        mailbox.check(sender.into(), &cause, 0, 60_000).unwrap();
+        for index in 20..64 {
+            let peer = Uuid::from_u128(index as u128 + 100);
+            mailbox.check(peer.into(), &cause, 0, 60_000).unwrap();
+            mailbox.record(peer.into(), &cause, 60_000);
+        }
+        assert!(matches!(
+            mailbox
+                .check(Uuid::new_v4().into(), &cause, 0, 60_000)
                 .unwrap_err()
                 .code,
             FamilyMessageRejectionCode::ChainLimit
         ));
         cause.chain_id = Uuid::new_v4();
-        mailbox.check(sender, &cause, 0, 60_000).unwrap();
+        mailbox.check(sender.into(), &cause, 0, 60_000).unwrap();
     }
 }

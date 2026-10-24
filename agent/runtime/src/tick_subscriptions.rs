@@ -15,6 +15,8 @@
 //! [`Agent::deliver_trigger`] as soon as the Loop can take it: it receives and its turn ended.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use tickloop_agent_protocol::{SubscriptionId, SubscriptionKind};
+use tickloop_ids::{IdContext, ModelRef};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -172,7 +174,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             "action":{"type":"string","enum":["subscribe","unsubscribe"]},
             "tick_instance_id":{"type":"string","minLength":3,"description":"Required for subscribe."},
             "frequency":{"type":"string","enum":frequencies,"description":"Optional for subscribe; not accepted for unsubscribe."},
-            "subscription":{"type":"string","format":"uuid","description":"Required for unsubscribe."}
+            "subscription":{"type":"string","minLength":1,"description":"Required for unsubscribe: the subscription id a subscribe returned."}
         },"required":["action"],"additionalProperties":false}),
     }]
 }
@@ -214,7 +216,7 @@ pub(super) fn subscription_request(
 #[serde(deny_unknown_fields)]
 struct TickUnsubscribeInput {
     action: String,
-    subscription: Uuid,
+    subscription: ModelRef<SubscriptionKind>,
 }
 
 #[derive(Default)]
@@ -407,11 +409,11 @@ impl DeliveryItem {
     }
 
     /// The item's fields beside its data, the text its Tick reports in them bounded.
-    fn header(&self) -> Value {
+    fn header(&self, ids: &IdContext) -> Value {
         let mut header = json!({
-            "subscription": self.subscription,
-            "watch": self.watch,
-            "instance": self.instance,
+            "subscription": ids.model_text(SubscriptionId::from(self.subscription)),
+            "watch": ids.model_text(WatchId::from(self.watch)),
+            "instance": self.instance.model_text(ids),
             "updates": self.updates,
             "seq": span(&self.first_sequence.to_string(), &self.sequence.to_string()),
             "between": bounded_text(&span(&self.first_observed_at, &self.observed_at)),
@@ -662,7 +664,7 @@ impl TickDeliveries {
                         && runtime.authority == configured.authority
                 })
             {
-                item.watch = runtime.watch;
+                item.watch = runtime.watch.into();
             }
         }
     }
@@ -724,11 +726,11 @@ impl TickDeliveries {
                 self.subscriptions
                     .values()
                     .filter(|subscription| subscription.blocked.is_none())
-                    .map(|subscription| (subscription.watch, subscription.chat_id))
+                    .map(|subscription| (subscription.watch, subscription.chat_id.uuid()))
                     .chain(
                         self.monitor_watches
                             .iter()
-                            .map(|((chat, _), watch)| (watch.watch, *chat)),
+                            .map(|((chat, _), watch)| (watch.watch, chat.uuid())),
                     )
                     .collect(),
             );
@@ -1336,7 +1338,12 @@ impl Agent {
             .ok_or_else(|| AgentError::Invalid("Tick stream is unavailable".into()))?;
         let input = json!({"tick_instance_id": instance});
         let watch = port
-            .prepare_watch(chat_id, instance, &input, self.inner.shutdown.child_token())
+            .prepare_watch(
+                chat_id.into(),
+                instance,
+                &input,
+                self.inner.shutdown.child_token(),
+            )
             .await
             .map_err(AgentError::Invalid)?;
         let authority = watch
@@ -1367,14 +1374,14 @@ impl Agent {
             )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let session = self.inner.session_permissions.lock().await.evaluate(
-                PermissionOwner::new(chat_id, loop_id)
+                PermissionOwner::new(chat_id.into(), loop_id.into())
                     .map_err(|error| AgentError::Invalid(error.to_string()))?,
                 &operation,
             );
             if chat.snapshot.policy.explicit_match_with_session(
                 policy_name,
                 permission_input,
-                loop_id,
+                loop_id.into(),
                 session.decision,
             ) == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny)
             {
@@ -1385,14 +1392,14 @@ impl Agent {
         }
         if let Some(admission) = &admission {
             crate::tick_stream::PreparedTickWatch::revalidate(
-                chat_id,
+                chat_id.into(),
                 admission,
                 self.inner.shutdown.child_token(),
             )
             .await
             .map_err(AgentError::Invalid)?;
         }
-        port.revalidate_watch(chat_id, instance, authority.as_ref())
+        port.revalidate_watch(chat_id.into(), instance, authority.as_ref())
             .await
             .map_err(AgentError::Invalid)?;
         Ok(authority)
@@ -1450,7 +1457,7 @@ impl Agent {
                 deliveries.monitor_watches.insert(
                     key,
                     MonitorWatch {
-                        watch: Uuid::new_v4(),
+                        watch: tickloop_ids::generate().into(),
                         authority: authority.clone(),
                         ready: false,
                         series: Vec::new(),
@@ -1485,7 +1492,7 @@ impl Agent {
         .map_err(|_| AgentError::Invalid("The Tick did not become ready for Send Update".into()))?;
         let through_ms = crate::monitor_members::now_ms();
         let observation =
-            tokio::time::timeout(SAMPLE_TIMEOUT, port.read_current(chat_id, &instance))
+            tokio::time::timeout(SAMPLE_TIMEOUT, port.read_current(chat_id.into(), &instance))
                 .await
                 .map_err(|_| AgentError::Invalid("Reading the Tick timed out".into()))?
                 .map_err(AgentError::Invalid)?
@@ -1504,7 +1511,8 @@ impl Agent {
                 "Tick authority changed while reading".into(),
             ));
         }
-        let mut header = json!({"instance":instance,"seq":observation.sequence.to_string(),"kind":observation.kind,"updates":1,"through_ms":through_ms});
+        let ids = self.chat_ids(chat_id).await;
+        let mut header = json!({"instance":instance.model_text(&ids),"seq":observation.sequence.to_string(),"kind":observation.kind,"updates":1,"through_ms":through_ms});
         if let Some(title) = title {
             header["title"] = json!(bounded_text(&title));
         }
@@ -1584,7 +1592,7 @@ impl Agent {
         let input =
             json!({"action":"subscribe","tick_instance_id": instance, "frequency": frequency});
         let watch = port
-            .prepare_watch(chat_id, &instance, &input, CancellationToken::new())
+            .prepare_watch(chat_id.into(), &instance, &input, CancellationToken::new())
             .await
             .map_err(AgentError::Invalid)?;
         let (authority, admission) = match watch {
@@ -1617,14 +1625,14 @@ impl Agent {
             )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let session = self.inner.session_permissions.lock().await.evaluate(
-                PermissionOwner::new(chat_id, loop_id)
+                PermissionOwner::new(chat_id.into(), loop_id.into())
                     .map_err(|error| AgentError::Invalid(error.to_string()))?,
                 &session_operation,
             );
             let decision = chat.snapshot.policy.explicit_match_with_session(
                 policy_name,
                 permission_input,
-                loop_id,
+                loop_id.into(),
                 session.decision,
             );
             if decision == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny)
@@ -1643,7 +1651,7 @@ impl Agent {
         }
         subscriptions.push(TickSubscription {
             paused: false,
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             instance,
             frequency,
             authority,
@@ -1701,14 +1709,16 @@ impl Agent {
             .iter()
             .find(|subscription| subscription.instance == instance)
         {
+            let ids = self.chat_ids(receipt.chat_id).await;
             return Err(format!(
                 "this Chat already subscribes to Tick Instance {} as {}; cancel it with {TICK_MANAGE} before subscribing at another frequency",
-                existing.instance, existing.id
+                existing.instance.model_text(&ids),
+                ids.model_text(SubscriptionId::from(existing.id))
             ));
         }
         let subscription = TickSubscription {
             paused: false,
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             instance,
             frequency,
             authority,
@@ -1720,9 +1730,10 @@ impl Agent {
         let (ready, link) = self
             .wait_for_subscription_ready(subscription.id, &run_cancel)
             .await;
+        let ids = self.chat_ids(receipt.chat_id).await;
         let mut answer = json!({
-            "subscription": subscription.id,
-            "tick_instance_id": subscription.instance,
+            "subscription": ids.model_text(SubscriptionId::from(subscription.id)),
+            "tick_instance_id": subscription.instance.model_text(&ids),
             "frequency": subscription.frequency,
             "paused": subscription.paused,
             "receiving": is_receiving,
@@ -1785,17 +1796,20 @@ impl Agent {
         if input.action != "unsubscribe" {
             return Err("TickManage requires action=unsubscribe here".into());
         }
+        let ids = self.chat_ids(receipt.chat_id).await;
+        let not_found = || tickloop_ids::not_found::<SubscriptionKind>(input.subscription.as_str());
+        let subscription = ids.resolve(&input.subscription).map_err(|_| not_found())?;
         self.update_tick_subscription(
             receipt.chat_id,
-            input.subscription,
+            subscription.uuid(),
             TickSubscriptionChange::Cancel,
         )
         .await
         .map_err(|error| match error {
-            AgentError::NotFound => format!("subscription {} does not exist", input.subscription),
+            AgentError::NotFound => not_found(),
             error => error.to_string(),
         })?;
-        Ok(json!({"subscription": input.subscription, "cancelled": true}).to_string())
+        Ok(json!({"subscription": ids.model_text(subscription), "cancelled": true}).to_string())
     }
 
     /// Reconciles the runtime with the subscriptions of every loaded Chat's Loop and republishes
@@ -1943,7 +1957,7 @@ impl Agent {
                                 loop_id,
                                 instance: subscription.instance.clone(),
                                 authority: subscription.authority.clone(),
-                                watch: Uuid::new_v4(),
+                                watch: tickloop_ids::generate().into(),
                                 ready: false,
                                 link: TickLinkState::Initializing,
                                 blocked: None,
@@ -2098,7 +2112,7 @@ impl Agent {
                 .and_then(|runtime| runtime.authority.clone());
             let admitted = match &port {
                 Some(port) => port
-                    .revalidate_watch(chat_id, &item.instance, authority.as_ref())
+                    .revalidate_watch(chat_id.into(), &item.instance, authority.as_ref())
                     .await
                     .is_ok(),
                 None => false,
@@ -2125,7 +2139,7 @@ impl Agent {
                     .get(&item.subscription)
                     .and_then(|runtime| runtime.authority.clone());
                 let current = match &port {
-                    Some(port) => port.read_current(chat_id, &item.instance).await,
+                    Some(port) => port.read_current(chat_id.into(), &item.instance).await,
                     None => Ok(None),
                 };
                 let put_back = self
@@ -2149,7 +2163,7 @@ impl Agent {
                 }
                 let still_admitted = match &port {
                     Some(port) => port
-                        .revalidate_watch(chat_id, &item.instance, authority.as_ref())
+                        .revalidate_watch(chat_id.into(), &item.instance, authority.as_ref())
                         .await
                         .is_ok(),
                     None => false,
@@ -2194,7 +2208,7 @@ impl Agent {
         if items.is_empty() {
             return;
         }
-        {
+        let ids = {
             let chats = self.inner.chats.lock().await;
             if let Some(chat) = chats.get(&chat_id) {
                 for item in &mut items {
@@ -2210,20 +2224,23 @@ impl Agent {
                     }
                 }
             }
-        }
+            chats
+                .get(&chat_id)
+                .map_or_else(IdContext::new, |chat| chat.ids)
+        };
         let FittedDelivery {
             payload,
             delivered: items,
             deferred,
             summary,
-        } = fit_delivery(items);
+        } = fit_delivery(&ids, items);
         if !deferred.is_empty() {
             // Held, they flush as soon as the run this delivery starts ends.
             self.tick_deliveries().restore(owner, deferred);
         }
         let marks = {
             let deliveries = self.tick_deliveries();
-            let delivery = Uuid::new_v4();
+            let delivery = tickloop_ids::generate();
             items
                 .iter()
                 .map(|item| {
@@ -2247,7 +2264,7 @@ impl Agent {
                 .iter()
                 .map(|item| TickDeliveryItem {
                     subscription: item.subscription,
-                    watch: item.watch,
+                    watch: item.watch.into(),
                     instance: item.instance.clone(),
                     sequence: item.sequence,
                     updates: item.updates,
@@ -2438,7 +2455,11 @@ impl Agent {
             .ok_or_else(|| AgentError::Invalid("Tick stream is unavailable".into()))?;
         for binding in bindings {
             if let Err(error) = port
-                .revalidate_watch(chat_id, &binding.instance, binding.authority.as_ref())
+                .revalidate_watch(
+                    chat_id.into(),
+                    &binding.instance,
+                    binding.authority.as_ref(),
+                )
                 .await
             {
                 self.tick_deliveries().apply_event(TickStreamEvent::State {
@@ -2595,7 +2616,7 @@ impl Agent {
             None
         };
         let event = if let Some((watch, (chat, instance, previous), port)) = resume {
-            match port.read_current(chat, &instance).await {
+            match port.read_current(chat.into(), &instance).await {
                 Ok(Some(mut observation))
                     if previous.is_some_and(|sequence| observation.sequence > sequence) =>
                 {
@@ -2757,7 +2778,7 @@ struct DeliveryNotes {
 /// first item always goes, which still keeps the cap: its allowance is no more than what the
 /// delivery has left, and [`DeliveryItem::delivered`] keeps within it whenever its header does,
 /// which bounds every field a Tick reports.
-fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
+fn fit_delivery(ids: &IdContext, items: Vec<DeliveryItem>) -> FittedDelivery {
     let worst_notes = DeliveryNotes {
         is_trimmed: true,
         is_screen_trimmed: true,
@@ -2776,7 +2797,7 @@ fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
     let mut deferred = Vec::new();
     let mut lines = Vec::new();
     for item in items {
-        let header = item.header();
+        let header = item.header(ids);
         // Each item after the first is preceded by a comma.
         let separator = usize::from(!delivered.is_empty());
         // One that would not fit even without its data waits untrimmed.
@@ -3008,7 +3029,7 @@ mod put_back_tests {
         DeliveryItem {
             title: None,
             subscription,
-            watch: Uuid::nil(),
+            watch: Uuid::nil().into(),
             instance: instance.clone(),
             first_sequence: sequence,
             first_observed_at: String::new(),
@@ -3030,7 +3051,7 @@ mod put_back_tests {
     #[tokio::test]
     async fn deliveries_put_back_out_of_order_keep_the_newest_update_and_its_data() {
         let mut deliveries = TickDeliveries::default();
-        let owner = (Uuid::new_v4(), Uuid::new_v4());
+        let owner = (ChatId::new(), LoopId::new());
         let subscription = Uuid::new_v4();
         let instance: InstanceRef = "calendar:fixture".parse().unwrap();
         deliveries.restore(owner, vec![item(subscription, &instance, 2)]);

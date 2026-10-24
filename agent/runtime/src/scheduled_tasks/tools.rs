@@ -2,12 +2,13 @@
 //! CronDelete and ScheduleWakeup.
 
 use std::time::Duration;
+use tickloop_agent_protocol::ScheduledTaskIdKind;
+use tickloop_ids::ModelRef;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tickloop_agent_cron::Schedule;
 use tickloop_agent_protocol::{MAX_SCHEDULED_TASK_TITLE_CHARS, ToolDefinition};
-use uuid::Uuid;
 
 use super::tasks::{CronTask, TaskRules, duration_words, rate, title};
 use crate::host_tools::HostToolPermission;
@@ -86,14 +87,14 @@ pub(crate) enum ScheduledTaskCall {
     },
     List,
     Update {
-        id: Uuid,
+        id: ModelRef<ScheduledTaskIdKind>,
         cron: Option<String>,
         prompt: Option<String>,
         recurring: Option<bool>,
         title: Option<String>,
     },
     Delete {
-        id: Uuid,
+        id: ModelRef<ScheduledTaskIdKind>,
     },
     Wakeup {
         delay: Duration,
@@ -135,13 +136,6 @@ struct UpdateInput {
 #[serde(deny_unknown_fields)]
 struct DeleteInput {
     id: String,
-}
-
-/// A task id the model passed, with a message that says where ids come from.
-fn task_id(text: &str) -> Result<Uuid, String> {
-    text.trim().parse().map_err(|_| {
-        format!("`{text}` is not a task id; {CRON_LIST_TOOL_NAME} gives each task's id")
-    })
 }
 
 #[derive(Deserialize)]
@@ -204,7 +198,7 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
                 .transpose()
                 .map_err(|error| error.to_string())?;
             Ok(ScheduledTaskCall::Update {
-                id: task_id(&input.id)?,
+                id: ModelRef::new(input.id),
                 cron: input.cron,
                 prompt: input.prompt,
                 recurring: input.recurring,
@@ -214,7 +208,7 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
         CRON_DELETE_TOOL_NAME => {
             let input: DeleteInput = serde_json::from_value(input.clone()).map_err(invalid)?;
             Ok(ScheduledTaskCall::Delete {
-                id: task_id(&input.id)?,
+                id: ModelRef::new(input.id),
             })
         }
         SCHEDULE_WAKEUP_TOOL_NAME => {
@@ -345,7 +339,7 @@ Returns the changed task, as {CRON_CREATE_TOOL_NAME} returns a new one.",
                 zone = terms.zone.name(),
             ),
             input_schema: json!({"type":"object","properties":{
-                "id":{"type":"string","description":"The task id, a UUID."},
+                "id":{"type":"string","description":format!("The task id {CRON_CREATE_TOOL_NAME} or {CRON_LIST_TOOL_NAME} returned.")},
                 "cron":{"type":"string","description":"A new standard 5-field cron expression in the user's local time zone: \"M H DoM Mon DoW\"."},
                 "prompt":{"type":"string","minLength":1,"description":"A new prompt to run at each scheduled time."},
                 "recurring":{"type":"boolean","description":"true runs at every time the expression names; false runs once at the next one, then deletes the task."},
@@ -356,7 +350,7 @@ Returns the changed task, as {CRON_CREATE_TOOL_NAME} returns a new one.",
             name: CRON_DELETE_TOOL_NAME.into(),
             description: format!("Cancel a scheduled task of this Chat by its id, as {CRON_CREATE_TOOL_NAME} or {CRON_LIST_TOOL_NAME} gave it."),
             input_schema: json!({"type":"object","properties":{
-                "id":{"type":"string","description":"The task id, a UUID."}
+                "id":{"type":"string","description":format!("The task id {CRON_CREATE_TOOL_NAME} or {CRON_LIST_TOOL_NAME} returned.")}
             },"required":["id"],"additionalProperties":false}),
         },
         ToolDefinition {

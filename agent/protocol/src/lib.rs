@@ -28,6 +28,7 @@ mod loops;
 mod model;
 mod model_availability;
 mod model_card;
+pub mod model_ids;
 mod monitor;
 mod permissions;
 mod permissions_view;
@@ -133,7 +134,12 @@ pub use hosted::{
     ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedMember, HostedMemberState, HostedProgramExit,
     HostedViewGrant, VIEW_PANE_ENVIRONMENT,
 };
-pub use ids::ChatId;
+pub use ids::{
+    AgentMessageId, AgentMessageKind, ChatId, ChatKind, DelegationId, DelegationKind, HostedRunId,
+    HostedRunKind, InputKind, LoopKind, MessageChainId, MessageChainKind, OperationId,
+    OperationKind, ResponseKind, RunKind, ScheduledTaskId, ScheduledTaskIdKind, SharedTaskId,
+    SharedTaskKind, ShellTaskId, ShellTaskKind, SubscriptionId, SubscriptionKind,
+};
 pub use image::{Image, ImageMediaType};
 pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};

@@ -39,7 +39,10 @@ fn update(instance: u64, sequence: u64, phase: &str) -> TickObservation {
     }
 }
 
-fn audience(stream: &InMemoryTickStream, instance: u64) -> Vec<Uuid> {
+fn audience(
+    stream: &InMemoryTickStream,
+    instance: u64,
+) -> Vec<tickloop_agent_runtime::tick_stream::WatchId> {
     stream
         .watches()
         .into_iter()
@@ -107,7 +110,7 @@ async fn subscribed_agent(
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
-    (agent, stream, chat, receipt.loop_id)
+    (agent, stream, chat.uuid(), receipt.loop_id.uuid())
 }
 
 fn subscription_tool_result(model: &ScriptedModel) -> serde_json::Value {
@@ -241,12 +244,15 @@ async fn a_delivery_to_a_chat_pursuing_a_goal_carries_it_as_background() {
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     // Plan mode holds the goal's own continuations; Tick deliveries still arrive.
     agent
-        .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::Plan)
+        .set_execution_mode(
+            tickloop_ids::Id::from(chat),
+            tickloop_agent_protocol::ExecutionMode::Plan,
+        )
         .await
         .unwrap();
     agent
         .manage_goal(
-            chat,
+            tickloop_ids::Id::from(chat),
             tickloop_agent_protocol::GoalAction::Set {
                 objective: "keep the quote panel current".into(),
                 token_budget: None,
@@ -328,10 +334,18 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_merg
 
     assert_eq!(stream.watched(), BTreeSet::from([fixture_instance(7)]));
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        agent
+            .snapshot(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .chat_loop
+            .state,
         LoopState::Idle
     );
-    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
+    let subscriptions = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(subscriptions.len(), 1);
     assert_eq!(subscriptions[0].frequency, TickSubscriptionFrequency::High);
     assert_eq!(TickSubscriptionFrequency::High.period(), Some(HIGH_PERIOD));
@@ -340,14 +354,17 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_merg
         stream.push(update(7, sequence, phase));
     }
     settle().await;
-    let waiting = agent.tick_subscriptions(chat).await.unwrap();
+    let waiting = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(waiting[0].accumulated, 3);
     let updated = waiting[0]
         .updated_at_ms
         .expect("the subscription knows when the instance last updated");
     assert!(
         agent
-            .snapshot(chat)
+            .snapshot(tickloop_ids::Id::from(chat))
             .await
             .unwrap()
             .monitor
@@ -359,7 +376,11 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_merg
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
-    let monitor = agent.snapshot(chat).await.unwrap().monitor;
+    let monitor = agent
+        .snapshot(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()
+        .monitor;
     assert!(
         monitor
             .handled_at(&fixture_instance(7))
@@ -395,7 +416,10 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_merg
     assert_eq!(items[0].updates, 3);
     assert!(!items[0].is_trimmed);
 
-    let after = agent.tick_subscriptions(chat).await.unwrap();
+    let after = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(after[0].accumulated, 0);
     assert_eq!(
         after[0].last_delivery.as_deref(),
@@ -428,7 +452,11 @@ async fn a_periodic_status_reports_its_next_check_on_the_wall_clock_and_restarts
     // The Agent's schedule runs on the paused test clock while the status reports wall-clock
     // milliseconds, so each reading is compared as the time left until the next check.
     let time_left = async || {
-        let row = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        let row = agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(row.period_ms, Some(period_ms), "{row:?}");
         let next_check = row
             .next_check_at_ms
@@ -473,11 +501,14 @@ async fn the_user_subscribes_a_tick_on_the_chats_loop_at_high_unless_refused() {
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model).await;
 
     agent
-        .tick_subscribe_for_user(chat, fixture_instance(8))
+        .tick_subscribe_for_user(tickloop_ids::Id::from(chat), fixture_instance(8))
         .await
         .unwrap();
     settle().await;
-    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    let rows = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     let added = rows
         .iter()
         .find(|row| row.instance == fixture_instance(8))
@@ -486,7 +517,7 @@ async fn the_user_subscribes_a_tick_on_the_chats_loop_at_high_unless_refused() {
     assert!(stream.watched().contains(&fixture_instance(8)));
 
     let again = agent
-        .tick_subscribe_for_user(chat, fixture_instance(7))
+        .tick_subscribe_for_user(tickloop_ids::Id::from(chat), fixture_instance(7))
         .await
         .unwrap_err()
         .to_string();
@@ -504,7 +535,7 @@ async fn the_user_subscribes_a_tick_on_the_chats_loop_at_high_unless_refused() {
 
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![tickloop_agent_protocol::PermissionRule {
                 id: Uuid::new_v4(),
                 decision: tickloop_agent_protocol::Decision::Deny,
@@ -518,14 +549,14 @@ async fn the_user_subscribes_a_tick_on_the_chats_loop_at_high_unless_refused() {
         .await
         .unwrap();
     let denied = agent
-        .tick_subscribe_for_user(chat, fixture_instance(9))
+        .tick_subscribe_for_user(tickloop_ids::Id::from(chat), fixture_instance(9))
         .await
         .unwrap_err()
         .to_string();
     assert!(denied.contains("Deny"), "{denied}");
     assert!(
         agent
-            .tick_subscriptions(chat)
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
             .await
             .unwrap()
             .iter()
@@ -554,21 +585,40 @@ async fn a_reopened_instance_takes_over_the_lost_subscriptions_only_when_asked()
     };
 
     agent
-        .replace_tick_subscriptions(chat, &fixture_instance(7), &fixture_instance(70), true)
+        .replace_tick_subscriptions(
+            tickloop_ids::Id::from(chat),
+            &fixture_instance(7),
+            &fixture_instance(70),
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
-        instances(&agent.tick_subscriptions(chat).await.unwrap()),
+        instances(
+            &agent
+                .tick_subscriptions(tickloop_ids::Id::from(chat))
+                .await
+                .unwrap()
+        ),
         [(fixture_instance(70), TickSubscriptionFrequency::Medium)],
         "the Loop follows the new instance at the frequency it had"
     );
 
     agent
-        .replace_tick_subscriptions(chat, &fixture_instance(70), &fixture_instance(71), false)
+        .replace_tick_subscriptions(
+            tickloop_ids::Id::from(chat),
+            &fixture_instance(70),
+            &fixture_instance(71),
+            false,
+        )
         .await
         .unwrap();
     assert!(
-        agent.tick_subscriptions(chat).await.unwrap().is_empty(),
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .is_empty(),
         "without restoring, the lost instance's subscriptions just end"
     );
     agent.shutdown().await;
@@ -648,7 +698,11 @@ async fn a_period_without_updates_costs_no_model_call() {
 
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .accumulated,
         0
     );
     assert!(stream.is_open());
@@ -716,7 +770,11 @@ async fn a_terminal_subscription_samples_the_screen_once_each_period() {
     let delivered = last_user_text(&model);
     assert!(delivered.contains("\"code\":0"), "{delivered}");
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].kind,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .kind,
         Some(ObservationKind::Terminal { truncated: false })
     );
     agent.shutdown().await;
@@ -756,7 +814,10 @@ async fn a_terminal_exit_is_delivered_at_once_without_waiting_for_the_period() {
     let delivered = last_user_text(&model);
     assert!(delivered.contains("error: no quote"), "{delivered}");
     assert!(delivered.contains("\"code\":3"), "{delivered}");
-    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    let status = &agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0];
     assert_eq!(status.accumulated, 0);
     assert!(!status.has_pending_change);
     assert_eq!(status.program_exit.unwrap().code, Some(3));
@@ -781,20 +842,31 @@ async fn the_pending_clock_starts_at_the_first_change_and_survives_newer_updates
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model).await;
     assert!(
-        agent.tick_subscriptions(chat).await.unwrap()[0]
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
             .pending_since_ms
             .is_none()
     );
     tokio::time::advance(Duration::from_secs(49)).await;
     stream.push(update(7, 1, "first"));
     settle().await;
-    let status = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+    let status = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()
+        .remove(0);
     let wait = status.next_check_at_ms.unwrap() - status.pending_since_ms.unwrap();
     assert!((10_900..=11_100).contains(&wait), "{status:?}");
     tokio::time::advance(Duration::from_secs(5)).await;
     stream.push(update(7, 2, "newer"));
     settle().await;
-    let status = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+    let status = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()
+        .remove(0);
     let wait = status.next_check_at_ms.unwrap() - status.pending_since_ms.unwrap();
     assert!(
         (10_900..=11_100).contains(&wait),
@@ -804,7 +876,10 @@ async fn the_pending_clock_starts_at_the_first_change_and_survives_newer_updates
     tokio::time::advance(Duration::from_secs(6)).await;
     wait_for_completion(&mut events).await;
     assert!(
-        agent.tick_subscriptions(chat).await.unwrap()[0]
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
             .pending_since_ms
             .is_none()
     );
@@ -833,7 +908,10 @@ async fn a_screen_change_waits_for_its_check_and_one_changed_back_delivers_nothi
 
     stream.emit(changed(true));
     settle().await;
-    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    let status = &agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0];
     assert!(status.has_pending_change, "{status:?}");
     assert!(status.pending_since_ms.is_some());
     assert_eq!(status.accumulated, 0, "a change is no Tick Update yet");
@@ -850,7 +928,13 @@ async fn a_screen_change_waits_for_its_check_and_one_changed_back_delivers_nothi
         2,
         "a screen changed back wakes nothing"
     );
-    assert!(!agent.tick_subscriptions(chat).await.unwrap()[0].has_pending_change);
+    assert!(
+        !agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .has_pending_change
+    );
 
     stream.emit(changed(true));
     stream.change_on_next_sample(screen(9, 8, "$ quote 700.HK", serde_json::Value::Null));
@@ -859,7 +943,10 @@ async fn a_screen_change_waits_for_its_check_and_one_changed_back_delivers_nothi
     wait_for_completion(&mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     assert!(last_user_text(&model).contains("$ quote 700.HK"));
-    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    let status = &agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0];
     assert!(!status.has_pending_change, "{status:?}");
     assert!(status.pending_since_ms.is_none());
     assert_eq!(status.accumulated, 0);
@@ -886,7 +973,11 @@ async fn an_update_for_an_instance_nobody_subscribed_to_never_reaches_a_loop() {
 
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .accumulated,
         0
     );
     agent.shutdown().await;
@@ -1075,17 +1166,36 @@ async fn unsubscribing_ends_a_subscription_and_stopping_pauses_it() {
         BTreeSet::from([fixture_instance(7), fixture_instance(8)])
     );
 
-    let first = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    let first = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0]
+        .id;
     agent
-        .update_tick_subscription(chat, first, TickSubscriptionChange::Cancel)
+        .update_tick_subscription(
+            tickloop_ids::Id::from(chat),
+            first,
+            TickSubscriptionChange::Cancel,
+        )
         .await
         .unwrap();
-    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
+    assert_eq!(
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(stream.watched().len(), 1);
 
-    agent.stop(chat).await.unwrap();
+    agent.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap().len(),
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .len(),
         1,
         "a paused Loop keeps its subscription"
     );
@@ -1122,19 +1232,27 @@ async fn changing_frequency_preserves_pending_content_until_delivery() {
             stream.push(update(7, 1, "pending content"));
         }
         settle().await;
-        let before = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        let before = agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .remove(0);
         assert!(before.pending_since_ms.is_some());
         let watches = stream.watches();
         agent
             .update_tick_subscription(
-                chat,
+                tickloop_ids::Id::from(chat),
                 before.id,
                 TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Medium),
             )
             .await
             .unwrap();
         settle().await;
-        let after = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        let after = agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(
             after.has_pending_change, before.has_pending_change,
             "terminal={terminal}: {after:?}"
@@ -1174,25 +1292,33 @@ async fn a_frequency_change_from_the_view_restarts_the_timer() {
         text("handled"),
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
-    let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    let subscription = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0]
+        .id;
     let mut events = agent.subscribe();
 
     agent
         .update_tick_subscription(
-            chat,
+            tickloop_ids::Id::from(chat),
             subscription,
             TickSubscriptionChange::Frequency(TickSubscriptionFrequency::High),
         )
         .await
         .unwrap();
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].frequency,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .frequency,
         TickSubscriptionFrequency::High
     );
     assert!(
         agent
             .update_tick_subscription(
-                chat,
+                tickloop_ids::Id::from(chat),
                 subscription,
                 TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Immediate),
             )
@@ -1256,7 +1382,7 @@ async fn each_periodic_frequency_delivers_on_its_own_period_and_quiet_periods_wa
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     let mut events = agent.subscribe();
     let mut frequencies = agent
-        .tick_subscriptions(chat)
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
         .await
         .unwrap()
         .into_iter()
@@ -1347,16 +1473,29 @@ async fn a_shell_subscription_is_immediate_and_refuses_a_frequency() {
     assert!(!is_error, "{result}");
     let result: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(result["frequency"], "immediate");
-    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    let rows = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].frequency, TickSubscriptionFrequency::Immediate);
     assert!(
         agent
-            .update_tick_subscription(chat, rows[0].id, TickSubscriptionChange::Paused(true))
+            .update_tick_subscription(
+                tickloop_ids::Id::from(chat),
+                rows[0].id,
+                TickSubscriptionChange::Paused(true)
+            )
             .await
             .is_err()
     );
-    assert!(!agent.tick_subscriptions(chat).await.unwrap()[0].paused);
+    assert!(
+        !agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .paused
+    );
     assert_eq!(
         (rows[0].next_check_at_ms, rows[0].period_ms),
         (None, None),
@@ -1365,7 +1504,7 @@ async fn a_shell_subscription_is_immediate_and_refuses_a_frequency() {
     assert!(
         agent
             .update_tick_subscription(
-                chat,
+                tickloop_ids::Id::from(chat),
                 rows[0].id,
                 TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Low),
             )
@@ -1400,7 +1539,13 @@ async fn a_protocol_subscription_refuses_immediate_and_unknown_parameters() {
     let (refusal, is_error) = tool_result(&model, "seconds");
     assert!(is_error, "{refusal}");
     assert!(refusal.contains("every_seconds"), "{refusal}");
-    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(stream.watched().is_empty());
     agent.shutdown().await;
 }
@@ -1427,7 +1572,13 @@ async fn subscribing_to_an_artifact_points_to_its_association() {
         refusal.contains("association") && refusal.contains("/artifacts"),
         "{refusal}"
     );
-    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(stream.watched().is_empty());
     agent.shutdown().await;
 }
@@ -1722,13 +1873,21 @@ async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
     ]));
     let (agent, stream, chat, _loop_id) = subscribed_agent(directory.path(), model.clone()).await;
     let old_watch = *stream.watches().keys().next().unwrap();
-    let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    let subscription = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0]
+        .id;
     agent
-        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
+        .update_tick_subscription(
+            tickloop_ids::Id::from(chat),
+            subscription,
+            TickSubscriptionChange::Cancel,
+        )
         .await
         .unwrap();
     agent
-        .tick_subscribe_for_user(chat, fixture_instance(7))
+        .tick_subscribe_for_user(tickloop_ids::Id::from(chat), fixture_instance(7))
         .await
         .unwrap();
     let new_watch = *stream.watches().keys().next().unwrap();
@@ -1774,7 +1933,11 @@ async fn a_lost_link_shows_in_the_subscription_snapshot() {
     });
     settle().await;
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].link,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .link,
         TickLinkState::Disconnected
     );
 
@@ -1785,7 +1948,11 @@ async fn a_lost_link_shows_in_the_subscription_snapshot() {
     });
     settle().await;
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].link,
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()[0]
+            .link,
         TickLinkState::InstanceGone
     );
     agent.shutdown().await;
@@ -1874,7 +2041,10 @@ async fn a_gone_instance_stops_being_watched_and_keeps_its_configuration() {
         BTreeSet::from([fixture_instance(8)]),
         "a gone instance stops being watched"
     );
-    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    let rows = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 2, "the configuration survives");
     let gone = rows
         .iter()
@@ -1933,15 +2103,26 @@ async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_
     });
     settle().await;
     assert!(stream.watches().is_empty());
-    let blocked = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    let blocked = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()[0]
+        .id;
     agent
-        .update_tick_subscription(chat, blocked, TickSubscriptionChange::Cancel)
+        .update_tick_subscription(
+            tickloop_ids::Id::from(chat),
+            blocked,
+            TickSubscriptionChange::Cancel,
+        )
         .await
         .unwrap();
 
     let mut events = agent.subscribe();
     agent
-        .submit(chat, "explicitly watch the proven same run again".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "explicitly watch the proven same run again".into(),
+        )
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
@@ -1949,7 +2130,14 @@ async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_
     assert_eq!(watches.len(), 1);
     assert!(!watches.contains_key(&first));
     assert_eq!(watches.values().next(), Some(&fixture_instance(7)));
-    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
+    assert_eq!(
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     stream.emit(TickStreamEvent::State {
         instance: fixture_instance(7),
         state: TickConnectionState::IdentityUncertain,
@@ -2003,6 +2191,17 @@ fn delivered_item<'a>(
 }
 
 /// An element of a series state, about 150 bytes once encoded.
+/// How much shorter a delivery item's header is than when it named its subscription and watch
+/// by UUID; the budget tests below were sized then, and pad their data by this much to keep the
+/// same items.
+fn header_id_savings() -> usize {
+    let stored = uuid::Uuid::nil().to_string().len();
+    let model = tickloop_ids::IdContext::new()
+        .model_text_of(uuid::Uuid::nil())
+        .len();
+    2 * stored.saturating_sub(model)
+}
+
 fn series_element(index: usize) -> serde_json::Value {
     json!({"i": index, "close": format!("{:.2}", 400.0 + index as f64 / 100.0), "note": "c".repeat(110)})
 }
@@ -2040,8 +2239,8 @@ async fn agent_subscribed_to(
     let mut events = agent.subscribe();
     agent.submit(chat, "watch many ticks".into()).await.unwrap();
     wait_for_completion(&mut events).await;
-    subscribe_loop(&agent, chat, instances).await;
-    (agent, model, chat)
+    subscribe_loop(&agent, chat.uuid(), instances).await;
+    (agent, model, chat.uuid())
 }
 
 /// A large state is no longer blanked: its largest array is trimmed by segments to the item's
@@ -2127,7 +2326,7 @@ async fn an_over_sized_item_is_trimmed_by_segments_instead_of_being_blanked() {
     );
     assert!(
         agent
-            .tick_subscriptions(chat)
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
             .await
             .unwrap()
             .iter()
@@ -2245,7 +2444,10 @@ async fn a_later_item_takes_what_is_left_instead_of_waiting() {
     for instance in &instances {
         stream.push(TickObservation {
             instance: instance.clone(),
-            data: json!({"history": (0..60).map(series_element).collect::<Vec<_>>()}),
+            data: json!({
+                "history": (0..60).map(series_element).collect::<Vec<_>>(),
+                "pad": "p".repeat(header_id_savings()),
+            }),
             ..update(1, 1, "unused")
         });
     }
@@ -2298,23 +2500,23 @@ async fn an_item_that_waited_goes_before_newer_ones() {
     let mut events = agent.subscribe();
     agent.submit(chat, "watch".into()).await.unwrap();
     wait_for_completion(&mut events).await;
-    subscribe_loop(&agent, chat, &instances).await;
+    subscribe_loop(&agent, chat.uuid(), &instances).await;
     // A single line no segment shortens, each item close to its full share.
     let observed = |instance: &InstanceRef, sequence| TickObservation {
         instance: instance.clone(),
-        data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+        data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400 + header_id_savings())}),
         ..update(1, sequence, "unused")
     };
     for instance in &instances {
         stream.push(observed(instance, 1));
     }
-    accumulated(&agent, chat, 5).await;
+    accumulated(&agent, chat.uuid(), 5).await;
     tokio::time::advance(HIGH_PERIOD).await;
     entered.notified().await;
     for instance in &instances[..3] {
         stream.push(observed(instance, 2));
     }
-    accumulated(&agent, chat, 5).await;
+    accumulated(&agent, chat.uuid(), 5).await;
     tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
     gate.notify_one();
@@ -2398,7 +2600,7 @@ async fn a_deferred_item_holds_no_data_and_is_read_again_in_its_turn() {
     for instance in &instances[..3] {
         stream.inner.push(TickObservation {
             instance: instance.clone(),
-            data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+            data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400 + header_id_savings())}),
             ..update(1, 1, "unused")
         });
     }
@@ -2406,7 +2608,7 @@ async fn a_deferred_item_holds_no_data_and_is_read_again_in_its_turn() {
     // it shortens.
     stream.inner.push(TickObservation {
         instance: instances[3].clone(),
-        data: json!({"text": "w".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+        data: json!({"text": "w".repeat(MAX_DELIVERY_ITEM_BYTES - 400 + header_id_savings())}),
         ..update(1, 1, "unused")
     });
     accumulated(&agent, chat, 4).await;
@@ -2757,7 +2959,7 @@ async fn chat_reading_final_admission(cancel_during_check: bool) {
             self.agent
                 .upgrade()
                 .ok_or("Agent unavailable")?
-                .snapshot(chat)
+                .snapshot(tickloop_ids::Id::from(chat))
                 .await
                 .map_err(|error| error.to_string())?;
             self.updates
@@ -2872,11 +3074,14 @@ fn watermark_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 async fn subscribe_loop(agent: &Agent, chat: Uuid, instances: &[InstanceRef]) -> Vec<Uuid> {
     for instance in instances {
         agent
-            .tick_subscribe_for_user(chat, instance.clone())
+            .tick_subscribe_for_user(tickloop_ids::Id::from(chat), instance.clone())
             .await
             .unwrap();
     }
-    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    let rows = agent
+        .tick_subscriptions(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     instances
         .iter()
         .map(|instance| {
@@ -2923,7 +3128,7 @@ async fn accumulated(agent: &Agent, chat: Uuid, expected: u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let total: u64 = agent
-                .tick_subscriptions(chat)
+                .tick_subscriptions(tickloop_ids::Id::from(chat))
                 .await
                 .unwrap()
                 .iter()
@@ -2960,10 +3165,10 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     let mut events = agent.subscribe();
     agent.submit(chat, "watch".into()).await.unwrap();
     wait_for_completion(&mut events).await;
-    let subscription = subscribe_loop(&agent, chat, &[fixture_instance(5)]).await[0];
+    let subscription = subscribe_loop(&agent, chat.uuid(), &[fixture_instance(5)]).await[0];
 
     stream.push(update(5, 3, "three"));
-    accumulated(&agent, chat, 1).await;
+    accumulated(&agent, chat.uuid(), 1).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("three"));
@@ -2974,7 +3179,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     // on the test's own thread, so yielding lets the stream's tasks take it, whatever the load.
     stream.push(update(5, 3, "three again"));
     settle().await;
-    accumulated(&agent, chat, 0).await;
+    accumulated(&agent, chat.uuid(), 0).await;
     tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
     assert_eq!(
@@ -2984,7 +3189,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     );
 
     stream.push(update(5, 4, "four"));
-    accumulated(&agent, chat, 1).await;
+    accumulated(&agent, chat.uuid(), 1).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("four"));
@@ -3079,9 +3284,9 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
     let mut events = agent.subscribe();
     agent.submit(chat, "watch".into()).await.unwrap();
     wait_for_completion(&mut events).await;
-    subscribe_loop(&agent, chat, &[fixture_instance(5)]).await;
+    subscribe_loop(&agent, chat.uuid(), &[fixture_instance(5)]).await;
     stream.push(update(5, 1, "first"));
-    accumulated(&agent, chat, 1).await;
+    accumulated(&agent, chat.uuid(), 1).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let lease = watermark_files(&root)[0]
@@ -3100,7 +3305,7 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
     .unwrap();
 
     stream.push(update(5, 2, "second"));
-    accumulated(&agent, chat, 1).await;
+    accumulated(&agent, chat.uuid(), 1).await;
     tokio::time::advance(HIGH_PERIOD).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -3158,7 +3363,10 @@ impl tickloop_agent_runtime::tick_stream::TickStreamPort for RefillingStream {
     }
     fn set_watch_authorities(
         &self,
-        authorities: std::collections::BTreeMap<Uuid, tickloop_agent_protocol::HostToolAuthority>,
+        authorities: std::collections::BTreeMap<
+            tickloop_agent_runtime::tick_stream::WatchId,
+            tickloop_agent_protocol::HostToolAuthority,
+        >,
     ) {
         self.inner.set_watch_authorities(authorities);
     }
@@ -3199,7 +3407,7 @@ async fn update_data_stays_within_the_content_budget_and_evicted_data_is_read_ag
     agent.submit(chat, "watch".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let instances: Vec<_> = (10..16).map(fixture_instance).collect();
-    subscribe_loop(&agent, chat, &instances).await;
+    subscribe_loop(&agent, chat.uuid(), &instances).await;
     for instance in &instances {
         let mut observation = update(0, 1, "large");
         observation.instance = instance.clone();
@@ -3207,7 +3415,7 @@ async fn update_data_stays_within_the_content_budget_and_evicted_data_is_read_ag
         stream.inner.push(observation);
         settle().await;
     }
-    accumulated(&agent, chat, 6).await;
+    accumulated(&agent, chat.uuid(), 6).await;
     let used = agent.tick_content_bytes();
     assert!(
         used <= 64 * 1024 && used > 4 * 12 * 1024,
@@ -3419,7 +3627,10 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     let mut events = agent.subscribe();
-    agent.submit(chat, "ask me first".into()).await.unwrap();
+    agent
+        .submit(tickloop_ids::Id::from(chat), "ask me first".into())
+        .await
+        .unwrap();
     loop {
         if matches!(
             next_event(&mut events).await.kind,
@@ -3428,14 +3639,19 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
             break;
         }
     }
-    agent.interrupt(chat).await.unwrap();
+    agent.interrupt(tickloop_ids::Id::from(chat)).await.unwrap();
     loop {
         if matches!(next_event(&mut events).await.kind, EventKind::Interrupted) {
             break;
         }
     }
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().chat_loop.state,
+        agent
+            .snapshot(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .chat_loop
+            .state,
         LoopState::Interrupted
     );
     stream.push(update(7, 1, "after esc"));
@@ -3444,14 +3660,21 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("after esc"));
 
-    agent.stop(chat).await.unwrap();
+    agent.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     settle().await;
     assert_eq!(
         stream.watched(),
         BTreeSet::from([fixture_instance(7)]),
         "a paused Loop keeps watching for the latest update"
     );
-    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
+    assert_eq!(
+        agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     stream.push(update(7, 2, "while stopped"));
     settle().await;
     let requests = model.requests.lock().unwrap().len();
@@ -3463,7 +3686,10 @@ async fn esc_keeps_a_subscription_delivering_and_stop_pauses_it_until_the_next_i
         "nothing is delivered while stopped"
     );
 
-    agent.submit(chat, "carry on".into()).await.unwrap();
+    agent
+        .submit(tickloop_ids::Id::from(chat), "carry on".into())
+        .await
+        .unwrap();
     wait_for_completion(&mut events).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
@@ -3496,7 +3722,10 @@ async fn an_update_held_when_the_chat_stops_is_delivered_once_after_it_continues
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     let mut events = agent.subscribe();
-    agent.submit(chat, "ask me first".into()).await.unwrap();
+    agent
+        .submit(tickloop_ids::Id::from(chat), "ask me first".into())
+        .await
+        .unwrap();
     loop {
         if matches!(
             next_event(&mut events).await.kind,
@@ -3509,14 +3738,17 @@ async fn an_update_held_when_the_chat_stops_is_delivered_once_after_it_continues
     settle().await;
     tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
-    agent.stop(chat).await.unwrap();
+    agent.stop(tickloop_ids::Id::from(chat)).await.unwrap();
     settle().await;
     let requests = model.requests.lock().unwrap().len();
     tokio::time::advance(HIGH_PERIOD * 2).await;
     settle().await;
     assert_eq!(model.requests.lock().unwrap().len(), requests);
 
-    agent.submit(chat, "go on".into()).await.unwrap();
+    agent
+        .submit(tickloop_ids::Id::from(chat), "go on".into())
+        .await
+        .unwrap();
     wait_for_completion(&mut events).await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
@@ -3557,18 +3789,27 @@ async fn individual_subscription_pause_discards_changes_and_resume_starts_a_new_
             text("received after resume"),
         ]));
         let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
-        let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0).id;
+        let subscription = agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .remove(0)
+            .id;
         let old_watch = audience(&stream, 7)[0];
         stream.push(update(7, 1, "discard before pause"));
         settle().await;
         agent
-            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Paused(true))
+            .update_tick_subscription(
+                tickloop_ids::Id::from(chat),
+                subscription,
+                TickSubscriptionChange::Paused(true),
+            )
             .await
             .unwrap();
-        agent.stop(chat).await.unwrap();
+        agent.stop(tickloop_ids::Id::from(chat)).await.unwrap();
         agent
             .update_tick_subscription(
-                chat,
+                tickloop_ids::Id::from(chat),
                 subscription,
                 TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Medium),
             )
@@ -3577,24 +3818,41 @@ async fn individual_subscription_pause_discards_changes_and_resume_starts_a_new_
         stream.push(update(7, 20, "discard during pause"));
         tokio::time::advance(Duration::from_secs(1800)).await;
         settle().await;
-        let paused = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        let paused = agent
+            .tick_subscriptions(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .remove(0);
         assert!(paused.paused);
         assert_eq!(paused.frequency, TickSubscriptionFrequency::Medium);
         assert_eq!(paused.accumulated, 0);
         assert!(!paused.has_pending_change);
         assert!(paused.next_check_at_ms.is_none());
         assert_eq!(model.requests.lock().unwrap().len(), 2);
-        agent.continue_loop(chat).await.unwrap();
-        assert!(agent.tick_subscriptions(chat).await.unwrap()[0].paused);
-        // Resuming the item also leaves the Loop's independent receiving switch alone.
-        agent.stop(chat).await.unwrap();
         agent
-            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Paused(false))
+            .continue_loop(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap();
+        assert!(
+            agent
+                .tick_subscriptions(tickloop_ids::Id::from(chat))
+                .await
+                .unwrap()[0]
+                .paused
+        );
+        // Resuming the item also leaves the Loop's independent receiving switch alone.
+        agent.stop(tickloop_ids::Id::from(chat)).await.unwrap();
+        agent
+            .update_tick_subscription(
+                tickloop_ids::Id::from(chat),
+                subscription,
+                TickSubscriptionChange::Paused(false),
+            )
             .await
             .unwrap();
         assert!(
             !agent
-                .snapshot(chat)
+                .snapshot(tickloop_ids::Id::from(chat))
                 .await
                 .unwrap()
                 .chat_loop
@@ -3609,7 +3867,10 @@ async fn individual_subscription_pause_discards_changes_and_resume_starts_a_new_
         });
         stream.emit(TickStreamEvent::Ready { watch });
         settle().await;
-        agent.continue_loop(chat).await.unwrap();
+        agent
+            .continue_loop(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap();
         tokio::time::advance(Duration::from_secs(600)).await;
         settle().await;
         assert_eq!(

@@ -75,7 +75,7 @@ async fn prepare_open(
 ) -> Result<tickloop_agent_runtime::host_tools::PreparedHostCall, String> {
     tools
         .prepare_call(
-            uuid::Uuid::new_v4(),
+            tickloop_ids::Id::from(uuid::Uuid::new_v4()),
             "TickManage",
             &json!({"action":"open","command":command,"cwd":cwd}),
             CancellationToken::new(),

@@ -73,7 +73,9 @@ async fn ctrl_b_backgrounds_the_models_running_bash(fixture: &PrivateFixture) {
     assert!(
         request["messages"].to_string().contains(&format!(
             "Command was manually backgrounded by user with ID: {}",
-            running.operation_id
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                running.operation_id
+            ))
         )),
         "{request}"
     );

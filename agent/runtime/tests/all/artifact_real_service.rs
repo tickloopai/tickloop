@@ -591,9 +591,12 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         .await;
     assert_eq!(
         metadata["agent_links"][0]["chat_id"],
-        owner_chat.to_string()
+        owner_chat.uuid().to_string()
     );
-    assert_eq!(metadata["agent_links"][0]["loop_id"], goal.id.to_string());
+    assert_eq!(
+        metadata["agent_links"][0]["loop_id"],
+        goal.id.uuid().to_string()
+    );
     assert_eq!(metadata["agent_links"][0]["epoch"], 1);
     let artifact_id = created.artifact_id.clone();
 
@@ -682,7 +685,7 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         .await;
     assert_eq!(
         metadata["agent_links"][0]["chat_id"],
-        owner_chat.to_string(),
+        owner_chat.uuid().to_string(),
         "each account has its own link"
     );
     viewer_agent.shutdown().await;

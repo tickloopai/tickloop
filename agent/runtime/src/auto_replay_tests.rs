@@ -159,7 +159,7 @@ async fn replay(use_jev: bool) {
                     let mut usage = None;
                     let mut answer = None;
                 let verdict = if let Some(jev) = &jev {
-                    let request = jev_review::review_request(
+                    let request = jev_review::review_request(&tickloop_ids::IdContext::new(),
                         &context,
                         stage,
                     )
@@ -187,7 +187,7 @@ async fn replay(use_jev: bool) {
                         Err(_) => Err("timeout".into()),
                     }
                 } else {
-                    let request = auto_mode::classifier_request(
+                    let request = auto_mode::classifier_request(&tickloop_ids::IdContext::new(),
                         &context,
                         stage,
                     );

@@ -261,7 +261,7 @@ impl Cloud {
             .chats
             .enqueue_by_user(
                 root,
-                &format!("turn:{}", request.input_id),
+                &format!("turn:{}", request.input_id.uuid()),
                 TaskKind::Turn {
                     member: None,
                     request: Box::new(request.clone()),
@@ -312,7 +312,7 @@ impl Cloud {
 
 fn prompt(text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -530,8 +530,8 @@ async fn a_run_longer_than_three_holding_caps_finishes_in_one_attempt() {
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
 
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
-    let attempts = answers(&lines, request.input_id);
+    completed(&lines, request.input_id.into());
+    let attempts = answers(&lines, request.input_id.into());
     assert_eq!(attempts.len(), 1, "{attempts:?}");
     assert!(matches!(
         ended(&attempts[0]),
@@ -608,7 +608,7 @@ async fn sigterm_mid_model_request_lets_the_stream_finish_and_the_next_holder_ma
     assert!(matches!(stopped.state, WaitState::Open));
     assert!(matches!(&stopped.resume, ResumePoint::InBatch { call_id, .. } if call_id == "list"));
     assert_eq!(
-        answers(&lines, request.input_id)[0].state,
+        answers(&lines, request.input_id.into())[0].state,
         ResponseState::Suspended
     );
     assert_eq!(calls_and_results(&lines, "list"), (1, 0));
@@ -621,8 +621,8 @@ async fn sigterm_mid_model_request_lets_the_stream_finish_and_the_next_holder_ma
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
-    assert_eq!(answers(&lines, request.input_id).len(), 1);
+    completed(&lines, request.input_id.into());
+    assert_eq!(answers(&lines, request.input_id.into()).len(), 1);
     assert_eq!(calls_and_results(&lines, "list"), (1, 1));
     assert_eq!(model.conversation().len(), 2);
     let view = cloud.task(cloud.root, task);
@@ -726,8 +726,8 @@ async fn sigterm_mid_tool_call_finishes_the_call_and_stops_before_the_next_one()
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
-    assert_eq!(answers(&lines, request.input_id).len(), 1);
+    completed(&lines, request.input_id.into());
+    assert_eq!(answers(&lines, request.input_id.into()).len(), 1);
     assert_eq!(calls_and_results(&lines, "page"), (1, 1));
     assert_eq!(calls_and_results(&lines, "list"), (1, 1));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -767,7 +767,7 @@ async fn a_request_gate_wait_and_a_retry_backoff_are_safe_points() {
             .await;
         } else {
             eventually("the answer started", || {
-                !answers(&cloud.lines(), request.input_id).is_empty()
+                !answers(&cloud.lines(), request.input_id.into()).is_empty()
             })
             .await;
         }
@@ -796,8 +796,8 @@ async fn a_request_gate_wait_and_a_retry_backoff_are_safe_points() {
             .unwrap();
         assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
         let lines = cloud.lines();
-        completed(&lines, request.input_id);
-        assert_eq!(answers(&lines, request.input_id).len(), 1);
+        completed(&lines, request.input_id.into());
+        assert_eq!(answers(&lines, request.input_id.into()).len(), 1);
         assert_eq!(
             model.conversation().len(),
             if in_backoff { 3 } else { 2 },
@@ -865,8 +865,8 @@ async fn a_child_stream_past_the_ceiling_reports_once_to_its_waiting_parent_afte
     let report = cloud.node("next", config).hold(cloud.root).await.unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
-    let parent = answers(&lines, request.input_id);
+    completed(&lines, request.input_id.into());
+    let parent = answers(&lines, request.input_id.into());
     assert_eq!(parent.len(), 1, "{parent:?}");
     let child_lines = cloud.member_lines();
     let child_input = child_lines
@@ -1013,7 +1013,7 @@ async fn a_crash_after_every_task_was_acknowledged_is_taken_over_by_the_sweep() 
         .await
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
-    let target = loop_of(&cloud.lines(), linked.input_id);
+    let target = loop_of(&cloud.lines(), linked.input_id.into());
     link_to_the_document(&cloud, target).await;
     let (turn_task, _) = cloud.user_turn(cloud.root, "Delegate the watch.");
     let node = cloud.node("crashing", NodeConfig::default());
@@ -1027,7 +1027,7 @@ async fn a_crash_after_every_task_was_acknowledged_is_taken_over_by_the_sweep() 
         .chats
         .enqueue(
             cloud.root,
-            &format!("feedback:{}", request.input_id),
+            &format!("feedback:{}", request.input_id.uuid()),
             TaskKind::Turn {
                 member: None,
                 request: Box::new(request.clone()),
@@ -1068,10 +1068,10 @@ async fn a_crash_after_every_task_was_acknowledged_is_taken_over_by_the_sweep() 
     assert_eq!(cloud.chats.consecutive_unclean(cloud.root), 0);
 
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
+    completed(&lines, request.input_id.into());
     assert_eq!(messages_saying(&lines, "Watcher report."), 1);
     assert_eq!(messages_saying(&lines, FEEDBACK_HEADING), 1);
-    let feedback = answers(&lines, request.input_id);
+    let feedback = answers(&lines, request.input_id.into());
     assert_eq!(feedback.len(), 2, "{feedback:?}");
     assert_eq!(
         ended(&feedback[0]),
@@ -1119,7 +1119,7 @@ async fn a_crash_after_an_answer_was_acknowledged_is_taken_over_by_the_sweep() {
         panic!("the family waits for the user: {asked:?}");
     };
     let answer = TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Answer {
             request: people[0].request,
             reply: QuestionReply::Answered(vec![QuestionAnswer::other("Weekly")]),
@@ -1131,7 +1131,7 @@ async fn a_crash_after_an_answer_was_acknowledged_is_taken_over_by_the_sweep() {
         .chats
         .enqueue_by_user(
             cloud.root,
-            &format!("answer:{}", answer.input_id),
+            &format!("answer:{}", answer.input_id.uuid()),
             TaskKind::Turn {
                 member: None,
                 request: Box::new(answer),
@@ -1163,7 +1163,7 @@ async fn a_crash_after_an_answer_was_acknowledged_is_taken_over_by_the_sweep() {
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     let lines = cloud.lines();
-    completed(&lines, turn.input_id);
+    completed(&lines, turn.input_id.into());
     assert_eq!(calls_and_results(&lines, "question"), (1, 1));
     assert_eq!(cloud.task(cloud.root, answer_task).deliveries, 1);
 }
@@ -1206,8 +1206,8 @@ async fn five_ceiling_handovers_neither_dead_letter_the_task_nor_fail_the_input(
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
-    let attempts = answers(&lines, request.input_id);
+    completed(&lines, request.input_id.into());
+    let attempts = answers(&lines, request.input_id.into());
     assert_eq!(attempts.len(), HANDOVERS + 1);
     assert!(attempts[..HANDOVERS].iter().all(|attempt| ended(attempt)
         == Some(&ResponseEnding::Interrupted {
@@ -1307,7 +1307,7 @@ async fn a_failed_holding_spends_no_attempt_of_the_tasks_it_finished() {
         .await
         .unwrap();
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
-    completed(&cloud.lines(), request.input_id);
+    completed(&cloud.lines(), request.input_id.into());
     let first = cloud.task(cloud.root, first);
     assert_eq!(
         (first.state, first.attempts, first.deliveries),
@@ -1419,7 +1419,7 @@ async fn a_family_whose_load_panics_is_held_a_bounded_number_of_times_until_the_
     assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
     assert_eq!(cloud.task_state(poisoned, retry), TaskState::Acknowledged);
     let lines = cloud.lines();
-    completed(&lines, request.input_id);
+    completed(&lines, request.input_id.into());
     assert_eq!(messages_saying(&lines, "Watcher report."), 1);
     assert_eq!(cloud.chats.consecutive_unclean(poisoned), 0);
 }
@@ -1483,7 +1483,7 @@ async fn repeated_family_holdings_and_handovers_leave_no_task_behind() {
             .unwrap();
         assert_eq!(report.end, HoldingEnd::Quiet, "{report:?}");
         assert_eq!(cloud.task_state(cloud.root, task), TaskState::Acknowledged);
-        completed(&cloud.lines(), request.input_id);
+        completed(&cloud.lines(), request.input_id.into());
         wait_for_alive_tasks(baseline, cycle).await;
     }
 }

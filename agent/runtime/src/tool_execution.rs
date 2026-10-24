@@ -882,6 +882,12 @@ impl Agent {
             input,
             registration,
         } = invocation;
+        let ids = self.chat_ids(receipt.chat_id).await;
+        let input = if crate::tick_tools::is_tick_tool(&name) {
+            crate::tick_tools::stored_instance_input(&ids, &name, input)
+        } else {
+            input
+        };
         let registration = registration.map(|mut registered| {
             if let ToolRoute::TickManage(provider) = &registered.route {
                 registered.route =
@@ -995,7 +1001,7 @@ impl Agent {
             let workspace = configured_workspace.clone();
             (configured_workspace, workspace)
         };
-        let permission_owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+        let permission_owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
         let host_tools = registration
             .as_ref()
@@ -1056,6 +1062,11 @@ impl Agent {
                     })
                 }
                 Err(error) => {
+                    let error = if crate::tick_tools::is_tick_tool(&name) {
+                        crate::tick_tools::model_tick_text(&ids, &error)
+                    } else {
+                        error
+                    };
                     return Ok(ToolCallOutcome {
                         result: ToolResult {
                             content: error,
@@ -1081,12 +1092,16 @@ impl Agent {
         {
             let instance = match tick_subscriptions::subscription_request(&input) {
                 Ok((instance, _)) => instance,
-                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+                Err(error) => {
+                    return Ok(ToolCallOutcome::not_admitted(
+                        crate::tick_tools::model_tick_text(&ids, &error),
+                    ));
+                }
             };
             let port = self.tick_deliveries().port.clone();
             match port {
                 Some(port) => match port
-                    .prepare_watch(receipt.chat_id, &instance, &input, cancel.clone())
+                    .prepare_watch(receipt.chat_id.into(), &instance, &input, cancel.clone())
                     .await
                 {
                     Ok(Some(watch)) => {
@@ -1233,7 +1248,7 @@ impl Agent {
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
                 task_binding: task_binding.flatten(),
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 loop_id: receipt.loop_id,
                 run_id: receipt.run_id,
                 call_id: id.clone(),
@@ -1512,7 +1527,7 @@ impl Agent {
                     match authority_check {
                         Ok(()) => {
                             crate::tick_stream::PreparedTickWatch::revalidate(
-                                receipt.chat_id,
+                                receipt.chat_id.into(),
                                 prepared,
                                 cancel.clone(),
                             )
@@ -1650,6 +1665,19 @@ impl Agent {
                                 .await;
                             host_call_status = Some(host_result.status());
                             let (mut result, effect) = host_result.into_parts();
+                            if crate::tick_tools::is_tick_tool(&name) {
+                                result.content =
+                                    match serde_json::from_str::<Value>(&result.content) {
+                                        Ok(value) => {
+                                            crate::tick_tools::model_tick_result(&ids, value)
+                                                .to_string()
+                                        }
+                                        Err(_) => crate::tick_tools::model_tick_text(
+                                            &ids,
+                                            &result.content,
+                                        ),
+                                    };
+                            }
                             if let Some(unchanged) = self
                                 .inner
                                 .chats
@@ -1700,18 +1728,14 @@ impl Agent {
                 }
             }
         } else {
-            let tools = self
-                .inner
-                .chats
-                .lock()
-                .await
-                .get(&receipt.chat_id)
-                .unwrap()
-                .tools
-                .clone();
+            let (tools, ids) = {
+                let chats = self.inner.chats.lock().await;
+                let chat = chats.get(&receipt.chat_id).unwrap();
+                (chat.tools.clone(), chat.ids)
+            };
             let prepared = if registration.is_some() {
                 tools
-                    .prepare(&workspace, &name, &input)
+                    .prepare(&ids, &workspace, &name, &input)
                     .await
                     .map_err(|error| error.to_string())
             } else {
@@ -1738,7 +1762,7 @@ impl Agent {
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
                         task_binding: task_binding.flatten(),
-                        id: Uuid::new_v4(),
+                        id: tickloop_ids::generate(),
                         loop_id: receipt.loop_id,
                         run_id: receipt.run_id,
                         call_id: id.clone(),
@@ -1808,7 +1832,7 @@ impl Agent {
                         } else if let Some(message) = policy.content_denial_message(
                             &prepared.name,
                             &prepared.input,
-                            receipt.loop_id,
+                            receipt.loop_id.into(),
                             session_evaluation.decision,
                         ) {
                             message
@@ -2222,8 +2246,9 @@ impl Agent {
                         );
                         let tools = chat.tools.clone();
                         let context = tickloop_agent_tools::ExecutionContext {
+                            ids: chat.ids,
                             operation_id: operation.id,
-                            loop_id: receipt.loop_id,
+                            loop_id: receipt.loop_id.into(),
                             accepts_images: chat.snapshot.model.accepts_images(),
                         };
                         let secondary_model = super::web_fetch::ChatSecondaryModel::new(

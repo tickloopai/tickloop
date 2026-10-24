@@ -514,7 +514,10 @@ fn signed_messages_reply() -> String {
 
 async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -556,15 +559,15 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
         Arc::new(LocalModelClients::new(Some(root.clone()))),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    finish_turn(&agent, chat, "First prompt").await;
-    finish_turn(&agent, chat, "Second prompt").await;
+    finish_turn(&agent, chat.uuid(), "First prompt").await;
+    finish_turn(&agent, chat.uuid(), "Second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     agent.set_model(chat, b.clone()).await.unwrap();
     assert_eq!(
         agent.snapshot(chat).await.unwrap().messages,
         before.messages
     );
-    finish_turn(&agent, chat, "Use B").await;
+    finish_turn(&agent, chat.uuid(), "Use B").await;
     let mixed = agent.snapshot(chat).await.unwrap();
     assert_ne!(mixed.message_sources.get(&1), mixed.message_sources.get(&5));
     agent.shutdown().await;
@@ -577,9 +580,9 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     assert_eq!(restored.message_sources, mixed.message_sources);
     assert_eq!(restored.message_models, mixed.message_models);
     assert!(restored.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Thinking { signature: Some(value), .. } if value == "original-signed-block")));
-    finish_turn(&resumed, chat, "Continue after restart").await;
+    finish_turn(&resumed, chat.uuid(), "Continue after restart").await;
     resumed.set_model(chat, a.clone()).await.unwrap();
-    finish_turn(&resumed, chat, "Return to A").await;
+    finish_turn(&resumed, chat.uuid(), "Return to A").await;
     let a_requests = a_requests.await.unwrap();
     let b_requests = b_requests.await.unwrap();
     let stable_prefix = &a_requests[1].1["messages"].as_array().unwrap()[..2];

@@ -145,7 +145,7 @@ async fn complete_prompt(
 ) -> Receipt {
     let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     assert!(matches!(
-        wait_for_run_end(events, receipt.run_id).await,
+        wait_for_run_end(events, receipt.run_id.uuid()).await,
         EventKind::Completed { .. }
     ));
     receipt
@@ -167,7 +167,7 @@ async fn interrupt_before_reply(
     model.entered.notified().await;
     agent.interrupt(chat).await.unwrap();
     assert!(matches!(
-        wait_for_run_end(events, receipt.run_id).await,
+        wait_for_run_end(events, receipt.run_id.uuid()).await,
         EventKind::Interrupted
     ));
     receipt
@@ -322,7 +322,7 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
     }
     agent.interrupt(chat).await.unwrap();
     assert!(matches!(
-        wait_for_run_end(&mut events, with_tool_call.run_id).await,
+        wait_for_run_end(&mut events, with_tool_call.run_id.uuid()).await,
         EventKind::Interrupted
     ));
     assert!(
@@ -342,7 +342,7 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
     let queued = agent.submit(chat, "queued input".into()).await.unwrap();
     agent.interrupt(chat).await.unwrap();
     assert!(matches!(
-        wait_for_run_end(&mut events, blocked.run_id).await,
+        wait_for_run_end(&mut events, blocked.run_id.uuid()).await,
         EventKind::Interrupted
     ));
     assert!(
@@ -354,7 +354,7 @@ async fn a_reply_a_queued_input_or_a_finished_turn_keeps_the_prompt() {
         "the queued input already moved on"
     );
     assert!(matches!(
-        wait_for_run_end(&mut events, queued.run_id).await,
+        wait_for_run_end(&mut events, queued.run_id.uuid()).await,
         EventKind::Completed { .. }
     ));
     assert!(
@@ -407,7 +407,7 @@ async fn guidance_written_after_the_prompt_is_no_reply_and_leaves_with_it() {
     );
     agent.interrupt(chat).await.unwrap();
     assert!(matches!(
-        wait_for_run_end(&mut events, receipt.run_id).await,
+        wait_for_run_end(&mut events, receipt.run_id.uuid()).await,
         EventKind::Interrupted
     ));
     let draft = agent

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ChatId, LoopId, RunId};
+use crate::{ChatId, LoopId, RunId, SharedTaskId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -29,10 +29,10 @@ pub struct TaskClaim {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SharedTask {
-    pub id: Uuid,
+    pub id: SharedTaskId,
     pub title: String,
     pub description: String,
-    pub dependencies: Vec<Uuid>,
+    pub dependencies: Vec<SharedTaskId>,
     pub status: SharedTaskStatus,
     pub owner: Option<TaskOwner>,
     pub claim: Option<TaskClaim>,
@@ -48,7 +48,7 @@ pub struct SharedTask {
 pub struct TaskMutationReceipt {
     pub actor: ChatId,
     pub input: String,
-    pub task_id: Uuid,
+    pub task_id: SharedTaskId,
     #[serde(default)]
     pub task_cleared: bool,
     #[serde(default)]
@@ -93,7 +93,7 @@ impl TaskBoard {
             .checked_add(1)
     }
 
-    pub fn blocked_by(&self, task: &SharedTask) -> Vec<Uuid> {
+    pub fn blocked_by(&self, task: &SharedTask) -> Vec<SharedTaskId> {
         task.dependencies
             .iter()
             .copied()

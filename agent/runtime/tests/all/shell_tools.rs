@@ -363,7 +363,9 @@ async fn a_foreground_command_moves_to_background_without_starting_a_second_proc
                 result.content,
                 format!(
                     "Command was manually backgrounded by user with ID: {}. Output is being written to: {}",
-                    running.operation_id,
+                    tickloop_ids::IdContext::new().model_text(
+                        tickloop_agent_protocol::ShellTaskId::from(running.operation_id)
+                    ),
                     running.output_ref.display()
                 )
             ),
@@ -481,7 +483,7 @@ async fn run_to_completion(
             .kind
         {
             EventKind::PermissionRequested { request } => agent
-                .answer_permission(chat, request.id, true)
+                .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                 .await
                 .unwrap(),
             EventKind::ToolCompleted {
@@ -511,12 +513,14 @@ async fn the_agent_stops_its_own_background_command_by_task_id_or_shell_id() {
             .submit(chat, "Start a background command, then stop it".into())
             .await
             .unwrap();
-        let results = run_to_completion(&agent, chat, &mut events).await;
+        let results = run_to_completion(&agent, chat.uuid(), &mut events).await;
         let commands = agent.commands(chat).await.unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].reason.as_deref(), Some("cancelled"));
         assert!(commands[0].exit_code.is_some() || commands[0].signal.is_some());
-        let task_id = commands[0].operation_id;
+        let task_id = tickloop_ids::IdContext::new().model_text(
+            tickloop_agent_protocol::ShellTaskId::from(commands[0].operation_id),
+        );
         assert_eq!(results.len(), 2, "{parameter}");
         assert_eq!(
             results[0].1.content,
@@ -888,7 +892,7 @@ async fn bash_runs_commands_with_bash_or_zsh() {
         .submit(chat, "Which shell runs commands?".into())
         .await
         .unwrap();
-    let results = run_to_completion(&agent, chat, &mut events).await;
+    let results = run_to_completion(&agent, chat.uuid(), &mut events).await;
     assert!(
         matches!(results[0].1.content.as_str(), "bash" | "zsh"),
         "{}",
@@ -999,7 +1003,9 @@ async fn task_stop_rejects_unknown_tasks_before_asking_for_permission() {
         .unwrap();
     assert!(result.1);
     assert!(
-        result.0.contains("No task found with ID: missing-task"),
+        result.0.contains(&tickloop_ids::not_found::<
+            tickloop_agent_protocol::ShellTaskKind,
+        >("missing-task")),
         "{}",
         result.0
     );
@@ -1034,9 +1040,9 @@ async fn task_stop_stops_a_command_an_earlier_turn_started() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, "Start the server".into()).await.unwrap();
-    run_to_completion(&agent, chat, &mut events).await;
+    run_to_completion(&agent, chat.uuid(), &mut events).await;
     agent.submit(chat, "Stop the server".into()).await.unwrap();
-    let results = run_to_completion(&agent, chat, &mut events).await;
+    let results = run_to_completion(&agent, chat.uuid(), &mut events).await;
     let command = agent.commands(chat).await.unwrap().remove(0);
     assert_eq!(results.len(), 1);
     assert!(!results[0].1.is_error, "{}", results[0].1.content);

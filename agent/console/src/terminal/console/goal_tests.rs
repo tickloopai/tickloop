@@ -158,7 +158,7 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
         .unwrap();
     let goal = agent.snapshot(chat).await.unwrap().goal.unwrap();
     let receipt = agent.deliver_trigger_for_tests(chat, TriggerSource::GoalContinuation {
-        goal_id: goal.id, after_run: Uuid::new_v4(), objective_revision: goal.objective_revision,
+        goal_id: goal.id, after_run: Uuid::new_v4().into(), objective_revision: goal.objective_revision,
     }, "Continue working toward the active goal of this Chat.\n<objective>Ship the release</objective>\nUsage\nContinuation behavior").await.unwrap();
     let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -194,8 +194,9 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
             .trigger_origins
             .contains_key(&receipt.run_id)
     );
-    let live = Console::test_interactive_for_chat(chat);
-    super::super::consume_input_echo_from_snapshot(&live, &snapshot, receipt.run_id).unwrap();
+    let live = Console::test_interactive_for_chat(chat.into());
+    super::super::consume_input_echo_from_snapshot(&live, &snapshot, receipt.run_id.into())
+        .unwrap();
     assert_eq!(
         live.test_conversation_text()
             .matches("↻ Continuing Goal")
@@ -216,9 +217,10 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
         "Transcript keeps the full prompt"
     );
     assert!(snapshot.trigger_origins.contains_key(&receipt.run_id));
-    let replay = Console::test_interactive_for_chat(chat);
+    let replay = Console::test_interactive_for_chat(chat.into());
     super::super::workflows::write_public_history(&replay, &snapshot).unwrap();
-    super::super::consume_input_echo_from_snapshot(&replay, &snapshot, receipt.run_id).unwrap();
+    super::super::consume_input_echo_from_snapshot(&replay, &snapshot, receipt.run_id.into())
+        .unwrap();
     let history = replay.test_conversation_text();
     assert_eq!(history.matches("↻ Continuing Goal").count(), 1);
     assert!(!history.contains("<objective>"));
@@ -235,12 +237,12 @@ fn goal_continuation_live_and_reopened_history_show_one_event() {
     snapshot.messages = vec![Message { role: MessageRole::User, content: vec![Content::Text {
         text: "Continue working toward the active goal of this Chat.\n<objective>Ship it</objective>\nUsage\nContinuation behavior".into(),
     }] }];
-    snapshot.message_runs.insert(0, run);
+    snapshot.message_runs.insert(0, run.into());
     snapshot.trigger_origins.insert(
-        run,
+        run.into(),
         TriggerIdentity::GoalContinuation {
             goal_id: Uuid::new_v4(),
-            after_run: Uuid::new_v4(),
+            after_run: Uuid::new_v4().into(),
         },
     );
     let live = Console::test_interactive_for_chat(chat);
@@ -290,9 +292,9 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
     snapshot.messages = vec![Message { role: MessageRole::User, content: vec![Content::Text {
         text: "Scheduled task 00000000-0000-0000-0000-000012345678: invoke the `review` Skill with the Skill tool with the arguments `main`.\n\nThis is the final run of this scheduled task: it was created seven days ago and is deleted after this run. Do not schedule it again; tell the user it ended and that they can start a new /loop to continue.".into(),
     }] }];
-    snapshot.message_runs.insert(0, run);
+    snapshot.message_runs.insert(0, run.into());
     snapshot.trigger_origins.insert(
-        run,
+        run.into(),
         TriggerIdentity::ScheduledTask {
             task_id: uuid::Uuid::from_u128(0x1234_5678),
             scheduled_for_ms: 1,
@@ -323,7 +325,7 @@ fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
     use tickloop_agent_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     for instruction in [
         tickloop_agent_protocol::scheduled_skill_prompt(
-            &uuid::Uuid::from_u128(0x1234_5678),
+            &uuid::Uuid::from_u128(0x1234_5678).to_string(),
             "review",
             "main",
         ),
@@ -332,7 +334,7 @@ fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
             "Visible instruction",
         ),
         tickloop_agent_protocol::loop_instructions_error_prompt(
-            &uuid::Uuid::from_u128(0x1234_5678),
+            &uuid::Uuid::from_u128(0x1234_5678).to_string(),
             "permission denied",
         ),
         tickloop_agent_protocol::final_scheduled_run_prompt("Check the release"),
@@ -346,9 +348,9 @@ fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
                 text: instruction.clone(),
             }],
         }];
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         snapshot.trigger_origins.insert(
-            run,
+            run.into(),
             TriggerIdentity::ScheduledTask {
                 task_id: uuid::Uuid::from_u128(0x1234_5678),
                 scheduled_for_ms: 1,
@@ -444,7 +446,7 @@ fn goal_only_monitor_is_fixed_selectable_and_enter_opens_its_menu() {
         let mut goal = goal();
         goal.objective = "长条件🦀".repeat(100);
         let status = status(goal);
-        state.chat = Some(status.id);
+        state.chat = Some(status.id.into());
         state.prompt_enabled = true;
         state.monitor.set_chat_status(Arc::new(status));
         assert!(state.monitor.is_shown());
@@ -530,7 +532,7 @@ fn status_bar_omits_every_goal_state_in_wide_and_short_console_frames() {
             let mut goal = goal();
             goal.status = goal_status.clone();
             let status = status(goal);
-            state.chat = Some(status.id);
+            state.chat = Some(status.id.into());
             state.monitor.set_chat_status(Arc::new(status));
             let frame = state.frame().0.join("\n");
             assert!(!frame.contains(expected), "{width}x{height}: {frame}");
@@ -846,7 +848,7 @@ fn paused_triggers_keep_model_in_the_same_status_line() {
         status.chat_loop.receiving = tickloop_agent_protocol::Receiving::Paused {
             reason: tickloop_agent_protocol::PauseReason::HistoryLoaded,
         };
-        state.chat = Some(status.id);
+        state.chat = Some(status.id.into());
         state.monitor.set_chat_status(Arc::new(status));
         let frame = state.frame().0.join("\n");
         let line = frame
@@ -873,7 +875,7 @@ async fn goal_budget_input_renders_compact_prefill_and_unit_help() {
         .await
         .unwrap();
     core.manage_goal(
-        chat,
+        chat.into(),
         GoalAction::Set {
             objective: "verify".into(),
             token_budget: Some(1500000),

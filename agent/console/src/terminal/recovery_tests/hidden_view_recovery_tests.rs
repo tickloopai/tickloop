@@ -272,12 +272,12 @@ async fn run_hidden_view_fixture() {
     };
     assert_eq!(buffered_chat, chat);
     assert_eq!(complete_line, !lagged);
-    let running = core.snapshot(chat).await.unwrap();
+    let running = core.snapshot(chat.into()).await.unwrap();
     assert_eq!(
         running.chat_loop.state,
         tickloop_agent_protocol::LoopState::Running
     );
-    assert_eq!(running.chat_loop.run_id, Some(run));
+    assert_eq!(running.chat_loop.run_id, Some(Into::into(run)));
     assert_eq!(model.requests.load(Ordering::SeqCst), 1);
     assert_eq!(access.submits.load(Ordering::SeqCst), 1);
     write_phase(
@@ -298,7 +298,7 @@ async fn run_hidden_view_fixture() {
             .unwrap();
         release_model.take().unwrap().send(()).unwrap();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
-            while core.snapshot(chat).await.unwrap().chat_loop.state
+            while core.snapshot(chat.into()).await.unwrap().chat_loop.state
                 != tickloop_agent_protocol::LoopState::Idle
             {
                 tokio::task::yield_now().await;
@@ -345,7 +345,7 @@ async fn run_hidden_view_fixture() {
     );
     if route == EXIT_OVERVIEW_ROUTE {
         interaction.await.unwrap().unwrap();
-        let snapshot = core.snapshot(chat).await.unwrap();
+        let snapshot = core.snapshot(chat.into()).await.unwrap();
         std::fs::write(
             std::env::var_os(PROOF_VARIABLE).unwrap(),
             serde_json::to_vec(&serde_json::json!({
@@ -396,8 +396,8 @@ async fn run_hidden_view_fixture() {
         RecoveryFact::AgentOpened { .. } => None,
         _ => unreachable!(),
     };
-    let snapshot = core.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.chat_loop.run_id, Some(run));
+    let snapshot = core.snapshot(chat.into()).await.unwrap();
+    assert_eq!(snapshot.chat_loop.run_id, Some(Into::into(run)));
     if route != INTERRUPT_OVERVIEW_ROUTE {
         assert_eq!(
             snapshot.chat_loop.state,
@@ -428,7 +428,7 @@ async fn run_hidden_view_fixture() {
     console.write("\nHidden recovery facts verified\n").unwrap();
     if route == INTERRUPT_OVERVIEW_ROUTE {
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
-            while core.snapshot(chat).await.unwrap().chat_loop.state
+            while core.snapshot(chat.into()).await.unwrap().chat_loop.state
                 != tickloop_agent_protocol::LoopState::Interrupted
             {
                 tokio::task::yield_now().await;
@@ -436,7 +436,7 @@ async fn run_hidden_view_fixture() {
         })
         .await
         .unwrap();
-        let snapshot = core.snapshot(chat).await.unwrap();
+        let snapshot = core.snapshot(chat.into()).await.unwrap();
         write_phase(serde_json::json!({
             "phase":"visible-interrupted","state":snapshot.chat_loop.state,
             "interrupts":access.interrupts.load(Ordering::SeqCst),
@@ -448,7 +448,7 @@ async fn run_hidden_view_fixture() {
     }
     interaction.await.unwrap().unwrap();
     if route == INTERRUPT_OVERVIEW_ROUTE {
-        let snapshot = core.snapshot(chat).await.unwrap();
+        let snapshot = core.snapshot(chat.into()).await.unwrap();
         let path = PathBuf::from(std::env::var_os(PROOF_VARIABLE).unwrap());
         let mut proof: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

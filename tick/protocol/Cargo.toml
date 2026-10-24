@@ -15,5 +15,6 @@ doctest = false
 jsonschema = { version = "0.56.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tickloop-ids = { path = "../ids" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = "1"

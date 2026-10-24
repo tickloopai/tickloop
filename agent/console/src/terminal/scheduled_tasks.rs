@@ -132,7 +132,7 @@ impl TickActionExecutor for TaskAction {
         if !self.delete {
             let chat = ui.chat().ok_or("No selected Chat")?;
             ui.open_detail(Box::new(TaskDetail {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 chat,
                 task: self.task.clone(),
                 top: 0,

@@ -177,7 +177,7 @@ async fn submit_input(
         .advance(
             chat,
             TurnRequest {
-                input_id: input,
+                input_id: tickloop_ids::Id::from(input),
                 op: TurnOp::Continue {
                     after: ParentSelection::CurrentLeaf,
                     message: UserMessage {
@@ -297,7 +297,11 @@ async fn a_turn_adds_only_response_started_to_its_events_and_records_its_lifecyc
     let mut events = agent.subscribe();
     let input = Uuid::new_v4();
     submit(&agent, chat, input, "greet me").await;
-    let state = agent.input_state(chat, input).await.unwrap().unwrap();
+    let state = agent
+        .input_state(chat, tickloop_ids::Id::from(input))
+        .await
+        .unwrap()
+        .unwrap();
     let seen = until_ended(&mut events, state.entry.run_id).await;
     assert_eq!(
         seen.iter()
@@ -327,7 +331,10 @@ async fn a_turn_adds_only_response_started_to_its_events_and_records_its_lifecyc
     let started_sequence = seen[0].sequence;
 
     assert_eq!(
-        agent.settled_input(chat, input).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(input))
+            .await
+            .unwrap(),
         SettledOutcome::Completed {
             usage: Usage::default()
         }
@@ -372,7 +379,7 @@ async fn a_turn_adds_only_response_started_to_its_events_and_records_its_lifecyc
         .expect("the prompt's id is its input id");
     assert_eq!(prompt.input_id, Some(input));
     assert!(lines.iter().any(
-        |line| matches!(line, Line::Assistant(entry) if entry.response_id == Some(response_id))
+        |line| matches!(line, Line::Assistant(entry) if entry.response_id == Some(response_id.uuid()))
     ));
     agent.shutdown().await;
 }
@@ -427,7 +434,11 @@ async fn crash_while_streaming(delta: Option<&str>) {
     recovered.seed(chat, crashed, StorePosition(1));
     let next = agent(recovered.clone(), StagedModel::new(Vec::new()));
     next.resume_chat(chat).await.unwrap();
-    let state = next.input_state(chat, input).await.unwrap().unwrap();
+    let state = next
+        .input_state(chat, tickloop_ids::Id::from(input))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(state.entry.state, InputState::Accepted);
     assert!(!state.is_live);
     assert!(state.prompt_in_conversation);
@@ -505,7 +516,7 @@ async fn a_crash_after_content_was_committed_keeps_that_content_in_the_interrupt
         }
     );
     assert_eq!(
-        next.input_state(chat, input)
+        next.input_state(chat, tickloop_ids::Id::from(input))
             .await
             .unwrap()
             .unwrap()
@@ -528,8 +539,15 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
     let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
     let input = Uuid::new_v4();
     submit(&first, chat, input, "do it once").await;
-    first.settled_input(chat, input).await.unwrap();
-    let original = first.input_state(chat, input).await.unwrap().unwrap();
+    first
+        .settled_input(chat, tickloop_ids::Id::from(input))
+        .await
+        .unwrap();
+    let original = first
+        .input_state(chat, tickloop_ids::Id::from(input))
+        .await
+        .unwrap()
+        .unwrap();
     first.sync().await.unwrap();
 
     let model = StagedModel::new(Vec::new());
@@ -548,7 +566,7 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
     .unwrap();
     assert_eq!(receipt.run_id, original.entry.run_id);
     assert!(matches!(
-        next.input_state(chat, input)
+        next.input_state(chat, tickloop_ids::Id::from(input))
             .await
             .unwrap()
             .unwrap()
@@ -590,7 +608,11 @@ async fn a_taken_back_input_settles_withdrawn() {
     submit(&agent, chat, queued, "edit this message").await;
     let waiting = {
         let agent = agent.clone();
-        tokio::spawn(async move { agent.settled_input(chat, queued).await })
+        tokio::spawn(async move {
+            agent
+                .settled_input(chat, tickloop_ids::Id::from(queued))
+                .await
+        })
     };
 
     let taken = agent.take_queued_inputs(chat, true).await.unwrap();
@@ -629,7 +651,10 @@ async fn stopping_a_loop_discards_its_queue_and_interrupting_settles_the_running
     model.reached.notified().await;
     agent.interrupt(chat).await.unwrap();
     assert_eq!(
-        agent.settled_input(chat, interrupted).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(interrupted))
+            .await
+            .unwrap(),
         SettledOutcome::Interrupted {
             by: InterruptedBy::User
         }
@@ -642,13 +667,19 @@ async fn stopping_a_loop_discards_its_queue_and_interrupting_settles_the_running
     submit(&agent, chat, queued, "never runs").await;
     agent.stop(chat).await.unwrap();
     assert_eq!(
-        agent.settled_input(chat, queued).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(queued))
+            .await
+            .unwrap(),
         SettledOutcome::Discarded {
             reason: DiscardReason::Stopped
         }
     );
     assert_eq!(
-        agent.settled_input(chat, running).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(running))
+            .await
+            .unwrap(),
         SettledOutcome::Interrupted {
             by: InterruptedBy::User
         }
@@ -688,18 +719,24 @@ async fn prompts_coalesced_before_a_start_chain_and_the_answer_hangs_under_the_l
     submit(&agent, chat, second, "second half").await;
     agent.interrupt(chat).await.unwrap();
     let first_run = agent
-        .input_state(chat, first)
+        .input_state(chat, tickloop_ids::Id::from(first))
         .await
         .unwrap()
         .unwrap()
         .entry
         .run_id;
     assert!(matches!(
-        agent.settled_input(chat, first).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(first))
+            .await
+            .unwrap(),
         SettledOutcome::Completed { .. }
     ));
     assert_eq!(
-        agent.settled_input(chat, second).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(second))
+            .await
+            .unwrap(),
         SettledOutcome::Merged { into: first_run }
     );
     agent.sync().await.unwrap();
@@ -752,7 +789,11 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
     let first = Uuid::new_v4();
     submit(&agent, chat, first, "read the notes").await;
     model.reached.notified().await;
-    let state = agent.input_state(chat, first).await.unwrap().unwrap();
+    let state = agent
+        .input_state(chat, tickloop_ids::Id::from(first))
+        .await
+        .unwrap()
+        .unwrap();
     let follow_up = Uuid::new_v4();
     let image = pasted_image(1);
     submit_input(
@@ -768,12 +809,18 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
     .unwrap();
     model.release.notify_one();
     assert_eq!(
-        agent.settled_input(chat, follow_up).await.unwrap(),
+        agent
+            .settled_input(chat, tickloop_ids::Id::from(follow_up))
+            .await
+            .unwrap(),
         SettledOutcome::Merged {
             into: state.entry.run_id
         }
     );
-    agent.settled_input(chat, first).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(first))
+        .await
+        .unwrap();
     agent.sync().await.unwrap();
 
     let lines = store.lines(chat);
@@ -821,12 +868,21 @@ async fn compaction_keeps_display_ids_stable_and_projects_nothing_twice() {
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let prompts = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
     submit(&agent, chat, prompts[0], "first prompt").await;
-    agent.settled_input(chat, prompts[0]).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(prompts[0]))
+        .await
+        .unwrap();
     agent.compact(chat).await.unwrap();
     submit(&agent, chat, prompts[1], "second prompt").await;
-    agent.settled_input(chat, prompts[1]).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(prompts[1]))
+        .await
+        .unwrap();
     submit(&agent, chat, prompts[2], "third prompt").await;
-    agent.settled_input(chat, prompts[2]).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(prompts[2]))
+        .await
+        .unwrap();
     agent.sync().await.unwrap();
     let before = project(&store.lines(chat));
     let third_answer = before
@@ -938,7 +994,7 @@ async fn compaction_keeps_display_ids_stable_and_projects_nothing_twice() {
     next.resume_chat(chat).await.unwrap();
     for prompt in prompts {
         assert!(matches!(
-            next.input_state(chat, prompt)
+            next.input_state(chat, tickloop_ids::Id::from(prompt))
                 .await
                 .unwrap()
                 .unwrap()
@@ -966,7 +1022,10 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
     let store = JsonlTranscriptStore::open(directory.path().join("root")).unwrap();
     let chat = Uuid::new_v4();
     let expected = store
-        .register(chat, &ChatPlacement::Folder(folder.canonicalize().unwrap()))
+        .register(
+            tickloop_ids::Id::from(chat),
+            &ChatPlacement::Folder(folder.canonicalize().unwrap()),
+        )
         .await
         .unwrap();
     let input = InputEntry {
@@ -1025,7 +1084,7 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
     ];
     store
         .append(
-            chat,
+            tickloop_ids::Id::from(chat),
             &AppendBatch {
                 id: BatchId::new(),
                 expected: Some(expected),
@@ -1038,7 +1097,7 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
         .await
         .unwrap();
     let tail = store
-        .load(chat, LoadRange::FromLatestBoundary)
+        .load(tickloop_ids::Id::from(chat), LoadRange::FromLatestBoundary)
         .await
         .unwrap()
         .unwrap();
@@ -1083,7 +1142,10 @@ async fn a_tail_initialized_projection_aliases_a_later_copy_of_the_same_answer()
         .zip(["first prompt", "second prompt", "third prompt"])
     {
         submit(&first, chat, *prompt, text).await;
-        first.settled_input(chat, *prompt).await.unwrap();
+        first
+            .settled_input(chat, tickloop_ids::Id::from(*prompt))
+            .await
+            .unwrap();
     }
     summarize_up_to(&first, chat, "second prompt").await;
     first.sync().await.unwrap();
@@ -1179,9 +1241,12 @@ async fn replaying_an_input_after_a_rewind_returns_its_receipt() {
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let opening = Uuid::new_v4();
     submit(&agent, chat, opening, "open a loop").await;
-    agent.settled_input(chat, opening).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(opening))
+        .await
+        .unwrap();
     let loop_id = agent
-        .input_state(chat, opening)
+        .input_state(chat, tickloop_ids::Id::from(opening))
         .await
         .unwrap()
         .unwrap()
@@ -1189,8 +1254,15 @@ async fn replaying_an_input_after_a_rewind_returns_its_receipt() {
         .loop_id;
     let continued = Uuid::new_v4();
     submit(&agent, chat, continued, "continue the loop").await;
-    agent.settled_input(chat, continued).await.unwrap();
-    let original = agent.input_state(chat, continued).await.unwrap().unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(continued))
+        .await
+        .unwrap();
+    let original = agent
+        .input_state(chat, tickloop_ids::Id::from(continued))
+        .await
+        .unwrap()
+        .unwrap();
 
     agent
         .rewind(chat, opening, RewindMode::Conversation)
@@ -1209,7 +1281,7 @@ async fn replaying_an_input_after_a_rewind_returns_its_receipt() {
     .await
     .unwrap();
     assert_eq!(
-        (receipt.loop_id, receipt.run_id),
+        (receipt.loop_id.uuid(), receipt.run_id.uuid()),
         (original.entry.loop_id, original.entry.run_id)
     );
     assert!(matches!(
@@ -1251,7 +1323,10 @@ async fn replaying_an_input_after_its_attachment_was_deleted_returns_its_receipt
         )
     };
     let original = submit_attached().await.unwrap();
-    agent.settled_input(chat, input).await.unwrap();
+    agent
+        .settled_input(chat, tickloop_ids::Id::from(input))
+        .await
+        .unwrap();
     std::fs::remove_file(&attachment).unwrap();
     let replayed = submit_attached().await.unwrap();
     assert_eq!(

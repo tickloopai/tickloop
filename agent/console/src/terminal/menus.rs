@@ -429,7 +429,7 @@ impl Selection {
                 | Self::PermissionRule { chat, .. }
                 | Self::Rewind { chat, .. }
                 | Self::RewindActions { chat, .. } => Some(*chat),
-                Self::Question(flow) => Some(flow.request().chat_id),
+                Self::Question(flow) => Some(flow.request().chat_id.into()),
                 Self::Workflow(workflow) => workflow.chat(),
                 _ => None,
             },
@@ -616,7 +616,7 @@ impl Menus {
             console.set_status(status)?;
             return Ok(Some(status.into()));
         }
-        self.show_rewind_points(console, snapshot.id, points)?;
+        self.show_rewind_points(console, snapshot.id.into(), points)?;
         Ok(None)
     }
 
@@ -634,7 +634,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Rewind".into(),
                 context: vec![
                     "Choose a prompt to restore or summarize from.".into(),
@@ -672,7 +672,7 @@ impl Menus {
         self.show_focused_commentable(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Rewind actions".into(),
                 context: vec![
                     format!(
@@ -703,7 +703,7 @@ impl Menus {
             return self.show(
                 console,
                 Menu {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     title: "Advanced commands".into(),
                     context: builtin_commands()
                         .iter()
@@ -752,7 +752,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: title.into(),
                 context: vec!["Choose an action, or use its slash command directly.".into()],
                 options,
@@ -790,9 +790,10 @@ impl Menus {
             let mut listing = format!("{}\n{}\n", picker.title(), picker.context());
             for (number, (entry, chat)) in picker.entries().iter().zip(choices).enumerate() {
                 listing.push_str(&format!(
-                    "  {}. {} · {chat}\n",
+                    "  {}. {} · {}\n",
                     number + 1,
-                    entry.plain_row()
+                    entry.plain_row(),
+                    chat.public()
                 ));
             }
             listing.push_str(&format!(
@@ -832,7 +833,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Choose Agent location".into(),
                 context: vec![
                     "Several live Views exist in this Herdr instance. Choose a verified location."
@@ -861,10 +862,10 @@ impl Menus {
             .map(|request| request.id)
             .chain(status.questions.iter().map(|request| request.id));
         for id in pending.filter(|id| !status.request_order.contains(id)) {
-            self.note_request(status.id, id);
+            self.note_request(status.id.into(), id);
         }
         for id in &status.request_order {
-            self.note_request(status.id, *id);
+            self.note_request(status.id.into(), *id);
         }
     }
 
@@ -955,7 +956,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Sign out of Tickloop Accounts?".into(),
                 context: vec!["Stops feedback listening before revoking the credential.".into()],
                 options: vec!["Cancel".into(), "Sign out".into()],
@@ -1231,7 +1232,7 @@ impl Menus {
             return Ok(Some(lines));
         };
         agent
-            .answer_question(request.chat_id, request.id, answers)
+            .answer_question(request.chat_id.into(), request.id, answers)
             .await
             .map_err(|error| error.to_string())?;
         Ok(None)
@@ -1492,7 +1493,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Effort".into(),
                 context: vec![
                     "Effort levels depend on the current model; auto uses its default. Use Settings to turn Thinking on or off. The choice is saved in user settings.".into(),
@@ -1558,7 +1559,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Settings".into(),
                 context,
                 options: vec![
@@ -1700,7 +1701,7 @@ impl Menus {
                 )
             })
             .collect();
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         self.show(
             console,
             Menu {
@@ -1735,7 +1736,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Preferred output style".into(),
                 context: vec![
                     "This changes how the Agent communicates with you.".into(),
@@ -1789,7 +1790,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Choose theme".into(),
                 context: vec![
                     "Applies to this terminal session. Colours only; layout and text are unchanged."
@@ -1831,7 +1832,7 @@ impl Menus {
             return self.show(
                 console,
                 Menu {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     title: if usage { "Usage" } else { "Session status" }.into(),
                     context,
                     options: vec!["Back to settings".into()],
@@ -1849,7 +1850,7 @@ impl Menus {
             recorded_usage_context(&snapshot.request_usage.summary())
         } else {
             vec![
-                format!("Chat: {}", snapshot.id),
+                format!("Chat: {}", snapshot.id.public()),
                 safe_text(&format!(
                     "Model: {}",
                     settings::model_label(&snapshot.model)
@@ -1871,7 +1872,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: if usage { "Usage" } else { "Session status" }.into(),
                 context,
                 options: vec!["Back to settings".into()],
@@ -1910,7 +1911,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Choose execution mode".into(),
                 context: vec!["Applies to this Chat. Explicit deny rules remain effective.".into()],
                 options,
@@ -1971,7 +1972,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Permissions · Choose mode".into(),
                 context: vec![context.into()],
                 options,
@@ -1991,7 +1992,7 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        family: &[Uuid],
+        family: &[tickloop_agent_protocol::ChatId],
         pending: &HashMap<Uuid, super::PermissionRequestOwner>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
@@ -2000,25 +2001,26 @@ impl Menus {
         }
         self.sync_dialog_chat(console)?;
         for chat in family {
-            if let Some((execution, plans)) = agent.cached_pending_plan_approvals(*chat) {
+            if let Some((execution, plans)) = agent.cached_pending_plan_approvals((*chat).into()) {
                 self.restored_plans
                     .retain(|_, request| request.chat != *chat || plans.contains(&request.version));
-                if self.scanned_plan_executions.get(chat) == Some(&execution) {
+                if self.scanned_plan_executions.get(&chat.uuid()) == Some(&execution) {
                     continue;
                 }
-                self.scanned_plan_executions.insert(*chat, execution);
+                self.scanned_plan_executions
+                    .insert((*chat).into(), execution);
                 self.restored_plans
                     .retain(|_, request| request.chat != *chat);
                 for version in plans {
-                    let request = Uuid::new_v4();
+                    let request = tickloop_ids::generate();
                     self.restored_plans.insert(
                         request,
                         RestoredPlanApproval {
-                            chat: *chat,
+                            chat: (*chat).into(),
                             version,
                         },
                     );
-                    self.note_request(*chat, request);
+                    self.note_request((*chat).into(), request);
                 }
             }
         }
@@ -2028,7 +2030,7 @@ impl Menus {
                 || self.restored_plans.contains_key(id)
         });
         if let Some((_, Selection::Workflow(Workflow::Plan { chat, version, .. }))) = &self.active
-            && family.contains(chat)
+            && family.contains(&tickloop_ids::Id::from(*chat))
             && agent.cached_plan_is_pending(*chat, *version) == Some(false)
         {
             let request = self
@@ -2041,7 +2043,7 @@ impl Menus {
         let queued = self
             .request_order
             .iter()
-            .filter(|(chat, _)| family.contains(chat))
+            .filter(|(chat, _)| family.contains(&tickloop_ids::Id::from(*chat)))
             .count();
         let active_unqueued = usize::from(
             self.active
@@ -2065,7 +2067,7 @@ impl Menus {
         {
             if let Some(requester) = selection
                 .chat()
-                .filter(|requester| family.contains(requester))
+                .filter(|requester| family.contains(&tickloop_ids::Id::from(*requester)))
             {
                 return self
                     .refresh_permissions(agent, console, Some(requester), pending, questions)
@@ -2083,19 +2085,19 @@ impl Menus {
         }
         for requester in family {
             let status = agent
-                .status(*requester)
+                .status((*requester).into())
                 .await
                 .map_err(|error| error.to_string())?;
             for id in status.request_order {
                 if pending.contains_key(&id) || questions.contains_key(&id) {
-                    self.note_request(*requester, id);
+                    self.note_request((*requester).into(), id);
                 }
             }
         }
         let queued = self
             .request_order
             .iter()
-            .filter(|(chat, _)| family.contains(chat))
+            .filter(|(chat, _)| family.contains(&tickloop_ids::Id::from(*chat)))
             .copied()
             .collect::<Vec<_>>();
         console.set_request_queue_count(queued.len())?;
@@ -2323,7 +2325,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Add permission rule".into(),
                 context: vec![
                     "Choose the command rule to allow for this project.".into(),
@@ -2545,7 +2547,7 @@ impl Menus {
                     FlowUpdate::Submit(answers) => {
                         let request = flow.request();
                         agent
-                            .answer_question(request.chat_id, request.id, answers)
+                            .answer_question(request.chat_id.into(), request.id, answers)
                             .await
                             .map_err(|error| error.to_string())?;
                         return Ok(MenuOutcome {
@@ -2556,7 +2558,7 @@ impl Menus {
                     FlowUpdate::Decline => {
                         let request = flow.request();
                         agent
-                            .decline_question(request.chat_id, request.id)
+                            .decline_question(request.chat_id.into(), request.id)
                             .await
                             .map_err(|error| error.to_string())?;
                         return Ok(MenuOutcome {
@@ -2709,14 +2711,14 @@ impl Menus {
                             let context = if matches!(action, providers::ConnectionAction::RemoveKey) {
                                 vec!["This removes the saved value of this connection's credential reference. Other connections using that reference are also affected.".into(), if fallback { "An environment key will still be used.".into() } else { "No environment key is configured.".into() }]
                             } else { vec!["This signs out this provider's saved login. Connections and Chats using the same login also need sign-in.".into()] };
-                            self.show(console, Menu { id: Uuid::new_v4(), title: format!("{label} · {}", provider.model_page_name()), context, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
+                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("{label} · {}", provider.model_page_name()), context, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
                         }
                         providers::ConnectionAction::CredentialDetails => {
                             self.provider.provider_nav.back_stack.push(parent);
                             let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_agent_protocol::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
                             let reference = &provider.models[0].api_key_env;
                             let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
-                            self.show(console, Menu { id: Uuid::new_v4(), title: format!("Credential details · {}", provider.model_page_name()), context, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
+                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Credential details · {}", provider.model_page_name()), context, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
                         }
                     }
                 }
@@ -2730,7 +2732,7 @@ impl Menus {
                             return Err(error.to_string());
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        self.refresh_connections.insert((target.agent(), provider.key()), Uuid::new_v4());
+                        self.refresh_connections.insert((target.agent(), provider.key()), tickloop_ids::generate());
                         self.provider_back(agent, console, target).await?;
                     } else {
                         let sign_in = super::login::SignInTarget::from_auth(provider.models[0].auth_source).unwrap_or(super::login::SignInTarget::Codex);
@@ -2848,7 +2850,7 @@ impl Menus {
                     let choice = choices.get(index).ok_or("model option does not exist")?;
                     if !choice.availability.selectable() {
                         let error = choice.availability.label().to_owned();
-                        self.show_model_choices(console, target, choices, index, Uuid::new_v4())?;
+                        self.show_model_choices(console, target, choices, index, tickloop_ids::generate())?;
                         return Err(error);
                     }
                     let result = agent
@@ -2864,7 +2866,7 @@ impl Menus {
                     match result {
                         Ok(change) => console.write(&safe_text(&format!("Model selection: {change} · {} · Effort {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
                         Err(error) => {
-                            self.show_model_choices(console, target, choices, index, Uuid::new_v4())?;
+                            self.show_model_choices(console, target, choices, index, tickloop_ids::generate())?;
                             return Err(error);
                         }
                     }
@@ -3152,7 +3154,7 @@ impl Menus {
             && self.active.is_none()
             && let Some((selection, mut menu)) = retry
         {
-            menu.id = Uuid::new_v4();
+            menu.id = tickloop_ids::generate();
             if let Some(index) = index {
                 menu.selected = index;
             }
@@ -3181,12 +3183,12 @@ impl Menus {
 async fn requester_label(agent: &Agent, console: &Console, status: &ChatStatus) -> String {
     let title = super::safe_line(
         &agent
-            .cached_title(status.id)
+            .cached_title(status.id.into())
             .map(|(_, title)| title)
             .unwrap_or_else(|| status.display_title()),
     );
     agent
-        .reference(status.id)
+        .reference(status.id.into())
         .await
         .ok()
         .and_then(|execution| console.agent_name(execution.agent_id, &title).ok())
@@ -3366,7 +3368,7 @@ fn usage_counter_label(counter: &CounterSummary) -> String {
 
 fn finish_rewind(console: &Console, outcome: RewindOutcome) -> Result<MenuOutcome, String> {
     if outcome.conversation_restored {
-        console.reset_chat(outcome.snapshot.id)?;
+        console.reset_chat(outcome.snapshot.id.into())?;
         workflows::write_public_history(console, &outcome.snapshot)?;
         console.write(
             "Conversation restored. The abandoned messages remain in the Transcript file.\n",
@@ -3385,7 +3387,7 @@ fn finish_rewind(console: &Console, outcome: RewindOutcome) -> Result<MenuOutcom
     console.set_status(&status)?;
     Ok(MenuOutcome {
         restored: Some(outcome.snapshot),
-        selection,
+        selection: selection.map(Into::into),
         status: Some(status),
         ..Default::default()
     })
@@ -3543,7 +3545,7 @@ mod tests {
         menus.note_status_requests(&ChatStatus::of(&snapshot));
         assert_eq!(
             menus.request_order,
-            VecDeque::from([(chat, permission), (chat, question)])
+            VecDeque::from([(chat.into(), permission), (chat.into(), question)])
         );
         core.shutdown().await;
     }
@@ -3588,7 +3590,7 @@ mod tests {
         let CommandResult::Created { snapshot, .. } = receipt.into_result().unwrap() else {
             panic!("Agent not created")
         };
-        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let target = ConfigTarget::Agent(snapshot.conversation.id.into());
         let before_model = snapshot.model.clone();
         launch.config_root = Some(root_b.clone());
         let view = Agent::from_access_for_test(
@@ -3791,7 +3793,7 @@ mod tests {
         let CommandResult::Created { snapshot, .. } = created else {
             panic!("Agent not created")
         };
-        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let target = ConfigTarget::Agent(snapshot.conversation.id.into());
         let endpoint = project.join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
         let epoch = access.daemon_epoch();
@@ -3893,7 +3895,7 @@ mod tests {
         let CommandResult::Created { snapshot, .. } = result else {
             panic!("Agent not created")
         };
-        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let target = ConfigTarget::Agent(snapshot.conversation.id.into());
         let view = Agent::from_access_for_test(
             access.clone(),
             access.daemon_epoch(),
@@ -4075,9 +4077,9 @@ mod tests {
                 .request_usage
                 .start(
                     RequestOwner {
-                        chat_id: chat,
-                        loop_id: Some(Uuid::new_v4()),
-                        run_id: Some(run),
+                        chat_id: chat.into(),
+                        loop_id: Some(Uuid::new_v4().into()),
+                        run_id: Some(run.into()),
                     },
                     ModelRequestKind::Conversation,
                     snapshot.model.identity(),

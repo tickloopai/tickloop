@@ -200,7 +200,7 @@ pub(super) async fn complete(
             HeaderValue::from_static(concat!("tickloop-agent/", env!("CARGO_PKG_VERSION"))),
         );
         if let Some(chat) = chat_id {
-            let session = HeaderValue::from_str(&chat.to_string())
+            let session = HeaderValue::from_str(&chat.uuid().to_string())
                 .map_err(|_| failure(ModelError::Connection, false))?;
             headers.insert("session-id", session.clone());
             headers.insert("x-client-request-id", session);

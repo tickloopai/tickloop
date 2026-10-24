@@ -22,13 +22,13 @@ pub async fn saved_records(
             .skip(page.offset)
             .take(page.bounded_limit())
             .map(|summary| SavedChat {
-                id: summary.chat_id,
+                id: summary.chat_id.into(),
                 title: summary.title,
                 first_prompt: summary.first_prompt,
                 last_prompt: summary.last_prompt,
                 modified: summary.modified,
                 cwd: summary.cwd,
-                branch_source: summary.forked_from.map(|origin| origin.chat_id),
+                branch_source: summary.forked_from.map(|origin| origin.chat_id.into()),
                 git_branch: summary.git_branch,
             })
             .collect(),

@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{
-    AgentColor, AgentMessageSource, Authority, Content, GoalSnapshot, ImageContext, InputContext,
-    LocalMessage, LoopState, Protocol, Question, Receiving, Role, ScheduledTask, SharedTask,
-    SubagentRegistration, TaskBoard, TickSubscription, TriggerIdentity,
+    AgentColor, AgentMessageSource, Authority, ChatId, Content, GoalSnapshot, ImageContext,
+    InputContext, LocalMessage, LoopId, LoopState, Protocol, Question, Receiving, Role,
+    ScheduledTask, SharedTask, SubagentRegistration, TaskBoard, TickSubscription, TriggerIdentity,
 };
 use uuid::Uuid;
 
@@ -69,16 +69,16 @@ pub enum PromptOrigin {
         artifact: String,
     },
     AgentMessage {
-        from: Uuid,
+        from: ChatId,
     },
     SubagentNotification {
-        child: Uuid,
+        child: ChatId,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayMember {
-    pub chat: Uuid,
+    pub chat: ChatId,
     pub handle: String,
     pub color: Option<AgentColor>,
 }
@@ -220,8 +220,8 @@ pub fn chat_loop(lines: &[Line]) -> Option<DisplayLoop> {
 /// Public board state, without mutation receipts. Disabling Tasks hides, rather than clears, it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayTaskBoard {
-    pub root_chat_id: Uuid,
-    pub root_loop_id: Uuid,
+    pub root_chat_id: ChatId,
+    pub root_loop_id: LoopId,
     pub revision: u64,
     pub is_team: bool,
     pub task_number_offset: u64,
@@ -552,7 +552,9 @@ impl DisplayProjector {
                         result.as_ref().and_then(|result| {
                             let value: serde_json::Value =
                                 serde_json::from_str(&result.text).ok()?;
-                            serde_json::from_value(value["child_chat_id"].clone()).ok()
+                            serde_json::from_value::<ChatId>(value["child_chat_id"].clone())
+                                .ok()
+                                .map(ChatId::uuid)
                         })
                     });
                 *member = self
@@ -564,7 +566,7 @@ impl DisplayProjector {
                                 result.is_none()
                                     && input["name"].as_str() == Some(registration.handle.as_str())
                             },
-                            |chat| registration.child_chat_id == chat,
+                            |chat| registration.child_chat_id.uuid() == chat,
                         )
                     })
                     .map(|registration| DisplayMember {

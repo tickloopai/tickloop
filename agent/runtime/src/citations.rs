@@ -187,7 +187,7 @@ impl Agent {
                 .ok_or("source Chat is unavailable")?
                 .bookkeeping
                 .citation_sources;
-            table.chat_id = root;
+            table.chat_id = root.into();
             let previous_count = table.sources.len();
             for source in evidence {
                 let Some(url) = provenance_key(&source.url) else {

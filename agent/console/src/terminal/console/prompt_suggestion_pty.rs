@@ -66,9 +66,9 @@ fn prompt_suggestion_pty_fixture() {
                     );
                     let mut chat = agent.create_chat(directory.clone()).await.unwrap();
                     if user_case {
-                        core.set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::Auto).await.unwrap();
+                        core.set_execution_mode(chat.into(), tickloop_agent_protocol::ExecutionMode::Auto).await.unwrap();
                         let mut events = core.subscribe();
-                        let receipt = core.submit(chat, "Complete the fixture family".into()).await.unwrap();
+                        let receipt = core.submit(chat.into(), "Complete the fixture family".into()).await.unwrap();
                         loop {
                             let event = tickloop_agent_test_support::next_event(&mut events).await;
                             assert!(!matches!(event.kind, tickloop_agent_protocol::EventKind::Failed(_)), "{event:?}");

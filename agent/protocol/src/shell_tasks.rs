@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use tick_protocol::ShellTaskId;
 use uuid::Uuid;
 
 use crate::{ChatId, LoopId};
@@ -256,20 +257,24 @@ impl ShellTaskPromptWatchdog {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShellTaskCenterError {
-    #[error("Chat {chat_id} does not exist")]
+    #[error("Chat {} does not exist", chat_id.public())]
     ChatNotFound { chat_id: ChatId },
-    #[error("Shell task {task_id} does not exist in Chat {chat_id}")]
+    #[error(
+        "Shell task {} does not exist in Chat {}",
+        ShellTaskId::from(*task_id).public(),
+        chat_id.public()
+    )]
     TaskNotFound { chat_id: ChatId, task_id: Uuid },
-    #[error("{action:?} is unavailable for Shell task {task_id}")]
+    #[error("{action:?} is unavailable for Shell task {}", ShellTaskId::from(*task_id).public())]
     ActionUnavailable {
         task_id: Uuid,
         action: ShellTaskAction,
     },
-    #[error("output is unavailable for Shell task {task_id}")]
+    #[error("output is unavailable for Shell task {}", ShellTaskId::from(*task_id).public())]
     OutputUnavailable { task_id: Uuid },
-    #[error("invalid output read for Shell task {task_id}: {reason}")]
+    #[error("invalid output read for Shell task {}: {reason}", ShellTaskId::from(*task_id).public())]
     InvalidOutputRead { task_id: Uuid, reason: String },
-    #[error("cannot read output for Shell task {task_id}: {reason}")]
+    #[error("cannot read output for Shell task {}: {reason}", ShellTaskId::from(*task_id).public())]
     OutputReadFailed { task_id: Uuid, reason: String },
     #[error("Shell task output response is invalid: {0}")]
     InvalidOutput(String),
@@ -474,9 +479,11 @@ mod tests {
             updated_at_ms: None,
             ended_at_ms: None,
             id: Uuid::new_v4(),
-            chat_id,
+            chat_id: chat_id.into(),
             origin: ShellTaskOrigin::User,
-            owner: ShellTaskOwner::User { chat_id },
+            owner: ShellTaskOwner::User {
+                chat_id: chat_id.into(),
+            },
             call_id: None,
             command: "interactive-command".into(),
             description: None,

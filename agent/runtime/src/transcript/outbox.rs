@@ -269,7 +269,7 @@ impl TranscriptOutbox {
                 .is_some_and(tickloop_agent_transcript::ChainEntry::restarts_chain)
         }) || outbox.retained.is_due()
         {
-            let snapshot = outbox.retained.snapshot(chat);
+            let snapshot = outbox.retained.snapshot(chat.into());
             outbox.retained.apply(&snapshot);
             accepted.push(snapshot);
         }
@@ -506,16 +506,16 @@ mod tests {
     fn the_first_message_starts_the_transcript_and_duplicates_are_dropped() {
         let outbox = TranscriptOutbox::default();
         let chat = Uuid::new_v4();
-        outbox.register(chat, StorePosition(3));
-        outbox.enqueue(chat, vec![title()], None);
-        assert!(outbox.next_batch(chat, false).is_none());
+        outbox.register(chat.into(), StorePosition(3));
+        outbox.enqueue(chat.into(), vec![title()], None);
+        assert!(outbox.next_batch(chat.into(), false).is_none());
 
         let uuid = Uuid::new_v4();
-        outbox.enqueue(chat, vec![chain(uuid, Role::User)], Some(9));
-        outbox.enqueue(chat, vec![chain(uuid, Role::User)], None);
+        outbox.enqueue(chat.into(), vec![chain(uuid, Role::User)], Some(9));
+        outbox.enqueue(chat.into(), vec![chain(uuid, Role::User)], None);
         let leaf = Uuid::new_v4();
-        outbox.set_display_leaf(chat, Some(leaf));
-        let batch = outbox.next_batch(chat, false).unwrap();
+        outbox.set_display_leaf(chat.into(), Some(leaf));
+        let batch = outbox.next_batch(chat.into(), false).unwrap();
         assert_eq!(batch.display_leaf, Some(leaf));
         assert_eq!(batch.lines.len(), 2);
         assert!(matches!(batch.lines[0], Line::CustomTitle(_)));
@@ -527,33 +527,41 @@ mod tests {
     fn a_failed_batch_is_retried_as_is_and_a_refusal_stops_everything() {
         let outbox = TranscriptOutbox::default();
         let chat = Uuid::new_v4();
-        outbox.register(chat, StorePosition(0));
-        outbox.enqueue(chat, vec![chain(Uuid::new_v4(), Role::User)], None);
-        let first = outbox.next_batch(chat, false).unwrap();
+        outbox.register(chat.into(), StorePosition(0));
+        outbox.enqueue(chat.into(), vec![chain(Uuid::new_v4(), Role::User)], None);
+        let first = outbox.next_batch(chat.into(), false).unwrap();
         assert!(matches!(
-            outbox.settle(chat, first.id, Err(TranscriptError::Storage("down".into()))),
+            outbox.settle(
+                chat.into(),
+                first.id,
+                Err(TranscriptError::Storage("down".into()))
+            ),
             Settled::Failed(_)
         ));
-        outbox.enqueue(chat, vec![chain(Uuid::new_v4(), Role::Assistant)], None);
-        let retried = outbox.next_batch(chat, false).unwrap();
+        outbox.enqueue(
+            chat.into(),
+            vec![chain(Uuid::new_v4(), Role::Assistant)],
+            None,
+        );
+        let retried = outbox.next_batch(chat.into(), false).unwrap();
         assert_eq!(retried.id, first.id);
         assert_eq!(retried.lines.len(), 1);
         assert_eq!(outbox.unresolved_error().as_deref(), Some("down"));
         outbox.settle(
-            chat,
+            chat.into(),
             first.id,
             Ok(AppendAck {
                 position: StorePosition(10),
             }),
         );
-        let next = outbox.next_batch(chat, false).unwrap();
+        let next = outbox.next_batch(chat.into(), false).unwrap();
         assert_eq!(next.expected, Some(StorePosition(10)));
         assert_eq!(outbox.unresolved_error(), None);
 
-        outbox.settle(chat, next.id, Err(TranscriptError::Fenced));
-        outbox.enqueue(chat, vec![chain(Uuid::new_v4(), Role::User)], None);
-        assert!(outbox.next_batch(chat, true).is_none());
-        assert_eq!(outbox.refusal(chat), Some(TranscriptError::Fenced));
+        outbox.settle(chat.into(), next.id, Err(TranscriptError::Fenced));
+        outbox.enqueue(chat.into(), vec![chain(Uuid::new_v4(), Role::User)], None);
+        assert!(outbox.next_batch(chat.into(), true).is_none());
+        assert_eq!(outbox.refusal(chat.into()), Some(TranscriptError::Fenced));
     }
 
     /// A result's chain entry and the lifecycle records of the same change, such as a resumed
@@ -562,21 +570,25 @@ mod tests {
     fn a_group_enqueued_together_is_never_split_across_batches() {
         let outbox = TranscriptOutbox::default();
         let chat = Uuid::new_v4();
-        outbox.register(chat, StorePosition(0));
-        outbox.enqueue(chat, vec![chain(Uuid::new_v4(), Role::User), title()], None);
-        let first = outbox.next_batch(chat, false).unwrap();
+        outbox.register(chat.into(), StorePosition(0));
+        outbox.enqueue(
+            chat.into(),
+            vec![chain(Uuid::new_v4(), Role::User), title()],
+            None,
+        );
+        let first = outbox.next_batch(chat.into(), false).unwrap();
         assert_eq!(first.lines.len(), 2);
         let group = vec![chain(Uuid::new_v4(), Role::User), title(), title()];
-        outbox.enqueue(chat, group.clone(), None);
-        assert_eq!(outbox.next_batch(chat, false).unwrap().id, first.id);
+        outbox.enqueue(chat.into(), group.clone(), None);
+        assert_eq!(outbox.next_batch(chat.into(), false).unwrap().id, first.id);
         outbox.settle(
-            chat,
+            chat.into(),
             first.id,
             Ok(AppendAck {
                 position: StorePosition(2),
             }),
         );
-        let second = outbox.next_batch(chat, false).unwrap();
+        let second = outbox.next_batch(chat.into(), false).unwrap();
         assert_eq!(second.lines.len(), group.len());
     }
 }

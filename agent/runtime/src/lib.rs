@@ -465,6 +465,9 @@ struct ChatBookkeeping {
 
 #[derive(Clone)]
 struct Chat {
+    /// How this Chat's Loop writes ids into model text and resolves the ids the model passes
+    /// back.
+    ids: tickloop_ids::IdContext,
     family_generation: u64,
     family_stopping: bool,
     task_checkpoint_pending: bool,
@@ -1034,7 +1037,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
         message_models: BTreeMap::new(),
-        chat_loop: LoopSnapshot::new(Uuid::new_v4()),
+        chat_loop: LoopSnapshot::new(tickloop_ids::generate().into()),
         last_sequence: 0,
         permissions: Vec::new(),
         questions: Vec::new(),
@@ -1309,7 +1312,7 @@ impl Agent {
                     && chat.snapshot.policy.explicit_decision_with_session(
                         tickloop_agent_config::skills::SKILL_TOOL_NAME,
                         &serde_json::json!({"skill":definition.name}),
-                        receipt.loop_id,
+                        receipt.loop_id.into(),
                         None,
                     ) != Some(Decision::Deny)
             })
@@ -1433,7 +1436,11 @@ impl Agent {
         let legacy = boundary_id
             .zip(lines.as_deref())
             .and_then(|(boundary_id, lines)| {
-                crate::transcript::load_original_user_inputs(lines, boundary_id, receipt.chat_id)
+                crate::transcript::load_original_user_inputs(
+                    lines,
+                    boundary_id,
+                    receipt.chat_id.into(),
+                )
             });
         let ancestors = match &lines {
             Some(lines) => {
@@ -1486,7 +1493,9 @@ impl Agent {
                 },
             ));
         };
+        let ids = self.chat_ids(snapshot.id).await;
         let context = approval_context::capture(
+            &ids,
             &snapshot,
             &bookkeeping,
             operation,
@@ -1519,7 +1528,7 @@ impl Agent {
             context.reply_history = approval_context::capture_reply_history(
                 &snapshot,
                 &bookkeeping,
-                Some((operation.run_id, &operation.call_id)),
+                Some((operation.run_id.into(), &operation.call_id)),
                 &context.original_user_inputs,
                 Some(ancestors),
             );
@@ -2105,12 +2114,14 @@ impl Agent {
     }
 
     pub async fn create_chat(&self, folder: PathBuf) -> Result<ChatId, AgentError> {
-        self.create_chat_with_id(Uuid::new_v4(), Some(folder)).await
+        self.create_chat_with_id(tickloop_ids::generate().into(), Some(folder))
+            .await
     }
 
     /// A new Chat without a Folder, in an Agent without an Execution Environment.
     pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
-        self.create_chat_with_id(Uuid::new_v4(), None).await
+        self.create_chat_with_id(tickloop_ids::generate().into(), None)
+            .await
     }
 
     pub async fn restore_empty_chat(
@@ -2220,8 +2231,11 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         if let Some(metadata) = &mut snapshot.delegation {
             let sessions = self.inner.session_permissions.lock().await;
-            let parent = PermissionOwner::new(metadata.parent_chat_id, metadata.parent_loop_id)
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let parent = PermissionOwner::new(
+                metadata.parent_chat_id.into(),
+                metadata.parent_loop_id.into(),
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
             if let Some(denials) = &mut metadata.ceiling.session_denials {
                 for denial in sessions.freeze_denials(parent) {
                     if !denials.contains(&denial) {
@@ -2235,6 +2249,7 @@ impl Agent {
         chats.insert(
             id,
             Chat {
+                ids: tickloop_ids::IdContext::new(),
                 family_generation: 0,
                 family_stopping: false,
                 task_checkpoint_pending: false,
@@ -2305,7 +2320,7 @@ impl Agent {
             .advance(
                 chat_id,
                 TurnRequest {
-                    input_id: Uuid::new_v4(),
+                    input_id: tickloop_ids::generate().into(),
                     op: TurnOp::Skill {
                         after: ParentSelection::CurrentLeaf,
                         skill: SkillInvocation {
@@ -2359,10 +2374,10 @@ impl Agent {
             .then(|| tickloop_agent_config::loop_skill::LoopSchedule::of(&skill.arguments).ok())
             .flatten();
         // The self-paced task names the turn it starts before the turn is submitted.
-        let run_id = Uuid::new_v4();
+        let run_id = tickloop_ids::generate();
         let started_loop = match &user_loop {
             Some(tickloop_agent_config::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
-                self.start_users_self_paced_loop(chat_id, prompt.clone(), run_id)
+                self.start_users_self_paced_loop(chat_id, prompt.clone(), run_id.into())
                     .await?
             }
             Some(tickloop_agent_config::loop_skill::LoopSchedule::Cron { .. }) | None => None,
@@ -2374,7 +2389,7 @@ impl Agent {
                 SubmissionOptions {
                     invoked_skill: Some(invoked),
                     user_loop,
-                    run_id: started_loop.is_some().then_some(run_id),
+                    run_id: started_loop.is_some().then_some(run_id.into()),
                     host_context,
                     ledger: Some(ledger),
                     turn,
@@ -2639,9 +2654,9 @@ impl Agent {
             let (id, op) = match (&agent_message, &directed_human) {
                 (Some(source), _) => (source.message_id, InputOp::AgentMessage),
                 (_, Some(source)) => (source.message_id, InputOp::AgentMessage),
-                (None, None) => (Uuid::new_v4(), InputOp::Continue),
+                (None, None) => (tickloop_ids::generate(), InputOp::Continue),
             };
-            lifecycle::LedgerInput::new(id, op, &input)
+            lifecycle::LedgerInput::new(id.into(), op, &input)
         });
         // Held through every task this submission starts: `shutdown` either refuses it or waits
         // for those tasks.
@@ -2724,25 +2739,25 @@ impl Agent {
         let run_id = feedback_input
             .as_ref()
             .map(|feedback| feedback.delivery_id)
-            .or(chosen_run_id)
-            .unwrap_or_else(Uuid::new_v4);
+            .or(chosen_run_id.map(Into::into))
+            .unwrap_or_else(tickloop_ids::generate);
         let receipt = Receipt {
             chat_id,
             loop_id,
-            run_id,
+            run_id: run_id.into(),
         };
         if let Some(user_loop) = user_loop {
-            chat.user_loops.insert(run_id, user_loop);
+            chat.user_loops.insert(run_id.into(), user_loop);
         }
         if let Some(mut invoked_skill) = invoked_skill {
             if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
                 && chat.skills.is_user_only(&invoked_skill.name)
             {
-                invoked_skill.run_id = Some(run_id);
+                invoked_skill.run_id = Some(run_id.into());
             }
             record_invoked_skill(chat, invoked_skill);
         } else if trigger_source.is_none() && agent_message.is_none() {
-            carry_user_skills_past_sign_in(chat, loop_id, run_id);
+            carry_user_skills_past_sign_in(chat, loop_id, run_id.into());
         }
         let requested_receipt = receipt.clone();
         if trigger_source.is_none() {
@@ -2842,7 +2857,7 @@ impl Agent {
             let context = self.inner.session_permissions.lock().await;
             let mut candidate = context.clone();
             candidate
-                .inherit_loop(chat_id, loop_id)
+                .inherit_loop(chat_id.into(), loop_id.into())
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
             session_context = Some(context);
             session_candidate = Some(candidate);
@@ -3071,6 +3086,7 @@ impl Agent {
                     "subscriptions": chat_loop.subscriptions,
                 });
             }
+            let state = tickloop_agent_protocol::model_ids::model_json(&chat.ids, state);
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
@@ -3294,7 +3310,7 @@ impl Agent {
                     &mut candidate,
                     receipt.run_id,
                     SettledOutcome::Merged {
-                        into: active.run_id,
+                        into: active.run_id.into(),
                     },
                 );
                 candidate.snapshot.last_sequence += 1;
@@ -3387,7 +3403,7 @@ impl Agent {
         let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let permission_is_current = session_context.revalidate(
             &admission.session_evaluation.token,
-            PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+            PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
                 .map_err(|error| error.to_string())?,
             &current_session_operation,
         );
@@ -3478,7 +3494,7 @@ impl Agent {
                 Err(error) => return Err(error.to_string()),
             };
             *is_awaiting_model = false;
-            let assistant_message_id = Uuid::new_v4();
+            let assistant_message_id = tickloop_ids::generate();
             let calls = tool_batch::batch_calls(&output.content);
             {
                 let mut chats = self.inner.chats.lock().await;
@@ -3579,7 +3595,7 @@ impl Agent {
             self.clear_run_interactions(chat, receipt.run_id).await;
         }
         if let Err(error) =
-            recovery::close_dangling_tool_calls(&mut chat.snapshot, Some(receipt.run_id))
+            recovery::close_dangling_tool_calls(&chat.ids, &mut chat.snapshot, Some(receipt.run_id))
         {
             result = Err(error.to_string());
         }
@@ -3876,21 +3892,23 @@ impl Agent {
                 chat.bookkeeping
                     .lifecycle
                     .open_input(pending.receipt.run_id)
-                    .unwrap_or_else(Uuid::new_v4)
+                    .unwrap_or_else(tickloop_agent_protocol::InputId::new)
             },
-            |source| source.message_id,
+            |source| source.message_id.into(),
         );
         if let Some(source) = pending.directed_human {
             chat.snapshot
                 .human_family_origins
-                .insert(message_id, source);
+                .insert(message_id.into(), source);
         }
-        chat.snapshot.message_ids.insert(message_index, message_id);
+        chat.snapshot
+            .message_ids
+            .insert(message_index, message_id.into());
         chat.snapshot
             .prompt_execution_modes
             .insert(message_index, chat.snapshot.policy.mode);
         if let Some(file_history) = &mut chat.file_history {
-            file_history.begin_snapshot(message_id);
+            file_history.begin_snapshot(message_id.into());
         }
     }
 
@@ -4369,7 +4387,7 @@ impl Agent {
                     &mut candidate,
                     consumed.run_id,
                     SettledOutcome::Merged {
-                        into: receipt.run_id,
+                        into: receipt.run_id.into(),
                     },
                 );
                 merged_receipts.push(consumed);
@@ -4428,7 +4446,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
         let request = PermissionRequest {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             loop_id: receipt.loop_id,
             execution: PermissionExecution::ToolCall {
                 run_id: receipt.run_id,
@@ -4458,8 +4476,8 @@ impl Agent {
             run_id,
         });
         let (sender, receiver) = oneshot::channel();
-        let owner =
-            PermissionOwner::new(chat_id, request.loop_id).map_err(|error| error.to_string())?;
+        let owner = PermissionOwner::new(chat_id.into(), request.loop_id.into())
+            .map_err(|error| error.to_string())?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
@@ -4497,7 +4515,7 @@ impl Agent {
             let receipt = model_receipt.clone().unwrap_or(Receipt {
                 chat_id,
                 loop_id: request.loop_id,
-                run_id: Uuid::nil(),
+                run_id: Uuid::nil().into(),
             });
             self.publish_event(
                 chat,
@@ -4884,9 +4902,11 @@ impl Agent {
                     let Some(denials) = &mut metadata.ceiling.session_denials else {
                         continue;
                     };
-                    let parent =
-                        PermissionOwner::new(metadata.parent_chat_id, metadata.parent_loop_id)
-                            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                    let parent = PermissionOwner::new(
+                        metadata.parent_chat_id.into(),
+                        metadata.parent_loop_id.into(),
+                    )
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
                     let mut changed = false;
                     for denial in candidate.freeze_denials(parent) {
                         if !denials.contains(&denial) {
@@ -4938,6 +4958,17 @@ impl Agent {
             .ok_or(AgentError::NotFound)
     }
 
+    /// The id context of `chat`'s Loop, for model text written outside the Chat lock. A Chat
+    /// this Agent does not hold writes ids in the default form.
+    pub(crate) async fn chat_ids(&self, chat: ChatId) -> tickloop_ids::IdContext {
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get(&chat)
+            .map_or_else(tickloop_ids::IdContext::new, |chat| chat.ids)
+    }
+
     pub async fn snapshot(&self, chat_id: ChatId) -> Result<ChatSnapshot, AgentError> {
         let chats = self.inner.chats.lock().await;
         let mut snapshot = chats
@@ -4977,11 +5008,11 @@ impl Agent {
             let mut candidate = original.clone();
             let ids = taken.iter().map(|entry| entry.id).collect::<HashSet<_>>();
             candidate.snapshot.pending_inputs.retain(|pending| {
-                pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id)
+                pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id.uuid())
             });
             for entry in &taken {
                 if entry.kind == QueuedInputKind::Message {
-                    self.settle_input(&mut candidate, entry.id, SettledOutcome::Withdrawn);
+                    self.settle_input(&mut candidate, entry.id.into(), SettledOutcome::Withdrawn);
                 }
             }
             candidate
@@ -5014,7 +5045,7 @@ impl Agent {
                     sequence: candidate.snapshot.last_sequence,
                     chat_id,
                     loop_id,
-                    run_id: entry.id,
+                    run_id: entry.id.into(),
                     kind: EventKind::InputTakenBack,
                 };
                 candidate.snapshot.events.push(event.clone());
@@ -5046,7 +5077,7 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         chat.snapshot.last_queue_sequence += 1;
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         chat.snapshot.pending_commands.push(PendingCommand {
             id,
             chat_id,
@@ -5153,7 +5184,10 @@ impl Agent {
         chat.bookkeeping
             .deferred_notifications
             .push(tick_protocol::InstanceRef::shell(notification.task_id));
-        self.append_local_messages(chat, [local_messages::task_notification(&notification)])?;
+        self.append_local_messages(
+            chat,
+            [local_messages::task_notification(&chat.ids, &notification)],
+        )?;
         let _ = self.inner.task_notifications.send(notification);
         Ok(self.queue_task_continuation(chat, loop_id))
     }
@@ -5190,7 +5224,7 @@ impl Agent {
         let receipt = Receipt {
             chat_id: chat.snapshot.id,
             loop_id,
-            run_id: Uuid::new_v4(),
+            run_id: tickloop_ids::generate().into(),
         };
         queue_continuation(chat, receipt);
         true
@@ -5249,7 +5283,10 @@ impl Agent {
                 }
             }
             for command in tools.user_commands().await {
-                if let Ok(command) = tools.stop_user_shell(command.operation_id, chat_id).await {
+                if let Ok(command) = tools
+                    .stop_user_shell(command.operation_id, chat_id.into())
+                    .await
+                {
                     let _ = self.record_user_shell(chat_id, command).await;
                 }
             }
@@ -5411,7 +5448,8 @@ mod thinking_settings_tests {
     #[test]
     fn disabled_preference_applies_only_when_model_card_allows_it() {
         let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
-        let mut snapshot = empty_snapshot(Uuid::new_v4(), Some(PathBuf::new()), model.clone());
+        let mut snapshot =
+            empty_snapshot(Uuid::new_v4().into(), Some(PathBuf::new()), model.clone());
         snapshot.thinking_enabled = false;
         assert_eq!(
             snapshot.effective_reasoning_effort(),

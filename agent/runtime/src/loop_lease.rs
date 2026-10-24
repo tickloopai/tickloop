@@ -488,7 +488,7 @@ fn try_acquire(directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<Leas
     let holder = LeaseHolder {
         chat_id,
         pid: std::process::id(),
-        nonce: Uuid::new_v4(),
+        nonce: tickloop_ids::generate(),
         started_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         host: local_host_name(),
     };
@@ -550,9 +550,11 @@ fn create_exclusive(directory: &PrivateDirectory, path: &Path, content: &[u8]) -
 }
 
 fn unique_temporary_path(directory: &PrivateDirectory) -> PathBuf {
-    directory
-        .path()
-        .join(format!(".{}.{}.tmp", std::process::id(), Uuid::new_v4()))
+    directory.path().join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        tickloop_ids::generate()
+    ))
 }
 
 fn refers_to_same_file(file: &File, path: &Path) -> io::Result<bool> {
@@ -1026,20 +1028,20 @@ mod tests {
     fn a_retry_is_cancelled_when_a_takeover_succeeds_and_only_its_own_end_clears_it() {
         let leases = ChatLeases::default();
         let chat_id = Uuid::new_v4();
-        let (first, _, first_cancel) = leases.schedule_retry(chat_id).unwrap();
+        let (first, _, first_cancel) = leases.schedule_retry(chat_id.into()).unwrap();
         assert!(
-            leases.schedule_retry(chat_id).is_none(),
+            leases.schedule_retry(chat_id.into()).is_none(),
             "one retry at a time"
         );
-        leases.mark_synced(chat_id, 0);
+        leases.mark_synced(chat_id.into(), 0);
         assert!(first_cancel.is_cancelled());
-        let (_, _, second_cancel) = leases.schedule_retry(chat_id).unwrap();
-        leases.retry_came_due(chat_id, first);
+        let (_, _, second_cancel) = leases.schedule_retry(chat_id.into()).unwrap();
+        leases.retry_came_due(chat_id.into(), first);
         assert!(
-            leases.schedule_retry(chat_id).is_none(),
+            leases.schedule_retry(chat_id.into()).is_none(),
             "a retry that came due late does not clear the one scheduled after it"
         );
-        leases.release(chat_id);
+        leases.release(chat_id.into());
         assert!(second_cancel.is_cancelled());
     }
 
@@ -1061,16 +1063,16 @@ mod tests {
     fn separate_opens_in_one_process_exclude_each_other_until_release() {
         let (_root, directory) = lease_directory();
         let chat_id = Uuid::new_v4();
-        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
+        let lease = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         assert!(matches!(
-            try_acquire(&directory, chat_id).unwrap(),
+            try_acquire(&directory, chat_id.into()).unwrap(),
             LeaseAttempt::HeldElsewhere
         ));
         assert!(lease.path.exists());
         let path = lease.path.clone();
         drop(lease);
         assert!(!path.exists());
-        let again = acquired(try_acquire(&directory, chat_id).unwrap());
+        let again = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         assert!(again.path.exists());
     }
 
@@ -1078,14 +1080,14 @@ mod tests {
     fn a_descriptor_opened_before_the_holder_deleted_the_lock_is_not_a_lease() {
         let (_root, directory) = lease_directory();
         let chat_id = Uuid::new_v4();
-        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
+        let lease = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         let stale = File::open(&lease.path).unwrap();
         let path = lease.path.clone();
         drop(lease);
         // 旧描述符上的 flock 可以拿到，但路径已不指向它；新获取者创建新文件。
         stale.try_lock().unwrap();
         assert!(!refers_to_same_file(&stale, &path).unwrap());
-        let current = acquired(try_acquire(&directory, chat_id).unwrap());
+        let current = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         assert!(refers_to_same_file(&current.file, &path).unwrap());
     }
 
@@ -1093,10 +1095,10 @@ mod tests {
     fn a_failed_attempt_leaves_the_holders_lock_in_place() {
         let (_root, directory) = lease_directory();
         let chat_id = Uuid::new_v4();
-        let lease = acquired(try_acquire(&directory, chat_id).unwrap());
+        let lease = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         for _ in 0..10 {
             assert!(matches!(
-                try_acquire(&directory, chat_id).unwrap(),
+                try_acquire(&directory, chat_id.into()).unwrap(),
                 LeaseAttempt::HeldElsewhere
             ));
         }
@@ -1134,16 +1136,16 @@ mod tests {
         let resumed = write_receiving(&directory, ReceivingChange::Resumed)
             .unwrap()
             .unwrap();
-        leases.remember_generation(chat_id, resumed.generation);
+        leases.remember_generation(chat_id.into(), resumed.generation);
         assert!(matches!(
-            leases.check(&directory, chat_id).unwrap(),
+            leases.check(&directory, chat_id.into()).unwrap(),
             LeaseCheck::Held { .. }
         ));
         write_receiving(&directory, ReceivingChange::Paused)
             .unwrap()
             .unwrap();
         assert!(matches!(
-            leases.check(&directory, chat_id).unwrap(),
+            leases.check(&directory, chat_id.into()).unwrap(),
             LeaseCheck::PausedElsewhere { generation, .. } if generation == resumed.generation + 1
         ));
     }
@@ -1154,19 +1156,19 @@ mod tests {
         let leases = ChatLeases::default();
         let chat_id = Uuid::new_v4();
         assert!(matches!(
-            leases.check(&directory, chat_id).unwrap(),
+            leases.check(&directory, chat_id.into()).unwrap(),
             LeaseCheck::Held { .. }
         ));
         let path = directory.path().join(LEASE_FILE);
         std::fs::remove_file(&path).unwrap();
-        let intruder = acquired(try_acquire(&directory, chat_id).unwrap());
+        let intruder = acquired(try_acquire(&directory, chat_id.into()).unwrap());
         assert!(matches!(
-            leases.check(&directory, chat_id).unwrap(),
+            leases.check(&directory, chat_id.into()).unwrap(),
             LeaseCheck::HeldElsewhere
         ));
         drop(intruder);
         assert!(matches!(
-            leases.check(&directory, chat_id).unwrap(),
+            leases.check(&directory, chat_id.into()).unwrap(),
             LeaseCheck::Held { .. }
         ));
     }

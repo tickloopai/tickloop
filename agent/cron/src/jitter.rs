@@ -32,7 +32,7 @@ impl<Tz: TimeZone> Run<Tz> {
 
 /// A new task id: a time-ordered UUIDv7, unique across every Chat.
 pub fn generate_task_id() -> Uuid {
-    Uuid::now_v7()
+    tickloop_ids::generate()
 }
 
 /// The first run scheduled strictly after `after`, fired as [`run_for`] describes and never

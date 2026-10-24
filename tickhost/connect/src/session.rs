@@ -194,7 +194,7 @@ impl TickSession {
             .command
             .first()
             .ok_or_else(|| SessionError::Protocol("Tick command is empty".into()))?;
-        let run = uuid::Uuid::new_v4();
+        let run = tick_protocol::HostedRunId::new().uuid();
         let instance = InstanceRef::hosted(run);
         let identity = instance.to_string();
         let runtime_dir = resolve_runtime_dir(launch.runtime_dir.as_deref())?;
@@ -820,7 +820,7 @@ impl SessionClient {
         })?;
         let directory = resolve_runtime_dir(runtime_dir.as_deref())?;
         verify_owner(&directory)?;
-        let socket = directory.join(format!("{run}.sock"));
+        let socket = directory.join(format!("{}.sock", run.uuid()));
         verify_owner(&socket)?;
         let client = Self {
             instance,

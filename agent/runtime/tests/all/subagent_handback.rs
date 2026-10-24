@@ -383,9 +383,11 @@ async fn report_requirements_and_deliveries_survive_restore_without_replaying_pl
         );
         assert!(idle.requests.lock().unwrap().is_empty());
         restored.shutdown().await;
-        let parent_log =
-            std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-                .unwrap();
+        let parent_log = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+            &root,
+            chat.uuid(),
+        ))
+        .unwrap();
         assert!(!parent_log.contains("PRIVATE-UNSENT-TEXT"));
     }
 }
@@ -702,7 +704,7 @@ async fn malformed_report_checkpoint_cannot_restore_as_unreviewed_plain_output()
     let child = agent.subagents(chat).await.unwrap()[0].child_chat_id;
     agent.shutdown().await;
     drop(agent);
-    let path = tickloop_agent_test_support::transcript_file(&root, child);
+    let path = tickloop_agent_test_support::transcript_file(&root, child.uuid());
     let mut changed = false;
     let lines = std::fs::read_to_string(&path)
         .unwrap()

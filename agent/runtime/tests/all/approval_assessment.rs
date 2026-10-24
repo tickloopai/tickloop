@@ -186,7 +186,7 @@ async fn missing_original_evidence_reports_no_actual_reviewer() {
     first.shutdown().await;
     drop(first);
 
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let mut changed = false;
     let rewritten = std::fs::read_to_string(&path)
         .unwrap()

@@ -183,7 +183,9 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     };
     if route == ATTACH_ROUTE {
         let mut events = core.subscribe();
-        core.submit(chat, "Plan the change".into()).await.unwrap();
+        core.submit(chat.into(), "Plan the change".into())
+            .await
+            .unwrap();
         wait_for_plan_approval(&mut events).await;
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -211,7 +213,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         let mut sample = 0_u64;
         loop {
             interval.tick().await;
-            let snapshot = core.snapshot(chat).await.unwrap();
+            let snapshot = core.snapshot(chat.into()).await.unwrap();
             sample += 1;
             let state = json!({
                 "sample": sample,
@@ -267,7 +269,7 @@ async fn raise_plan_approval_then_stop(
     record_phase(workdir, "approval-raised");
     core.shutdown().await;
     record_phase(workdir, "shutdown-finished");
-    chat
+    chat.into()
 }
 
 async fn wait_for_plan_approval(

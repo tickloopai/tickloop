@@ -18,7 +18,14 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
-pub type WatchId = Uuid;
+/// One stream a Loop or the Monitor watches a Tick Instance through.
+pub enum WatchKind {}
+
+impl tickloop_ids::Kind for WatchKind {
+    const NOUN: &'static str = "watch";
+}
+
+pub type WatchId = tickloop_ids::Id<WatchKind>;
 
 /// Where an opened Tick stream runs its tasks: the Agent's own, which cancels them and waits for
 /// them when it shuts down. The default belongs to no Agent: its tasks end with their channels.
@@ -164,7 +171,7 @@ impl TickWatchValidator for HostWatchValidator {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), String> {
         self.provider
-            .revalidate_call(chat, &self.query, cancel)
+            .revalidate_call(chat.into(), &self.query, cancel)
             .await
     }
     fn host_authority(&self) -> Result<Option<WatchHostAuthority>, String> {
@@ -880,7 +887,7 @@ async fn follow_instances<O: InstanceObserver>(
                 continue;
             }
             let (sender, receiver) = watch::channel(watches.clone());
-            let generation = Uuid::new_v4();
+            let generation = tickloop_ids::generate();
             workers.insert(
                 instance.clone(),
                 Worker {
@@ -1243,7 +1250,7 @@ mod tests {
     async fn observe_ending(answers: usize) -> (bool, TickConnectionState) {
         let (publisher, mut events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
-        let watch = Uuid::new_v4();
+        let watch = WatchId::new();
         let (_wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
         let feed = EndingFeed {
             answers,
@@ -1326,7 +1333,7 @@ mod tests {
     async fn a_watch_that_starts_before_the_first_content_receives_it_once() {
         let (publisher, mut events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
-        let watch = Uuid::new_v4();
+        let watch = WatchId::new();
         let (wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
         let (content, observations) = watch::channel(SessionObservation {
             update: None,
@@ -1376,8 +1383,8 @@ mod tests {
     async fn a_new_watch_is_not_retired_with_a_worker_that_ended_before_it_joined() {
         let (publisher, _events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
-        let old = Uuid::new_v4();
-        let fresh = Uuid::new_v4();
+        let old = WatchId::new();
+        let fresh = WatchId::new();
         let old_desired = BTreeMap::from([(old, instance.clone())]);
         publisher.retain(&old_desired);
         publisher.state_to(

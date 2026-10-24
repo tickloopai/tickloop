@@ -824,7 +824,7 @@ fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<Open
 /// 在目录内写临时文件、设置权限位后 `renameat` 替换 `name`；失败时删除临时文件。
 /// 替换的是目录项本身，即使 `name` 此时是符号链接也不会写到链接指向的位置。
 fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> io::Result<()> {
-    let staged = c_string(format!("{STAGED_FILE_PREFIX}{}", Uuid::new_v4()).as_bytes())?;
+    let staged = c_string(format!("{STAGED_FILE_PREFIX}{}", tickloop_ids::generate()).as_bytes())?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: 目录描述符有效，名称以 NUL 结尾；成功时返回的描述符归 `File` 所有。
     let descriptor = unsafe {

@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use tickloop_agent_protocol::{
-    AgentColor, AgentSummary, ChatSnapshot, Content, FamilyCompletion, LocalMessage, LoopState,
-    SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SubagentNotificationDelivery,
+    AgentColor, AgentSummary, ChatId, ChatSnapshot, Content, FamilyCompletion, LocalMessage,
+    LoopState, SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SubagentNotificationDelivery,
     SubagentReportMessage, VerifiedUserRelay,
 };
 use uuid::Uuid;
@@ -61,7 +61,7 @@ pub(super) fn catalog_colors(rows: &[AgentSummary]) -> AgentColors {
 
 /// Every child `snapshot`'s conversation names in its Agent Color: the children it delegated to
 /// and the ones whose completions reached it.
-pub(super) fn named_agents(snapshot: &ChatSnapshot) -> HashSet<Uuid> {
+pub(super) fn named_agents(snapshot: &ChatSnapshot) -> HashSet<ChatId> {
     let mut agents = snapshot
         .family_completions
         .iter()
@@ -81,14 +81,13 @@ pub(super) fn named_agents(snapshot: &ChatSnapshot) -> HashSet<Uuid> {
 }
 
 /// The child a Subagent result names.
-pub(super) fn launched_child(result: &str) -> Option<Uuid> {
+/// The child a Subagent result names, written as a UUID by older versions and in the model's
+/// id form since.
+pub(super) fn launched_child(result: &str) -> Option<ChatId> {
     if !result.contains("\"child_chat_id\"") {
         return None;
     }
-    serde_json::from_str::<Value>(result).ok()?["child_chat_id"]
-        .as_str()?
-        .parse()
-        .ok()
+    ChatId::parse(serde_json::from_str::<Value>(result).ok()?["child_chat_id"].as_str()?)
 }
 
 fn agent_role(colors: &AgentColors, chat: Option<Uuid>) -> Option<Role> {
@@ -104,7 +103,9 @@ pub(super) fn subagent_call_runs(
     display: DisplayProfile,
 ) -> RoleRuns {
     let (handle, description) = subagent_identity(input, launch);
-    let child = launch.and_then(|launch| launch["child_chat_id"].as_str()?.parse().ok());
+    let child = launch
+        .and_then(|launch| ChatId::parse(launch["child_chat_id"].as_str()?))
+        .map(ChatId::uuid);
     let mut runs = vec![
         ("\n".into(), None),
         (
@@ -225,7 +226,8 @@ pub(super) fn subagent_report(
 ) -> Option<SubagentReportMessage> {
     let child_run = launch["child_run_id"]
         .as_str()
-        .and_then(|run| run.parse().ok());
+        .and_then(tickloop_agent_protocol::RunId::parse)
+        .map(tickloop_agent_protocol::RunId::uuid);
     reported(launch["result"].as_str().unwrap_or_default(), || {
         delivered_report(snapshot, child_run?)
     })
@@ -317,7 +319,7 @@ pub(super) fn shown_agent_inputs(snapshot: &ChatSnapshot) -> impl Iterator<Item 
             snapshot
                 .family_completions
                 .iter()
-                .map(|completion| completion.child_run_id),
+                .map(|completion| completion.child_run_id.uuid()),
         )
 }
 
@@ -350,7 +352,7 @@ pub(super) fn completion_runs(
         (format!(" {TEAMMATE} "), None),
         (
             format!("@{}", safe_line(&completion.handle)),
-            agent_role(colors, Some(completion.child_chat_id)),
+            agent_role(colors, Some(completion.child_chat_id.into())),
         ),
         (format!(" {word}"), None),
     ];
@@ -374,7 +376,7 @@ pub(super) fn completion_runs(
     heading.push(("\n".into(), None));
     let mut body = Body::default();
     let report = reported(&completion.result, || {
-        delivered_report(snapshot, completion.child_run_id)
+        delivered_report(snapshot, completion.child_run_id.into())
     });
     match &report {
         Some(report) => body.report(report, detail),
@@ -595,9 +597,9 @@ mod tests {
 
     fn completion(state: LoopState, result: &str, error: Option<&str>) -> FamilyCompletion {
         FamilyCompletion {
-            child_chat_id: Uuid::new_v4(),
-            child_loop_id: Uuid::new_v4(),
-            child_run_id: Uuid::new_v4(),
+            child_chat_id: Uuid::new_v4().into(),
+            child_loop_id: Uuid::new_v4().into(),
+            child_run_id: Uuid::new_v4().into(),
             handle: "audit".into(),
             state,
             result: result.into(),
@@ -647,8 +649,8 @@ mod tests {
             note: Some(warning.into()),
             report: "First finding.\n\nSecond finding.\nThird finding.".into(),
         };
-        let snapshot = delivered(finished.child_run_id, &report);
-        let colors = AgentColors::from([(finished.child_chat_id, Some(AgentColor::Cyan))]);
+        let snapshot = delivered(finished.child_run_id.into(), &report);
+        let colors = AgentColors::from([(finished.child_chat_id.uuid(), Some(AgentColor::Cyan))]);
         let (heading, body) = completion_runs(
             &finished,
             &snapshot,
@@ -725,7 +727,7 @@ mod tests {
     #[test]
     fn another_agent_message_folds_into_one_dim_line_and_reads_in_full() {
         let relay = VerifiedUserRelay {
-            original_chat_id: Uuid::new_v4(),
+            original_chat_id: Uuid::new_v4().into(),
             original_message_id: Uuid::new_v4(),
             original_text: "Human instruction".into(),
             forwarded_verbatim: true,

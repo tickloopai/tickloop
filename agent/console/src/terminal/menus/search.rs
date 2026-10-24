@@ -365,7 +365,7 @@ impl Menus {
         self.show_with_roles(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Web search".into(),
                 context: Vec::new(),
                 options,
@@ -513,7 +513,7 @@ impl Menus {
             .filter(|flow| flow.config == config)
             .map(|flow| flow.id)
             .or_else(|| previous.map(|(id, _)| *id))
-            .unwrap_or_else(Uuid::new_v4);
+            .unwrap_or_else(tickloop_ids::generate);
         self.show_with_roles(
             console,
             Menu {
@@ -553,7 +553,7 @@ impl Menus {
             ));
         }
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: format!("API key · {}", config.provider.label()),
             context: vec![
                 format!("Saved privately as {name}; the existing key is kept until Save succeeds."),
@@ -585,7 +585,7 @@ impl Menus {
         return_to_settings: bool,
     ) -> Result<(), String> {
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: "Search endpoint".into(),
             context: vec![
                 "HTTPS JSON search URL; loopback HTTP is also supported.".into(),
@@ -657,7 +657,7 @@ impl Menus {
         self.provider.search.flow.take();
         self.invalidate_search_test(config.provider);
         let credential = self.search_credential_stamp(&config)?;
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = agent.clone();
         let test_config = config.clone();

@@ -244,7 +244,7 @@ async fn run_identity_rearms_completion_without_a_reported_timestamp() {
     let main = row(epoch, 1, None, "Idle");
     let mut child = row(epoch, 2, Some(main.execution), "Idle");
     child.updated_at = None;
-    child.run_id = Some(Uuid::from_u128(100));
+    child.run_id = Some(Uuid::from_u128(100).into());
     let clock = Arc::new(AtomicU64::new(100_000));
     let injected = clock.clone();
     let catalog = catalog(epoch, vec![main.clone(), child]);
@@ -255,7 +255,7 @@ async fn run_identity_rearms_completion_without_a_reported_timestamp() {
     clock.store(140_000, Ordering::SeqCst);
     console.refresh().await.unwrap();
     assert_eq!(console.family(main.execution).len(), 1);
-    catalog.rows.lock().unwrap()[1].run_id = Some(Uuid::from_u128(101));
+    catalog.rows.lock().unwrap()[1].run_id = Some(Uuid::from_u128(101).into());
     console.refresh().await.unwrap();
     assert_eq!(console.family(main.execution).len(), 2);
     clock.store(169_999, Ordering::SeqCst);

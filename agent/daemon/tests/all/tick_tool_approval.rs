@@ -312,7 +312,7 @@ async fn assert_mode_admits_tick_modification_without_human(mode: ExecutionMode,
             _ => {}
         }
     }
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.into()).await;
     assert_eq!(host.sent.lock().unwrap().len(), 1);
     assert_eq!(
         reviewer.requests.lock().unwrap().len(),
@@ -346,7 +346,7 @@ async fn auto_tick_modification_uses_reviewer_instead_of_forced_human_confirmati
 async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let chat_loop = agent.snapshot(chat).await.unwrap().chat_loop;
+            let chat_loop = agent.snapshot(chat.into()).await.unwrap().chat_loop;
             if chat_loop.state == LoopState::Idle && chat_loop.run_id.is_some() {
                 return;
             }

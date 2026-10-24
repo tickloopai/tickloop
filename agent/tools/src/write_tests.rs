@@ -51,7 +51,15 @@ impl Chat {
     }
 
     async fn run(&self, name: &str, input: Value) -> Result<ToolResult, ToolError> {
-        let prepared = self.tools.prepare(&self.workspace(), name, &input).await?;
+        let prepared = self
+            .tools
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &self.workspace(),
+                name,
+                &input,
+            )
+            .await?;
         self.tools.execute(prepared, CancellationToken::new()).await
     }
 
@@ -323,6 +331,7 @@ async fn new_files_get_their_missing_parent_directories() {
     let prepared = chat
         .tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &chat.workspace(),
             "Write",
             &json!({"file_path":"reports/2026/q3.md","content":"# Q3\n"}),

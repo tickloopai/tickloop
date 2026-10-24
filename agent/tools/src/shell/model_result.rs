@@ -3,6 +3,8 @@
 //! `interpretCommandResult` (`BashTool/commandSemantics.ts`) and `TaskStopTool`.
 
 use std::{io::Read, path::Path, time::Duration};
+use tickloop_agent_protocol::ShellTaskId;
+use tickloop_ids::IdContext;
 
 use serde::Serialize;
 
@@ -33,6 +35,7 @@ const EXIT_ONE_IS_AN_ANSWER: [&str; 6] = ["grep", "rg", "find", "diff", "test", 
 /// Claude Code's result for a command now in the background; one the model asked to background or
 /// that outlived its foreground timeout reads as running in the background.
 pub(super) fn background_started(
+    ids: &IdContext,
     snapshot: &CommandSnapshot,
     is_backgrounded_by_user: bool,
 ) -> ToolResult {
@@ -44,7 +47,7 @@ pub(super) fn background_started(
     ToolResult {
         content: format!(
             "{lead}: {}. Output is being written to: {}",
-            snapshot.operation_id,
+            ids.model_text(ShellTaskId::from(snapshot.operation_id)),
             snapshot.output_ref.display()
         ),
         is_error: false,
@@ -86,7 +89,10 @@ pub(super) fn finished(snapshot: &CommandSnapshot, timeout: Duration) -> ToolRes
     }
 }
 
-pub(super) fn task_stopped(snapshot: &CommandSnapshot) -> Result<ToolResult, ToolError> {
+pub(super) fn task_stopped(
+    ids: &IdContext,
+    snapshot: &CommandSnapshot,
+) -> Result<ToolResult, ToolError> {
     #[derive(Serialize)]
     struct TaskStopOutput<'a> {
         message: String,
@@ -94,7 +100,7 @@ pub(super) fn task_stopped(snapshot: &CommandSnapshot) -> Result<ToolResult, Too
         task_type: &'static str,
         command: &'a str,
     }
-    let task_id = snapshot.operation_id.to_string();
+    let task_id = ids.model_text(ShellTaskId::from(snapshot.operation_id));
     let output = TaskStopOutput {
         message: format!(
             "Successfully stopped task: {task_id} ({})",
@@ -462,21 +468,26 @@ mod tests {
         let mut command = snapshot(directory.path(), "npm run dev", b"");
         command.operation_id = Uuid::from_u128(7);
         let path = command.output_ref.display();
+        let ids = IdContext::new();
+        let task = ids.model_text(ShellTaskId::from(command.operation_id));
+        assert!(task.starts_with("shell:"));
         assert_eq!(
-            background_started(&command, false).content,
+            background_started(&ids, &command, false).content,
             format!(
-                "Command running in background with ID: 00000000-0000-0000-0000-000000000007. Output is being written to: {path}"
+                "Command running in background with ID: {task}. Output is being written to: {path}"
             )
         );
         assert_eq!(
-            background_started(&command, true).content,
+            background_started(&ids, &command, true).content,
             format!(
-                "Command was manually backgrounded by user with ID: 00000000-0000-0000-0000-000000000007. Output is being written to: {path}"
+                "Command was manually backgrounded by user with ID: {task}. Output is being written to: {path}"
             )
         );
         assert_eq!(
-            task_stopped(&command).unwrap().content,
-            r#"{"message":"Successfully stopped task: 00000000-0000-0000-0000-000000000007 (npm run dev)","task_id":"00000000-0000-0000-0000-000000000007","task_type":"local_bash","command":"npm run dev"}"#
+            task_stopped(&ids, &command).unwrap().content,
+            format!(
+                r#"{{"message":"Successfully stopped task: {task} (npm run dev)","task_id":"{task}","task_type":"local_bash","command":"npm run dev"}}"#
+            )
         );
     }
 

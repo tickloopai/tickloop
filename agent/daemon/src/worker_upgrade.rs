@@ -428,7 +428,9 @@ fn prepare_record(
             previous_endpoint: worker.endpoint.clone(),
             checkpoint: checkpoint_path,
             executable: executable.to_path_buf(),
-            successor_endpoint: factory.directory.join(format!("w-{}.sock", Uuid::new_v4())),
+            successor_endpoint: factory
+                .directory
+                .join(format!("w-{}.sock", tickloop_ids::generate())),
             successor_pid: None,
         },
         record_path: factory
@@ -481,8 +483,9 @@ async fn advance(
             return Err("upgraded Worker exited after activation; the committed execution is lost and is not replayed".into());
         }
         pending.candidate.take();
-        pending.record.successor_endpoint =
-            factory.directory.join(format!("w-{}.sock", Uuid::new_v4()));
+        pending.record.successor_endpoint = factory
+            .directory
+            .join(format!("w-{}.sock", tickloop_ids::generate()));
     }
     if pending.candidate.is_none() {
         pending.candidate = Some(spawn_replacement(factory, worker, &pending.record).await?);

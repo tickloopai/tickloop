@@ -138,9 +138,14 @@ async fn wait_until(what: &str, timeout: Duration, condition: impl Fn() -> bool)
 fn chat_directory(root: &Path, chat: ChatId) -> PathBuf {
     std::fs::read_dir(root.join("projects"))
         .unwrap()
-        .map(|project| project.unwrap().path().join(format!("{chat}.jsonl")))
+        .map(|project| {
+            project
+                .unwrap()
+                .path()
+                .join(format!("{}.jsonl", chat.uuid()))
+        })
         .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("Transcript for Chat {chat} does not exist"))
+        .unwrap_or_else(|| panic!("Transcript for Chat {chat:?} does not exist"))
         .with_extension("")
 }
 

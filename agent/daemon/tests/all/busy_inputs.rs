@@ -272,7 +272,7 @@ fn runs_with(snapshot: &LiveChatSnapshot, matches: impl Fn(&EventKind) -> bool) 
         .events
         .iter()
         .filter(|event| matches(&event.kind))
-        .map(|event| event.run_id)
+        .map(|event| event.run_id.uuid())
         .collect()
 }
 
@@ -353,7 +353,7 @@ async fn busy_inputs_accepted_before_a_tool_boundary_join_the_active_run_in_one_
     let completed = runs_with(&settled, |kind| matches!(kind, EventKind::Completed { .. }));
     assert!(
         runs.iter()
-            .all(|run| !started.contains(run) && !completed.contains(run))
+            .all(|run| !started.contains(&run.uuid()) && !completed.contains(&run.uuid()))
             && completed == vec![busy.active.run_id],
         "merged inputs never start or complete runs of their own: started {started:?}, completed {completed:?}"
     );
@@ -846,7 +846,12 @@ async fn worker_submissions_are_ledger_inputs_settled_by_their_answers() {
         if !snapshot.prompt_execution_modes.contains_key(index) {
             continue;
         }
-        let state = busy.runtime.input_state(chat, *id).await.unwrap().unwrap();
+        let state = busy
+            .runtime
+            .input_state(chat, (*id).into())
+            .await
+            .unwrap()
+            .unwrap();
         settled.push((state.entry.run_id, state.entry.state));
     }
     assert_eq!(

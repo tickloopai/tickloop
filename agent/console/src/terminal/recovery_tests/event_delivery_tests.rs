@@ -173,10 +173,10 @@ async fn delivery_fixture() -> (
 
 fn traffic(chat: Uuid, sequence: u64) -> Event {
     Event {
-        chat_id: chat,
+        chat_id: chat.into(),
         sequence,
-        loop_id: Uuid::nil(),
-        run_id: Uuid::nil(),
+        loop_id: Uuid::nil().into(),
+        run_id: Uuid::nil().into(),
         kind: EventKind::Thinking("bounded traffic".into()),
     }
 }
@@ -197,12 +197,12 @@ async fn failed_catalog_and_cached_snapshot_keep_retained_background_requests() 
         next_fact(&mut facts, |fact| matches!(fact, RecoveryFact::Forwarded { chat, sequence: received } if *chat == visible && *received == sequence)).await;
     }
     let receipt = core
-        .submit(background, "Ask a controlled question".into())
+        .submit(background.into(), "Ask a controlled question".into())
         .await
         .unwrap();
     let snapshot = tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
-            let snapshot = core.snapshot(background).await.unwrap();
+            let snapshot = core.snapshot(background.into()).await.unwrap();
             if !snapshot.questions.is_empty() {
                 break snapshot;
             }
@@ -235,7 +235,7 @@ async fn failed_catalog_and_cached_snapshot_keep_retained_background_requests() 
     for event in &retained {
         track_run_requests(event, &mut pending, &mut permissions, &mut questions);
     }
-    let retained_receipt = pending.get(&receipt.run_id).unwrap();
+    let retained_receipt = pending.get(&receipt.run_id.uuid()).unwrap();
     assert_eq!(
         (
             retained_receipt.chat_id,
@@ -332,7 +332,7 @@ async fn a_delayed_reset_cannot_roll_back_the_snapshot_covered_by_recovery() {
     let ObservationValue::Agent(older) = initial.initial else {
         panic!("expected initial snapshot");
     };
-    core.submit(chat, "Ask a controlled question".into())
+    core.submit(chat.into(), "Ask a controlled question".into())
         .await
         .unwrap();
     let current = tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -414,7 +414,7 @@ async fn delayed_changed_and_resync_queries_cannot_roll_back_recovered_requests(
             .await
             .unwrap()
             .unwrap();
-        core.submit(chat, "Ask a controlled question".into())
+        core.submit(chat.into(), "Ask a controlled question".into())
             .await
             .unwrap();
         let current = tokio::time::timeout(RECOVERY_TIMEOUT, async {
@@ -517,12 +517,12 @@ async fn replaced_execution_recovery(cover_before_reset: bool) {
         recovery.cover(observed.execution, &observed.snapshot);
     }
     let receipt = core
-        .submit(chat, "Ask after execution replacement".into())
+        .submit(chat.into(), "Ask after execution replacement".into())
         .await
         .unwrap();
     let snapshot = tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
-            let snapshot = core.snapshot(chat).await.unwrap();
+            let snapshot = core.snapshot(chat.into()).await.unwrap();
             if !snapshot.questions.is_empty() {
                 break snapshot;
             }
@@ -548,7 +548,7 @@ async fn replaced_execution_recovery(cover_before_reset: bool) {
     for event in &deferred {
         track_run_requests(event, &mut pending, &mut permissions, &mut questions);
     }
-    assert!(pending.contains_key(&receipt.run_id));
+    assert!(pending.contains_key(&receipt.run_id.uuid()));
     assert!(questions.contains_key(&snapshot.questions[0].id));
     drop(recovery);
     agent.leave_view().await.unwrap();

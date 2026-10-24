@@ -1818,10 +1818,10 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     let mut menus = Menus::default();
     let pending = HashMap::from([(
         request.id,
-        crate::terminal::PermissionRequestOwner::new(chat, &request),
+        crate::terminal::PermissionRequestOwner::new(chat.into(), &request),
     )]);
     menus
-        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .refresh_family_permissions(&agent, &console, &[chat.into()], &pending, &HashMap::new())
         .await
         .unwrap();
     let approval_id = console.dialog_menu_id().unwrap().unwrap();
@@ -1867,13 +1867,13 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     }
     console.select_chat(Some(other)).unwrap();
     menus
-        .refresh_family_permissions(&agent, &console, &[other], &pending, &HashMap::new())
+        .refresh_family_permissions(&agent, &console, &[other.into()], &pending, &HashMap::new())
         .await
         .unwrap();
     assert!(console.dialog_menu_id().unwrap().is_none());
     console.select_chat(Some(chat)).unwrap();
     menus
-        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .refresh_family_permissions(&agent, &console, &[chat.into()], &pending, &HashMap::new())
         .await
         .unwrap();
     assert_eq!(console.dialog_menu_id().unwrap(), Some(approval_id));
@@ -1991,7 +1991,7 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
         .refresh_family_permissions(
             &restored,
             &console,
-            &[chat],
+            &[chat.into()],
             &HashMap::new(),
             &HashMap::new(),
         )
@@ -2118,7 +2118,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     let branch = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
-            source_chat_id: source,
+            source_chat_id: source.into(),
             name: None,
         })
         .await
@@ -2126,7 +2126,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     let copy = branch.child_chat_id;
     assert_eq!(branch.snapshot.plans[0].loop_id, receipt.loop_id);
     agent.snapshot(source).await.unwrap();
-    agent.snapshot(copy).await.unwrap();
+    agent.snapshot(copy.into()).await.unwrap();
     let console = tests::console_with_state(State::new(true, 80, 24));
     let mut menus = Menus::default();
     console.select_chat(Some(source)).unwrap();
@@ -2134,14 +2134,14 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
         .refresh_family_permissions(
             &agent,
             &console,
-            &[source],
+            &[source.into()],
             &HashMap::new(),
             &HashMap::new(),
         )
         .await
         .unwrap();
     let source_menu = console.dialog_menu_id().unwrap().unwrap();
-    console.select_chat(Some(copy)).unwrap();
+    console.select_chat(Some(copy.into())).unwrap();
     menus
         .refresh_family_permissions(&agent, &console, &[copy], &HashMap::new(), &HashMap::new())
         .await
@@ -2172,7 +2172,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
         .refresh_family_permissions(
             &agent,
             &console,
-            &[source],
+            &[source.into()],
             &HashMap::new(),
             &HashMap::new(),
         )
@@ -2237,11 +2237,23 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
     let mut first_menus = Menus::default();
     let mut second_menus = Menus::default();
     first_menus
-        .refresh_family_permissions(&agent, &first, &[chat], &HashMap::new(), &HashMap::new())
+        .refresh_family_permissions(
+            &agent,
+            &first,
+            &[chat.into()],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
         .await
         .unwrap();
     second_menus
-        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .refresh_family_permissions(
+            &agent,
+            &second,
+            &[chat.into()],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
         .await
         .unwrap();
     let first_id = first.dialog_menu_id().unwrap().unwrap();
@@ -2263,7 +2275,13 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
     }
     agent.snapshot(chat).await.unwrap();
     second_menus
-        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .refresh_family_permissions(
+            &agent,
+            &second,
+            &[chat.into()],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
         .await
         .unwrap();
     assert!(
@@ -2349,7 +2367,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
     }
     let child = child.expect("the child completed before its parent");
     let console = tests::console_with_state(State::new(true, 80, 24));
-    console.select_chat(Some(child)).unwrap();
+    console.select_chat(Some(child.into())).unwrap();
     console.set_visible_delegation(true).unwrap();
     let mut menus = Menus::default();
     let refusal = open_current_plan(&agent, &console, &mut menus, Some(child))
@@ -2360,7 +2378,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
         "{refusal}"
     );
     assert!(console.dialog_menu_id().unwrap().is_none());
-    let snapshot = agent.snapshot(child).await.unwrap();
+    let snapshot = agent.snapshot(child.into()).await.unwrap();
     assert_eq!(snapshot.policy.mode, ExecutionMode::FullAccess);
     assert!(snapshot.plans.is_empty());
     agent.shutdown().await;
@@ -2418,7 +2436,13 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     console.select_chat(Some(chat)).unwrap();
     let mut menus = Menus::default();
     menus
-        .refresh_family_permissions(&agent, &console, &[chat], &HashMap::new(), &HashMap::new())
+        .refresh_family_permissions(
+            &agent,
+            &console,
+            &[chat.into()],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
         .await
         .unwrap();
     let old_id = console.dialog_menu_id().unwrap().unwrap();
@@ -2440,10 +2464,10 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     menus.note_request(chat, revised.id);
     let pending = HashMap::from([(
         revised.id,
-        crate::terminal::PermissionRequestOwner::new(chat, &revised),
+        crate::terminal::PermissionRequestOwner::new(chat.into(), &revised),
     )]);
     menus
-        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .refresh_family_permissions(&agent, &console, &[chat.into()], &pending, &HashMap::new())
         .await
         .unwrap();
     let new_id = console.dialog_menu_id().unwrap().unwrap();

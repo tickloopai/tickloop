@@ -172,7 +172,7 @@ fn cloud_harness(
 
 fn prompt(after: ParentSelection, text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Continue {
             after,
             message: UserMessage {
@@ -223,7 +223,7 @@ fn check_publish(chats: &DurableChats, chat: Uuid, entries: &[StreamEntry]) {
                     Line::Response(response) if response.run_id == event.run_id
                 )),
                 "a delta of Run {} went out before its answer's start was committed",
-                event.run_id
+                event.run_id.uuid()
             ),
             StreamItem::Event(_) => {}
         }
@@ -474,8 +474,8 @@ async fn an_older_holder_cannot_publish_once_a_newer_one_activated() {
     assert_completed_and_acknowledged(&finished);
     world.catch_up(&mut follower);
     world.assert_follower_current(&follower);
-    assert!(is_completed(world.input_state(request.input_id)));
-    world.assert_acknowledged_once(request.input_id);
+    assert!(is_completed(world.input_state(request.input_id.into())));
+    world.assert_acknowledged_once(request.input_id.into());
 }
 
 #[tokio::test]
@@ -508,7 +508,7 @@ async fn a_holder_stops_at_its_local_deadline_and_the_next_holder_finishes_the_a
     );
     assert_eq!(world.entries().len(), entries, "nothing published after it");
     assert!(matches!(
-        world.input_state(request.input_id),
+        world.input_state(request.input_id.into()),
         Some(InputState::Accepted)
     ));
     assert!(matches!(
@@ -523,7 +523,7 @@ async fn a_holder_stops_at_its_local_deadline_and_the_next_holder_finishes_the_a
     world.catch_up(&mut follower);
     world.assert_follower_current(&follower);
     assert_eq!(follower.reloads(), 1, "the takeover after expiry resyncs");
-    world.assert_acknowledged_once(request.input_id);
+    world.assert_acknowledged_once(request.input_id.into());
 }
 
 #[tokio::test]
@@ -638,7 +638,7 @@ async fn a_failed_publish_owes_a_marker_at_or_below_last_seq_and_clients_reload_
 
     world.stream.fail_next_publishes(1);
     let second = prompt(
-        ParentSelection::Message(world.answer_to(first.input_id)),
+        ParentSelection::Message(world.answer_to(first.input_id.into()).into()),
         "second prompt",
     );
     let report = host.deliver(world.chat, second.clone()).await.unwrap();
@@ -681,7 +681,7 @@ async fn a_publish_lost_after_its_commit_withholds_the_ack_until_redelivery_repa
     world.catch_up(&mut follower);
 
     let second = prompt(
-        ParentSelection::Message(world.answer_to(first.input_id)),
+        ParentSelection::Message(world.answer_to(first.input_id.into()).into()),
         "second prompt",
     );
     let holding = first_host.acquire(world.chat).unwrap();
@@ -693,7 +693,7 @@ async fn a_publish_lost_after_its_commit_withholds_the_ack_until_redelivery_repa
     assert_eq!(lost.halt, Some(Halt::DrainTimedOut));
     assert!(!lost.acknowledged);
     assert!(
-        is_completed(world.input_state(second.input_id)),
+        is_completed(world.input_state(second.input_id.into())),
         "the answer is committed"
     );
     let last_seq = world.chats.last_seq(world.chat);
@@ -732,7 +732,7 @@ async fn a_publish_lost_after_its_commit_withholds_the_ack_until_redelivery_repa
     world.catch_up(&mut follower);
     world.assert_follower_current(&follower);
     assert_eq!(follower.reloads(), 1);
-    world.assert_acknowledged_once(second.input_id);
+    world.assert_acknowledged_once(second.input_id.into());
 }
 
 #[tokio::test]
@@ -761,7 +761,7 @@ async fn a_holder_that_cannot_activate_the_stream_keeps_the_lease_and_runs_nothi
     assert_completed_and_acknowledged(&finished);
     world.catch_up(&mut follower);
     world.assert_follower_current(&follower);
-    world.assert_acknowledged_once(request.input_id);
+    world.assert_acknowledged_once(request.input_id.into());
 }
 
 /// What a crash on the second turn and its redelivery to another host left behind.
@@ -786,7 +786,7 @@ async fn crash_on_second_turn(point: CrashPoint, after_crash: impl FnOnce(&World
     world.catch_up(&mut follower);
 
     let second = prompt(
-        ParentSelection::Message(world.answer_to(first.input_id)),
+        ParentSelection::Message(world.answer_to(first.input_id.into()).into()),
         "second prompt",
     );
     let holding = crashing.acquire(world.chat).unwrap();
@@ -794,7 +794,7 @@ async fn crash_on_second_turn(point: CrashPoint, after_crash: impl FnOnce(&World
     let crashed = holding.run(second.clone()).await;
     assert_eq!(crashed.halt, Some(Halt::Crashed), "{crashed:?}");
     assert!(!crashed.acknowledged);
-    after_crash(&world, second.input_id);
+    after_crash(&world, second.input_id.into());
     let requests_after_crash = model.requests();
     assert!(
         matches!(surviving.acquire(world.chat), Err(LeaseError::Held { .. })),
@@ -811,9 +811,9 @@ async fn crash_on_second_turn(point: CrashPoint, after_crash: impl FnOnce(&World
         1,
         "the takeover after the crash resyncs once"
     );
-    assert!(is_completed(world.input_state(second.input_id)));
+    assert!(is_completed(world.input_state(second.input_id.into())));
     assert_eq!(world.prompts("second prompt"), 1);
-    world.assert_acknowledged_once(second.input_id);
+    world.assert_acknowledged_once(second.input_id.into());
     Crash {
         requests_after_redelivery: model.requests(),
         world,
@@ -846,7 +846,7 @@ async fn a_crash_after_a_commit_before_its_publish_continues_the_answer() {
         .lines()
         .into_iter()
         .filter_map(|line| match line {
-            Line::Response(entry) if entry.input_id == Some(crash.second.input_id) => {
+            Line::Response(entry) if entry.input_id == Some(crash.second.input_id.into()) => {
                 Some((entry.attempt, entry.state))
             }
             _ => None,
@@ -927,7 +927,7 @@ async fn the_final_append_under_a_newer_lease_is_fenced() {
     assert_completed_and_acknowledged(&finished);
     world.catch_up(&mut follower);
     world.assert_follower_current(&follower);
-    world.assert_acknowledged_once(request.input_id);
+    world.assert_acknowledged_once(request.input_id.into());
 }
 
 #[tokio::test]
@@ -944,8 +944,8 @@ async fn two_hosts_alternate_as_holders_without_resyncing_clients() {
         assert_eq!(report.epoch, turn as u64 + 1);
         world.catch_up(&mut follower);
         world.assert_follower_current(&follower);
-        world.assert_acknowledged_once(request.input_id);
-        after = ParentSelection::Message(world.answer_to(request.input_id));
+        world.assert_acknowledged_once(request.input_id.into());
+        after = ParentSelection::Message(world.answer_to(request.input_id.into()).into());
     }
     assert_eq!(follower.reloads(), 0, "clean handoffs write no marker");
     assert!(!world.entries().iter().any(is_resync));
@@ -986,7 +986,7 @@ async fn repeated_holdings_leave_no_instance_or_task_behind() {
         let request = prompt(after, "prompt");
         let report = host.deliver(world.chat, request.clone()).await.unwrap();
         assert_completed_and_acknowledged(&report);
-        after = ParentSelection::Message(world.answer_to(request.input_id));
+        after = ParentSelection::Message(world.answer_to(request.input_id.into()).into());
         wait_for_alive_tasks(baseline, cycle).await;
     }
     let mut follower = world.follower();

@@ -184,7 +184,7 @@ impl GoogleAuth {
         );
         let verifier = super::new_pkce_verifier();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let state = Uuid::new_v4().simple().to_string();
+        let state = tickloop_ids::random_token();
         let mut url = reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
             .expect("Google authorization URL");
         url.query_pairs_mut()
@@ -199,7 +199,7 @@ impl GoogleAuth {
             .append_pair("state", &state);
         let store = self.store();
         let lock = store.lock(cancel).await?;
-        let generation = Uuid::new_v4();
+        let generation = tickloop_ids::generate();
         let credentials = store.read::<State>()?.and_then(|state| state.credentials);
         store.save(&State {
             generation,
@@ -265,7 +265,7 @@ impl GoogleAuth {
         )
         .await?;
         let credentials = OAuthCredentials {
-            identity: Uuid::new_v4(),
+            identity: tickloop_ids::generate(),
             access_token: token_field(&value, "access_token")?,
             refresh_token: token_field(&value, "refresh_token")?,
             expires_at_ms: expiry(&value)?,
@@ -283,7 +283,7 @@ impl GoogleAuth {
         }
         let identity = credentials.identity.to_string();
         store.save(&State {
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: Some(credentials),
         })?;
         Ok(identity)
@@ -308,7 +308,7 @@ impl GoogleAuth {
             .ok_or_else(|| configuration("Google OAuth quota project is required"))?;
         validate_identifier(&project)?;
         let credentials = OAuthCredentials {
-            identity: Uuid::new_v4(),
+            identity: tickloop_ids::generate(),
             access_token: String::new(),
             refresh_token: token_field(&value, "refresh_token")?,
             expires_at_ms: 0,
@@ -319,7 +319,7 @@ impl GoogleAuth {
         let store = self.store();
         let _lock = store.lock(cancel).await?;
         store.save(&State {
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: Some(credentials),
         })
     }
@@ -328,7 +328,7 @@ impl GoogleAuth {
         let store = self.store();
         let _lock = store.lock(cancel).await?;
         store.save(&State {
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: None,
         })
     }

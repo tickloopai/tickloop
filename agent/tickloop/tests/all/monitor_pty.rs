@@ -445,7 +445,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
             chat
         });
 
-    let mut session = Session::resume(&workdir, chat);
+    let mut session = Session::resume(&workdir, chat.into());
     session.keep_history_paused();
     session.wait("Monitor 1");
     session.wait("calendar:pty-member");
@@ -484,7 +484,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.exit();
     drop(session);
 
-    let mut restarted = Session::resume(&workdir, chat);
+    let mut restarted = Session::resume(&workdir, chat.into());
     restarted.keep_history_paused();
     thread::sleep(Duration::from_millis(500));
     let frame = restarted.frame();
@@ -540,7 +540,7 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
             agent.shutdown().await;
             chat
         });
-    let mut session = Session::resume(&workdir, chat);
+    let mut session = Session::resume(&workdir, chat.into());
     session.keep_history_paused();
     session.wait("Scheduled (2)");
     session.send(b"\x1b[C\r");
@@ -590,7 +590,7 @@ fn monitor_keeps_neighbouring_ticks_visible_when_keyboard_navigation_crosses_a_p
             agent.shutdown().await;
             chat
         });
-    let mut session = Session::resume(&workdir, chat);
+    let mut session = Session::resume(&workdir, chat.into());
     session.keep_history_paused();
     session.wait("Ticks (140)");
     assert!(

@@ -99,7 +99,7 @@ async fn agent_websocket_reuses_chat_connection_for_tools_and_continuation() {
         .unwrap();
     assert_eq!(frames.len(), 3);
     assert_eq!(frames[0]["type"], "response.create");
-    assert_eq!(frames[0]["prompt_cache_key"], chat.to_string());
+    assert_eq!(frames[0]["prompt_cache_key"], chat.uuid().to_string());
     assert_eq!(frames[0]["store"], false);
     assert_eq!(frames[1]["previous_response_id"], "resp-tools");
     assert!(frames[2]["previous_response_id"].is_null());
@@ -234,7 +234,7 @@ async fn concurrent_agent_chats_keep_websocket_tools_and_results_separate() {
         let output = results[0]["output"].as_str().unwrap();
         assert!(output.contains(own));
         assert!(!output.contains(foreign));
-        let snapshot = agent.snapshot(chat).await.unwrap();
+        let snapshot = agent.snapshot(chat.into()).await.unwrap();
         let text = snapshot
             .messages
             .iter()

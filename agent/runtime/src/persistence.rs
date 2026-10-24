@@ -34,8 +34,8 @@ use tickloop_agent_protocol::{
     CompactTrigger, CompactionMarker, Content, DelegationMetadata, DenialRecord,
     DirectedHumanSource, Event, EventKind, ExecutionMode, FamilyCompletion, FamilyInputRecord,
     HostNote, InputContext, LocalMessage, LoopId, LoopSnapshot, LoopState, MAX_RECENT_DENIALS,
-    Message, ModelConfig, MonitorMembership, PrivateHistorySource, Receiving, Role, RunId,
-    SavedChat, SubagentRegistration, SummarizeMetadata, SummaryDirection, TickSubscription,
+    Message, ModelConfig, MonitorMembership, PrivateHistorySource, Receiving, ResponseId, Role,
+    RunId, SavedChat, SubagentRegistration, SummarizeMetadata, SummaryDirection, TickSubscription,
     TodoItem, ToolCallRecovery, Usage,
 };
 use tickloop_agent_transcript::{
@@ -289,7 +289,10 @@ impl ChatRecorder {
     pub(super) fn record_subagents(&self, chat_id: ChatId, subagents: Vec<SubagentRegistration>) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::Subagents(SubagentsEntry { chat_id, subagents })],
+            vec![Line::Subagents(SubagentsEntry {
+                chat_id: chat_id.into(),
+                subagents,
+            })],
             None,
         );
     }
@@ -331,8 +334,11 @@ impl ChatRecorder {
         &self,
         entry: tickloop_agent_transcript::CitationSourcesEntry,
     ) {
-        self.outbox
-            .enqueue(entry.chat_id, vec![Line::CitationSources(entry)], None);
+        self.outbox.enqueue(
+            entry.chat_id.into(),
+            vec![Line::CitationSources(entry)],
+            None,
+        );
     }
 
     pub(super) fn record_sent_agent_messages(
@@ -343,7 +349,7 @@ impl ChatRecorder {
         self.outbox.enqueue(
             chat_id,
             vec![Line::SentAgentMessages(SentAgentMessagesEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 messages,
             })],
             None,
@@ -354,8 +360,8 @@ impl ChatRecorder {
         // Sync advances the lifecycle revision baseline with the records queued alongside the
         // hold. An append already in progress may drain this group before the next dirty flush.
         let hold = Line::FamilyMessageHold(tickloop_agent_transcript::FamilyMessageHoldEntry {
-            chat_id: chat.snapshot.id,
-            stopped_runs,
+            chat_id: chat.snapshot.id.into(),
+            stopped_runs: stopped_runs.into_iter().map(Into::into).collect(),
         });
         self.enqueue_with_sync(&chat.snapshot, &chat.bookkeeping, vec![hold], Vec::new());
     }
@@ -367,7 +373,10 @@ impl ChatRecorder {
     ) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::FamilyInputs(FamilyInputsEntry { chat_id, inputs })],
+            vec![Line::FamilyInputs(FamilyInputsEntry {
+                chat_id: chat_id.into(),
+                inputs,
+            })],
             None,
         );
     }
@@ -380,7 +389,7 @@ impl ChatRecorder {
         self.outbox.enqueue(
             chat_id,
             vec![Line::FamilyCompletions(FamilyCompletionsEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 completions,
             })],
             None,
@@ -391,7 +400,7 @@ impl ChatRecorder {
         self.outbox.enqueue(
             chat_id,
             vec![Line::AiTitle(AiTitleEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 ai_title: title,
             })],
             None,
@@ -570,13 +579,13 @@ impl ChatRecorder {
         }
         let custom_title = metadata.custom_title.map(|entry| {
             Line::CustomTitle(CustomTitleEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 custom_title: entry.custom_title,
             })
         });
         let branch_origin = metadata.branch_origin.map(|entry| {
             Line::BranchOrigin(BranchOriginEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 forked_from: entry.forked_from,
             })
         });
@@ -587,13 +596,13 @@ impl ChatRecorder {
                 .chain(branch_origin)
                 .chain(metadata.citation_sources.map(|entry| {
                     Line::CitationSources(tickloop_agent_transcript::CitationSourcesEntry {
-                        chat_id,
+                        chat_id: chat_id.into(),
                         ..entry
                     })
                 }))
                 .chain(metadata.artifact_ticks.map(|entry| {
                     Line::ArtifactTicks(ArtifactTicksEntry {
-                        chat_id,
+                        chat_id: chat_id.into(),
                         cwd: folder.map(Path::to_path_buf),
                         artifact_ticks: entry.artifact_ticks,
                         removed_artifact_ticks: entry.removed_artifact_ticks,
@@ -606,7 +615,7 @@ impl ChatRecorder {
                         .filter(|monitor| !monitor.is_empty())
                         .map(|monitor| {
                             Line::MonitorMembers(MonitorMembersEntry {
-                                chat_id,
+                                chat_id: chat_id.into(),
                                 cwd: folder.map(Path::to_path_buf),
                                 monitor,
                             })
@@ -647,21 +656,21 @@ impl ChatRecorder {
         }
         let mut lines = vec![
             Line::BranchOrigin(BranchOriginEntry {
-                chat_id: child_chat_id,
+                chat_id: child_chat_id.into(),
                 forked_from: ForkedFrom {
-                    chat_id: source.id,
+                    chat_id: source.id.into(),
                     message_uuid: leaf,
                 },
             }),
             Line::CustomTitle(CustomTitleEntry {
-                chat_id: child_chat_id,
+                chat_id: child_chat_id.into(),
                 custom_title: title.to_owned(),
             }),
         ];
         if !source_bookkeeping.citation_sources.sources.is_empty() {
             lines.push(Line::CitationSources(
                 tickloop_agent_transcript::CitationSourcesEntry {
-                    chat_id: child_chat_id,
+                    chat_id: child_chat_id.into(),
                     ..source_bookkeeping.citation_sources.clone()
                 },
             ));
@@ -669,14 +678,14 @@ impl ChatRecorder {
         let monitor = source.monitor.for_new_chat();
         if !monitor.is_empty() {
             lines.push(Line::MonitorMembers(MonitorMembersEntry {
-                chat_id: child_chat_id,
+                chat_id: child_chat_id.into(),
                 cwd: source.folder.clone(),
                 monitor,
             }));
         }
         if !source.artifact_ticks.is_empty() || !source.removed_artifact_ticks.is_empty() {
             lines.push(Line::ArtifactTicks(ArtifactTicksEntry {
-                chat_id: child_chat_id,
+                chat_id: child_chat_id.into(),
                 cwd: source.folder.clone(),
                 artifact_ticks: source.artifact_ticks.clone(),
                 removed_artifact_ticks: source.removed_artifact_ticks.clone(),
@@ -695,7 +704,7 @@ impl ChatRecorder {
         self.outbox.enqueue(
             chat_id,
             vec![Line::ContentReplacement(ContentReplacementEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 replacements,
             })],
             None,
@@ -769,7 +778,7 @@ impl ChatRecorder {
         let replacements = chat.content_replacements.records_for(compacted);
         if !replacements.is_empty() {
             lines.push(Line::ContentReplacement(ContentReplacementEntry {
-                chat_id: compacted.id,
+                chat_id: compacted.id.into(),
                 replacements,
             }));
         }
@@ -837,7 +846,7 @@ impl ChatRecorder {
                 .message_ids
                 .get(&index)
                 .copied()
-                .unwrap_or_else(Uuid::new_v4);
+                .unwrap_or_else(tickloop_ids::generate);
             let message = compacted.messages[index].clone();
             let role = message.role;
             let blocks = message.content.len();
@@ -1044,7 +1053,7 @@ impl ChatRecorder {
                     snapshot,
                     bookkeeping,
                     index,
-                    Uuid::new_v4(),
+                    tickloop_ids::generate(),
                     appended,
                     parent.or(log.links[index].uuids.last().copied()),
                     EntryStamp {
@@ -1094,7 +1103,7 @@ impl ChatRecorder {
                 .message_ids
                 .get(&index)
                 .copied()
-                .unwrap_or_else(Uuid::new_v4);
+                .unwrap_or_else(tickloop_ids::generate);
             let prompt = (role == Role::User
                 && !is_meta
                 && !snapshot.agent_message_origins.contains_key(&uuid))
@@ -1128,7 +1137,7 @@ impl ChatRecorder {
             lines.push(Line::chain(role, entry));
             if let Some(prompt) = prompt {
                 lines.push(Line::LastPrompt(LastPromptEntry {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     last_prompt: prompt,
                 }));
             }
@@ -1216,7 +1225,7 @@ impl ChatRecorder {
                 .response_of(snapshot, &bookkeeping.message_responses, index)
         };
         let index = (0..snapshot.messages.len()).rev().find(|index| {
-            response_of(*index) == Some(display_id)
+            response_of(*index) == Some(display_id.into())
                 || (snapshot.prompt_execution_modes.contains_key(index)
                     && response_of(*index).is_none()
                     && snapshot
@@ -1441,7 +1450,7 @@ fn chain_entry(
         },
         logical_parent_uuid: None,
         is_sidechain: false,
-        chat_id: snapshot.id,
+        chat_id: snapshot.id.into(),
         timestamp: stamp.timestamp.to_owned(),
         cwd: stamp.folder.map(Path::to_path_buf),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -1471,7 +1480,7 @@ fn chain_entry(
             .get(&index)
             .and_then(|id| snapshot.agent_message_origins.get(id))
             .cloned(),
-        run_id,
+        run_id: run_id.map(Into::into),
         tool_call_recoveries,
         contexts: snapshot
             .message_contexts
@@ -1502,13 +1511,12 @@ fn chain_entry(
         loop_id: snapshot
             .message_runs
             .contains_key(&index)
-            .then_some(snapshot.chat_loop.id),
+            .then_some(snapshot.chat_loop.id.into()),
         slug: bookkeeping.plan_slug.clone(),
-        response_id: bookkeeping.lifecycle.response_of(
-            snapshot,
-            &bookkeeping.message_responses,
-            index,
-        ),
+        response_id: bookkeeping
+            .lifecycle
+            .response_of(snapshot, &bookkeeping.message_responses, index)
+            .map(Into::into),
         input_id: is_user
             .then(|| {
                 snapshot
@@ -1536,7 +1544,7 @@ fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) ->
                 .iter()
                 .filter_map(|event| serde_json::to_value(event).ok())
                 .collect(),
-            loop_id: chat_loop.id,
+            loop_id: chat_loop.id.into(),
             state: serde_json::to_value(&chat_loop.state).unwrap_or(serde_json::Value::Null),
             // Receiving is the default a record without the field reads as.
             receiving: (!chat_loop.receiving.is_receiving())
@@ -1591,11 +1599,11 @@ fn record_loop(
     stamp: EntryStamp<'_>,
 ) -> Line {
     let entry = ChainEntry {
-        uuid: Uuid::new_v4(),
+        uuid: tickloop_ids::generate(),
         parent_uuid: *parent,
         logical_parent_uuid: None,
         is_sidechain: false,
-        chat_id: snapshot.id,
+        chat_id: snapshot.id.into(),
         timestamp: stamp.timestamp.to_owned(),
         cwd: stamp.folder.map(Path::to_path_buf),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -1614,7 +1622,7 @@ fn record_loop(
         original_message_id: None,
         agent_message_origin: None,
         human_family_origin: None,
-        run_id,
+        run_id: run_id.map(Into::into),
         tool_call_recoveries: Vec::new(),
         contexts: None,
         continues_message: false,
@@ -1738,7 +1746,7 @@ struct RestoredChain {
     messages: Vec<Message>,
     invoked_skills: Vec<tickloop_agent_protocol::InvokedSkill>,
     message_runs: BTreeMap<usize, RunId>,
-    message_responses: BTreeMap<usize, Uuid>,
+    message_responses: BTreeMap<usize, ResponseId>,
     tool_call_recoveries: BTreeMap<usize, Vec<ToolCallRecovery>>,
     message_contexts: BTreeMap<usize, Vec<InputContext>>,
     message_ids: BTreeMap<usize, Uuid>,
@@ -1813,7 +1821,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             .map(|record| record.loop_id)
             .or(entry.loop_id);
         if let (Some(run_id), Some(loop_id)) = (entry.run_id, entry_loop) {
-            restored.run_loops.insert(run_id, loop_id);
+            restored.run_loops.insert(run_id.into(), loop_id.into());
         }
         if entry.is_loop_record() {
             // Records of a Chat with several Loops are an earlier format, dropped on load.
@@ -1822,9 +1830,10 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .clone()
                 .filter(|_| entry.is_current_loop_record())
             {
-                restored
-                    .loop_records
-                    .push((restored.messages.len(), (record, entry.run_id)));
+                restored.loop_records.push((
+                    restored.messages.len(),
+                    (record, entry.run_id.map(Into::into)),
+                ));
             }
             continue;
         }
@@ -1862,10 +1871,10 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored.message_models.insert(index, model);
         }
         if let Some(run_id) = entry.run_id {
-            restored.message_runs.insert(index, run_id);
+            restored.message_runs.insert(index, run_id.into());
         }
         if let Some(response) = entry.response_id {
-            restored.message_responses.insert(index, response);
+            restored.message_responses.insert(index, response.into());
         }
         if let Some(contexts) = entry
             .contexts
@@ -2200,7 +2209,13 @@ fn recover_transcript(
             .task_boards
             .as_ref()
             .filter(|entry| entry.chat_id == chat_id)
-            .map(|entry| entry.boards.clone())
+            .map(|entry| {
+                entry
+                    .boards
+                    .iter()
+                    .map(|(loop_id, board)| (LoopId::from(*loop_id), board.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         for board in snapshot
             .task_boards
@@ -2278,7 +2293,10 @@ fn recover_transcript(
             .citation_sources
             .clone()
             .filter(|entry| entry.chat_id == source_chat_id)
-            .map(|entry| tickloop_agent_transcript::CitationSourcesEntry { chat_id, ..entry })
+            .map(|entry| tickloop_agent_transcript::CitationSourcesEntry {
+                chat_id: chat_id.into(),
+                ..entry
+            })
             .unwrap_or_default(),
         provenance: loaded
             .metadata
@@ -2324,7 +2342,7 @@ fn restored_branch_origin(
         .filter(|name| super::branch::is_valid_branch_name(name))
         .unwrap_or_else(|| UNTITLED_BRANCH_NAME.into());
     Some(BranchOrigin {
-        source_chat_id: entry.forked_from.chat_id,
+        source_chat_id: entry.forked_from.chat_id.into(),
         name,
         creation: None,
     })
@@ -2429,7 +2447,7 @@ impl RestoredChain {
                 }
             }
             snapshot.chat_loop = LoopSnapshot {
-                id: record.loop_id,
+                id: record.loop_id.into(),
                 state,
                 run_id: *run_id,
                 run_started_at: record.run_started_at,
@@ -2464,7 +2482,7 @@ fn recover_snapshot_for_resume(
     let rebuilt_runs = |snapshot: &ChatSnapshot| {
         super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
             .into_iter()
-            .map(|wait| wait.run_id)
+            .map(|wait| RunId::from(wait.run_id))
             .collect::<HashSet<_>>()
     };
     let rebuilt = rebuilt_runs(&snapshot);
@@ -2476,10 +2494,12 @@ fn recover_snapshot_for_resume(
     let rebuilt = rebuilt_runs(&snapshot);
     // A family call's effect is in the family's records: its result is what they say.
     let message_responses = bookkeeping.message_responses.clone();
+    // The loading Chat's Loop writes ids as a new Loop does.
+    let ids = tickloop_ids::IdContext::new();
     let reconcile = |snapshot: &ChatSnapshot, call: &projection::HistoryCall| {
-        family.and_then(|family| family.reconcile(snapshot, &message_responses, call))
+        family.and_then(|family| family.reconcile(&ids, snapshot, &message_responses, call))
     };
-    super::recovery::close_dangling_tool_calls_except(&mut snapshot, &rebuilt, &reconcile)?;
+    super::recovery::close_dangling_tool_calls_except(&ids, &mut snapshot, &rebuilt, &reconcile)?;
     let ends_with_rebuilt_run = (0..snapshot.messages.len())
         .rev()
         .find(|index| snapshot.messages[*index].role != Role::System)
@@ -2825,7 +2845,7 @@ impl Agent {
         self.record_chat_metadata(
             chat_id,
             Line::ArtifactTicks(ArtifactTicksEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 cwd: folder.map(Path::to_path_buf),
                 artifact_ticks,
                 removed_artifact_ticks,
@@ -2842,7 +2862,7 @@ impl Agent {
         self.record_chat_metadata(
             chat_id,
             Line::MonitorMembers(MonitorMembersEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 cwd: folder.map(Path::to_path_buf),
                 monitor,
             }),
@@ -2875,7 +2895,7 @@ impl Agent {
             recorder.outbox.enqueue(
                 child_id,
                 vec![Line::Delegation(DelegationEntry {
-                    chat_id: child_id,
+                    chat_id: child_id.into(),
                     delegation,
                     search_config,
                 })],
@@ -3145,13 +3165,13 @@ impl Agent {
         Ok(summaries
             .into_iter()
             .map(|summary| SavedChat {
-                id: summary.chat_id,
+                id: summary.chat_id.into(),
                 title: summary.title,
                 first_prompt: summary.first_prompt,
                 last_prompt: summary.last_prompt,
                 modified: summary.modified,
                 cwd: summary.cwd,
-                branch_source: summary.forked_from.map(|origin| origin.chat_id),
+                branch_source: summary.forked_from.map(|origin| origin.chat_id.into()),
                 git_branch: summary.git_branch,
             })
             .collect())
@@ -3274,7 +3294,7 @@ impl Agent {
             return Err(AgentError::Invalid("Unsupported: a delegated Transcript cannot be copied into an unrestricted new Agent".into()));
         }
         let new_chat_id = loop {
-            let candidate = Uuid::new_v4();
+            let candidate = ChatId::new();
             if !self.inner.chats.lock().await.contains_key(&candidate) {
                 break candidate;
             }
@@ -3574,7 +3594,7 @@ impl Agent {
         }
         let rebuilt = super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, &snapshot)
             .into_iter()
-            .map(|wait| wait.response_id)
+            .map(|wait| wait.response_id.into())
             .collect();
         bookkeeping.lifecycle.settle_after_load(
             &snapshot,
@@ -3597,11 +3617,12 @@ impl Agent {
                 .lock()
                 .await
                 .stopped_runs
-                .insert(chat_id, stopped_runs);
+                .insert(chat_id, stopped_runs.into_iter().map(Into::into).collect());
         }
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {
+                ids: tickloop_ids::IdContext::new(),
                 family_generation: 0,
                 family_stopping: false,
                 task_checkpoint_pending: false,

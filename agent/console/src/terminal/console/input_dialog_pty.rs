@@ -386,7 +386,7 @@ fn plan_approval_pty_fixture() {
         loop {
             tokio::select! {
                 event = events.recv() => match event.unwrap().kind {
-                    EventKind::PermissionRequested { request } => { pending.insert(request.id, crate::terminal::PermissionRequestOwner::new(chat, &request)); }
+                    EventKind::PermissionRequested { request } => { pending.insert(request.id, crate::terminal::PermissionRequestOwner::new(chat.into(), &request)); }
                     EventKind::Failed(error) => panic!("{error}"),
                     EventKind::Completed { .. } => {
                         assert_eq!(model.requests.lock().unwrap().len(), 3);
@@ -410,7 +410,7 @@ fn plan_approval_pty_fixture() {
                     _ => {},
                 },
                 _ = poll.tick() => {
-                    menus.refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new()).await.unwrap();
+                    menus.refresh_family_permissions(&agent, &console, &[chat.into()], &pending, &HashMap::new()).await.unwrap();
                     if !pending.is_empty() && console.dialog_menu_id().unwrap().is_some() {
                         assert!(!directory.join("executed.txt").exists());
                         assert_eq!(model.requests.lock().unwrap().len(), 1);

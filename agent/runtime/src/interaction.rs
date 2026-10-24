@@ -369,16 +369,20 @@ impl Agent {
         let receipt = Receipt {
             chat_id,
             loop_id: request.loop_id,
-            run_id: Uuid::new_v4(),
+            run_id: tickloop_ids::generate().into(),
         };
         let lifecycle = &mut chat.bookkeeping.lifecycle;
-        lifecycle.resolve_wait(request_id, result, ledger.as_ref().map(|input| input.id));
+        lifecycle.resolve_wait(
+            request_id,
+            result,
+            (ledger.as_ref().map(|input| input.id)).map(Into::into),
+        );
         if let Some(input) = &ledger {
             lifecycle.record_settled(
                 input,
                 &receipt,
                 SettledOutcome::Merged {
-                    into: request.run_id,
+                    into: request.run_id.into(),
                 },
                 None,
             );
@@ -423,7 +427,7 @@ impl Agent {
             return Err(UNIQUENESS_ERROR.into());
         }
         let request = QuestionRequest {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat_id: receipt.chat_id,
             loop_id: receipt.loop_id,
             run_id: receipt.run_id,

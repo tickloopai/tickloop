@@ -56,7 +56,10 @@ impl JudgmentClient for ReviewingJudgment {
 
 async fn finish(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> usize {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     let mut prompts = 0;
     loop {
         let event = next_event(&mut events).await;
@@ -67,7 +70,7 @@ async fn finish(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> usize {
             EventKind::PermissionRequested { request } => {
                 prompts += 1;
                 agent
-                    .answer_permission(chat, request.id, true)
+                    .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                     .await
                     .unwrap();
             }
@@ -128,7 +131,8 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                         let chat = agent.create_chat(directory.path().into()).await.unwrap();
                         let child = if tool == "SendMessage" {
                             assert_eq!(
-                                finish(&agent, chat, "Create the bounded fixture child").await,
+                                finish(&agent, chat.uuid(), "Create the bounded fixture child")
+                                    .await,
                                 0
                             );
                             Some(agent.subagents(chat).await.unwrap()[0].child_chat_id)
@@ -170,7 +174,7 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                         }
                         let prompts = finish(
                             &agent,
-                            chat,
+                            chat.uuid(),
                             if child.is_some() {
                                 "MESSAGE_PROBE_REQUEST: Send the bounded follow-up to peer"
                             } else {
@@ -213,7 +217,10 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                         if let Some(request) = requests.first() {
                             assert_eq!(request["operation"]["tool"], tool, "{label}");
                             if let Some(child) = child {
-                                assert_eq!(request["operation"]["input"]["to"], child.to_string());
+                                assert_eq!(
+                                    request["operation"]["input"]["to"],
+                                    tickloop_ids::IdContext::new().model_text(child)
+                                );
                             }
                         }
                         if child.is_some() {
@@ -251,7 +258,7 @@ async fn malformed_delegation_is_rejected_before_classifier_or_child_creation() 
         .set_execution_mode(chat, ExecutionMode::Auto)
         .await
         .unwrap();
-    let prompts = finish(&agent, chat, "Delegate the bounded task").await;
+    let prompts = finish(&agent, chat.uuid(), "Delegate the bounded task").await;
     let children = agent.subagents(chat).await.unwrap();
     agent.shutdown().await;
     assert_eq!(prompts, 0);
@@ -315,7 +322,7 @@ async fn classifier_allow_cannot_create_or_message_after_cancellation_or_policy_
             let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(replies)));
             let chat = agent.create_chat(directory.path().into()).await.unwrap();
             if tool == "SendMessage" {
-                finish(&agent, chat, "Create the bounded peer").await;
+                finish(&agent, chat.uuid(), "Create the bounded peer").await;
             }
             let before = agent.subagents(chat).await.unwrap().len();
             agent

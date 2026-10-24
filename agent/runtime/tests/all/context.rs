@@ -585,8 +585,8 @@ async fn context_status_counts_tool_results_streamed_usage_and_model_changes() {
         .start(
             RequestOwner {
                 chat_id: chat,
-                loop_id: Some(Uuid::new_v4()),
-                run_id: Some(Uuid::new_v4()),
+                loop_id: Some(tickloop_ids::Id::from(Uuid::new_v4())),
+                run_id: Some(tickloop_ids::Id::from(Uuid::new_v4())),
             },
             ModelRequestKind::Conversation,
             snapshot.model.identity(),

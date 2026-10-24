@@ -179,7 +179,7 @@ fn lost_presentation_pty_fixture() {
                     tokio::task::yield_now().await;
                 }
                 if std::env::var(LOST_COMPLETED_VARIABLE).as_deref() == Ok("1") {
-                    while core.snapshot(chat).await.unwrap().chat_loop.state
+                    while core.snapshot(chat.into()).await.unwrap().chat_loop.state
                         != tickloop_agent_protocol::LoopState::Idle
                     {
                         tokio::task::yield_now().await;
@@ -208,7 +208,7 @@ fn lost_presentation_pty_fixture() {
                         if std::path::Path::new(DAEMON_UNAVAILABLE_FLAG).exists() {
                             proof_agent.snapshot(chat).await.unwrap();
                         }
-                        let snapshot = proof_core.snapshot(chat).await.unwrap();
+                        let snapshot = proof_core.snapshot(chat.into()).await.unwrap();
                         std::fs::write(
                             LOST_PROOF,
                             serde_json::to_vec(&serde_json::json!({
@@ -412,11 +412,11 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
         "the connection notice stays separate from floated core status: {status}"
     );
     assert!(
-        !frame.contains(before["run"].as_str().unwrap()),
+        !frame.contains(&public(&before["run"])),
         "the default interactive loss notice uses the readable Agent label: {frame}"
     );
     assert!(
-        !frame.contains(&format!("/resume {}", before["chat"].as_str().unwrap())),
+        !frame.contains(&format!("/resume {}", public(&before["chat"]))),
         "the default action uses the history picker: {frame}"
     );
     assert!(
@@ -431,12 +431,9 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
     let details = wait_for_lost_presentation(&mut view, |frame| {
         frame.contains("Execution connection details") && frame.contains(LOST_RAW_ERROR)
     });
+    assert!(details.contains(&public(&before["run"])), "{details}");
     assert!(
-        details.contains(before["run"].as_str().unwrap()),
-        "{details}"
-    );
-    assert!(
-        details.contains(&format!("/resume {}", before["chat"].as_str().unwrap())),
+        details.contains(&format!("/resume {}", public(&before["chat"]))),
         "{details}"
     );
     view.writer.write_all(b"\x1b").unwrap();
@@ -486,7 +483,7 @@ fn completed_cached_execution_keeps_its_known_outcome_and_exposes_connection_det
         frame.contains("Last connection diagnostic (this View)") && frame.contains(LOST_RAW_ERROR)
     });
     assert!(
-        details.contains(&format!("/resume {}", before["chat"].as_str().unwrap())),
+        details.contains(&format!("/resume {}", public(&before["chat"]))),
         "{details}"
     );
     assert!(
@@ -579,7 +576,7 @@ fn an_unavailable_daemon_catalog_preserves_the_live_worker_core_and_connection_d
             && frame.contains(DAEMON_UNAVAILABLE_CAUSE)
     });
     assert!(
-        details.contains(&format!("/resume {}", before["chat"].as_str().unwrap())),
+        details.contains(&format!("/resume {}", public(&before["chat"]))),
         "{details}"
     );
     view.writer.write_all(b"\x1b").unwrap();
@@ -598,4 +595,9 @@ fn an_unavailable_daemon_catalog_preserves_the_live_worker_core_and_connection_d
     let restored = lost_presentation_proof(directory.path());
     assert_eq!(restored["commands"], before["commands"]);
     assert_eq!(restored["model_calls"], before["model_calls"]);
+}
+
+/// A stored id from the fixture's proof as the Console shows it.
+fn public(id: &serde_json::Value) -> String {
+    tickloop_ids::base62::encode(id.as_str().unwrap().parse().unwrap())
 }

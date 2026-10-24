@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use serde_json::{Value, json};
+use tickloop_ids::IdContext;
 
 use super::*;
 use crate::{
@@ -75,7 +76,7 @@ mod ancestry_authority_tests {
             let receipt = Receipt {
                 chat_id: child,
                 loop_id: chats[&child].snapshot.chat_loop.id,
-                run_id: Uuid::new_v4(),
+                run_id: Uuid::new_v4().into(),
             };
             let input = json!({"task":"delegate again"});
             let operation = OperationRecord {
@@ -316,13 +317,15 @@ fn check_direct_call(
         return Err("the frozen parent Session denial applies to this delegated operation".into());
     }
     if let Some(parent) = chats.get(&delegation.parent_chat_id) {
-        let parent_owner =
-            PermissionOwner::new(delegation.parent_chat_id, delegation.parent_loop_id)
-                .map_err(|error| error.to_string())?;
+        let parent_owner = PermissionOwner::new(
+            delegation.parent_chat_id.into(),
+            delegation.parent_loop_id.into(),
+        )
+        .map_err(|error| error.to_string())?;
         let current_parent_decision = parent.snapshot.policy.explicit_decision_with_session(
             name,
             input,
-            delegation.parent_loop_id,
+            delegation.parent_loop_id.into(),
             sessions.evaluate(parent_owner, &session_operation).decision,
         );
         if current_parent_decision == Some(Decision::Deny) {
@@ -331,10 +334,12 @@ fn check_direct_call(
             );
         }
     }
-    if ceiling
-        .policy
-        .explicit_decision_with_session(name, input, delegation.parent_loop_id, None)
-        == Some(Decision::Deny)
+    if ceiling.policy.explicit_decision_with_session(
+        name,
+        input,
+        delegation.parent_loop_id.into(),
+        None,
+    ) == Some(Decision::Deny)
     {
         return Err("delegated authorization ceiling denies this operation".into());
     }
@@ -353,7 +358,7 @@ fn check_direct_call(
         if !is_plan_file_access
             && ceiling
                 .policy
-                .decide(prepared, &workspace, delegation.parent_loop_id)
+                .decide(prepared, &workspace, delegation.parent_loop_id.into())
                 == Decision::Deny
         {
             return Err("delegated authorization ceiling denies this operation".into());
@@ -455,7 +460,7 @@ pub(super) fn effective_policy(
                         })
                         .cloned()
                         .map(|mut rule| {
-                            rule.loop_id = Some(receipt.loop_id);
+                            rule.loop_id = Some(receipt.loop_id.into());
                             rule
                         }),
                 );
@@ -507,7 +512,7 @@ pub(super) fn host_authority(
     let own = &chats[&receipt.chat_id];
     let (mut decision, mut explicit_ask) = decide(
         &own.snapshot.policy,
-        receipt.loop_id,
+        receipt.loop_id.into(),
         session,
         permission == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
             && own.has_human_input_for_run(receipt.run_id),
@@ -527,15 +532,22 @@ pub(super) fn host_authority(
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let owner = PermissionOwner::new(delegation.parent_chat_id, delegation.parent_loop_id)
-            .map_err(|error| error.to_string())?;
+        let owner = PermissionOwner::new(
+            delegation.parent_chat_id.into(),
+            delegation.parent_loop_id.into(),
+        )
+        .map_err(|error| error.to_string())?;
         let inherited_session = sessions.evaluate(owner, &session_operation).decision;
         for (ancestor_policy, session) in [
             (&delegation.ceiling.policy, None),
             (&parent.snapshot.policy, inherited_session),
         ] {
-            let (ancestor_decision, ancestor_ask) =
-                decide(ancestor_policy, delegation.parent_loop_id, session, false);
+            let (ancestor_decision, ancestor_ask) = decide(
+                ancestor_policy,
+                delegation.parent_loop_id.into(),
+                session,
+                false,
+            );
             decision = decision.stricter(ancestor_decision);
             explicit_ask |= ancestor_ask;
         }
@@ -545,7 +557,7 @@ pub(super) fn host_authority(
         let read_operation =
             SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(own))
                 .map_err(|error| error.to_string())?;
-        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+        let owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
         let read_session = sessions.evaluate(owner, &read_operation).decision;
         let read_authority =
@@ -638,14 +650,14 @@ fn direct_permission_authority(
         decision: policy.decide_with_plan_file(
             prepared,
             &configured_workspace_for_chat(chat),
-            receipt.loop_id,
+            receipt.loop_id.into(),
             session,
             plan_file,
         ),
         explicit_ask: policy.explicit_match_with_session(
             &prepared.name,
             &prepared.input,
-            receipt.loop_id,
+            receipt.loop_id.into(),
             session,
         ) == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
         policy_revision: policy.revision,
@@ -666,20 +678,22 @@ fn direct_permission_authority(
     let frozen = delegation.ceiling.policy.decide_with_plan_file(
         prepared,
         &workspace,
-        delegation.parent_loop_id,
+        delegation.parent_loop_id.into(),
         session,
         plan_file,
     );
     let frozen_ask = delegation.ceiling.policy.explicit_decision_with_session(
         &prepared.name,
         &prepared.input,
-        delegation.parent_loop_id,
+        delegation.parent_loop_id.into(),
         session,
     ) == Some(Decision::Ask);
     let parent = chats.get(&delegation.parent_chat_id);
     let (current, parent_ask, revision) = parent.map_or((Decision::Deny, false, None), |parent| {
-        let Ok(owner) = PermissionOwner::new(delegation.parent_chat_id, delegation.parent_loop_id)
-        else {
+        let Ok(owner) = PermissionOwner::new(
+            delegation.parent_chat_id.into(),
+            delegation.parent_loop_id.into(),
+        ) else {
             return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
         };
         let parent_workspace = configured_workspace_for_chat(parent);
@@ -699,14 +713,14 @@ fn direct_permission_authority(
             parent.snapshot.policy.decide_with_plan_file(
                 prepared,
                 &parent_workspace,
-                delegation.parent_loop_id,
+                delegation.parent_loop_id.into(),
                 effective_session,
                 plan_file,
             ),
             parent.snapshot.policy.explicit_decision_with_session(
                 &prepared.name,
                 &prepared.input,
-                delegation.parent_loop_id,
+                delegation.parent_loop_id.into(),
                 effective_session,
             ) == Some(Decision::Ask),
             Some(parent.snapshot.policy.revision),
@@ -929,7 +943,7 @@ impl Agent {
             .await?;
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
-        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+        let owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
         let operation =
             SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(chat))
@@ -944,7 +958,7 @@ impl Agent {
         match effective_policy(&chats, receipt)?.explicit_match_with_session(
             &read.name,
             &read.input,
-            receipt.loop_id,
+            receipt.loop_id.into(),
             session,
         ) {
             Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny) => {
@@ -1032,8 +1046,9 @@ impl Agent {
                             chat_id: parent.chat_id,
                             loop_id: parent.loop_id,
                         });
-                        let parent_owner = PermissionOwner::new(parent.chat_id, parent.loop_id)
-                            .map_err(|error| error.to_string())?;
+                        let parent_owner =
+                            PermissionOwner::new(parent.chat_id.into(), parent.loop_id.into())
+                                .map_err(|error| error.to_string())?;
                         let sessions = self.inner.session_permissions.lock().await;
                         (
                             chat.snapshot.clone(),
@@ -1069,7 +1084,7 @@ impl Agent {
                         &mut policy.managed_constraints,
                     ] {
                         rules.retain(|rule| {
-                            rule.loop_id.is_none() || rule.loop_id == Some(parent.loop_id)
+                            rule.loop_id.is_none() || rule.loop_id == Some(parent.loop_id.into())
                         });
                         for rule in rules {
                             rule.loop_id = None;
@@ -1116,7 +1131,7 @@ impl Agent {
                         context.interaction = None;
                     }
                     let mut registration = SubagentRegistration {
-                        child_chat_id: Uuid::new_v4(),
+                        child_chat_id: ChatId::new(),
                         handle: name,
                         description: description.clone(),
                         created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
@@ -1154,14 +1169,14 @@ impl Agent {
                         serde_json::to_value(approval_context::capture_reply_history(
                             &snapshot,
                             &bookkeeping,
-                            Some((parent.run_id, call_id)),
+                            Some((parent.run_id.into(), call_id)),
                             inputs,
                             history_ancestors.as_deref(),
                         ))
                         .ok()
                     });
                     let metadata = DelegationMetadata {
-                        delegation_id: Uuid::new_v4(),
+                        delegation_id: tickloop_agent_protocol::DelegationId::new().uuid(),
                         parent_chat_id: parent.chat_id,
                         parent_loop_id: parent.loop_id,
                         parent_run_id: parent.run_id,
@@ -1226,7 +1241,7 @@ impl Agent {
 
                     let source = AgentMessageSource {
                         cause,
-                        message_id: Uuid::new_v4(),
+                        message_id: tickloop_agent_protocol::AgentMessageId::new().uuid(),
                         call_id: None,
                         created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                         sender_chat_id: parent.chat_id,
@@ -1241,10 +1256,11 @@ impl Agent {
                             .into(),
                         relay: None,
                     };
+                    let child_ids = self.chat_ids(child_id).await;
                     let receipt = self
                         .submit_internal(
                             child_id,
-                            local_messages::agent_message(&source, &task),
+                            local_messages::agent_message(&child_ids, &source, &task),
                             SubmissionOptions {
                                 task_delegation: Some(parent.clone()),
                                 agent_message: Some(source),
@@ -1271,7 +1287,8 @@ impl Agent {
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or("child handle is unavailable")?;
-                return Ok(launched_result(&child, &registration));
+                let ids = self.chat_ids(parent.chat_id).await;
+                return Ok(launched_result(&ids, &child, &registration));
             }
             let release = self.suspend_for_subagent(parent, call_id, &child).await?;
             loop {
@@ -1303,6 +1320,7 @@ impl Agent {
         call_id: &str,
         child: &Receipt,
     ) -> Result<ToolResult, String> {
+        let ids = self.chat_ids(parent.chat_id).await;
         let mut invocations = self.inner.subagent_invocations.lock().await;
         if let Some(result) = self.recorded_child_result(parent.chat_id, child).await? {
             return Ok(result);
@@ -1314,15 +1332,23 @@ impl Agent {
         if let Some(invocation) = invocations.get_mut(&(parent.run_id, call_id.to_owned())) {
             invocation.run_in_background = true;
         }
-        Ok(interrupted_observation_result(child, registration.as_ref()))
+        Ok(interrupted_observation_result(
+            &ids,
+            child,
+            registration.as_ref(),
+        ))
     }
 }
 
 /// What a background `Subagent` call returns: the child it launched.
-pub(super) fn launched_result(child: &Receipt, registration: &SubagentRegistration) -> ToolResult {
+pub(super) fn launched_result(
+    ids: &IdContext,
+    child: &Receipt,
+    registration: &SubagentRegistration,
+) -> ToolResult {
     ToolResult {
-        content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
-            "child_loop_id":child.loop_id,"child_run_id":child.run_id,
+        content: json!({"status":"async_launched", "child_chat_id":ids.model_text(child.chat_id),
+            "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),
             "handle":registration.handle,"description":registration.description,
             "created_at":registration.created_at})
         .to_string(),
@@ -1333,11 +1359,12 @@ pub(super) fn launched_result(child: &Receipt, registration: &SubagentRegistrati
 
 /// What a foreground `Subagent` call returns when it stops observing a child that goes on.
 pub(super) fn interrupted_observation_result(
+    ids: &IdContext,
     child: &Receipt,
     registration: Option<&SubagentRegistration>,
 ) -> ToolResult {
     ToolResult {
-        content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.map(|registration|registration.handle.as_str()),"description":registration.map(|registration|registration.description.as_str()),"created_at":registration.map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
+        content: json!({"status":"interrupted","child_chat_id":ids.model_text(child.chat_id),"handle":registration.map(|registration|registration.handle.as_str()),"description":registration.map(|registration|registration.description.as_str()),"created_at":registration.map(|registration|registration.created_at),"child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
         is_error: true,
         output_ref: None,
     }

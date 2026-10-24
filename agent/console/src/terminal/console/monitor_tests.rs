@@ -104,9 +104,11 @@ fn shell_ticks_only_list_background_executions_and_ctrl_x_twice_removes_a_finish
         snapshot.tasks[0].origin = origin;
         snapshot.tasks[0].owner = match origin {
             ShellTaskOrigin::Agent => ShellTaskOwner::Agent {
-                loop_id: Uuid::new_v4(),
+                loop_id: Uuid::new_v4().into(),
             },
-            ShellTaskOrigin::User => ShellTaskOwner::User { chat_id: chat },
+            ShellTaskOrigin::User => ShellTaskOwner::User {
+                chat_id: chat.into(),
+            },
         };
         snapshot.tasks[0].was_background = false;
         snapshot.tasks[0].state = ShellTaskState::Running;
@@ -2539,7 +2541,7 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(chat, "watch the calendar".into())
+    core.submit(chat.into(), "watch the calendar".into())
         .await
         .unwrap();
     loop {
@@ -2616,7 +2618,7 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
     let quotes = tick_protocol::InstanceRef::new("calendar", "quotes-run").unwrap();
     let joined = core
         .record_reopened_tick(
-            chat,
+            chat.into(),
             &tick_protocol::InstanceRef::new("calendar", "lost-run").unwrap(),
             quotes.clone(),
         )
@@ -2986,7 +2988,7 @@ fn refresh_status(
     let _frame_hold = console.hold_frames().unwrap();
     console
         .set_input_context(
-            Some(chat),
+            Some(chat.into()),
             snapshot.folder.as_deref().unwrap(),
             &snapshot.additional_directories,
         )
@@ -2994,9 +2996,9 @@ fn refresh_status(
     console.set_visible_delegation(false).unwrap();
     console.set_foreground_shell(changed).unwrap();
     console
-        .set_queued_inputs(chat, snapshot.queued_inputs())
+        .set_queued_inputs(chat.into(), snapshot.queued_inputs())
         .unwrap();
-    console.set_chat_images(chat, true, None).unwrap();
+    console.set_chat_images(chat.into(), true, None).unwrap();
     let commands = if changed {
         vec![(tasks.tasks[0].id, None)]
     } else {
@@ -3011,7 +3013,7 @@ fn refresh_status(
         })
         .unwrap();
     console
-        .set_provider_failures(chat, &snapshot.provider_failures)
+        .set_provider_failures(chat.into(), &snapshot.provider_failures)
         .unwrap();
     console.set_provider_failure(None).unwrap();
     console
@@ -3125,7 +3127,7 @@ async fn subscribed_calendar_chat(
     );
     let chat = agent.create_chat(directory.into()).await.unwrap();
     let mut events = core.subscribe();
-    core.submit(chat, "watch the calendar".into())
+    core.submit(chat.into(), "watch the calendar".into())
         .await
         .unwrap();
     loop {
@@ -3396,7 +3398,7 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
         AgentCommand::CloseHostedTick { instance, .. } if instance == &watched));
     assert!(console.test_status_text().is_empty());
     assert!(
-        core.snapshot(chat)
+        core.snapshot(chat.into())
             .await
             .unwrap()
             .monitor
@@ -3420,7 +3422,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     core.schedule_task(
-        chat,
+        chat.into(),
         tickloop_agent_runtime::NewScheduledTask::new("* * * * *", "remind me about weather", true),
     )
     .await
@@ -3475,7 +3477,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     execute(action, context).await.unwrap();
     assert!(console.test_status_text().is_empty());
     assert!(
-        core.snapshot(chat)
+        core.snapshot(chat.into())
             .await
             .unwrap()
             .scheduled_tasks
@@ -3484,7 +3486,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     assert!(!console.monitor_has_entries().unwrap());
     for index in 0..4 {
         core.schedule_task(
-            chat,
+            chat.into(),
             tickloop_agent_runtime::NewScheduledTask::new(
                 "* * * * *",
                 format!("extra instruction {index}"),
@@ -3522,7 +3524,14 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
         assert!(state.monitor.task_list_is_open());
     }
     assert!(console.test_status_text().is_empty());
-    assert_eq!(core.snapshot(chat).await.unwrap().scheduled_tasks.len(), 3);
+    assert_eq!(
+        core.snapshot(chat.into())
+            .await
+            .unwrap()
+            .scheduled_tasks
+            .len(),
+        3
+    );
     core.shutdown().await;
 }
 
@@ -3564,7 +3573,7 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
         let chat = if folder {
             agent.create_chat(directory.path().into()).await.unwrap()
         } else {
-            core.create_chat_without_folder().await.unwrap()
+            (core.create_chat_without_folder().await.unwrap()).uuid()
         };
         let mut events = core.subscribe();
         for (arguments, expected) in [
@@ -3575,7 +3584,9 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
             let receipt = if folder {
                 agent.invoke_skill(chat, "loop", arguments).await.unwrap()
             } else {
-                core.invoke_skill(chat, "loop", arguments).await.unwrap()
+                core.invoke_skill(chat.into(), "loop", arguments)
+                    .await
+                    .unwrap()
             };
             loop {
                 let event = tickloop_agent_test_support::next_event(&mut events).await;
@@ -4836,8 +4847,8 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
         .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
     state.queued_inputs = vec![tickloop_agent_protocol::QueuedInput {
         id: Uuid::new_v4(),
-        chat_id: state.chat.unwrap(),
-        loop_id: Some(Uuid::new_v4()),
+        chat_id: state.chat.unwrap().into(),
+        loop_id: Some(Uuid::new_v4().into()),
         kind: tickloop_agent_protocol::QueuedInputKind::Message,
         text: "/loop 每分钟看看 qqq.us 的股价是多少".into(),
         contexts: Vec::new(),
@@ -5011,8 +5022,8 @@ fn queued_input_layout_is_bounded_by_conversation_width_before_rendering() {
         .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
     state.queued_inputs = vec![tickloop_agent_protocol::QueuedInput {
         id: Uuid::new_v4(),
-        chat_id: state.chat.unwrap(),
-        loop_id: Some(Uuid::new_v4()),
+        chat_id: state.chat.unwrap().into(),
+        loop_id: Some(Uuid::new_v4().into()),
         kind: tickloop_agent_protocol::QueuedInputKind::Message,
         text: format!("/loop {}", "每分钟看看 qqq.us 的股价是多少".repeat(20)),
         contexts: Vec::new(),
@@ -5529,8 +5540,8 @@ fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapsh
         .unwrap();
     console
         .write_shell_notification(&tickloop_agent_protocol::TaskNotification {
-            chat_id: chat,
-            task_id: shells.tasks[0].id,
+            chat_id: chat.into(),
+            task_id: shells.tasks[0].id.into(),
             tool_use_id: None,
             output_file: "output.txt".into(),
             status: tickloop_agent_protocol::TaskNotificationStatus::Completed,
@@ -5658,11 +5669,11 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
         snapshot.scheduled_tasks = source.chat.scheduled_tasks.clone();
         let input = Uuid::new_v4();
         snapshot.trigger_origins.insert(
-            input,
+            input.into(),
             if goal {
                 TriggerIdentity::GoalContinuation {
                     goal_id: snapshot.goal.as_ref().unwrap().id,
-                    after_run: Uuid::new_v4(),
+                    after_run: Uuid::new_v4().into(),
                 }
             } else {
                 TriggerIdentity::ScheduledTask {
@@ -5682,7 +5693,7 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
                 },
             }],
         });
-        snapshot.message_runs.insert(0, input);
+        snapshot.message_runs.insert(0, input.into());
         for history in [false, true] {
             let console = Console::test_interactive_for_chat(chat);
             console
@@ -5912,7 +5923,7 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
     }
     let task = core
         .schedule_task(
-            chat,
+            chat.into(),
             tickloop_agent_runtime::NewScheduledTask::new("*/10 * * * *", "check build", true),
         )
         .await

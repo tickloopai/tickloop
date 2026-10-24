@@ -452,9 +452,9 @@ mod tests {
         });
         let request = QuestionRequest {
             id: Uuid::new_v4(),
-            chat_id: chat,
-            loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
+            chat_id: chat.into(),
+            loop_id: Uuid::new_v4().into(),
+            run_id: Uuid::new_v4().into(),
             call_id: "question-review-regression".into(),
             questions: (0..2)
                 .map(|index| Question {
@@ -1726,7 +1726,7 @@ impl Menus {
             target,
             self.provider.provider_choices.clone(),
             self.provider.provider_selected,
-            Uuid::new_v4(),
+            tickloop_ids::generate(),
         )
     }
 
@@ -1814,7 +1814,7 @@ impl Menus {
             context.push(format!("Provider message: {}", failure.message));
         }
         let mut selected = selected;
-        let mut id = Uuid::new_v4();
+        let mut id = tickloop_ids::generate();
         if let Some((
             previous_id,
             Selection::ConnectionDetails {
@@ -1940,7 +1940,7 @@ impl Menus {
         provider: &ProviderModels,
     ) -> Result<(), String> {
         self.refresh_connections
-            .insert((target.agent(), provider.key()), Uuid::new_v4());
+            .insert((target.agent(), provider.key()), tickloop_ids::generate());
         self.refresh_provider_scope(agent, target).await?;
         if matches!(
             self.provider.provider_nav.back_stack.last(),
@@ -2117,7 +2117,7 @@ impl Menus {
             .entries()
             .iter()
             .rev()
-            .find(|request| request.run_id == Some(run))
+            .find(|request| request.run_id == Some(run.into()))
         else {
             return;
         };
@@ -2136,11 +2136,11 @@ impl Menus {
             self.model_discovery.invalidate(&snapshot.model.provider_id);
             self.refresh_connections.insert(
                 (
-                    Some(snapshot.id),
+                    Some(snapshot.id.into()),
                     self.key_for_model(&snapshot.model)
                         .unwrap_or_else(|| connection_key(&snapshot.model)),
                 ),
-                Uuid::new_v4(),
+                tickloop_ids::generate(),
             );
         } else {
             for provider in &self.provider.provider_choices {
@@ -2151,8 +2151,10 @@ impl Menus {
                 {
                     self.model_discovery
                         .invalidate(&provider.models[0].provider_id);
-                    self.refresh_connections
-                        .insert((Some(snapshot.id), provider.key()), Uuid::new_v4());
+                    self.refresh_connections.insert(
+                        (Some(snapshot.id.into()), provider.key()),
+                        tickloop_ids::generate(),
+                    );
                 }
             }
         }
@@ -2419,7 +2421,7 @@ impl Menus {
                     .position(|candidate| *candidate == action)
             })
             .map_or(selected, |index| choices.len() + index);
-        self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
+        self.show_model_choices(console, target, choices, selected, tickloop_ids::generate())
     }
 
     pub(super) fn remember_model_drafts(&mut self, choices: &[ModelChoice]) {
@@ -2478,7 +2480,7 @@ impl Menus {
                     .position(|candidate| *candidate == action)
             })
             .map_or(selected, |index| choices.len() + index);
-        self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
+        self.show_model_choices(console, target, choices, selected, tickloop_ids::generate())
     }
 
     pub(super) async fn refresh_model_choices(
@@ -2497,7 +2499,7 @@ impl Menus {
                 && connection.as_ref().is_none_or(|key| *key == provider.key())
             {
                 self.refresh_connections
-                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+                    .insert((target.agent(), provider.key()), tickloop_ids::generate());
             }
         }
         self.provider.model_return = Some(ModelPickerDraft {
@@ -2835,7 +2837,7 @@ impl Menus {
                         ConnectionFilter::All => ConnectionFilter::Configured,
                         ConnectionFilter::Configured => ConnectionFilter::All,
                     };
-                    self.show_providers(console, target, choices, 0, Uuid::new_v4())?;
+                    self.show_providers(console, target, choices, 0, tickloop_ids::generate())?;
                 } else if action == PickerAction::ConfigureProvider {
                     if let Some(provider) = provider {
                         self.provider
@@ -2845,7 +2847,7 @@ impl Menus {
                         self.connection_details(console, target, provider, 0)?;
                     } else {
                         self.provider.provider_nav.filter = ConnectionFilter::All;
-                        self.show_providers(console, target, choices, 0, Uuid::new_v4())?;
+                        self.show_providers(console, target, choices, 0, tickloop_ids::generate())?;
                     }
                 } else {
                     self.show_providers(console, target, choices, index, menu_id)?;
@@ -2923,7 +2925,7 @@ impl Menus {
         target: ConfigTarget,
         provider: ProviderModels,
     ) -> Result<(), String> {
-        self.show(console, Menu { id: Uuid::new_v4(), title: format!("Sign in · {}", provider.model_page_name()), context: vec!["Authorize this connection. Existing login is kept until authorization succeeds.".into()], options: vec!["Device code".into(), "Browser + callback".into()], selected: 0, confirmation: false }, Selection::LoginMethods { target, provider })
+        self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Sign in · {}", provider.model_page_name()), context: vec!["Authorize this connection. Existing login is kept until authorization succeeds.".into()], options: vec!["Device code".into(), "Browser + callback".into()], selected: 0, confirmation: false }, Selection::LoginMethods { target, provider })
     }
 
     pub(super) fn provider_auth(
@@ -2995,7 +2997,7 @@ impl Menus {
             )
             .unwrap_or(None);
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: "Service account · Google Vertex".into(),
             context: vec![
                 "Enter the absolute path to your service-account JSON file on this computer."
@@ -3037,7 +3039,7 @@ impl Menus {
             ));
         }
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: safe_text(&format!("API key · {}", provider.model_page_name())),
             context: vec![
                 format!("Use an API key for {}. Other regions/products have separate credentials.", provider.model_page_name()),
@@ -3072,7 +3074,7 @@ impl Menus {
                 self.model_discovery
                     .invalidate(&provider.models[0].provider_id);
                 self.refresh_connections
-                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+                    .insert((target.agent(), provider.key()), tickloop_ids::generate());
             }
         }
         self.provider_login_results.insert(chat, succeeded);
@@ -3100,7 +3102,7 @@ impl Menus {
                 self.model_discovery
                     .invalidate(&provider.models[0].provider_id);
                 self.refresh_connections
-                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+                    .insert((target.agent(), provider.key()), tickloop_ids::generate());
             }
             if matches!(&self.active, Some((_, Selection::ConnectionDetails { target: current_target, provider: current_provider, .. })) if *current_target == target && current_provider.key() == provider.key())
             {
@@ -3211,7 +3213,7 @@ impl Menus {
     pub(in crate::terminal) fn invalidate_model_discovery(&mut self) {
         if let Some((target, provider)) = &self.provider.login_return {
             self.refresh_connections
-                .insert((target.agent(), provider.key()), Uuid::new_v4());
+                .insert((target.agent(), provider.key()), tickloop_ids::generate());
             self.model_discovery
                 .invalidate(&provider.models[0].provider_id);
         }

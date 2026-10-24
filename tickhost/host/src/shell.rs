@@ -362,7 +362,7 @@ struct PendingSpawn {
 impl SpawnGrants {
     pub(crate) fn issue(&mut self, binding: SpawnBinding, token: String, now: Instant) -> Uuid {
         self.pending.retain(|_, pending| now < pending.expires);
-        let grant = Uuid::new_v4();
+        let grant = tickloop_ids::generate();
         self.pending.insert(
             grant,
             PendingSpawn {

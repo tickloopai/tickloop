@@ -149,7 +149,7 @@ fn config() -> ModelConfig {
 async fn require_file_change_approval(agent: &Agent, chat: Uuid, tool: &str) {
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: Uuid::new_v4(),
                 decision: Decision::Ask,
@@ -304,7 +304,7 @@ async fn searching_outside_the_workspace_asks_for_approval_first() {
         .await
         .unwrap();
 
-    let (results, approvals) = finish_turn(&agent, chat, &mut events).await;
+    let (results, approvals) = finish_turn(&agent, chat.uuid(), &mut events).await;
     assert_eq!(approvals, 1, "only the search outside the workspace asks");
     assert_eq!(
         result(&results, "inside").content,
@@ -603,7 +603,7 @@ async fn a_file_changed_while_approval_is_pending_is_not_overwritten() {
         ])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Edit").await;
+    require_file_change_approval(&agent, chat.uuid(), "Edit").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Correct the delivery day".into())
@@ -805,7 +805,7 @@ async fn finish_turn(
             EventKind::PermissionRequested { request } => {
                 approvals += 1;
                 agent
-                    .answer_permission(chat, request.id, true)
+                    .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                     .await
                     .unwrap();
             }
@@ -842,14 +842,14 @@ async fn an_unread_file_is_rejected_before_any_approval_is_requested() {
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Write").await;
+    require_file_change_approval(&agent, chat.uuid(), "Write").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Replace the report".into())
         .await
         .unwrap();
 
-    let (results, approvals) = finish_turn(&agent, chat, &mut events).await;
+    let (results, approvals) = finish_turn(&agent, chat.uuid(), &mut events).await;
     assert_eq!(approvals, 0);
     let overwrite = result(&results, "overwrite");
     assert!(overwrite.is_error);
@@ -892,7 +892,7 @@ async fn a_file_attached_with_an_at_mention_counts_as_read_when_attached_whole()
         .await
         .unwrap();
 
-    let (results, _) = finish_turn(&agent, chat, &mut events).await;
+    let (results, _) = finish_turn(&agent, chat.uuid(), &mut events).await;
     let edited = result(&results, "edit-notes");
     assert!(!edited.is_error, "{}", edited.content);
     assert_eq!(
@@ -939,7 +939,7 @@ async fn compaction_forgets_which_files_the_chat_read() {
     let mut events = agent.subscribe();
     let mut turn = async |prompt: &str| {
         agent.submit(chat, prompt.into()).await.unwrap();
-        finish_turn(&agent, chat, &mut events).await.0
+        finish_turn(&agent, chat.uuid(), &mut events).await.0
     };
 
     turn("Read the notes").await;
@@ -1015,7 +1015,7 @@ async fn write_and_edit_report_success_in_claude_code_words() {
         .await
         .unwrap();
 
-    let (results, _) = finish_turn(&agent, chat, &mut events).await;
+    let (results, _) = finish_turn(&agent, chat.uuid(), &mut events).await;
     for (call_id, expected) in [
         ("create", format!("File created successfully at: {report}")),
         (

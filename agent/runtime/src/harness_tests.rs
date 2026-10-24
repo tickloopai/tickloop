@@ -50,7 +50,7 @@ fn harness(
 
 fn prompt_request(input: Uuid, after: ParentSelection, delivery: Delivery) -> TurnRequest {
     TurnRequest {
-        input_id: input,
+        input_id: input.into(),
         op: TurnOp::Continue {
             after,
             message: UserMessage {
@@ -104,7 +104,7 @@ async fn settle_leased_turns(agent: &Agent, chat: ChatId) {
             chat,
             prompt_request(
                 Uuid::new_v4(),
-                ParentSelection::Message(answer),
+                ParentSelection::Message(answer.into()),
                 Delivery::SendNow,
             ),
         )
@@ -281,7 +281,11 @@ async fn shutdown_waits_for_a_submission_admitted_before_it_registered_its_run()
     submitting.await.unwrap().unwrap();
     shutting_down.await.unwrap();
 
-    let state = agent.input_state(chat, input).await.unwrap().unwrap();
+    let state = agent
+        .input_state(chat, input.into())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!state.is_live, "the Run ended before shutdown returned");
     assert_eq!(state.responses.len(), 1);
     assert!(matches!(

@@ -46,7 +46,9 @@ impl Agent {
                     .filter(survives_restart)
                     .map(|pending| pending.receipt.run_id)
                     .collect::<std::collections::HashSet<_>>();
-                self.forget_inputs(chat, |entry| !waiting.contains(&entry.run_id));
+                self.forget_inputs(chat, |entry| {
+                    !waiting.contains(&tickloop_ids::Id::from(entry.run_id))
+                });
                 self.requeue_inputs(chat, survives_restart);
                 chat.bookkeeping
                     .lifecycle
@@ -78,7 +80,7 @@ impl Agent {
             if !entry.op.is_from_user() && lost(&entry) {
                 self.settle_input(
                     chat,
-                    entry.run_id,
+                    entry.run_id.into(),
                     SettledOutcome::Interrupted {
                         by: InterruptedBy::Host,
                     },
@@ -89,7 +91,10 @@ impl Agent {
 
     fn continue_lost_inputs(&self, chat: &mut Chat) {
         for entry in chat.bookkeeping.lifecycle.open_entries() {
-            let attempts = chat.bookkeeping.lifecycle.responses_of(entry.input_id);
+            let attempts = chat
+                .bookkeeping
+                .lifecycle
+                .responses_of(entry.input_id.into());
             let answer_parent = match attempts.last() {
                 Some(last) if lost_its_host(&last.state) => last.display_parent,
                 Some(_) => continue,
@@ -98,7 +103,7 @@ impl Agent {
                     && chat
                         .bookkeeping
                         .lifecycle
-                        .state(entry.input_id, &chat.snapshot, |_| false)
+                        .state(entry.input_id.into(), &chat.snapshot, |_| false)
                         .is_some_and(|state| state.prompt_in_conversation) =>
                 {
                     Some(entry.input_id)
@@ -113,8 +118,8 @@ impl Agent {
                 .count();
             let receipt = Receipt {
                 chat_id: chat.snapshot.id,
-                loop_id: entry.loop_id,
-                run_id: entry.run_id,
+                loop_id: entry.loop_id.into(),
+                run_id: entry.run_id.into(),
             };
             if losses >= LOST_HOST_LIMIT {
                 self.fail_lost_input(chat, &receipt);
@@ -128,7 +133,7 @@ impl Agent {
             if continued.is_err() && !entry.op.is_from_user() {
                 self.settle_input(
                     chat,
-                    entry.run_id,
+                    entry.run_id.into(),
                     SettledOutcome::Interrupted {
                         by: InterruptedBy::Host,
                     },

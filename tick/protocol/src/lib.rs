@@ -6,7 +6,9 @@ mod instance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use instance::{InstanceRef, artifact_instance_id};
+pub use instance::{
+    HostedRunId, HostedRunKind, InstanceRef, ShellTaskId, ShellTaskKind, artifact_instance_id,
+};
 
 pub const NATIVE_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_REQUEST_BYTES: usize = 512 * 1024;

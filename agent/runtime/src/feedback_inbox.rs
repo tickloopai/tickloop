@@ -72,7 +72,7 @@ pub(super) struct FeedbackInbox {
 impl FeedbackInbox {
     pub(super) fn identities_for(chat: &super::Chat) -> io::Result<Vec<FeedbackIdentity>> {
         let mut identities =
-            Self::new(chat.tools.chat_directory(), chat.snapshot.id).identities()?;
+            Self::new(chat.tools.chat_directory(), chat.snapshot.id.into()).identities()?;
         identities.extend(chat.feedback_inputs.values().cloned());
         let ledger_inputs = chat.bookkeeping.lifecycle.queued_inputs();
         for input in chat.snapshot.pending_inputs.iter().chain(&ledger_inputs) {

@@ -316,7 +316,7 @@ fn recovery_child() {
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let state = std::path::PathBuf::from(state);
-        let chat = std::env::var("TICKLOOP_TEST_CODEX_HISTORY_CHAT").unwrap().parse().unwrap();
+        let chat = tickloop_agent_protocol::ChatId::parse(&std::env::var("TICKLOOP_TEST_CODEX_HISTORY_CHAT").unwrap()).unwrap();
         let endpoint = std::env::var("TICKLOOP_TEST_CODEX_RESPONSES").unwrap().parse().unwrap();
         let agent = Agent::open_embedded(state.clone(), config(), client(&state, &endpoint)).unwrap();
         let restored = agent.resume_chat(chat).await.unwrap();
@@ -363,7 +363,7 @@ async fn new_process_restores_transcript_with_full_history_and_no_previous_conne
             "--nocapture",
         ])
         .env("TICKLOOP_TEST_CODEX_HISTORY_ROOT", &state)
-        .env("TICKLOOP_TEST_CODEX_HISTORY_CHAT", chat.to_string())
+        .env("TICKLOOP_TEST_CODEX_HISTORY_CHAT", chat.uuid().to_string())
         .env("TICKLOOP_TEST_CODEX_RESPONSES", endpoint.as_str())
         .kill_on_drop(true)
         .output()
@@ -575,7 +575,10 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
             .unwrap()
             .unwrap();
     assert_eq!(source_requests.len(), 7);
-    assert_eq!(source_requests[0]["prompt_cache_key"], source.to_string());
+    assert_eq!(
+        source_requests[0]["prompt_cache_key"],
+        source.uuid().to_string()
+    );
     assert!(source_requests[1]["input"].to_string().contains("opaque"));
     assert!(
         source_requests[2]["input"]
@@ -591,7 +594,7 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
     assert!(source_requests[5]["previous_response_id"].is_null());
     assert_eq!(
         branch_request["prompt_cache_key"],
-        branch.child_chat_id.to_string()
+        branch.child_chat_id.uuid().to_string()
     );
     assert!(branch_request["previous_response_id"].is_null());
     assert!(
@@ -600,7 +603,7 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
             .contains("Summary: remember WS_HISTORY_MARKER")
     );
     let rewind = &source_requests[6];
-    assert_eq!(rewind["prompt_cache_key"], source.to_string());
+    assert_eq!(rewind["prompt_cache_key"], source.uuid().to_string());
     assert!(rewind["previous_response_id"].is_null());
     assert!(rewind["input"].to_string().contains("WS_HISTORY_MARKER"));
     assert!(!rewind["input"].to_string().contains("After compact answer"));

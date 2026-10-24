@@ -96,10 +96,9 @@ impl InMemoryTranscriptStore {
             return Err(TranscriptError::Fenced);
         }
         let gap = state.position_gap;
-        let stored = state
-            .chats
-            .get_mut(&chat)
-            .ok_or_else(|| TranscriptError::Storage(format!("Chat {chat} is not registered")))?;
+        let stored = state.chats.get_mut(&chat).ok_or_else(|| {
+            TranscriptError::Storage(format!("Chat {} is not registered", chat.public()))
+        })?;
         stored.received.push(batch.clone());
         if let Some(ack) = stored.committed.get(&batch.id) {
             return Ok(*ack);

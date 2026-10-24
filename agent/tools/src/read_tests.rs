@@ -20,7 +20,14 @@ fn chat_tools(output: &tempfile::TempDir) -> Tools {
 }
 
 async fn read(tools: &Tools, directory: &Path, input: Value) -> Result<ToolResult, ToolError> {
-    let prepared = tools.prepare(&workspace(directory), "Read", &input).await?;
+    let prepared = tools
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace(directory),
+            "Read",
+            &input,
+        )
+        .await?;
     tools.execute(prepared, CancellationToken::new()).await
 }
 
@@ -80,6 +87,7 @@ async fn read_is_the_only_file_reading_tool_the_model_sees() {
     let output = tempfile::tempdir().unwrap();
     let error = chat_tools(&output)
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "read_file",
             &json!({"path":"notes.txt"}),
@@ -316,13 +324,19 @@ async fn read_inputs_follow_the_claude_code_schema() {
         json!({"file_path":"notes.txt","limit":"many"}),
     ] {
         let error = tools
-            .prepare(&workspace(directory.path()), "Read", &input)
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace(directory.path()),
+                "Read",
+                &input,
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidInput(_)), "{input}");
     }
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Read",
             &json!({"file_path":"notes.txt","limit":5}),
@@ -460,18 +474,27 @@ async fn family_temp_writes_edits_and_bash_are_allowed_but_other_families_and_li
             json!({"command":format!("echo owned > {}", path.display())}),
         ),
     ] {
-        let prepared = tools.prepare(&workspace, name, &input).await.unwrap();
+        let prepared = tools
+            .prepare(&tickloop_ids::IdContext::new(), &workspace, name, &input)
+            .await
+            .unwrap();
         assert!(!prepared.requires_permission, "{name}: {input}");
     }
     std::fs::write(&path, "owned result").unwrap();
     let read = tools
-        .prepare(&workspace, "Read", &json!({"file_path":path}))
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            "Read",
+            &json!({"file_path":path}),
+        )
         .await
         .unwrap();
     assert!(!read.requires_permission);
     tools.execute(read, CancellationToken::new()).await.unwrap();
     let edit = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             "Edit",
             &json!({"file_path":path,"old_string":"owned","new_string":"shared"}),
@@ -485,12 +508,18 @@ async fn family_temp_writes_edits_and_bash_are_allowed_but_other_families_and_li
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     for candidate in [&outside, &link] {
         let prepared = tools
-            .prepare(&workspace, "Read", &json!({"file_path":candidate}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Read",
+                &json!({"file_path":candidate}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{}", candidate.display());
         let prepared = tools
             .prepare(
+                &tickloop_ids::IdContext::new(),
                 &workspace,
                 "Bash",
                 &json!({"command":format!("cat {}",candidate.display())}),
@@ -523,7 +552,10 @@ async fn family_temp_auto_allow_does_not_widen_plan_permission() {
             json!({"command":format!("touch {}",root.join("probe").display())}),
         ),
     ] {
-        let prepared = tools.prepare(&workspace, name, &input).await.unwrap();
+        let prepared = tools
+            .prepare(&tickloop_ids::IdContext::new(), &workspace, name, &input)
+            .await
+            .unwrap();
         assert_eq!(
             policy.decide(&prepared, &workspace, uuid::Uuid::new_v4()),
             Decision::Deny,
@@ -566,7 +598,12 @@ impl ShellCwdFixture {
         cwd: &Path,
     ) -> crate::PreparedTool {
         self.tools
-            .prepare(workspace, "Bash", &json!({"command":command,"cwd":cwd}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                workspace,
+                "Bash",
+                &json!({"command":command,"cwd":cwd}),
+            )
             .await
             .unwrap()
     }
@@ -721,6 +758,7 @@ async fn prepared_internal_bash_rejects_a_later_symlink_escape() {
     let tools = Tools::new(temp.path().canonicalize().unwrap());
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(&project.path().canonicalize().unwrap()),
             "Bash",
             &json!({"command":format!("cat {}",path.display())}),
@@ -755,13 +793,19 @@ async fn recursive_symlink_following_requires_normal_shell_authorization() {
         format!("find -L {}", root.display()),
     ] {
         let prepared = tools
-            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Bash",
+                &json!({"command":command}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{command}");
     }
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             "Bash",
             &json!({"command":format!("rg OUTSIDE {}",root.display())}),
@@ -795,7 +839,12 @@ async fn implicit_directory_diff_and_input_derived_file_paths_need_permission() 
         format!("diff --from-file={} {}", secret.display(), list.display()),
     ] {
         let prepared = tools
-            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Bash",
+                &json!({"command":command}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{command}");
@@ -806,6 +855,7 @@ async fn implicit_directory_diff_and_input_derived_file_paths_need_permission() 
     std::fs::write(&file_b, "two").unwrap();
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             "Bash",
             &json!({"command":format!("diff -u {} {}",file_a.display(),file_b.display())}),
@@ -834,7 +884,12 @@ async fn pattern_file_arguments_require_the_same_read_permission_as_search_input
         format!("grep --file={} {}", patterns.display(), input.display()),
     ] {
         let prepared = tools
-            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Bash",
+                &json!({"command":command}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{command}");
@@ -846,7 +901,12 @@ async fn pattern_file_arguments_require_the_same_read_permission_as_search_input
         format!("rg -e123 {}", patterns.display()),
     ] {
         let prepared = tools
-            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Bash",
+                &json!({"command":command}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{command}");
@@ -855,6 +915,7 @@ async fn pattern_file_arguments_require_the_same_read_permission_as_search_input
     std::fs::write(&own, "example").unwrap();
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             "Bash",
             &json!({"command":format!("rg -f {} {}",own.display(),input.display())}),
@@ -881,7 +942,12 @@ async fn tilde_directory_operands_use_the_same_normalized_path_checks() {
         b.strip_prefix(&home).unwrap().display()
     );
     let prepared = tools
-        .prepare(&workspace(&project), "Bash", &json!({"command":command}))
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace(&project),
+            "Bash",
+            &json!({"command":command}),
+        )
         .await
         .unwrap();
     assert!(prepared.requires_permission);
@@ -913,13 +979,19 @@ async fn filename_lists_and_ambiguous_short_values_require_ordinary_permission()
         format!("grep -f=123 {}", input.display()),
     ] {
         let prepared = tools
-            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                "Bash",
+                &json!({"command":command}),
+            )
             .await
             .unwrap();
         assert!(prepared.requires_permission, "{command}");
     }
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             "Bash",
             &json!({"command":format!("rg -H input {}",input.display())}),
@@ -943,14 +1015,24 @@ async fn quoted_literal_glob_symlink_does_not_get_family_temp_allowance() {
     let workspace = workspace(&project.path().canonicalize().unwrap());
     let command = format!("cat '{}'", path.display());
     let prepared = tools
-        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            "Bash",
+            &json!({"command":command}),
+        )
         .await
         .unwrap();
     assert!(!prepared.requires_permission);
     std::fs::remove_file(&path).unwrap();
     std::os::unix::fs::symlink(&target, &path).unwrap();
     let prepared = tools
-        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            "Bash",
+            &json!({"command":command}),
+        )
         .await
         .unwrap();
     assert!(prepared.requires_permission);
@@ -969,6 +1051,7 @@ async fn prepared_quoted_literal_glob_rechecks_replaced_symlink() {
     let tools = Tools::new(root);
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(&project.path().canonicalize().unwrap()),
             "Bash",
             &json!({"command":format!("cat '{}'",path.display())}),

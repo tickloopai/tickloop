@@ -121,7 +121,7 @@ pub async fn wait_for_snapshot(
     let mut latest = String::new();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let snapshot = core.snapshot(chat).await.unwrap();
+            let snapshot = core.snapshot(tickloop_ids::Id::from(chat)).await.unwrap();
             if ready(&snapshot) {
                 break snapshot;
             }

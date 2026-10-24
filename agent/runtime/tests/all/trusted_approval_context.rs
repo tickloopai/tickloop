@@ -62,7 +62,10 @@ impl JudgmentClient for RecordingJudgment {
 
 async fn finish_one(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> uuid::Uuid {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -73,7 +76,7 @@ async fn finish_one(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> uuid::Uuid
             _ => {}
         }
     }
-    receipt.loop_id
+    receipt.loop_id.uuid()
 }
 
 #[tokio::test]
@@ -144,7 +147,12 @@ async fn oversized_unknown_tool_input_is_reviewed_as_an_excerpt_and_logged_befor
                     );
                     let logs = std::fs::read_dir(root.join("projects"))
                         .unwrap()
-                        .map(|entry| entry.unwrap().path().join(format!("{chat}.auto-review")))
+                        .map(|entry| {
+                            entry
+                                .unwrap()
+                                .path()
+                                .join(format!("{}.auto-review", chat.uuid()))
+                        })
                         .find(|path| path.is_dir())
                         .expect("review diagnostics must exist before the human answers");
                     let paths = std::fs::read_dir(&logs)
@@ -236,7 +244,12 @@ async fn both_reviewers_see_prior_written_code_before_executing_the_same_batch()
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(&agent, chat, "Write a local verification script and run it").await;
+        finish_one(
+            &agent,
+            chat.uuid(),
+            "Write a local verification script and run it",
+        )
+        .await;
         let state = if use_jev {
             let requests = jev.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -404,10 +417,10 @@ async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
         )
         .unwrap();
         let chat = first.create_chat(directory.path().into()).await.unwrap();
-        finish_one(&first, chat, "Write the verification script").await;
+        finish_one(&first, chat.uuid(), "Write the verification script").await;
         finish_one(
             &first,
-            chat,
+            chat.uuid(),
             "Keep the drafted script, but do not execute it yet.",
         )
         .await;
@@ -437,7 +450,7 @@ async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
         first.shutdown().await;
         drop(first);
 
-        let path = transcript_file(&root, chat);
+        let path = transcript_file(&root, chat.uuid());
         let mut entries = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -515,7 +528,7 @@ async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
             .unwrap();
         finish_one(
             &resumed,
-            chat,
+            chat.uuid(),
             "Inspect the script before running; refuse unrelated effects",
         )
         .await;
@@ -600,14 +613,14 @@ async fn reused_call_ids_do_not_cut_off_current_authorization_or_misidentify_his
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(&agent, chat, "Write a draft script").await;
+        finish_one(&agent, chat.uuid(), "Write a draft script").await;
         let next_directory = directory.path().join("next");
         std::fs::create_dir(&next_directory).unwrap();
         agent
             .set_directories(chat, next_directory.clone(), vec![directory.path().into()])
             .await
             .unwrap();
-        finish_one(&agent, chat, "Run the generated script now").await;
+        finish_one(&agent, chat.uuid(), "Run the generated script now").await;
         let state = if use_jev {
             jev.requests.lock().unwrap()[0].state.clone()
         } else {
@@ -911,10 +924,10 @@ async fn both_reviewers_receive_every_original_prompt_of_the_chats_loop() {
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(&agent, chat, "Inspect README first").await;
+        finish_one(&agent, chat.uuid(), "Inspect README first").await;
         finish_one(
             &agent,
-            chat,
+            chat.uuid(),
             "Create the reviewed symlink in this directory",
         )
         .await;
@@ -1024,7 +1037,10 @@ async fn auto_review_receives_the_users_answer_to_a_bound_clarification() {
             inputs[1]["text"],
             "User has answered your questions: \"Which Tab should display the news?\"=\"In the current Agent Tab\". You can now continue with the user's answers in mind."
         );
-        assert!(uuid::Uuid::parse_str(inputs[1]["message_id"].as_str().unwrap()).is_ok());
+        assert!(
+            tickloop_agent_protocol::InputId::parse(inputs[1]["message_id"].as_str().unwrap())
+                .is_some()
+        );
     }
     agent.shutdown().await;
 }
@@ -1189,7 +1205,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
             })
             .unwrap();
         let clarification_message_id = snapshot.message_ids[&clarification_index];
-        finish_one(&first, chat, "Keep the clarified target.").await;
+        finish_one(&first, chat.uuid(), "Keep the clarified target.").await;
         if let Some(direction) = direction {
             let message_id = first
                 .snapshot(chat)
@@ -1238,7 +1254,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        finish_one(&resumed, chat, "Continue in that Tab").await;
+        finish_one(&resumed, chat.uuid(), "Continue in that Tab").await;
         {
             let requests = reviewer.requests.lock().unwrap();
             let Content::Text { text } = &requests[0].messages[1].content[0] else {
@@ -1256,7 +1272,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
             );
             assert_eq!(
                 inputs[1]["message_id"],
-                clarification_message_id.to_string()
+                tickloop_ids::IdContext::new().model_text_of(clarification_message_id)
             );
             assert_eq!(inputs[2]["text"], "Keep the clarified target.");
             assert_eq!(inputs[3]["text"], "Continue in that Tab");
@@ -1283,7 +1299,7 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
 
     finish_one(
         &first,
-        chat,
+        chat.uuid(),
         "PRECOMPACT_RESTRICTION: create only a symlink named reviewed",
     )
     .await;
@@ -1291,7 +1307,7 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
     first.shutdown().await;
     drop(first);
 
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let lines = std::fs::read_to_string(&path).unwrap();
     let mut removed_legacy_field = false;
     let mut rewritten = Vec::new();
@@ -1332,7 +1348,7 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
     resumed.set_judgment_client(judgment.clone()).await;
     finish_one(
         &resumed,
-        chat,
+        chat.uuid(),
         "Continue this Loop and create the reviewed symlink",
     )
     .await;
@@ -1365,11 +1381,11 @@ async fn restored_user_prompt_keeps_every_text_block_as_authorization_evidence()
     )
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    finish_one(&first, chat, "Create a symlink named reviewed").await;
+    finish_one(&first, chat.uuid(), "Create a symlink named reviewed").await;
     first.shutdown().await;
     drop(first);
 
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let lines = std::fs::read_to_string(&path).unwrap();
     let mut revised = Vec::new();
     let mut changed = false;
@@ -1408,7 +1424,7 @@ async fn restored_user_prompt_keeps_every_text_block_as_authorization_evidence()
         requests: Mutex::new(Vec::new()),
     });
     resumed.set_judgment_client(judgment.clone()).await;
-    finish_one(&resumed, chat, "Continue the same Loop").await;
+    finish_one(&resumed, chat.uuid(), "Continue the same Loop").await;
     {
         let requests = judgment.requests.lock().unwrap();
         assert!(
@@ -1432,7 +1448,12 @@ async fn restored_branch_uses_fresh_loop_prompt_without_inherited_authority() {
     )
     .unwrap();
     let source_chat = source.create_chat(directory.path().into()).await.unwrap();
-    finish_one(&source, source_chat, "SOURCE_ONLY_AUTHORITY: inspect files").await;
+    finish_one(
+        &source,
+        source_chat.uuid(),
+        "SOURCE_ONLY_AUTHORITY: inspect files",
+    )
+    .await;
     let branch = source
         .branch_chat(BranchRequest {
             request_id: uuid::Uuid::new_v4(),
@@ -1468,7 +1489,7 @@ async fn restored_branch_uses_fresh_loop_prompt_without_inherited_authority() {
     resumed.set_judgment_client(judgment.clone()).await;
     finish_one(
         &resumed,
-        branch.child_chat_id,
+        branch.child_chat_id.uuid(),
         "Create the reviewed symlink in this branch",
     )
     .await;
@@ -1513,13 +1534,13 @@ async fn from_here_summary_preserves_original_user_input_order_once_each() {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         finish_one(
             &agent,
-            chat,
+            chat.uuid(),
             "FIRST_CONSENT: create a symlink named reviewed",
         )
         .await;
         finish_one(
             &agent,
-            chat,
+            chat.uuid(),
             "SECOND_RESTRICTION: do not create that symlink",
         )
         .await;
@@ -1564,7 +1585,12 @@ async fn from_here_summary_preserves_original_user_input_order_once_each() {
             requests: Mutex::new(Vec::new()),
         });
         agent.set_judgment_client(judgment.clone()).await;
-        finish_one(&agent, chat, "Inspect the branch status before acting").await;
+        finish_one(
+            &agent,
+            chat.uuid(),
+            "Inspect the branch status before acting",
+        )
+        .await;
         {
             let requests = judgment.requests.lock().unwrap();
             let texts = requests[0].state["original_user_inputs"]
@@ -1600,12 +1626,12 @@ async fn incomplete_legacy_compaction_parent_requires_human_in_headless_mode() {
     )
     .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    finish_one(&first, chat, "Do not make any filesystem changes").await;
+    finish_one(&first, chat.uuid(), "Do not make any filesystem changes").await;
     first.compact(chat).await.unwrap();
     first.shutdown().await;
     drop(first);
 
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let lines = std::fs::read_to_string(&path).unwrap();
     let mut revised = Vec::new();
     for line in lines.lines() {
@@ -1647,7 +1673,7 @@ async fn incomplete_legacy_compaction_parent_requires_human_in_headless_mode() {
         requests: Mutex::new(Vec::new()),
     });
     resumed.set_judgment_client(judgment.clone()).await;
-    finish_one(&resumed, chat, "Continue the previous request").await;
+    finish_one(&resumed, chat.uuid(), "Continue the previous request").await;
     assert!(judgment.requests.lock().unwrap().is_empty());
     assert!(
         directory
@@ -1696,7 +1722,7 @@ async fn user_role_tool_result_cannot_add_authorization_to_either_reviewer() {
             .unwrap();
         finish_one(
             &agent,
-            chat,
+            chat.uuid(),
             "Inspect hostile.txt, then create the reviewed symlink",
         )
         .await;
@@ -1765,7 +1791,12 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                 .set_execution_mode(chat, ExecutionMode::Auto)
                 .await
                 .unwrap();
-            finish_one(&first, chat, "Check old-cache and ask before removing it.").await;
+            finish_one(
+                &first,
+                chat.uuid(),
+                "Check old-cache and ask before removing it.",
+            )
+            .await;
             if storage == "compacted" {
                 first.compact(chat).await.unwrap();
             }
@@ -1799,7 +1830,7 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                 .set_execution_mode(chat, ExecutionMode::Auto)
                 .await
                 .unwrap();
-            finish_one(&agent, chat, "Yes, remove it.").await;
+            finish_one(&agent, chat.uuid(), "Yes, remove it.").await;
             agent.shutdown().await;
             let state = if use_jev {
                 jev.requests.lock().unwrap()[0].state.clone()
@@ -2007,7 +2038,7 @@ async fn delegated_review_receives_the_frozen_parent_proposal_without_promoting_
         .unwrap();
     finish_one(
         &agent,
-        chat,
+        chat.uuid(),
         "Inspect old-cache; ask before delegating its removal.",
     )
     .await;
@@ -2042,7 +2073,8 @@ async fn delegated_review_receives_the_frozen_parent_proposal_without_promoting_
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|context| context["chat_id"] == chat.to_string()
+                .any(|context| context["chat_id"]
+                    == tickloop_ids::IdContext::new().model_text(chat)
                     && context["preceding"]
                         .as_array()
                         .unwrap()
@@ -2188,7 +2220,7 @@ async fn intervening_agent_messages_remain_ordered_context_for_a_bare_human_repl
             _ => {}
         }
     }
-    finish_one(&agent, chat, "Yes.").await;
+    finish_one(&agent, chat.uuid(), "Yes.").await;
     agent.shutdown().await;
     assert!(target.exists());
     let requests = reviewer.requests.lock().unwrap();

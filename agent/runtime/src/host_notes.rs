@@ -12,7 +12,6 @@ use tickloop_agent_protocol::{
     ChatSnapshot, Content, ExecutionMode, GuidanceNote, HostNote, InvokedSkill, Message, Receipt,
     Role, SkillSource,
 };
-use uuid::Uuid;
 
 use crate::{Agent, AgentError, Chat, host_tools::McpServerInstructions};
 
@@ -325,7 +324,7 @@ fn restored_skill_content(content: &str, remaining_tokens: &mut usize) -> Option
 fn append_note(snapshot: &mut ChatSnapshot, receipt: &Receipt, text: String, note: HostNote) {
     let index = snapshot.messages.len();
     snapshot.message_runs.insert(index, receipt.run_id);
-    snapshot.message_ids.insert(index, Uuid::new_v4());
+    snapshot.message_ids.insert(index, tickloop_ids::generate());
     snapshot.host_notes.insert(index, note);
     snapshot.messages.push(Message {
         role: Role::User,

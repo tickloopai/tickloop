@@ -1383,7 +1383,7 @@ async fn a_continuation_waiting_through_an_edit_carries_the_new_objective() {
             chat,
             tickloop_agent_protocol::TriggerSource::GoalContinuation {
                 goal_id: goal_before.id,
-                after_run: uuid::Uuid::new_v4(),
+                after_run: tickloop_ids::Id::from(uuid::Uuid::new_v4()),
                 objective_revision: goal_before.objective_revision,
             },
             QUEUED,
@@ -1461,7 +1461,7 @@ async fn a_queued_continuation_waits_for_background_work_a_later_turn_started() 
             chat,
             tickloop_agent_protocol::TriggerSource::GoalContinuation {
                 goal_id: current.id,
-                after_run: uuid::Uuid::new_v4(),
+                after_run: tickloop_ids::Id::from(uuid::Uuid::new_v4()),
                 objective_revision: current.objective_revision,
             },
             QUEUED,
@@ -1487,7 +1487,7 @@ async fn a_queued_continuation_waits_for_background_work_a_later_turn_started() 
             chat,
             tickloop_agent_protocol::TriggerSource::GoalContinuation {
                 goal_id: current.id,
-                after_run: uuid::Uuid::new_v4(),
+                after_run: tickloop_ids::Id::from(uuid::Uuid::new_v4()),
                 objective_revision: current.objective_revision,
             },
             "handed over while the shell runs",

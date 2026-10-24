@@ -338,7 +338,7 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
     }
     agent.compact(chat).await.unwrap();
     // 模拟进程在压缩完成后立即被强制结束：只保留此刻已经落盘的内容。
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let original = std::fs::read_to_string(&path).unwrap();
     agent.shutdown().await;
     drop(agent);
@@ -502,7 +502,7 @@ async fn running_summaries_are_not_written_and_restore_as_if_they_never_started(
         model.started.notified().await;
         agent.flush_transcripts().await;
         assert!(
-            !std::fs::read_to_string(transcript_file(&root, chat))
+            !std::fs::read_to_string(transcript_file(&root, chat.uuid()))
                 .unwrap()
                 .contains("compact_boundary")
         );
@@ -844,7 +844,7 @@ async fn rewind_across_a_full_compaction_after_a_directed_summary(prompt_padding
     agent.shutdown().await;
     drop(agent);
 
-    let size = std::fs::metadata(transcript_file(&root, chat))
+    let size = std::fs::metadata(transcript_file(&root, chat.uuid()))
         .unwrap()
         .len();
     assert_eq!(

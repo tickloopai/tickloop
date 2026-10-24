@@ -994,7 +994,7 @@ impl HttpModelClient {
             endpoint,
             credentials,
             provenance,
-            cache_id: uuid::Uuid::new_v4(),
+            cache_id: tickloop_ids::generate(),
         })
     }
 }
@@ -1117,7 +1117,7 @@ impl HttpModelClient {
                 format!(
                     "{}:{}",
                     self.config.provider_id,
-                    chat_id.unwrap_or(self.cache_id)
+                    chat_id.map_or(self.cache_id, tickloop_agent_protocol::ChatId::uuid)
                 )
                 .as_bytes()
             ));
@@ -2557,24 +2557,44 @@ mod tests {
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         };
-        first_chat.record_private_output(Some(chat_a), Some(first_key.as_str()), &output);
+        first_chat.record_private_output(Some(chat_a.into()), Some(first_key.as_str()), &output);
         first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(first_key.as_str()))
+            .ensure_credential_history_compatible(
+                Some(chat_a.into()),
+                &private,
+                Some(first_key.as_str()),
+            )
             .unwrap();
         second_chat
-            .ensure_credential_history_compatible(Some(chat_b), &public, Some(second_key.as_str()))
+            .ensure_credential_history_compatible(
+                Some(chat_b.into()),
+                &public,
+                Some(second_key.as_str()),
+            )
             .unwrap();
-        second_chat.record_private_output(Some(chat_b), Some(second_key.as_str()), &output);
+        second_chat.record_private_output(Some(chat_b.into()), Some(second_key.as_str()), &output);
         second_chat
-            .ensure_credential_history_compatible(Some(chat_b), &private, Some(second_key.as_str()))
+            .ensure_credential_history_compatible(
+                Some(chat_b.into()),
+                &private,
+                Some(second_key.as_str()),
+            )
             .unwrap();
         let error = first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(second_key.as_str()))
+            .ensure_credential_history_compatible(
+                Some(chat_a.into()),
+                &private,
+                Some(second_key.as_str()),
+            )
             .unwrap_err();
         assert_eq!(error.kind(), ModelFailureKind::Configuration);
         assert!(!format!("{error:?}").contains("secret-key"));
         first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(first_key.as_str()))
+            .ensure_credential_history_compatible(
+                Some(chat_a.into()),
+                &private,
+                Some(first_key.as_str()),
+            )
             .unwrap();
 
         let mut unknown = protocol_config(Protocol::Messages, "http://127.0.0.1:49322");
@@ -2584,7 +2604,7 @@ mod tests {
         assert!(
             unknown
                 .ensure_credential_history_compatible(
-                    Some(unknown_chat),
+                    Some(unknown_chat.into()),
                     &private,
                     Some(first_key.as_str())
                 )
@@ -2593,7 +2613,7 @@ mod tests {
         assert!(
             unknown
                 .ensure_credential_history_compatible(
-                    Some(unknown_chat),
+                    Some(unknown_chat.into()),
                     &public,
                     Some(first_key.as_str())
                 )
@@ -2602,7 +2622,7 @@ mod tests {
         assert!(
             unknown
                 .ensure_credential_history_compatible(
-                    Some(unknown_chat),
+                    Some(unknown_chat.into()),
                     &private,
                     Some(first_key.as_str())
                 )

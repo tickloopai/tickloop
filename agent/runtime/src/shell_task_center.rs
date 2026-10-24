@@ -385,7 +385,7 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot, call_id: Option<String>
         chat_id,
         origin: ShellTaskOrigin::Agent,
         owner: ShellTaskOwner::Agent {
-            loop_id: command.loop_id,
+            loop_id: command.loop_id.into(),
         },
         call_id,
         command: command.command,
@@ -897,7 +897,12 @@ mod tests {
         );
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].origin, ShellTaskOrigin::Agent);
-        assert_eq!(tasks[0].owner, ShellTaskOwner::Agent { loop_id });
+        assert_eq!(
+            tasks[0].owner,
+            ShellTaskOwner::Agent {
+                loop_id: loop_id.into()
+            }
+        );
         assert!(tasks[0].capabilities.can_background);
         assert!(tasks[0].capabilities.can_stop);
         assert!(tasks[0].capabilities.can_read_output);

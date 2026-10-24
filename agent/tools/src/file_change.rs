@@ -250,7 +250,7 @@ pub(crate) fn persist_file_change_review(
         path: artifact_dir.clone(),
         reason: error.to_string(),
     })?;
-    let artifact_id = uuid::Uuid::new_v4();
+    let artifact_id = tickloop_ids::generate();
     let path = artifact_dir.join(format!("review-{artifact_id}.json"));
     let temporary_path = artifact_dir.join(format!(".review-{artifact_id}.tmp"));
     write_artifact(&temporary_path, &path, &bytes)?;

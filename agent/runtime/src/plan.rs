@@ -262,7 +262,10 @@ fn plan_file_path(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<P
     if !is_valid_plan_slug(slug) {
         return Err(invalid_input(format!("invalid plan file prefix {slug:?}")));
     }
-    let file_name = format!("{slug}{PLAN_LOOP_SEPARATOR}{loop_id}{PLAN_FILE_EXTENSION}");
+    let file_name = format!(
+        "{slug}{PLAN_LOOP_SEPARATOR}{}{PLAN_FILE_EXTENSION}",
+        loop_id.uuid()
+    );
     let path = directory.join(&file_name);
     if path.file_name() != Some(file_name.as_ref()) || path.parent() != Some(directory) {
         return Err(invalid_input(format!(
@@ -301,7 +304,7 @@ fn verify_plans_directory(directory: &Path) -> io::Result<()> {
 /// 照 Claude Code `getPlanSlug`：随机生成 slug，已有计划文件使用该 slug 时重试，最多 10 次。
 pub(super) fn generate_plan_slug(directory: Option<&Path>) -> String {
     let random_slug = || {
-        let random = Uuid::new_v4().as_u128();
+        let random = tickloop_ids::random_u128();
         let pick = |words: &[&'static str], shift: u32| {
             words[((random >> shift) % words.len() as u128) as usize]
         };

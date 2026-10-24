@@ -69,7 +69,7 @@ impl DelayedRecovery {
             })
             .collect();
         DelayedSubmission {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat: self.chat,
             owner: self.owner,
             prompt: self.prompt,

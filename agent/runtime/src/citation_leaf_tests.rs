@@ -70,7 +70,7 @@ fn result(number: u64, parent: u64, run: u64, continued: bool, calls: &[&str]) -
 fn call(name: &str, run: u64, message: u64, number: u64, aliases: &[u64]) -> CitationCall {
     CitationCall {
         call_id: name.into(),
-        run_id: id(run),
+        run_id: id(run).into(),
         message_id: id(message),
         numbers: vec![number],
         aliases: aliases.iter().copied().map(id).collect(),

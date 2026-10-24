@@ -173,7 +173,7 @@ impl DaemonIngress {
             session.expires = None;
             resume.session_id
         } else {
-            let session_id = Uuid::new_v4();
+            let session_id = tickloop_ids::generate();
             state.sessions.insert(
                 session_id,
                 Session {
@@ -197,7 +197,7 @@ impl DaemonIngress {
             ingress: self.clone(),
             session_id,
             handoff,
-            connection_id: Uuid::new_v4(),
+            connection_id: tickloop_ids::generate(),
             attached: false,
         })
     }

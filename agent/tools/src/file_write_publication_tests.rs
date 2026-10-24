@@ -21,17 +21,26 @@ async fn cancellation_and_conflicts_never_publish_a_write() {
     let tools = Tools::new(directory.path().join("output"));
     let workspace = workspace(directory.path());
     let input = json!({"file_path":"notes.txt","content":"new"});
-    let rejected = tools.prepare(&workspace, "Write", &input).await.unwrap();
+    let rejected = tools
+        .prepare(&tickloop_ids::IdContext::new(), &workspace, "Write", &input)
+        .await
+        .unwrap();
     drop(rejected);
     assert!(!directory.path().join("notes.txt").exists());
 
-    let cancelled = tools.prepare(&workspace, "Write", &input).await.unwrap();
+    let cancelled = tools
+        .prepare(&tickloop_ids::IdContext::new(), &workspace, "Write", &input)
+        .await
+        .unwrap();
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(tools.execute(cancelled, cancel).await.is_err());
     assert!(!directory.path().join("notes.txt").exists());
 
-    let conflict = tools.prepare(&workspace, "Write", &input).await.unwrap();
+    let conflict = tools
+        .prepare(&tickloop_ids::IdContext::new(), &workspace, "Write", &input)
+        .await
+        .unwrap();
     fs::write(directory.path().join("notes.txt"), "manual change").unwrap();
     assert!(
         tools
@@ -86,6 +95,7 @@ async fn restrictive_umask_does_not_remove_existing_rwx_permissions() {
     let tools = Tools::new(directory.path().join("output"));
     let read = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Read",
             &json!({"file_path":"notes"}),
@@ -95,6 +105,7 @@ async fn restrictive_umask_does_not_remove_existing_rwx_permissions() {
     tools.execute(read, CancellationToken::new()).await.unwrap();
     let prepared = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace(directory.path()),
             "Write",
             &json!({"file_path":"notes","content":"new"}),

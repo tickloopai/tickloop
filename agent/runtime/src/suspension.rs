@@ -64,8 +64,13 @@ pub(crate) fn rebuilt_waits(
             ResumePoint::InBatch {
                 assistant_message,
                 call_id,
-            } => tool_batch::locate_batch_call(snapshot, wait.run_id, *assistant_message, call_id)
-                .is_ok(),
+            } => tool_batch::locate_batch_call(
+                snapshot,
+                wait.run_id.into(),
+                *assistant_message,
+                call_id,
+            )
+            .is_ok(),
             ResumePoint::BeforeModelRequest => true,
         })
         .collect()
@@ -233,9 +238,9 @@ impl Agent {
                 .suspend(
                     parent,
                     WaitKind::Subagent {
-                        child_chat: child.chat_id,
-                        child_loop: child.loop_id,
-                        child_run: child.run_id,
+                        child_chat: child.chat_id.into(),
+                        child_loop: child.loop_id.into(),
+                        child_run: child.run_id.into(),
                         operation_id,
                     },
                     ResumePoint::InBatch {
@@ -293,9 +298,13 @@ impl Agent {
                 None => Some(ResumePoint::BeforeModelRequest),
             };
         if !is_waiting && let Some(resume) = resume {
-            chat.bookkeeping
-                .lifecycle
-                .suspend(receipt, WaitKind::Children { children }, resume);
+            chat.bookkeeping.lifecycle.suspend(
+                receipt,
+                WaitKind::Children {
+                    children: children.into_iter().map(Into::into).collect(),
+                },
+                resume,
+            );
         }
         let release = chat.releases.entry(receipt.run_id).or_default().clone();
         self.save_now(&chat.snapshot);
@@ -365,7 +374,7 @@ impl Agent {
             let receipt = Receipt {
                 chat_id,
                 loop_id: chat.snapshot.chat_loop.id,
-                run_id: wait.run_id,
+                run_id: wait.run_id.into(),
             };
             let is_resolved = matches!(wait.state, WaitState::Resolved { .. });
             let holds_slot = !is_resolved
@@ -375,7 +384,7 @@ impl Agent {
                 )
                 && chat.active.is_none();
             let chat_loop = &mut chat.snapshot.chat_loop;
-            chat_loop.run_id = Some(wait.run_id);
+            chat_loop.run_id = Some(wait.run_id.into());
             chat_loop.recover_state(match wait.kind {
                 WaitKind::Question { .. } => LoopState::WaitingQuestion,
                 _ => LoopState::Running,
@@ -385,10 +394,10 @@ impl Agent {
             let resume = Arc::new(Notify::new());
             if holds_slot {
                 chat.active = Some(cancel.clone());
-                chat.active_run = Some(wait.run_id);
+                chat.active_run = Some(wait.run_id.into());
             } else {
                 chat.parked.insert(
-                    wait.run_id,
+                    wait.run_id.into(),
                     ParkedRun {
                         receipt: receipt.clone(),
                         cancel: cancel.clone(),
@@ -397,13 +406,13 @@ impl Agent {
                     },
                 );
             }
-            chat.releases.insert(wait.run_id, release.clone());
+            chat.releases.insert(wait.run_id.into(), release.clone());
             chat.bookkeeping
                 .run_loops
-                .insert(wait.run_id, receipt.loop_id);
+                .insert(wait.run_id.into(), receipt.loop_id);
             chat.bookkeeping.lifecycle.reactivate(
-                wait.run_id,
-                wait.response_id,
+                wait.run_id.into(),
+                wait.response_id.into(),
                 chat.snapshot.messages.len(),
             );
             let call_input = request_input(&chat.snapshot, &wait).unwrap_or_default();
@@ -433,8 +442,8 @@ impl Agent {
                     chat.snapshot.operations.push(OperationRecord {
                         task_binding: None,
                         id: *operation_id,
-                        loop_id: wait.loop_id,
-                        run_id: wait.run_id,
+                        loop_id: wait.loop_id.into(),
+                        run_id: wait.run_id.into(),
                         call_id: request.call_id.clone(),
                         name: ASK_USER_QUESTION_TOOL_NAME.into(),
                         input: call_input,
@@ -450,9 +459,9 @@ impl Agent {
                     operation_id,
                 } => {
                     let child = Receipt {
-                        chat_id: *child_chat,
-                        loop_id: *child_loop,
-                        run_id: *child_run,
+                        chat_id: (*child_chat).into(),
+                        loop_id: (*child_loop).into(),
+                        run_id: (*child_run).into(),
                     };
                     let call_id = call_id.clone().unwrap_or_default();
                     // The call goes on returning the child's run, so its completion is no
@@ -467,8 +476,8 @@ impl Agent {
                     chat.snapshot.operations.push(OperationRecord {
                         task_binding: None,
                         id: *operation_id,
-                        loop_id: wait.loop_id,
-                        run_id: wait.run_id,
+                        loop_id: wait.loop_id.into(),
+                        run_id: wait.run_id.into(),
                         call_id: call_id.clone(),
                         name: tickloop_agent_protocol::SUBAGENT_TOOL_NAME.into(),
                         input: call_input,
@@ -490,7 +499,7 @@ impl Agent {
             // A wait that ended, or a slot-holding wait whose slot another Run took, goes on once
             // the Run gets the slot.
             if is_resolved || (!holds_slot && !matches!(wait.kind, WaitKind::Question { .. })) {
-                chat.ready_runs.push_back(wait.run_id);
+                chat.ready_runs.push_back(wait.run_id.into());
             }
             rebuilt.push(RebuiltRun {
                 receipt,
@@ -506,11 +515,11 @@ impl Agent {
             self.save(&chat.snapshot);
         }
         drop(chats);
-        self.inner
-            .subagent_invocations
-            .lock()
-            .await
-            .extend(invocations);
+        self.inner.subagent_invocations.lock().await.extend(
+            invocations
+                .into_iter()
+                .map(|((run, call), invocation)| ((run.into(), call), invocation)),
+        );
         rebuilt
     }
 
@@ -921,6 +930,7 @@ fn request_input(snapshot: &ChatSnapshot, wait: &WaitEntry) -> Option<serde_json
         return None;
     };
     let (batch, start) =
-        tool_batch::locate_batch_call(snapshot, wait.run_id, *assistant_message, call_id).ok()?;
+        tool_batch::locate_batch_call(snapshot, wait.run_id.into(), *assistant_message, call_id)
+            .ok()?;
     batch.calls.into_iter().nth(start).map(|call| call.input)
 }

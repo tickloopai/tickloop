@@ -243,7 +243,7 @@ impl Agent {
         if needs_task_notification && !self.inner.closed.load(Ordering::SeqCst) {
             let notification = TaskNotification::for_background_command(
                 chat_id,
-                command.operation_id,
+                command.operation_id.into(),
                 Some(tool_use_id),
                 command.output_ref.clone(),
                 command
@@ -436,8 +436,8 @@ mod tests {
                 .push(OperationRecord {
                     task_binding: None,
                     id: operation_id,
-                    loop_id,
-                    run_id: Uuid::new_v4(),
+                    loop_id: loop_id.into(),
+                    run_id: Uuid::new_v4().into(),
                     call_id: "shell-call".into(),
                     name: tickloop_agent_tools::BASH_TOOL_NAME.into(),
                     input: serde_json::json!({"command":"printf agent"}),

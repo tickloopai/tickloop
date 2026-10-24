@@ -15,7 +15,9 @@ async fn completed_cleanup_is_shared_durable_and_does_not_replay_old_mutations()
     let created = invoke(&core, root, "TaskCreate", input.clone())
         .await
         .unwrap();
-    let task_id = serde_json::from_value(created["task"]["id"].clone()).unwrap();
+    let task_id = SharedTaskId::parse(created["task"]["id"].as_str().unwrap())
+        .unwrap()
+        .uuid();
     complete(&core, root, task_id).await;
     {
         let mut chats = core.inner.chats.lock().await;
@@ -90,7 +92,7 @@ async fn completed_cleanup_is_shared_durable_and_does_not_replay_old_mutations()
         invoke(&core, root, "TaskGet", json!({"task_id":task_id}))
             .await
             .unwrap_err(),
-        "unknown task"
+        tickloop_ids::not_found::<tickloop_agent_protocol::SharedTaskKind>(&task_id.to_string())
     );
     core.clear_completed_tasks(root.chat_id, root.loop_id, revision)
         .await
@@ -134,7 +136,7 @@ async fn completed_cleanup_rechecks_settings_scope_revision_and_every_task_statu
     let (core, receipts) = family(None).await;
     let root = &receipts[0];
     let first = create(&core, root, vec![]).await;
-    complete(&core, root, first.id).await;
+    complete(&core, root, first.id.into()).await;
     let revision = core.snapshot(root.chat_id).await.unwrap().task_boards[&root.loop_id].revision;
     let second = create(&core, root, vec![]).await;
     core.clear_completed_tasks(root.chat_id, root.loop_id, revision)
@@ -147,7 +149,7 @@ async fn completed_cleanup_rechecks_settings_scope_revision_and_every_task_statu
         2
     );
     assert!(
-        core.clear_completed_tasks(receipts[1].chat_id, Uuid::new_v4(), revision)
+        core.clear_completed_tasks(receipts[1].chat_id, Uuid::new_v4().into(), revision)
             .await
             .is_err()
     );
@@ -240,11 +242,11 @@ async fn failed_cleanup_checkpoint_returns_error_and_preserves_the_persistence_b
     let (core, receipts) = family(Some(store.clone())).await;
     let root = &receipts[0];
     let task = create(&core, root, vec![]).await;
-    complete(&core, root, task.id).await;
+    complete(&core, root, task.id.into()).await;
     let revision = core.snapshot(root.chat_id).await.unwrap().task_boards[&root.loop_id].revision;
     std::fs::remove_file(tickloop_agent_test_support::transcript_file(
         &store,
-        root.chat_id,
+        root.chat_id.into(),
     ))
     .unwrap();
     let error = core

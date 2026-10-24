@@ -191,7 +191,7 @@ async fn artifact_edit_preparation_preserves_complete_current_arguments() {
     ] {
         let prepared = provider
             .prepare_call(
-                Uuid::new_v4(),
+                tickloop_ids::Id::from(Uuid::new_v4()),
                 "ArtifactEdit",
                 &input,
                 CancellationToken::new(),
@@ -599,7 +599,12 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
         *control.publication.lock().unwrap() =
             audience.map(|audience| json!({"audience":audience,"membership_revision":0}));
         let prepared = provider
-            .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                &input,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -617,7 +622,11 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
             audience.is_some()
         );
         provider
-            .revalidate_call(chat, &prepared, CancellationToken::new())
+            .revalidate_call(
+                tickloop_ids::Id::from(chat),
+                &prepared,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         if audience == Some("private") {
@@ -625,7 +634,11 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
                 Some(json!({"audience":"public","membership_revision":0}));
             assert!(
                 provider
-                    .revalidate_call(chat, &prepared, CancellationToken::new())
+                    .revalidate_call(
+                        tickloop_ids::Id::from(chat),
+                        &prepared,
+                        CancellationToken::new()
+                    )
                     .await
                     .unwrap_err()
                     .contains("audience changed")
@@ -638,7 +651,7 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
         Some(json!({"audience":"private","membership_revision":0}));
     let prepared = provider
         .prepare_call(
-            chat,
+            tickloop_ids::Id::from(chat),
             "ArtifactEdit",
             &with_capabilities,
             CancellationToken::new(),
@@ -1184,29 +1197,51 @@ async fn artifact_access_is_revalidated_before_dispatch() {
     let read = json!({"action":"read","artifact_id":"doc"});
     let edit = json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"x"});
     let prepared_read = provider
-        .prepare_call(chat, "ArtifactRead", &read, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactRead",
+            &read,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(prepared_read.permission(), HostToolPermission::ReadOnly);
     let prepared_edit = provider
-        .prepare_call(chat, "ArtifactEdit", &edit, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactEdit",
+            &edit,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
     *control.access_role.lock().unwrap() = Some("viewer".into());
     provider
-        .revalidate_call(chat, &prepared_read, CancellationToken::new())
+        .revalidate_call(
+            tickloop_ids::Id::from(chat),
+            &prepared_read,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let error = provider
-        .revalidate_call(chat, &prepared_edit, CancellationToken::new())
+        .revalidate_call(
+            tickloop_ids::Id::from(chat),
+            &prepared_edit,
+            CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(error.contains("not edit"), "{error}");
 
     *control.access_role.lock().unwrap() = Some(NO_ACCESS.into());
     let error = provider
-        .revalidate_call(chat, &prepared_read, CancellationToken::new())
+        .revalidate_call(
+            tickloop_ids::Id::from(chat),
+            &prepared_read,
+            CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(error.contains("no access"), "{error}");
@@ -1228,7 +1263,12 @@ async fn each_role_prepares_only_the_artifact_calls_it_may_make() {
         *control.access_role.lock().unwrap() = Some(role.into());
         let chat = Uuid::new_v4();
         let comment = provider
-            .prepare_call(chat, "ArtifactComment", &reply, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactComment",
+                &reply,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1238,7 +1278,12 @@ async fn each_role_prepares_only_the_artifact_calls_it_may_make() {
         );
         for edit in &edits {
             let prepared = provider
-                .prepare_call(chat, "ArtifactEdit", edit, CancellationToken::new())
+                .prepare_call(
+                    tickloop_ids::Id::from(chat),
+                    "ArtifactEdit",
+                    edit,
+                    CancellationToken::new(),
+                )
                 .await;
             if role == "viewer" {
                 let error = prepared.err().unwrap();
@@ -1255,7 +1300,12 @@ async fn each_role_prepares_only_the_artifact_calls_it_may_make() {
             }
         }
         provider
-            .prepare_call(chat, "ArtifactEdit", &create, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                &create,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
     }
@@ -1282,7 +1332,12 @@ async fn each_role_prepares_only_the_artifact_calls_it_may_make() {
             ("ArtifactEdit", edits[0].clone()),
         ] {
             let error = provider
-                .prepare_call(Uuid::new_v4(), tool, &input, CancellationToken::new())
+                .prepare_call(
+                    tickloop_ids::Id::from(Uuid::new_v4()),
+                    tool,
+                    &input,
+                    CancellationToken::new(),
+                )
                 .await
                 .err()
                 .unwrap();
@@ -1476,7 +1531,12 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
         json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"Report"});
     let chat = Uuid::new_v4();
     let prepared = provider
-        .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactEdit",
+            &input,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1485,13 +1545,22 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     );
     assert!(matches!(
         provider
-            .execute_prepared(chat, prepared, CancellationToken::new())
+            .execute_prepared(
+                tickloop_ids::Id::from(chat),
+                prepared,
+                CancellationToken::new()
+            )
             .await,
         HostCallResult::Completed(_)
     ));
     assert_eq!(
         provider
-            .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                &input,
+                CancellationToken::new()
+            )
             .await
             .unwrap()
             .permission(),
@@ -1502,7 +1571,12 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
         Some(json!({"audience":"public","membership_revision":0}));
     control.reject_writes.store(true, Ordering::SeqCst);
     let prepared = provider
-        .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactEdit",
+            &input,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1510,12 +1584,17 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
         HostToolPermission::PublicArtifactWrite
     );
     assert!(
-        matches!(provider.execute_prepared(chat, prepared, CancellationToken::new()).await, HostCallResult::Completed(result) if result.is_error)
+        matches!(provider.execute_prepared(tickloop_ids::Id::from(chat), prepared, CancellationToken::new()).await, HostCallResult::Completed(result) if result.is_error)
     );
     control.reject_writes.store(false, Ordering::SeqCst);
 
     let prepared = provider
-        .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactEdit",
+            &input,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1524,7 +1603,8 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     );
     control.block_call_response.store(true, Ordering::SeqCst);
     let cancel = CancellationToken::new();
-    let dispatch = provider.execute_prepared(chat, prepared, cancel.clone());
+    let dispatch =
+        provider.execute_prepared(tickloop_ids::Id::from(chat), prepared, cancel.clone());
     let interrupt = async {
         control.call_entered.notified().await;
         cancel.cancel();
@@ -1535,7 +1615,12 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     control.block_call_response.store(false, Ordering::SeqCst);
 
     let prepared = provider
-        .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+        .prepare_call(
+            tickloop_ids::Id::from(chat),
+            "ArtifactEdit",
+            &input,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1544,13 +1629,22 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     );
     assert!(matches!(
         provider
-            .execute_prepared(chat, prepared, CancellationToken::new())
+            .execute_prepared(
+                tickloop_ids::Id::from(chat),
+                prepared,
+                CancellationToken::new()
+            )
             .await,
         HostCallResult::Completed(_)
     ));
     assert_eq!(
         provider
-            .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                &input,
+                CancellationToken::new()
+            )
             .await
             .unwrap()
             .permission(),
@@ -1562,7 +1656,12 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     provider.refresh(CancellationToken::new()).await.unwrap();
     assert_eq!(
         provider
-            .prepare_call(chat, "ArtifactEdit", &input, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                &input,
+                CancellationToken::new()
+            )
             .await
             .unwrap()
             .permission(),
@@ -1613,7 +1712,7 @@ async fn non_edit_mcp_preparation_shows_short_arguments_and_bounds_private_conte
     });
     let prepared = provider
         .prepare_call(
-            ChatId::new_v4(),
+            ChatId::new(),
             "ArtifactComment",
             &input,
             CancellationToken::new(),
@@ -1645,7 +1744,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
     provider.refresh(CancellationToken::new()).await.unwrap();
     let prepared = provider
         .prepare_call(
-            ChatId::new_v4(),
+            ChatId::new(),
             "ArtifactEdit",
             &json!({"mode":"fixed"}),
             CancellationToken::new(),
@@ -1656,7 +1755,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
     let dispatch_provider = provider.clone();
     let dispatch = tokio::spawn(async move {
         dispatch_provider
-            .execute_prepared(ChatId::new_v4(), prepared, CancellationToken::new())
+            .execute_prepared(ChatId::new(), prepared, CancellationToken::new())
             .await
     });
     tokio::time::timeout(
@@ -1749,7 +1848,7 @@ async fn account_change_after_tool_reaches_server_is_outcome_unknown() {
     provider.refresh(CancellationToken::new()).await.unwrap();
     let prepared = provider
         .prepare_call(
-            ChatId::new_v4(),
+            ChatId::new(),
             "ArtifactEdit",
             &json!({"mode":"fixed"}),
             CancellationToken::new(),
@@ -1760,7 +1859,7 @@ async fn account_change_after_tool_reaches_server_is_outcome_unknown() {
     let dispatch_provider = provider.clone();
     let dispatch = tokio::spawn(async move {
         dispatch_provider
-            .execute_prepared(ChatId::new_v4(), prepared, CancellationToken::new())
+            .execute_prepared(ChatId::new(), prepared, CancellationToken::new())
             .await
     });
     tokio::time::timeout(
@@ -1957,7 +2056,7 @@ async fn deeply_structured_non_edit_mcp_input_cannot_fill_the_operation_record()
     assert!(
         provider
             .prepare_call(
-                ChatId::new_v4(),
+                ChatId::new(),
                 "ArtifactComment",
                 &input,
                 CancellationToken::new()

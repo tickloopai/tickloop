@@ -528,7 +528,7 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
         updated_at: None,
         run_started_at: None,
         subagent: parent.map(|_| SubagentRegistration {
-            child_chat_id: id,
+            child_chat_id: id.into(),
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
             created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
@@ -3805,7 +3805,7 @@ fn fleet_row(
         updated_at: None,
         run_started_at: None,
         subagent: parent.map(|_| SubagentRegistration {
-            child_chat_id: id,
+            child_chat_id: id.into(),
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
             created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),

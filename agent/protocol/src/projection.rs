@@ -538,7 +538,7 @@ pub fn history_calls_in(
         if wire_ids.contains(&wire_id) {
             let origin = call
                 .run_id
-                .map(|run| run.simple().to_string())
+                .map(|run| run.uuid().simple().to_string())
                 .unwrap_or_else(|| "legacy".into());
             let mut ordinal = index;
             wire_id = format!("tl_{origin}_{ordinal:x}");

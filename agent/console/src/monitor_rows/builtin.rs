@@ -755,9 +755,11 @@ mod tests {
         let chat_id = Uuid::from_u128(1);
         ShellTask {
             id: Uuid::from_u128(2),
-            chat_id,
+            chat_id: chat_id.into(),
             origin: ShellTaskOrigin::User,
-            owner: ShellTaskOwner::User { chat_id },
+            owner: ShellTaskOwner::User {
+                chat_id: chat_id.into(),
+            },
             call_id: None,
             command: command.into(),
             description: description.map(Into::into),

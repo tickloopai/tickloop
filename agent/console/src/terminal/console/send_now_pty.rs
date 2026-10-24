@@ -89,13 +89,13 @@ fn send_now_pty_fixture() {
                     );
                     let chat = agent.create_chat(directory.clone()).await.unwrap();
                     core.set_execution_mode(
-                        chat,
+                        chat.into(),
                         tickloop_agent_protocol::ExecutionMode::AcceptEdits,
                     )
                     .await
                     .unwrap();
                     core.set_permission_rules(
-                        chat,
+                        chat.into(),
                         vec![tickloop_agent_protocol::PermissionRule {
                             id: Uuid::new_v4(),
                             decision: tickloop_agent_protocol::Decision::Allow,

@@ -1782,11 +1782,18 @@ async fn run_child_views(fixture: &PrivateFixture) {
         "{child_frame}"
     );
     assert!(
-        !child_frame.contains(&snapshot(&client, parent).await.conversation.id.to_string()),
+        !child_frame.contains(
+            &snapshot(&client, parent)
+                .await
+                .conversation
+                .id
+                .uuid()
+                .to_string()
+        ),
         "{child_frame}"
     );
     assert!(
-        !child_frame.contains(&child_before.conversation.id.to_string()),
+        !child_frame.contains(&child_before.conversation.id.uuid().to_string()),
         "{child_frame}"
     );
     assert_eq!(

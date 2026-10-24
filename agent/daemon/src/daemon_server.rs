@@ -501,7 +501,7 @@ impl DaemonServer {
                     .filter(|_| known.launch.session_persistence)
                     .map(|store_root| TranscriptRef {
                         store_root,
-                        chat_id: snapshot.conversation.id,
+                        chat_id: snapshot.conversation.id.into(),
                     });
                 let state = tickloop_agent_runtime::summary_state(
                     &snapshot.conversation.chat_loop,
@@ -525,7 +525,7 @@ impl DaemonServer {
                 known.last_directory.push(AgentSummary {
                     availability: ExecutionAvailability::Live,
                     execution,
-                    chat_id: snapshot.conversation.id,
+                    chat_id: snapshot.conversation.id.into(),
                     folder: snapshot.conversation.folder.clone(),
                     run_id: super::summary::summary_run_id(
                         &snapshot.conversation.chat_loop,
@@ -569,7 +569,7 @@ impl DaemonServer {
             self.inner.records.lock().await.insert(
                 TranscriptRef {
                     store_root,
-                    chat_id: snapshot.conversation.id,
+                    chat_id: snapshot.conversation.id.into(),
                 },
                 execution,
             );
@@ -909,7 +909,7 @@ impl AgentAccess for DaemonServer {
                     let _ = worker
                         .execute(CommandEnvelope {
                             daemon_epoch: self.inner.epoch,
-                            command_id: Uuid::new_v4(),
+                            command_id: tickloop_ids::generate(),
                             command: AgentCommand::FlushTranscripts,
                         })
                         .await;

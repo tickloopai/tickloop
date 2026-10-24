@@ -226,7 +226,7 @@ impl CopilotAuth {
         &self,
         cancel: &CancellationToken,
     ) -> Result<CopilotDeviceLogin, CopilotAuthError> {
-        let generation = Uuid::new_v4();
+        let generation = tickloop_ids::generate();
         {
             let _lock = self.lock(cancel).await?;
             let credentials = self.read()?.and_then(|state| state.credentials);
@@ -296,7 +296,7 @@ impl CopilotAuth {
                 .await?;
             match error_code(&payload) {
                 None => {
-                    let credential = parse_credentials(&payload, Uuid::new_v4())?;
+                    let credential = parse_credentials(&payload, tickloop_ids::generate())?;
                     let _lock = self.lock(cancel).await?;
                     let current = self.read()?.ok_or(CopilotAuthError::Superseded)?;
                     if current.generation != login.generation {
@@ -499,7 +499,7 @@ impl CopilotAuth {
     pub async fn logout(&self, cancel: &CancellationToken) -> Result<(), CopilotAuthError> {
         let _lock = self.lock(cancel).await?;
         self.save(&StoredState {
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: None,
         })
     }

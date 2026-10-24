@@ -299,7 +299,7 @@ pub(super) async fn serve_connection_mode(
     };
     let session_id = session
         .as_ref()
-        .map_or_else(Uuid::new_v4, |session| session.session_id);
+        .map_or_else(tickloop_ids::generate, |session| session.session_id);
     let capabilities = vec![
         AccessCapability::Overview,
         AccessCapability::AgentDetails,
@@ -850,7 +850,7 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
     cancel: &CancellationToken,
     limits: AccessLimits,
 ) -> Result<(), AccessError> {
-    let transfer_id = Uuid::new_v4();
+    let transfer_id = tickloop_ids::generate();
     let total_bytes = encoded.total_bytes;
     let frame_bytes = limits.frame_bytes();
     let chunk_bytes = limits.chunk_bytes();

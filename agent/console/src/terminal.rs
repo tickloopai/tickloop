@@ -134,12 +134,12 @@ use thinking_preview::ThinkingPreview;
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AfterTurnAction, AgentDetailQuery, AgentHostOptions,
-    AgentSummary, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandResult,
+    AgentSummary, BranchOutcome, BranchRequest, ChatId, ChatSnapshot, ChatStatus, CommandResult,
     ConfigurationChange, Decision, DirectoryTrustPolicy, EnvironmentValue, EventKind,
     ExecutionAvailability, ExecutionMode, ExecutionRef, HostLocation, HostWorkContext,
     InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
-    QueuedInputKind, ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin,
+    QueuedInputKind, ReasoningEffort, Receipt, RunId, ShellTaskNotice, ShellTaskOrigin,
     ShellTaskPromptWatchdog, ShellTaskState, TaskNotification, TaskNotificationStatus, Usage,
     UserInput, UserShellRecord, UserShellState, ViewRef,
 };
@@ -172,7 +172,7 @@ const STOPPED_NOTICE: &str =
     "Stopped. Queued messages were discarded; send your next message to resume receiving Triggers.";
 
 struct RunningActivity {
-    chat_id: uuid::Uuid,
+    chat_id: ChatId,
     label: String,
     started_at: Option<std::time::Instant>,
     interruptible: bool,
@@ -287,18 +287,18 @@ fn write_pending_reply_lines(console: &Console, reply: &mut ReplyLines) -> Resul
 /// the model had produced line by line.
 fn stop_visual_pacing(
     console: &Console,
-    chat: uuid::Uuid,
+    chat: ChatId,
     pending: &HashMap<uuid::Uuid, Receipt>,
     thinking_previews: &mut HashMap<uuid::Uuid, ThinkingPreview>,
     reply_lines: &mut HashMap<uuid::Uuid, ReplyLines>,
-    unpaced_runs: &mut HashSet<uuid::Uuid>,
+    unpaced_runs: &mut HashSet<RunId>,
 ) -> Result<(), String> {
     let _frame_hold = console.hold_frames()?;
     for (run_id, receipt) in pending {
         if receipt.chat_id != chat {
             continue;
         }
-        unpaced_runs.insert(*run_id);
+        unpaced_runs.insert((*run_id).into());
         thinking_previews.remove(run_id);
         if let Some(reply) = reply_lines.get_mut(run_id) {
             write_pending_reply_lines(console, reply)?;
@@ -353,7 +353,7 @@ struct CompletionDetails {
 }
 
 fn completion_details(
-    run: uuid::Uuid,
+    run: RunId,
     elapsed: Option<std::time::Duration>,
     shells: usize,
 ) -> CompletionDetails {
@@ -361,7 +361,7 @@ fn completion_details(
         || RESTORED_TURN_SUMMARY.to_owned(),
         |elapsed| {
             let verb = TURN_COMPLETION_VERBS
-                [(run.as_u128() % TURN_COMPLETION_VERBS.len() as u128) as usize];
+                [(run.uuid().as_u128() % TURN_COMPLETION_VERBS.len() as u128) as usize];
             format!("{verb} for {}", format_activity_elapsed(elapsed))
         },
     );
@@ -461,11 +461,12 @@ fn waiting_input_kind(line: &str) -> Option<QueuedInputKind> {
 /// Whether an input sent to `chat` now waits behind running work, as the Agent queues it: one of
 /// its turns or its foreground Shell is running.
 fn input_waits(
-    chat: uuid::Uuid,
+    chat: ChatId,
     pending: &HashMap<uuid::Uuid, Receipt>,
     foreground_shells: &HashMap<uuid::Uuid, uuid::Uuid>,
 ) -> bool {
-    pending.values().any(|receipt| receipt.chat_id == chat) || foreground_shells.contains_key(&chat)
+    pending.values().any(|receipt| receipt.chat_id == chat)
+        || foreground_shells.contains_key(&chat.uuid())
 }
 
 const TUI_SYNTAX: &str = "use /tui [inline|fullscreen]";
@@ -503,13 +504,15 @@ fn branch_failure_message(error: &impl std::fmt::Display) -> String {
     )
 }
 
-fn switch_to_saved_branch(console: &Console, child_chat_id: uuid::Uuid) -> Result<(), String> {
-    match console.commit_branch_and_reset_chat(child_chat_id) {
+fn switch_to_saved_branch(console: &Console, child_chat_id: ChatId) -> Result<(), String> {
+    match console.commit_branch_and_reset_chat(child_chat_id.into()) {
         Ok(()) => Ok(()),
         Err(reset_error) => {
             let recovery = format!(
-                "Branch {child_chat_id} was saved, but the terminal could not switch to it: {}. Use /resume to find it or /resume {child_chat_id} to open it.",
-                safe_line(&reset_error)
+                "Branch {} was saved, but the terminal could not switch to it: {}. Use /resume to find it or /resume {} to open it.",
+                child_chat_id.public(),
+                safe_line(&reset_error),
+                child_chat_id.public()
             );
             match console.commit_branch_submission() {
                 Ok(()) => Err(recovery),
@@ -532,7 +535,7 @@ fn switch_to_saved_branch(console: &Console, child_chat_id: uuid::Uuid) -> Resul
 async fn branch_from_terminal(
     console: &Console,
     agent: &Agent,
-    source_chat_id: Option<uuid::Uuid>,
+    source_chat_id: Option<ChatId>,
     command: &str,
     preserve_until_summary_finishes: bool,
 ) -> Result<BranchOutcome, String> {
@@ -555,7 +558,7 @@ async fn branch_from_terminal(
     };
     let outcome = match agent
         .branch_chat(BranchRequest {
-            request_id: uuid::Uuid::new_v4(),
+            request_id: tickloop_ids::generate(),
             source_chat_id,
             name,
         })
@@ -790,7 +793,7 @@ async fn connect_daemon_at_startup(
     }
     options.push("Cancel — keep running Agents".into());
     let cancel_index = options.len() - 1;
-    let menu_id = uuid::Uuid::new_v4();
+    let menu_id = tickloop_ids::generate();
     let menu = console::Menu {
         id: menu_id,
         title: "Stop the running daemon and continue?".into(),
@@ -975,7 +978,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let mut unrestricted = false;
     let mut caller_managed_trust = false;
     let mut continue_recent = false;
-    let mut resume: Option<Option<uuid::Uuid>> = None;
+    let mut resume: Option<Option<ChatId>> = None;
     let mut exact_chat = None;
     let mut view_handoff_path = None;
     let mut fork_session = false;
@@ -1029,7 +1032,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                 let chat = arguments
                     .next_if(|value| !value.starts_with('-'))
                     .map(|value| {
-                        value.parse::<uuid::Uuid>().map_err(|_| {
+                        ChatId::parse(&value).ok_or_else(|| {
                             format!(
                                 "--resume expects a Chat ID, got {}; omit it to choose a Chat",
                                 safe_text(&value)
@@ -1041,7 +1044,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             }
             "--chat-id" => {
                 let value = arguments.next().ok_or("--chat-id requires a Chat ID")?;
-                exact_chat = Some(value.parse::<uuid::Uuid>().map_err(|_| {
+                exact_chat = Some(ChatId::parse(&value).ok_or_else(|| {
                     format!("--chat-id expects a Chat ID, got {}", safe_text(&value))
                 })?);
             }
@@ -1060,7 +1063,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .map(view_upgrade::read_handoff)
         .transpose()?;
     if let Some(handoff) = &view_handoff {
-        exact_chat = handoff.selection.chat;
+        exact_chat = handoff.selection.chat.map(Into::into);
         continue_recent = false;
         resume = None;
         fork_session = false;
@@ -1276,26 +1279,27 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     }
     let startup = if let Some(chat) = exact_chat {
         let opened = if view_handoff.is_some() {
-            agent.snapshot(chat).await
+            agent.snapshot(chat.into()).await
         } else {
-            agent.resume_chat(chat).await
+            agent.resume_chat(chat.into()).await
         };
         let (snapshot, has_history) = match opened {
             Ok(snapshot) => (snapshot, true),
             Err(error) if error.code == AccessErrorCode::NotFound && view_handoff.is_none() => {
                 agent
-                    .restore_empty_chat(chat, workdir.clone())
+                    .restore_empty_chat(chat.into(), workdir.clone())
                     .await
-                    .map_err(|error| format!("Failed to create Chat {chat}: {error}"))?;
+                    .map_err(|error| format!("Failed to create Chat {}: {error}", chat.public()))?;
                 (
-                    agent
-                        .snapshot(chat)
-                        .await
-                        .map_err(|error| format!("Failed to open Chat {chat}: {error}"))?,
+                    agent.snapshot(chat.into()).await.map_err(|error| {
+                        format!("Failed to open Chat {}: {error}", chat.public())
+                    })?,
                     false,
                 )
             }
-            Err(error) => return Err(format!("Failed to resume Chat {chat}: {error}")),
+            Err(error) => {
+                return Err(format!("Failed to resume Chat {}: {error}", chat.public()));
+            }
         };
         StartupChat::Resumed(Box::new(snapshot), has_history)
     } else if continue_recent {
@@ -1426,18 +1430,21 @@ fn initialize_startup_console(
 /// 按 `--fork-session` 恢复或复制已保存的 Chat，错误文案照 Claude Code。
 async fn open_saved_chat(
     agent: &Agent,
-    chat: uuid::Uuid,
+    chat: ChatId,
     as_new_chat: bool,
 ) -> Result<tickloop_agent_protocol::ChatSnapshot, String> {
     let opened = if as_new_chat {
-        agent.resume_as_new_chat(chat).await
+        agent.resume_as_new_chat(chat.into()).await
     } else {
-        agent.resume_chat(chat).await
+        agent.resume_chat(chat.into()).await
     };
     opened.map_err(|error| match error.code {
-        AccessErrorCode::NotFound => format!("No conversation found with Chat ID: {chat}"),
+        AccessErrorCode::NotFound => {
+            format!("No conversation found with Chat ID: {}", chat.public())
+        }
         _ => format!(
-            "Failed to resume Chat {chat}: {}",
+            "Failed to resume Chat {}: {}",
+            chat.public(),
             safe_text(&error.to_string())
         ),
     })
@@ -1495,7 +1502,7 @@ fn ensure_snapshot_banner(
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
 ) -> Result<(), String> {
     console.ensure_chat_banner(
-        snapshot.id,
+        snapshot.id.into(),
         &startup_banner_spans(&snapshot.model, shown_folder(snapshot.folder.as_deref())),
     )
 }
@@ -1544,11 +1551,11 @@ async fn open_current_plan(
     agent: &Agent,
     console: &Console,
     menus: &mut Menus,
-    chat: Option<uuid::Uuid>,
+    chat: Option<ChatId>,
 ) -> Result<(), String> {
     if let Some(chat) = chat {
         let snapshot = agent
-            .snapshot(chat)
+            .snapshot(chat.into())
             .await
             .map_err(|error| error.to_string())?;
         // Plain input reaches here without the editor's scope check.
@@ -1565,7 +1572,7 @@ async fn open_current_plan(
             .find(|plan| plan.loop_id == snapshot.chat_loop.id)
         {
             if console.is_interactive() || plan.approval_pending {
-                return menus.workflow(console, Workflow::plan(agent, chat).await?);
+                return menus.workflow(console, Workflow::plan(agent, chat.into()).await?);
             }
             outln!(
                 console,
@@ -1577,7 +1584,7 @@ async fn open_current_plan(
             return Ok(());
         }
         agent
-            .set_execution_mode(chat, ExecutionMode::Plan)
+            .set_execution_mode(chat.into(), ExecutionMode::Plan)
             .await
             .map_err(|error| error.to_string())?;
     } else {
@@ -1716,7 +1723,7 @@ async fn interact_with_herdr(
     )> = tokio::task::JoinSet::new();
     let mut suggestible_runs = HashSet::new();
     // Runs this View interrupted by esc or ctrl+c; their prompt may come back to the editor.
-    let mut user_interrupted_runs: HashSet<uuid::Uuid> = HashSet::new();
+    let mut user_interrupted_runs: HashSet<RunId> = HashSet::new();
     let mut suggestion_diagnostics: HashMap<uuid::Uuid, (uuid::Uuid, &'static str)> =
         HashMap::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -1747,10 +1754,10 @@ async fn interact_with_herdr(
     let mut prompt_watchdog = ShellTaskPromptWatchdog::default();
     let prompt_watchdog_epoch = std::time::Instant::now();
     let mut pending: HashMap<uuid::Uuid, Receipt> = HashMap::new();
-    let mut thinking_runs = HashSet::new();
+    let mut thinking_runs: HashSet<RunId> = HashSet::new();
     let mut thinking_previews: HashMap<uuid::Uuid, ThinkingPreview> = HashMap::new();
     let mut reply_lines: HashMap<uuid::Uuid, ReplyLines> = HashMap::new();
-    let mut unpaced_runs: HashSet<uuid::Uuid> = HashSet::new();
+    let mut unpaced_runs: HashSet<RunId> = HashSet::new();
     let mut deferred_events = VecDeque::new();
     let mut merged_echoes = MergedEchoes::default();
     let mut merged_echoes_view = None;
@@ -1759,7 +1766,7 @@ async fn interact_with_herdr(
     let mut compactions = tokio::task::JoinSet::new();
     let mut compaction_chats = HashMap::new();
     let mut directed_summaries = DirectedSummaryTasks::default();
-    let mut summary_recovery_required = HashSet::new();
+    let mut summary_recovery_required: HashSet<ChatId> = HashSet::new();
     let mut selected_chat = None;
     let mut global = crate::agent_console::AgentConsole::new(
         agent.access(),
@@ -1769,15 +1776,15 @@ async fn interact_with_herdr(
     );
     let mut overview_active = false;
     let mut history_return_overview = false;
-    let mut visible_family = Vec::new();
+    let mut visible_family: Vec<ChatId> = Vec::new();
     // The daemon fact behind the shared catalog; set by a failed refresh and cleared by the next success.
     let mut daemon_unreachable: Option<String> = None;
     let mut global_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     global_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ui_selected = selected_chat;
-    let mut background_notice: Option<(uuid::Uuid, BackgroundRunNotice)> = None;
+    let mut background_notice: Option<(ChatId, BackgroundRunNotice)> = None;
     let mut transcript_write_error = None;
-    let mut loop_trigger_notices: Vec<(uuid::Uuid, String)> = Vec::new();
+    let mut loop_trigger_notices: Vec<(ChatId, String)> = Vec::new();
     let mut displayed_sequences: HashMap<uuid::Uuid, u64> = HashMap::new();
     let mut eof = false;
     let mut failed = false;
@@ -1821,7 +1828,7 @@ async fn interact_with_herdr(
             learn_agent_colors(console, agent, &snapshot).await?;
             show_opened_chat(console, agent, &snapshot, has_history)?;
             selected_chat = Some(snapshot.id);
-            displayed_sequences.insert(snapshot.id, snapshot.last_sequence);
+            displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
             tools.restore(&snapshot.conversation_events());
             sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
         }
@@ -1854,20 +1861,24 @@ async fn interact_with_herdr(
     }
     if let Some(chat) = selected_chat {
         let snapshot = agent
-            .snapshot(chat)
+            .snapshot(chat.into())
             .await
             .map_err(|error| error.to_string())?;
-        menus.warm_model_directory(agent, ConfigTarget::Agent(chat), snapshot.model);
+        menus.warm_model_directory(agent, ConfigTarget::Agent(chat.into()), snapshot.model);
     } else if let Some(model) = agent.launch_spec().model {
         menus.warm_model_directory(agent, ConfigTarget::NewDraft, model);
     }
     agent
-        .display_chat(selected_chat)
+        .display_chat(selected_chat.map(Into::into))
         .await
         .map_err(|error| error.to_string())?;
     let mut registration = config_root.as_deref().and_then(|root| {
-        let registration =
-            ProcessRegistration::register(root, selected_chat, &workdir, interactive);
+        let registration = ProcessRegistration::register(
+            root,
+            selected_chat.map(Into::into),
+            &workdir,
+            interactive,
+        );
         process_registry::count_concurrent_processes(root);
         registration
     });
@@ -1882,13 +1893,13 @@ async fn interact_with_herdr(
         menus.set_new_agent_directory(global.projection().dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
             agent
-                .display_chat(selected_chat)
+                .display_chat(selected_chat.map(Into::into))
                 .await
                 .map_err(|error| error.to_string())?;
             let visible = match selected_chat {
                 Some(chat) => Some(
                     agent
-                        .reference(chat)
+                        .reference(chat.into())
                         .await
                         .map_err(|error| error.to_string())?,
                 ),
@@ -1912,9 +1923,9 @@ async fn interact_with_herdr(
             status_dirty = true;
         }
         if let Some(registration) = registration.as_mut()
-            && registration.chat_id() != selected_chat
+            && registration.chat_id() != selected_chat.map(Into::into)
         {
-            registration.update_chat(selected_chat);
+            registration.update_chat(selected_chat.map(Into::into));
         }
         menus.sync_dialog_chat(console)?;
         if logout.is_none()
@@ -1927,7 +1938,7 @@ async fn interact_with_herdr(
         {
             turn_snapshot.forget();
             if let Some(chat) = selected_chat
-                && let Err(error) = agent.refresh_configuration(chat).await
+                && let Err(error) = agent.refresh_configuration(chat.into()).await
             {
                 outln!(
                     console,
@@ -1967,7 +1978,7 @@ async fn interact_with_herdr(
             }
             if outcome.provider_logout {
                 menus.invalidate_model_discovery();
-                provider_logout_chat = Some(selected_chat);
+                provider_logout_chat = Some(selected_chat.map(Into::into));
                 if let Some(root) = menus.provider_login_root() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
                     logout_target = outcome.logout_target;
@@ -2006,7 +2017,7 @@ async fn interact_with_herdr(
             }
             if let Some((chat, request)) = outcome.summary {
                 let direction = directed_summaries.start(agent, chat, request);
-                selected_chat = Some(chat);
+                selected_chat = Some(chat.into());
                 console.set_prompt_enabled(false)?;
                 outln!(
                     console,
@@ -2021,19 +2032,19 @@ async fn interact_with_herdr(
                 questions.remove(&id);
             }
             if let Some(snapshot) = outcome.restored {
-                displayed_sequences.insert(snapshot.id, snapshot.last_sequence);
+                displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
                 tools.restore(&snapshot.conversation_events());
                 sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
             }
             if let Some(chat) = outcome.selection {
-                if selected_chat != Some(chat) {
+                if selected_chat != Some(chat.into()) {
                     message_groups = MessageGroups::default();
                 }
-                selected_chat = Some(chat);
+                selected_chat = Some(chat.into());
             }
             if let Some(receipt) = outcome.receipt {
                 selected_chat = Some(receipt.chat_id);
-                pending.insert(receipt.run_id, receipt);
+                pending.insert(receipt.run_id.into(), receipt);
             }
             if let Some(status) = outcome.status {
                 console.set_status(&status)?;
@@ -2085,12 +2096,12 @@ async fn interact_with_herdr(
                 // An input waits for its echo after a turn that read the conversation for it, and
                 // that turn's conversation settles it. Only waits that read could not settle, as
                 // when the conversation was unreachable at their event, are read for here.
-                let mut awaiting = console.awaiting_input_echoes(chat)?;
+                let mut awaiting = console.awaiting_input_echoes(chat.into())?;
                 awaiting.sort();
                 let reconciling = match turn_snapshot.conversation_of(chat) {
                     Some(conversation) => Some(conversation),
                     None if !awaiting.is_empty()
-                        && unsettled_echoes.get(&chat) != Some(&awaiting) =>
+                        && unsettled_echoes.get(&chat.uuid()) != Some(&awaiting) =>
                     {
                         turn_snapshot.read(agent, chat).await.ok()
                     }
@@ -2101,23 +2112,23 @@ async fn interact_with_herdr(
                     .await
                     .map_err(|error| error.to_string())?;
                 let task_snapshot = task_center
-                    .snapshot(chat)
+                    .snapshot(chat.into())
                     .await
                     .map_err(|error| error.to_string())?;
-                let subscriptions = agent.tick_subscriptions(chat).await.ok();
+                let subscriptions = agent.tick_subscriptions(chat.into()).await.ok();
                 // Everything is read before the first change shows, and the changes reach the
                 // terminal as one frame; keys typed during the reads still draw at once.
                 let _frame_hold = console.hold_frames()?;
                 console.set_input_context(
-                    Some(chat),
+                    Some(chat.into()),
                     shown_folder(status.folder.as_deref()),
                     &status.additional_directories,
                 )?;
                 console.set_visible_delegation(status.delegation.is_some())?;
-                console.set_foreground_shell(foreground_shells.contains_key(&chat))?;
-                console.set_queued_inputs(chat, status.queued_inputs())?;
+                console.set_foreground_shell(foreground_shells.contains_key(&chat.uuid()))?;
+                console.set_queued_inputs(chat.into(), status.queued_inputs())?;
                 console.set_chat_images(
-                    chat,
+                    chat.into(),
                     status.accepts_images(),
                     status.highest_pasted_image_id,
                 )?;
@@ -2126,9 +2137,9 @@ async fn interact_with_herdr(
                     // A cached conversation, read while the daemon is unreachable, settles
                     // nothing for good; the waits are read for again once it answers.
                     if agent.disconnected().is_none() {
-                        let mut unsettled = console.awaiting_input_echoes(chat)?;
+                        let mut unsettled = console.awaiting_input_echoes(chat.into())?;
                         unsettled.sort();
-                        unsettled_echoes.insert(chat, unsettled);
+                        unsettled_echoes.insert(chat.into(), unsettled);
                     }
                 }
                 console.set_foreground_commands(
@@ -2148,8 +2159,8 @@ async fn interact_with_herdr(
                     shells: task_snapshot,
                     subscriptions,
                 })?;
-                console.set_provider_failures(chat, &status.provider_failures)?;
-                menus.note_provider_failures(chat, &status.provider_failures);
+                console.set_provider_failures(chat.into(), &status.provider_failures)?;
+                menus.note_provider_failures(chat.into(), &status.provider_failures);
                 menus.offer_continue(console, &status)?;
                 console.set_provider_failure(
                     status
@@ -2173,8 +2184,9 @@ async fn interact_with_herdr(
                     std::time::Instant::now(),
                 ) {
                     let agent = agent.clone();
-                    completed_task_cleanups
-                        .spawn(async move { agent.clear_completed_tasks(chat, cleanup).await });
+                    completed_task_cleanups.spawn(async move {
+                        agent.clear_completed_tasks(chat.into(), cleanup).await
+                    });
                 }
                 console.update_status_area(
                     status.policy.mode.to_string(),
@@ -2200,7 +2212,7 @@ async fn interact_with_herdr(
                     status.chat_loop.run_id.is_some()
                         && status.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
                         && !pending.values().any(|receipt| receipt.chat_id == chat)
-                        && agent.unknown_input(chat).is_none()
+                        && agent.unknown_input(chat.into()).is_none()
                         && status.queued_inputs().is_empty()
                         && status.user_shells.iter().all(|record| {
                             matches!(
@@ -2264,20 +2276,22 @@ async fn interact_with_herdr(
                     let working = RunningActivity {
                         chat_id: chat,
                         label: WORKING_ACTIVITY.to_owned(),
-                        started_at: running_receipt
-                            .and_then(|receipt| observed_run_starts.get(&receipt.run_id).copied()),
+                        started_at: running_receipt.and_then(|receipt| {
+                            observed_run_starts.get(&receipt.run_id.uuid()).copied()
+                        }),
                         interruptible: loop_interruptible,
                     };
                     let preview = pending.iter().find_map(|(run_id, receipt)| {
-                        (receipt.chat_id == chat && thinking_runs.contains(run_id))
-                            .then(|| thinking_previews.get(run_id))
-                            .flatten()
+                        (receipt.chat_id == chat
+                            && thinking_runs.contains(&tickloop_ids::Id::from(*run_id)))
+                        .then(|| thinking_previews.get(run_id))
+                        .flatten()
                     });
                     activity = Some(working.spans(console, preview, &working_shimmer)?);
                     console.set_activity_interruptible(working.interruptible)?;
                     running_activity = Some(working);
                     "Working".to_owned()
-                } else if foreground_shells.contains_key(&chat) {
+                } else if foreground_shells.contains_key(&chat.uuid()) {
                     "Shell running".to_owned()
                 } else {
                     "Ready".to_owned()
@@ -2329,7 +2343,7 @@ async fn interact_with_herdr(
                             .clone()
                             .filter(|(chat, notice)| {
                                 notice.message != REPLY_COMPLETED_NOTICE
-                                    || !agent.cached_is_delegated(*chat)
+                                    || !agent.cached_is_delegated((*chat).into())
                             })
                             .map(|(chat, notice)| {
                                 let role = if notice.necessary {
@@ -2344,7 +2358,7 @@ async fn interact_with_herdr(
                     displayed_background
                         .map(|(chat, notice, role)| {
                             console.background_status_notice(
-                                agent.cached_title(chat),
+                                agent.cached_title(chat.into()),
                                 notice.message,
                                 notice.compact_message,
                                 notice.necessary,
@@ -2353,7 +2367,8 @@ async fn interact_with_herdr(
                         })
                         .transpose()?,
                 )?;
-                cached_activity_status = Some((chat, safe_text(status.trim_start_matches(" · "))));
+                cached_activity_status =
+                    Some((chat.into(), safe_text(status.trim_start_matches(" · "))));
                 console.set_activity_and_status(
                     activity.as_deref(),
                     &safe_text(status.trim_start_matches(" · ")),
@@ -2387,10 +2402,13 @@ async fn interact_with_herdr(
                 // Subscriptions and Shell tasks move on while the Chat itself stays as it was,
                 // whose own changes come with its events; only they are read again.
                 let shells = task_center
-                    .snapshot(chat)
+                    .snapshot(chat.into())
                     .await
                     .map_err(|error| error.to_string())?;
-                console.refresh_monitor_ticks(shells, agent.tick_subscriptions(chat).await.ok())?;
+                console.refresh_monitor_ticks(
+                    shells,
+                    agent.tick_subscriptions(chat.into()).await.ok(),
+                )?;
             }
         }
         if interactive && activity_dirty {
@@ -2401,7 +2419,7 @@ async fn interact_with_herdr(
             {
                 #[cfg(test)]
                 agent.record_recovery_fact(recovery_tests::RecoveryFact::ActivityFrameBegin {
-                    chat,
+                    chat: chat.into(),
                 });
                 let activity = running_activity
                     .as_ref()
@@ -2418,7 +2436,7 @@ async fn interact_with_herdr(
                 console.set_activity_and_status(activity.as_deref(), status)?;
                 #[cfg(test)]
                 agent.record_recovery_fact(recovery_tests::RecoveryFact::ActivityFrameEnd {
-                    chat,
+                    chat: chat.into(),
                     painted: activity.is_some(),
                 });
             }
@@ -2459,9 +2477,9 @@ async fn interact_with_herdr(
             !directed_summaries.is_empty() || !summary_recovery_required.is_empty();
         let visual_pacing_pending = interactive
             && !overview_active
-            && reply_lines
-                .values()
-                .any(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line());
+            && reply_lines.values().any(|reply| {
+                Some(reply.chat_id) == selected_chat.map(Into::into) && reply.has_complete_line()
+            });
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
         if interactive
@@ -2490,7 +2508,7 @@ async fn interact_with_herdr(
         {
             let selection = view_upgrade::ViewSelection {
                 navigation,
-                chat: selected_chat,
+                chat: selected_chat.map(Into::into),
                 overview: overview_active,
                 configuration,
             };
@@ -2519,7 +2537,7 @@ async fn interact_with_herdr(
         if interactive {
             let execution = selected_chat
                 .filter(|_| !overview_active)
-                .and_then(|chat| agent.cached_reference(chat));
+                .and_then(|chat| agent.cached_reference(chat.into()));
             if runtime_selection != execution {
                 runtime_selection = execution;
                 if execution.is_some() {
@@ -2535,7 +2553,11 @@ async fn interact_with_herdr(
                     worker.is_some_and(|worker| worker.upgrading),
                 );
                 if runtime_presentation.as_ref() != Some(&presentation) {
-                    console.set_agent_runtime(chat, presentation.1.clone(), presentation.2)?;
+                    console.set_agent_runtime(
+                        chat.into(),
+                        presentation.1.clone(),
+                        presentation.2,
+                    )?;
                     runtime_presentation = Some(presentation);
                 }
             }
@@ -2632,7 +2654,7 @@ async fn interact_with_herdr(
             },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
                 if let Some(Ok((request, mut result))) = result {
-                    let suppression = if selected_chat != Some(request.chat) || overview_active {
+                    let suppression = if selected_chat != Some(request.chat.into()) || overview_active {
                         Some("discarded: Agent View changed")
                     } else {
                         match agent.status(request.chat).await {
@@ -2736,7 +2758,7 @@ async fn interact_with_herdr(
                     merged_echoes.next_submission_block();
                 }
                 let line = match line {
-                    Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
+                    Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat.into()) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
                         if let Err(error) = tick_actions::execute(action,context).await { console.report_monitor_error(chat, &error)?; }
                         status_dirty=true;
@@ -2751,7 +2773,7 @@ async fn interact_with_herdr(
                             console.repark_delayed_submission(id)?;
                             continue;
                         }
-                        match console.begin_delayed_submission(id, selected_chat)? {
+                        match console.begin_delayed_submission(id, selected_chat.map(Into::into))? {
                             Some((event, guard)) => (Some(guard), Some(event)),
                             None => continue,
                         }
@@ -2768,7 +2790,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::OpenOverview) => {
                     menus.dismiss(console)?;
                     // Only a registered conversation is something to return to; a new draft has none.
-                    let source=match selected_chat { Some(chat)=>agent.reference(chat).await.ok(), None=>None };
+                    let source=match selected_chat { Some(chat)=>agent.reference(chat.into()).await.ok(), None=>None };
                     global.visible_ready(source);
                     // An unreachable daemon leaves the cached catalog on screen with a stale label;
                     // the View, its drafts and its reading positions stay alive.
@@ -2792,13 +2814,13 @@ async fn interact_with_herdr(
                     global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
                     console.set_global_overview(None)?;
                     overview_active = false;
-                    if let Err(error)=agent.display_chat(selected_chat).await {
+                    if let Err(error)=agent.display_chat(selected_chat.map(Into::into)).await {
                         console.set_connection_notice(Some(format!("{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",safe_line(&error.to_string()))))?;
                     }
                     if let Some(chat)=selected_chat {
-                        match restore_view(console,agent,&mut tools,chat,displayed_sequences.get(&chat).copied().unwrap_or(0),&mut reply_lines,&mut message_groups).await {
+                        match restore_view(console,agent,&mut tools,chat,displayed_sequences.get(&chat.uuid()).copied().unwrap_or(0),&mut reply_lines,&mut message_groups).await {
                             Ok(observation)=>{
-                                displayed_sequences.insert(chat,observation.snapshot.last_sequence);
+                                displayed_sequences.insert(chat.into(),observation.snapshot.last_sequence);
                                 sync_snapshot(&observation.snapshot,&mut pending,&mut permissions,&mut questions);
                             },
                             Err(error)=>console.set_status(&format!("Showing cached conversation · {}",safe_line(&error)))?,
@@ -2829,7 +2851,7 @@ async fn interact_with_herdr(
                             Err(error)=>{
                                 #[cfg(test)]
                                 agent.record_recovery_fact(recovery_tests::RecoveryFact::NavigationRejected {
-                                    selected_chat,
+                                    selected_chat: selected_chat.map(Into::into),
                                     visible: global.projection().visible,
                                 });
                                 console.set_status(&format!("Cannot open the Agent · {}",safe_line(&error)))?;
@@ -2839,12 +2861,12 @@ async fn interact_with_herdr(
                         };
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
-                            displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
+                            displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
                             tools.restore(&snapshot.conversation_events());
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                             message_groups=MessageGroups::default();
                             #[cfg(test)]
-                            agent.record_recovery_fact(recovery_tests::RecoveryFact::AgentOpened {chat:snapshot.id});
+                            agent.record_recovery_fact(recovery_tests::RecoveryFact::AgentOpened {chat:snapshot.id.into()});
                         }
                     } else {console.set_status("This Agent is no longer live; reopen its saved history to recover")?;}
                     status_dirty = true;
@@ -2893,7 +2915,7 @@ async fn interact_with_herdr(
                 },
                 Some(InputEvent::ToggleMonitor { show }) => {
                     if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { console.set_status(&safe_text(&error))?; }
-                    else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
+                    else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat.into()).await?; }
                     status_dirty = true;
                 },
                 Some(InputEvent::ArtifactChoice(choice)) => {
@@ -2902,13 +2924,13 @@ async fn interact_with_herdr(
                     if matches!(choice.action, artifacts_picker::ArtifactPickerAction::Add(_)) && selected_chat.is_none() {
                         let _ = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
                     }
-                    match artifact_ui::apply_choice(agent, console, root, selected_chat, *choice).await {
+                    match artifact_ui::apply_choice(agent, console, root, selected_chat.map(Into::into), *choice).await {
                         Ok(()) => {}, Err(error) => console.artifact_picker_error(safe_text(&error))?,
                     }
                     status_dirty = true;
                 },
                 Some(InputEvent::ArtifactSignOut) => {
-                    menus.confirm_artifact_sign_out(console, ConfigTarget::visible(selected_chat), false)?;
+                    menus.confirm_artifact_sign_out(console, ConfigTarget::visible(selected_chat.map(Into::into)), false)?;
                 },
                 Some(InputEvent::TickPackages(work)) => {
                     if let Some(root) = config_root.as_deref() { ticks_work::start(root, work, &mut tick_package_tasks); }
@@ -2919,7 +2941,7 @@ async fn interact_with_herdr(
                         || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
                         || directed_summaries.contains(chat)
                         || summary_recovery_required.contains(&chat)
-                        || foreground_shells.contains_key(&chat));
+                        || foreground_shells.contains_key(&chat.uuid()));
                     open_rewind(agent,console,&mut menus,selected_chat,is_busy).await?;
                 },
                 Some(InputEvent::Interrupt) => {
@@ -2934,13 +2956,13 @@ async fn interact_with_herdr(
                         continue;
                     }
                     if let Some(chat)=selected_chat
-                        && let Some(command_id)=foreground_shells.get(&chat).copied()
+                        && let Some(command_id)=foreground_shells.get(&chat.uuid()).copied()
                     {
-                        match agent.stop_user_shell(chat,command_id).await {
-                            Ok(_) => outln!(console,"\nStopped user shell {command_id}."),
+                        match agent.stop_user_shell(chat.into(),command_id).await {
+                            Ok(_) => outln!(console,"\nStopped user shell {}.",shown_id(command_id)),
                             Err(error) => outln!(console,"\nCannot stop user shell: {}",safe_text(&error.to_string())),
                         }
-                        foreground_shells.remove(&chat);
+                        foreground_shells.remove(&chat.uuid());
                         console.set_foreground_shell(false)?;
                         status_dirty=true;
                         continue;
@@ -2948,7 +2970,7 @@ async fn interact_with_herdr(
                     if let Some(chat)=selected_chat
                         && directed_summaries.contains(chat)
                     {
-                        agent.interrupt(chat).await.map_err(|error|error.to_string())?;
+                        agent.interrupt(chat.into()).await.map_err(|error|error.to_string())?;
                         outln!(console,"\nCancelling conversation summary…");
                         status_dirty=true;
                         continue;
@@ -2958,7 +2980,7 @@ async fn interact_with_herdr(
                     if let Some(chat) = selected_chat
                         && pending.values().any(|receipt| receipt.chat_id == chat)
                     {
-                        agent.interrupt(chat).await.map_err(|error|error.to_string())?;
+                        agent.interrupt(chat.into()).await.map_err(|error|error.to_string())?;
                         user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
                         stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
                         status_dirty=true;
@@ -2969,7 +2991,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::InterruptActivity) => {
                     let Some(chat) = selected_chat.filter(|chat| idle_interruptible_chat == Some(*chat) || running_activity.as_ref().is_some_and(|activity| activity.chat_id == *chat && activity.interruptible)) else { continue; };
                     if idle_interruptible_chat == Some(chat) || pending.values().any(|receipt| receipt.chat_id == chat) || directed_summaries.contains(chat) {
-                        match agent.interrupt(chat).await {
+                        match agent.interrupt(chat.into()).await {
                             Ok(_) => {
                                 user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
                                 stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
@@ -2982,7 +3004,7 @@ async fn interact_with_herdr(
                 },
                 Some(InputEvent::SendQueuedNow { run_id }) => {
                     let Some(chat) = selected_chat else { continue; };
-                    if let Err(error) = agent.send_now(chat, run_id).await {
+                    if let Err(error) = agent.send_now(chat.into(), run_id).await {
                         console.set_status(&format!("Cannot send now: {}", safe_line(&error.to_string())))?;
                     }
                     status_dirty = true;
@@ -2992,10 +3014,10 @@ async fn interact_with_herdr(
                         console.set_status("No Chat is selected")?;
                         continue;
                     };
-                    match agent.take_queued_inputs(chat, draft_empty).await {
+                    match agent.take_queued_inputs(chat.into(), draft_empty).await {
                         Ok(entries) if entries.is_empty() => {
-                            let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                            console.set_queued_inputs(chat,status.queued_inputs())?;
+                            let status=agent.status(chat.into()).await.map_err(|error|error.to_string())?;
+                            console.set_queued_inputs(chat.into(),status.queued_inputs())?;
                         },
                         Ok(entries) => {
                             for entry in &entries {
@@ -3003,7 +3025,7 @@ async fn interact_with_herdr(
                                 user_shell_offsets.remove(&entry.id);
                                 user_shell_chats.remove(&entry.id);
                                 queued_shells.remove(&entry.id);
-                                foreground_shells.remove(&entry.chat_id);
+                                foreground_shells.remove(&entry.chat_id.uuid());
                             }
                             console.restore_queued_inputs(&entries)?;
                             console.set_status("Queued input restored for editing")?;
@@ -3014,7 +3036,7 @@ async fn interact_with_herdr(
                 },
                 Some(InputEvent::OpenTranscript { id }) => {
                     if let Some(chat)=selected_chat {
-                        let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                        let snapshot=agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                         console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                     } else {console.update_transcript(id,vec!["No conversation yet. Return to enter a task.".into()].into())?;}
                 },
@@ -3071,10 +3093,10 @@ async fn interact_with_herdr(
                 Some(InputEvent::BackgroundForegroundShell) => {
                     let Some(chat)=selected_chat else { continue; };
                     // Like Claude Code's `backgroundAll`, one press moves every foreground Shell.
-                    if let Some(command_id)=foreground_shells.get(&chat).copied() {
-                        match agent.background_user_shell(chat,command_id).await {
+                    if let Some(command_id)=foreground_shells.get(&chat.uuid()).copied() {
+                        match agent.background_user_shell(chat.into(),command_id).await {
                             Ok(_) => {
-                                foreground_shells.remove(&chat);
+                                foreground_shells.remove(&chat.uuid());
                                 backgrounded_shells.insert(command_id);
                                 console.set_foreground_shell(false)?;
                                 console.set_shell_preview(&[])?;
@@ -3085,7 +3107,7 @@ async fn interact_with_herdr(
                     }
                     // The Bash call returns to the model on its own once its command leaves the foreground.
                     for command_id in console.backgroundable_commands()? {
-                        if let Err(error)=agent.background_command(chat,command_id).await {
+                        if let Err(error)=agent.background_command(chat.into(),command_id).await {
                             outln!(console,"Cannot background command: {}",safe_text(&error.to_string()));
                         }
                     }
@@ -3094,7 +3116,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::Permissions(effect)) => {
                     match effect {
                         PermissionsEffect::Close { destination: PermissionsReturn::ModePicker { settings } } => {
-                            menus.permission_modes(agent, console, ConfigTarget::visible(selected_chat), settings).await?;
+                            menus.permission_modes(agent, console, ConfigTarget::visible(selected_chat.map(Into::into)), settings).await?;
                         },
                         PermissionsEffect::GenerateEnvironment { generation, options } => {
                             let Some(chat) = console.permissions_view_chat()? else { continue; };
@@ -3140,7 +3162,7 @@ async fn interact_with_herdr(
                             match agent.request_denial_retry(chat,record_id).await {
                                 Ok(receipt)=>{
                                     console.close_permissions()?;
-                                    pending.insert(receipt.run_id,receipt);
+                                    pending.insert(receipt.run_id.into(),receipt);
                                     status_dirty=true;
                                     outln!(console,"New retry requested; the Agent will prepare the operation and check current permissions.");
                                 },
@@ -3199,11 +3221,11 @@ async fn interact_with_herdr(
                     let history_line=format!("!{}",submission.command());
                     // Only this attempt's own echo or queue entry may be withdrawn if it is held back
                     // unsent. While a turn works, the command waits in the queue until it starts.
-                    let queue_entry=if retry_of.is_none() && input_waits(chat,&pending,&foreground_shells) {console.queue_submitted_input(QueuedInputKind::Shell,submission.command())?} else {None};
+                    let queue_entry=if retry_of.is_none() && input_waits(chat.into(),&pending,&foreground_shells) {console.queue_submitted_input(QueuedInputKind::Shell,submission.command())?} else {None};
                     let echo=if retry_of.is_none() && queue_entry.is_none() {console.record_input(&history_line)?} else {None};
                     console.record_prompt_history(&history_line)?;
                     let starts_in_background = submission.execution()==shell_input::ShellExecution::Background;
-                    let sent=send_input(agent,chat,retry_of,agent.submit_user_shell(chat,submission.command().to_owned(),starts_in_background),|result|match result {
+                    let sent=send_input(agent,chat.into(),retry_of,agent.submit_user_shell(chat,submission.command().to_owned(),starts_in_background),|result|match result {
                         CommandResult::ShellSubmitted(receipt)=>Some(receipt),
                         _=>None,
                     }).await;
@@ -3305,7 +3327,7 @@ async fn interact_with_herdr(
                             match global.interpret(crate::agent_console::Intent::ChooseLocation {generation,view:ViewRef{session_id,view_id}}) {
                                 Ok(Some(effect))=>{if let Some(snapshot)=navigate_agent(&mut global,agent,console,&mut menus,effect,&displayed_sequences,&mut reply_lines).await? {
                                     selected_chat=Some(snapshot.id);overview_active=false;
-                                    displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
+                                    displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                     message_groups=MessageGroups::default();
@@ -3320,7 +3342,7 @@ async fn interact_with_herdr(
                         // The reference is shown in place; only a command the overview cannot name becomes a Skill dispatch.
                         if line.trim()=="/help advanced" {menus.help_advanced(console)?;continue;}
                         if let Some(command_id)=line.trim().strip_prefix("/acknowledge-create ") {
-                            match command_id.parse::<uuid::Uuid>().map_err(|error|error.to_string())
+                            match tickloop_ids::base62::decode_either(command_id).ok_or_else(||format!("{command_id} is not a command ID"))
                                 .and_then(|id|global.interpret(crate::agent_console::Intent::AcknowledgeUnconfirmedDispatch(id)).map_err(|error|error.to_string())) {
                                 Ok(_)=>{console.set_creation_notice(None)?;console.set_status("Unknown creation acknowledged; no command was replayed")?;},
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
@@ -3391,7 +3413,7 @@ async fn interact_with_herdr(
                         match global.dispatch(agent.launch_spec(),input,agent.origin()).await {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
                                 CreationAcceptance::Attached(created,submitted)=>{
-                                    if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}
+                                    if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id.into());pending.insert(receipt.run_id.into(),receipt);}
                                     // The View goes on to the Agent it just started.
                                     paused_inputs.push_back(InputEvent::OpenAgent(created));
                                 },
@@ -3426,7 +3448,7 @@ async fn interact_with_herdr(
                     if let (Some(source_chat), Some(target)) = (selected_chat, family_target) {
                         let contexts = pasted_images.into_iter().map(InputContext::Image).chain(restored_contexts.clone()).collect();
                         match send_input(agent, source_chat, retry_of,
-                            agent.send_family_input(source_chat, target, line.clone(), contexts, file_references, None),
+                            agent.send_family_input(source_chat.into(), target, line.clone(), contexts, file_references, None),
                             |result| match result {
                                 CommandResult::FamilyInputSent { receipt, target_handle, .. } => Some((receipt, target_handle)),
                                 _ => None,
@@ -3477,26 +3499,26 @@ async fn interact_with_herdr(
                         && command_timing(&line) == CommandTiming::AfterTurn
                         && let Some(chat) = selected_chat
                     {
-                        let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                        let status=agent.status(chat.into()).await.map_err(|error|error.to_string())?;
                         let is_busy=matches!(status.chat_loop.state,tickloop_agent_protocol::LoopState::Running|tickloop_agent_protocol::LoopState::WaitingPermission|tickloop_agent_protocol::LoopState::WaitingQuestion);
                         if is_busy {
-                            let queued=agent.queue_command(chat,original_input.clone());
+                            let queued=agent.queue_command(chat.into(),original_input.clone());
                             match send_input(agent,chat,retry_of,queued,|result|match result {
                                 CommandResult::Queued { command_id }=>Some(command_id),
                                 _=>None,
                             }).await {
                                 InputSend::Accepted { adopted, .. }=>{
-                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat.into()),echo)?;}
                                     console.set_status(&adopted.map(input_adopted).unwrap_or_else(||"Command queued until the current turn ends".into()))?;
                                 },
                                 InputSend::Unknown(id, error)=>{
-                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat.into()),echo)?;}
                                     if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     report_refused_input(console,&error.to_string(),&mut failed);
                                 },
                                 InputSend::Held(error)=>{
-                                    if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat.into()),echo)?;}
                                     if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
                                     report_refused_input(console,&error.to_string(),&mut failed);
@@ -3539,7 +3561,7 @@ async fn interact_with_herdr(
                             let Some(root) = config_root.as_ref() else { outln!(console, "Tickloop Artifacts needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
                             match tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
-                                    Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Tickloop Artifacts: {}", safe_text(&error)); } }
+                                    Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat.map(Into::into), interactive).await { outln!(console, "Cannot open Tickloop Artifacts: {}", safe_text(&error)); } }
                                     Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start the Tickloop Artifacts login: {}", safe_text(&error)) },
                                     Err(error) => outln!(console, "Cannot check the Tickloop Artifacts account: {}", safe_text(&error.to_string())),
                                 },
@@ -3550,7 +3572,7 @@ async fn interact_with_herdr(
                             if command.trim() != "/ticks" { outln!(console, "Use /ticks"); continue; }
                             let Some(root) = config_root.as_deref() else { outln!(console, "Tick packages need a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
                             if !interactive { outln!(console, "/ticks needs an interactive terminal; run tickloop tick there instead."); continue; }
-                            if let Err(error) = ticks_work::open(console, root, selected_chat, &mut tick_package_tasks) { outln!(console, "Cannot open /ticks: {}", safe_text(&error)); }
+                            if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), &mut tick_package_tasks) { outln!(console, "Cannot open /ticks: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
@@ -3563,15 +3585,15 @@ async fn interact_with_herdr(
                         },
                         "/clear" => {
                             if let Some(chat)=selected_chat {
-                                let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                                let status=agent.status(chat.into()).await.map_err(|error|error.to_string())?;
                                 if status.delegation.is_some() {
                                     console.hold_status(&completion::command_refusal(completion::CommandScope::Child,"/clear",completion::CHILD_HISTORY_FIXED))?;
                                     continue;
                                 }
                                 let mut shell_stop_failed=false;
-                                let tasks=task_center.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                let tasks=task_center.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                 for shell in tasks.tasks.iter().filter(|task|task.chat_id==chat && agent.disconnected().is_none() && !task.was_background && task.capabilities.can_stop && matches!(task.state,ShellTaskState::Running|ShellTaskState::Queued|ShellTaskState::WaitingPermission)) {
-                                    if let Err(error)=task_center.dispatch(chat,shell.id,tickloop_agent_protocol::ShellTaskAction::Stop).await {
+                                    if let Err(error)=task_center.dispatch(chat.into(),shell.id,tickloop_agent_protocol::ShellTaskAction::Stop).await {
                                         console.set_status(&format!("Cannot clear the foreground Shell: {}",safe_line(&error.to_string())))?;
                                         shell_stop_failed=true;
                                         break;
@@ -3588,24 +3610,24 @@ async fn interact_with_herdr(
                         },
                         "/status" => {
                             if let Some(chat)=selected_chat {
-                                let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                                outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat,safe_text(&status.model.model),status.model.protocol,status.policy.mode,status.queued_inputs().len());
+                                let status=agent.status(chat.into()).await.map_err(|error|error.to_string())?;
+                                outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat.public(),safe_text(&status.model.model),status.model.protocol,status.policy.mode,status.queued_inputs().len());
                                 if console.prompt_suggestion_enabled()? {
                                     let diagnostic = prompt_suggestion::suppression(&status)
                                         .map(str::to_owned)
-                                        .unwrap_or_else(|| format!("last: {}", suggestion_diagnostics.get(&chat).map_or("not generated in this View", |(_, reason)| *reason)));
+                                        .unwrap_or_else(|| format!("last: {}", suggestion_diagnostics.get(&chat.uuid()).map_or("not generated in this View", |(_, reason)| *reason)));
                                     outln!(console, "Prompt suggestions: On · {diagnostic}");
                                 } else { outln!(console, "Prompt suggestions: Off"); }
                             } else {outln!(console,"No Chat is selected.");}
                         },
-                        "/resume" => match Workflow::chats(agent,&workdir,selected_chat,false).await {
+                        "/resume" => match Workflow::chats(agent,&workdir,selected_chat.map(Into::into),false).await {
                             Ok(picker) => menus.conversations(console,picker)?,
                             Err(error) => outln!(console,"{error}"),
                         },
                         "/monitor" => {
                             let show = !console.monitor_is_visible()?;
                             if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
-                            else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
+                            else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat.into()).await?; }
                         },
                         "/plan" => {
                             if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat).await {
@@ -3615,7 +3637,7 @@ async fn interact_with_herdr(
                         "/details" if interactive => {
                             let id = console.start_transcript()?;
                             if let Some(chat)=selected_chat {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                let snapshot=agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                 console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                             } else {console.update_transcript(id,vec!["No conversation yet. Return to enter a task.".into()].into())?;}
                         },
@@ -3629,7 +3651,7 @@ async fn interact_with_herdr(
                         },
                         "/diff" => {
                             if let Some(chat) = selected_chat {
-                                let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                let snapshot = agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                 let catalog = ChangeCatalog::load(&snapshot).await;
                                     outln!(console, "Diff sources: {} (Agent changes saved in this process)", catalog.sources.len());
                                     for source in catalog.sources {
@@ -3644,19 +3666,19 @@ async fn interact_with_herdr(
                             }
                         },
                         "/settings" => {
-                            menus.settings(agent,console,ConfigTarget::visible(selected_chat)).await?;
+                            menus.settings(agent,console,ConfigTarget::visible(selected_chat.map(Into::into))).await?;
                         },
                         "/auto-mode-setup" => {
                             if let Some(chat) = selected_chat {
-                                match agent.permissions_view(chat).await {
-                                    Ok(view) => { console.show_permissions(view, agent.approval_history_view(chat).await.map_err(|error| error.to_string()), false, true)?; console.open_environment_setup()?; }
+                                match agent.permissions_view(chat.into()).await {
+                                    Ok(view) => { console.show_permissions(view, agent.approval_history_view(chat.into()).await.map_err(|error| error.to_string()), false, true)?; console.open_environment_setup()?; }
                                     Err(error) => outln!(console, "Cannot open Environment setup: {}", safe_text(&error.to_string())),
                                 }
                             } else { outln!(console, "Enter a task before generating an Environment draft."); }
                         },
                         "/permissions" => {
                             if console.is_interactive() {
-                                if let Err(error)=menus.permission_modes(agent,console,ConfigTarget::visible(selected_chat),false).await {
+                                if let Err(error)=menus.permission_modes(agent,console,ConfigTarget::visible(selected_chat.map(Into::into)),false).await {
                                     outln!(console,"Cannot open Permissions: {}.",safe_text(&error));
                                 }
                             } else {
@@ -3674,7 +3696,7 @@ async fn interact_with_herdr(
                                 }
                                 continue;
                             };
-                            match agent.permissions_view(chat).await {
+                            match agent.permissions_view(chat.into()).await {
                                 Ok(view) => {
                                     let rules=view.rules.into_iter().filter(|entry| matches!(entry.source,tickloop_agent_protocol::PermissionRuleSource::ChatSession | tickloop_agent_protocol::PermissionRuleSource::ProjectUser)).map(|entry|entry.rule).collect::<Vec<_>>();
                                     outln!(console,"Permission rules (deny takes precedence over ask and allow):\n{}",safe_text(&serde_json::to_string_pretty(&rules).map_err(|_|"cannot render permission rules")?));
@@ -3689,11 +3711,11 @@ async fn interact_with_herdr(
                             match branch_from_terminal(console,agent,selected_chat,command,preserve_until_summary_finishes).await {
                                 Ok(outcome) => {
                                     menus.dismiss(console)?;
-                                    outln!(console,"Branched conversation \"{}\". You are now in the new Chat {}. Use /resume {} to return to the original.",safe_line(&outcome.name),outcome.child_chat_id,outcome.source_chat_id);
+                                    outln!(console,"Branched conversation \"{}\". You are now in the new Chat {}. Use /resume {} to return to the original.",safe_line(&outcome.name),outcome.child_chat_id.public(),shown_id(outcome.source_chat_id));
                                     workflows::write_public_history(console, &outcome.snapshot)?;
                                     selected_chat=Some(outcome.child_chat_id);
                                     message_groups=MessageGroups::default();
-                                    displayed_sequences.insert(outcome.child_chat_id,outcome.snapshot.last_sequence);
+                                    displayed_sequences.insert(outcome.child_chat_id.into(),outcome.snapshot.last_sequence);
                                     tools.restore(&outcome.snapshot.conversation_events());
                                     sync_snapshot(&outcome.snapshot,&mut pending,&mut permissions,&mut questions);
                                     console.scroll_conversation_to_end()?;
@@ -3707,7 +3729,7 @@ async fn interact_with_herdr(
                             }
                         },
                         _ if line=="/mode" || line.starts_with("/mode ") => {
-                            let target=ConfigTarget::visible(selected_chat);
+                            let target=ConfigTarget::visible(selected_chat.map(Into::into));
                             if let Some(mode) = line.strip_prefix("/mode ") {
                                 match parse_execution_mode(mode) {
                                     Ok((mode,warning)) => {
@@ -3721,16 +3743,16 @@ async fn interact_with_herdr(
                             status_dirty=true;
                         },
                         _ if line=="/provider" => {
-                            if let Err(error) = menus.providers(agent, console, ConfigTarget::visible(selected_chat)).await {
+                            if let Err(error) = menus.providers(agent, console, ConfigTarget::visible(selected_chat.map(Into::into))).await {
                                 outln!(console,"Cannot open Provider directory: {}",safe_text(&error));
                             }
                         },
                         "/model" => {
-                            if let Err(error) = menus.models(agent,console,ConfigTarget::visible(selected_chat)).await { outln!(console,"Cannot open Models: {}",safe_text(&error)); }
+                            if let Err(error) = menus.models(agent,console,ConfigTarget::visible(selected_chat.map(Into::into))).await { outln!(console,"Cannot open Models: {}",safe_text(&error)); }
                         },
                         _ if line.starts_with("/model ") => { outln!(console,"Model files are not supported; use /model to choose from the built-in catalog."); },
                         _ if line=="/thinking" || line.starts_with("/thinking ") => {
-                            let target=ConfigTarget::visible(selected_chat);
+                            let target=ConfigTarget::visible(selected_chat.map(Into::into));
                             if let Some(level) = line.strip_prefix("/thinking ") {
                                 let level = level.trim();
                                 let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
@@ -3764,7 +3786,7 @@ async fn interact_with_herdr(
                             }
                         },
                         _ if line == "/websearch" => {
-                            let target = ConfigTarget::visible(selected_chat);
+                            let target = ConfigTarget::visible(selected_chat.map(Into::into));
                             if let Err(error) = Box::pin(menus.search_settings(agent, console, target, false)).await {
                                 outln!(console, "Cannot open Web search: {}", safe_text(&error));
                             }
@@ -3774,9 +3796,9 @@ async fn interact_with_herdr(
                             if let Some(chat)=selected_chat {
                                 let agent=agent.clone();
                                 let instructions=line.strip_prefix("/compact").map(str::trim).filter(|instructions|!instructions.is_empty()).map(str::to_owned);
-                                let task=compactions.spawn(async move {(chat,agent.compact_with_instructions(chat,instructions).await)});
+                                let task=compactions.spawn(async move {(chat,agent.compact_with_instructions(chat.into(),instructions).await)});
                                 compaction_chats.insert(task.id(),(chat,None::<uuid::Uuid>));
-                                outln!(console, "Compaction requested for Chat {chat}.");
+                                outln!(console, "Compaction requested for Chat {}.", chat.public());
                             } else {outln!(console, "No Chat is selected.");}
                         },
                         _ if line=="/tui" || line.starts_with("/tui ") => {
@@ -3807,7 +3829,7 @@ async fn interact_with_herdr(
                                 }
                                 continue;
                             };
-                            let mut snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                            let mut snapshot = agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                             let Some(mut folder) = snapshot.folder.clone() else {
                                 outln!(console, "This Agent has no working directory");
                                 continue;
@@ -3819,29 +3841,29 @@ async fn interact_with_herdr(
                             }
                             if let Some(path) = line.strip_prefix("/cwd ") { folder = folder.join(path.trim()); }
                             if let Some(path) = line.strip_prefix("/add-dir ") { snapshot.additional_directories.push(folder.join(path.trim())); }
-                            match agent.set_directories(chat,folder,snapshot.additional_directories).await {
+                            match agent.set_directories(chat.into(),folder,snapshot.additional_directories).await {
                                 Ok(()) => {
-                                    let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                    let snapshot = agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                     outln!(console, "Working directory: {}",safe_text(&shown_folder(snapshot.folder.as_deref()).to_string_lossy()));
                                     for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
-                                    show_settings_warnings(console, agent.user_settings_warnings(chat))?;
+                                    show_settings_warnings(console, agent.user_settings_warnings(chat.into()))?;
                                 },
                                 Err(error) => outln!(console, "Cannot update directories: {}",safe_text(&error.to_string())),
                             }
                         },
                         _ if line.starts_with("/acknowledge-create ") || line.starts_with("/acknowledge-input ") => {
                             let (command,argument)=line.split_once(' ').unwrap_or((line.as_str(),""));
-                            let Ok(id)=argument.trim().parse::<uuid::Uuid>() else {
+                            let Some(id)=tickloop_ids::base62::decode_either(argument.trim()) else {
                                 outln!(console,"Usage: {command} COMMAND_ID");
                                 continue;
                             };
                             let message=if command=="/acknowledge-input" {
-                                if agent.acknowledge_input(id) {format!("Input {id} is no longer tracked; nothing was resent")} else {format!("No input {id} with an unknown acceptance result")}
+                                if agent.acknowledge_input(id) {format!("Input {} is no longer tracked; nothing was resent",shown_id(id))} else {format!("No input {} with an unknown acceptance result",shown_id(id))}
                             } else {
                                 match agent.acknowledge_first_create(id) {
-                                    Some(CreateAcknowledgement::DraftRestored)=>format!("Creation {id} is no longer tracked; nothing was resent. If it created an Agent, that Agent appears in Agents; the next input creates a new Agent"),
-                                    Some(CreateAcknowledgement::ChoicesCancelled)=>format!("Choices not yet applied after {id} are cancelled; nothing was resent. The Agent keeps the choices already applied and now takes input"),
-                                    None=>format!("No unknown or failed New Agent command {id}"),
+                                    Some(CreateAcknowledgement::DraftRestored)=>format!("Creation {} is no longer tracked; nothing was resent. If it created an Agent, that Agent appears in Agents; the next input creates a new Agent",shown_id(id)),
+                                    Some(CreateAcknowledgement::ChoicesCancelled)=>format!("Choices not yet applied after {} are cancelled; nothing was resent. The Agent keeps the choices already applied and now takes input",shown_id(id)),
+                                    None=>format!("No unknown or failed New Agent command {}",shown_id(id)),
                                 }
                             };
                             outln!(console,"{message}");
@@ -3860,19 +3882,19 @@ async fn interact_with_herdr(
                         },
                         "/operations" => {
                             if let Some(chat)=selected_chat {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                let snapshot=agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                 outln!(console, "Operations recorded in this process: {}",snapshot.operations.len());
                                 for operation in snapshot.operations {
-                                    outln!(console, "Operation: {} · {:?}\n{} · {}",operation.id,operation.state,safe_text(&operation.name),safe_text(&operation.input.to_string()));
+                                    outln!(console, "Operation: {} · {:?}\n{} · {}",shown_id(operation.id),operation.state,safe_text(&operation.name),safe_text(&operation.input.to_string()));
                                     if let Some(result)=operation.result {outln!(console, "Result: {}",safe_text(&result.content));}
                                 }
                             } else {outln!(console, "No Chat is selected.");}
                         },
                         "/interrupt" => {
                             if let Some(chat) = selected_chat {
-                                let operations = agent.interrupt(chat).await.map_err(|error|error.to_string())?;
+                                let operations = agent.interrupt(chat.into()).await.map_err(|error|error.to_string())?;
                                 outln!(console, "Interrupt requested for the current turn. Tick Subscriptions and Artifact feedback keep arriving.");
-                                for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
+                                for operation in operations { outln!(console, "Operation {} remains {:?}: {}",shown_id(operation.id),operation.state,safe_text(&operation.name)); }
                             } else { outln!(console, "No Chat is selected."); }
                         },
                         _ if line == "/goal" || line.starts_with("/goal ") => {
@@ -3884,11 +3906,11 @@ async fn interact_with_herdr(
                         },
                         "/stop" => {
                             if let Some(chat) = selected_chat {
-                                match agent.stop(chat).await {
+                                match agent.stop(chat.into()).await {
                                     Ok(operations) => {
-                                        menus.reoffer_continue(chat);
+                                        menus.reoffer_continue(chat.into());
                                         outln!(console, "{STOPPED_NOTICE}");
-                                        for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
+                                        for operation in operations { outln!(console, "Operation {} remains {:?}: {}",shown_id(operation.id),operation.state,safe_text(&operation.name)); }
                                     },
                                     Err(error) => outln!(console, "Cannot stop: {}",safe_text(&error.to_string())),
                                 }
@@ -3908,7 +3930,7 @@ async fn interact_with_herdr(
                         _ if line.starts_with("/answer ") && interactive => outln!(console, "Answer the question in its dialog."),
                         _ if line.starts_with("/answer ") => {
                             let request=line.trim_start_matches("/answer ").split_once(' ').ok_or("use /answer QUESTION ANSWER").and_then(|(id,answer)|{
-                                let id=id.parse::<uuid::Uuid>().map_err(|_|"question ID must be a UUID")?;
+                                let id=tickloop_ids::base62::decode_either(id).ok_or("not a question ID")?;
                                 let request=questions.get(&id).cloned().ok_or("question expired")?;
                                 Ok((request,answer.to_owned()))
                             });
@@ -3926,7 +3948,7 @@ async fn interact_with_herdr(
                                     show_opened_chat(console,agent,&snapshot,true)?;
                                     selected_chat=Some(snapshot.id);
                                     message_groups=MessageGroups::default();
-                                    displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
+                                    displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
@@ -3952,13 +3974,13 @@ async fn interact_with_herdr(
                                 outln!(console, "Unknown command; use /help.");
                                 continue;
                             }
-                            let sent=send_input(agent,chat_id,retry_of,agent.invoke_skill(chat_id, name, arguments),submitted_receipt).await;
+                            let sent=send_input(agent,chat_id.into(),retry_of,agent.invoke_skill(chat_id, name, arguments),submitted_receipt).await;
                             match sent {
                                 InputSend::Accepted { value: receipt, adopted } => {
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
-                                    suggestible_runs.insert(receipt.run_id);
-                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id);}
+                                    suggestible_runs.insert(receipt.run_id.into());
+                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id.public());}
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
                                 },
                                 InputSend::Unknown(id, error) => {
@@ -4009,16 +4031,16 @@ async fn interact_with_herdr(
                                 contexts,
                                 file_references,
                             );
-                            match send_input(agent,chat_id,retry_of,submission,submitted_receipt).await {
+                            match send_input(agent,chat_id.into(),retry_of,submission,submitted_receipt).await {
                                 InputSend::Accepted { value: receipt, adopted } => {
                                     if let Some(guard) = &_delayed_guard { guard.mark_accepted(); }
-                                    suggestible_runs.insert(receipt.run_id);
+                                    suggestible_runs.insert(receipt.run_id.into());
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
-                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id);}
+                                    if !interactive {outln!(console, "Accepted: Run {}", receipt.run_id.public());}
                                     let run_id=receipt.run_id;
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
-                                    if send_now && let Err(error)=agent.send_now(chat_id,run_id).await {
+                                    if send_now && let Err(error)=agent.send_now(chat_id,run_id.into()).await {
                                         console.set_status(&format!("Cannot send now: {}",safe_line(&error.to_string())))?;
                                     }
                                 },
@@ -4045,7 +4067,7 @@ async fn interact_with_herdr(
                     }
                 }
                 Some(InputEvent::CycleExecutionMode) => {
-                    let target=ConfigTarget::visible(selected_chat);
+                    let target=ConfigTarget::visible(selected_chat.map(Into::into));
                     // The overview shows no Agent; `selected_chat` there is the hidden one.
                     let hidden=overview_active.then(||completion::unavailable_command("/mode",completion::CommandScope::Overview)).flatten();
                     let result=if let Some((_,reason))=hidden {Err(completion::command_refusal(completion::CommandScope::Overview,"shift+tab mode",reason))} else {match agent.configuration(target).await {
@@ -4092,34 +4114,34 @@ async fn interact_with_herdr(
                 }
                 match &event {
                     Ok(event) => {
-                        if matches!(event.kind,EventKind::Started) && event.sequence>*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
-                            pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
-                            observed_run_starts.entry(event.run_id).or_insert_with(std::time::Instant::now);
+                        if matches!(event.kind,EventKind::Started) && event.sequence>*displayed_sequences.get(&event.chat_id.uuid()).unwrap_or(&0) {
+                            pending.entry(event.run_id.into()).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
+                            observed_run_starts.entry(event.run_id.into()).or_insert_with(std::time::Instant::now);
                             #[cfg(test)]
-                            agent.record_recovery_fact(recovery_tests::RecoveryFact::LiveRunStarted {chat:event.chat_id,run:event.run_id,overview:overview_active});
+                            agent.record_recovery_fact(recovery_tests::RecoveryFact::LiveRunStarted {chat:event.chat_id.into(),run:event.run_id.into(),overview:overview_active});
                         }
                         if matches!(event.kind,EventKind::Started|EventKind::InputMerged {..}) {
                             let echo=show_consumed_input(console,agent,&mut turn_snapshot,event).await?;
                             merged_echoes.consumed_echo(event.run_id,echo);
                         }
-                        if let Some((previous,current))=merged_echoes.observe(event,displayed_sequences.get(&event.chat_id).copied().unwrap_or(0)) {console.join_inputs(event.chat_id,previous,current)?;}
+                        if let Some((previous,current))=merged_echoes.observe(event,displayed_sequences.get(&event.chat_id.uuid()).copied().unwrap_or(0)) {console.join_inputs(event.chat_id.into(),previous,current)?;}
                         #[cfg(test)]
                         if let EventKind::InputMerged { into_run_id } = &event.kind {
-                            agent.record_recovery_fact(recovery_tests::RecoveryFact::MergeObserved {chat:event.chat_id,run:event.run_id,sequence:event.sequence,into_run:*into_run_id});
+                            agent.record_recovery_fact(recovery_tests::RecoveryFact::MergeObserved {chat:event.chat_id.into(),run:event.run_id.into(),sequence:event.sequence,into_run:(*into_run_id).into()});
                         }
                     },
                     Err(_) => merged_echoes.close_all(),
                 }
                 if let Ok(event) = &event {
                     match &event.kind {
-                        EventKind::PermissionRequested { request } => menus.note_request(event.chat_id, request.id),
-                        EventKind::QuestionAsked { request } => menus.note_request(event.chat_id, request.id),
+                        EventKind::PermissionRequested { request } => menus.note_request(event.chat_id.into(), request.id),
+                        EventKind::QuestionAsked { request } => menus.note_request(event.chat_id.into(), request.id),
                         _ => {}
                     }
                     transcript_refresh_due |= Some(event.chat_id) == selected_chat;
                 }
                 match event {
-                Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
+                Ok(event) if !overview_active && (pending.contains_key(&event.run_id.uuid()) || Some(event.chat_id)==selected_chat) => {
                     // Only a run that took in a family message has one to show from the conversation.
                     if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
                         && turn_snapshot.status(agent,event.chat_id).await.is_ok_and(|status|status.family_input_runs.contains(&event.run_id))
@@ -4127,11 +4149,11 @@ async fn interact_with_herdr(
                         learn_agent_colors(console,agent,&snapshot).await?;
                         show_consumed_family_input(console,&snapshot,event.run_id)?;
                     }
-                    if event.sequence<=*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
+                    if event.sequence<=*displayed_sequences.get(&event.chat_id.uuid()).unwrap_or(&0) {
                         #[cfg(test)]
                         agent.record_recovery_fact(recovery_tests::RecoveryFact::Skipped {
-                            chat: event.chat_id,
-                            run: event.run_id,
+                            chat: event.chat_id.into(),
+                            run: event.run_id.into(),
                             sequence: event.sequence,
                             completed: matches!(event.kind, EventKind::Completed { .. }),
                         });
@@ -4141,8 +4163,8 @@ async fn interact_with_herdr(
                     match &event.kind {
                         EventKind::Thinking(thinking) => {
                             thinking_runs.insert(event.run_id);
-                            if interactive && Some(event.chat_id) == selected_chat && !unpaced_runs.contains(&event.run_id) {
-                                let preview = thinking_previews.entry(event.run_id).or_default();
+                            if interactive && Some(event.chat_id) == selected_chat && !unpaced_runs.contains(&tickloop_ids::Id::from(event.run_id.uuid())) {
+                                let preview = thinking_previews.entry(event.run_id.into()).or_default();
                                 preview.append(thinking);
                                 thinking_frame_due = true;
                             }
@@ -4160,14 +4182,14 @@ async fn interact_with_herdr(
                     }
                     let stopped_thinking = was_thinking && !thinking_runs.contains(&event.run_id);
                     if stopped_thinking {
-                        thinking_previews.remove(&event.run_id);
+                        thinking_previews.remove(&event.run_id.uuid());
                     }
                     status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_) | EventKind::ToolUseStarted { .. }) || stopped_thinking;
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
                         if let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await {
-                            menus.invalidate_failed_directory(&snapshot, event.run_id);
+                            menus.invalidate_failed_directory(&snapshot, event.run_id.into());
                         }
                     }
                     if matches!(&event.kind,EventKind::Started) {
@@ -4181,7 +4203,7 @@ async fn interact_with_herdr(
                             .read(agent, event.chat_id)
                             .await
                             .map_err(|error| error.to_string())?;
-                        displayed_sequences.insert(event.chat_id, snapshot.last_sequence);
+                        displayed_sequences.insert(event.chat_id.into(), snapshot.last_sequence);
                         tools.restore(&snapshot.conversation_events());
                         message_groups = MessageGroups::default();
                         thinking_runs.clear();
@@ -4194,7 +4216,7 @@ async fn interact_with_herdr(
                             &mut permissions,
                             &mut questions,
                         );
-                        console.reset_chat(event.chat_id)?;
+                        console.reset_chat(event.chat_id.into())?;
                         learn_agent_colors(console, agent, &snapshot).await?;
                         workflows::write_public_history(console, &snapshot)?;
                         outln!(
@@ -4221,7 +4243,7 @@ async fn interact_with_herdr(
                             message_groups.displayed
                                 .contains(&id.replace(":assistant:", ":thinking:"))
                         });
-                    displayed_sequences.insert(event.chat_id,event.sequence);
+                    displayed_sequences.insert(event.chat_id.into(),event.sequence);
                     let console = &console.for_message(message_id.clone());
                     let result_source = tools.result_source(&event);
                     let conversation = if result_source == presentation::ResultSource::Conversation || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
@@ -4231,7 +4253,7 @@ async fn interact_with_herdr(
                     };
                     let operation = match &event.kind {
                         EventKind::ToolCompleted { call_id, .. } if result_source == presentation::ResultSource::Operation => {
-                            agent.operation(event.chat_id, event.run_id, call_id).await.ok().flatten()
+                            agent.operation(event.chat_id.into(), event.run_id.into(), call_id).await.ok().flatten()
                         },
                         _ => None,
                     };
@@ -4252,7 +4274,7 @@ async fn interact_with_herdr(
                         | EventKind::Failed(_)
                         | EventKind::Interrupted
                     )
-                        && let Some(mut reply) = reply_lines.remove(&event.run_id) {
+                        && let Some(mut reply) = reply_lines.remove(&event.run_id.uuid()) {
                             reply.finish();
                             write_pending_reply_lines(console, &mut reply)?;
                     }
@@ -4260,16 +4282,16 @@ async fn interact_with_herdr(
                         console.write_pieces(&[presentation::thinking_label()])?;
                     }
                     let interrupted_by_user = matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted)
-                        && user_interrupted_runs.remove(&event.run_id)
+                        && user_interrupted_runs.remove(&tickloop_ids::Id::from(event.run_id.uuid()))
                         && matches!(&event.kind,EventKind::Interrupted);
                     if matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted) {
-                        unpaced_runs.remove(&event.run_id);
+                        unpaced_runs.remove(&tickloop_ids::Id::from(event.run_id.uuid()));
                     }
                     let facts = match &operation {
                         Some(operation) => presentation::CallFacts { review: presentation::operation_review(operation), report: None },
                         None => conversation.as_ref().map(|snapshot| tools.call_facts(&event, snapshot)).unwrap_or_default(),
                     };
-                    let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
+                    let interrupted_by_rejection = tools.ended_with_rejection(event.run_id.into());
                     if tools.present_event(console,&event,&facts)? { continue; }
                     match event.kind {
                         EventKind::FamilyInputUpdated { record } => console.write(&presentation::family_input_text(&record, presentation::OutputDetail::Preview))?,
@@ -4288,16 +4310,16 @@ async fn interact_with_herdr(
                         },
                         EventKind::Text(text) => {
                             if interactive {
-                                let reply = reply_lines.entry(event.run_id).or_insert_with(|| ReplyLines::new(event.chat_id, message_id));
+                                let reply = reply_lines.entry(event.run_id.into()).or_insert_with(|| ReplyLines::new(event.chat_id.into(), message_id));
                                 reply.push(&safe_text(&text));
                                 #[cfg(test)]
                                 agent.record_recovery_fact(recovery_tests::RecoveryFact::Buffered {
-                                    chat: event.chat_id,
-                                    run: event.run_id,
+                                    chat: event.chat_id.into(),
+                                    run: event.run_id.into(),
                                     sequence: event.sequence,
                                     complete_line: reply.has_complete_line(),
                                 });
-                                if unpaced_runs.contains(&event.run_id) {
+                                if unpaced_runs.contains(&tickloop_ids::Id::from(event.run_id.uuid())) {
                                     write_pending_reply_lines(console, reply)?;
                                 } else {
                                     write_next_reply_line(console, reply)?;
@@ -4314,19 +4336,19 @@ async fn interact_with_herdr(
                         },
                         EventKind::Completed { .. } => {
                             #[cfg(test)]
-                            agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
+                            agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id.into(),run:event.run_id.into(),sequence:event.sequence});
                             event_frame.take();
                             let details = if interactive {
-                                let shells = task_center.snapshot(event.chat_id).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
-                                Some(completion_details(event.run_id, observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), shells))
+                                let shells = task_center.snapshot(event.chat_id.into()).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
+                                Some(completion_details(event.run_id, observed_run_starts.get(&event.run_id.uuid()).map(std::time::Instant::elapsed), shells))
                             } else { None };
                             write_completion_notice(console, details.as_ref())?;
-                            if suggestible_runs.remove(&event.run_id) && interactive {
+                            if suggestible_runs.remove(&event.run_id.uuid()) && interactive {
                                 if let Ok(status) = turn_snapshot.status(agent, event.chat_id).await {
                                     if let Some(reason) = prompt_suggestion::suppression(&status) {
-                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
-                                    } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
-                                        suggestion_diagnostics.insert(event.chat_id, (request.id, "generating"));
+                                        suggestion_diagnostics.insert(event.chat_id.into(), (event.run_id.into(), reason));
+                                    } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id.into())? {
+                                        suggestion_diagnostics.insert(event.chat_id.into(), (request.id, "generating"));
                                         let models = suggestion_models.clone();
                                         // A suggestion is drawn from the conversation it follows.
                                         let conversation = turn_snapshot.read(agent, event.chat_id).await;
@@ -4339,16 +4361,16 @@ async fn interact_with_herdr(
                                         });
                                     } else {
                                         let reason = console.prompt_suggestion_suppression()?.unwrap_or("suppressed: Agent View changed");
-                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
+                                        suggestion_diagnostics.insert(event.chat_id.into(), (event.run_id.into(), reason));
                                     }
                                 } else {
-                                    suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: Agent unavailable"));
+                                    suggestion_diagnostics.insert(event.chat_id.into(), (event.run_id.into(), "suppressed: Agent unavailable"));
                                 }
                             }
                         },
                         EventKind::Failed(error) => {
-                            if suggestible_runs.remove(&event.run_id) {
-                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: failed turn"));
+                            if suggestible_runs.remove(&event.run_id.uuid()) {
+                                suggestion_diagnostics.insert(event.chat_id.into(), (event.run_id.into(), "suppressed: failed turn"));
                             }
                             let message = if interactive {
                                 format!(
@@ -4368,14 +4390,14 @@ async fn interact_with_herdr(
                         EventKind::ModelRetry { kind, error, attempt, max_retries, delay_ms } => {
                             let (failure, retry) =
                                 model_retry_parts(kind, &error, attempt, max_retries, delay_ms);
-                            console.write_model_retry(event.run_id, kind, attempt, &[
+                            console.write_model_retry(event.run_id.into(), kind, attempt, &[
                                 (failure, Some(Role::Error)),
                                 (retry, Some(Role::MutedText)),
                             ])?;
                         },
                         EventKind::Interrupted => {
-                            if suggestible_runs.remove(&event.run_id) {
-                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
+                            if suggestible_runs.remove(&event.run_id.uuid()) {
+                                suggestion_diagnostics.insert(event.chat_id.into(), (event.run_id.into(), "suppressed: interrupted turn"));
                             }
                             event_frame.take();
                             if interactive {
@@ -4390,37 +4412,37 @@ async fn interact_with_herdr(
                                 if interrupted_by_user
                                     && let Some(restored)=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
                                 {
-                                    displayed_sequences.insert(restored.id,restored.last_sequence);
+                                    displayed_sequences.insert(restored.id.into(),restored.last_sequence);
                                     tools.restore(&restored.conversation_events());
                                     sync_snapshot(&restored,&mut pending,&mut permissions,&mut questions);
                                 }
                             } else {
-                                outln!(console, "\nInterrupted run {}",event.run_id);
+                                outln!(console, "\nInterrupted run {}",event.run_id.public());
                             }
                         },
                         EventKind::InputMerged { into_run_id } => {
                             if !interactive {
-                                outln!(console, "Queued input joined run {into_run_id}.");
+                                outln!(console, "Queued input joined run {}.", into_run_id.public());
                             }
                         },
                         EventKind::InputTakenBack | EventKind::ResponseStarted { .. } | EventKind::ToolUseStarted { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
                         EventKind::Started => {
-                            pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
+                            pending.entry(event.run_id.into()).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
                             if interactive {
                                 console.hide_completion_notice()?;
                             } else {
                                 event_frame.take();
                                 let status = turn_snapshot.status(agent, event.chat_id).await.map_err(|error|error.to_string())?;
-                                outln!(console, "Run: {} · Running\nModel: {} · {:?}", event.run_id,safe_text(&status.model.model),status.model.protocol);
+                                outln!(console, "Run: {} · Running\nModel: {} · {:?}", event.run_id.public(),safe_text(&status.model.model),status.model.protocol);
                             }
                         },
                         // The terminal UI asks in its request dialog, outside the conversation.
                         EventKind::PermissionRequested {request} if !interactive => {
                             event_frame.take();
-                            if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id).await?)?;}
-                            else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
-                            else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
+                            if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id.into()).await?)?;}
+                            else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {0} to enter plan mode or /deny {0} to stay in the current mode.", shown_id(request.id));}
+                            else {outln!(console, "\nPermission request: {0} · {1}\nOperation: {2}\nUse /allow {0} [once|session|persistent] or /deny {0}.", shown_id(request.id), safe_text(&request.name), safe_text(&request.input.to_string()));}
                         },
                         EventKind::PermissionRequested {..} => {},
                         EventKind::ApprovalAssessed { .. } => {},
@@ -4431,7 +4453,7 @@ async fn interact_with_herdr(
                         },
                         EventKind::QuestionAsked {request} => print_question(console, &request)?,
                         EventKind::PlanUpdated {plan} => {
-                            outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id,plan.version,safe_text(&plan.markdown));
+                            outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id.public(),plan.version,safe_text(&plan.markdown));
 
                         },
                         EventKind::ProgressUpdated {progress} => {
@@ -4470,10 +4492,10 @@ async fn interact_with_herdr(
                     let visible_chat = selected_chat.filter(|_| !overview_active);
                     if let Some(chat)=visible_chat.filter(|chat|lost.includes(*chat)) {
                         let frame_hold=console.hold_frames()?;
-                        let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
+                        let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat.uuid()).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                         drop(frame_hold);
                         failed |= observation.snapshot.chat_loop.state==tickloop_agent_protocol::LoopState::Failed;
-                        displayed_sequences.insert(chat,observation.snapshot.last_sequence);
+                        displayed_sequences.insert(chat.into(),observation.snapshot.last_sequence);
                         let status=ChatStatus::of(&observation.snapshot);
                         sync_status(&status,&mut pending,&mut permissions,&mut questions);
                         menus.note_status_requests(&status);
@@ -4490,7 +4512,7 @@ async fn interact_with_herdr(
                         LostEvents::Chats(chats) => (Vec::new(), chats.iter().copied().filter(|chat|Some(*chat)!=visible_chat).collect()),
                     };
                     for chat in unlisted_chats {
-                        match agent.live_snapshot(chat).await {
+                        match agent.live_snapshot(chat.into()).await {
                             Ok(snapshot)=>background_snapshots.push(snapshot),
                             Err(error) if error.code==AccessErrorCode::NotFound=>{
                                 pending.retain(|_,receipt|receipt.chat_id!=chat);
@@ -4583,7 +4605,7 @@ async fn interact_with_herdr(
                         Ok(outcome) => {
                             let effect=directed_summary::finish_success(console,outcome)?;
                             summary_recovery_required.remove(&metadata.chat);
-                            displayed_sequences.insert(metadata.chat,effect.snapshot.last_sequence);
+                            displayed_sequences.insert(metadata.chat.into(),effect.snapshot.last_sequence);
                             merged_echoes.close_all();
                             tools.restore(&effect.snapshot.conversation_events());
                             message_groups=MessageGroups::default();
@@ -4598,7 +4620,7 @@ async fn interact_with_herdr(
                     },
                     SummaryTaskCompletion::ObserverStopped {metadata}=>{
                         summary_recovery_required.insert(metadata.chat);
-                        outln!(console,"Conversation summary observer for Chat {} stopped before receiving its result. Restart the Agent host to recover before continuing.",metadata.chat);
+                        outln!(console,"Conversation summary observer for Chat {} stopped before receiving its result. Restart the Agent host to recover before continuing.",metadata.chat.public());
                         console.finish_summary_input_transition()?;
                         failed=true;
                     },
@@ -4612,7 +4634,7 @@ async fn interact_with_herdr(
                     Ok(_)=>{
                         if let Ok(Some(receipt))=global.reconcile_dispatch().await {
                             match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(_,submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
+                                CreationAcceptance::Attached(_,submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id.into(),receipt);}},
                                 CreationAcceptance::AttachUnavailable(error)=>{
                                     let notice=creation_attach_unavailable(&error);
                                     console.set_status(&notice)?;
@@ -4632,13 +4654,13 @@ async fn interact_with_herdr(
                             failed=true;
                             if interactive {
                                 let label=readable_background_label(agent,console,notice.chat);
-                                console.record_execution_loss(notice.chat,console::ExecutionLossNotice {
-                                    run_id:notice.run,
+                                console.record_execution_loss(notice.chat.into(),console::ExecutionLossNotice {
+                                    run_id:notice.run.into(),
                                     summary:format!("\n{label} · Execution connection was lost · outcome unknown for that attempt; nothing was resent. Use /resume to open saved history; continuing requires an explicit new input.\n"),
                                     technical:notice.text,
                                 })?;
                             } else {outln!(console,"{}",notice.text);}
-                            if Some(notice.chat)!=selected_chat {background_notice=Some((notice.chat,BackgroundRunNotice { message: "Outcome unknown · execution lost · nothing resent".into(), compact_message: Some("Unknown/lost/no resend".into()), necessary: true }));}
+                            if Some(notice.chat)!=selected_chat{background_notice=Some((notice.chat,BackgroundRunNotice { message: "Outcome unknown · execution lost · nothing resent".into(), compact_message: Some("Unknown/lost/no resend".into()), necessary: true }));}
                         }
                         console.set_creation_notice(creation_notice(&projection))?;
                         if overview_active {console.set_global_overview(Some(agent_overview(&projection)))?;}
@@ -4648,7 +4670,7 @@ async fn interact_with_herdr(
                                 global.visible_ready(Some(row.execution));
                                 console.set_family_input_targets(family_input_targets(&global.family_members(row.execution), row.execution))?;
                                 let family=global.family(row.execution);
-                                visible_family=family.iter().filter(|row|row.availability==ExecutionAvailability::Live).map(|row|row.chat_id).collect();
+                                visible_family=family.iter().filter(|row|row.availability==ExecutionAvailability::Live).map(|row|ChatId::from(row.chat_id)).collect();
                                 console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
                                 console.set_task_title((row.parent.is_none() && row.has_work==Some(true)).then(|| safe_line(&row.title)))?;
                                 // Only the daemon's current answer can prove a run ended; a cached copy predates it.
@@ -4656,7 +4678,7 @@ async fn interact_with_herdr(
                                 // shows its work changed since its snapshot was last applied, as a run ending
                                 // without its end event does. The reads go out together, so a quiet family costs
                                 // none and a busy one a single round trip that Thinking deltas do not wait behind.
-                                applied_member_work.retain(|member,_|visible_family.contains(member));
+                                applied_member_work.retain(|member,_|visible_family.contains(&tickloop_ids::Id::from(*member)));
                                 let changed=family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live
                                     && (!agent.follows(row.execution) || applied_member_work.get(&row.chat_id)!=Some(&MemberWork::of(row))))
                                     .collect::<Vec<_>>();
@@ -4677,9 +4699,9 @@ async fn interact_with_herdr(
                                         applied_member_work.insert(row.chat_id,MemberWork::of(row));
                                         if outcome_pending {
                                             if !overview_active && Some(status.id)==selected_chat {
-                                                let restored=restore_view(console,agent,&mut tools,status.id,*displayed_sequences.get(&status.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
+                                                let restored=restore_view(console,agent,&mut tools,status.id,*displayed_sequences.get(&status.id.uuid()).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                                                 failed |= restored.snapshot.chat_loop.state==tickloop_agent_protocol::LoopState::Failed;
-                                                displayed_sequences.insert(status.id,restored.snapshot.last_sequence);
+                                                displayed_sequences.insert(status.id.into(),restored.snapshot.last_sequence);
                                                 merged_echoes.close_all();
                                                 sync_snapshot(&restored.snapshot,&mut pending,&mut permissions,&mut questions);
                                             } else {
@@ -4702,7 +4724,7 @@ async fn interact_with_herdr(
                                     }
                                 }
                                 if row.availability==ExecutionAvailability::Live {
-                                    show_settings_warnings(console,agent.user_settings_warnings(chat))?;
+                                    show_settings_warnings(console,agent.user_settings_warnings(chat.into()))?;
                                 }
                             }
                             else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;console.set_task_title(None)?;console.set_family_input_targets(Vec::new())?;}
@@ -4714,7 +4736,7 @@ async fn interact_with_herdr(
                             .collect::<HashSet<_>>();
                         for chat in background_request_chats {
                             // A cached snapshot cannot prove that another View resolved a request.
-                            if let Ok(execution)=agent.reference(chat).await
+                            if let Ok(execution)=agent.reference(chat.into()).await
                                 && let Ok(observation)=agent.access().observe(ObservationRequest::Agent {
                                     execution,detail:AgentDetailQuery::Status,after:None,
                                 }).await
@@ -4725,7 +4747,7 @@ async fn interact_with_herdr(
                         }
                         let live_visible=selected_chat.filter(|chat|visible_rows.iter().any(|row|row.chat_id==*chat && row.availability==ExecutionAvailability::Live));
                         daemon_unreachable=None;
-                        let notice=if let Err(error)=agent.display_chat(if overview_active {None}else{live_visible}).await {
+                        let notice=if let Err(error)=agent.display_chat(if overview_active {None}else{live_visible.map(Into::into)}).await {
                             Some(format!("{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",safe_line(&error.to_string())))
                         } else if let Err(error)=agent.renew_display().await {
                             Some(format!("View connection unavailable · {}",safe_line(&error.to_string())))
@@ -4757,7 +4779,7 @@ async fn interact_with_herdr(
                 transcript_refresh_due = false;
                 if let Some(chat) = selected_chat
                     && let Some(id) = console.open_transcript()?
-                    && let Ok(snapshot) = agent.snapshot(chat).await
+                    && let Ok(snapshot) = agent.snapshot(chat.into()).await
                 {
                     console.refresh_transcript(id, presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                 }
@@ -4766,7 +4788,7 @@ async fn interact_with_herdr(
                 activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
-                if let Some(reply) = reply_lines.values_mut().find(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line()) {
+                if let Some(reply) = reply_lines.values_mut().find(|reply| Some(reply.chat_id) == selected_chat.map(Into::into) && reply.has_complete_line()) {
                     write_next_reply_line(console, reply)?;
                 }
             },
@@ -4838,13 +4860,16 @@ async fn interact_with_herdr(
 async fn take_back_interrupted_prompt(
     agent: &Agent,
     console: &Console,
-    chat: uuid::Uuid,
-    run: uuid::Uuid,
+    chat: ChatId,
+    run: RunId,
 ) -> Result<Option<ChatSnapshot>, String> {
     if !console.input_is_empty()? {
         return Ok(None);
     }
-    let (snapshot, draft) = match agent.take_back_interrupted_prompt(chat, run).await {
+    let (snapshot, draft) = match agent
+        .take_back_interrupted_prompt(chat.into(), run.into())
+        .await
+    {
         Ok(Some(taken_back)) => taken_back,
         Ok(None) => return Ok(None),
         Err(error) => {
@@ -4855,7 +4880,7 @@ async fn take_back_interrupted_prompt(
             return Ok(None);
         }
     };
-    console.reset_chat(chat)?;
+    console.reset_chat(chat.into())?;
     workflows::write_public_history(console, &snapshot)?;
     console.restore_interrupted_prompt(&draft.prompt, &draft.contexts)?;
     Ok(Some(snapshot))
@@ -4865,7 +4890,7 @@ async fn open_rewind(
     agent: &Agent,
     console: &Console,
     menus: &mut Menus,
-    chat: Option<uuid::Uuid>,
+    chat: Option<ChatId>,
     is_busy: bool,
 ) -> Result<Option<String>, String> {
     let Some(chat) = chat else {
@@ -4879,7 +4904,7 @@ async fn open_rewind(
         return Ok(Some(status.into()));
     }
     let snapshot = agent
-        .snapshot(chat)
+        .snapshot(chat.into())
         .await
         .map_err(|error| error.to_string())?;
     if !snapshot.permissions.is_empty() || !snapshot.questions.is_empty() {
@@ -4919,8 +4944,8 @@ fn save_monitor_width(settings: Option<&UserSettings>, columns: usize) -> Result
         .map_err(|error| format!("Cannot save the Monitor width: {error}"))
 }
 
-async fn open_diff(agent: &Agent, console: &Console, chat_id: uuid::Uuid) -> Result<(), String> {
-    let snapshot = match agent.snapshot(chat_id).await {
+async fn open_diff(agent: &Agent, console: &Console, chat_id: ChatId) -> Result<(), String> {
+    let snapshot = match agent.snapshot(chat_id.into()).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             console.set_status(&format!(
@@ -4931,20 +4956,20 @@ async fn open_diff(agent: &Agent, console: &Console, chat_id: uuid::Uuid) -> Res
         }
     };
     let catalog = ChangeCatalog::load(&snapshot).await;
-    console.show_diff(chat_id, catalog)
+    console.show_diff(chat_id.into(), catalog)
 }
 
 async fn check_shell_prompt_watchdog(
     task_center: &ShellTaskCenter,
     console: &Console,
-    chat_id: uuid::Uuid,
+    chat_id: ChatId,
     watchdog: &mut ShellTaskPromptWatchdog,
     now: std::time::Duration,
 ) -> Result<(), String> {
     const PROMPT_TAIL_BYTES: u64 = 4096;
 
     let snapshot = task_center
-        .snapshot(chat_id)
+        .snapshot(chat_id.into())
         .await
         .map_err(|error| error.to_string())?;
     for task in &snapshot.tasks {
@@ -4954,7 +4979,7 @@ async fn check_shell_prompt_watchdog(
                 .unwrap_or(PROMPT_TAIL_BYTES as usize)
                 .max(1);
             task_center
-                .read_output(chat_id, task.id, cursor, limit)
+                .read_output(chat_id.into(), task.id, cursor, limit)
                 .await
                 .map(|chunk| chunk.output)
                 .unwrap_or_default()
@@ -4964,11 +4989,10 @@ async fn check_shell_prompt_watchdog(
         if let Some(ShellTaskNotice::InteractivePrompt { task_id, .. }) =
             watchdog.observe(task, &trailing_output, now)
         {
-            let task_id = task_id.simple().to_string();
             outln!(
                 console,
                 "\nBackground Shell {} may be waiting for input. Open it in Monitor to inspect it.",
-                &task_id[..8]
+                tick_protocol::ShellTaskId::from(task_id).public()
             );
         }
     }
@@ -5023,7 +5047,7 @@ async fn render_user_shell_update(
     let mut offset = shown.offset;
     while record.output_bytes > offset {
         let result = match agent
-            .read_user_shell_output(record.chat_id, record.id, offset, 64 * 1024)
+            .read_user_shell_output(record.chat_id.into(), record.id, offset, 64 * 1024)
             .await
         {
             Ok(result) => result,
@@ -5070,7 +5094,7 @@ async fn render_user_shell_update(
     }
     if console.is_interactive() {
         let output = agent
-            .read_user_shell_output(record.chat_id, record.id, 0, USER_SHELL_RESULT_BYTES)
+            .read_user_shell_output(record.chat_id.into(), record.id, 0, USER_SHELL_RESULT_BYTES)
             .await
             .ok()
             .and_then(|result| serde_json::from_str::<serde_json::Value>(&result.content).ok())
@@ -5126,16 +5150,16 @@ fn observe_user_shell_record(
     }
     let is_backgrounded = backgrounded_shells.contains(&record.id);
     let is_terminal = user_shell_is_terminal(record);
-    let was_foreground = foreground_shells.get(&record.chat_id) == Some(&record.id);
+    let was_foreground = foreground_shells.get(&record.chat_id.uuid()) == Some(&record.id);
     let mut foreground = None;
     if record.state == UserShellState::Running && !is_backgrounded {
-        foreground_shells.insert(record.chat_id, record.id);
+        foreground_shells.insert(record.chat_id.into(), record.id);
         foreground = Some(true);
     }
-    let is_foreground = foreground_shells.get(&record.chat_id) == Some(&record.id);
+    let is_foreground = foreground_shells.get(&record.chat_id.uuid()) == Some(&record.id);
     let render_in_chat = !is_backgrounded && (was_foreground || is_foreground || is_terminal);
     if (is_terminal || is_backgrounded) && is_foreground {
-        foreground_shells.remove(&record.chat_id);
+        foreground_shells.remove(&record.chat_id.uuid());
         foreground = Some(false);
     }
     if is_terminal {
@@ -5160,7 +5184,7 @@ fn show_started_shell(
     let _frame_hold = console.hold_frames()?;
     console.withdraw_queued_input(record.id)?;
     console.record_consumed_input(
-        record.chat_id,
+        record.chat_id.into(),
         record.id,
         &safe_text(&format!("!{}", record.command)),
     )?;
@@ -5190,12 +5214,12 @@ impl TurnSnapshot {
     async fn read(
         &mut self,
         agent: &Agent,
-        chat: uuid::Uuid,
+        chat: ChatId,
     ) -> Result<Arc<ChatSnapshot>, AccessError> {
         if let Some(snapshot) = self.conversation_of(chat) {
             return Ok(snapshot);
         }
-        let snapshot = Arc::new(agent.snapshot(chat).await?);
+        let snapshot = Arc::new(agent.snapshot(chat.into()).await?);
         self.status = None;
         self.conversation = Some(snapshot.clone());
         Ok(snapshot)
@@ -5205,21 +5229,21 @@ impl TurnSnapshot {
     async fn status(
         &mut self,
         agent: &Agent,
-        chat: uuid::Uuid,
+        chat: ChatId,
     ) -> Result<Arc<ChatStatus>, AccessError> {
         if let Some(status) = self.status.as_ref().filter(|status| status.id == chat) {
             return Ok(status.clone());
         }
         let status = Arc::new(match self.conversation_of(chat) {
             Some(snapshot) => ChatStatus::of(&snapshot),
-            None => agent.status(chat).await?,
+            None => agent.status(chat.into()).await?,
         });
         self.status = Some(status.clone());
         Ok(status)
     }
 
     /// This turn's conversation of `chat`, when the turn read one.
-    fn conversation_of(&self, chat: uuid::Uuid) -> Option<Arc<ChatSnapshot>> {
+    fn conversation_of(&self, chat: ChatId) -> Option<Arc<ChatSnapshot>> {
         self.conversation
             .clone()
             .filter(|snapshot| snapshot.id == chat)
@@ -5241,7 +5265,7 @@ impl TurnSnapshot {
 #[derive(PartialEq)]
 struct MemberWork {
     state: tickloop_agent_protocol::LoopState,
-    run_id: Option<uuid::Uuid>,
+    run_id: Option<RunId>,
     updated_at: Option<u64>,
     waiting_permissions: usize,
     waiting_questions: usize,
@@ -5262,16 +5286,18 @@ impl MemberWork {
 /// Report the selected family, or all known work in the overview. A new draft is idle;
 /// stale family membership from the previously selected Chat must not leak into its report.
 fn herdr_view_state(
-    selected: Option<uuid::Uuid>,
+    selected: Option<ChatId>,
     overview: bool,
-    family: &[uuid::Uuid],
-    mut working: impl Iterator<Item = uuid::Uuid>,
-    mut waiting: impl Iterator<Item = uuid::Uuid>,
+    family: &[ChatId],
+    mut working: impl Iterator<Item = ChatId>,
+    mut waiting: impl Iterator<Item = ChatId>,
 ) -> herdr_agent::State {
     let includes = |chat| {
         overview
             || selected.is_some_and(|selected| {
-                selected == chat || (family.contains(&selected) && family.contains(&chat))
+                selected == chat
+                    || (family.contains(&tickloop_ids::Id::from(selected.uuid()))
+                        && family.contains(&chat))
             })
     };
     if waiting.any(includes) {
@@ -5286,10 +5312,10 @@ fn herdr_view_state(
 #[test]
 fn herdr_state_follows_selected_family_and_user_requests() {
     use herdr_agent::State;
-    let root = uuid::Uuid::new_v4();
-    let child = uuid::Uuid::new_v4();
-    let other = uuid::Uuid::new_v4();
-    let state = |selected, overview, family: &[uuid::Uuid], working: Vec<_>, waiting: Vec<_>| {
+    let root = ChatId::new();
+    let child = ChatId::new();
+    let other = ChatId::new();
+    let state = |selected, overview, family: &[ChatId], working: Vec<_>, waiting: Vec<_>| {
         herdr_view_state(
             selected,
             overview,
@@ -5349,7 +5375,7 @@ fn sync_status(
     sync_status_requests(status, permissions, questions);
     pending.retain(|_, receipt| receipt.chat_id != status.id);
     for receipt in receipts_in_progress(status) {
-        pending.insert(receipt.run_id, receipt);
+        pending.insert(receipt.run_id.into(), receipt);
     }
 }
 
@@ -5381,16 +5407,16 @@ fn receipts_in_progress(status: &ChatStatus) -> impl Iterator<Item = Receipt> + 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PermissionRequestOwner {
-    chat_id: uuid::Uuid,
+    chat_id: ChatId,
     loop_id: uuid::Uuid,
-    run_id: Option<uuid::Uuid>,
+    run_id: Option<RunId>,
 }
 
 impl PermissionRequestOwner {
-    fn new(chat_id: uuid::Uuid, request: &tickloop_agent_protocol::PermissionRequest) -> Self {
+    fn new(chat_id: ChatId, request: &tickloop_agent_protocol::PermissionRequest) -> Self {
         Self {
             chat_id,
-            loop_id: request.loop_id,
+            loop_id: request.loop_id.into(),
             run_id: request.execution.run_id(),
         }
     }
@@ -5416,11 +5442,11 @@ enum LostEvents {
     /// The View's own event queue overflowed, so any Chat may have lost events.
     AnyChat,
     /// The daemon's feed of these Chats skipped events.
-    Chats(HashSet<uuid::Uuid>),
+    Chats(HashSet<ChatId>),
 }
 
 impl LostEvents {
-    fn includes(&self, chat: uuid::Uuid) -> bool {
+    fn includes(&self, chat: ChatId) -> bool {
         match self {
             Self::AnyChat => true,
             Self::Chats(chats) => chats.contains(&chat),
@@ -5429,7 +5455,7 @@ impl LostEvents {
 
     /// `lost` widened by a gap in `chat`'s feed; `None` when so many gaps were announced that
     /// some of their Chats are no longer known.
-    fn with_gap(lost: Option<Self>, chat: Option<uuid::Uuid>) -> Self {
+    fn with_gap(lost: Option<Self>, chat: Option<ChatId>) -> Self {
         match (lost, chat) {
             (Some(Self::Chats(mut chats)), Some(chat)) => {
                 chats.insert(chat);
@@ -5461,7 +5487,7 @@ fn announced_feed_gaps(
                 return lost;
             }
         };
-        lost = Some(LostEvents::with_gap(lost, chat));
+        lost = Some(LostEvents::with_gap(lost, chat.map(Into::into)));
     }
 }
 
@@ -5486,7 +5512,7 @@ async fn next_event(
         tokio::select! {
             biased;
             gap @ (Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) = feed_gaps.recv() => {
-                lost = Some(LostEvents::with_gap(None, gap.ok()));
+                lost = Some(LostEvents::with_gap(None, gap.ok().map(Into::into)));
             }
             received = events.recv() => match received {
                 Ok(event) if feed_gaps.is_empty() => return Ok(event),
@@ -5502,13 +5528,13 @@ async fn restore_view(
     console: &Console,
     agent: &Agent,
     tools: &mut ToolPresentation,
-    chat: uuid::Uuid,
+    chat: ChatId,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
     message_groups: &mut MessageGroups,
 ) -> Result<ExecutionObservation, String> {
     let observation = agent
-        .observe(chat, after)
+        .observe(chat.into(), after)
         .await
         .map_err(|error| error.to_string())?;
     learn_agent_colors(console, agent, &observation.snapshot).await?;
@@ -5523,7 +5549,7 @@ async fn restore_view(
     )?;
     #[cfg(test)]
     agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
-        chat,
+        chat: chat.into(),
         after,
         last_sequence: observation.snapshot.last_sequence,
         reset_required: observation.reset_required,
@@ -5534,7 +5560,7 @@ async fn restore_view(
 fn render_restored_observation(
     console: &Console,
     tools: &mut ToolPresentation,
-    chat: uuid::Uuid,
+    chat: ChatId,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
     message_groups: &mut MessageGroups,
@@ -5542,7 +5568,7 @@ fn render_restored_observation(
 ) -> Result<ExecutionObservation, String> {
     ensure_snapshot_banner(console, &observation.snapshot)?;
     let conversation_events = observation.snapshot.conversation_events();
-    console.select_chat(Some(chat))?;
+    console.select_chat(Some(chat.into()))?;
     let failed_runs = conversation_events
         .iter()
         .filter_map(|event| matches!(event.kind, EventKind::Failed(_)).then_some(event.run_id))
@@ -5555,10 +5581,10 @@ fn render_restored_observation(
             .filter(|event| event.chat_id == chat)
         {
             if matches!(event.kind, EventKind::Failed(_)) {
-                buffered_replies.remove(&event.run_id);
+                buffered_replies.remove(&event.run_id.uuid());
             } else if event.sequence <= after
                 && matches!(event.kind, EventKind::Completed { .. })
-                && let Some(mut reply) = buffered_replies.remove(&event.run_id)
+                && let Some(mut reply) = buffered_replies.remove(&event.run_id.uuid())
             {
                 reply.finish();
                 write_pending_reply_lines(console, &mut reply)?;
@@ -5585,7 +5611,7 @@ fn render_restored_observation(
         }
     }
     if observation.reset_required {
-        console.reset_chat(chat)?;
+        console.reset_chat(chat.into())?;
         tools.restore(&conversation_events);
         workflows::write_public_history(console, &observation.snapshot)?;
         if observation.snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Failed {
@@ -5617,7 +5643,11 @@ fn render_restored_observation(
                 event.kind,
                 EventKind::Started | EventKind::InputMerged { .. }
             ) {
-                consume_input_echo_from_snapshot(console, &observation.snapshot, event.run_id)?;
+                consume_input_echo_from_snapshot(
+                    console,
+                    &observation.snapshot,
+                    event.run_id.into(),
+                )?;
             }
             if matches!(
                 event.kind,
@@ -5630,13 +5660,13 @@ fn render_restored_observation(
                     | EventKind::Completed { .. }
                     | EventKind::Interrupted
                     | EventKind::Failed(_)
-            ) && let Some(mut reply) = buffered_replies.remove(&event.run_id)
+            ) && let Some(mut reply) = buffered_replies.remove(&event.run_id.uuid())
             {
                 reply.finish();
                 write_pending_reply_lines(console, &mut reply)?;
             }
             if matches!(event.kind, EventKind::Failed(_)) {
-                buffered_replies.remove(&event.run_id);
+                buffered_replies.remove(&event.run_id.uuid());
             }
             let message_id = message_groups.message_id(event);
             let starts_thinking = matches!(event.kind, EventKind::Thinking(_))
@@ -5663,7 +5693,7 @@ fn render_restored_observation(
                 console.write_pieces(&[presentation::thinking_label()])?;
             }
             let facts = tools.call_facts(event, &observation.snapshot);
-            let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
+            let interrupted_by_rejection = tools.ended_with_rejection(event.run_id.into());
             if tools.present_event(console, event, &facts)? {
                 continue;
             }
@@ -5685,8 +5715,8 @@ fn render_restored_observation(
                 EventKind::Text(text) if !failed_runs.contains(&event.run_id) => {
                     if console.is_interactive() {
                         let reply = buffered_replies
-                            .entry(event.run_id)
-                            .or_insert_with(|| ReplyLines::new(event.chat_id, message_id));
+                            .entry(event.run_id.into())
+                            .or_insert_with(|| ReplyLines::new(event.chat_id.into(), message_id));
                         reply.push(&safe_text(text));
                         write_pending_reply_lines(console, reply)?;
                     } else {
@@ -5713,7 +5743,7 @@ fn render_restored_observation(
                     let (failure, retry) =
                         model_retry_parts(*kind, error, *attempt, *max_retries, *delay_ms);
                     console.write_model_retry(
-                        event.run_id,
+                        event.run_id.into(),
                         *kind,
                         *attempt,
                         &[(failure, Some(Role::Error)), (retry, Some(Role::MutedText))],
@@ -5799,7 +5829,7 @@ fn render_restored_observation(
             outln!(
                 console,
                 "Saved input awaiting manual continuation: Run {}\n{}",
-                input.receipt.run_id,
+                input.receipt.run_id.public(),
                 safe_text(&input.input)
             );
         }
@@ -5812,12 +5842,10 @@ fn render_restored_observation(
     {
         outln!(
             console,
-            "Permission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.",
-            request.id,
+            "Permission request: {0} · {1}\nOperation: {2}\nUse /allow {0} [once|session|persistent] or /deny {0}.",
+            shown_id(request.id),
             safe_text(&request.name),
             safe_text(&request.input.to_string()),
-            request.id,
-            request.id
         );
     }
     for request in &observation.snapshot.questions {
@@ -5840,7 +5868,7 @@ fn print_question(console: &Console, request: &QuestionRequest) -> Result<(), St
     if console.is_interactive() {
         return Ok(());
     }
-    outln!(console, "\nQuestion: {}", request.id);
+    outln!(console, "\nQuestion: {}", shown_id(request.id));
     let total = request.questions.len();
     for (index, question) in request.questions.iter().enumerate() {
         for line in questions::question_lines(question, index, total) {
@@ -5850,7 +5878,7 @@ fn print_question(console: &Console, request: &QuestionRequest) -> Result<(), St
     outln!(
         console,
         "Answer each question on its own line: an option number or label, numbers separated by commas where more than one is allowed, or your own text. /answer {} ANSWER answers its next question.",
-        request.id
+        shown_id(request.id)
     );
     Ok(())
 }
@@ -5882,7 +5910,7 @@ async fn answer_typed_question(
 
 async fn parse_after_turn(
     agent: &Agent,
-    chat: uuid::Uuid,
+    chat: ChatId,
     command: &str,
 ) -> Result<AfterTurnAction, AccessError> {
     use tickloop_agent_protocol::{AfterTurnAction, ConfigurationChange, HistoryAction, UserInput};
@@ -5899,7 +5927,7 @@ async fn parse_after_turn(
             },
         }),
         "/cwd" | "/add-dir" => {
-            let mut snapshot = agent.snapshot(chat).await?;
+            let mut snapshot = agent.snapshot(chat.into()).await?;
             let mut folder = snapshot.folder.clone().ok_or_else(|| {
                 AccessError::new(
                     AccessErrorCode::Unsupported,
@@ -5920,7 +5948,7 @@ async fn parse_after_turn(
         }
         "/rule" => {
             let fields = arguments.split_whitespace().collect::<Vec<_>>();
-            let view = agent.permissions_view(chat).await?;
+            let view = agent.permissions_view(chat.into()).await?;
             let change = if fields.len() == 2 && fields[0] == "remove" {
                 PermissionChange::RemoveRule {
                     id: fields[1]
@@ -5941,7 +5969,7 @@ async fn parse_after_turn(
                 };
                 PermissionChange::UpsertRule {
                     rule: PermissionRule {
-                        id: uuid::Uuid::new_v4(),
+                        id: tickloop_ids::generate(),
                         decision,
                         tool: fields[1].into(),
                         specifier: None,
@@ -5952,7 +5980,7 @@ async fn parse_after_turn(
                 }
             } else {
                 return Err(invalid(
-                    "use /rule allow|ask|deny TOOL [session|persistent], or /rule remove UUID",
+                    "use /rule allow|ask|deny TOOL [session|persistent], or /rule remove RULE_ID",
                 ));
             };
             Ok(AfterTurnAction::Configure {
@@ -5966,7 +5994,7 @@ async fn parse_after_turn(
             let skill = name
                 .strip_prefix('/')
                 .ok_or_else(|| invalid("after-turn actions must be explicit commands"))?;
-            if !agent.has_skill(chat, skill).await? {
+            if !agent.has_skill(chat.into(), skill).await? {
                 return Err(invalid("unknown after-turn command or Skill"));
             }
             Ok(AfterTurnAction::Submit {
@@ -5983,7 +6011,7 @@ async fn parse_after_turn(
 async fn command_control(
     console: &Console,
     agent: &Agent,
-    chat: uuid::Uuid,
+    chat: ChatId,
     command: &str,
 ) -> Result<(), String> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
@@ -6007,7 +6035,7 @@ async fn command_control(
             .map_err(|_| "limit must be a positive integer")?
             .unwrap_or(COMMAND_OUTPUT_BYTES);
         let output = agent
-            .read_command(chat, operation, offset, limit)
+            .read_command(chat.into(), operation, offset, limit)
             .await
             .map_err(|error| error.to_string())?;
         outln!(console, "{}", safe_text(&output.content));
@@ -6023,9 +6051,9 @@ async fn command_control(
             return Err("background and stop-command accept only an operation ID".into());
         }
         let state = if fields[0] == "/background" {
-            agent.background_command(chat, operation).await
+            agent.background_command(chat.into(), operation).await
         } else {
-            agent.stop_command(chat, operation).await
+            agent.stop_command(chat.into(), operation).await
         }
         .map_err(|error| error.to_string())?;
         print_command(console, &state)?;
@@ -6084,13 +6112,13 @@ fn normalize_state_root(root: PathBuf) -> PathBuf {
 async fn ensure_chat(
     console: &Console,
     agent: &Agent,
-    selected: &mut Option<uuid::Uuid>,
+    selected: &mut Option<ChatId>,
     workdir: &std::path::Path,
 ) -> Result<uuid::Uuid, String> {
     if let Some(id) = selected
-        && !agent.first_create_pending(*id)
+        && !agent.first_create_pending((*id).into())
     {
-        return Ok(*id);
+        return Ok((*id).into());
     }
     let draft = agent
         .configuration(ConfigTarget::NewDraft)
@@ -6110,6 +6138,7 @@ async fn ensure_chat(
             agent_id,
             error,
         }) => {
+            let (command_id, agent_id) = (shown_id(command_id), shown_id(agent_id));
             return Err(format!(
                 "Creation {command_id} failed after Agent {agent_id} was registered: {}; it received no input. Open it from Agents, or /acknowledge-create {command_id} to keep this draft and create again; input kept",
                 safe_line(&error)
@@ -6125,7 +6154,8 @@ async fn ensure_chat(
         Err(DraftCreationError::ChoiceUnknown { chat, command_id }) => (
             chat,
             Some(format!(
-                "New Agent created; staged choice {command_id} has an unknown result and was not resent. Send again once its receipt is available, or /acknowledge-create {command_id} to cancel the remaining choices. Input kept and not sent"
+                "New Agent created; staged choice {0} has an unknown result and was not resent. Send again once its receipt is available, or /acknowledge-create {0} to cancel the remaining choices. Input kept and not sent",
+                shown_id(command_id)
             )),
         ),
         Err(DraftCreationError::ChoiceRefused {
@@ -6135,7 +6165,8 @@ async fn ensure_chat(
         }) => (
             chat,
             Some(format!(
-                "New Agent created, but staged choice {command_id} was refused: {}. /acknowledge-create {command_id} cancels the remaining choices. Input kept and not sent",
+                "New Agent created, but staged choice {0} was refused: {1}. /acknowledge-create {0} cancels the remaining choices. Input kept and not sent",
+                shown_id(command_id),
                 safe_line(&error)
             )),
         ),
@@ -6147,12 +6178,13 @@ async fn ensure_chat(
             )),
         ),
         Err(DraftCreationError::Unconfirmed(command_id)) => {
+            let command_id = shown_id(command_id);
             return Err(format!(
                 "New Agent creation {command_id} is unconfirmed; nothing was resent. Send again after reconnecting to check its receipt; input kept"
             ));
         }
     };
-    *selected = Some(id);
+    *selected = Some(id.into());
     console.select_created_chat(id, &startup_banner)?;
     console.set_input_context(Some(id), workdir, &[])?;
     agent
@@ -6160,7 +6192,7 @@ async fn ensure_chat(
         .await
         .map_err(|error| error.to_string())?;
     if !console.is_interactive() {
-        outln!(console, "Chat: {id}");
+        outln!(console, "Chat: {}", ChatId::from(id).public());
     }
     show_settings_warnings(console, agent.user_settings_warnings(id))?;
     if let Some(message) = unapplied {
@@ -6185,23 +6217,23 @@ struct MergedEchoes {
 
 /// A chat's latest live InputMerged: the run it joined, its event sequence and the input's echo.
 struct MergeCursor {
-    into_run: uuid::Uuid,
+    into_run: RunId,
     sequence: u64,
     echo: InputEcho,
     submission_block: Option<u64>,
 }
 
 impl MergedEchoes {
-    fn accepted(&mut self, run: uuid::Uuid, echo: Option<InputEcho>) {
+    fn accepted(&mut self, run: RunId, echo: Option<InputEcho>) {
         self.input_blocks
-            .entry(run)
+            .entry(run.into())
             .or_insert(self.submission_block);
         self.consumed_echo(run, echo);
     }
 
-    fn consumed_echo(&mut self, run: uuid::Uuid, echo: Option<InputEcho>) {
+    fn consumed_echo(&mut self, run: RunId, echo: Option<InputEcho>) {
         if let Some(echo) = echo {
-            self.accepted.insert(run, echo);
+            self.accepted.insert(run.into(), echo);
         }
     }
 
@@ -6212,7 +6244,7 @@ impl MergedEchoes {
         event: &tickloop_agent_protocol::Event,
         displayed_through: u64,
     ) -> Option<(InputEcho, InputEcho)> {
-        let previous = self.open.remove(&event.chat_id);
+        let previous = self.open.remove(&event.chat_id.uuid());
         // A run merged, started, taken back or ended no longer needs its echo, even when a
         // restore already showed that event.
         let consumed = matches!(
@@ -6225,10 +6257,10 @@ impl MergedEchoes {
                 | EventKind::Interrupted
         );
         let current = consumed
-            .then(|| self.accepted.remove(&event.run_id))
+            .then(|| self.accepted.remove(&event.run_id.uuid()))
             .flatten();
         let submission_block = consumed
-            .then(|| self.input_blocks.remove(&event.run_id))
+            .then(|| self.input_blocks.remove(&event.run_id.uuid()))
             .flatten();
         if event.sequence <= displayed_through {
             return None;
@@ -6238,9 +6270,9 @@ impl MergedEchoes {
         };
         let current = current?;
         self.open.insert(
-            event.chat_id,
+            event.chat_id.into(),
             MergeCursor {
-                into_run: *into_run_id,
+                into_run: (*into_run_id),
                 sequence: event.sequence,
                 echo: current,
                 submission_block,
@@ -6272,7 +6304,7 @@ impl MergedEchoes {
 async fn ensure_chat_for_input(
     console: &Console,
     agent: &Agent,
-    selected: &mut Option<uuid::Uuid>,
+    selected: &mut Option<ChatId>,
     workdir: &std::path::Path,
     retry_of: Option<uuid::Uuid>,
     input: &str,
@@ -6280,22 +6312,22 @@ async fn ensure_chat_for_input(
 ) -> Result<Result<uuid::Uuid, String>, String> {
     let echoed_in = *selected;
     let creates_agent =
-        retry_of.is_none() && echoed_in.is_none_or(|chat| agent.first_create_pending(chat));
+        retry_of.is_none() && echoed_in.is_none_or(|chat| agent.first_create_pending(chat.into()));
     let chat = match ensure_chat(console, agent, selected, workdir).await {
         Ok(chat) => chat,
         Err(error) => {
             if creates_agent && let Some(echo) = echo.take() {
-                console.withdraw_echo(echoed_in, echo)?;
+                console.withdraw_echo(echoed_in.map(Into::into), echo)?;
                 if *selected != echoed_in {
-                    console.withdraw_echo(*selected, echo)?;
+                    console.withdraw_echo(selected.map(Into::into), echo)?;
                 }
             }
             return Ok(Err(error));
         }
     };
-    if creates_agent && echoed_in != Some(chat) {
+    if creates_agent && echoed_in != Some(chat.into()) {
         if let Some(echo) = echo.take() {
-            console.withdraw_echo(echoed_in, echo)?;
+            console.withdraw_echo(echoed_in.map(Into::into), echo)?;
             console.withdraw_echo(Some(chat), echo)?;
         }
         *echo = console.record_input(input)?;
@@ -6322,13 +6354,13 @@ enum InputSend<T> {
 /// stays held, and a refused one lets this input go out as new.
 async fn send_input<T>(
     agent: &Agent,
-    chat: uuid::Uuid,
+    chat: ChatId,
     retry_of: Option<uuid::Uuid>,
     send: impl std::future::Future<Output = Result<T, AccessError>>,
     adopt: impl FnOnce(CommandResult) -> Option<T>,
 ) -> InputSend<T> {
     if let Some(id) = retry_of {
-        match agent.resolve_input(chat, id).await {
+        match agent.resolve_input(chat.into(), id).await {
             InputResolution::Accepted(result) => {
                 return match adopt(*result) {
                     Some(value) => InputSend::Accepted {
@@ -6336,7 +6368,8 @@ async fn send_input<T>(
                         adopted: Some(id),
                     },
                     None => InputSend::Failed(AccessError::invalid(format!(
-                        "Input {id} was accepted as another kind of input; nothing was resent"
+                        "Input {} was accepted as another kind of input; nothing was resent",
+                        shown_id(id)
                     ))),
                 };
             }
@@ -6344,20 +6377,21 @@ async fn send_input<T>(
                 return InputSend::Unknown(
                     id,
                     AccessError::invalid(format!(
-                        "Input {id} still has an unknown acceptance result; nothing was resent. /acknowledge-input {id} releases it without resending"
+                        "Input {0} still has an unknown acceptance result; nothing was resent. /acknowledge-input {0} releases it without resending",
+                        shown_id(id)
                     )),
                 );
             }
             InputResolution::Refused | InputResolution::Released => {}
         }
     }
-    let before = agent.unknown_input(chat);
+    let before = agent.unknown_input(chat.into());
     match send.await {
         Ok(value) => InputSend::Accepted {
             value,
             adopted: None,
         },
-        Err(error) => match agent.unknown_input(chat) {
+        Err(error) => match agent.unknown_input(chat.into()) {
             Some(id) if Some(id) != before => InputSend::Unknown(id, error),
             Some(_) => InputSend::Held(error),
             None => InputSend::Failed(error),
@@ -6373,14 +6407,17 @@ fn submitted_receipt(result: CommandResult) -> Option<Receipt> {
 }
 
 fn input_adopted(id: uuid::Uuid) -> String {
-    format!("Input {id} was already accepted; nothing was resent")
+    format!(
+        "Input {} was already accepted; nothing was resent",
+        shown_id(id)
+    )
 }
 
 fn consumed_input_text(
     snapshot: &ChatSnapshot,
     input: uuid::Uuid,
 ) -> Option<std::borrow::Cow<'_, str>> {
-    let trigger = snapshot.trigger_origins.get(&input);
+    let trigger = snapshot.trigger_origins.get(&tickloop_ids::Id::from(input));
     if matches!(
         trigger,
         Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
@@ -6392,7 +6429,7 @@ fn consumed_input_text(
         .iter()
         .enumerate()
         .find_map(|(index, message)| {
-            if snapshot.message_runs.get(&index) != Some(&input)
+            if snapshot.message_runs.get(&index) != Some(&tickloop_ids::Id::from(input))
                 || message.role != tickloop_agent_protocol::Role::User
                 || snapshot.host_notes.contains_key(&index)
             {
@@ -6423,7 +6460,7 @@ fn consumed_input_text(
 fn show_consumed_family_input(
     console: &Console,
     snapshot: &ChatSnapshot,
-    run: uuid::Uuid,
+    run: RunId,
 ) -> Result<(), String> {
     for (index, message) in snapshot.messages.iter().enumerate() {
         let Some(id) = snapshot.message_ids.get(&index).filter(|id| {
@@ -6433,7 +6470,7 @@ fn show_consumed_family_input(
             continue;
         };
         if snapshot.message_runs.get(&index) != Some(&run)
-            || console.input_is_echoed(snapshot.id, *id)?
+            || console.input_is_echoed(snapshot.id.into(), *id)?
         {
             continue;
         }
@@ -6485,7 +6522,7 @@ fn show_consumed_family_input(
         }
         // A report whose run has not ended shows with the child's completion.
         if !awaits_completion {
-            console.mark_input_echoes(snapshot.id, [*id])?;
+            console.mark_input_echoes(snapshot.id.into(), [*id])?;
         }
     }
     Ok(())
@@ -6500,10 +6537,10 @@ fn show_family_completion(
     snapshot: &ChatSnapshot,
 ) -> Result<(), String> {
     if !completion.notification.is_background() {
-        console.mark_input_echoes(snapshot.id, [completion.child_run_id])?;
+        console.mark_input_echoes(snapshot.id.into(), [completion.child_run_id.uuid()])?;
         return Ok(());
     }
-    if console.input_is_echoed(snapshot.id, completion.child_run_id)? {
+    if console.input_is_echoed(snapshot.id.into(), completion.child_run_id.into())? {
         if let tickloop_agent_protocol::SubagentNotificationDelivery::Rejected(rejection) =
             &completion.notification
         {
@@ -6528,7 +6565,7 @@ fn show_family_completion(
             console.display_profile()?,
         ),
     )?;
-    console.mark_input_echoes(snapshot.id, [completion.child_run_id])
+    console.mark_input_echoes(snapshot.id.into(), [completion.child_run_id.uuid()])
 }
 
 /// An Agent block: its heading and the body indented under it.
@@ -6553,7 +6590,7 @@ async fn learn_agent_colors(
     let known = console.agent_colors()?;
     let unknown = agent_messaging::named_agents(snapshot)
         .into_iter()
-        .filter(|chat| !known.contains_key(chat))
+        .filter(|chat| !known.contains_key(&chat.uuid()))
         .collect::<Vec<_>>();
     if unknown.is_empty() {
         return Ok(());
@@ -6563,7 +6600,7 @@ async fn learn_agent_colors(
     };
     let mut colors = agent_messaging::catalog_colors(&rows);
     for chat in unknown {
-        colors.entry(chat).or_insert(None);
+        colors.entry(chat.into()).or_insert(None);
     }
     console.remember_agent_colors(colors)
 }
@@ -6577,26 +6614,26 @@ async fn track_accepted_echo(
     if !console.is_interactive() {
         return Ok(echo);
     }
-    let snapshot = agent.snapshot(receipt.chat_id).await.ok();
+    let snapshot = agent.snapshot(receipt.chat_id.into()).await.ok();
     // The input is listed where the Agent queued it, or shown as sent when its turn already took
     // it, in one frame that also drops the provisional queue entry or echo it had.
     let _frame_hold = console.hold_frames()?;
     if let Some(snapshot) = &snapshot {
-        console.set_queued_inputs(receipt.chat_id, snapshot.queued_inputs())?;
-        if let Some(input) = consumed_input_text(snapshot, receipt.run_id) {
+        console.set_queued_inputs(receipt.chat_id.into(), snapshot.queued_inputs())?;
+        if let Some(input) = consumed_input_text(snapshot, receipt.run_id.into()) {
             if echo.is_some() {
-                console.mark_input_echoes(receipt.chat_id, [receipt.run_id])?;
+                console.mark_input_echoes(receipt.chat_id.into(), [receipt.run_id.uuid()])?;
                 return Ok(echo);
             }
             return console.record_consumed_input(
-                receipt.chat_id,
-                receipt.run_id,
+                receipt.chat_id.into(),
+                receipt.run_id.into(),
                 &safe_text(&input),
             );
         }
     }
     if let Some(echo) = echo {
-        console.withdraw_echo(Some(receipt.chat_id), echo)?;
+        console.withdraw_echo(Some(receipt.chat_id.into()), echo)?;
     }
     Ok(None)
 }
@@ -6607,11 +6644,11 @@ async fn show_consumed_input(
     turn_snapshot: &mut TurnSnapshot,
     event: &tickloop_agent_protocol::Event,
 ) -> Result<Option<InputEcho>, String> {
-    if console.input_is_echoed(event.chat_id, event.run_id)? {
+    if console.input_is_echoed(event.chat_id.into(), event.run_id.into())? {
         return Ok(None);
     }
     if console.is_interactive() {
-        console.defer_input_echo(event.chat_id, event.run_id)?;
+        console.defer_input_echo(event.chat_id.into(), event.run_id.into())?;
     }
     let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await else {
         return Ok(None);
@@ -6624,7 +6661,7 @@ async fn show_consumed_input(
     {
         return Ok(None);
     }
-    consume_input_echo_from_snapshot(console, &snapshot, event.run_id)
+    consume_input_echo_from_snapshot(console, &snapshot, event.run_id.into())
 }
 
 fn consume_input_echo_from_snapshot(
@@ -6632,18 +6669,18 @@ fn consume_input_echo_from_snapshot(
     snapshot: &ChatSnapshot,
     input: uuid::Uuid,
 ) -> Result<Option<InputEcho>, String> {
-    if console.input_is_echoed(snapshot.id, input)? {
+    if console.input_is_echoed(snapshot.id.into(), input)? {
         return Ok(None);
     }
     if matches!(
-        snapshot.trigger_origins.get(&input),
+        snapshot.trigger_origins.get(&tickloop_ids::Id::from(input)),
         Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. })
     ) {
         let _frame_hold = console.hold_frames()?;
-        console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+        console.set_queued_inputs(snapshot.id.into(), snapshot.queued_inputs())?;
         console.flash_trigger_input(snapshot, input)?;
         console.write_roles(&goal_view::continuation_runs())?;
-        console.mark_input_echoes(snapshot.id, [input])?;
+        console.mark_input_echoes(snapshot.id.into(), [input])?;
         return Ok(None);
     }
     let deliveries = snapshot
@@ -6651,7 +6688,7 @@ fn consume_input_echo_from_snapshot(
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            snapshot.message_runs.get(index) == Some(&input)
+            snapshot.message_runs.get(index) == Some(&tickloop_ids::Id::from(input))
                 && message.role == tickloop_agent_protocol::Role::User
                 && !snapshot.host_notes.contains_key(index)
         })
@@ -6678,16 +6715,16 @@ fn consume_input_echo_from_snapshot(
         Some(text) => {
             // The input leaves the queue in the frame that shows it sent.
             let _frame_hold = console.hold_frames()?;
-            console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+            console.set_queued_inputs(snapshot.id.into(), snapshot.queued_inputs())?;
             console.flash_trigger_input(snapshot, input)?;
-            console.record_consumed_input(snapshot.id, input, &safe_text(&text))
+            console.record_consumed_input(snapshot.id.into(), input, &safe_text(&text))
         }
         None => {
             let mut has_unshown_agent_message = false;
             for (index, id) in &snapshot.message_ids {
-                if snapshot.message_runs.get(index) == Some(&input)
+                if snapshot.message_runs.get(index) == Some(&tickloop_ids::Id::from(input))
                     && snapshot.agent_message_origins.contains_key(id)
-                    && !console.input_is_echoed(snapshot.id, *id)?
+                    && !console.input_is_echoed(snapshot.id.into(), *id)?
                 {
                     has_unshown_agent_message = true;
                     break;
@@ -6695,7 +6732,7 @@ fn consume_input_echo_from_snapshot(
             }
             if !has_unshown_agent_message && snapshot.message_runs.values().any(|run| *run == input)
             {
-                console.finish_deferred_input_echo(snapshot.id, input)?;
+                console.finish_deferred_input_echo(snapshot.id.into(), input)?;
             }
             Ok(None)
         }
@@ -6706,7 +6743,7 @@ fn reconcile_consumed_input_echoes(
     console: &Console,
     snapshot: &ChatSnapshot,
 ) -> Result<(), String> {
-    let mut inputs = console.awaiting_input_echoes(snapshot.id)?;
+    let mut inputs = console.awaiting_input_echoes(snapshot.id.into())?;
     inputs.sort_by_key(|input| {
         snapshot
             .message_runs
@@ -6715,7 +6752,7 @@ fn reconcile_consumed_input_echoes(
             .unwrap_or(usize::MAX)
     });
     for input in inputs {
-        show_consumed_family_input(console, snapshot, input)?;
+        show_consumed_family_input(console, snapshot, input.into())?;
         consume_input_echo_from_snapshot(console, snapshot, input)?;
     }
     Ok(())
@@ -6733,11 +6770,11 @@ async fn track_accepted_input(
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Result<(), String> {
     let Some(id) = adopted else {
-        pending.insert(receipt.run_id, receipt);
+        pending.insert(receipt.run_id.into(), receipt);
         return Ok(());
     };
     outln!(console, "{}", input_adopted(id));
-    if let Ok(snapshot) = agent.snapshot(receipt.chat_id).await {
+    if let Ok(snapshot) = agent.snapshot(receipt.chat_id.into()).await {
         sync_snapshot(&snapshot, pending, permissions, questions);
     }
     Ok(())
@@ -6751,10 +6788,9 @@ enum RuleCommand {
 fn parse_rule_command(command: &str) -> Result<RuleCommand, String> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
     if fields.len() == 3 && fields[1] == "remove" {
-        return fields[2]
-            .parse::<uuid::Uuid>()
+        return tickloop_ids::base62::decode_either(fields[2])
             .map(RuleCommand::Remove)
-            .map_err(|_| "rule ID must be a UUID".into());
+            .ok_or_else(|| format!("{} is not a rule ID", fields[2]));
     }
     if !(3..=4).contains(&fields.len()) {
         return Err(
@@ -6773,7 +6809,7 @@ fn parse_rule_command(command: &str) -> Result<RuleCommand, String> {
         _ => return Err("rule scope must be session or persistent".into()),
     };
     Ok(RuleCommand::Add(PermissionRule {
-        id: uuid::Uuid::new_v4(),
+        id: tickloop_ids::generate(),
         decision,
         tool: fields[2].into(),
         specifier: None,
@@ -6786,7 +6822,7 @@ fn parse_rule_command(command: &str) -> Result<RuleCommand, String> {
 fn rule_added_message(rule: &PermissionRule, scope: &str) -> String {
     format!(
         "Rule added: {} · {:?} · {} · {} · {scope}",
-        rule.id,
+        shown_id(rule.id),
         rule.decision,
         safe_text(&rule.tool),
         if rule.persistent {
@@ -6797,10 +6833,10 @@ fn rule_added_message(rule: &PermissionRule, scope: &str) -> String {
     )
 }
 
-async fn update_rule(agent: &Agent, chat: uuid::Uuid, command: &str) -> Result<String, String> {
+async fn update_rule(agent: &Agent, chat: ChatId, command: &str) -> Result<String, String> {
     let command = parse_rule_command(command)?;
     let view = agent
-        .permissions_view(chat)
+        .permissions_view(chat.into())
         .await
         .map_err(|error| error.to_string())?;
     match command {
@@ -6813,15 +6849,23 @@ async fn update_rule(agent: &Agent, chat: uuid::Uuid, command: &str) -> Result<S
                 return Err("rule does not exist".into());
             }
             agent
-                .apply_permission_change(chat, PermissionChange::RemoveRule { id }, view.revision)
+                .apply_permission_change(
+                    chat.into(),
+                    PermissionChange::RemoveRule { id },
+                    view.revision,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(format!("Rule removed: {id}"))
+            Ok(format!("Rule removed: {}", shown_id(id)))
         }
         RuleCommand::Add(rule) => {
             let message = rule_added_message(&rule, "all inputs in this Chat");
             agent
-                .apply_permission_change(chat, PermissionChange::UpsertRule { rule }, view.revision)
+                .apply_permission_change(
+                    chat.into(),
+                    PermissionChange::UpsertRule { rule },
+                    view.revision,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(message)
@@ -6839,8 +6883,8 @@ fn stage_draft_rule(
     let (change, saved_message, staged_message) = match parse_rule_command(command)? {
         RuleCommand::Remove(id) => (
             PermissionChange::RemoveRule { id },
-            format!("Rule removed: {id}"),
-            format!("Rule removed from the New Agent: {id}"),
+            format!("Rule removed: {}", shown_id(id)),
+            format!("Rule removed from the New Agent: {}", shown_id(id)),
         ),
         RuleCommand::Add(rule) => {
             let saved = rule_added_message(&rule, "saved for this project");
@@ -6917,16 +6961,15 @@ async fn stage_draft_directories(
 /// 按请求 id 在本进程所有已加载 Chat 中定位所属 Chat；找不到时交给前台 Chat 报告。
 async fn answer_permission(
     agent: &Agent,
-    selected_chat: Option<uuid::Uuid>,
+    selected_chat: Option<ChatId>,
     command: &str,
 ) -> Result<uuid::Uuid, String> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
     if !(2..=3).contains(&fields.len()) {
         return Err("use /allow REQUEST [once|session|persistent] or /deny REQUEST".into());
     }
-    let request = fields[1]
-        .parse()
-        .map_err(|_| "permission request ID must be a UUID")?;
+    let request = tickloop_ids::base62::decode_either(fields[1])
+        .ok_or_else(|| format!("{} is not a permission request ID", fields[1]))?;
     let scope = match fields.get(2).copied().unwrap_or("once") {
         "once" => PermissionScope::Once,
         "session" => PermissionScope::Session,
@@ -6947,7 +6990,7 @@ async fn answer_permission(
         .or(selected_chat)
         .ok_or("no Chat is selected")?;
     agent
-        .answer_permission_with_scope(chat, request, fields[0] == "/allow", scope)
+        .answer_permission_with_scope(chat.into(), request, fields[0] == "/allow", scope)
         .await
         .map_err(|error| error.to_string())?;
     Ok(request)
@@ -6956,24 +6999,23 @@ async fn answer_permission(
 async fn open_chat(
     agent: &Agent,
     command: &str,
-    current_chat: Option<uuid::Uuid>,
+    current_chat: Option<ChatId>,
 ) -> Result<tickloop_agent_protocol::ChatSnapshot, String> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
     let [_, chat] = fields.as_slice() else {
         return Err("use /resume [CHAT]".into());
     };
-    let chat = chat
-        .parse::<uuid::Uuid>()
-        .map_err(|_| "Chat ID must be a UUID; use /resume to choose a saved conversation")?;
+    let chat =
+        ChatId::parse(chat).ok_or("not a Chat ID; use /resume to choose a saved conversation")?;
     if current_chat == Some(chat) {
-        return Err(format!("Chat {chat} is already open."));
+        return Err(format!("Chat {} is already open.", chat.public()));
     }
     let snapshot = agent
-        .resume_chat(chat)
+        .resume_chat(chat.into())
         .await
         .map_err(|error| match error.code {
-            AccessErrorCode::NotFound => format!("Chat {chat} was not found."),
-            _ => format!("Failed to resume Chat {chat}: {error}"),
+            AccessErrorCode::NotFound => format!("Chat {} was not found.", chat.public()),
+            _ => format!("Failed to resume Chat {}: {error}", chat.public()),
         })?;
     Ok(snapshot)
 }
@@ -6995,11 +7037,7 @@ fn show_settings_warnings(console: &Console, warnings: Vec<String>) -> Result<()
 
 /// A finished compaction as Claude Code marks it: one muted `⏺ Conversation compacted` line, with
 /// the summary left to the detailed transcript.
-fn write_compaction_notice(
-    console: &Console,
-    chat: uuid::Uuid,
-    summary: &str,
-) -> Result<(), String> {
+fn write_compaction_notice(console: &Console, chat: ChatId, summary: &str) -> Result<(), String> {
     if console.is_interactive() {
         console.write_roles(&[(
             format!(
@@ -7010,7 +7048,8 @@ fn write_compaction_notice(
         )])
     } else {
         console.write(&format!(
-            "Context compacted for Chat {chat}. Earlier messages stay in the detailed transcript and are no longer sent to the model.\n{}\n",
+            "Context compacted for Chat {}. Earlier messages stay in the detailed transcript and are no longer sent to the model.\n{}\n",
+            chat.public(),
             safe_text(summary)
         ))
     }
@@ -7040,12 +7079,12 @@ fn show_opened_chat(
     has_history: bool,
 ) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
-    console.reset_chat(snapshot.id)?;
-    outln!(console, "Chat: {}", snapshot.id);
-    for warning in agent.transcript_load_warnings(snapshot.id) {
+    console.reset_chat(snapshot.id.into())?;
+    outln!(console, "Chat: {}", snapshot.id.public());
+    for warning in agent.transcript_load_warnings(snapshot.id.into()) {
         write_warning(console, &warning)?;
     }
-    show_settings_warnings(console, agent.user_settings_warnings(snapshot.id))?;
+    show_settings_warnings(console, agent.user_settings_warnings(snapshot.id.into()))?;
     workflows::write_public_history(console, snapshot)?;
     if has_history {
         let receiving_hint = if snapshot.chat_loop.receiving.is_receiving() {
@@ -7068,20 +7107,19 @@ const UNLABELED_BACKGROUND_AGENT: &str = "Background Agent · label unavailable 
 
 /// A background Agent as notices name it. Pipe output keeps the Chat identifier that scripts
 /// match against its `Chat:` line; the interactive View names the Agent by its title.
-fn background_label(agent: &Agent, console: &Console, chat: uuid::Uuid) -> String {
+fn background_label(agent: &Agent, console: &Console, chat: ChatId) -> String {
     if console.is_interactive() {
         readable_background_label(agent, console, chat)
     } else {
-        let chat = chat.simple().to_string();
-        format!("Chat {}", &chat[..8])
+        format!("Chat {}", chat.public())
     }
 }
 
 /// The title this View last saw for `chat`, with the reading number its rows carry; never a
 /// generated identifier.
-fn readable_background_label(agent: &Agent, console: &Console, chat: uuid::Uuid) -> String {
+fn readable_background_label(agent: &Agent, console: &Console, chat: ChatId) -> String {
     agent
-        .cached_title(chat)
+        .cached_title(chat.into())
         .and_then(|(agent_id, title)| console.agent_name(agent_id, &safe_line(&title)).ok())
         .unwrap_or_else(|| UNLABELED_BACKGROUND_AGENT.into())
 }
@@ -7122,8 +7160,10 @@ fn background_request_notice(
     label: &str,
 ) -> Option<String> {
     let request = match &event.kind {
-        EventKind::PermissionRequested { request } => format!("permission request {}", request.id),
-        EventKind::QuestionAsked { request } => format!("question {}", request.id),
+        EventKind::PermissionRequested { request } => {
+            format!("permission request {}", shown_id(request.id))
+        }
+        EventKind::QuestionAsked { request } => format!("question {}", shown_id(request.id)),
         _ => return None,
     };
     Some(format!("{label} · {request}"))
@@ -7134,7 +7174,7 @@ fn announce_background_event(
     console: &Console,
     event: &tickloop_agent_protocol::Event,
     label: &str,
-    background_notice: &mut Option<(uuid::Uuid, BackgroundRunNotice)>,
+    background_notice: &mut Option<(ChatId, BackgroundRunNotice)>,
 ) -> Result<bool, String> {
     let interactive = console.is_interactive();
     if let Some(notice) = background_request_notice(event, label) {
@@ -7170,14 +7210,14 @@ fn track_run_requests(
         EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
             permissions.retain(|_, request| request.run_id != Some(event.run_id));
             questions.retain(|_, question| question.run_id != event.run_id);
-            pending.remove(&event.run_id);
+            pending.remove(&event.run_id.uuid());
         }
         EventKind::InputMerged { .. } | EventKind::InputTakenBack => {
-            pending.remove(&event.run_id);
+            pending.remove(&event.run_id.uuid());
         }
         EventKind::PermissionRequested { request } => {
             if let Some(run_id) = request.execution.run_id() {
-                pending.entry(run_id).or_insert_with(receipt);
+                pending.entry(run_id.into()).or_insert_with(receipt);
             }
             permissions.insert(
                 request.id,
@@ -7185,7 +7225,7 @@ fn track_run_requests(
             );
         }
         EventKind::QuestionAsked { request } => {
-            pending.entry(event.run_id).or_insert_with(receipt);
+            pending.entry(event.run_id.into()).or_insert_with(receipt);
             questions.insert(request.id, request.clone());
         }
         _ => {}
@@ -7200,14 +7240,14 @@ enum BackgroundWaitKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackgroundWait {
-    chat_id: uuid::Uuid,
+    chat_id: ChatId,
     request_id: uuid::Uuid,
     kind: BackgroundWaitKind,
 }
 
 /// 非前台 Chat 中等待用户处理的请求；权限请求优先于提问。
 fn background_wait(
-    selected_chat: Option<uuid::Uuid>,
+    selected_chat: Option<ChatId>,
     permissions: &HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Option<BackgroundWait> {
@@ -7233,14 +7273,14 @@ fn background_wait(
 
 /// A run that stopped being waited for because the daemon reports its execution Lost.
 struct LostRunNotice {
-    chat: uuid::Uuid,
-    run: uuid::Uuid,
+    chat: ChatId,
+    run: RunId,
     text: String,
 }
 
 fn execution_connection_notice(
     rows: &[AgentSummary],
-    chat: uuid::Uuid,
+    chat: ChatId,
     disconnected: bool,
     cached_completed: bool,
     daemon_unreachable: bool,
@@ -7276,17 +7316,17 @@ fn end_runs_of_lost_executions(
         .filter(|row| row.availability == ExecutionAvailability::Lost)
         .map(|row| row.chat_id)
         .collect::<HashSet<_>>();
-    permissions.retain(|_, request| !lost.contains(&request.chat_id));
-    questions.retain(|_, request| !lost.contains(&request.chat_id));
+    permissions.retain(|_, request| !lost.contains(&request.chat_id.uuid()));
+    questions.retain(|_, request| !lost.contains(&request.chat_id.uuid()));
     let ended = pending
         .values()
-        .filter(|receipt| lost.contains(&receipt.chat_id))
+        .filter(|receipt| lost.contains(&receipt.chat_id.uuid()))
         .cloned()
         .collect::<Vec<_>>();
     ended
         .into_iter()
         .map(|receipt| {
-            pending.remove(&receipt.run_id);
+            pending.remove(&receipt.run_id.uuid());
             permissions.retain(|_, request| request.run_id != Some(receipt.run_id));
             questions.retain(|_, question| question.run_id != receipt.run_id);
             LostRunNotice {
@@ -7294,7 +7334,7 @@ fn end_runs_of_lost_executions(
                 run: receipt.run_id,
                 text: format!(
                     "Run {} has an unknown outcome: its Agent execution was lost; nothing was resent. /resume {} loads its history",
-                    receipt.run_id, receipt.chat_id
+                    receipt.run_id.public(), receipt.chat_id.public()
                 ),
             }
         })
@@ -7304,7 +7344,7 @@ fn end_runs_of_lost_executions(
 /// The message the process exits with when input ends while a request is still waiting; it names
 /// the owning Chat only when that Chat is in the background.
 fn input_closed_while_waiting(
-    selected_chat: Option<uuid::Uuid>,
+    selected_chat: Option<ChatId>,
     permissions: &HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Option<String> {
@@ -7319,7 +7359,8 @@ fn input_closed_while_waiting(
     if let Some(wait) = wait.filter(|wait| wait.kind == BackgroundWaitKind::Approval) {
         return Some(format!(
             "input closed while background Chat {} was waiting for permission request {}; no pending operation was approved",
-            wait.chat_id, wait.request_id
+            wait.chat_id.public(),
+            shown_id(wait.request_id)
         ));
     }
     if questions
@@ -7331,7 +7372,8 @@ fn input_closed_while_waiting(
     wait.map(|wait| {
         format!(
             "input closed while background Chat {} was waiting for an answer to question {}; no answer was assumed",
-            wait.chat_id, wait.request_id
+            wait.chat_id.public(),
+            shown_id(wait.request_id)
         )
     })
 }
@@ -7363,7 +7405,7 @@ fn recover_background_chat(
     let mut recovery = BackgroundRecovery::default();
     let run_ended = runs_before
         .iter()
-        .any(|receipt| !pending.contains_key(&receipt.run_id));
+        .any(|receipt| !pending.contains_key(&receipt.run_id.uuid()));
     let outcome = match status.chat_loop.state {
         LoopState::Failed => Some("failed"),
         LoopState::Interrupted => Some("interrupted"),
@@ -7383,16 +7425,17 @@ fn recover_background_chat(
     }
     for request in &status.permissions {
         if !known_permissions.contains(&request.id) {
-            recovery
-                .request_notices
-                .push(format!("{label} · permission request {}", request.id));
+            recovery.request_notices.push(format!(
+                "{label} · permission request {}",
+                shown_id(request.id)
+            ));
         }
     }
     for request in &status.questions {
         if !known_questions.contains(&request.id) {
             recovery
                 .request_notices
-                .push(format!("{label} · question {}", request.id));
+                .push(format!("{label} · question {}", shown_id(request.id)));
         }
     }
     recovery
@@ -7470,8 +7513,15 @@ pub fn safe_line(text: &str) -> String {
     escaped
 }
 
+/// An id of the Console's own (a command, an input, a rule, a question) as a person reads and
+/// types it back.
+fn shown_id(id: impl Into<uuid::Uuid>) -> String {
+    tickloop_ids::base62::encode(id.into())
+}
+
 fn creation_notice(projection: &crate::agent_console::Projection) -> Option<String> {
     projection.unconfirmed_dispatch.map(|command_id| {
+        let command_id = shown_id(command_id);
         format!("Creation {command_id} unknown; inspect Agents, then /acknowledge-create {command_id} to allow another submission without replay")
     })
 }
@@ -7693,7 +7743,7 @@ async fn navigate_agent(
                 "Execution interrupted; open saved history explicitly{}",
                 record
                     .as_ref()
-                    .map(|record| format!(" with /resume {}", record.chat_id))
+                    .map(|record| format!(" with /resume {}", shown_id(record.chat_id)))
                     .unwrap_or_default()
             ))?;
             return Ok(None);
@@ -7758,7 +7808,7 @@ async fn navigate_agent(
                     let observation = render_restored_observation(
                         console,
                         &mut presentation,
-                        chat,
+                        chat.into(),
                         after,
                         reply_lines,
                         &mut MessageGroups::default(),
@@ -8032,9 +8082,9 @@ mod tests {
         let loop_id = uuid::Uuid::new_v4();
         let record = tickloop_agent_protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
-            target_chat_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
-            target_run_id: run,
+            target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
             state: Some(tickloop_agent_protocol::LoopState::Idle),
@@ -8043,8 +8093,8 @@ mod tests {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Pending,
             usage: Default::default(),
             child_chat_id: record.target_chat_id,
-            child_loop_id: loop_id,
-            child_run_id: run,
+            child_loop_id: loop_id.into(),
+            child_run_id: run.into(),
             handle: "audit".into(),
             state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
@@ -8061,16 +8111,16 @@ mod tests {
         snapshot.events = vec![
             tickloop_agent_protocol::Event {
                 sequence: 1,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyInputUpdated { record },
             },
             tickloop_agent_protocol::Event {
                 sequence: 2,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
@@ -8094,7 +8144,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             0,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8111,7 +8161,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             2,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8134,9 +8184,9 @@ mod tests {
         let loop_id = uuid::Uuid::new_v4();
         let record = tickloop_agent_protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
-            target_chat_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
-            target_run_id: run,
+            target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
             state: Some(tickloop_agent_protocol::LoopState::Idle),
@@ -8145,8 +8195,8 @@ mod tests {
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Foreground,
             usage: Default::default(),
             child_chat_id: record.target_chat_id,
-            child_loop_id: loop_id,
-            child_run_id: run,
+            child_loop_id: loop_id.into(),
+            child_run_id: run.into(),
             handle: "audit".into(),
             state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
@@ -8163,16 +8213,16 @@ mod tests {
         snapshot.events = vec![
             tickloop_agent_protocol::Event {
                 sequence: 1,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyInputUpdated { record },
             },
             tickloop_agent_protocol::Event {
                 sequence: 2,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
@@ -8196,7 +8246,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             0,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8213,7 +8263,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             2,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8236,9 +8286,9 @@ mod tests {
         let loop_id = uuid::Uuid::new_v4();
         let record = tickloop_agent_protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
-            target_chat_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
-            target_run_id: run,
+            target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
             state: Some(tickloop_agent_protocol::LoopState::Idle),
@@ -8252,8 +8302,8 @@ mod tests {
             ),
             usage: Default::default(),
             child_chat_id: record.target_chat_id,
-            child_loop_id: loop_id,
-            child_run_id: run,
+            child_loop_id: loop_id.into(),
+            child_run_id: run.into(),
             handle: "audit".into(),
             state: tickloop_agent_protocol::LoopState::Idle,
             result: "Actual child completion".into(),
@@ -8270,16 +8320,16 @@ mod tests {
         snapshot.events = vec![
             tickloop_agent_protocol::Event {
                 sequence: 1,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyInputUpdated { record },
             },
             tickloop_agent_protocol::Event {
                 sequence: 2,
-                chat_id: chat,
-                loop_id,
-                run_id: run,
+                chat_id: chat.into(),
+                loop_id: loop_id.into(),
+                run_id: run.into(),
                 kind: tickloop_agent_protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
@@ -8303,7 +8353,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             0,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8321,7 +8371,7 @@ mod tests {
         super::render_restored_observation(
             &console,
             &mut tools,
-            chat,
+            chat.into(),
             2,
             &mut std::collections::HashMap::new(),
             &mut super::MessageGroups::default(),
@@ -8351,9 +8401,9 @@ mod tests {
             serde_json::json!({"source":{"message_id":child_run,"sender_handle":"audit","sender_label":"audit","is_result":true},"message":report.text()})
         );
         let completion = tickloop_agent_protocol::FamilyCompletion {
-            child_chat_id: uuid::Uuid::new_v4(),
-            child_loop_id: uuid::Uuid::new_v4(),
-            child_run_id: child_run,
+            child_chat_id: tickloop_agent_protocol::ChatId::new(),
+            child_loop_id: uuid::Uuid::new_v4().into(),
+            child_run_id: child_run.into(),
             handle: "audit".into(),
             state: tickloop_agent_protocol::LoopState::Idle,
             result: tickloop_agent_protocol::SUBAGENT_REPORT_RECEIPT.into(),
@@ -8374,13 +8424,13 @@ mod tests {
             }))
             .unwrap();
             snapshot.message_ids.insert(0, child_run);
-            snapshot.message_runs.insert(0, run);
+            snapshot.message_runs.insert(0, run.into());
             snapshot
                 .agent_message_origins
                 .insert(child_run, serde_json::json!({"is_result":true}));
             let console = Console::test_interactive_for_chat(chat);
             if report_first {
-                show_consumed_family_input(&console, &snapshot, run).unwrap();
+                show_consumed_family_input(&console, &snapshot, run.into()).unwrap();
                 assert!(
                     !console.test_conversation_text().contains("Report line"),
                     "a report whose run has not ended waits for its completion"
@@ -8389,7 +8439,7 @@ mod tests {
             }
             snapshot.family_completions.push(completion.clone());
             show_family_completion(&console, &completion, &snapshot).unwrap();
-            show_consumed_family_input(&console, &snapshot, run).unwrap();
+            show_consumed_family_input(&console, &snapshot, run.into()).unwrap();
             show_family_completion(&console, &completion, &snapshot).unwrap();
             assert_eq!(
                 console.test_conversation_text(),
@@ -8411,7 +8461,7 @@ mod tests {
             "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         })).unwrap();
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         let history = super::workflows::public_history(&snapshot, super::DisplayProfile::default());
         assert!(
             history.contains("TickUpdate: Stock watcher"),
@@ -8475,7 +8525,7 @@ mod tests {
             &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
         );
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         let console = Console::test_interactive_for_chat(chat);
         for _ in 0..2 {
             consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
@@ -8504,7 +8554,7 @@ mod tests {
             tickloop_agent_base::private_fs::unix_time_milliseconds(),
         );
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         let history = super::workflows::public_history(&snapshot, super::DisplayProfile::default());
         assert!(
             history.contains("@tickloop request: doc"),
@@ -8586,7 +8636,7 @@ mod tests {
         );
         let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
         snapshot.message_ids.insert(0, source);
-        snapshot.message_runs.insert(0, run);
+        snapshot.message_runs.insert(0, run.into());
         snapshot
             .agent_message_origins
             .insert(source, serde_json::json!({"sender_relationship":"child"}));
@@ -8655,9 +8705,9 @@ mod tests {
             .request_usage
             .start(
                 RequestOwner {
-                    chat_id,
-                    loop_id: Some(Uuid::new_v4()),
-                    run_id: Some(Uuid::new_v4()),
+                    chat_id: chat_id.into(),
+                    loop_id: Some(Uuid::new_v4().into()),
+                    run_id: Some(Uuid::new_v4().into()),
                 },
                 ModelRequestKind::Conversation,
                 snapshot.model.identity(),
@@ -8706,9 +8756,9 @@ mod tests {
             .request_usage
             .start(
                 RequestOwner {
-                    chat_id,
-                    loop_id: Some(Uuid::new_v4()),
-                    run_id: Some(Uuid::new_v4()),
+                    chat_id: chat_id.into(),
+                    loop_id: Some(Uuid::new_v4().into()),
+                    run_id: Some(Uuid::new_v4().into()),
                 },
                 ModelRequestKind::Conversation,
                 snapshot.model.identity(),
@@ -8971,7 +9021,7 @@ mod tests {
         let outcome = agent
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
-                source_chat_id,
+                source_chat_id: source_chat_id.into(),
                 name: Some("recoverable child".into()),
             })
             .await
@@ -8990,15 +9040,15 @@ mod tests {
         let failure = switch_to_saved_branch(&console, child_chat_id).unwrap_err();
 
         assert_eq!(failure.lines().count(), 1);
-        assert!(failure.contains(&format!("Branch {child_chat_id} was saved")));
+        assert!(failure.contains(&format!("Branch {} was saved", child_chat_id.public())));
         assert!(failure.contains("renderer\\nfailed\\u{1b}[2J"));
         assert!(failure.contains("editor\\ncleanup\\u{1b}[3J"));
         assert!(failure.contains("Use /resume to find it"));
-        assert!(failure.contains(&format!("/resume {child_chat_id}")));
+        assert!(failure.contains(&format!("/resume {}", child_chat_id.public())));
         assert!(!failure.contains('\x1b'));
         assert_eq!(agent.list_chats().await.len(), 2);
         assert_eq!(
-            serde_json::to_value(agent.snapshot(child_chat_id).await.unwrap()).unwrap(),
+            serde_json::to_value(agent.snapshot(child_chat_id.into()).await.unwrap()).unwrap(),
             durable_child
         );
         agent.shutdown().await;
@@ -9021,17 +9071,16 @@ mod tests {
             .position(|chat| *chat == child_chat_id)
             .expect("the Chat picker did not list the saved child");
         assert!(
-            picker
-                .entries()
-                .iter()
-                .all(|entry| !entry.plain_row().contains(&child_chat_id.to_string())),
+            picker.entries().iter().all(|entry| !entry
+                .plain_row()
+                .contains(&child_chat_id.uuid().to_string())),
             "picker rows must not show Chat IDs"
         );
         let effect = workflow
             .choose(&reopened, &console, Some(child_index))
             .await
             .unwrap();
-        assert_eq!(effect.selection, Some(child_chat_id));
+        assert_eq!(effect.selection, Some(Into::into(child_chat_id)));
         // Branch 的创建请求与复制种子只在创建它的进程内有效，恢复时由元数据只还原来源与名称。
         let mut restored_child = durable_child.clone();
         restored_child["branch_origin"]["creation"] = serde_json::Value::Null;
@@ -9135,7 +9184,7 @@ mod tests {
         open_rewind(&agent, &console, &mut menus, None, false)
             .await
             .unwrap();
-        open_rewind(&agent, &console, &mut menus, Some(chat), false)
+        open_rewind(&agent, &console, &mut menus, Some(chat.into()), false)
             .await
             .unwrap();
         assert!(menus.id().is_none());
@@ -9165,14 +9214,14 @@ mod tests {
             }
         }
         let before = agent.snapshot(chat).await.unwrap();
-        open_rewind(&agent, &console, &mut menus, Some(chat), true)
+        open_rewind(&agent, &console, &mut menus, Some(chat.into()), true)
             .await
             .unwrap();
         assert!(menus.id().is_none());
         {
             let command = "/rewind";
             assert!(is_rewind_command(command));
-            open_rewind(&agent, &console, &mut menus, Some(chat), false)
+            open_rewind(&agent, &console, &mut menus, Some(chat.into()), false)
                 .await
                 .unwrap();
             assert!(
@@ -9180,7 +9229,7 @@ mod tests {
                 "{command} did not open the recorded selector"
             );
             let opened = menus.id();
-            open_rewind(&agent, &console, &mut menus, Some(chat), true)
+            open_rewind(&agent, &console, &mut menus, Some(chat.into()), true)
                 .await
                 .unwrap();
             assert_eq!(menus.id(), opened, "busy guard dismissed the current menu");
@@ -9207,7 +9256,7 @@ mod tests {
             }
         }
         let pending = agent.snapshot(chat).await.unwrap();
-        open_rewind(&agent, &console, &mut menus, Some(chat), false)
+        open_rewind(&agent, &console, &mut menus, Some(chat.into()), false)
             .await
             .unwrap();
         assert!(menus.id().is_none());
@@ -9302,7 +9351,7 @@ mod tests {
             .restore_rewind_draft("typed after the interrupt", &[])
             .unwrap();
         assert!(
-            super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
+            super::take_back_interrupted_prompt(&agent, &console, chat.into(), receipt.run_id)
                 .await
                 .unwrap()
                 .is_none(),
@@ -9314,10 +9363,11 @@ mod tests {
         let console = Console::test_interactive_for_chat(chat);
         super::workflows::write_public_history(&console, &agent.snapshot(chat).await.unwrap())
             .unwrap();
-        let snapshot = super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
-            .await
-            .unwrap()
-            .expect("an empty editor gets the prompt back");
+        let snapshot =
+            super::take_back_interrupted_prompt(&agent, &console, chat.into(), receipt.run_id)
+                .await
+                .unwrap()
+                .expect("an empty editor gets the prompt back");
         assert!(snapshot.messages.is_empty());
         assert!(!console.test_conversation_text().contains(prompt));
         assert_eq!(console.test_draft(), prompt);
@@ -9375,16 +9425,16 @@ mod tests {
         };
         let (console, _) = Console::start(false).unwrap();
         assert_eq!(
-            readable_background_label(&agent, &console, Uuid::new_v4()),
+            readable_background_label(&agent, &console, Uuid::new_v4().into()),
             UNLABELED_BACKGROUND_AGENT,
             "an Agent this View has not seen is not given an invented name"
         );
         agent.snapshot(background_chat).await.unwrap();
-        let label = readable_background_label(&agent, &console, background_chat);
+        let label = readable_background_label(&agent, &console, background_chat.into());
         assert_eq!(label, "Agent Write in the background");
 
         // 滞后丢失了权限请求事件：终端只知道提交回执。
-        let mut pending = HashMap::from([(receipt.run_id, receipt.clone())]);
+        let mut pending = HashMap::from([(receipt.run_id.uuid(), receipt.clone())]);
         let mut permissions = HashMap::new();
         let mut questions = HashMap::new();
         let snapshot = agent.snapshot(background_chat).await.unwrap();
@@ -9399,29 +9449,37 @@ mod tests {
             recovery,
             BackgroundRecovery {
                 run_notices: Vec::new(),
-                request_notices: vec![format!("{label} · permission request {}", request.id)],
+                request_notices: vec![format!(
+                    "{label} · permission request {}",
+                    tickloop_ids::base62::encode(request.id)
+                )],
                 failed: false,
             }
         );
-        assert!(pending.contains_key(&receipt.run_id));
+        assert!(pending.contains_key(&receipt.run_id.uuid()));
         assert_eq!(
             permissions.get(&request.id),
             Some(&super::PermissionRequestOwner::new(
-                background_chat,
+                background_chat.into(),
                 &request
             ))
         );
-        let wait = background_wait(foreground_chat, &permissions, &questions).unwrap();
+        let wait =
+            background_wait(foreground_chat.map(Into::into), &permissions, &questions).unwrap();
         assert_eq!(wait.kind, BackgroundWaitKind::Approval);
         assert_eq!(wait.chat_id, background_chat);
         assert_eq!(wait.request_id, request.id);
-        let closed = input_closed_while_waiting(foreground_chat, &permissions, &questions).unwrap();
+        let closed =
+            input_closed_while_waiting(foreground_chat.map(Into::into), &permissions, &questions)
+                .unwrap();
         assert!(
-            closed.contains(&format!("background Chat {background_chat}"))
-                && closed.contains(&request.id.to_string()),
+            closed.contains(&format!(
+                "background Chat {}",
+                tickloop_ids::base62::encode(background_chat)
+            )) && closed.contains(&tickloop_ids::base62::encode(request.id)),
             "{closed}"
         );
-        assert!(background_wait(Some(background_chat), &permissions, &questions).is_none());
+        assert!(background_wait(Some(background_chat.into()), &permissions, &questions).is_none());
 
         agent
             .answer_permission(background_chat, request.id, true)
@@ -9459,7 +9517,10 @@ mod tests {
             }
         );
         assert!(pending.is_empty() && permissions.is_empty());
-        assert!(input_closed_while_waiting(foreground_chat, &permissions, &questions).is_none());
+        assert!(
+            input_closed_while_waiting(foreground_chat.map(Into::into), &permissions, &questions)
+                .is_none()
+        );
         agent.shutdown().await;
     }
 
@@ -9473,15 +9534,17 @@ mod tests {
         let into = Uuid::from_u128(2);
         let merged = |sequence: u64, run: u128, into: Uuid| tickloop_agent_protocol::Event {
             sequence,
-            chat_id: chat,
-            loop_id: Uuid::from_u128(3),
-            run_id: Uuid::from_u128(run),
-            kind: EventKind::InputMerged { into_run_id: into },
+            chat_id: chat.into(),
+            loop_id: Uuid::from_u128(3).into(),
+            run_id: Uuid::from_u128(run).into(),
+            kind: EventKind::InputMerged {
+                into_run_id: into.into(),
+            },
         };
         let accept = |echoes: &mut MergedEchoes| {
-            echoes.accepted(Uuid::from_u128(10), Some(alpha));
-            echoes.accepted(Uuid::from_u128(11), Some(bravo));
-            echoes.accepted(Uuid::from_u128(12), Some(charlie));
+            echoes.accepted(Uuid::from_u128(10).into(), Some(alpha));
+            echoes.accepted(Uuid::from_u128(11).into(), Some(bravo));
+            echoes.accepted(Uuid::from_u128(12).into(), Some(charlie));
         };
 
         let mut echoes = MergedEchoes::default();
@@ -9543,14 +9606,16 @@ mod tests {
         let into = Uuid::from_u128(2);
         let merged = |sequence: u64, run: u128| tickloop_agent_protocol::Event {
             sequence,
-            chat_id: Uuid::from_u128(1),
-            loop_id: Uuid::from_u128(3),
-            run_id: Uuid::from_u128(run),
-            kind: EventKind::InputMerged { into_run_id: into },
+            chat_id: Uuid::from_u128(1).into(),
+            loop_id: Uuid::from_u128(3).into(),
+            run_id: Uuid::from_u128(run).into(),
+            kind: EventKind::InputMerged {
+                into_run_id: into.into(),
+            },
         };
         let mut echoes = MergedEchoes::default();
-        echoes.accepted(Uuid::from_u128(10), Some(alpha));
-        echoes.accepted(Uuid::from_u128(11), Some(bravo));
+        echoes.accepted(Uuid::from_u128(10).into(), Some(alpha));
+        echoes.accepted(Uuid::from_u128(11).into(), Some(bravo));
         // Alpha's merge is shown live; then a restore displays the Agent through sequence 21, so
         // bravo's merge arrives afterwards as an event the View already shows.
         assert_eq!(echoes.observe(&merged(20, 10), 19), None);
@@ -9564,8 +9629,8 @@ mod tests {
             "a merge already shown still releases its echo"
         );
         let mut live = MergedEchoes::default();
-        live.accepted(Uuid::from_u128(10), Some(alpha));
-        live.accepted(Uuid::from_u128(11), Some(bravo));
+        live.accepted(Uuid::from_u128(10).into(), Some(alpha));
+        live.accepted(Uuid::from_u128(11).into(), Some(bravo));
         live.observe(&merged(20, 10), 19);
         assert_eq!(
             live.observe(&merged(21, 11), 20),
@@ -9579,7 +9644,7 @@ mod tests {
         let chat = Uuid::new_v4();
         let request = tickloop_agent_protocol::PermissionRequest {
             id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4().into(),
             execution: tickloop_agent_protocol::PermissionExecution::UserShell {
                 command_id: Uuid::new_v4(),
             },
@@ -9591,9 +9656,9 @@ mod tests {
         };
         let event = tickloop_agent_protocol::Event {
             sequence: 1,
-            chat_id: chat,
+            chat_id: chat.into(),
             loop_id: request.loop_id,
-            run_id: Uuid::nil(),
+            run_id: Uuid::nil().into(),
             kind: EventKind::PermissionRequested {
                 request: request.clone(),
             },
@@ -9603,7 +9668,7 @@ mod tests {
         let mut questions = HashMap::new();
         track_run_requests(&event, &mut pending, &mut permissions, &mut questions);
         assert!(pending.is_empty());
-        let wait = background_wait(Some(Uuid::new_v4()), &permissions, &questions).unwrap();
+        let wait = background_wait(Some(Uuid::new_v4().into()), &permissions, &questions).unwrap();
         assert_eq!(wait.chat_id, chat);
         assert_eq!(wait.request_id, request.id);
         let directory = tempfile::tempdir().unwrap();
@@ -9657,7 +9722,7 @@ mod tests {
             permissions.is_empty(),
             "lost direct Shell approval must not remain actionable"
         );
-        snapshot.id = chat;
+        snapshot.id = chat.into();
         super::sync_status_requests(
             &tickloop_agent_protocol::ChatStatus::of(&snapshot),
             &mut permissions,
@@ -9671,9 +9736,9 @@ mod tests {
     fn background_run_events_clear_pending_work_even_when_only_merged_or_taken_back() {
         let chat_id = Uuid::from_u128(1);
         let receipt = |run: u128| Receipt {
-            chat_id,
-            loop_id: Uuid::from_u128(2),
-            run_id: Uuid::from_u128(run),
+            chat_id: chat_id.into(),
+            loop_id: Uuid::from_u128(2).into(),
+            run_id: Uuid::from_u128(run).into(),
         };
         let mut pending = HashMap::from([
             (Uuid::from_u128(3), receipt(3)),
@@ -9685,16 +9750,16 @@ mod tests {
             (
                 3,
                 EventKind::InputMerged {
-                    into_run_id: Uuid::from_u128(5),
+                    into_run_id: Uuid::from_u128(5).into(),
                 },
             ),
             (4, EventKind::InputTakenBack),
         ] {
             let event = tickloop_agent_protocol::Event {
                 sequence: 1,
-                chat_id,
-                loop_id: Uuid::from_u128(2),
-                run_id: Uuid::from_u128(run),
+                chat_id: chat_id.into(),
+                loop_id: Uuid::from_u128(2).into(),
+                run_id: Uuid::from_u128(run).into(),
                 kind,
             };
             track_run_requests(&event, &mut pending, &mut permissions, &mut questions);

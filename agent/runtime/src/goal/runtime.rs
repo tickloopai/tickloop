@@ -262,7 +262,7 @@ impl Agent {
     /// base: a lease that went in the meantime is taken again with the goal its holder left.
     async fn account_goal(&self, chat_id: ChatId, events: Vec<GoalEvent>, turn_ends: bool) {
         if !self.keeps_goal_accounts(chat_id) {
-            tracing::info!(chat = %chat_id, "not counted: another process keeps the goal");
+            tracing::info!(chat = %chat_id.uuid(), "not counted: another process keeps the goal");
             return;
         }
         let accounted = self
@@ -274,7 +274,7 @@ impl Agent {
             .map_err(GoalUpdateError::from)
             .and_then(|result| result)
         {
-            tracing::warn!(chat = %chat_id, %error, "could not account for the goal");
+            tracing::warn!(chat = %chat_id.uuid(), %error, "could not account for the goal");
         }
     }
 
@@ -341,7 +341,7 @@ impl Agent {
                     goal_id,
                     objective_revision,
                 } => tracing::info!(
-                    chat = %chat.snapshot.id,
+                    chat = %chat.snapshot.id.uuid(),
                     %goal_id,
                     objective_revision,
                     "discarded a goal completion check for an earlier objective"
@@ -402,7 +402,7 @@ impl Agent {
                     chat_id,
                     Line::GoalEvent(GoalEventEntry {
                         after_message_id,
-                        chat_id,
+                        chat_id: chat_id.into(),
                         goal_id: *goal_id,
                         objective: objective.clone(),
                         notice: notice.clone(),
@@ -415,7 +415,7 @@ impl Agent {
         let receipt = Receipt {
             chat_id,
             loop_id: chat.snapshot.chat_loop.id,
-            run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
+            run_id: chat.snapshot.chat_loop.run_id.unwrap_or(RunId::nil()),
         };
         let goal = chat.snapshot.goal.clone();
         let notices = if notices.is_empty() {
@@ -446,7 +446,7 @@ impl Agent {
         };
         let message = local_messages::goal_steering(&prompt(&prompt_context(goal)));
         if let Err(error) = self.append_local_messages(chat, [message]) {
-            tracing::warn!(chat = %chat.snapshot.id, %error, "could not steer the running turn");
+            tracing::warn!(chat = %chat.snapshot.id.uuid(), %error, "could not steer the running turn");
         }
     }
 
@@ -460,7 +460,7 @@ impl Agent {
                 token_budget,
                 replace,
             } => GoalEvent::Set {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 objective,
                 token_budget: token_budget.or_else(|| self.default_goal_budget()),
                 replace,
@@ -485,7 +485,8 @@ impl Agent {
         self.change_goal(chat_id, vec![event]).await?;
         if starts_work {
             // Nothing ended a turn: the continuation is named by this command alone.
-            self.continue_goal(chat_id, Uuid::new_v4()).await;
+            self.continue_goal(chat_id, tickloop_ids::generate().into())
+                .await;
         }
         Ok(())
     }
@@ -507,7 +508,7 @@ impl Agent {
             .get(&chat_id)
             .is_some_and(|chat| chat.snapshot.goal.is_some());
         if has_goal && let Err(error) = self.change_goal(chat_id, vec![event]).await {
-            tracing::warn!(chat = %chat_id, %error, "could not pause the goal");
+            tracing::warn!(chat = %chat_id.uuid(), %error, "could not pause the goal");
             self.inner.chat_leases.set_notice(
                 chat_id,
                 tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
@@ -638,7 +639,7 @@ impl Agent {
         };
         if let Err(error) = Box::pin(self.deliver_trigger(chat_id, delivery)).await {
             // The Chat's waiting input is retried with a backoff, and with it its goal.
-            tracing::debug!(chat = %chat_id, %error, "the goal continuation waits");
+            tracing::debug!(chat = %chat_id.uuid(), %error, "the goal continuation waits");
             self.retry_waiting_trigger_input(chat_id);
         }
     }
@@ -662,7 +663,7 @@ impl Agent {
                 .get(&chat_id)
                 .and_then(|chat| chat.snapshot.chat_loop.run_id);
             agent
-                .continue_goal(chat_id, after_run.unwrap_or_else(Uuid::new_v4))
+                .continue_goal(chat_id, after_run.unwrap_or_else(RunId::new))
                 .await;
         })
     }
@@ -699,7 +700,7 @@ impl Agent {
                     token_budget,
                 } = super::tools::parse_create_goal(&operation.input)?;
                 let event = GoalEvent::Set {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     objective,
                     token_budget: token_budget.or_else(|| self.default_goal_budget()),
                     replace: false,
@@ -806,7 +807,7 @@ impl Agent {
                     .finish_model_request(receipt.chat_id, response.sequence, outcome)
                     .await
                 {
-                    tracing::warn!(chat = %receipt.chat_id, %error, "could not settle the goal check request");
+                    tracing::warn!(chat = %receipt.chat_id.uuid(), %error, "could not settle the goal check request");
                 }
                 verdict
             }
@@ -884,16 +885,17 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
         for line in stored {
             retained.apply(line);
         }
-        chat.snapshot.goal_history =
-            tickloop_agent_transcript::display::goal_events(&[retained.snapshot(chat.snapshot.id)])
-                .into_iter()
-                .map(|entry| tickloop_agent_protocol::GoalHistoryEntry {
-                    after_message_id: entry.after_message_id,
-                    objective: entry.objective,
-                    notice: entry.notice,
-                    timestamp: entry.timestamp,
-                })
-                .collect();
+        chat.snapshot.goal_history = tickloop_agent_transcript::display::goal_events(&[
+            retained.snapshot(chat.snapshot.id.into())
+        ])
+        .into_iter()
+        .map(|entry| tickloop_agent_protocol::GoalHistoryEntry {
+            after_message_id: entry.after_message_id,
+            objective: entry.objective,
+            notice: entry.notice,
+            timestamp: entry.timestamp,
+        })
+        .collect();
         let mut goal = tickloop_agent_transcript::display::goal(stored);
         chat.goal_recorded_tokens = goal.as_ref().map_or(0, |goal| goal.tokens_used);
         // What this process counted for the same goal and has not recorded yet still counts.
@@ -924,14 +926,14 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
                     change.record_source_state(line)
                 }),
                 Err(error) => {
-                    tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal")
+                    tracing::warn!(chat = %chat.snapshot.id.uuid(), %error, "could not pause the goal")
                 }
             }
         } else if changed {
             let receipt = Receipt {
                 chat_id: chat.snapshot.id,
                 loop_id: chat.snapshot.chat_loop.id,
-                run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
+                run_id: chat.snapshot.chat_loop.run_id.unwrap_or(RunId::nil()),
             };
             let goal = chat.snapshot.goal.clone();
             agent.publish_event(
@@ -959,7 +961,7 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
                 .agent()
                 .update_goal(change, chat, vec![GoalEvent::Stopped], false)
         {
-            tracing::warn!(chat = %chat.snapshot.id, %error, "could not pause the goal");
+            tracing::warn!(chat = %chat.snapshot.id.uuid(), %error, "could not pause the goal");
         }
     }
 }
@@ -967,7 +969,7 @@ impl crate::wakeup::TriggerSourceState for GoalSourceState {
 /// The record of the Chat's goal as it is now.
 fn goal_line(chat: &Chat) -> Line {
     Line::Goal(GoalEntry {
-        chat_id: chat.snapshot.id,
+        chat_id: chat.snapshot.id.into(),
         cwd: chat.snapshot.folder.clone(),
         goal: chat.snapshot.goal.clone(),
     })

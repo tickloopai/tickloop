@@ -113,7 +113,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
     let requests = model.requests.lock().unwrap().clone();
     let after_entering = tickloop_agent_test_support::reminded_plan_file(requests.last().unwrap());
     assert!(
-        after_entering.is_some_and(|path| path.ends_with(&format!("-loop-{goal}.md"))),
+        after_entering.is_some_and(|path| path.ends_with(&format!("-loop-{}.md", goal.uuid()))),
         "the request after entering plan mode names the plan file"
     );
 
@@ -560,7 +560,7 @@ async fn legacy_transcript_modes_are_mapped_conservatively() {
         }
         first.shutdown().await;
 
-        let path = transcript_file(&root, chat);
+        let path = transcript_file(&root, chat.uuid());
         let transcript = std::fs::read_to_string(&path).unwrap();
         assert!(
             transcript.contains("\"executionMode\":\"acceptEdits\""),

@@ -180,7 +180,7 @@ impl CodexModelClient {
         let origin = codex_origin(&self.config.model, &credentials.account_id);
         let mut body = encode_request(&self.config, request, &origin)?;
         if let Some(chat) = chat_id {
-            body["prompt_cache_key"] = json!(chat.to_string());
+            body["prompt_cache_key"] = json!(chat.uuid().to_string());
         }
         let mut output = if self.prefer_websocket {
             match transport::complete(
@@ -264,8 +264,8 @@ impl CodexModelClient {
             .json(&body);
         if let Some(chat) = chat_id {
             outgoing = outgoing
-                .header("session-id", chat.to_string())
-                .header("x-client-request-id", chat.to_string());
+                .header("session-id", chat.uuid().to_string())
+                .header("x-client-request-id", chat.uuid().to_string());
         }
         let started = Instant::now();
         let sent = tokio::select! {
@@ -1092,7 +1092,7 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let first = client
             .complete_for_chat(
-                chat,
+                chat.into(),
                 simple_request(),
                 events.clone(),
                 CancellationToken::new(),
@@ -1122,7 +1122,12 @@ mod tests {
             ..simple_request()
         };
         let second = client
-            .complete_for_chat(chat, second_request, events, CancellationToken::new())
+            .complete_for_chat(
+                chat.into(),
+                second_request,
+                events,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(
@@ -1207,7 +1212,7 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let first = client
             .complete_for_chat(
-                chat,
+                chat.into(),
                 simple_request(),
                 events.clone(),
                 CancellationToken::new(),
@@ -1237,7 +1242,7 @@ mod tests {
             ..simple_request()
         };
         let result = client
-            .complete_for_chat(chat, request, events, CancellationToken::new())
+            .complete_for_chat(chat.into(), request, events, CancellationToken::new())
             .await;
         if reject_full_history {
             assert!(matches!(
@@ -1320,7 +1325,7 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         client
             .complete_for_chat(
-                first_chat,
+                first_chat.into(),
                 simple_request(),
                 events.clone(),
                 CancellationToken::new(),
@@ -1329,7 +1334,7 @@ mod tests {
             .unwrap();
         client
             .complete_for_chat(
-                second_chat,
+                second_chat.into(),
                 simple_request(),
                 events.clone(),
                 CancellationToken::new(),
@@ -1344,7 +1349,7 @@ mod tests {
         );
         client
             .complete_for_chat(
-                first_chat,
+                first_chat.into(),
                 simple_request(),
                 events.clone(),
                 CancellationToken::new(),
@@ -1354,7 +1359,7 @@ mod tests {
         rewrite_credentials(&state_dir, "new-account-token", "new-account", 3_600_000);
         client
             .complete_for_chat(
-                first_chat,
+                first_chat.into(),
                 simple_request(),
                 events,
                 CancellationToken::new(),
@@ -1731,7 +1736,7 @@ mod tests {
                 budget
                     .complete(
                         &client,
-                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4().into(),
                         simple_request(),
                         request_cancel,
                     )
@@ -1815,7 +1820,7 @@ mod tests {
                 budget
                     .complete(
                         &client,
-                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4().into(),
                         simple_request(),
                         request_cancel,
                     )
@@ -1866,7 +1871,7 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let error = client
             .complete_for_chat_with_context(
-                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4().into(),
                 simple_request(),
                 events,
                 CancellationToken::new(),

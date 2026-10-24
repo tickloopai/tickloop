@@ -1599,7 +1599,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     };
     let record = TranscriptRef {
         store_root: root.clone(),
-        chat_id: snapshot.conversation.id,
+        chat_id: snapshot.conversation.id.into(),
     };
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         let snapshot = first.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
@@ -3087,7 +3087,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
     assert_eq!(records.len(), 3);
     let record = TranscriptRef {
         store_root: temporary.path().join("state"),
-        chat_id: records[0].id,
+        chat_id: records[0].id.into(),
     };
     let observed = client
         .observe(ObservationRequest::Transcript {

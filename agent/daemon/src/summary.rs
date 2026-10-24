@@ -34,10 +34,10 @@ mod tests {
     fn current_run_start_survives_tool_state_changes_and_excludes_finished_runs() {
         let mut chat_loop = LoopSnapshot {
             state: LoopState::Running,
-            run_id: Some(uuid::Uuid::new_v4()),
+            run_id: Some(uuid::Uuid::new_v4().into()),
             run_started_at: Some(20_000),
             state_since: Some(25_000),
-            ..LoopSnapshot::new(uuid::Uuid::new_v4())
+            ..LoopSnapshot::new(uuid::Uuid::new_v4().into())
         };
         assert_eq!(
             run_started_at(&chat_loop, &LoopState::Running),
@@ -78,7 +78,7 @@ mod tests {
         );
         assert_eq!(updated_at(&chat_loop, &[shell]), Some(80_000));
         chat_loop.state = LoopState::Running;
-        chat_loop.run_id = Some(uuid::Uuid::new_v4());
+        chat_loop.run_id = Some(uuid::Uuid::new_v4().into());
         chat_loop.run_started_at = Some(90_000);
         chat_loop.state_since = Some(91_000);
         assert_eq!(

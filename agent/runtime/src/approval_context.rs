@@ -8,6 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tickloop_agent_protocol::{ScheduledTaskId, ScheduledTaskIdKind};
+use tickloop_ids::{IdContext, ModelRef};
 use uuid::Uuid;
 
 use super::ChatBookkeeping;
@@ -148,7 +150,9 @@ fn proposed_call_position(
         .enumerate()
         .rev()
         .find_map(|(index, message)| {
-            if message.role != Role::Assistant || snapshot.message_runs.get(&index) != Some(&run) {
+            if message.role != Role::Assistant
+                || snapshot.message_runs.get(&index) != Some(&tickloop_ids::Id::from(run))
+            {
                 return None;
             }
             message
@@ -188,7 +192,10 @@ pub(super) fn recovered_tool_history(
         compaction_gap,
         ..Default::default()
     };
-    let boundary = proposed_call_position(snapshot, Some((operation.run_id, &operation.call_id)));
+    let boundary = proposed_call_position(
+        snapshot,
+        Some((operation.run_id.into(), &operation.call_id)),
+    );
     let mut pending: HashMap<(Uuid, &str), usize> = HashMap::new();
     let mut seen_calls = HashSet::new();
     let mut ambiguous = HashSet::new();
@@ -227,7 +234,7 @@ pub(super) fn recovered_tool_history(
         .map(|(index, message)| {
             (
                 Some(index),
-                snapshot.message_runs.get(&index).copied(),
+                snapshot.message_runs.get(&index).map(|run| run.uuid()),
                 snapshot
                     .original_message_ids
                     .get(&index)
@@ -265,7 +272,7 @@ pub(super) fn recovered_tool_history(
                         history.complete = false;
                     }
                     let previous = run
-                        .and_then(|run| prepared.get(&(run, id.as_str())))
+                        .and_then(|run| prepared.get(&(run.into(), id.as_str())))
                         .copied()
                         .flatten();
                     let path_field = match name.as_str() {
@@ -323,7 +330,7 @@ pub(super) fn recovered_tool_history(
     for call in &mut history.calls {
         if let Some(prior) = call
             .run_id
-            .and_then(|run| prepared.get(&(run, call.call_id.as_str())))
+            .and_then(|run| prepared.get(&(run.into(), call.call_id.as_str())))
             .copied()
             .flatten()
             && prior.state == tickloop_agent_protocol::OperationState::Unknown
@@ -350,6 +357,7 @@ pub(super) struct ScheduledTaskEvidence {
 }
 
 fn scheduled_task_evidence(
+    ids: &IdContext,
     snapshot: &ChatSnapshot,
     operation: &OperationRecord,
     history: &ToolHistory,
@@ -361,20 +369,19 @@ fn scheduled_task_evidence(
     ) {
         return None;
     }
-    let task_id: uuid::Uuid = operation.input.get("id")?.as_str()?.trim().parse().ok()?;
+    let reference = ModelRef::<ScheduledTaskIdKind>::from(operation.input.get("id")?.as_str()?);
+    let task_id = ids.resolve(&reference).ok()?;
     let task = snapshot
         .scheduled_tasks
         .iter()
-        .find(|task| task.id == task_id)?;
-    let id = task.id.to_string();
-    let id = id.as_str();
+        .find(|task| task.id == task_id.uuid())?;
     let creation_call_id = history.calls.iter().find_map(|call| {
         if task.creator != tickloop_agent_protocol::ScheduledTaskCreator::Agent
             || call.tool != crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME
             || !matches!(call.outcome, HistoricalToolOutcome::ReturnedSuccess)
             || !snapshot.operations.iter().any(|prior| {
                 prior.loop_id == operation.loop_id
-                    && Some(prior.run_id) == call.run_id
+                    && Some(prior.run_id) == call.run_id.map(Into::into)
                     && prior.call_id == call.call_id
                     && prior.name == call.tool
                     && prior.state == tickloop_agent_protocol::OperationState::Completed
@@ -388,7 +395,7 @@ fn scheduled_task_evidence(
             .enumerate()
             .find_map(|(index, message)| {
                 if message.role != Role::User
-                    || snapshot.message_runs.get(&index).copied() != call.run_id
+                    || snapshot.message_runs.get(&index).copied() != call.run_id.map(Into::into)
                 {
                     return None;
                 }
@@ -401,7 +408,8 @@ fn scheduled_task_evidence(
                     } if tool_use_id == &call.call_id
                         && serde_json::from_str::<Value>(&content.text())
                             .ok()
-                            .is_some_and(|result| result["id"].as_str() == Some(id)) =>
+                            .and_then(|result| ScheduledTaskId::parse(result["id"].as_str()?))
+                            .is_some_and(|created| created == task_id) =>
                     {
                         Some(call.call_id.clone())
                     }
@@ -564,9 +572,9 @@ fn originals_for_active_chain_with_legacy(
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             }
             originals.push(OriginalUserInput {
-                chat_id: snapshot.id,
-                loop_id,
-                run_id,
+                chat_id: snapshot.id.into(),
+                loop_id: loop_id.into(),
+                run_id: run_id.into(),
                 message_id,
                 text,
             });
@@ -589,7 +597,7 @@ fn originals_for_active_chain_with_legacy(
                 if call_counts.get(&(run_id, tool_use_id.clone())) != Some(&1) {
                     return Err(ApprovalContextError::MissingOriginalUserInput);
                 }
-                if captured_inputs.contains(&(snapshot.id, message_id)) {
+                if captured_inputs.contains(&(snapshot.id.into(), message_id)) {
                     continue;
                 }
                 let answer = content.text();
@@ -606,9 +614,9 @@ fn originals_for_active_chain_with_legacy(
                     previous.text.push_str(&answer);
                 } else {
                     originals.push(OriginalUserInput {
-                        chat_id: snapshot.id,
-                        loop_id,
-                        run_id,
+                        chat_id: snapshot.id.into(),
+                        loop_id: loop_id.into(),
+                        run_id: run_id.into(),
                         message_id,
                         text: answer.into_owned(),
                     });
@@ -665,9 +673,9 @@ fn user_goal_input(
         }
     };
     Some(OriginalUserInput {
-        chat_id,
-        loop_id,
-        run_id: operation.run_id,
+        chat_id: chat_id.into(),
+        loop_id: loop_id.into(),
+        run_id: operation.run_id.into(),
         message_id: goal.id,
         text: format!(
             "The user set this Chat's goal with /goal, for the Agent to keep working toward: {}",
@@ -676,7 +684,9 @@ fn user_goal_input(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn capture(
+    ids: &IdContext,
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
     operation: &OperationRecord,
@@ -689,7 +699,7 @@ pub(super) fn capture(
         snapshot,
         bookkeeping,
         legacy,
-        Some((operation.run_id, &operation.call_id)),
+        Some((operation.run_id.into(), &operation.call_id)),
     )?;
     let mut original_user_inputs = originals
         .into_iter()
@@ -722,14 +732,14 @@ pub(super) fn capture(
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
     let tool_history = tool_history(snapshot, operation);
-    let scheduled_task = scheduled_task_evidence(snapshot, operation, &tool_history);
+    let scheduled_task = scheduled_task_evidence(ids, snapshot, operation, &tool_history);
     Ok(ApprovalSnapshot {
         context_truncation: None,
         tool_history,
         reply_history: capture_reply_history(
             snapshot,
             bookkeeping,
-            Some((operation.run_id, &operation.call_id)),
+            Some((operation.run_id.into(), &operation.call_id)),
             &original_user_inputs,
             None,
         ),
@@ -778,8 +788,8 @@ pub(super) fn capture(
         operation: ApprovalOperation {
             id: operation.id,
             call_id: operation.call_id.clone(),
-            loop_id: operation.loop_id,
-            run_id: operation.run_id,
+            loop_id: operation.loop_id.into(),
+            run_id: operation.run_id.into(),
             tool: operation.name.clone(),
             input: project_tool_input(&operation.name, &operation.input, InputPurpose::Proposed)
                 .unwrap_or(Value::Null),
@@ -811,11 +821,11 @@ impl crate::Agent {
             })?;
         match lines {
             Some(lines) => {
-                crate::transcript::load_compaction_ancestors(lines, boundary, snapshot.id)
+                crate::transcript::load_compaction_ancestors(lines, boundary, snapshot.id.into())
             }
             None => {
                 let lines = self.stored_lines(snapshot.id).await?;
-                crate::transcript::load_compaction_ancestors(&lines, boundary, snapshot.id)
+                crate::transcript::load_compaction_ancestors(&lines, boundary, snapshot.id.into())
             }
         }
     }
@@ -850,14 +860,14 @@ mod tests {
             .unwrap()
         };
         let mut root = crate::empty_snapshot(
-            Uuid::new_v4(),
+            Uuid::new_v4().into(),
             Some("/project".into()),
             ModelConfig::unselected(),
         );
         root.goal = Some(set(GoalAuthor::User));
         let delegated = delegated_goal(&root).expect("the user's goal is delegated");
         let mut child = crate::empty_snapshot(
-            Uuid::new_v4(),
+            Uuid::new_v4().into(),
             Some("/project".into()),
             ModelConfig::unselected(),
         );
@@ -865,7 +875,7 @@ mod tests {
             delegation_id: Uuid::new_v4(),
             parent_chat_id: root.id,
             parent_loop_id: root.chat_loop.id,
-            parent_run_id: Uuid::new_v4(),
+            parent_run_id: Uuid::new_v4().into(),
             parent_call_id: "s1".into(),
             ancestors: Vec::new(),
             task: "write the export".into(),
@@ -891,7 +901,7 @@ mod tests {
             task_binding: None,
             id: Uuid::new_v4(),
             loop_id: child.chat_loop.id,
-            run_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4().into(),
             call_id: "b1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "touch export.txt"}),
@@ -904,7 +914,10 @@ mod tests {
 
         let current = root.goal.clone().unwrap();
         let input = weighed(Some(&current)).expect("the goal it was delegated under");
-        assert_eq!((input.chat_id, input.loop_id), (root.id, root.chat_loop.id));
+        assert_eq!(
+            (input.chat_id, input.loop_id),
+            (root.id.uuid(), root.chat_loop.id.uuid())
+        );
         assert!(input.text.contains("Ship the export command"));
 
         assert!(weighed(None).is_none(), "a cleared goal");
@@ -935,7 +948,7 @@ mod tests {
     fn tool_outputs_cannot_claim_success_or_replace_a_host_unknown_outcome() {
         let run = Uuid::new_v4();
         let mut snapshot = crate::empty_snapshot(
-            Uuid::new_v4(),
+            Uuid::new_v4().into(),
             Some("/project".into()),
             ModelConfig::unselected(),
         );
@@ -974,13 +987,13 @@ mod tests {
             },
         ];
         for index in 0..snapshot.messages.len() {
-            snapshot.message_runs.insert(index, run);
+            snapshot.message_runs.insert(index, run.into());
         }
         let operation = OperationRecord {
             task_binding: None,
             id: Uuid::new_v4(),
-            loop_id: Uuid::new_v4(),
-            run_id: run,
+            loop_id: Uuid::new_v4().into(),
+            run_id: run.into(),
             call_id: "next".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command":"bash draft"}),
@@ -1025,7 +1038,7 @@ mod tests {
             [snapshot.messages[0].clone(), snapshot.messages[2].clone()],
         );
         for index in 0..snapshot.messages.len() {
-            snapshot.message_runs.insert(index, run);
+            snapshot.message_runs.insert(index, run.into());
         }
         let duplicated = tool_history(&snapshot, &operation);
         assert_eq!(duplicated.calls.len(), 2);

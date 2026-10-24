@@ -159,7 +159,11 @@ pub struct ObservationEffect {
 pub enum LedgerError {
     #[error("invalid request owner for {0:?}")]
     InvalidOwner(ModelRequestKind),
-    #[error("request usage ledger belongs to Chat {expected}, not {actual}")]
+    #[error(
+        "request usage ledger belongs to Chat {}, not {}",
+        expected.public(),
+        actual.public()
+    )]
     ChatMismatch { expected: ChatId, actual: ChatId },
     #[error("request sequence exhausted")]
     SequenceOverflow,
@@ -557,9 +561,9 @@ mod tests {
 
     fn owner() -> RequestOwner {
         RequestOwner {
-            chat_id: Uuid::from_u128(1),
-            loop_id: Some(Uuid::from_u128(2)),
-            run_id: Some(Uuid::from_u128(3)),
+            chat_id: Uuid::from_u128(1).into(),
+            loop_id: Some(Uuid::from_u128(2).into()),
+            run_id: Some(Uuid::from_u128(3).into()),
         }
     }
 
@@ -590,7 +594,7 @@ mod tests {
         let other = ledger
             .start(
                 RequestOwner {
-                    run_id: Some(Uuid::new_v4()),
+                    run_id: Some(Uuid::new_v4().into()),
                     ..owner()
                 },
                 ModelRequestKind::Conversation,
@@ -820,7 +824,7 @@ mod tests {
             ledger
                 .start(
                     RequestOwner {
-                        chat_id: Uuid::from_u128(99),
+                        chat_id: Uuid::from_u128(99).into(),
                         ..owner()
                     },
                     ModelRequestKind::Conversation,
@@ -877,7 +881,7 @@ mod tests {
             ledger.validate_in_flight(
                 sequence,
                 RequestOwner {
-                    chat_id: Uuid::from_u128(99),
+                    chat_id: Uuid::from_u128(99).into(),
                     ..request_owner
                 },
                 ModelRequestKind::CompactionDirected,
@@ -1058,7 +1062,7 @@ mod tests {
         let other = ledger
             .start(
                 RequestOwner {
-                    run_id: Some(Uuid::from_u128(90)),
+                    run_id: Some(Uuid::from_u128(90).into()),
                     ..owner()
                 },
                 ModelRequestKind::Conversation,

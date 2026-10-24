@@ -175,7 +175,7 @@ impl LoginFlow {
         console: &Console,
         method: LoginMethod,
     ) -> Result<Self, String> {
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         let chat = console.dialog_chat()?;
         let cancel = CancellationToken::new();
         Self::show(
@@ -372,7 +372,7 @@ impl LoginFlow {
         console: &Console,
         method: LoginMethod,
     ) -> Result<(Self, mpsc::UnboundedSender<LoginUpdate>), String> {
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         let chat = console.dialog_chat()?;
         Self::show(
             console,

@@ -469,7 +469,7 @@ impl Agent {
             }
             let input = specifier.is_none().then_some(request.input);
             let rule = PermissionRule {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 decision: if allow {
                     Decision::Allow
                 } else {

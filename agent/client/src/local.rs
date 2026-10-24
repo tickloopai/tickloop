@@ -267,7 +267,7 @@ impl LocalAgentClient {
         self.inner.hello.read().unwrap().clone()
     }
     pub async fn shutdown_daemon(&self) -> Result<(), AccessError> {
-        let request_id = Uuid::new_v4();
+        let request_id = tickloop_ids::generate();
         match self
             .request(
                 request_id,
@@ -332,7 +332,7 @@ impl LocalAgentClient {
             return Err(AccessError::unavailable("daemon connection is closed"));
         }
         let (sender, receiver) = oneshot::channel();
-        let attempt = Uuid::new_v4();
+        let attempt = tickloop_ids::generate();
         self.inner.pending.lock().await.insert(
             request_id,
             PendingRequest {
@@ -433,7 +433,7 @@ impl LocalAgentClient {
 #[async_trait]
 impl AgentAccess for LocalAgentClient {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let request_id = Uuid::new_v4();
+        let request_id = tickloop_ids::generate();
         let (written, waiting) = watch::channel(None);
         let mut cancel = PendingObservationCancel {
             writer: Arc::downgrade(&self.inner.writer),
@@ -474,7 +474,7 @@ impl AgentAccess for LocalAgentClient {
         }
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        let request_id = Uuid::new_v4();
+        let request_id = tickloop_ids::generate();
         match self
             .request(
                 request_id,
@@ -502,7 +502,7 @@ impl AgentAccess for LocalAgentClient {
         }
     }
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        let request_id = Uuid::new_v4();
+        let request_id = tickloop_ids::generate();
         match self
             .request(request_id, ClientMessage::ShowView { request_id, update })
             .await?

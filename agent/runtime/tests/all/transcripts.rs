@@ -28,7 +28,7 @@ const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 async fn require_workspace_write_approval(agent: &Agent, chat: Uuid) {
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: Uuid::new_v4(),
                 decision: Decision::Ask,
@@ -252,7 +252,7 @@ async fn two_resumes_of_one_chat_fork_and_the_latest_leaf_wins() {
     assert!(sent.contains("from the right host"), "{sent}");
     assert!(!sent.contains("from the left host"), "{sent}");
     latest.shutdown().await;
-    let file = std::fs::read_to_string(transcript_file(&root, chat)).unwrap();
+    let file = std::fs::read_to_string(transcript_file(&root, chat.uuid())).unwrap();
     assert!(file.contains("from the left host"));
 }
 
@@ -275,7 +275,7 @@ async fn corrupt_and_truncated_lines_are_skipped_on_resume() {
     agent.shutdown().await;
     drop(agent);
 
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
     let text_before = std::fs::read_to_string(&path).unwrap();
     let mut lines = text_before.lines().map(str::to_owned).collect::<Vec<_>>();
     let metadata_line = lines
@@ -342,7 +342,7 @@ async fn killed_process_fixture() {
         .set_execution_mode(chat, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
-    std::fs::write(directory.join("chat"), chat.to_string()).unwrap();
+    std::fs::write(directory.join("chat"), chat.uuid().to_string()).unwrap();
     complete_turn(&agent, chat, "first prompt").await;
     agent
         .submit(chat, "prompt before the kill".into())
@@ -374,8 +374,9 @@ async fn killed_process_resumes_from_its_flushed_transcript() {
     );
     let chat: ChatId = std::fs::read_to_string(directory.path().join("chat"))
         .unwrap()
-        .parse()
-        .unwrap();
+        .parse::<uuid::Uuid>()
+        .unwrap()
+        .into();
 
     let model = Arc::new(ScriptedModel::new(vec![text("resumed answer")]));
     let restored =
@@ -416,7 +417,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         complete_turn(&agent, chat, "read the notes").await;
         agent.shutdown().await;
         drop(agent);
-        truncate_transcript_before(&transcript_file(&root, chat), |line| {
+        truncate_transcript_before(&transcript_file(&root, chat.uuid()), |line| {
             line.contains("final answer that was lost")
         });
 
@@ -461,7 +462,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         complete_turn(&agent, chat, "read the notes").await;
         agent.shutdown().await;
         drop(agent);
-        truncate_transcript_before(&transcript_file(&root, chat), |line| {
+        truncate_transcript_before(&transcript_file(&root, chat.uuid()), |line| {
             is_tool_result_line(line, "read")
         });
 
@@ -614,7 +615,8 @@ async fn branch_copies_only_the_visible_conversation_and_records_its_source() {
     assert!(sent.contains("kept prompt"), "{sent}");
     assert!(!sent.contains("ABANDONED-MARKER"), "{sent}");
     reopened.shutdown().await;
-    let child_file = std::fs::read_to_string(transcript_file(&root, branch.child_chat_id)).unwrap();
+    let child_file =
+        std::fs::read_to_string(transcript_file(&root, branch.child_chat_id.uuid())).unwrap();
     assert!(!child_file.contains("ABANDONED-MARKER"));
 }
 
@@ -707,7 +709,7 @@ async fn string_tool_results_from_earlier_transcripts_resume_rewind_and_branch()
     complete_turn(&agent, chat, "ABANDONED-MARKER prompt").await;
     agent.shutdown().await;
     drop(agent);
-    let stored = edit_stored_tool_result(&transcript_file(&root, chat), "read-1", |_| {});
+    let stored = edit_stored_tool_result(&transcript_file(&root, chat.uuid()), "read-1", |_| {});
     let stored = stored
         .as_str()
         .expect("results are stored as plain strings")
@@ -765,7 +767,7 @@ async fn block_array_tool_results_round_trip_through_resume_and_branch() {
         {"type":"text","text":"BLOCK-ONE"},
         {"type":"text","text":"BLOCK-TWO"}
     ]);
-    edit_stored_tool_result(&transcript_file(&root, chat), "read-1", |content| {
+    edit_stored_tool_result(&transcript_file(&root, chat.uuid()), "read-1", |content| {
         *content = blocks.clone();
     });
 
@@ -795,7 +797,7 @@ async fn block_array_tool_results_round_trip_through_resume_and_branch() {
         )]
     );
     assert_eq!(
-        edit_stored_tool_result(&transcript_file(&root, child), "read-1", |_| {}),
+        edit_stored_tool_result(&transcript_file(&root, child.uuid()), "read-1", |_| {}),
         blocks
     );
 }
@@ -814,7 +816,7 @@ async fn resuming_a_loaded_chat_returns_the_live_instance() {
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_workspace_write_approval(&agent, chat).await;
+    require_workspace_write_approval(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     agent.submit(chat, "write a file".into()).await.unwrap();
     loop {
@@ -916,7 +918,7 @@ async fn long_working_directory_names_share_one_project() {
         vec![chat]
     );
     assert_eq!(second.resume_chat(chat).await.unwrap().messages.len(), 2);
-    let project = transcript_file(&root, chat);
+    let project = transcript_file(&root, chat.uuid());
     let project_name = project.parent().unwrap().file_name().unwrap().len();
     assert!(project_name <= 255 && project_name > 200);
     first.shutdown().await;
@@ -939,7 +941,7 @@ async fn interruption_while_waiting_for_permission_leaves_no_pending_work_after_
     )
     .unwrap();
     let chat = original.create_chat(directory.path().into()).await.unwrap();
-    require_workspace_write_approval(&original, chat).await;
+    require_workspace_write_approval(&original, chat.uuid()).await;
     let mut events = original.subscribe();
     original.submit(chat, "write a file".into()).await.unwrap();
     loop {
@@ -1069,7 +1071,10 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     .await
     .unwrap();
     agent.flush_transcripts().await;
-    let project = transcript_file(&root, warm).parent().unwrap().to_path_buf();
+    let project = transcript_file(&root, warm.uuid())
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let set_mode =
         |mode| std::fs::set_permissions(&project, std::fs::Permissions::from_mode(mode)).unwrap();
 
@@ -1091,7 +1096,7 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     .unwrap();
     agent.flush_transcripts().await;
     let error = agent.transcript_write_error();
-    let path = project.join(format!("{chat}.jsonl"));
+    let path = project.join(format!("{}.jsonl", chat.uuid()));
     set_mode(0o700);
     assert!(error.is_some());
     assert!(!path.exists());
@@ -1143,7 +1148,7 @@ async fn a_resumed_chat_whose_transcript_was_deleted_is_not_recreated() {
     complete_turn(&agent, chat, "saved prompt").await;
     agent.shutdown().await;
     drop(agent);
-    let path = transcript_file(&root, chat);
+    let path = transcript_file(&root, chat.uuid());
 
     let restored = Agent::open_embedded(
         root.clone(),
@@ -1184,7 +1189,7 @@ async fn externally_removing_the_transcript_of_a_running_chat_stops_saving_it() 
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     complete_turn(&agent, chat, "saved prompt").await;
     agent.flush_transcripts().await;
-    let transcript = transcript_file(&root, chat);
+    let transcript = transcript_file(&root, chat.uuid());
 
     std::fs::remove_file(&transcript).unwrap();
 

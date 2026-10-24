@@ -1261,8 +1261,11 @@ async fn resuming_retains_original_reasoning_and_projects_different_model_source
     let chat = first.create_chat(workdir.clone()).await.unwrap();
     run_turn(&first, chat, "Think about it", PermissionScope::Once).await;
     first.shutdown().await;
-    let transcript =
-        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat)).unwrap();
+    let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+        &root,
+        chat.uuid(),
+    ))
+    .unwrap();
     let assistant = transcript
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())

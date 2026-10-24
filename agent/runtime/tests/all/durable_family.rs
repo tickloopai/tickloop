@@ -222,7 +222,7 @@ fn options(waits: WaitHosting) -> HarnessOptions {
 
 fn prompt(text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -237,7 +237,7 @@ fn prompt(text: &str) -> TurnRequest {
 
 fn answer(request: &QuestionRequest) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Answer {
             request: request.id,
             reply: QuestionReply::Answered(vec![QuestionAnswer::other("Weekly")]),
@@ -257,7 +257,7 @@ async fn outcome(turn: &Turn) -> TurnOutcome {
 async fn settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        agent.settled_input(chat, input),
+        agent.settled_input(chat, tickloop_ids::Id::from(input)),
     )
     .await
     .expect("the input settles")
@@ -388,7 +388,7 @@ async fn answered_in_process() -> Value {
     let reply = agent.advance(child, answer(&request)).await.unwrap();
     assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
     assert!(matches!(
-        settled(&agent, root, turn.input_id()).await,
+        settled(&agent, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = agent.snapshot(root).await.unwrap();
@@ -534,7 +534,7 @@ async fn subagent_search_survives_durable_family_reload_including_disabled() {
         let reply = restored.advance(child, answer(&question)).await.unwrap();
         assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
         assert!(matches!(
-            settled(&restored, root, turn.input_id()).await,
+            settled(&restored, root, (turn.input_id()).uuid()).await,
             SettledOutcome::Completed { .. }
         ));
         assert_eq!(
@@ -680,7 +680,7 @@ async fn fixed_search_defaults_reach_every_chat_and_override_stored_family_setti
             .unwrap();
         assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
         assert!(matches!(
-            settled(&restored, root, turn.input_id()).await,
+            settled(&restored, root, (turn.input_id()).uuid()).await,
             SettledOutcome::Completed { .. }
         ));
         restored.shutdown().await;
@@ -699,7 +699,10 @@ async fn a_foreground_childs_question_suspends_the_family_and_another_instance_f
     let root_lines = store.lines(root);
     let root_run = turn.receipt().run_id;
     assert_eq!(
-        response_states(&root_lines, root_run).last().unwrap().1,
+        response_states(&root_lines, root_run.uuid())
+            .last()
+            .unwrap()
+            .1,
         ResponseState::Suspended
     );
     let waits = subagent_waits(&root_lines);
@@ -718,7 +721,7 @@ async fn a_foreground_childs_question_suspends_the_family_and_another_instance_f
     let reply = answering.advance(child, answer(&request)).await.unwrap();
     assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
     assert!(matches!(
-        settled(&answering, root, turn.input_id()).await,
+        settled(&answering, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     assert_eq!(answering.quiesce(root).await, Quiescence::Idle);
@@ -741,7 +744,7 @@ async fn a_foreground_childs_question_suspends_the_family_and_another_instance_f
     answering.sync().await.unwrap();
     let root_lines = store.lines(root);
     assert_eq!(
-        response_states(&root_lines, root_run)
+        response_states(&root_lines, root_run.uuid())
             .iter()
             .map(|(attempt, _)| *attempt)
             .max(),
@@ -783,7 +786,7 @@ async fn a_worker_restarted_during_a_foreground_subagent_ends_it_as_a_lost_host_
     restarted.sync().await.unwrap();
     let lines = crashed.lines(root);
     assert_eq!(
-        response_states(&lines, turn.receipt().run_id)
+        response_states(&lines, (turn.receipt().run_id).uuid())
             .last()
             .unwrap()
             .1,
@@ -818,11 +821,11 @@ async fn a_pending_completion_of_a_foreground_call_is_returned_not_notified() {
         .unwrap();
     let mut root_lines = store.lines(root);
     root_lines.push(Line::FamilyCompletions(FamilyCompletionsEntry {
-        chat_id: root,
+        chat_id: root.uuid(),
         completions: vec![FamilyCompletion {
             child_chat_id: child,
-            child_loop_id: child_receipt.0,
-            child_run_id: child_receipt.1,
+            child_loop_id: tickloop_ids::Id::from(child_receipt.0),
+            child_run_id: tickloop_ids::Id::from(child_receipt.1),
             handle: "writer".into(),
             state: LoopState::Idle,
             result: CHILD_REPORT.into(),
@@ -841,7 +844,7 @@ async fn a_pending_completion_of_a_foreground_call_is_returned_not_notified() {
     let loading = harness(seeded.clone(), model.clone(), WaitHosting::Durable);
     loading.resume_chat(root).await.unwrap();
     assert!(matches!(
-        settled(&loading, root, turn.input_id()).await,
+        settled(&loading, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = loading.snapshot(root).await.unwrap();
@@ -877,7 +880,7 @@ async fn a_child_that_lost_its_host_once_reports_to_its_foreground_parent_once()
     let second = harness(store.clone(), model.clone(), WaitHosting::Durable);
     second.resume_chat(root).await.unwrap();
     assert!(matches!(
-        settled(&second, root, turn.input_id()).await,
+        settled(&second, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = second.snapshot(root).await.unwrap();
@@ -891,7 +894,7 @@ async fn a_child_that_lost_its_host_once_reports_to_its_foreground_parent_once()
     let completion = &snapshot.family_completions[0];
     let attempts = response_states(
         &store.lines(completion.child_chat_id),
-        completion.child_run_id,
+        completion.child_run_id.uuid(),
     );
     assert_eq!(
         attempts.last().unwrap(),
@@ -929,7 +932,7 @@ async fn a_child_failed_by_three_lost_hosts_at_load_resolves_its_foreground_pare
     let last = harness(store.clone(), model.clone(), WaitHosting::Durable);
     last.resume_chat(root).await.unwrap();
     assert!(matches!(
-        settled(&last, root, turn.input_id()).await,
+        settled(&last, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = last.snapshot(root).await.unwrap();
@@ -956,7 +959,7 @@ async fn a_member_registered_without_a_transcript_does_not_fail_the_load() {
     lost.seed(root, store.lines(root), StorePosition(1));
     let loading = harness(lost.clone(), model.clone(), WaitHosting::Durable);
     loading.resume_chat(root).await.unwrap();
-    let outcome = settled(&loading, root, turn.input_id()).await;
+    let outcome = settled(&loading, root, (turn.input_id()).uuid()).await;
     assert!(
         matches!(outcome, SettledOutcome::Completed { .. }),
         "{outcome:?}"
@@ -1002,7 +1005,7 @@ async fn message_rounds(agent: &Agent, root: ChatId, rounds: std::ops::Range<usi
             .advance(root, prompt(&format!("ping round {round}")))
             .await
             .unwrap();
-        settled(agent, root, turn.input_id()).await;
+        settled(agent, root, (turn.input_id()).uuid()).await;
         assert_eq!(agent.quiesce(root).await, Quiescence::Idle);
     }
 }
@@ -1017,7 +1020,7 @@ async fn pruned_family_lists_deliver_nothing_again_after_a_load() {
         .advance(root, prompt("Delegate a watcher."))
         .await
         .unwrap();
-    settled(&agent, root, start.input_id()).await;
+    settled(&agent, root, (start.input_id()).uuid()).await;
     assert_eq!(agent.quiesce(root).await, Quiescence::Idle);
     message_rounds(&agent, root, 0..70).await;
     let snapshot = agent.snapshot(root).await.unwrap();
@@ -1052,7 +1055,7 @@ async fn a_family_messaging_over_many_holdings_leaves_bounded_loads() {
         .advance(root, prompt("Delegate a watcher."))
         .await
         .unwrap();
-    settled(&agent, root, start.input_id()).await;
+    settled(&agent, root, (start.input_id()).uuid()).await;
     agent.shutdown().await;
     agent.sync().await.unwrap();
     for holding in 0..HOLDINGS {
@@ -1166,7 +1169,7 @@ async fn a_member_waiting_for_its_children_holds_on_across_instances_without_pol
     let reply = answering.advance(leaf, answer(&request)).await.unwrap();
     assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
     assert!(matches!(
-        settled(&answering, root, turn.input_id()).await,
+        settled(&answering, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = answering.snapshot(root).await.unwrap();
@@ -1290,7 +1293,7 @@ async fn a_handback_waits_for_the_members_children_across_instances_under_the_cl
     let reply = answering.advance(leaf, answer(&request)).await.unwrap();
     assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
     assert!(matches!(
-        settled(&answering, root, turn.input_id()).await,
+        settled(&answering, root, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let snapshot = answering.snapshot(root).await.unwrap();
@@ -1510,7 +1513,7 @@ async fn stopped_message_family(
             TurnOutcome::Merged { .. }
         ));
         assert!(matches!(
-            settled(&agent, root, turn.input_id()).await,
+            settled(&agent, root, (turn.input_id()).uuid()).await,
             SettledOutcome::Completed { .. }
         ));
         let snapshot = agent.snapshot(root).await.unwrap();
@@ -1566,7 +1569,7 @@ async fn assert_stopped_family_recovery(
             let id = completion.child_run_id;
             lines.retain(|line| !matches!(line, Line::Input(entry) if entry.input_id == id));
             lines.push(Line::FamilyCompletions(FamilyCompletionsEntry {
-                chat_id: target,
+                chat_id: target.uuid(),
                 completions,
             }));
         }
@@ -1729,7 +1732,7 @@ async fn ordinary_family_messages_follow_the_stopped_subtree_exception_independe
         .await
         .unwrap();
     assert!(matches!(
-        settled(&agent, root, outside.input_id()).await,
+        settled(&agent, root, (outside.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let awakened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1985,7 +1988,7 @@ async fn durable_continue_hold_survives_crash_during_append_with_a_source_state(
 
 fn source_record(chat: ChatId, record: &str) -> Line {
     Line::CustomTitle(tickloop_agent_transcript::CustomTitleEntry {
-        chat_id: chat,
+        chat_id: chat.uuid(),
         custom_title: record.into(),
     })
 }
@@ -2006,7 +2009,7 @@ async fn a_shut_down_durable_host_changes_no_source_state() {
         .run_source_change_for_tests(root, move |snapshot| {
             vec![Line::CustomTitle(
                 tickloop_agent_transcript::CustomTitleEntry {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.uuid(),
                     custom_title: "after the shutdown".into(),
                 },
             )]

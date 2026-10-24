@@ -148,9 +148,9 @@ fn pending_input_pty_fixture() {
                     loop {
                         if let Some(snapshot) = proof_core.list_chats().await.into_iter().next() {
                             if !submitted_elsewhere && std::path::Path::new(OTHER_VIEW_SUBMIT).exists() && !snapshot.messages.is_empty() {
-                                other_view.display_chat(Some(snapshot.id)).await.unwrap();
+                                other_view.display_chat(Some(snapshot.id.into())).await.unwrap();
                                 for _ in 0..2 {
-                                    other_view.submit(snapshot.id,QUEUED_MESSAGE.into()).await.unwrap();
+                                    other_view.submit(snapshot.id.into(),QUEUED_MESSAGE.into()).await.unwrap();
                                 }
                                 submitted_elsewhere=true;
                             }
@@ -169,7 +169,7 @@ fn pending_input_pty_fixture() {
                                 "started": snapshot.events.iter().filter(|event| matches!(event.kind,EventKind::Started)).map(|event|event.run_id).collect::<Vec<_>>(),
                                 "completed": snapshot.events.iter().filter(|event| matches!(event.kind,EventKind::Completed {..})).map(|event|event.run_id).collect::<Vec<_>>(),
                                 "interrupted": snapshot.events.iter().filter(|event| matches!(event.kind,EventKind::Interrupted)).map(|event|event.run_id).collect::<Vec<_>>(),
-                                "execution": proof_agent.reference(snapshot.id).await.unwrap(),
+                                "execution": proof_agent.reference(snapshot.id.into()).await.unwrap(),
                                 "merges": snapshot.events.iter().filter_map(|event| match event.kind {
                                     EventKind::InputMerged {into_run_id} => Some(serde_json::json!({"input":event.run_id,"into":into_run_id})),
                                     _=>None,

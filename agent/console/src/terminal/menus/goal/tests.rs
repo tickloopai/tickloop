@@ -261,7 +261,7 @@ async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
     let before = core.snapshot(chat).await.unwrap().goal_history;
     assert_eq!(before.len(), 2);
     core.shutdown().await;
-    let path = tickloop_agent_test_support::transcript_file(directory.path(), chat);
+    let path = tickloop_agent_test_support::transcript_file(directory.path(), chat.into());
     let mut transcript = std::fs::read_to_string(&path).unwrap();
     let notices = transcript
         .lines()
@@ -282,18 +282,21 @@ async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
         model,
     )
     .unwrap();
-    let snapshot = reopened.resume_chat(chat).await.unwrap();
+    let snapshot = reopened.resume_chat(chat.into()).await.unwrap();
     assert_eq!(snapshot.goal_history, before);
     apply(
         &reopened,
-        chat,
+        chat.into(),
         GoalAction::SetBudget {
             token_budget: Some(100_000),
         },
     )
     .await
     .unwrap();
-    assert_eq!(reopened.snapshot(chat).await.unwrap().goal_history, before);
+    assert_eq!(
+        reopened.snapshot(chat.into()).await.unwrap().goal_history,
+        before
+    );
     let history = super::super::super::workflows::public_history(
         &snapshot,
         super::super::super::display::DisplayProfile::default(),

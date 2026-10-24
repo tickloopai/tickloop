@@ -66,7 +66,7 @@ async fn create_execution(
     else {
         panic!("{receipt:?}");
     };
-    (execution, snapshot.conversation.id)
+    (execution, snapshot.conversation.id.into())
 }
 
 async fn shell_record(agent: &Agent, chat: Uuid, state: UserShellState) -> UserShellRecord {

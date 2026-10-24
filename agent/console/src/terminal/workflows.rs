@@ -65,7 +65,7 @@ impl PlanApprovalChoice {
 
 pub(super) enum Workflow {
     Chats {
-        choices: Vec<Uuid>,
+        choices: Vec<tickloop_agent_protocol::ChatId>,
         as_new_chat: bool,
     },
     Commands {
@@ -144,7 +144,7 @@ impl Workflow {
             .map_err(|error| error.to_string())?;
         let chats = saved
             .iter()
-            .filter(|chat| Some(chat.id) != current_chat)
+            .filter(|chat| Some(chat.id) != current_chat.map(Into::into))
             .collect::<Vec<_>>();
         if chats.is_empty() {
             return Err("No conversations found to resume.".into());
@@ -331,32 +331,35 @@ impl Workflow {
                 }
                 let chosen = *choices.get(index).ok_or("Invalid Chat selection.")?;
                 let snapshot = if as_new_chat {
-                    agent.resume_as_new_chat(chosen).await
+                    agent.resume_as_new_chat(chosen.into()).await
                 } else {
-                    agent.resume_chat(chosen).await
+                    agent.resume_chat(chosen.into()).await
                 }
                 .map_err(|error| error.to_string())?;
                 let chat = snapshot.id;
                 super::ensure_snapshot_banner(console, &snapshot)?;
-                console.reset_chat(chat)?;
+                console.reset_chat(chat.into())?;
                 console.write(&format!(
                     "\nOpened Chat: {} · {}\n",
                     chat_title(&snapshot),
-                    snapshot.id,
+                    snapshot.id.public(),
                 ))?;
                 if let Some(origin) = &snapshot.branch_origin {
-                    console.write(&format!("Branch of Chat: {}\n", origin.source_chat_id))?;
+                    console.write(&format!(
+                        "Branch of Chat: {}\n",
+                        origin.source_chat_id.public()
+                    ))?;
                 }
                 if as_new_chat {
-                    console.write(&format!("Copied from Chat: {chosen}\n"))?;
+                    console.write(&format!("Copied from Chat: {}\n", chosen.public()))?;
                 }
-                for warning in agent.transcript_load_warnings(chat) {
+                for warning in agent.transcript_load_warnings(chat.into()) {
                     super::write_warning(console, &warning)?;
                 }
-                super::show_settings_warnings(console, agent.user_settings_warnings(chat))?;
+                super::show_settings_warnings(console, agent.user_settings_warnings(chat.into()))?;
                 console.write("History only; selecting this Chat starts no work.\n")?;
                 write_public_history(console, &snapshot)?;
-                effect.selection = Some(chat);
+                effect.selection = Some(chat.into());
                 effect.restored = Some(snapshot);
             }
             Self::Commands { chat, choices } => {
@@ -636,7 +639,7 @@ async fn command_menu(
 
 fn menu(title: &str, context: Vec<String>, options: Vec<String>) -> Menu {
     Menu {
-        id: Uuid::new_v4(),
+        id: tickloop_ids::generate(),
         title: title.into(),
         context,
         options,
@@ -962,7 +965,7 @@ fn public_history_pieces(
     let shown_completions = std::mem::take(&mut history.shown_completions);
     for completion in chat.family_completions.iter().filter(|completion| {
         completion.notification.is_background()
-            && !shown_completions.contains(&completion.child_run_id)
+            && !shown_completions.contains(&completion.child_run_id.uuid())
     }) {
         history.push_agent_block(agent_messaging::completion_runs(
             completion,
@@ -995,7 +998,11 @@ fn subagent_launches(projection: &[BranchPublicItem]) -> HashMap<ToolCallKey, se
                     let text = content.text();
                     agent_messaging::launched_child(&text)?;
                     Some((
-                        (source.chat_id, source.run_id, tool_use_id.clone()),
+                        (
+                            source.chat_id.uuid(),
+                            source.run_id.map(|run| run.uuid()),
+                            tool_use_id.clone(),
+                        ),
                         serde_json::from_str(&text).ok()?,
                     ))
                 }
@@ -1032,7 +1039,9 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
         } else {
             console.write(&format!(
                 "Agent family · root {} / child {}\nTask: {}\n",
-                delegation.parent_chat_id, chat.id, task
+                delegation.parent_chat_id.public(),
+                chat.id.public(),
+                task
             ))?;
         }
     }
@@ -1044,20 +1053,21 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
     );
     console.write_pieces(&pieces)?;
     console.mark_input_echoes(
-        chat.id,
+        chat.id.into(),
         chat.message_runs
             .values()
             .copied()
             .filter(|input| {
-                super::consumed_input_text(chat, *input).is_some()
+                super::consumed_input_text(chat, (*input).into()).is_some()
                     || matches!(chat.trigger_origins.get(input), Some(tickloop_agent_protocol::TriggerIdentity::GoalContinuation { .. }))
             })
+            .map(|input| input.uuid())
             .chain(
                 chat.messages
                     .iter()
                     .enumerate()
                     .filter(|(_, message)| is_tick_delivery(message) || (message.role == Role::User && message.content.iter().any(|content| matches!(content, Content::Text { text } if matches!(LocalMessage::parse(text), Some(LocalMessage::ArtifactRequest { .. }))))))
-                    .filter_map(|(index, _)| chat.message_runs.get(&index).copied()),
+                    .filter_map(|(index, _)| chat.message_runs.get(&index).map(|run| run.uuid())),
             )
             .chain(agent_messaging::shown_agent_inputs(chat)),
     )?;
@@ -1070,7 +1080,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
     {
         super::write_completion_notice(console, None)?;
     }
-    console.replay_execution_losses(chat.id)?;
+    console.replay_execution_losses(chat.id.into())?;
     Ok(())
 }
 
@@ -1113,7 +1123,9 @@ fn push_agent_input(
             if !completion.notification.is_background() {
                 return;
             }
-            history.shown_completions.insert(completion.child_run_id);
+            history
+                .shown_completions
+                .insert(completion.child_run_id.into());
             let block = agent_messaging::completion_runs(
                 completion,
                 history.chat,
@@ -1172,7 +1184,7 @@ fn append_public_message(
                     presentation::name_local_ticks(local_message, &history.tick_labels);
                 if let LocalMessage::BashInput { command } = &local_message {
                     history.push_prompt(
-                        source_chat_id,
+                        source_chat_id.into(),
                         &format!("!{}", safe_text(command)),
                         display,
                         false,
@@ -1201,7 +1213,7 @@ fn append_public_message(
                         |trigger| trigger.display_input(text),
                     );
                     history.push_prompt(
-                        source_chat_id,
+                        source_chat_id.into(),
                         &safe_text(&text),
                         display,
                         !source.is_agent_message,
@@ -1218,7 +1230,7 @@ fn append_public_message(
             },
             Content::ToolUse { id, name, input } if message.role == Role::Assistant => {
                 tool_calls.insert(
-                    (source_chat_id, run_id, id.clone()),
+                    (source_chat_id.into(), run_id.map(Into::into), id.clone()),
                     (name.clone(), input.clone()),
                 );
                 if presentation::has_no_call_row(name) {
@@ -1227,15 +1239,17 @@ fn append_public_message(
                 if let Some(run) = run_id {
                     let state = history
                         .tool_states
-                        .get(&(run, id.clone()))
+                        .get(&(run.into(), id.clone()))
                         .copied()
                         .unwrap_or(super::scrollback::ToolCallState::Finished);
                     let spans = if name == SUBAGENT_TOOL_NAME {
                         agent_messaging::subagent_call_runs(
                             input,
-                            history
-                                .subagent_launches
-                                .get(&(source_chat_id, run_id, id.clone())),
+                            history.subagent_launches.get(&(
+                                source_chat_id.into(),
+                                run_id.map(Into::into),
+                                id.clone(),
+                            )),
                             history.colors,
                             display,
                         )
@@ -1256,9 +1270,9 @@ fn append_public_message(
                     text.push_str(state.suffix());
                     text.push('\n');
                     history.pieces.push(ConversationPiece::ToolCall {
-                        run_id: run,
+                        run_id: run.into(),
                         text,
-                        call_key: presentation::tool_call_key(run, id),
+                        call_key: presentation::tool_call_key(run.into(), id),
                         spans,
                         state,
                         collapse: history
@@ -1286,7 +1300,11 @@ fn append_public_message(
                 content,
                 is_error,
             } if message.role == Role::User => {
-                let call = tool_calls.remove(&(source_chat_id, run_id, tool_use_id.clone()));
+                let call = tool_calls.remove(&(
+                    source_chat_id.into(),
+                    run_id.map(Into::into),
+                    tool_use_id.clone(),
+                ));
                 let (name, input) = call
                     .as_ref()
                     .map_or(("tool", None), |(name, input)| (name.as_str(), Some(input)));
@@ -1322,9 +1340,9 @@ fn append_public_message(
                             &history.tick_labels,
                         );
                         history.pieces.push(ConversationPiece::ToolCall {
-                            run_id: run,
+                            run_id: run.into(),
                             text: spans.iter().map(|(text, _)| text.as_str()).collect(),
-                            call_key: presentation::tool_call_key(run, tool_use_id),
+                            call_key: presentation::tool_call_key(run.into(), tool_use_id),
                             spans,
                             state: super::scrollback::ToolCallState::Failed,
                             collapse: None,
@@ -1335,11 +1353,15 @@ fn append_public_message(
                     review: run_id
                         .filter(|_| name == tickloop_agent_tools::EDIT_TOOL_NAME && !*is_error)
                         .and_then(|run| {
-                            presentation::file_change_review(history.chat, run, tool_use_id)
+                            presentation::file_change_review(history.chat, run.into(), tool_use_id)
                         }),
                     report: history
                         .subagent_launches
-                        .get(&(source_chat_id, run_id, tool_use_id.clone()))
+                        .get(&(
+                            source_chat_id.into(),
+                            run_id.map(Into::into),
+                            tool_use_id.clone(),
+                        ))
                         .filter(|_| name == SUBAGENT_TOOL_NAME)
                         .and_then(|launch| agent_messaging::subagent_report(history.chat, launch)),
                 };
@@ -1353,7 +1375,7 @@ fn append_public_message(
                 );
                 match run_id {
                     Some(run) => history.pieces.push(ConversationPiece::ToolResult {
-                        call_key: presentation::tool_call_key(run, tool_use_id),
+                        call_key: presentation::tool_call_key(run.into(), tool_use_id),
                         runs,
                         clip_summary: presentation::goal_completion_rejection_reason(
                             name,
@@ -1521,7 +1543,9 @@ mod tests {
             }
         };
         let mut snapshot = history_snapshot(compacted);
-        snapshot.message_runs.extend(runs);
+        snapshot
+            .message_runs
+            .extend(runs.into_iter().map(|(index, run)| (index, run.into())));
         snapshot.message_compactions.insert(0, boundary_marker());
         snapshot
             .message_compactions
@@ -1538,9 +1562,10 @@ mod tests {
         messages.push(user_text("This session is being continued. full summary"));
         messages.push(user_text("after compaction prompt"));
         let mut snapshot = history_snapshot(messages);
-        snapshot
-            .message_runs
-            .extend([(2, Uuid::from_u128(501)), (8, Uuid::from_u128(502))]);
+        snapshot.message_runs.extend([
+            (2, Uuid::from_u128(501).into()),
+            (8, Uuid::from_u128(502).into()),
+        ]);
         snapshot
             .message_compactions
             .insert(boundary_index, boundary_marker());
@@ -2147,14 +2172,14 @@ mod tests {
         let streaming_run = Uuid::new_v4();
         let unfinished = "an unfinished reply\u{1b}[31m";
         streaming.chat_loop.state = LoopState::Running;
-        streaming.chat_loop.run_id = Some(streaming_run);
+        streaming.chat_loop.run_id = Some(streaming_run.into());
         for kind in [EventKind::Started, EventKind::Text(unfinished.into())] {
             streaming.last_sequence += 1;
             streaming.events.push(Event {
                 sequence: streaming.last_sequence,
-                chat_id: chat,
+                chat_id: chat.into(),
                 loop_id: receipt.loop_id,
-                run_id: streaming_run,
+                run_id: streaming_run.into(),
                 kind,
             });
         }
@@ -2165,7 +2190,7 @@ mod tests {
         let committed_index = streaming.messages.len();
         streaming
             .message_runs
-            .insert(committed_index, streaming_run);
+            .insert(committed_index, streaming_run.into());
         streaming.messages.push(Message {
             role: Role::Assistant,
             content: vec![Content::Text {
@@ -2188,7 +2213,7 @@ mod tests {
         streaming.last_sequence += 1;
         streaming.events.push(Event {
             sequence: streaming.last_sequence,
-            chat_id: chat,
+            chat_id: chat.into(),
             loop_id: receipt.loop_id,
             run_id: receipt.run_id,
             kind: EventKind::ConversationRewound {
@@ -2512,7 +2537,7 @@ mod tests {
         let child = agent
             .branch_chat(BranchRequest {
                 request_id: Uuid::new_v4(),
-                source_chat_id: source,
+                source_chat_id: source.into(),
                 name: Some("child".into()),
             })
             .await
@@ -2520,7 +2545,7 @@ mod tests {
             .child_chat_id;
         agent.flush_transcripts().await;
         let now = SystemTime::now();
-        for (chat, age_seconds) in [(source, 7_200), (child, 60)] {
+        for (chat, age_seconds) in [(source, 7_200), (child.into(), 60)] {
             std::fs::File::options()
                 .write(true)
                 .open(tickloop_agent_test_support::transcript_file(&root, chat))
@@ -2546,7 +2571,8 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .all(|row| !row.contains(&child.to_string()) && !row.contains(&source.to_string())),
+                .all(|row| !row.contains(&child.uuid().to_string())
+                    && !row.contains(&source.to_string())),
             "{rows:?}"
         );
         let Workflow::Chats {
@@ -2556,12 +2582,13 @@ mod tests {
         else {
             panic!("chat picker returned the wrong workflow");
         };
-        assert_eq!(choices, vec![child, source]);
+        assert_eq!(choices, vec![child, source.into()]);
         assert!(!as_new_chat);
 
-        let (picker, workflow) = Workflow::chats(&agent, directory.path(), Some(child), true)
-            .await
-            .unwrap();
+        let (picker, workflow) =
+            Workflow::chats(&agent, directory.path(), Some(child.into()), true)
+                .await
+                .unwrap();
         assert_eq!(picker.title(), "Copy Chat");
         assert_eq!(picker.entries().len(), 1);
         assert!(

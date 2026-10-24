@@ -108,7 +108,7 @@ fn expected_replacement(path: &Path, content: &str) -> String {
 
 /// Transcript 同级的 Chat 目录（Agent 使用 canonical 根目录，替换文本中的路径同样是 canonical）。
 fn chat_directory(root: &Path, chat: ChatId) -> PathBuf {
-    transcript_file(root, chat)
+    transcript_file(root, chat.uuid())
         .canonicalize()
         .unwrap()
         .with_extension("")
@@ -387,7 +387,7 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
     drop(agent);
     let large_transcript = 5 * 1024 * 1024;
     assert!(
-        std::fs::metadata(transcript_file(&root, chat))
+        std::fs::metadata(transcript_file(&root, chat.uuid()))
             .unwrap()
             .len()
             > large_transcript
@@ -405,7 +405,7 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
     copying.shutdown().await;
     drop(copying);
     assert!(
-        std::fs::metadata(transcript_file(&root, copy))
+        std::fs::metadata(transcript_file(&root, copy.uuid()))
             .unwrap()
             .len()
             > large_transcript
@@ -484,7 +484,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "tasks");
         assert_eq!(
             chat_directory.file_name().unwrap().to_string_lossy(),
-            chat.to_string()
+            chat.uuid().to_string()
         );
         assert_eq!(
             chat_directory.parent().unwrap().parent().unwrap(),
@@ -729,7 +729,7 @@ async fn assert_untrusted_family_temp_directory(
     let agent =
         Agent::open_embedded(directory.path().join("root"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let family_temp = family_temp_directory(chat);
+    let family_temp = family_temp_directory(chat.uuid());
     let _cleanup = RemoveOnDrop(family_temp.clone());
     let secret = tamper(&family_temp, outside.path());
     model.enqueue(call("read-secret", "Read", json!({"file_path":secret})));
@@ -764,7 +764,7 @@ async fn assert_untrusted_family_temp_directory(
     }
 
     let shell_chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let shell_temp = family_temp_directory(shell_chat);
+    let shell_temp = family_temp_directory(shell_chat.uuid());
     let _shell_cleanup = RemoveOnDrop(shell_temp.clone());
     tamper(&shell_temp, outside.path());
     let shell = agent
@@ -799,7 +799,7 @@ async fn assert_untrusted_family_temp_directory(
         reason.contains(&shell_temp.display().to_string()) && reason.contains(expected_reason),
         "{reason}"
     );
-    assert!(!outside.path().join(shell_chat.to_string()).exists());
+    assert!(!outside.path().join(shell_chat.uuid().to_string()).exists());
     agent.shutdown().await;
 }
 
@@ -862,7 +862,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(output.starts_with(family_temp_directory(chat)));
+    assert!(output.starts_with(family_temp_directory(chat.uuid())));
     model.enqueue(call("read-output", "Read", json!({"file_path":output})));
     model.enqueue(text("Read it."));
     complete_turn(&agent, chat, "Read the output").await;

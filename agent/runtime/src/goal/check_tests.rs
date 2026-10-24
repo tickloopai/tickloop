@@ -31,7 +31,7 @@ fn output(text: &str) -> ModelOutput {
 /// A Chat whose conversation is `messages`, with the user's own prompts at `prompts`.
 fn chat_with(messages: Vec<Message>, prompts: &[usize]) -> ChatSnapshot {
     let mut snapshot = crate::empty_snapshot(
-        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4().into(),
         None,
         tickloop_agent_test_support::config(),
     );

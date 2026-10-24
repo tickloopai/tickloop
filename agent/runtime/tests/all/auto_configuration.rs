@@ -169,7 +169,7 @@ async fn default_llm_uses_the_chat_model_even_when_a_legacy_jev_key_exists() {
         )
         .await
         .unwrap();
-    let assessment = finish(&mut events, receipt.run_id).await;
+    let assessment = finish(&mut events, receipt.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(model.review_count(), 1);
     assert!(
@@ -228,7 +228,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .submit(first, "Create a symlink".into())
         .await
         .unwrap();
-    let assessment = finish(&mut events, receipt.run_id).await;
+    let assessment = finish(&mut events, receipt.run_id.uuid()).await;
     assert_eq!(
         assessment.reviewer.unwrap().requested_model,
         "first-chat-model"
@@ -259,7 +259,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .await
         .unwrap();
     gate.release.notify_one();
-    let assessment = finish(&mut events, receipt.run_id).await;
+    let assessment = finish(&mut events, receipt.run_id.uuid()).await;
     assert_eq!(
         assessment.reviewer.unwrap().requested_model,
         "active-chat-model"
@@ -269,7 +269,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .submit(first, "Create the next symlink".into())
         .await
         .unwrap();
-    let assessment = finish(&mut events, receipt.run_id).await;
+    let assessment = finish(&mut events, receipt.run_id.uuid()).await;
     assert_eq!(
         assessment.reviewer.unwrap().requested_model,
         "pending-chat-model"
@@ -531,14 +531,14 @@ async fn jev_retry_keeps_its_connection_while_later_chats_and_generic_judgments_
     settings["jev"]["model"] = json!("jev-two");
     std::fs::write(&settings_path, settings.to_string()).unwrap();
     release.notify_one();
-    let assessment = finish(&mut first_events, receipt.run_id).await;
+    let assessment = finish(&mut first_events, receipt.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().requested_model, "jev-one");
     let mut next_events = next.subscribe();
     let receipt = next
         .submit(b, "Create the next symlink".into())
         .await
         .unwrap();
-    let assessment = finish(&mut next_events, receipt.run_id).await;
+    let assessment = finish(&mut next_events, receipt.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().requested_model, "jev-two");
     assert_eq!(first_model.review_count() + next_model.review_count(), 0);
     let generic = JevClient::new(

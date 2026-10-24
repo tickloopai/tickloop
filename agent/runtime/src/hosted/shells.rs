@@ -137,7 +137,7 @@ impl OwnTickhost {
     pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
         Self {
             directory: crate::transcript::private_tickhost_directory(),
-            worker: Uuid::new_v4(),
+            worker: tickloop_ids::generate(),
             idle_timeout,
             controller: OnceCell::new(),
         }
@@ -165,7 +165,7 @@ impl OwnTickhost {
                             .path()
                             .join(crate::transcript::TICKHOST_RUNTIME_SUBDIRECTORY),
                     },
-                    Uuid::new_v4(),
+                    tickloop_ids::generate(),
                     self.idle_timeout,
                 ))
             })
@@ -278,7 +278,7 @@ impl ShellTasks {
                 };
                 let guard = listing.inner.upgrade_gate.clone().read_owned().await;
                 if listing.inner.shutdown.is_cancelled()
-                    || !listing.monitor_may_list_shell(chat, task).await
+                    || !listing.monitor_may_list_shell(chat.into(), task).await
                 {
                     tasks.retained_handoffs.lock().unwrap().remove(&task);
                     drop(connection);
@@ -478,7 +478,7 @@ impl ChatShells {
                 endpoint,
                 instance: spawned.instance,
                 owner_token: spawned.owner_token,
-                handoff: Uuid::new_v4(),
+                handoff: tickloop_ids::generate(),
             },
             exit,
             stops: Some(stops),

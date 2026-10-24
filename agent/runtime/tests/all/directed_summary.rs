@@ -25,7 +25,10 @@ async fn run_prompt(
     chat: uuid::Uuid,
     prompt: &str,
 ) {
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     loop {
         let event = next_event(events).await;
         if event.run_id != receipt.run_id {
@@ -114,8 +117,8 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
         Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[1].clone();
     let raw_messages = before.messages.clone();
@@ -272,7 +275,13 @@ async fn rejected_or_failed_summaries_leave_no_trace_in_the_conversation() {
         let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
-        run_prompt(&agent, &mut events, chat, "prompt kept after failure").await;
+        run_prompt(
+            &agent,
+            &mut events,
+            chat.uuid(),
+            "prompt kept after failure",
+        )
+        .await;
         let before = agent.snapshot(chat).await.unwrap();
         let checkpoint = before.rewind_points()[0].clone();
 
@@ -333,7 +342,7 @@ async fn directed_summary_retries_a_transient_service_failure() {
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "Summarize this answer").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "Summarize this answer").await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = &before.rewind_points()[0];
     let outcome = agent
@@ -379,7 +388,7 @@ async fn a_summary_that_exceeds_the_verified_context_keeps_the_previous_projecti
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "small prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "small prompt").await;
     agent.set_context_window(chat, 10_000).await.unwrap();
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[0].clone();
@@ -426,7 +435,7 @@ async fn summarize_last_prompt(
     direction: SummaryDirection,
 ) -> tickloop_agent_protocol::DirectedSummaryOutcome {
     let checkpoint = agent
-        .snapshot(chat)
+        .snapshot(tickloop_ids::Id::from(chat))
         .await
         .unwrap()
         .rewind_points()
@@ -435,7 +444,7 @@ async fn summarize_last_prompt(
         .clone();
     agent
         .summarize_checkpoint(
-            chat,
+            tickloop_ids::Id::from(chat),
             DirectedSummaryRequest {
                 message_id: checkpoint.message_id,
                 direction,
@@ -463,13 +472,13 @@ async fn repeated_summaries_follow_claude_code_partial_compaction_layouts() {
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "prompt A").await;
-    run_prompt(&agent, &mut events, chat, "prompt B").await;
-    summarize_last_prompt(&agent, chat, SummaryDirection::FromHere).await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt A").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt B").await;
+    summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::FromHere).await;
 
     // 向前保留时，之前的边界与摘要作为保留消息原样留在新边界之后。
-    run_prompt(&agent, &mut events, chat, "prompt C").await;
-    let summary_c = summarize_last_prompt(&agent, chat, SummaryDirection::FromHere).await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt C").await;
+    let summary_c = summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::FromHere).await;
     assert_eq!(
         summary_texts(&summary_c.snapshot),
         ["summary B", "summary C"]
@@ -478,16 +487,16 @@ async fn repeated_summaries_follow_claude_code_partial_compaction_layouts() {
     assert!(summary_c.snapshot.is_compact_boundary(1));
 
     // 向后保留时，被摘要范围从最后一个边界开始，保留消息中不再有旧边界和旧摘要。
-    run_prompt(&agent, &mut events, chat, "prompt D").await;
-    let summary_d = summarize_last_prompt(&agent, chat, SummaryDirection::UpToHere).await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt D").await;
+    let summary_d = summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::UpToHere).await;
     assert_eq!(summary_texts(&summary_d.snapshot), ["summary through C"]);
     assert_eq!(summary_d.snapshot.messages.len(), 4);
     let d_text = message_text(&summary_d.snapshot.conversation_messages().unwrap());
     assert!(d_text.contains("prompt D"));
     assert!(!d_text.contains("answer A"));
 
-    run_prompt(&agent, &mut events, chat, "prompt E").await;
-    let summary_e = summarize_last_prompt(&agent, chat, SummaryDirection::FromHere).await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt E").await;
+    let summary_e = summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::FromHere).await;
     let active = summary_e.snapshot.active_conversation_projection().unwrap();
     assert!(matches!(
         active.first(),
@@ -581,8 +590,8 @@ async fn up_to_here_replaces_only_the_prefix_and_keeps_the_conversation_end() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[1].clone();
 
@@ -641,7 +650,7 @@ async fn an_empty_or_already_compacted_range_does_not_start_a_model_request() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
     let checkpoint = agent.snapshot(chat).await.unwrap().rewind_points()[0].clone();
     let usage_before = agent
         .snapshot(chat)
@@ -716,8 +725,8 @@ async fn a_prompt_abandoned_by_conversation_rewind_cannot_summarize_the_new_bran
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let before_rewind = agent.snapshot(chat).await.unwrap();
     let abandoned_checkpoint = before_rewind.rewind_points()[1].clone();
     agent.stop(chat).await.unwrap();
@@ -730,7 +739,13 @@ async fn a_prompt_abandoned_by_conversation_rewind_cannot_summarize_the_new_bran
         .await
         .unwrap();
     assert!(rewind.draft.is_some());
-    run_prompt(&agent, &mut events, chat, "replacement branch prompt").await;
+    run_prompt(
+        &agent,
+        &mut events,
+        chat.uuid(),
+        "replacement branch prompt",
+    )
+    .await;
     let branched = agent.snapshot(chat).await.unwrap();
     let usage_before = branched.request_usage.entries().to_vec();
     let compactions_before = branched.message_compactions.clone();
@@ -775,7 +790,7 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
 
     let release = directory.path().join("release-background-shell");
     let shell = agent
@@ -810,7 +825,7 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
     .await
     .unwrap();
 
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     std::fs::write(&release, b"release").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -843,7 +858,11 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
     assert_eq!(outcome.direction, SummaryDirection::FromHere);
     let summary_source = message_text(&model.requests.lock().unwrap()[3].messages);
     assert!(summary_source.contains("second prompt"));
-    assert!(summary_source.contains(&format!("<task-id>{}</task-id>", shell.command_id)));
+    assert!(summary_source.contains(&format!(
+            "<task-id>{}</task-id>",
+            tickloop_ids::IdContext::new()
+                .model_text(tickloop_agent_protocol::ShellTaskId::from(shell.command_id))
+        )));
     assert!(!summary_source.contains("<bash-input>"));
     let active = message_text(&outcome.snapshot.conversation_messages().unwrap());
     assert!(active.contains("<bash-input>"));
@@ -874,7 +893,7 @@ async fn summarized_private_model_blocks_do_not_enter_the_request_or_new_context
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "public prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "public prompt").await;
     let checkpoint = agent.snapshot(chat).await.unwrap().rewind_points()[0].clone();
 
     let outcome = agent
@@ -1040,8 +1059,8 @@ async fn assert_pending_model_after_summary(
     let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[1].clone();
     let summary = {
@@ -1161,7 +1180,13 @@ async fn a_context_window_set_while_summary_runs_applies_to_the_summarized_conte
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "prompt before context change").await;
+    run_prompt(
+        &agent,
+        &mut events,
+        chat.uuid(),
+        "prompt before context change",
+    )
+    .await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[0].clone();
     let summary = {
@@ -1256,7 +1281,7 @@ async fn interrupt_cancels_the_summary_and_keeps_the_previous_projection() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "keep this prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "keep this prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[0].clone();
     let summary = {
@@ -1324,8 +1349,8 @@ async fn summary_keeps_a_visible_tool_pair_and_excludes_a_rewound_pair() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "read retained.txt").await;
-    run_prompt(&agent, &mut events, chat, "read abandoned.txt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "read retained.txt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "read abandoned.txt").await;
 
     let before_rewind = agent.snapshot(chat).await.unwrap();
     let abandoned_checkpoint = before_rewind.rewind_points()[1].clone();
@@ -1339,7 +1364,13 @@ async fn summary_keeps_a_visible_tool_pair_and_excludes_a_rewound_pair() {
         .await
         .unwrap();
     assert!(rewind.draft.is_some());
-    run_prompt(&agent, &mut events, chat, "replacement branch prompt").await;
+    run_prompt(
+        &agent,
+        &mut events,
+        chat.uuid(),
+        "replacement branch prompt",
+    )
+    .await;
     let before_summary = agent.snapshot(chat).await.unwrap();
     let replacement_checkpoint = before_summary.rewind_points().last().unwrap().clone();
 
@@ -1407,8 +1438,8 @@ async fn summary_resumes_the_input_queued_while_it_ran() {
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     let loop_id = before.chat_loop.id;
     let checkpoint_id = before.rewind_points()[1].message_id;

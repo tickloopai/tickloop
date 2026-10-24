@@ -153,8 +153,9 @@ pub(crate) fn capture(
                     .get(&index)
                     .copied()
                     .unwrap_or(id),
-                loop_id: run_id.and_then(|run| bookkeeping.run_loops.get(&run).copied()),
-                run_id,
+                loop_id: (run_id.and_then(|run| bookkeeping.run_loops.get(&run).copied()))
+                    .map(Into::into),
+                run_id: run_id.map(Into::into),
                 is_human: snapshot.prompt_execution_modes.contains_key(&index)
                     && !snapshot.inherited_prompts.contains(&index)
                     && !is_agent,
@@ -201,7 +202,7 @@ pub(crate) fn capture(
                     && input.message_id == entry.user_id
             }) {
                 history.contexts.push(ReplyContext {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     user_message_id: entry.user_id,
                     preceding: std::mem::take(before),
                 });
@@ -226,7 +227,7 @@ pub(crate) fn capture(
                     before.clear();
                     if anchored.insert(user_id) {
                         history.contexts.push(ReplyContext {
-                            chat_id: snapshot.id,
+                            chat_id: snapshot.id.into(),
                             user_message_id: user_id,
                             preceding: Vec::new(),
                         });

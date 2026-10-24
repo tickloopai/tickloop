@@ -210,7 +210,16 @@ async fn cron_delete_requires_user_cancellation_or_exact_agent_creation() {
             }
         );
         reviewer.requests.lock().unwrap().clear();
-        model.enqueue(call("delete", "CronDelete", json!({"id":task.id})));
+        let task_text = tickloop_ids::IdContext::new()
+            .model_text(tickloop_agent_protocol::ScheduledTaskId::from(task.id));
+        // The Agent's own task is named as CronCreate wrote it; the user's by the UUID an older
+        // session showed.
+        let written = if agent_created {
+            json!(task_text)
+        } else {
+            json!(task.id)
+        };
+        model.enqueue(call("delete", "CronDelete", json!({"id":written})));
         model.enqueue(text("Done."));
         let outcomes = turn(
             &agent,
@@ -242,7 +251,7 @@ async fn cron_delete_requires_user_cancellation_or_exact_agent_creation() {
             assert_eq!(requests.len(), 2, "screening plus authorization");
             for request in requests.iter() {
                 let facts = &request.state["scheduled_task"];
-                assert_eq!(facts["id"], json!(task.id));
+                assert_eq!(facts["id"], json!(task_text));
                 assert_eq!(facts["details"]["prompt"], task.prompt);
                 assert_eq!(
                     facts["creation_call_id"],

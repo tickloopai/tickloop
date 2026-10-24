@@ -1193,7 +1193,7 @@ mod tests {
         OperationRecord {
             task_binding: None,
             id: uuid::Uuid::new_v4(),
-            loop_id: uuid::Uuid::new_v4(),
+            loop_id: uuid::Uuid::new_v4().into(),
             run_id,
             call_id: uuid::Uuid::new_v4().to_string(),
             name: "Write".into(),
@@ -1211,6 +1211,7 @@ mod tests {
     ) -> PreparedFileChange {
         tools
             .prepare(
+                &tickloop_ids::IdContext::new(),
                 workspace,
                 "Write",
                 &json!({"file_path":path,"content":format!("content for {path}\n")}),
@@ -1259,13 +1260,13 @@ mod tests {
                 }],
             },
         ];
-        snapshot.message_runs.insert(0, first_run);
-        snapshot.message_runs.insert(1, second_run);
+        snapshot.message_runs.insert(0, first_run.into());
+        snapshot.message_runs.insert(1, second_run.into());
         snapshot.operations = vec![
-            operation(first_run, OperationState::Completed, available),
-            operation(failed_run, OperationState::Failed, failed),
-            operation(first_run, OperationState::Completed, missing),
-            operation(second_run, OperationState::Completed, corrupt),
+            operation(first_run.into(), OperationState::Completed, available),
+            operation(failed_run.into(), OperationState::Failed, failed),
+            operation(first_run.into(), OperationState::Completed, missing),
+            operation(second_run.into(), OperationState::Completed, corrupt),
         ];
 
         let catalog = ChangeCatalog::load(&snapshot).await;
@@ -1274,7 +1275,7 @@ mod tests {
         assert_eq!(catalog.sources[0].state, ChangeSourceState::NonGit);
         assert_eq!(catalog.sources.len(), 3);
         let first = &catalog.sources[1];
-        assert_eq!(first.id, ChangeSourceId::AgentRun(first_run));
+        assert_eq!(first.id, ChangeSourceId::AgentRun(first_run.into()));
         assert_eq!(first.user_prompt.as_deref(), Some("first request"));
         assert_eq!(first.files.len(), 2);
         assert!(matches!(
@@ -1289,7 +1290,7 @@ mod tests {
             }
         ));
         let second = &catalog.sources[2];
-        assert_eq!(second.id, ChangeSourceId::AgentRun(second_run));
+        assert_eq!(second.id, ChangeSourceId::AgentRun(second_run.into()));
         assert_eq!(second.user_prompt.as_deref(), Some("second request"));
         assert_eq!(second.files.len(), 1);
         assert!(matches!(
@@ -1303,7 +1304,7 @@ mod tests {
             catalog
                 .sources
                 .iter()
-                .all(|source| source.id != ChangeSourceId::AgentRun(failed_run))
+                .all(|source| source.id != ChangeSourceId::AgentRun(failed_run.into()))
         );
         agent.shutdown().await;
     }

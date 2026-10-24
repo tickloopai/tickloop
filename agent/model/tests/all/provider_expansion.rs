@@ -120,7 +120,7 @@ async fn request_output_budget_reaches_every_http_encoder_without_changing_the_n
             assert!(
                 client
                     .complete_for_chat_with_context(
-                        chat,
+                        chat.into(),
                         request(Some(ReasoningEffort::High)),
                         events,
                         CancellationToken::new(),

@@ -214,7 +214,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                 updated_at: None,
                 run_started_at: None,
                 subagent: (id == child).then_some(SubagentRegistration {
-                    child_chat_id: child,
+                    child_chat_id: child.into(),
                     handle: "scoped-child".into(),
                     description: "Controlled panel".into(),
                     created_at: 1,
@@ -563,9 +563,9 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
     view.execution_mode = tickloop_agent_protocol::ExecutionMode::AcceptEdits;
     let record = ApprovalRecord {
         id: Uuid::new_v4(),
-        chat_id: chat,
-        loop_id: Uuid::new_v4(),
-        run_id: Uuid::new_v4(),
+        chat_id: chat.into(),
+        loop_id: Uuid::new_v4().into(),
+        run_id: Uuid::new_v4().into(),
         operation_id: Uuid::new_v4(),
         call_id: "controlled".into(),
         at_ms: 1,

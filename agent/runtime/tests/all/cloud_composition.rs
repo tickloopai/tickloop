@@ -70,7 +70,7 @@ fn cloud_harness(
 
 fn prompt(text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -336,7 +336,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .advance(
             root,
             TurnRequest {
-                input_id: Uuid::new_v4(),
+                input_id: tickloop_ids::Id::from(Uuid::new_v4()),
                 op: TurnOp::Answer {
                     request: question.id,
                     reply: QuestionReply::Answered(vec![QuestionAnswer::other("Weekly")]),
@@ -397,7 +397,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
     ) {
         assert!(
             agent.recent_denials(chat).await.unwrap().records.is_empty(),
-            "{chat}"
+            "{chat:?}"
         );
     }
     let calls = service

@@ -422,12 +422,13 @@ pub(crate) fn stored_trigger_deliveries(
     root: &Path,
     chat: ChatId,
 ) -> Vec<tickloop_agent_transcript::display::DisplayTriggerDelivery> {
-    let lines: Vec<tickloop_agent_transcript::Line> =
-        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(root, chat))
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+    let lines: Vec<tickloop_agent_transcript::Line> = std::fs::read_to_string(
+        tickloop_agent_test_support::transcript_file(root, chat.uuid()),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str(line).ok())
+    .collect();
     tickloop_agent_transcript::display::trigger_deliveries(&lines)
 }
 

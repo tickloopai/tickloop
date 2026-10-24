@@ -20,7 +20,7 @@ async fn run_prompt(
     prompt: &str,
 ) {
     let receipt = agent
-        .submit(chat, prompt.into())
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
         .await
         .expect("prompt accepted");
     loop {
@@ -30,7 +30,7 @@ async fn run_prompt(
         }
         match event.kind {
             EventKind::PermissionRequested { request } => agent
-                .answer_permission(chat, request.id, true)
+                .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                 .await
                 .expect("permission accepted"),
             EventKind::Completed { .. } => return,
@@ -74,8 +74,8 @@ async fn chat_after_edits(
     let agent = Agent::open_embedded(workspace.state.clone(), config(), model).unwrap();
     let chat = agent.create_chat(workspace.workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "edit files").await;
-    run_prompt(&agent, &mut events, chat, "keep talking").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "edit files").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "keep talking").await;
     let points = agent
         .snapshot(chat)
         .await
@@ -84,7 +84,7 @@ async fn chat_after_edits(
         .into_iter()
         .map(|point| point.message_id)
         .collect();
-    (agent, chat, points)
+    (agent, chat.uuid(), points)
 }
 
 fn failed_paths(code: &CodeRewind) -> Vec<PathBuf> {
@@ -140,7 +140,7 @@ async fn rewind_does_not_write_through_a_tracked_file_replaced_by_a_symbolic_lin
     symlink(&secret, &tracked).unwrap();
 
     let outcome = agent
-        .rewind(chat, points[0], RewindMode::Code)
+        .rewind(tickloop_ids::Id::from(chat), points[0], RewindMode::Code)
         .await
         .unwrap();
     let code = outcome.code.unwrap();
@@ -185,13 +185,13 @@ async fn rewind_does_not_delete_or_write_inside_a_parent_replaced_by_a_symbolic_
     symlink(&workspace.outside, &nested).unwrap();
 
     let preview = agent
-        .rewind_file_changes(chat, points[0])
+        .rewind_file_changes(tickloop_ids::Id::from(chat), points[0])
         .await
         .unwrap()
         .unwrap();
     assert_eq!(preview.len(), 2);
     let outcome = agent
-        .rewind(chat, points[0], RewindMode::Code)
+        .rewind(tickloop_ids::Id::from(chat), points[0], RewindMode::Code)
         .await
         .unwrap();
     let code = outcome.code.unwrap();
@@ -235,10 +235,16 @@ async fn snapshots_never_back_up_the_target_of_a_symbolic_link() {
     let agent = Agent::open_embedded(workspace.state.clone(), config(), model).unwrap();
     let chat = agent.create_chat(workspace.workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "edit the file").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "edit the file").await;
     fs::remove_file(&tracked).unwrap();
     symlink(&secret, &tracked).unwrap();
-    run_prompt(&agent, &mut events, chat, "prompt while the file is a link").await;
+    run_prompt(
+        &agent,
+        &mut events,
+        chat.uuid(),
+        "prompt while the file is a link",
+    )
+    .await;
     assert!(files_containing(&workspace.state, OUTSIDE_CONTENT).is_empty());
 
     fs::remove_file(&tracked).unwrap();
@@ -284,7 +290,7 @@ async fn restored_parent_directories_follow_the_umask_instead_of_owner_only_perm
     let expected_mode = fs::metadata(&reference).unwrap().permissions().mode() & 0o7777;
 
     let outcome = agent
-        .rewind(chat, points[0], RewindMode::Code)
+        .rewind(tickloop_ids::Id::from(chat), points[0], RewindMode::Code)
         .await
         .unwrap();
     let code = outcome.code.unwrap();

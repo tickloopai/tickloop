@@ -200,7 +200,7 @@ fn model_listing_retains_complete_names_when_descriptions_exceed_the_budget() {
 async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let snapshot = agent.snapshot(chat).await.unwrap();
+            let snapshot = agent.snapshot(tickloop_ids::Id::from(chat)).await.unwrap();
             if snapshot.chat_loop.state == LoopState::Idle {
                 break;
             }
@@ -229,7 +229,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
         .submit(chat, "Arrange my Workspace".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
 
     {
         let requests = model.requests.lock().unwrap();
@@ -292,7 +292,7 @@ async fn loaded_skill_guidance_follows_its_call_once_and_keeps_every_request_a_p
         .submit(chat, "Analyze the target".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent
         .submit(chat, "Analyze the next one".into())
         .await
@@ -369,7 +369,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
         .submit(chat, "Analyze the report".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
 
     let requests = model.requests.lock().unwrap();
     let skill_tool = requests[0]
@@ -432,7 +432,7 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
         .invoke_skill(chat, "/tickloop", "show the current Workspace")
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
 
     let requests = model.requests.lock().unwrap();
     let messages = serde_json::to_string(&requests[0].messages).unwrap();
@@ -470,7 +470,7 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent.invoke_skill(chat, "tickloop", "").await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.compact(chat).await.unwrap();
     agent.shutdown().await;
     drop(agent);
@@ -530,7 +530,7 @@ async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided()
         .submit(chat, "Analyze these targets".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     let requests = model.requests.lock().unwrap();
     assert!(
@@ -583,16 +583,16 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
             .invoke_skill(chat, &format!("guide-{index}"), "")
             .await
             .unwrap();
-        wait_for_completion(&agent, chat).await;
+        wait_for_completion(&agent, chat.uuid()).await;
     }
     agent.invoke_skill(chat, "guide-0", "").await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.compact(chat).await.unwrap();
     agent
         .submit(chat, "Continue with these guides".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let requests = model.requests.lock().unwrap();
     let restored = requests
         .last()
@@ -746,7 +746,7 @@ async fn agent_in(
         .await
         .unwrap();
     let chat = agent.create_chat(workdir.to_path_buf()).await.unwrap();
-    (agent, chat, model)
+    (agent, chat.uuid(), model)
 }
 
 #[tokio::test]
@@ -767,7 +767,10 @@ async fn unchanged_skills_send_the_same_skill_tool_definition_so_the_prompt_cach
     let mut events = agent.subscribe();
 
     for prompt in ["One", "Two"] {
-        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+        let receipt = agent
+            .submit(tickloop_ids::Id::from(chat), prompt.into())
+            .await
+            .unwrap();
         finish(&mut events, &receipt).await;
     }
 
@@ -801,7 +804,10 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
     let (agent, chat, model) = agent_in(&config_root, &workdir, 2).await;
     let mut events = agent.subscribe();
 
-    let receipt = agent.submit(chat, "One".into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), "One".into())
+        .await
+        .unwrap();
     finish(&mut events, &receipt).await;
     assert!(skill_listing(&model, 0).contains("- notes [User]: Take notes\n"));
 
@@ -811,7 +817,10 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
         "name: notes\ndescription: Take dated notes",
         "Write dated notes.",
     );
-    let receipt = agent.submit(chat, "Two".into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), "Two".into())
+        .await
+        .unwrap();
     finish(&mut events, &receipt).await;
     assert!(
         skill_listing(&model, 1).contains("- notes [User]: Take dated notes\n"),
@@ -1079,12 +1088,12 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
         )
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent
         .submit(chat, "Something unrelated".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
 
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests.len(), 4);
@@ -1174,7 +1183,7 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
     }
     assert!(merged, "the invocation joined the working run");
     agent.submit(chat, "Next task".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert!(!carries_slides_guidance(&requests[0]));

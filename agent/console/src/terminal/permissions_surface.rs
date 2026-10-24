@@ -224,7 +224,7 @@ fn source_label(source: PermissionRuleSource) -> &'static str {
 fn scope_label(scope: &PermissionRuleScope) -> String {
     match scope {
         PermissionRuleScope::Chat => "Chat session".into(),
-        PermissionRuleScope::Loop(id) => format!("Loop {id}"),
+        PermissionRuleScope::Loop(id) => format!("Loop {}", tickloop_ids::base62::encode(*id)),
         PermissionRuleScope::Project(path) => format!("Project {}", path.display()),
     }
 }
@@ -461,7 +461,7 @@ impl RuleDraft {
         };
         Ok(PermissionChange::UpsertRule {
             rule: PermissionRule {
-                id: self.original_id.unwrap_or_else(Uuid::new_v4),
+                id: self.original_id.unwrap_or_else(tickloop_ids::generate),
                 decision,
                 tool: tool.to_owned(),
                 specifier,
@@ -597,7 +597,7 @@ impl From<PermissionsView> for PermissionsPage {
     fn from(view: PermissionsView) -> Self {
         Self {
             subject: PermissionsSubject::Agent {
-                chat: view.chat_id,
+                chat: view.chat_id.into(),
                 revision: view.revision,
             },
             content: PermissionsContent {

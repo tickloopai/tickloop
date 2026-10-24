@@ -346,7 +346,7 @@ async fn fixture_choosing_models(
         .set_execution_mode(chat, ExecutionMode::Auto)
         .await
         .unwrap();
-    (root, agent, model, adapter, chat, models)
+    (root, agent, model, adapter, chat.uuid(), models)
 }
 
 async fn completed(
@@ -380,10 +380,13 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::Authentication).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let first = completed(&mut events, run.run_id).await;
+    let first = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(first.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(first.fallback_from, Some(ApprovalReviewerKind::Jev));
     assert_eq!(
@@ -404,10 +407,13 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
     ));
 
     let run = agent
-        .submit(chat, "Create another requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create another requested symlink".into(),
+        )
         .await
         .unwrap();
-    let second = completed(&mut events, run.run_id).await;
+    let second = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(second.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         second.fallback_reason,
@@ -417,10 +423,13 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
 
     tokio::time::advance(Duration::from_secs(60)).await;
     let run = agent
-        .submit(chat, "Create one more requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create one more requested symlink".into(),
+        )
         .await
         .unwrap();
-    let _ = completed(&mut events, run.run_id).await;
+    let _ = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 3);
     assert!(root.path().join("link-4").symlink_metadata().is_ok());
@@ -432,10 +441,13 @@ async fn valid_jev_refusal_does_not_seek_llm_approval() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::Block).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(assessment.block_kind, Some(AutoBlockKind::TaskScope));
@@ -451,11 +463,14 @@ async fn jev_wait_uses_one_shared_twenty_second_budget_before_llm_fallback() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     tokio::time::advance(Duration::from_secs(20)).await;
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         assessment.fallback_failure,
@@ -472,11 +487,14 @@ async fn transient_jev_failure_retries_once_within_budget_and_keeps_valid_refusa
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::TransientThenBlock).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     tokio::time::advance(Duration::from_millis(500)).await;
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(assessment.attempts.len(), 3);
@@ -490,10 +508,13 @@ async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Invalid).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(
         assessment.fallback_failure,
         Some(ApprovalFailureKind::InvalidResponse)
@@ -506,7 +527,10 @@ async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Block).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     let assessment = loop {
@@ -523,7 +547,7 @@ async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     assert!(assessment.fallback_from.is_none());
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 0);
-    agent.interrupt(chat).await.unwrap();
+    agent.interrupt(tickloop_ids::Id::from(chat)).await.unwrap();
     agent.shutdown().await;
 }
 
@@ -532,13 +556,16 @@ async fn cancellation_during_jev_wait_does_not_fallback_or_change_health() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     while jev.calls.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
-    agent.interrupt(chat).await.unwrap();
+    agent.interrupt(tickloop_ids::Id::from(chat)).await.unwrap();
     loop {
         let event = events.recv().await.unwrap();
         if event.run_id != run.run_id {
@@ -565,7 +592,10 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     let (_root, agent, model, old, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     while old.calls.load(Ordering::SeqCst) == 0 {
@@ -577,7 +607,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     });
     agent.set_judgment_client(replacement.clone()).await;
     tokio::time::advance(Duration::from_secs(20)).await;
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         agent.auto_reviewer_health().await,
@@ -585,10 +615,13 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     );
 
     let run = agent
-        .submit(chat, "Create another requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create another requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(replacement.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
@@ -645,7 +678,7 @@ async fn jev_capacity_routes_complete_policy_without_overriding_valid_denials() 
             .submit(chat, "Create the requested symlink".into())
             .await
             .unwrap();
-        let assessment = completed(&mut events, run.run_id).await;
+        let assessment = completed(&mut events, run.run_id.uuid()).await;
         if repetitions == 3_000 && !provider_limit {
             assert_eq!(assessment.outcome, ApprovalOutcome::Block);
             assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
@@ -700,10 +733,13 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
         fixture_choosing_models(JevBehavior::AuthThenWait).await;
     let mut events = agent.subscribe();
     let first_run = agent
-        .submit(first_chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(first_chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    completed(&mut events, first_run.run_id).await;
+    completed(&mut events, first_run.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
 
     let other_model = Arc::new(ConversationModel {
@@ -723,7 +759,10 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     tokio::time::advance(Duration::from_secs(60)).await;
     let mut probe_events = agent.subscribe();
     let probe = agent
-        .submit(first_chat, "Create another requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(first_chat),
+            "Create another requested symlink".into(),
+        )
         .await
         .unwrap();
     while jev.calls.load(Ordering::SeqCst) < 2 {
@@ -741,7 +780,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     assert_eq!(probe.chat_id, first_chat);
     assert_eq!(concurrent.chat_id, other_chat);
     assert_ne!(probe.run_id, concurrent.run_id);
-    let concurrent_assessment = completed(&mut events, concurrent.run_id).await;
+    let concurrent_assessment = completed(&mut events, concurrent.run_id.uuid()).await;
     assert_eq!(
         concurrent_assessment.reviewer.unwrap().kind,
         ApprovalReviewerKind::Llm
@@ -758,7 +797,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
 
     tokio::time::advance(Duration::from_secs(20)).await;
-    let probe_assessment = completed(&mut probe_events, probe.run_id).await;
+    let probe_assessment = completed(&mut probe_events, probe.run_id.uuid()).await;
     assert_eq!(
         probe_assessment.fallback_failure,
         Some(ApprovalFailureKind::Timeout)
@@ -775,10 +814,13 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::AuthThenBlock).await;
     let mut events = agent.subscribe();
     let first = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let first_assessment = completed(&mut events, first.run_id).await;
+    let first_assessment = completed(&mut events, first.run_id.uuid()).await;
     assert_eq!(
         first_assessment.fallback_from,
         Some(ApprovalReviewerKind::Jev)
@@ -786,10 +828,13 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     tokio::time::advance(Duration::from_secs(60)).await;
 
     let second = agent
-        .submit(chat, "Create another requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create another requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, second.run_id).await;
+    let assessment = completed(&mut events, second.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(
@@ -798,10 +843,13 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
     );
 
     let third = agent
-        .submit(chat, "Create one more requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create one more requested symlink".into(),
+        )
         .await
         .unwrap();
-    let _ = completed(&mut events, third.run_id).await;
+    let _ = completed(&mut events, third.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 5);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
@@ -838,7 +886,7 @@ async fn limited_fallback_fixture(
         .set_execution_mode(chat, ExecutionMode::Auto)
         .await
         .unwrap();
-    (root, agent, model, chat)
+    (root, agent, model, chat.uuid())
 }
 
 #[tokio::test]
@@ -848,7 +896,10 @@ async fn both_reviewers_at_capacity_ask_a_human_or_stop_headless() {
             limited_fallback_fixture(FallbackBehavior::ContextLimit, prompt_policy).await;
         let mut events = agent.subscribe();
         let run = agent
-            .submit(chat, "Create the requested symlink".into())
+            .submit(
+                tickloop_ids::Id::from(chat),
+                "Create the requested symlink".into(),
+            )
             .await
             .unwrap();
         let mut assessment = None;
@@ -865,7 +916,7 @@ async fn both_reviewers_at_capacity_ask_a_human_or_stop_headless() {
                     assert_eq!(prompt_policy, PromptPolicy::Interactive);
                     prompted = true;
                     agent
-                        .answer_permission(chat, request.id, true)
+                        .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                         .await
                         .unwrap();
                 }
@@ -895,7 +946,12 @@ async fn both_reviewers_at_capacity_ask_a_human_or_stop_headless() {
             prompted
         );
         assert_eq!(
-            agent.recent_denials(chat).await.unwrap().records.len(),
+            agent
+                .recent_denials(tickloop_ids::Id::from(chat))
+                .await
+                .unwrap()
+                .records
+                .len(),
             usize::from(stopped)
         );
         agent.shutdown().await;
@@ -908,13 +964,16 @@ async fn cancelling_waiting_llm_fallback_leaves_no_denial_or_execution() {
         limited_fallback_fixture(FallbackBehavior::WaitForCancel, PromptPolicy::DenyOnPrompt).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
     while model.review_requests.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
-    agent.interrupt(chat).await.unwrap();
+    agent.interrupt(tickloop_ids::Id::from(chat)).await.unwrap();
     loop {
         let event = events.recv().await.unwrap();
         if event.run_id != run.run_id {
@@ -928,7 +987,14 @@ async fn cancelling_waiting_llm_fallback_leaves_no_denial_or_execution() {
             _ => {}
         }
     }
-    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+    assert!(
+        agent
+            .recent_denials(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
     assert!(root.path().join("reviewed").symlink_metadata().is_err());
     agent.shutdown().await;
 }
@@ -1026,10 +1092,13 @@ async fn authorization_stage_failure_falls_back_without_treating_screening_as_re
     let (root, agent, model, jev, chat) = fixture(JevBehavior::BlockThenAuthentication).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
     assert_eq!(
         assessment.fallback_failure,
@@ -1050,7 +1119,14 @@ async fn authorization_stage_failure_falls_back_without_treating_screening_as_re
     );
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
-    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+    assert!(
+        agent
+            .recent_denials(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
     assert!(root.path().join("link-0").symlink_metadata().is_ok());
     agent.shutdown().await;
 }
@@ -1061,10 +1137,13 @@ async fn jev_stages_share_one_twenty_second_budget() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(12)).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(
         assessment.fallback_failure,
         Some(ApprovalFailureKind::Timeout)
@@ -1081,7 +1160,14 @@ async fn jev_stages_share_one_twenty_second_budget() {
     );
     assert_eq!(assessment.attempts[1].elapsed_ms, 8000);
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
-    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+    assert!(
+        agent
+            .recent_denials(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
     agent.shutdown().await;
 }
 
@@ -1090,10 +1176,13 @@ async fn jev_can_complete_two_six_second_stages_without_premature_fallback() {
     let (root, agent, model, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(6)).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert!(assessment.fallback_failure.is_none());
@@ -1117,10 +1206,13 @@ async fn both_jev_stages_share_one_retry_allowance() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::TransientInBothStages).await;
     let mut events = agent.subscribe();
     let run = agent
-        .submit(chat, "Create the requested symlink".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create the requested symlink".into(),
+        )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id).await;
+    let assessment = completed(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
     assert_eq!(
         assessment.fallback_failure,

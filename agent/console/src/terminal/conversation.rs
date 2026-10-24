@@ -182,7 +182,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
         if let Some(kind) = compaction {
             blocks.push(ConversationBlock {
                 id: ConversationBlockId::MessageContent {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     message_index,
                     content_index: 0,
                 },
@@ -204,24 +204,24 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
         ) {
             blocks.push(ConversationBlock {
                 id: ConversationBlockId::MessageContent {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     message_index,
                     content_index: 0,
                 },
-                metadata: metadata(run_id, None, None),
+                metadata: metadata(run_id.map(Into::into), None, None),
                 kind: ConversationBlockKind::GoalContinuation,
             });
             continue;
         }
         let model = (message.role == Role::Assistant)
-            .then(|| run_model(snapshot, run_id))
+            .then(|| run_model(snapshot, run_id.map(Into::into)))
             .flatten();
         for (content_index, content) in message.content.iter().enumerate() {
             if let Some(mut block) = message_block(
-                snapshot.id,
+                snapshot.id.into(),
                 message_index,
                 content_index,
-                run_id,
+                run_id.map(Into::into),
                 message.role,
                 content,
             ) {
@@ -242,10 +242,10 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
     {
         blocks.push(ConversationBlock {
             id: ConversationBlockId::StreamingThinking {
-                chat_id: snapshot.id,
-                run_id,
+                chat_id: snapshot.id.into(),
+                run_id: run_id.into(),
             },
-            metadata: metadata(Some(run_id), Some(chat_loop.id), None),
+            metadata: metadata(Some(run_id.into()), Some(chat_loop.id.into()), None),
             kind: ConversationBlockKind::Thinking {
                 text: thinking.clone(),
                 source: ThinkingSource::ModelText,
@@ -257,7 +257,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
         let run_id = pending_run(snapshot);
         blocks.push(ConversationBlock {
             id: ConversationBlockId::StreamingAssistant {
-                chat_id: snapshot.id,
+                chat_id: snapshot.id.into(),
                 run_id,
             },
             metadata: metadata(run_id, None, None),
@@ -274,28 +274,36 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             .iter()
             .map(|request| ConversationBlock {
                 id: ConversationBlockId::Permission {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     request_id: request.id,
                 },
-                metadata: metadata(request.execution.run_id(), Some(request.loop_id), None),
+                metadata: metadata(
+                    request.execution.run_id().map(Into::into),
+                    Some(request.loop_id.into()),
+                    None,
+                ),
                 kind: ConversationBlockKind::Permission,
             }),
     );
     blocks.extend(snapshot.questions.iter().map(|request| ConversationBlock {
         id: ConversationBlockId::Question {
-            chat_id: snapshot.id,
+            chat_id: snapshot.id.into(),
             request_id: request.id,
         },
-        metadata: metadata(Some(request.run_id), Some(request.loop_id), None),
+        metadata: metadata(
+            Some(request.run_id.into()),
+            Some(request.loop_id.into()),
+            None,
+        ),
         kind: ConversationBlockKind::Question,
     }));
     blocks.extend(snapshot.plans.iter().map(|plan| ConversationBlock {
         id: ConversationBlockId::Plan {
-            chat_id: snapshot.id,
-            loop_id: plan.loop_id,
+            chat_id: snapshot.id.into(),
+            loop_id: plan.loop_id.into(),
             version: plan.version,
         },
-        metadata: metadata(None, Some(plan.loop_id), None),
+        metadata: metadata(None, Some(plan.loop_id.into()), None),
         kind: ConversationBlockKind::Plan,
     }));
     let events = snapshot
@@ -328,7 +336,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             .cloned()
             .map(|command| ConversationBlock {
                 id: ConversationBlockId::Command {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     operation_id: command.operation_id,
                 },
                 metadata: metadata(None, Some(command.loop_id), None),
@@ -342,7 +350,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             .cloned()
             .map(|record| ConversationBlock {
                 id: ConversationBlockId::FamilyInput {
-                    chat_id: snapshot.id,
+                    chat_id: snapshot.id.into(),
                     message_id: record.message_id,
                 },
                 metadata: metadata(None, None, None),
@@ -357,13 +365,13 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 completion.notification.is_background()
                     && !snapshot
                         .agent_message_origins
-                        .contains_key(&completion.child_run_id)
+                        .contains_key(&completion.child_run_id.uuid())
             })
             .cloned()
             .map(|completion| ConversationBlock {
                 id: ConversationBlockId::FamilyCompletion {
-                    chat_id: snapshot.id,
-                    child_run_id: completion.child_run_id,
+                    chat_id: snapshot.id.into(),
+                    child_run_id: completion.child_run_id.into(),
                 },
                 metadata: metadata(None, None, None),
                 kind: ConversationBlockKind::FamilyCompletion { completion },
@@ -380,20 +388,22 @@ fn run_model(snapshot: &ChatSnapshot, run_id: Option<Uuid>) -> Option<String> {
         .entries()
         .iter()
         .rev()
-        .find(|entry| entry.run_id == Some(run_id) && entry.kind == ModelRequestKind::Conversation)
+        .find(|entry| {
+            entry.run_id == Some(run_id.into()) && entry.kind == ModelRequestKind::Conversation
+        })
         .map(|entry| entry.model.requested_model.clone())
 }
 
 pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
     let event_metadata = metadata(
-        Some(event.run_id),
-        Some(event.loop_id),
+        Some(event.run_id.into()),
+        Some(event.loop_id.into()),
         Some(event.sequence),
     );
     let block = match &event.kind {
         EventKind::FamilyInputUpdated { record } => ConversationBlock {
             id: ConversationBlockId::FamilyInput {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 message_id: record.message_id,
             },
             metadata: event_metadata,
@@ -407,8 +417,8 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             }
             ConversationBlock {
                 id: ConversationBlockId::FamilyCompletion {
-                    chat_id: event.chat_id,
-                    child_run_id: completion.child_run_id,
+                    chat_id: event.chat_id.into(),
+                    child_run_id: completion.child_run_id.into(),
                 },
                 metadata: event_metadata,
                 kind: ConversationBlockKind::FamilyCompletion {
@@ -418,7 +428,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         }
         EventKind::Text(text) => ConversationBlock {
             id: ConversationBlockId::Event {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 sequence: event.sequence,
             },
             metadata: event_metadata,
@@ -429,7 +439,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         },
         EventKind::Thinking(text) => ConversationBlock {
             id: ConversationBlockId::Event {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 sequence: event.sequence,
             },
             metadata: event_metadata,
@@ -443,7 +453,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             name,
             input,
         } => {
-            let exchange = exchange(event.chat_id, Some(event.run_id), call_id);
+            let exchange = exchange(event.chat_id.into(), Some(event.run_id.into()), call_id);
             ConversationBlock {
                 id: tool_call_id(&exchange),
                 metadata: event_metadata,
@@ -457,7 +467,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         EventKind::ToolCompleted {
             call_id, result, ..
         } => {
-            let exchange = exchange(event.chat_id, Some(event.run_id), call_id);
+            let exchange = exchange(event.chat_id.into(), Some(event.run_id.into()), call_id);
             ConversationBlock {
                 id: tool_result_id(&exchange),
                 metadata: event_metadata,
@@ -470,18 +480,18 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         }
         EventKind::PermissionRequested { request } => ConversationBlock {
             id: ConversationBlockId::Permission {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 request_id: request.id,
             },
             metadata: ConversationBlockMetadata {
-                run_id: request.execution.run_id(),
+                run_id: request.execution.run_id().map(Into::into),
                 ..event_metadata
             },
             kind: ConversationBlockKind::Permission,
         },
         EventKind::QuestionAsked { request } => ConversationBlock {
             id: ConversationBlockId::Question {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 request_id: request.id,
             },
             metadata: event_metadata,
@@ -489,8 +499,8 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         },
         EventKind::PlanUpdated { plan } => ConversationBlock {
             id: ConversationBlockId::Plan {
-                chat_id: event.chat_id,
-                loop_id: plan.loop_id,
+                chat_id: event.chat_id.into(),
+                loop_id: plan.loop_id.into(),
                 version: plan.version,
             },
             metadata: event_metadata,
@@ -508,7 +518,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             notice: Some(tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled { .. }),
         } => ConversationBlock {
             id: ConversationBlockId::Event {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 sequence: event.sequence,
             },
             metadata: event_metadata,
@@ -516,7 +526,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         },
         EventKind::CommandUpdated { command } => ConversationBlock {
             id: ConversationBlockId::Command {
-                chat_id: event.chat_id,
+                chat_id: event.chat_id.into(),
                 operation_id: command.operation_id,
             },
             metadata: event_metadata,
@@ -649,12 +659,12 @@ fn message_block(
 fn outcome_block(event: &Event, outcome: ConversationOutcome) -> ConversationBlock {
     ConversationBlock {
         id: ConversationBlockId::Outcome {
-            chat_id: event.chat_id,
+            chat_id: event.chat_id.into(),
             sequence: event.sequence,
         },
         metadata: metadata(
-            Some(event.run_id),
-            Some(event.loop_id),
+            Some(event.run_id.into()),
+            Some(event.loop_id.into()),
             Some(event.sequence),
         ),
         kind: ConversationBlockKind::Outcome(outcome),
@@ -666,8 +676,8 @@ fn pending_run(snapshot: &ChatSnapshot) -> Option<Uuid> {
         .events
         .iter()
         .rev()
-        .find_map(|event| matches!(event.kind, EventKind::Text(_)).then_some(event.run_id))
-        .or(snapshot.last_model_run)
+        .find_map(|event| matches!(event.kind, EventKind::Text(_)).then_some(event.run_id.uuid()))
+        .or(snapshot.last_model_run.map(|run| run.uuid()))
 }
 
 fn exchange(chat_id: Uuid, run_id: Option<Uuid>, call_id: &str) -> ToolExchangeId {
@@ -747,9 +757,9 @@ mod tests {
     fn event(chat_id: Uuid, loop_id: Uuid, run_id: Uuid, sequence: u64, kind: EventKind) -> Event {
         Event {
             sequence,
-            chat_id,
-            loop_id,
-            run_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             kind,
         }
     }
@@ -834,12 +844,12 @@ mod tests {
                 }],
             },
         ];
-        snapshot.message_runs = BTreeMap::from([(0, run_id), (1, run_id)]);
+        snapshot.message_runs = BTreeMap::from([(0, run_id.into()), (1, run_id.into())]);
         snapshot.permissions.push(PermissionRequest {
             id: permission_id,
-            loop_id,
+            loop_id: loop_id.into(),
             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                run_id,
+                run_id: run_id.into(),
                 call_id: "call".into(),
             },
             name: "Bash".into(),
@@ -850,9 +860,9 @@ mod tests {
         });
         snapshot.questions.push(QuestionRequest {
             id: question_id,
-            chat_id,
-            loop_id,
-            run_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             call_id: "question".into(),
             questions: vec![Question {
                 question: "Continue?".into(),
@@ -866,7 +876,7 @@ mod tests {
             }],
         });
         snapshot.plans.push(Plan {
-            loop_id,
+            loop_id: loop_id.into(),
             version: 2,
             markdown: "Plan".into(),
             approved_execution_mode: None,
@@ -948,7 +958,7 @@ mod tests {
                 }],
             },
         ];
-        snapshot.message_runs = BTreeMap::from([(0, run_id), (1, run_id)]);
+        snapshot.message_runs = BTreeMap::from([(0, run_id.into()), (1, run_id.into())]);
 
         let projection = project(&snapshot);
         let message_exchanges = projection
@@ -1014,7 +1024,7 @@ mod tests {
                 text: "saved prompt".into(),
             }],
         });
-        full.message_runs.insert(0, run_id);
+        full.message_runs.insert(0, run_id.into());
         full.events = vec![
             event(chat_id, loop_id, run_id, 10, EventKind::Started),
             event(
@@ -1082,7 +1092,11 @@ mod tests {
                 }],
             },
         ];
-        snapshot.message_runs = BTreeMap::from([(0, failed_run), (1, later_run), (2, later_run)]);
+        snapshot.message_runs = BTreeMap::from([
+            (0, failed_run.into()),
+            (1, later_run.into()),
+            (2, later_run.into()),
+        ]);
         snapshot.events.push(event(
             chat_id,
             loop_id,
@@ -1118,9 +1132,9 @@ mod tests {
     fn wakeup_cancellation_is_projected_once_as_a_conversation_notice() {
         let event = Event {
             sequence: 7,
-            chat_id: Uuid::nil(),
-            loop_id: Uuid::nil(),
-            run_id: Uuid::new_v4(),
+            chat_id: Uuid::nil().into(),
+            loop_id: Uuid::nil().into(),
+            run_id: Uuid::new_v4().into(),
             kind: EventKind::ScheduledTasksChanged {
                 notice: Some(
                     tickloop_agent_protocol::ScheduledTaskNotice::WakeupCancelled {

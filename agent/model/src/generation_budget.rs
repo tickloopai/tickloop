@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{
     ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, ModelRequestContext,
@@ -48,7 +47,7 @@ impl GenerationBudget {
     pub async fn complete(
         self,
         client: &dyn ModelClient,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         request: ModelRequest,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {

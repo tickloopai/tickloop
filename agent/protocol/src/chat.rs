@@ -18,15 +18,7 @@ use crate::{
     ReasoningEffort, RequestUsageLedger, Role, ToolResult, TriggerSource, Usage,
 };
 
-pub type LoopId = Uuid;
-
-pub type RunId = Uuid;
-
-/// The identity a host gives one input, kept in the Chat's input ledger.
-pub type InputId = Uuid;
-
-/// One displayed answer: one attempt of one Run.
-pub type ResponseId = Uuid;
+pub use crate::ids::{InputId, LoopId, ResponseId, RunId};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
@@ -888,7 +880,7 @@ pub(crate) fn queued_inputs(
         .iter()
         .filter(|pending| is_queued_user_message(pending))
         .map(|pending| QueuedInput {
-            id: pending.receipt.run_id,
+            id: pending.receipt.run_id.uuid(),
             chat_id: pending.receipt.chat_id,
             loop_id: Some(pending.receipt.loop_id),
             kind: QueuedInputKind::Message,

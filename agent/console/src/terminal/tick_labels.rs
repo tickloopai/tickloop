@@ -162,8 +162,10 @@ impl TickLabels {
         {
             if let Content::ToolResult { content, .. } = content
                 && let Ok(result) = serde_json::from_str::<Value>(&content.text())
-                && let (Ok(id), Ok(instance)) = (
-                    serde_json::from_value(result["subscription"].clone()),
+                && let (Some(id), Ok(instance)) = (
+                    result["subscription"]
+                        .as_str()
+                        .and_then(tickloop_ids::base62::decode_either),
                     serde_json::from_value(result["tick_instance_id"].clone()),
                 )
             {
@@ -226,8 +228,9 @@ impl TickLabels {
         let instance = serde_json::from_value::<InstanceRef>(input["tick_instance_id"].clone())
             .ok()
             .or_else(|| {
-                serde_json::from_value::<Uuid>(input["subscription"].clone())
-                    .ok()
+                input["subscription"]
+                    .as_str()
+                    .and_then(tickloop_ids::base62::decode_either)
                     .and_then(|id| self.subscriptions.get(&id).cloned())
             });
         let known = instance
@@ -323,7 +326,7 @@ pub(super) fn delivery_runs(
         ));
         if matches!(detail, OutputDetail::Full) {
             runs.push((
-                format!("  Tick Instance: {}\n", item.instance),
+                format!("  Tick Instance: {}\n", item.instance.public()),
                 Some(Role::MutedText),
             ));
         }
@@ -351,12 +354,25 @@ fn label_runs(
     ]
 }
 
+/// A name for a Tick without a title. A hosted or Shell identity is a UUID v7 whose leading
+/// characters are its creation time, alike for Ticks opened together, so the name takes the end
+/// of its base62 form, which is random.
 fn short_name(instance: &InstanceRef) -> String {
-    let id = instance
-        .id()
-        .chars()
-        .take(SHORT_INSTANCE_CHARACTERS)
-        .collect::<String>();
+    let uuid = instance
+        .hosted_run()
+        .map(|run| run.uuid())
+        .or_else(|| instance.shell_task().map(|task| task.uuid()));
+    let id = match uuid {
+        Some(uuid) => {
+            let public = tickloop_ids::base62::encode(uuid);
+            public[public.len() - SHORT_INSTANCE_CHARACTERS..].to_owned()
+        }
+        None => instance
+            .id()
+            .chars()
+            .take(SHORT_INSTANCE_CHARACTERS)
+            .collect(),
+    };
     format!("Tick {id}")
 }
 

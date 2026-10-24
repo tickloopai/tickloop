@@ -72,7 +72,7 @@ impl SubscriptionDetail {
         display: DisplayProfile,
     ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat,
             instance,
             title,

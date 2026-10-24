@@ -14,9 +14,9 @@ fn question_console(width: u16, height: u16, multi_select: bool) -> Console {
     let flow = QuestionFlow::new(
         QuestionRequest {
             id: REQUEST,
-            chat_id: Uuid::from_u128(481),
-            loop_id: Uuid::from_u128(482),
-            run_id: Uuid::from_u128(483),
+            chat_id: Uuid::from_u128(481).into(),
+            loop_id: Uuid::from_u128(482).into(),
+            run_id: Uuid::from_u128(483).into(),
             call_id: "question-layout".into(),
             questions: vec![Question {
                 question: "“4 个 task”指的是哪种？".into(),
@@ -200,9 +200,9 @@ fn present_question(state: State) -> Console {
     let flow = QuestionFlow::new(
         QuestionRequest {
             id: REQUEST,
-            chat_id: Uuid::from_u128(481),
-            loop_id: Uuid::from_u128(482),
-            run_id: Uuid::from_u128(483),
+            chat_id: Uuid::from_u128(481).into(),
+            loop_id: Uuid::from_u128(482).into(),
+            run_id: Uuid::from_u128(483).into(),
             call_id: "question-keys".into(),
             questions: vec![report_question()],
         },

@@ -1058,7 +1058,7 @@ impl Default for ChatInput {
             shell_input: ShellInputState::default(),
             completion: Completion::default(),
             file_mentions: FileMentionState::default(),
-            owner: Uuid::new_v4(),
+            owner: tickloop_ids::generate(),
         }
     }
 }
@@ -1545,8 +1545,10 @@ impl Console {
         let status = status.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let chat = status.id;
-        state.monitor_for_chat_mut(chat).set_chat_status(status);
-        state.auto_reveal_monitor(chat);
+        state
+            .monitor_for_chat_mut(chat.into())
+            .set_chat_status(status);
+        state.auto_reveal_monitor(chat.into());
         Ok(())
     }
     /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
@@ -1558,10 +1560,10 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let chat = shells.chat_id;
         state
-            .monitor_for_chat_mut(chat)
+            .monitor_for_chat_mut(chat.into())
             .refresh_ticks(shells, subscriptions);
-        let revealed = state.auto_reveal_monitor(chat);
-        if state.chat != Some(chat)
+        let revealed = state.auto_reveal_monitor(chat.into());
+        if state.chat != Some(chat.into())
             || !state.monitor_visible()
                 && !revealed
                 && state
@@ -1585,8 +1587,10 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let chat = sources.chat.id;
-        state.monitor_for_chat_mut(chat).refresh_sources(sources);
-        state.auto_reveal_monitor(chat);
+        state
+            .monitor_for_chat_mut(chat.into())
+            .refresh_sources(sources);
+        state.auto_reveal_monitor(chat.into());
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -2897,7 +2901,8 @@ impl Console {
                 "Last connection diagnostic (this View)".to_owned(),
                 format!("Technical cause: {cause}"),
                 format!(
-                    "/resume {chat} loads saved history; continuing requires an explicit new input."
+                    "/resume {} loads saved history; continuing requires an explicit new input.",
+                    tickloop_ids::base62::encode(chat)
                 ),
             ]);
         }
@@ -3862,7 +3867,7 @@ impl Console {
             }
         }
         self.record_delivery_labels(
-            snapshot.id,
+            snapshot.id.into(),
             input,
             labels,
             instances
@@ -3950,8 +3955,8 @@ impl Console {
         input: Uuid,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat == Some(snapshot.id)
-            && let Some(source) = snapshot.trigger_origins.get(&input)
+        if state.chat == Some(snapshot.id.into())
+            && let Some(source) = snapshot.trigger_origins.get(&tickloop_ids::Id::from(input))
         {
             state.monitor.flash_trigger(
                 source,
@@ -4666,10 +4671,10 @@ impl Console {
         else {
             return Ok(None);
         };
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         state.queued_inputs.push(QueuedInput {
             id,
-            chat_id: chat,
+            chat_id: chat.into(),
             loop_id: None,
             kind,
             text: text.to_owned(),
@@ -5135,9 +5140,10 @@ impl Drop for Lifetime {
             let mut reopen_hint = None;
             if let Ok(mut state) = self.state.lock() {
                 let mut output = io::stdout().lock();
-                reopen_hint = state
-                    .chat
-                    .map(|chat| format!("Chat {chat} · reopen it with /resume {chat}"));
+                reopen_hint = state.chat.map(|chat| {
+                    let chat = tickloop_ids::base62::encode(chat);
+                    format!("Chat {chat} · reopen it with /resume {chat}")
+                });
                 state.transcript = None;
                 let _ = state.draw(&mut output);
                 if !renderer.uses_alternate_screen() {
@@ -5411,7 +5417,7 @@ fn append_input_echo(
     let first_line = append_input_spans(scrollback, &spans, fill);
     let echo = scrollback.mark_input(first_line..scrollback.line_count() - 1);
     if !input.starts_with('/') {
-        scrollback.note_message(Uuid::new_v4().to_string());
+        scrollback.note_message(tickloop_ids::generate().to_string());
         if scrollback.auto_scroll() {
             scrollback.scroll(ScrollAction::Last);
         }
@@ -5693,7 +5699,7 @@ impl State {
             next.history_project = self.history_project.clone();
             next.history_session = chat
                 .map(|id| id.to_string())
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                .unwrap_or_else(|| tickloop_ids::generate().to_string());
             next.mention_roots = self.mention_roots.clone();
             next
         });
@@ -5901,7 +5907,7 @@ impl State {
             file_mentions: FileMentionState::default(),
             file_index_worker: None,
             file_index_focused: true,
-            input_owner: Uuid::new_v4(),
+            input_owner: tickloop_ids::generate(),
             editor: Editor::new(),
             editor_cache: HashMap::new(),
             view_cache: HashMap::new(),
@@ -5924,7 +5930,7 @@ impl State {
             input_history: None,
             history_search: None,
             history_project: PathBuf::new(),
-            history_session: Uuid::new_v4().to_string(),
+            history_session: tickloop_ids::generate().to_string(),
             shell_history_cache: None,
             submitted_pasted_texts: None,
             submitted_prompt: None,
@@ -10914,7 +10920,7 @@ impl State {
     }
 
     fn start_transcript(&mut self) -> Uuid {
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         self.shell_background_chord_started_at = None;
         self.clear_footer_selection();
 
@@ -13545,13 +13551,13 @@ fn diff_screen_lines(
         |source| match source.id {
             ChangeSourceId::Current => "Current · working tree".into(),
             ChangeSourceId::AgentRun(run_id) => {
-                let run_id = run_id.to_string();
+                let run_id = run_id.public();
                 let prompt = source
                     .user_prompt
                     .as_deref()
                     .map(display_single_line)
                     .unwrap_or_else(|| "Agent turn in this process".into());
-                format!("Agent · {} · {prompt}", &run_id[..8])
+                format!("Agent · {run_id} · {prompt}")
             }
         },
     );
@@ -14161,16 +14167,18 @@ mod tests {
 
     pub(super) fn task_snapshot(chat_id: Uuid, count: usize) -> ShellTaskSnapshot {
         ShellTaskSnapshot {
-            chat_id,
+            chat_id: chat_id.into(),
             live_revision: 1,
             tasks: (0..count)
                 .map(|index| ShellTask {
                     updated_at_ms: None,
                     ended_at_ms: None,
                     id: Uuid::from_u128(index as u128 + 1),
-                    chat_id,
+                    chat_id: chat_id.into(),
                     origin: ShellTaskOrigin::User,
-                    owner: ShellTaskOwner::User { chat_id },
+                    owner: ShellTaskOwner::User {
+                        chat_id: chat_id.into(),
+                    },
                     call_id: None,
                     command: format!("printf task-{index}"),
                     description: None,
@@ -16030,9 +16038,10 @@ mod tests {
             assert_eq!(state.restored_contexts, std::slice::from_ref(&context));
         }
 
-        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, false)
-            .await
-            .unwrap_err();
+        let error =
+            branch_from_terminal(&console, &agent, Some(source_chat.into()), command, false)
+                .await
+                .unwrap_err();
 
         assert!(error.contains("there is no conversation to branch"));
         assert_pre_save_branch_input_preserved(
@@ -16116,9 +16125,15 @@ mod tests {
         assert_pre_save_branch_input_preserved(&console, None, command, &context, cursor, false);
 
         let (console, context, cursor) = pending_branch_console(Some(empty_chat), command);
-        let error = branch_from_terminal(&console, &agent, Some(empty_chat), "/branching", false)
-            .await
-            .unwrap_err();
+        let error = branch_from_terminal(
+            &console,
+            &agent,
+            Some(empty_chat.into()),
+            "/branching",
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("use /branch [NAME]"));
         assert_pre_save_branch_input_preserved(
             &console,
@@ -16130,7 +16145,7 @@ mod tests {
         );
 
         let (console, context, cursor) = pending_branch_console(Some(empty_chat), command);
-        let error = branch_from_terminal(&console, &agent, Some(empty_chat), command, false)
+        let error = branch_from_terminal(&console, &agent, Some(empty_chat.into()), command, false)
             .await
             .unwrap_err();
         assert!(error.contains("there is no conversation to branch"));
@@ -16205,7 +16220,7 @@ mod tests {
         let command = "/branch @branch-context";
         let (console, context, cursor) = pending_branch_console(Some(source_chat), command);
 
-        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, true)
+        let error = branch_from_terminal(&console, &agent, Some(source_chat.into()), command, true)
             .await
             .unwrap_err();
 
@@ -16255,7 +16270,7 @@ mod tests {
         let command = "/branch completion-ready-summary";
         let (console, context, cursor) = pending_branch_console(Some(source_chat), command);
 
-        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, true)
+        let error = branch_from_terminal(&console, &agent, Some(source_chat.into()), command, true)
             .await
             .unwrap_err();
 
@@ -16306,9 +16321,10 @@ mod tests {
         let (console, _, _) = pending_branch_console(Some(source_chat), command);
         console.fail_next_reset_chat("renderer failed").unwrap();
 
-        let error = branch_from_terminal(&console, &agent, Some(source_chat), command, false)
-            .await
-            .unwrap_err();
+        let error =
+            branch_from_terminal(&console, &agent, Some(source_chat.into()), command, false)
+                .await
+                .unwrap_err();
         let child = agent
             .list_chats()
             .await
@@ -16316,9 +16332,10 @@ mod tests {
             .find(|snapshot| snapshot.conversation.id != source_chat)
             .expect("the durable child was not published");
 
-        assert!(error.contains(&format!("Branch {} was saved", child.conversation.id)));
+        let child_text = tickloop_ids::base62::encode(child.conversation.id.uuid());
+        assert!(error.contains(&format!("Branch {child_text} was saved")));
         assert!(error.contains("Use /resume to find it"));
-        assert!(error.contains(&format!("/resume {}", child.conversation.id)));
+        assert!(error.contains(&format!("/resume {child_text}")));
         {
             let mut state = console.state.lock().unwrap();
             assert_eq!(state.chat, Some(source_chat));
@@ -16382,7 +16399,7 @@ mod tests {
     #[test]
     fn diff_list_keeps_paths_and_source_labels_on_one_terminal_row() {
         let mut catalog = diff_catalog(1);
-        catalog.sources[0].id = ChangeSourceId::AgentRun(Uuid::from_u128(7));
+        catalog.sources[0].id = ChangeSourceId::AgentRun(Uuid::from_u128(7).into());
         catalog.sources[0].user_prompt = Some("first line\nsecond\tpart".into());
         catalog.sources[0].files[0].path = PathBuf::from("line\nbreak.txt");
         catalog.sources[0].files[0].current_status = Some(CurrentFileStatus {
@@ -16864,7 +16881,7 @@ mod tests {
                 Some(chat),
                 &HashMap::from([(
                     request.id,
-                    crate::terminal::PermissionRequestOwner::new(chat, &request),
+                    crate::terminal::PermissionRequestOwner::new(chat.into(), &request),
                 )]),
                 &HashMap::new(),
             )
@@ -16934,7 +16951,7 @@ mod tests {
                 Some(chat),
                 &HashMap::from([(
                     request.id,
-                    crate::terminal::PermissionRequestOwner::new(chat, &request),
+                    crate::terminal::PermissionRequestOwner::new(chat.into(), &request),
                 )]),
                 &HashMap::new(),
             )
@@ -16945,7 +16962,7 @@ mod tests {
             .iter()
             .find(|line| line.trim_start().starts_with("Agent "))
             .unwrap_or_else(|| panic!("the request names its Agent: {frame:#?}"));
-        let loop_prefix = &receipt.loop_id.to_string()[..8];
+        let loop_prefix = &receipt.loop_id.uuid().to_string()[..8];
         assert!(
             context.contains("Agent Inspect commit deadbeef") && !context.contains(loop_prefix),
             "the requester is named by text, the Loop by nothing generated: {context}"
@@ -16998,7 +17015,7 @@ mod tests {
                     Some(chat),
                     &HashMap::from([(
                         request.id,
-                        crate::terminal::PermissionRequestOwner::new(chat, &request),
+                        crate::terminal::PermissionRequestOwner::new(chat.into(), &request),
                     )]),
                     &HashMap::new(),
                 )
@@ -21587,8 +21604,8 @@ mod tests {
     fn queued_input(kind: QueuedInputKind, text: &str, sequence: u64) -> QueuedInput {
         QueuedInput {
             id: Uuid::new_v4(),
-            chat_id: Uuid::new_v4(),
-            loop_id: Some(Uuid::new_v4()),
+            chat_id: Uuid::new_v4().into(),
+            loop_id: Some(Uuid::new_v4().into()),
             kind,
             text: text.into(),
             contexts: Vec::new(),
@@ -21604,8 +21621,8 @@ mod tests {
         let message = queued_input(QueuedInputKind::Message, "check deadbeef exactly", 1);
         let shell = queued_input(QueuedInputKind::Shell, "printf exact-shell", 2);
         let hashes = [
-            message.chat_id.to_string()[..8].to_owned(),
-            message.loop_id.unwrap().to_string()[..8].to_owned(),
+            message.chat_id.uuid().to_string()[..8].to_owned(),
+            message.loop_id.unwrap().uuid().to_string()[..8].to_owned(),
         ];
         state.queued_inputs = vec![message, shell];
         let lines = state.frame().0;
@@ -21635,7 +21652,7 @@ mod tests {
 
         let mut new_goal = queued_input(QueuedInputKind::Message, "start fresh", 3);
         new_goal.loop_id = None;
-        let chat = new_goal.chat_id.to_string()[..8].to_owned();
+        let chat = new_goal.chat_id.uuid().to_string()[..8].to_owned();
         state.queued_inputs = vec![new_goal];
         let lines = state.frame().0;
         let row = lines

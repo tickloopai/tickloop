@@ -164,9 +164,11 @@ async fn confirmation_secret_surfaces() {
         };
         let snapshot = serde_json::to_string(&agent.snapshot(chat).await.unwrap()).unwrap();
         agent.shutdown().await;
-        let transcript =
-            std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-                .unwrap();
+        let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+            &root,
+            chat.uuid(),
+        ))
+        .unwrap();
         let record = serde_json::Value::Array(
             transcript
                 .lines()
@@ -407,9 +409,11 @@ async fn confirmation_bounded_html_credential_prefix() {
             }
         };
         agent.shutdown().await;
-        let transcript =
-            std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-                .unwrap();
+        let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+            &root,
+            chat.uuid(),
+        ))
+        .unwrap();
         let surfaces = [
             ("Display", error.to_string()),
             ("Debug", format!("{error:?}")),
@@ -536,9 +540,11 @@ async fn all_64_confirmation_probe_variants_are_safe_on_all_surfaces() {
         };
         let snapshot = serde_json::to_value(agent.snapshot(chat).await.unwrap()).unwrap();
         agent.shutdown().await;
-        let transcript =
-            std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-                .unwrap();
+        let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+            &root,
+            chat.uuid(),
+        ))
+        .unwrap();
         let surface = decoded(&format!("{failed}\n{snapshot}\n{transcript}"));
         if surface.contains(&key)
             || surface.contains("synthetic-private-value")
@@ -618,9 +624,11 @@ async fn assert_safe_provider_surfaces(cases: Vec<(String, String, String)>) {
         };
         let snapshot = serde_json::to_string(&agent.snapshot(chat).await.unwrap()).unwrap();
         agent.shutdown().await;
-        let transcript =
-            std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&root, chat))
-                .unwrap();
+        let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+            &root,
+            chat.uuid(),
+        ))
+        .unwrap();
         let record = serde_json::Value::Array(
             transcript
                 .lines()

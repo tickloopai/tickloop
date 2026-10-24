@@ -1345,12 +1345,20 @@ async fn directory_presents_exactly_the_three_artifact_tools_and_the_host_upload
     );
     let chat = uuid::Uuid::new_v4();
     assert_eq!(
-        provider.permission(chat, "ArtifactRead", &json!({"action":"read"})),
+        provider.permission(
+            tickloop_ids::Id::from(chat),
+            "ArtifactRead",
+            &json!({"action":"read"})
+        ),
         HostToolPermission::ReadOnly
     );
     for name in ["ArtifactEdit", "ArtifactComment"] {
         assert_eq!(
-            provider.permission(chat, name, &json!({"action":"reply"})),
+            provider.permission(
+                tickloop_ids::Id::from(chat),
+                name,
+                &json!({"action":"reply"})
+            ),
             HostToolPermission::Reviewable
         );
     }
@@ -1547,7 +1555,12 @@ async fn a_rename_prepares_dispatches_and_admits_like_a_content_edit_of_the_same
     let chat = uuid::Uuid::new_v4();
     let prepare = async |input: &Value| {
         provider
-            .prepare_call(chat, "ArtifactEdit", input, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                "ArtifactEdit",
+                input,
+                CancellationToken::new(),
+            )
             .await
             .unwrap()
     };
@@ -1571,7 +1584,11 @@ async fn a_rename_prepares_dispatches_and_admits_like_a_content_edit_of_the_same
         HostToolPermission::PrivateArtifactWrite
     );
     let HostCallResult::CompletedWithEffect(result, effect) = provider
-        .execute_prepared(chat, prepared, CancellationToken::new())
+        .execute_prepared(
+            tickloop_ids::Id::from(chat),
+            prepared,
+            CancellationToken::new(),
+        )
         .await
     else {
         panic!("a confirmed rename reports the new title");
@@ -1610,12 +1627,16 @@ async fn a_base62_write_receipt_admits_only_the_same_artifact_in_either_id_form(
     let uuid = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
     let short = "6rvWPvOnhVABug7llbHb26";
     let prepare = async |id: &str| {
-        provider.prepare_call(chat, "ArtifactEdit", &json!({"action":"rename","artifact_id":id,"title":"Renamed","expected_title":"Fixture"}), CancellationToken::new()).await.unwrap()
+        provider.prepare_call(tickloop_ids::Id::from(chat), "ArtifactEdit", &json!({"action":"rename","artifact_id":id,"title":"Renamed","expected_title":"Fixture"}), CancellationToken::new()).await.unwrap()
     };
     let first = prepare(uuid).await;
     assert_eq!(first.permission(), HostToolPermission::PrivateArtifactWrite);
     let HostCallResult::CompletedWithEffect(result, effect) = provider
-        .execute_prepared(chat, first, CancellationToken::new())
+        .execute_prepared(
+            tickloop_ids::Id::from(chat),
+            first,
+            CancellationToken::new(),
+        )
         .await
     else {
         panic!("a confirmed rename reports its effect");
@@ -2281,7 +2302,7 @@ async fn a_changed_directory_rejects_a_prepared_write() {
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
-    let chat = ChatId::new_v4();
+    let chat = ChatId::new();
     let prepared = provider
         .prepare_call(
             chat,
@@ -2458,7 +2479,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         );
     let prepared = provider
         .prepare_call_in_scope(
-            uuid::Uuid::new_v4(),
+            tickloop_ids::Id::from(uuid::Uuid::new_v4()),
             &HostCallScope {
                 local_files: local_files.as_ref(),
                 context: Some(&context),
@@ -2490,7 +2511,7 @@ async fn a_renewed_artifacts_token_keeps_the_account_directory_and_dispatches_wi
         .store(1, Ordering::SeqCst);
     let renewed = account.access_snapshot().await.unwrap().unwrap();
     assert_eq!(renewed.access_token, "test-service-token-1");
-    let chat = ChatId::new_v4();
+    let chat = ChatId::new();
     provider
         .prepare_call(
             chat,
@@ -2562,7 +2583,7 @@ async fn an_expired_artifacts_token_is_renewed_when_a_call_needs_it() {
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
-    let chat = ChatId::new_v4();
+    let chat = ChatId::new();
     let edit =
         json!({"action":"replace","artifact_id":"doc","expected_revision":3,"content":"renewed"});
     let expire_with_next_revision = |revision| {
@@ -4134,8 +4155,8 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
     let goal = snapshot.chat_loop;
     assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
     let link = service.link(CREATED_ARTIFACT).unwrap();
-    assert_eq!(link.loop_id, goal.id.to_string());
-    assert_eq!(link.chat_id, chat.to_string());
+    assert_eq!(link.loop_id, goal.id.uuid().to_string());
+    assert_eq!(link.chat_id, chat.uuid().to_string());
     assert!(tick_protocol::InstanceRef::artifact(&service.origin, CREATED_ARTIFACT).is_ok());
     agent.shutdown().await;
 }
@@ -4413,7 +4434,7 @@ async fn signed_out_offers_only_artifact_login() {
         json!({"type":"object","properties":{},"additionalProperties":false})
     );
     assert_eq!(
-        provider.permission(ChatId::new_v4(), "ArtifactLogin", &json!({})),
+        provider.permission(ChatId::new(), "ArtifactLogin", &json!({})),
         HostToolPermission::Automatic
     );
     assert!(
@@ -5116,7 +5137,7 @@ async fn created_slides_join_monitor_as_slides_and_link_to_the_creating_loop() {
     assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
     assert_eq!(
         service.link(CREATED_ARTIFACT).unwrap().loop_id,
-        goal.id.to_string()
+        goal.id.uuid().to_string()
     );
     agent.shutdown().await;
 }
@@ -6344,7 +6365,7 @@ async fn each_chat_links_an_artifact_with_its_own_host_credentials() {
     assert_eq!(links.len(), 2, "one link per Chat");
     for (headers, chat) in links.iter().zip(&chats) {
         assert!(
-            headers.contains(&format!("authorization: bearer chat-{chat}")),
+            headers.contains(&format!("authorization: bearer chat-{}", chat.uuid())),
             "{headers}"
         );
     }
@@ -6455,11 +6476,20 @@ async fn delegated_mcp_401_invalidates_and_retries_the_same_read_edit_and_commen
         provider.refresh(CancellationToken::new()).await.unwrap();
         let chat = uuid::Uuid::new_v4();
         let prepared = provider
-            .prepare_call(chat, name, &arguments, CancellationToken::new())
+            .prepare_call(
+                tickloop_ids::Id::from(chat),
+                name,
+                &arguments,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let outcome = provider
-            .execute_prepared(chat, prepared, CancellationToken::new())
+            .execute_prepared(
+                tickloop_ids::Id::from(chat),
+                prepared,
+                CancellationToken::new(),
+            )
             .await;
         let result = match outcome {
             HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {

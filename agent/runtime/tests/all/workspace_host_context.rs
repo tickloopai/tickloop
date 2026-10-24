@@ -120,13 +120,18 @@ impl HostToolProvider for CapturedHostSource {
         }]
     }
 
-    fn permission(&self, _: uuid::Uuid, _: &str, _: &Value) -> HostToolPermission {
+    fn permission(
+        &self,
+        _: tickloop_agent_protocol::ChatId,
+        _: &str,
+        _: &Value,
+    ) -> HostToolPermission {
         HostToolPermission::ReadOnly
     }
 
     async fn prepare_call_in_scope(
         &self,
-        chat: uuid::Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
@@ -146,7 +151,7 @@ impl HostToolProvider for CapturedHostSource {
 
     async fn execute(
         &self,
-        _: uuid::Uuid,
+        _: tickloop_agent_protocol::ChatId,
         _: &str,
         input: Value,
         _: CancellationToken,

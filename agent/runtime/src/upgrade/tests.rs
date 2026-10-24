@@ -69,7 +69,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
         .unwrap();
     snapshot.pending_inputs.push(PendingInput {
         receipt: Receipt {
-            run_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4().into(),
             ..receipt.clone()
         },
         input: "queued skill".into(),
@@ -162,7 +162,7 @@ async fn planned_restore_keeps_receiving_and_session_permissions_without_model_c
     let original = Agent::new_embedded(config(), model);
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     let receipt = complete(&original, chat, "wait for later").await;
-    let owner = PermissionOwner::new(chat, receipt.loop_id).unwrap();
+    let owner = PermissionOwner::new(chat.into(), receipt.loop_id.into()).unwrap();
     let operation = session_permissions::SessionPermissionOperation::from_normalized(
         "Read".into(),
         serde_json::json!({"path":"allowed"}),
@@ -546,7 +546,10 @@ impl crate::tick_stream::TickStreamPort for UpgradeStream {
     }
     fn set_watch_authorities(
         &self,
-        authorities: BTreeMap<Uuid, tickloop_agent_protocol::HostToolAuthority>,
+        authorities: BTreeMap<
+            crate::tick_stream::WatchId,
+            tickloop_agent_protocol::HostToolAuthority,
+        >,
     ) {
         self.stream.set_watch_authorities(authorities);
     }
@@ -615,7 +618,8 @@ async fn watch_reconnect_delivers_one_latest_update_since_the_original_baseline(
         sequence: 10,
     });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while original.tick_deliveries().upgrade_checkpoint()["baselines"][watch.to_string()] != 10
+        while original.tick_deliveries().upgrade_checkpoint()["baselines"][watch.uuid().to_string()]
+            != 10
         {
             tokio::task::yield_now().await;
         }
@@ -759,7 +763,7 @@ async fn unread_completed_shell_keeps_its_host_view_after_upgrade_and_idle_timeo
         successor
             .inner
             .shells
-            .allow_view(chat, &instance)
+            .allow_view(chat.into(), &instance)
             .await
             .is_ok()
     );

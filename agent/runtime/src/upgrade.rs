@@ -32,7 +32,7 @@ impl AgentUpgradeCheckpoint {
         self.transfer_id
     }
 
-    pub fn chat_roots(&self) -> impl Iterator<Item = (Uuid, Option<Uuid>)> + '_ {
+    pub fn chat_roots(&self) -> impl Iterator<Item = (ChatId, Option<ChatId>)> + '_ {
         self.chats.iter().map(|chat| {
             (
                 chat.snapshot.id,
@@ -175,7 +175,7 @@ impl Agent {
         let selected_model = self.inner.selected_model.lock().unwrap().config.clone();
         let checkpoint = AgentUpgradeCheckpoint {
             version: CHECKPOINT_VERSION,
-            transfer_id: Uuid::new_v4(),
+            transfer_id: tickloop_ids::generate(),
             selected_model,
             chats: saved,
             session_permissions: self.inner.session_permissions.lock().await.clone(),
@@ -330,6 +330,7 @@ impl Agent {
             self.inner.chats.lock().await.insert(
                 snapshot.id,
                 Chat {
+                    ids: tickloop_ids::IdContext::new(),
                     snapshot,
                     bookkeeping: saved.bookkeeping.clone(),
                     family_generation: saved.family_generation,

@@ -714,7 +714,7 @@ impl Host {
         request: &OpenRequest,
         generation: u64,
     ) -> Result<OpenedTick, HostError> {
-        let terminal = Uuid::new_v4();
+        let terminal = tickloop_ids::generate();
         let size = TerminalSize::default();
         let (pty, slave) = Pty::open(size)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
@@ -801,7 +801,7 @@ impl Host {
         let lifecycle = match adapter {
             Adapter::Protocol(_) => Lifecycle::Opening,
             Adapter::Terminal(_) => Lifecycle::Live {
-                instance: InstanceRef::hosted(Uuid::new_v4()),
+                instance: InstanceRef::hosted(tick_protocol::HostedRunId::new()),
                 business_pid: launcher_pid,
             },
         };
@@ -1088,7 +1088,7 @@ impl Host {
             .await
             .filter(|tick| &tick.owner == owner)
             .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
-        let view = Uuid::new_v4();
+        let view = tickloop_ids::generate();
         tick.view_grants.lock().unwrap().allow(view, Instant::now());
         Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
     }
@@ -1109,7 +1109,7 @@ impl Host {
             .find(|task| &task.instance == instance && &task.binding.identity == identity)
             .cloned()
             .ok_or_else(|| HostError::before("TargetGone", "no such Shell task of this Chat"))?;
-        let view = Uuid::new_v4();
+        let view = tickloop_ids::generate();
         task.view_grants.lock().unwrap().allow(view, Instant::now());
         Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
     }
@@ -1553,7 +1553,7 @@ pub async fn serve_until(
     let identity = paths::file_identity(&socket)?;
     let host = Arc::new(Host {
         paths,
-        epoch: Uuid::new_v4(),
+        epoch: tickloop_ids::generate(),
         controller_key: config.controller_key,
         idle_timeout: config.idle_timeout,
         started: Instant::now(),

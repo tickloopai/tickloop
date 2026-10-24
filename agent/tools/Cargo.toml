@@ -28,6 +28,7 @@ similar = "2.7"
 thiserror = "2"
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

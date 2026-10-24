@@ -3,8 +3,6 @@
 //! "Other" choice, multi-select toggles and a review step before submitting; Esc or its Cancel
 //! declines the questions. Without a terminal, typed lines answer the questions one at a time.
 
-use uuid::Uuid;
-
 use super::{
     console::{Menu, QuestionMenu},
     display::{DisplayProfile, Glyph},
@@ -250,7 +248,7 @@ impl QuestionFlow {
             }
             context.push(REVIEW_PROMPT.into());
             let menu = Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: REVIEW_TITLE.into(),
                 context,
                 options: vec![SUBMIT_ANSWERS.into(), CANCEL.into()],
@@ -311,7 +309,7 @@ impl QuestionFlow {
             );
         }
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: safe_text(&question.question),
             context,
             selected: self.focus.min(options.len() - 1),
@@ -502,6 +500,7 @@ fn typed_draft(question: &Question, text: &str) -> Result<QuestionDraft, String>
 mod tests {
     use super::*;
     use tickloop_agent_protocol::QuestionOption;
+    use uuid::Uuid;
 
     fn question(text: &str, header: &str, labels: &[&str], multi_select: bool) -> Question {
         Question {
@@ -523,9 +522,9 @@ mod tests {
         QuestionFlow::new(
             QuestionRequest {
                 id: Uuid::new_v4(),
-                chat_id: Uuid::new_v4(),
-                loop_id: Uuid::new_v4(),
-                run_id: Uuid::new_v4(),
+                chat_id: Uuid::new_v4().into(),
+                loop_id: Uuid::new_v4().into(),
+                run_id: Uuid::new_v4().into(),
                 call_id: "clarify".into(),
                 questions,
             },

@@ -265,7 +265,8 @@ impl Agent {
             requested_model: client.model().into(),
             reported_model: None,
         };
-        let request = match review_request(context, stage) {
+        let ids = self.chat_ids(receipt.chat_id).await;
+        let request = match review_request(&ids, context, stage) {
             Ok(request) => request,
             Err(AutoReview::ContextLimit) => {
                 return Ok(ReviewerRun::technical(
@@ -482,7 +483,8 @@ impl Agent {
             requested_model: client.identity().requested_model,
             reported_model: None,
         };
-        let mut request = auto_mode::classifier_request(context, stage);
+        let ids = self.chat_ids(receipt.chat_id).await;
+        let mut request = auto_mode::classifier_request(&ids, context, stage);
         let mut attempts = Vec::new();
         let mut invalid_reason = "invalid classification";
         for _ in 0..max_attempts {

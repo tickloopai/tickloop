@@ -196,7 +196,7 @@ impl InstanceObserver for HostedScope {
         publisher: EventPublisher,
         tasks: StreamTasks,
     ) {
-        let observer = Uuid::new_v4();
+        let observer = tickloop_ids::generate();
         observe_hosted_instance(&self, observer, instance, wanted, publisher, tasks).await;
         // A later watch of this Tick starts from the screen as it is then.
         self.forget_screens(observer);
@@ -332,8 +332,8 @@ impl HostedFeed {
     /// Proves the Chat still holds a current binding for the instance before anything is read,
     /// and tells which adapter serves it.
     async fn check_binding(&self) -> Result<TickAdapter, HostError> {
-        self.tools.data(self.chat, &self.instance).await?;
-        self.tools.adapter(self.chat, &self.instance).await
+        self.tools.data(self.chat.into(), &self.instance).await?;
+        self.tools.adapter(self.chat.into(), &self.instance).await
     }
 
     /// Registers a host watch of a terminal Tick: what it runs, its screen now, which the host's
@@ -343,7 +343,7 @@ impl HostedFeed {
     ) -> Result<(TerminalDescription, TerminalRead, TerminalLink), String> {
         let mut connection = self
             .tools
-            .data(self.chat, &self.instance)
+            .data(self.chat.into(), &self.instance)
             .await
             .map_err(|error| error.to_string())?;
         let description = connection
@@ -641,7 +641,7 @@ async fn read_terminal(
     instance: &InstanceRef,
 ) -> Result<TerminalRead, String> {
     let read = tools
-        .data(chat, instance)
+        .data(chat.into(), instance)
         .await
         .map_err(|error| error.to_string())?
         .request("read", json!({}), CONTROL_TIMEOUT)
@@ -807,7 +807,7 @@ async fn observe_terminal_screen(
 #[async_trait::async_trait]
 impl ProtocolFeed for HostedFeed {
     async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
-        let mut connection = self.tools.data(self.chat, &self.instance).await?;
+        let mut connection = self.tools.data(self.chat.into(), &self.instance).await?;
         let descriptor = connection
             .request("describe", json!({}), CONTROL_TIMEOUT)
             .await?;
@@ -819,7 +819,7 @@ impl ProtocolFeed for HostedFeed {
     async fn watch(
         &self,
     ) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), HostError> {
-        let mut connection = self.tools.data(self.chat, &self.instance).await?;
+        let mut connection = self.tools.data(self.chat.into(), &self.instance).await?;
         let registered = connection
             .request("watch", json!({}), CONTROL_TIMEOUT)
             .await?;
@@ -890,7 +890,7 @@ impl TickStreamPort for HostedTickStream {
         let query = self
             .tools
             .prepare_call(
-                chat,
+                chat.into(),
                 TICK_READ,
                 &json!({"tick_instance_id":instance}),
                 cancel,
@@ -939,7 +939,7 @@ impl TickStreamPort for HostedTickStream {
             .contains(&(chat, instance.clone()));
         if !is_live {
             self.tools
-                .data(chat, instance)
+                .data(chat.into(), instance)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -954,7 +954,7 @@ impl TickStreamPort for HostedTickStream {
     ) -> Result<Option<TickObservation>, String> {
         let adapter = self
             .tools
-            .adapter(chat, instance)
+            .adapter(chat.into(), instance)
             .await
             .map_err(|error| error.to_string())?;
         if adapter == TickAdapter::Terminal {
@@ -963,7 +963,7 @@ impl TickStreamPort for HostedTickStream {
         }
         let mut connection = self
             .tools
-            .data(chat, instance)
+            .data(chat.into(), instance)
             .await
             .map_err(|error| error.to_string())?;
         let read = connection

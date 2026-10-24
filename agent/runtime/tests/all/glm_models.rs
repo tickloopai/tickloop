@@ -771,7 +771,10 @@ fn signed_messages_reply() -> String {
 
 async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
@@ -806,10 +809,10 @@ async fn glm_messages_restart_glm_keeps_original_history_and_same_source_prefix(
         Arc::new(LocalModelClients::new(Some(root.clone()))),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    finish_turn(&agent, chat, "First prompt").await;
-    finish_turn(&agent, chat, "Second prompt").await;
+    finish_turn(&agent, chat.uuid(), "First prompt").await;
+    finish_turn(&agent, chat.uuid(), "Second prompt").await;
     agent.set_model(chat, claude.clone()).await.unwrap();
-    finish_turn(&agent, chat, "Use Claude").await;
+    finish_turn(&agent, chat.uuid(), "Use Claude").await;
     let mixed = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
 
@@ -822,7 +825,7 @@ async fn glm_messages_restart_glm_keeps_original_history_and_same_source_prefix(
     assert_eq!(restored.messages, mixed.messages);
     assert_eq!(restored.message_sources, mixed.message_sources);
     resumed.set_model(chat, glm.clone()).await.unwrap();
-    finish_turn(&resumed, chat, "Return to GLM").await;
+    finish_turn(&resumed, chat.uuid(), "Return to GLM").await;
     resumed.shutdown().await;
 
     glm_requests.recv().await.unwrap();
@@ -894,7 +897,7 @@ async fn network_error_on_the_documented_empty_final_chunk_is_retried_by_the_run
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    finish_turn(&agent, chat, "Try once more").await;
+    finish_turn(&agent, chat.uuid(), "Try once more").await;
     requests.recv().await.unwrap();
     requests.recv().await.unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();

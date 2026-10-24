@@ -225,7 +225,7 @@ impl MiniMaxAuth {
         &self,
         cancel: &CancellationToken,
     ) -> Result<MiniMaxDeviceLogin, MiniMaxAuthError> {
-        let generation = Uuid::new_v4();
+        let generation = tickloop_ids::generate();
         {
             let _lock = self.lock(cancel).await?;
             let credentials = self.read()?.and_then(|state| state.credentials);
@@ -235,9 +235,13 @@ impl MiniMaxAuth {
                 credentials,
             })?;
         }
-        let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let verifier = format!(
+            "{}{}",
+            tickloop_ids::random_token(),
+            tickloop_ids::random_token()
+        );
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let state = Uuid::new_v4().to_string();
+        let state = tickloop_ids::random_token();
         let payload = self
             .post(
                 "/oauth2/device/code",
@@ -394,7 +398,7 @@ impl MiniMaxAuth {
         let _lock = self.lock(cancel).await?;
         self.save(&StoredState {
             region: self.region,
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: None,
         })
     }
@@ -456,7 +460,7 @@ impl MiniMaxAuth {
             .client
             .post(format!("{}{path}", self.origin))
             .header("accept", "application/json")
-            .header("x-request-id", Uuid::new_v4().to_string())
+            .header("x-request-id", tickloop_ids::generate().to_string())
             .form(form);
         tokio::select! {
             biased;

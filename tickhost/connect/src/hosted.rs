@@ -270,7 +270,7 @@ impl ManagementConnection {
     ) -> Result<(), HostError> {
         let mut params = json!({
             "epoch":self.hello.epoch,
-            "operation":uuid::Uuid::new_v4(),
+            "operation":tickloop_ids::generate(),
         });
         if let Some(own_connections) = own_connections {
             params["own_connections"] = json!(own_connections);

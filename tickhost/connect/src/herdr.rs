@@ -208,7 +208,7 @@ impl HerdrPort for SocketHerdr {
         cancel: CancellationToken,
     ) -> Result<Value, HostError> {
         let mut dispatched = false;
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = tickloop_ids::generate().to_string();
         let work = async {
             let mut stream = UnixStream::connect(&self.context.socket)
                 .await

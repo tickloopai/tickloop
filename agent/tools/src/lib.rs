@@ -296,6 +296,8 @@ pub struct WebSource {
 /// What a tool execution knows about the run it serves.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionContext {
+    /// How the Loop writes ids into the result and reads the ids the model passed.
+    pub ids: tickloop_ids::IdContext,
     pub operation_id: uuid::Uuid,
     pub loop_id: uuid::Uuid,
     /// Whether the model reading the result accepts images; `Read` refuses images otherwise.
@@ -560,6 +562,7 @@ impl Tools {
 
     pub async fn prepare(
         &self,
+        ids: &tickloop_ids::IdContext,
         workspace: &Workspace,
         name: &str,
         input: &Value,
@@ -625,7 +628,7 @@ impl Tools {
             reason: format!("tool preparation did not finish: {error}"),
         })??;
         if let Operation::TaskStop(input) = &prepared.operation {
-            self.commands.stoppable_task(&input.task_id).await?;
+            self.commands.stoppable_task(ids, &input.task_id).await?;
         }
         self.bind_search(prepared).await
     }
@@ -864,7 +867,11 @@ impl Tools {
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled).into();
             }
-            return self.commands.stop_task(&input.task_id).await.into();
+            return self
+                .commands
+                .stop_task(&context.ids, &input.task_id)
+                .await
+                .into();
         }
         if let Operation::Shell(input) = &prepared.operation {
             return async {
@@ -880,6 +887,7 @@ impl Tools {
                         &prepared.resolved_path,
                         input.clone(),
                         self.task_output_directory()?,
+                        &context.ids,
                         context.operation_id,
                         context.loop_id,
                         cancel,
@@ -908,7 +916,8 @@ impl Tools {
             }
         }
         let context = ExecutionContext {
-            operation_id: uuid::Uuid::new_v4(),
+            ids: tickloop_ids::IdContext::new(),
+            operation_id: tickloop_ids::generate(),
             loop_id: uuid::Uuid::nil(),
             accepts_images: false,
         };

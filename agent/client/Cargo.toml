@@ -20,6 +20,7 @@ sha2 = "0.10"
 shell-words = "1"
 tempfile = "3"
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

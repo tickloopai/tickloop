@@ -3,6 +3,8 @@
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
+use tickloop_agent_protocol::{ScheduledTaskId, ScheduledTaskIdKind};
+use tickloop_ids::{IdContext, ModelRef};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz as Zone;
@@ -206,10 +208,15 @@ fn run_input(
                     instructions: instructions.text,
                 }],
             ),
-            Err(error) => (
-                loop_instructions_error_prompt(&task.id, &error.to_string()),
-                vec![ScheduledInputWrapper::LoopInstructionsError],
-            ),
+            Err(error) => {
+                let task_text = chat.ids.model_text(ScheduledTaskId::from(task.id));
+                (
+                    loop_instructions_error_prompt(&task_text, &error.to_string()),
+                    vec![ScheduledInputWrapper::LoopInstructionsError {
+                        task_text: Some(task_text),
+                    }],
+                )
+            }
         };
     }
     if let Some(command) = prompt.strip_prefix('/') {
@@ -218,7 +225,11 @@ fn run_input(
             .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
         if chat.skills.contains(name) && !chat.skills.is_user_only(name) {
             return (
-                scheduled_skill_prompt(&task.id, name, arguments),
+                scheduled_skill_prompt(
+                    &chat.ids.model_text(ScheduledTaskId::from(task.id)),
+                    name,
+                    arguments,
+                ),
                 vec![ScheduledInputWrapper::Skill {
                     instruction: task.prompt.clone(),
                 }],
@@ -242,14 +253,14 @@ fn local_time(millis: Option<u64>, zone: &str) -> Value {
     json!(time)
 }
 
-fn describe(task: &ScheduledTask) -> Value {
+fn describe(ids: &IdContext, task: &ScheduledTask) -> Value {
     let (schedule, recurring) = match &task.kind {
         ScheduledTaskKind::Recurring { cron } => (cron.as_str(), true),
         ScheduledTaskKind::OneShot { cron } => (cron.as_str(), false),
         ScheduledTaskKind::SelfPaced { .. } => ("self-paced", true),
     };
     json!({
-        "id": task.id,
+        "id": ids.model_text(ScheduledTaskId::from(task.id)),
         "title": task.title,
         "schedule": schedule,
         "recurring": recurring,
@@ -346,7 +357,7 @@ impl crate::wakeup::TriggerSourceState for ScheduledTasksState {
 
 fn scheduled_tasks_record(chat: &Chat) -> Line {
     Line::ScheduledTasks(ScheduledTasksEntry {
-        chat_id: chat.snapshot.id,
+        chat_id: chat.snapshot.id.into(),
         cwd: chat.snapshot.folder.clone(),
         tasks: chat.snapshot.scheduled_tasks.clone(),
         revoked: chat.snapshot.scheduled_task_revocations.clone(),
@@ -377,7 +388,7 @@ struct DueRun {
 fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::RunId) -> bool {
     task.last_scheduled_for_ms.is_some_and(|scheduled_for_ms| {
         let input = tickloop_agent_transcript::input_ids::trigger(
-            chat.snapshot.id,
+            chat.snapshot.id.into(),
             &tickloop_agent_protocol::TriggerIdentity::ScheduledTask {
                 task_id: task.id,
                 scheduled_for_ms,
@@ -386,7 +397,7 @@ fn started_run(chat: &Chat, task: &ScheduledTask, run: tickloop_agent_protocol::
         );
         chat.bookkeeping
             .lifecycle
-            .input(input)
+            .input(input.into())
             .is_some_and(|input| input.run_id == run)
     })
 }
@@ -512,7 +523,11 @@ impl Agent {
         let receipt = Receipt {
             chat_id: chat.snapshot.id,
             loop_id: chat.snapshot.chat_loop.id,
-            run_id: chat.snapshot.chat_loop.run_id.unwrap_or_default(),
+            run_id: chat
+                .snapshot
+                .chat_loop
+                .run_id
+                .unwrap_or(tickloop_agent_protocol::RunId::nil()),
         };
         if notices.is_empty() {
             self.publish_event(
@@ -718,12 +733,16 @@ impl Agent {
                     };
                     tasks
                         .create_cron(new, rules, &now)
-                        .map(|task| (describe(task), Vec::new(), Vec::new()))
+                        .map(|task| (describe(&chat.ids, task), Vec::new(), Vec::new()))
                         .map_err(|error| error.to_string())
                 }
             },
             ScheduledTaskCall::List => {
-                let listed: Vec<Value> = tasks.tasks().iter().map(describe).collect();
+                let listed: Vec<Value> = tasks
+                    .tasks()
+                    .iter()
+                    .map(|task| describe(&chat.ids, task))
+                    .collect();
                 return tool_result(json!({ "tasks": listed }));
             }
             ScheduledTaskCall::Update {
@@ -747,14 +766,21 @@ impl Agent {
                     zone,
                     now,
                 )
-                .map(|task| (describe(&task), Vec::new(), Vec::new())),
-            ScheduledTaskCall::Delete { id } => match tasks.delete(&id) {
+                .map(|task| (describe(&chat.ids, &task), Vec::new(), Vec::new())),
+            ScheduledTaskCall::Delete { id: reference } => match chat
+                .ids
+                .resolve(&reference)
+                .ok()
+                .and_then(|id| tasks.delete(&id.uuid()))
+            {
                 Some(task) => Ok((
-                    json!({ "deleted": task.id }),
+                    json!({ "deleted": chat.ids.model_text(ScheduledTaskId::from(task.id)) }),
                     vec![removed(task, ScheduledTaskRemovalReason::AgentDeleted)],
                     Vec::new(),
                 )),
-                None => Err(ScheduledTaskError::NotFound(id).to_string()),
+                None => Err(tickloop_ids::not_found::<ScheduledTaskIdKind>(
+                    reference.as_str(),
+                )),
             },
             ScheduledTaskCall::Wakeup { .. }
                 if !has_self_paced(&tasks) && started_by_scheduled_run(chat, receipt.run_id) =>
@@ -781,7 +807,7 @@ impl Agent {
                     &now,
                 )
                 .map(|scheduled| {
-                    let mut value = describe(scheduled.task);
+                    let mut value = describe(&chat.ids, scheduled.task);
                     if scheduled.ignored_prompt {
                         value["note"] = json!(
                             "The loop keeps the instruction it was started with; the prompt passed here was not used."
@@ -794,7 +820,7 @@ impl Agent {
                 Some(task) => {
                     let notice = ScheduledTaskNotice::SelfPacedEnded { task_id: task.id };
                     Ok((
-                        json!({ "stopped": task.id }),
+                        json!({ "stopped": chat.ids.model_text(ScheduledTaskId::from(task.id)) }),
                         vec![removed(task, ScheduledTaskRemovalReason::SelfPacedEnded)],
                         vec![notice],
                     ))
@@ -828,21 +854,27 @@ impl Agent {
         chat: &mut Chat,
         receipt: &Receipt,
         tasks: &mut ScheduledTasks,
-        id: Uuid,
+        reference: ModelRef<ScheduledTaskIdKind>,
         update: TaskUpdate,
         zone: Zone,
         now: DateTime<Utc>,
     ) -> Result<ScheduledTask, String> {
-        let before = tasks
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| ScheduledTaskError::NotFound(id).to_string())?;
+        let not_found = || tickloop_ids::not_found::<ScheduledTaskIdKind>(reference.as_str());
+        let id = chat
+            .ids
+            .resolve(&reference)
+            .map_err(|_| not_found())?
+            .uuid();
+        let before = tasks.get(&id).cloned().ok_or_else(not_found)?;
         let current_cron = match &before.kind {
             ScheduledTaskKind::Recurring { cron } | ScheduledTaskKind::OneShot { cron } => cron,
             ScheduledTaskKind::SelfPaced { .. } => {
-                return Err(format!(
-                    "scheduled task `{id}` is the self-paced loop; reschedule it with {}",
-                    tools::SCHEDULE_WAKEUP_TOOL_NAME
+                return Err(chat.ids.state_error(
+                    ScheduledTaskId::from(id),
+                    &format!(
+                        "is the self-paced loop; reschedule it with {}",
+                        tools::SCHEDULE_WAKEUP_TOOL_NAME
+                    ),
                 ));
             }
         };
@@ -874,7 +906,7 @@ impl Agent {
                 self.scheduled_task_rules(),
                 &now,
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.model_message(&chat.ids, Some(reference.as_str())))?
             .clone();
         if changes_timing || reconfirm {
             self.withdraw_deleted_task_runs(chat, std::slice::from_ref(&before));
@@ -1102,7 +1134,7 @@ impl Agent {
                 .iter_mut()
                 .find(|task| task.id == id)
             {
-                task.started_by_run = Some(run);
+                task.started_by_run = Some(run.into());
             }
             let agent = change.agent();
             let notices = replaced
@@ -1307,7 +1339,7 @@ impl Agent {
             match self.deliver_trigger(chat_id, delivery).await {
                 Ok(receipt) => receipts.push(receipt),
                 Err(error) => {
-                    tracing::debug!(%chat_id, %error, "a scheduled run was not taken");
+                    tracing::debug!(chat_id = %chat_id.uuid(), %error, "a scheduled run was not taken");
                     refusal.get_or_insert(error);
                 }
             }
@@ -1408,7 +1440,7 @@ impl Agent {
             })
             .await;
         if let Err(error) = changed {
-            tracing::warn!(%chat_id, %error, "the self-paced loop's fallback was not scheduled");
+            tracing::warn!(chat_id = %chat_id.uuid(), %error, "the self-paced loop's fallback was not scheduled");
         }
     }
 
@@ -1426,7 +1458,7 @@ impl Agent {
         else {
             return;
         };
-        let started_by_users_loop = task.started_by_run == Some(run);
+        let started_by_users_loop = task.started_by_run == Some(run.into());
         if task.scheduled_for_ms.is_some()
             || !(started_by_users_loop || started_run(chat, task, run))
         {
@@ -1514,7 +1546,7 @@ impl Agent {
             })
             .await;
         if let Err(error) = cancelled {
-            tracing::warn!(chat = %chat_id, %error, "could not cancel the self-paced wake-up");
+            tracing::warn!(chat = %chat_id.uuid(), %error, "could not cancel the self-paced wake-up");
             self.inner.chat_leases.set_notice(
                 chat_id,
                 tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
@@ -1576,7 +1608,7 @@ impl Agent {
             })
             .await;
         if let Err(error) = recorded {
-            tracing::debug!(%chat_id, %error, "the history load's scheduled tasks were not recorded");
+            tracing::debug!(chat_id = %chat_id.uuid(), %error, "the history load's scheduled tasks were not recorded");
         }
     }
 

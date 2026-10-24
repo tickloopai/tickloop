@@ -1222,9 +1222,9 @@ mod tests {
                 kind: WaitKind::Question {
                     request: QuestionRequest {
                         id: Uuid::nil(),
-                        chat_id,
-                        loop_id: Uuid::nil(),
-                        run_id: Uuid::nil(),
+                        chat_id: tickloop_ids::Id::from(chat_id),
+                        loop_id: tickloop_ids::Id::from(Uuid::nil()),
+                        run_id: tickloop_ids::Id::from(Uuid::nil()),
                         call_id: "call".into(),
                         questions: Vec::new(),
                     },

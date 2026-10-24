@@ -68,6 +68,7 @@ impl Finished {
     ) -> Self {
         let snapshot = agent.snapshot(receipt.chat_id).await.unwrap();
         projection::history_calls(&snapshot).expect("the conversation stays valid");
+        let stored = serde_json::to_string(&snapshot).unwrap();
         Self {
             messages: serde_json::to_value(&snapshot.messages).unwrap(),
             requests: model
@@ -77,6 +78,7 @@ impl Finished {
                 .iter()
                 .map(|request| {
                     let messages = serde_json::to_string(&request.messages).unwrap();
+                    let messages = tickloop_agent_test_support::stored_ids(&messages, &stored);
                     serde_json::from_str(&without_run_identities(messages)).unwrap()
                 })
                 .collect(),

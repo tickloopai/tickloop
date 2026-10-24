@@ -120,7 +120,14 @@ impl HostToolProvider for PanelHost {
 async fn wait_for_completion(agent: &Agent, chat: Uuid) {
     tokio::time::timeout(COMPLETION_TIMEOUT, async {
         loop {
-            if agent.snapshot(chat).await.unwrap().chat_loop.state == LoopState::Idle {
+            if agent
+                .snapshot(tickloop_ids::Id::from(chat))
+                .await
+                .unwrap()
+                .chat_loop
+                .state
+                == LoopState::Idle
+            {
                 return;
             }
             // Snapshots clone the whole Chat, so polling without a pause starves the run under load.
@@ -158,7 +165,7 @@ async fn final_rule_denial_is_recorded_once_with_private_display_facts() {
         .submit(chat, "prepare the report".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
 
     let view = agent.recent_denials(chat).await.unwrap();
     assert_eq!(view.records.len(), 1);
@@ -256,7 +263,7 @@ async fn a_retry_starts_a_new_run_and_obeys_the_current_ask_rule() {
         .await
         .unwrap();
     let original = agent.submit(chat, "write held.txt".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let record_id = agent.recent_denials(chat).await.unwrap().records[0].id;
     assert_eq!(
         agent.recent_denials(chat).await.unwrap().persistence,
@@ -327,7 +334,7 @@ async fn the_latest_hundred_denials_are_physically_bounded_and_restore_in_order(
         .await
         .unwrap();
     agent.submit(chat, "try each file".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let view = agent.recent_denials(chat).await.unwrap();
     assert_eq!(view.records.len(), 100);
     assert_eq!(
@@ -342,7 +349,7 @@ async fn the_latest_hundred_denials_are_physically_bounded_and_restore_in_order(
     assert_eq!(view.records.first().unwrap().call_id, "call-100");
     assert_eq!(view.records.last().unwrap().call_id, "call-1");
     agent.flush_transcripts().await;
-    let path = transcript_file(&root, chat).with_extension("denials.json");
+    let path = transcript_file(&root, chat.uuid()).with_extension("denials.json");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(saved["records"].as_array().unwrap().len(), 100);
     agent.shutdown().await;
@@ -383,7 +390,7 @@ async fn mixed_allow_and_deny_history_keeps_the_latest_hundred_results() {
         .await
         .unwrap();
     agent.submit(chat, "read and write".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 100);
     assert_eq!(history.records[0].call_id, "call-100");
@@ -438,7 +445,7 @@ async fn disabled_persistence_keeps_denials_only_in_memory() {
         .await
         .unwrap();
     agent.submit(chat, "write".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let view = agent.recent_denials(chat).await.unwrap();
     assert_eq!(view.records.len(), 1);
     assert_eq!(view.persistence, DenialPersistence::Disabled);
@@ -467,9 +474,9 @@ async fn damaged_history_warns_without_blocking_chat_recovery() {
         .await
         .unwrap();
     agent.submit(chat, "write".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.shutdown().await;
-    let sidecar = transcript_file(&root, chat).with_extension("denials.json");
+    let sidecar = transcript_file(&root, chat.uuid()).with_extension("denials.json");
     std::fs::write(sidecar, b"{broken").unwrap();
     let restored =
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
@@ -512,13 +519,13 @@ async fn failed_history_save_keeps_memory_and_retries_without_losing_records() {
         .await
         .unwrap();
     agent.submit(chat, "first".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.flush_transcripts().await;
-    let sidecar = transcript_file(&root, chat).with_extension("denials.json");
+    let sidecar = transcript_file(&root, chat.uuid()).with_extension("denials.json");
     std::fs::remove_file(&sidecar).unwrap();
     std::fs::create_dir(&sidecar).unwrap();
     agent.submit(chat, "second".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.flush_transcripts().await;
     let unsaved = agent.recent_denials(chat).await.unwrap();
     assert_eq!(unsaved.records.len(), 2);
@@ -562,7 +569,7 @@ async fn host_rule_denial_is_recorded_without_executing_the_host_tool() {
         .await
         .unwrap();
     agent.submit(chat, "change panel".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let records = agent.recent_denials(chat).await.unwrap().records;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].call_id, "host-denied");
@@ -595,9 +602,9 @@ async fn direct_read_and_host_admission_each_have_one_allow_record() {
     agent.install_host_tools(host.clone()).unwrap();
     let chat = agent.create_chat(workdir).await.unwrap();
     agent.submit(chat, "read input.txt".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     agent.submit(chat, "change panel".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 2);
     assert_eq!(history.records[0].call_id, "host");
@@ -649,7 +656,7 @@ async fn a_tool_failure_after_admission_keeps_its_allow_result() {
     agent.install_host_tools(host.clone()).unwrap();
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     agent.submit(chat, "change panel".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let history = agent.approval_history_view(chat).await.unwrap();
     assert_eq!(history.records.len(), 1);
     assert_eq!(history.records[0].outcome, ApprovalResult::Allow);
@@ -770,7 +777,7 @@ async fn headless_explicit_ask_is_a_final_no_human_denial() {
         .await
         .unwrap();
     agent.submit(chat, "write".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let records = agent.recent_denials(chat).await.unwrap().records;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].category, DenialCategory::NoHuman);
@@ -839,7 +846,7 @@ async fn branch_starts_without_source_denials_while_source_rewind_retains_histor
         .await
         .unwrap();
     agent.submit(chat, "write past.txt".into()).await.unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let record = agent.recent_denials(chat).await.unwrap().records[0].clone();
     let child = agent
         .branch_chat(BranchRequest {
@@ -964,7 +971,7 @@ async fn automatic_hard_deny_keeps_the_frozen_rule_and_reviewer_path_after_polic
         .submit(chat, "create the protected symlink".into())
         .await
         .unwrap();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     let record = agent.recent_denials(chat).await.unwrap().records.remove(0);
     assert_eq!(record.category, DenialCategory::Automatic);
     assert_eq!(
@@ -1048,7 +1055,7 @@ async fn stale_auto_allow_is_reviewed_again_against_the_new_hard_deny() {
     }}});
     std::fs::write(&settings_path, changed.to_string()).unwrap();
     model.release_review.notify_one();
-    wait_for_completion(&agent, chat).await;
+    wait_for_completion(&agent, chat.uuid()).await;
     assert!(temp.path().join("held-auto").symlink_metadata().is_err());
     let records = agent.recent_denials(chat).await.unwrap().records;
     assert_eq!(records.len(), 1);

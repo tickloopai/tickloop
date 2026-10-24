@@ -52,8 +52,8 @@ pub(super) fn feedback_identity(
         } => Some(feedback_inbox::FeedbackIdentity {
             delivery_id: *delivery_id,
             feedback_id: feedback_id.clone(),
-            chat_id,
-            loop_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
             origin: origin.clone(),
             account_id: account_id.clone(),
             artifact_id: artifact_id.clone(),
@@ -179,6 +179,7 @@ impl ExternalDelivery {
             &self.account_id,
             self.delivery_id,
         )
+        .into()
     }
 
     pub fn delivery_id(&self) -> Uuid {
@@ -189,8 +190,8 @@ impl ExternalDelivery {
         feedback_inbox::FeedbackIdentity {
             delivery_id: self.delivery_id,
             feedback_id: self.feedback_id.clone(),
-            chat_id,
-            loop_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
             origin: self.origin.clone(),
             account_id: self.account_id.clone(),
             artifact_id: self.artifact_id.clone(),
@@ -449,8 +450,10 @@ impl Agent {
             cancel.cancel();
         }
         self.withdraw_ended_inputs(chat);
-        let inbox =
-            feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat.snapshot.id);
+        let inbox = feedback_inbox::FeedbackInbox::new(
+            chat.tools.chat_directory(),
+            chat.snapshot.id.into(),
+        );
         for input in inbox.pending().unwrap_or_default() {
             let identity = &input.identity;
             if identity.origin == origin
@@ -479,12 +482,12 @@ impl Agent {
         history: ArtifactFeedbackHistory,
     ) -> Result<EventSourceBinding, AgentError> {
         // The link names the receiving Chat, so it is made as that Chat.
-        let client = client.for_chat(receiver.0);
+        let client = client.for_chat(receiver.0.into());
         let request = AgentLinkRequest {
-            binding_id: Uuid::new_v4(),
-            client_instance_id: Uuid::new_v4(),
-            chat_id: receiver.0,
-            loop_id: receiver.1,
+            binding_id: tickloop_ids::generate(),
+            client_instance_id: tickloop_ids::generate(),
+            chat_id: receiver.0.into(),
+            loop_id: receiver.1.into(),
             history,
         };
         let link = client
@@ -745,7 +748,7 @@ impl Agent {
                         };
                         let inbox = super::feedback_inbox::FeedbackInbox::new(
                             chat.tools.chat_directory(),
-                            chat_id,
+                            chat_id.into(),
                         );
                         let chat_loop = &chat.snapshot.chat_loop;
                         let remains_linked = chat_loop.id == loop_id
@@ -852,8 +855,11 @@ impl Agent {
             if !chat.snapshot.chat_loop.receiving.is_receiving() {
                 return;
             }
-            match super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
-                .pending()
+            match super::feedback_inbox::FeedbackInbox::new(
+                chat.tools.chat_directory(),
+                chat_id.into(),
+            )
+            .pending()
             {
                 Ok(inputs) => inputs,
                 Err(error) => {
@@ -961,8 +967,10 @@ impl Agent {
         {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let inbox =
-                super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id);
+            let inbox = super::feedback_inbox::FeedbackInbox::new(
+                chat.tools.chat_directory(),
+                chat_id.into(),
+            );
             let chat_loop = &chat.snapshot.chat_loop;
             for source in chat_loop
                 .event_sources
@@ -970,7 +978,7 @@ impl Agent {
                 .filter(|source| instance.is_none_or(|(origin, id)| source.is_for(origin, id)))
             {
                 if let Err(error) = inbox.queue_unlink(&super::feedback_inbox::FeedbackUnlink {
-                    loop_id: chat_loop.id,
+                    loop_id: chat_loop.id.into(),
                     source: source.clone(),
                 }) {
                     self.warn_feedback_delivery(
@@ -994,8 +1002,10 @@ impl Agent {
             if chat.feedback_cleanup_started {
                 return;
             }
-            let inbox =
-                super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id);
+            let inbox = super::feedback_inbox::FeedbackInbox::new(
+                chat.tools.chat_directory(),
+                chat_id.into(),
+            );
             if !inbox.unlinks().is_ok_and(|entries| !entries.is_empty()) {
                 return;
             }
@@ -1019,7 +1029,7 @@ impl Agent {
                     let Some(chat) = chats.get(&chat_id) else {
                         break;
                     };
-                    super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
+                    super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id.into())
                         .unlinks()
                         .unwrap_or_default()
                 };
@@ -1031,7 +1041,7 @@ impl Agent {
                         continue;
                     }
                     let link = source.link();
-                    let chat_client = client.for_chat(chat_id);
+                    let chat_client = client.for_chat(chat_id.into());
                     let result = tokio::select! {
                         _ = agent.inner.shutdown.cancelled() => return,
                         result = chat_client.unlink_agent(&source.account_id, &link) => result,
@@ -1042,7 +1052,7 @@ impl Agent {
                             if let Some(chat) = chats.get(&chat_id) {
                                 let inbox = super::feedback_inbox::FeedbackInbox::new(
                                     chat.tools.chat_directory(),
-                                    chat_id,
+                                    chat_id.into(),
                                 );
                                 if let Err(error) = inbox.unlinked(&entry) {
                                     agent.warn_feedback_delivery(
@@ -1072,7 +1082,8 @@ impl Agent {
         }
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&chat_id).ok_or("Feedback Chat is unavailable")?;
-        let inbox = super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id);
+        let inbox =
+            super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id.into());
         // The inbox keeps a request until the ledger shows it went past its queue.
         let ready = inbox
             .pending()
@@ -1081,7 +1092,7 @@ impl Agent {
             .filter(|input| {
                 chat.bookkeeping
                     .lifecycle
-                    .input(input.identity.input_id())
+                    .input(input.identity.input_id().into())
                     .is_some_and(|entry| entry.state != InputState::Accepted)
             })
             .collect::<Vec<_>>();
@@ -1166,7 +1177,7 @@ impl Agent {
         {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
+            feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id.into())
                 .stage(feedback_inbox::FeedbackInput::new(
                     delivery.identity(chat_id, chat.snapshot.chat_loop.id),
                     delivery.prompt.clone(),
@@ -1246,8 +1257,8 @@ mod feedback_admission_tests {
 
     fn feedback_identity(receipt: &Receipt) -> feedback_inbox::FeedbackIdentity {
         feedback_inbox::FeedbackIdentity {
-            chat_id: receipt.chat_id,
-            loop_id: receipt.loop_id,
+            chat_id: receipt.chat_id.into(),
+            loop_id: receipt.loop_id.into(),
             delivery_id: Uuid::new_v4(),
             feedback_id: "feedback".into(),
             origin: "https://docs.example".into(),

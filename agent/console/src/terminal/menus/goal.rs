@@ -226,7 +226,7 @@ impl Menus {
                 self.show(
                     console,
                     Menu {
-                        id: Uuid::new_v4(),
+                        id: tickloop_ids::generate(),
                         title: "Replace unfinished Goal?".into(),
                         context: vec![
                             safe_text(&format!(
@@ -276,7 +276,7 @@ impl Menus {
             return self.show(
                 console,
                 Menu {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     title: "Goal".into(),
                     context,
                     options: vec!["Clear".into()],
@@ -332,7 +332,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Goal".into(),
                 context,
                 options,
@@ -372,7 +372,7 @@ impl Menus {
         action: GoalMenuAction,
     ) -> Result<(), String> {
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: title.into(),
             context: vec!["ctrl+g external editor · enter save · esc cancel".into()],
             options: vec!["Save".into()],
@@ -407,7 +407,7 @@ impl Menus {
         self.sync_dialog_chat(console)?;
         if !console.is_interactive()
             || self.id().is_some()
-            || self.continue_offered.contains(&status.id)
+            || self.continue_offered.contains(&status.id.uuid())
         {
             return Ok(());
         }
@@ -419,7 +419,7 @@ impl Menus {
             )
         });
         if !receiving_paused && !resume_goal {
-            self.continue_offered.insert(status.id);
+            self.continue_offered.insert(status.id.into());
             return Ok(());
         }
         let mut context = vec![if receiving_paused {
@@ -430,11 +430,11 @@ impl Menus {
         if let Some(goal) = status.goal.as_ref().filter(|_| resume_goal) {
             context.push(safe_text(&format!("Goal: {}", goal.objective)));
         }
-        self.continue_offered.insert(status.id);
+        self.continue_offered.insert(status.id.into());
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Continue Chat?".into(),
                 context,
                 options: vec![
@@ -451,7 +451,7 @@ impl Menus {
                 confirmation: false,
             },
             Selection::Goal {
-                chat: status.id,
+                chat: status.id.into(),
                 actions: vec![
                     GoalMenuAction::Continue { resume_goal },
                     GoalMenuAction::KeepPaused,

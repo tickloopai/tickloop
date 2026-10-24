@@ -234,7 +234,7 @@ async fn accepting_and_taking_back_waiting_input_or_commands_does_not_capture_ph
     let taken = agent.take_queued_inputs(chat, true).await.unwrap();
     assert_eq!(
         taken.iter().map(|item| item.id).collect::<Vec<_>>(),
-        vec![queued.run_id, command]
+        vec![queued.run_id, tickloop_ids::Id::from(command)]
     );
     assert_eq!(checkpoints(&agent, chat).await, before);
     assert!(

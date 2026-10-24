@@ -113,7 +113,7 @@ impl CompactionLayout {
                     }
                     if let Some(original_id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {
-                            Uuid::new_v4()
+                            tickloop_ids::generate()
                         } else {
                             *original_id
                         };
@@ -173,14 +173,18 @@ impl CompactionLayout {
                             text: COMPACT_BOUNDARY_TEXT.into(),
                         }],
                     });
-                    compacted.message_ids.insert(index, Uuid::new_v4());
+                    compacted
+                        .message_ids
+                        .insert(index, tickloop_ids::generate());
                     compacted
                         .message_compactions
                         .insert(index, CompactionMarker::Boundary(self.boundary.clone()));
                 }
                 MessageSource::Summary => {
                     compacted.messages.push(self.summary.clone());
-                    compacted.message_ids.insert(index, Uuid::new_v4());
+                    compacted
+                        .message_ids
+                        .insert(index, tickloop_ids::generate());
                     compacted.message_compactions.insert(
                         index,
                         CompactionMarker::Summary {

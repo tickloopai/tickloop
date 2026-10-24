@@ -266,7 +266,7 @@ impl DenialCandidate {
 
     pub fn finish(self, chat_id: ChatId, operation: &OperationRecord) -> DenialRecord {
         DenialRecord {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat_id,
             loop_id: operation.loop_id,
             run_id: operation.run_id,
@@ -318,7 +318,7 @@ fn matching_rule_summaries(
                 rule,
                 &operation.name,
                 permission_input,
-                operation.loop_id,
+                operation.loop_id.into(),
             )
         })
         .take(13)

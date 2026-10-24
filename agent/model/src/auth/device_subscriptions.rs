@@ -177,7 +177,7 @@ impl SubscriptionAuth {
     ) -> Result<DeviceLogin, ModelError> {
         let store = self.store();
         let lock = store.lock(cancel).await?;
-        let generation = Uuid::new_v4();
+        let generation = tickloop_ids::generate();
         store.save(&State {
             provider: self.provider,
             generation,
@@ -280,7 +280,7 @@ impl SubscriptionAuth {
                 Some(_) => return Err(auth_error("subscription authorization failed")),
                 None => {}
             }
-            let credential = parse_credentials(&value, None, Uuid::new_v4())?;
+            let credential = parse_credentials(&value, None, tickloop_ids::generate())?;
             let store = self.store();
             let _lock = store.lock(cancel).await?;
             if self
@@ -297,7 +297,7 @@ impl SubscriptionAuth {
             };
             store.save(&State {
                 provider: self.provider,
-                generation: Uuid::new_v4(),
+                generation: tickloop_ids::generate(),
                 credentials: Some(credential),
             })?;
             return Ok(access);
@@ -354,7 +354,7 @@ impl SubscriptionAuth {
         let _lock = store.lock(cancel).await?;
         store.save(&State {
             provider: self.provider,
-            generation: Uuid::new_v4(),
+            generation: tickloop_ids::generate(),
             credentials: None,
         })
     }

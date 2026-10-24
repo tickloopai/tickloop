@@ -62,6 +62,7 @@ tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }
+tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tickloop-tick-oauth-test-server = { path = "../../tick/oauth-test-server" }
 tickloop-tickhost = { path = "../../tickhost/host" }

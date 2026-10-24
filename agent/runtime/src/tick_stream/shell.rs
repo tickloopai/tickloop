@@ -55,9 +55,7 @@ impl ShellTickStream {
 }
 
 fn task_of(instance: &InstanceRef) -> Option<Uuid> {
-    (instance.access() == tick_protocol::SHELL_ACCESS)
-        .then(|| Uuid::parse_str(instance.id()).ok())
-        .flatten()
+    instance.shell_task().map(|task| task.uuid())
 }
 
 #[derive(Clone)]
@@ -78,7 +76,7 @@ impl ShellScope {
     async fn task(&self, chat: Uuid, task: Uuid) -> Result<Option<ShellTask>, String> {
         let snapshot = self
             .center()?
-            .snapshot(chat)
+            .snapshot(chat.into())
             .await
             .map_err(|error| error.to_string())?;
         Ok(snapshot.tasks.into_iter().find(|listed| listed.id == task))
@@ -302,9 +300,12 @@ impl ShellObserver {
                     continue;
                 }
             };
-            let owned =
-                self.scope
-                    .owned(&admitted, listed.chat_id, &self.instance, &self.publisher);
+            let owned = self.scope.owned(
+                &admitted,
+                listed.chat_id.into(),
+                &self.instance,
+                &self.publisher,
+            );
             self.ready.retain(|watch| owned.contains(watch));
             self.awaiting_exit.retain(|watch| owned.contains(watch));
             if owned.is_empty() {

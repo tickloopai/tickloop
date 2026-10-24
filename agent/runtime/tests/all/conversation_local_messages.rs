@@ -458,14 +458,18 @@ async fn background_user_shell_completion_notifies_its_chat() {
         .expect("background shell output file");
     let expected_notification = format!(
         "<task-notification>\n<task-id>{}</task-id>\n<output-file>{}</output-file>\n<status>completed</status>\n<summary>Background command \"printf done\" completed (exit code 0)</summary>\n</task-notification>",
-        receipt.command_id,
+        tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+            receipt.command_id
+        )),
         output_file.display()
     );
     let expected_texts = vec![
         "<bash-input>printf done</bash-input>".to_string(),
         format!(
             "<bash-stdout>Command running in background with ID: {}. Output is being written to: {}</bash-stdout><bash-stderr></bash-stderr>",
-            receipt.command_id,
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                receipt.command_id
+            )),
             output_file.display()
         ),
         expected_notification.clone(),
@@ -558,7 +562,9 @@ async fn background_agent_command_completion_notifies_with_its_tool_use_id() {
             .unwrap(),
         &format!(
             "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>background-shell</tool-use-id>\n<output-file>{}</output-file>\n<status>failed</status>\n<summary>Background command \"{}\" failed with exit code 4</summary>\n</task-notification>",
-            command.operation_id,
+            tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(
+                command.operation_id
+            )),
             command.output_ref.display(),
             command_text.replace('<', "&lt;").replace('>', "&gt;"),
         )

@@ -125,12 +125,18 @@ fn harness(
 
 async fn assert_persisted_visibility(agent: &Agent, store: &InMemoryTranscriptStore, chat: Uuid) {
     agent.sync().await.unwrap();
-    let lines = store.lines(chat);
+    let lines = store.lines(tickloop_ids::Id::from(chat));
     let leaf = lines.iter().rev().find_map(Line::chain_entry).unwrap().uuid;
-    let root = agent.citation_sources(chat).await.unwrap();
+    let root = agent
+        .citation_sources(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap();
     assert_eq!(
         visible_citations_at(&lines, leaf, Some(&root)).unwrap(),
-        agent.visible_citations(chat).await.unwrap()
+        agent
+            .visible_citations(tickloop_ids::Id::from(chat))
+            .await
+            .unwrap()
     );
 }
 
@@ -155,7 +161,10 @@ async fn turn(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<CompletedTool> {
 
 async fn turn_for_loop(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<CompletedTool> {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     let mut results = Vec::new();
     loop {
         let event = next_event(&mut events).await;
@@ -204,10 +213,10 @@ async fn numbered_sources_reuse_urls_across_turns_and_keep_existing_request_pref
         false,
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let first = turn(&agent, chat, "Find evidence").await;
+    let first = turn(&agent, chat.uuid(), "Find evidence").await;
     assert_eq!(numbers(&first[0]), [1, 2]);
     assert_eq!(numbers(&first[1]), [1, 3]);
-    let second = turn_for_loop(&agent, chat, "Find more evidence").await;
+    let second = turn_for_loop(&agent, chat.uuid(), "Find more evidence").await;
     assert_eq!(numbers(&second[0]), [4]);
     for result in first.iter().chain(&second) {
         assert!(!result.is_error, "{}", result.content);
@@ -279,8 +288,8 @@ async fn fetched_pages_use_the_same_registry_and_default_results_have_no_added_m
             false,
         );
         let chat = agent.create_chat_without_folder().await.unwrap();
-        let first = turn(&agent, chat, "Read the page").await;
-        let second = turn(&agent, chat, "Read it again").await;
+        let first = turn(&agent, chat.uuid(), "Read the page").await;
+        let second = turn(&agent, chat.uuid(), "Read it again").await;
         if style == CitationStyle::Numbered {
             assert_eq!(numbers(&first[0]), [1]);
             assert_eq!(numbers(&second[0]), [1]);
@@ -326,7 +335,7 @@ async fn source_metadata_survives_restore_new_chat_copy_and_branch_without_renum
     let agent = harness(model, store.clone(), &server, CitationStyle::Numbered, true);
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    turn(&agent, chat, "Find initial evidence").await;
+    turn(&agent, chat.uuid(), "Find initial evidence").await;
     let branch = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
@@ -341,7 +350,7 @@ async fn source_metadata_survives_restore_new_chat_copy_and_branch_without_renum
     agent.sync().await.unwrap();
     agent.shutdown().await;
     for id in [chat, branch, copy] {
-        assert!(store.lines(id).iter().any(|line| matches!(line,Line::CitationSources(entry) if entry.chat_id==id && entry.sources.len()==2)),"{id}");
+        assert!(store.lines(id).iter().any(|line| matches!(line,Line::CitationSources(entry) if entry.chat_id==id && entry.sources.len()==2)),"{id:?}");
     }
     let restored_model = Arc::new(ScriptedModel::new(vec![
         search("restored-root"),
@@ -360,7 +369,7 @@ async fn source_metadata_survives_restore_new_chat_copy_and_branch_without_renum
     );
     for id in [chat, branch, copy] {
         restored.resume_chat(id).await.unwrap();
-        let result = turn(&restored, id, "Continue evidence").await;
+        let result = turn(&restored, id.uuid(), "Continue evidence").await;
         assert_eq!(numbers(&result[0]), [1, 3]);
     }
     restored.sync().await.unwrap();
@@ -412,8 +421,8 @@ async fn ordinary_and_directed_summaries_preserve_markers_and_append_the_global_
             false,
         );
         let chat = agent.create_chat_without_folder().await.unwrap();
-        turn(&agent, chat, "Find a fact").await;
-        turn(&agent, chat, "Discuss the fact").await;
+        turn(&agent, chat.uuid(), "Find a fact").await;
+        turn(&agent, chat.uuid(), "Discuss the fact").await;
         if let Some(direction) = direction {
             let snapshot = agent.snapshot(chat).await.unwrap();
             let index = if direction == SummaryDirection::FromHere {
@@ -439,13 +448,13 @@ async fn ordinary_and_directed_summaries_preserve_markers_and_append_the_global_
         assert_eq!(visible.calls.len(), 1);
         assert_eq!(visible.calls[0].call_id, "before");
         assert_eq!(visible.calls[0].numbers, [1]);
-        assert_persisted_visibility(&agent, &store, chat).await;
+        assert_persisted_visibility(&agent, &store, chat.uuid()).await;
         let snapshot = agent.snapshot(chat).await.unwrap();
         let history = serde_json::to_string(&snapshot.messages).unwrap();
         assert!(history.contains("Retained fact.[citation:1]"));
         assert!(history.contains("1｜Source a｜evidence.test"));
         assert_eq!(
-            numbers(&turn(&agent, chat, "Find another fact").await[0]),
+            numbers(&turn(&agent, chat.uuid(), "Find another fact").await[0]),
             [2]
         );
         let requests = model.requests.lock().unwrap().clone();
@@ -461,7 +470,7 @@ async fn ordinary_and_directed_summaries_preserve_markers_and_append_the_global_
         model.enqueue(text("Compacted again.[citation:1][citation:2]"));
         agent.compact(chat).await.unwrap();
         assert_eq!(agent.visible_citations(chat).await.unwrap().calls.len(), 2);
-        assert_persisted_visibility(&agent, &store, chat).await;
+        assert_persisted_visibility(&agent, &store, chat.uuid()).await;
         agent.sync().await.unwrap();
         assert!(store.lines(chat).iter().any(|line| matches!(line, Line::RetainedSnapshot(snapshot) if snapshot.lines.iter().any(|line| matches!(line, Line::CitationSources(entry) if entry.calls.len() == 2)))));
         agent.shutdown().await;
@@ -529,7 +538,7 @@ async fn a_delegated_child_uses_its_roots_global_sources() {
         false,
     );
     let root = agent.create_chat_without_folder().await.unwrap();
-    let results = turn(&agent, root, "Find evidence with help").await;
+    let results = turn(&agent, root.uuid(), "Find evidence with help").await;
     assert_eq!(numbers(&results[0]), [1]);
     assert_eq!(numbers(results.last().unwrap()), [3]);
     let members = agent.family_registrations(root).await.unwrap();
@@ -586,7 +595,7 @@ async fn default_search_keeps_the_existing_links_format_and_no_source_table() {
         false,
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let results = turn(&agent, chat, "Find evidence").await;
+    let results = turn(&agent, chat.uuid(), "Find evidence").await;
     let result = &results[0];
     assert!(result.content.ends_with("Web search results for query: \"source evidence\"\n\nLinks: [{\"title\":\"Source a\",\"url\":\"https://evidence.test/a\",\"summary\":\"Evidence for a\"}]\n\n\nREMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks."));
     assert!(result.sources.is_empty());
@@ -651,7 +660,7 @@ async fn background_children_allocate_distinct_numbers_under_concurrent_searches
         false,
     );
     let root = agent.create_chat_without_folder().await.unwrap();
-    turn(&agent, root, "Find two sources").await;
+    turn(&agent, root.uuid(), "Find two sources").await;
     tokio::time::timeout(std::time::Duration::from_secs(20), agent.quiesce(root))
         .await
         .unwrap();
@@ -710,29 +719,33 @@ impl RootSourceFailure {
 impl TranscriptStore for RootSourceFailure {
     async fn register(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         placement: &ChatPlacement,
     ) -> Result<StorePosition, TranscriptError> {
-        self.root.lock().unwrap().get_or_insert(chat);
+        self.root.lock().unwrap().get_or_insert(chat.into());
         self.inner.register(chat, placement).await
     }
     async fn load(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
         self.inner.load(chat, range).await
     }
-    async fn append(&self, chat: Uuid, batch: &AppendBatch) -> Result<AppendAck, TranscriptError> {
-        self.check(chat, batch)?;
+    async fn append(
+        &self,
+        chat: tickloop_agent_protocol::ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
+        self.check(chat.into(), batch)?;
         self.inner.append(chat, batch).await
     }
     fn append_blocking(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         batch: &AppendBatch,
     ) -> Result<AppendAck, TranscriptError> {
-        self.check(chat, batch)?;
+        self.check(chat.into(), batch)?;
         self.inner.append_blocking(chat, batch)
     }
 }
@@ -781,10 +794,10 @@ async fn process_host_does_not_publish_a_childs_number_when_the_root_source_writ
     let agent = harness(model.clone(), fault, &server, CitationStyle::Numbered, true);
     let directory = tempfile::tempdir().unwrap();
     let root = agent.create_chat(directory.path().into()).await.unwrap();
-    turn(&agent, root, "Prepare").await;
+    turn(&agent, root.uuid(), "Prepare").await;
     agent.sync().await.unwrap();
     let mut family_events = agent.subscribe();
-    turn(&agent, root, "Delegate evidence gathering").await;
+    turn(&agent, root.uuid(), "Delegate evidence gathering").await;
     let child = agent.family_registrations(root).await.unwrap()[0].child_chat_id;
     let child_events = std::iter::from_fn(|| family_events.try_recv().ok())
         .filter(|event| event.chat_id == child)
@@ -821,7 +834,7 @@ async fn process_host_does_not_publish_a_childs_number_when_the_root_source_writ
         true,
     );
     restored.resume_chat(root).await.unwrap();
-    let results = turn(&restored, root, "Find fresh evidence").await;
+    let results = turn(&restored, root.uuid(), "Find fresh evidence").await;
     assert_eq!(numbers(&results[0]), [1]);
     assert_eq!(
         results[0].sources[0].url,
@@ -851,8 +864,8 @@ async fn every_call_is_recorded_and_rewind_filters_reused_call_ids_and_sources_a
     let agent = harness(model, store.clone(), &server, CitationStyle::Numbered, true);
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    turn(&agent, chat, "First").await;
-    turn(&agent, chat, "Second").await;
+    turn(&agent, chat.uuid(), "First").await;
+    turn(&agent, chat.uuid(), "Second").await;
     let all = agent.visible_citations(chat).await.unwrap();
     assert_eq!(all.calls.len(), 2);
     assert_eq!(
@@ -879,11 +892,11 @@ async fn every_call_is_recorded_and_rewind_filters_reused_call_ids_and_sources_a
         [1]
     );
     assert_eq!(agent.citation_sources(chat).await.unwrap().len(), 2);
-    turn(&agent, chat, "Replacement").await;
+    turn(&agent, chat.uuid(), "Replacement").await;
     let visible = agent.visible_citations(chat).await.unwrap();
     assert_eq!(visible.calls.len(), 2);
     assert!(visible.calls.iter().all(|call| call.numbers == [1]));
-    assert_persisted_visibility(&agent, &store, chat).await;
+    assert_persisted_visibility(&agent, &store, chat.uuid()).await;
     agent.sync().await.unwrap();
     let branch = agent
         .branch_chat(BranchRequest {
@@ -896,7 +909,7 @@ async fn every_call_is_recorded_and_rewind_filters_reused_call_ids_and_sources_a
         .child_chat_id;
     let copy = agent.resume_as_new_chat(chat).await.unwrap().id;
     for id in [branch, copy] {
-        assert_persisted_visibility(&agent, &store, id).await;
+        assert_persisted_visibility(&agent, &store, id.uuid()).await;
     }
     agent.sync().await.unwrap();
     agent.shutdown().await;
@@ -912,7 +925,7 @@ async fn every_call_is_recorded_and_rewind_filters_reused_call_ids_and_sources_a
         assert_eq!(
             restored.visible_citations(id).await.unwrap().calls.len(),
             visible.calls.len(),
-            "{id}: inherited evidence"
+            "{id:?}: inherited evidence"
         );
         assert_eq!(
             restored.visible_citations(id).await.unwrap().sources,
@@ -937,7 +950,7 @@ async fn malformed_source_frames_are_neutralized_and_duplicate_urls_get_one_fram
         false,
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let results = turn(&agent, chat, "Search").await;
+    let results = turn(&agent, chat.uuid(), "Search").await;
     assert_eq!(numbers(&results[0]), [1]);
     let body = &results[0].content;
     assert_eq!(body.matches("[webpage 1 begin]").count(), 1);
@@ -974,7 +987,7 @@ impl CallAuditStore {
                 "call association write failed".into(),
             ));
         }
-        let stored = self.inner.lines(chat);
+        let stored = self.inner.lines(tickloop_ids::Id::from(chat));
         let mut projected = stored.clone();
         for line in &batch.lines {
             projected.push(line.clone());
@@ -1008,28 +1021,32 @@ impl CallAuditStore {
 impl TranscriptStore for CallAuditStore {
     async fn register(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         placement: &ChatPlacement,
     ) -> Result<StorePosition, TranscriptError> {
         self.inner.register(chat, placement).await
     }
     async fn load(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
         self.inner.load(chat, range).await
     }
-    async fn append(&self, chat: Uuid, batch: &AppendBatch) -> Result<AppendAck, TranscriptError> {
-        self.check(chat, batch)?;
+    async fn append(
+        &self,
+        chat: tickloop_agent_protocol::ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
+        self.check(chat.into(), batch)?;
         self.inner.append(chat, batch).await
     }
     fn append_blocking(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         batch: &AppendBatch,
     ) -> Result<AppendAck, TranscriptError> {
-        self.check(chat, batch)?;
+        self.check(chat.into(), batch)?;
         self.inner.append_blocking(chat, batch)
     }
 }
@@ -1063,7 +1080,7 @@ async fn call_associations_precede_results_and_failed_reused_source_writes_deliv
         } else {
             agent.create_chat_without_folder().await.unwrap()
         };
-        turn(&agent, chat, "First").await;
+        turn(&agent, chat.uuid(), "First").await;
         agent.sync().await.unwrap();
         store.fail_calls.store(true, Ordering::SeqCst);
         let mut events = agent.subscribe();
@@ -1103,7 +1120,7 @@ async fn empty_searches_still_record_the_call_without_making_a_number_visible() 
         false,
     );
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let results = turn(&agent, chat, "Find").await;
+    let results = turn(&agent, chat.uuid(), "Find").await;
     assert!(results[0].sources.is_empty());
     let visible = agent.visible_citations(chat).await.unwrap();
     assert!(visible.sources.is_empty());
@@ -1134,19 +1151,23 @@ struct PausedResultStore {
 impl TranscriptStore for PausedResultStore {
     async fn register(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         placement: &ChatPlacement,
     ) -> Result<StorePosition, TranscriptError> {
         self.inner.register(chat, placement).await
     }
     async fn load(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
         self.inner.load(chat, range).await
     }
-    async fn append(&self, chat: Uuid, batch: &AppendBatch) -> Result<AppendAck, TranscriptError> {
+    async fn append(
+        &self,
+        chat: tickloop_agent_protocol::ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
         if batch.lines.iter().any(|line| line.chain_entry().is_some_and(|entry| entry.message.content.iter().any(|content| matches!(content, Content::ToolResult {tool_use_id, ..} if tool_use_id == "durable"))))
             && self.pause.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.result_started.notify_one();
@@ -1156,7 +1177,7 @@ impl TranscriptStore for PausedResultStore {
     }
     fn append_blocking(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         batch: &AppendBatch,
     ) -> Result<AppendAck, TranscriptError> {
         self.inner.append_blocking(chat, batch)
@@ -1240,19 +1261,23 @@ struct ResultWriteFailure {
 impl TranscriptStore for ResultWriteFailure {
     async fn register(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         placement: &ChatPlacement,
     ) -> Result<StorePosition, TranscriptError> {
         self.inner.register(chat, placement).await
     }
     async fn load(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         range: LoadRange,
     ) -> Result<Option<StoredTranscript>, TranscriptError> {
         self.inner.load(chat, range).await
     }
-    async fn append(&self, chat: Uuid, batch: &AppendBatch) -> Result<AppendAck, TranscriptError> {
+    async fn append(
+        &self,
+        chat: tickloop_agent_protocol::ChatId,
+        batch: &AppendBatch,
+    ) -> Result<AppendAck, TranscriptError> {
         if batch.lines.iter().any(|line| line.chain_entry().is_some_and(|entry| entry.message.content.iter().any(|content| matches!(content, Content::ToolResult {tool_use_id,..} if tool_use_id == "result-write"))))
             && self.fail_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(TranscriptError::Storage("result node write failed once".into()));
@@ -1261,7 +1286,7 @@ impl TranscriptStore for ResultWriteFailure {
     }
     fn append_blocking(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         batch: &AppendBatch,
     ) -> Result<AppendAck, TranscriptError> {
         self.inner.append_blocking(chat, batch)
@@ -1351,8 +1376,8 @@ async fn physical_parallel_anchors_survive_retained_rewrites_and_branches_after_
     );
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    turn(&agent, chat, "Research").await;
-    turn(&agent, chat, "Discuss").await;
+    turn(&agent, chat.uuid(), "Research").await;
+    turn(&agent, chat.uuid(), "Discuss").await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
     let stored = original.load(chat, LoadRange::Full).await.unwrap().unwrap();
@@ -1413,7 +1438,7 @@ async fn physical_parallel_anchors_survive_retained_rewrites_and_branches_after_
         restored.visible_citations(chat).await.unwrap().calls.len(),
         2
     );
-    assert_persisted_visibility(&restored, &store, chat).await;
+    assert_persisted_visibility(&restored, &store, chat.uuid()).await;
     let branch = restored
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
@@ -1437,7 +1462,7 @@ async fn physical_parallel_anchors_survive_retained_rewrites_and_branches_after_
         .unwrap();
     for id in [chat, branch] {
         assert_eq!(restored.visible_citations(id).await.unwrap().calls.len(), 2);
-        assert_persisted_visibility(&restored, &store, id).await;
+        assert_persisted_visibility(&restored, &store, id.uuid()).await;
     }
     restored.shutdown().await;
     let cold = harness(
@@ -1449,7 +1474,7 @@ async fn physical_parallel_anchors_survive_retained_rewrites_and_branches_after_
     );
     for id in [chat, branch] {
         assert_eq!(cold.visible_citations(id).await.unwrap().calls.len(), 2);
-        assert_persisted_visibility(&cold, &store, id).await;
+        assert_persisted_visibility(&cold, &store, id.uuid()).await;
     }
     cold.shutdown().await;
 }

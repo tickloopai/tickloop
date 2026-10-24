@@ -14,9 +14,9 @@ fn id(value: u128) -> Uuid {
 fn event(sequence: u64, kind: EventKind) -> Event {
     Event {
         sequence,
-        chat_id: id(0xc1),
-        loop_id: id(0x10),
-        run_id: id(0x20),
+        chat_id: tickloop_ids::Id::from(id(0xc1)),
+        loop_id: tickloop_ids::Id::from(id(0x10)),
+        run_id: tickloop_ids::Id::from(id(0x20)),
         kind,
     }
 }
@@ -61,9 +61,9 @@ fn busy_chat() -> ChatSnapshot {
     .unwrap();
     let permission = PermissionRequest {
         id: id(0x70),
-        loop_id: id(0x10),
+        loop_id: tickloop_ids::Id::from(id(0x10)),
         execution: PermissionExecution::ToolCall {
-            run_id: id(0x20),
+            run_id: tickloop_ids::Id::from(id(0x20)),
             call_id: "call-bash".into(),
         },
         name: "Bash".into(),
@@ -74,9 +74,9 @@ fn busy_chat() -> ChatSnapshot {
     };
     let question = QuestionRequest {
         id: id(0x71),
-        chat_id: id(0xc1),
-        loop_id: id(0x10),
-        run_id: id(0x20),
+        chat_id: tickloop_ids::Id::from(id(0xc1)),
+        loop_id: tickloop_ids::Id::from(id(0x10)),
+        run_id: tickloop_ids::Id::from(id(0x20)),
         call_id: "call-ask".into(),
         questions: Vec::new(),
     };
@@ -123,7 +123,7 @@ fn busy_chat() -> ChatSnapshot {
     ];
     snapshot
         .pending_thinking
-        .insert(id(0x20), "thinking ".repeat(1_000));
+        .insert(tickloop_ids::Id::from(id(0x20)), "thinking ".repeat(1_000));
     snapshot
 }
 
@@ -137,7 +137,10 @@ fn a_status_derives_the_facts_it_needs_from_the_history_it_leaves_out() {
         "the requests in the order they were asked"
     );
     assert_eq!(status.command_started_at_ms[&id(0x60)], 200);
-    assert_eq!(status.family_input_runs, [id(0x21)].into());
+    assert_eq!(
+        status.family_input_runs,
+        [tickloop_agent_protocol::RunId::from(id(0x21))].into()
+    );
     assert!(status.context_tokens.is_some_and(|tokens| tokens > 0));
     assert_eq!(status.last_sequence, 6);
     assert_eq!(status.queued_inputs().len(), 1);

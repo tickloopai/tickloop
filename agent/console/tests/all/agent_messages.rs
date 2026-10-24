@@ -297,7 +297,7 @@ impl tickloop_agent_runtime::host_tools::HostToolProvider for ReviewableTick {
     }
     fn permission(
         &self,
-        _: uuid::Uuid,
+        _: tickloop_agent_protocol::ChatId,
         _: &str,
         _: &Value,
     ) -> tickloop_agent_runtime::host_tools::HostToolPermission {
@@ -305,7 +305,7 @@ impl tickloop_agent_runtime::host_tools::HostToolProvider for ReviewableTick {
     }
     async fn execute(
         &self,
-        _: uuid::Uuid,
+        _: tickloop_agent_protocol::ChatId,
         _: &str,
         _: Value,
         _: CancellationToken,
@@ -390,7 +390,7 @@ async fn child_auto_review_uses_frozen_parent_human_intent_instead_of_model_gene
     assert_eq!(context["original_user_inputs"][0]["text"], original);
     assert_eq!(
         context["original_user_inputs"][0]["chat_id"],
-        parent.to_string()
+        tickloop_ids::IdContext::new().model_text(parent)
     );
     assert!(
         !context["original_user_inputs"]
@@ -779,8 +779,8 @@ async fn unrelated_roots_and_forged_parent_targets_are_rejected_by_the_model_vis
         let sender = agent.create_chat(directory.path().into()).await.unwrap();
         let unrelated = agent.create_chat(directory.path().into()).await.unwrap();
         *target.lock().unwrap() = match target_case {
-            "unrelated" => unrelated.to_string(),
-            "short-id" => unrelated.to_string()[..8].into(),
+            "unrelated" => unrelated.uuid().to_string(),
+            "short-id" => unrelated.uuid().to_string()[..8].into(),
             other => other.into(),
         };
         let mut events = agent.subscribe();
@@ -877,8 +877,10 @@ async fn same_family_siblings_route_by_the_parent_handle_registry() {
         received
             .agent_message_origins
             .values()
-            .any(|source| source["sender_chat_id"] == second.to_string()
-                && source["sender_relationship"] == "sibling")
+            .any(
+                |source| source["sender_chat_id"] == second.uuid().to_string()
+                    && source["sender_relationship"] == "sibling"
+            )
     );
     agent.shutdown().await;
 }
@@ -952,7 +954,7 @@ async fn ended_parent_resumes_from_child_messages(stopped: bool) {
         .await
         .unwrap();
     completed(&mut events, &child_receipt).await;
-    let after = wait_for_snapshot(&agent, parent, "the new child message", |snapshot| {
+    let after = wait_for_snapshot(&agent, parent.into(), "the new child message", |snapshot| {
         agent_body_count(snapshot, "Try to resume the ended parent.") == 1
             && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
     })
@@ -1081,7 +1083,7 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
             .find(|chat| chat.id != parent)
             .unwrap();
         agent.shutdown().await;
-        let path = tickloop_agent_test_support::transcript_file(&store, child.id);
+        let path = tickloop_agent_test_support::transcript_file(&store, child.id.into());
         let content = std::fs::read_to_string(&path).unwrap();
         let rewritten = content
             .lines()
@@ -1416,7 +1418,7 @@ async fn interrupt_preserves_an_already_accepted_agent_message_and_automatically
     }
     let after = wait_for_snapshot(
         &agent,
-        parent,
+        parent.into(),
         "the accepted message after interruption",
         |snapshot| {
             agent_body_count(snapshot, "Accepted context survives") == 1
@@ -2028,7 +2030,7 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
     })
     .await
     .expect("every child run must append one parent notification");
-    assert_eq!(completions[0]["child_chat_id"], child.to_string());
+    assert_eq!(completions[0]["child_chat_id"], child.uuid().to_string());
     assert_eq!(completions[0]["handle"], "audit");
     assert_eq!(completions[0]["result"], "Initial final reply");
     assert_eq!(completions[1]["result"], "Follow-up final reply");
@@ -2305,15 +2307,20 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
         serde_json::to_value(&received).unwrap()["human_family_origins"][id.to_string()]["original_submission"],
         "@audit 你好"
     );
-    let origin = wait_for_snapshot(&core, root_chat, "the directed run's notice", |snapshot| {
-        snapshot.family_completions.len() == 2
-            && matches!(
-                snapshot.family_completions[1].notification,
-                tickloop_agent_protocol::SubagentNotificationDelivery::Queued
-            )
-            && snapshot.pending_inputs.is_empty()
-            && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
-    })
+    let origin = wait_for_snapshot(
+        &core,
+        root_chat.into(),
+        "the directed run's notice",
+        |snapshot| {
+            snapshot.family_completions.len() == 2
+                && matches!(
+                    snapshot.family_completions[1].notification,
+                    tickloop_agent_protocol::SubagentNotificationDelivery::Queued
+                )
+                && snapshot.pending_inputs.is_empty()
+                && snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Idle
+        },
+    )
     .await;
     assert_eq!(
         origin.family_completions[1].child_run_id,
@@ -2578,8 +2585,8 @@ impl DirectedFixture {
             access,
             root,
             child,
-            root_chat,
-            child_chat,
+            root_chat: root_chat.into(),
+            child_chat: child_chat.into(),
             origin: InteractionSource {
                 view,
                 display_version: shown.version,
@@ -2625,7 +2632,7 @@ async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_curre
     fixture
         .core
         .set_permission_rules(
-            fixture.root_chat,
+            fixture.root_chat.into(),
             vec![PermissionRule {
                 id: Uuid::new_v4(),
                 decision: Decision::Deny,
@@ -2640,7 +2647,7 @@ async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_curre
         .unwrap();
     let before = fixture
         .core
-        .snapshot(fixture.child_chat)
+        .snapshot(fixture.child_chat.into())
         .await
         .unwrap()
         .messages
@@ -2679,7 +2686,7 @@ async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_curre
     assert_eq!(
         fixture
             .core
-            .snapshot(fixture.child_chat)
+            .snapshot(fixture.child_chat.into())
             .await
             .unwrap()
             .messages
@@ -2698,16 +2705,16 @@ async fn family_human_main_input_after_stop_continues_the_root_loop() {
     let fixture = DirectedFixture::new().await;
     let chat_loop = fixture
         .core
-        .snapshot(fixture.root_chat)
+        .snapshot(fixture.root_chat.into())
         .await
         .unwrap()
         .chat_loop
         .id;
-    fixture.core.stop(fixture.root_chat).await.unwrap();
+    fixture.core.stop(fixture.root_chat.into()).await.unwrap();
     let mut events = fixture.core.subscribe();
     let current = fixture
         .core
-        .submit(fixture.root_chat, "New root task".into())
+        .submit(fixture.root_chat.into(), "New root task".into())
         .await
         .unwrap();
     completed(&mut events, &current).await;
@@ -2757,7 +2764,7 @@ async fn family_human_main_input_after_stop_continues_the_root_loop() {
     assert_eq!(
         fixture
             .core
-            .snapshot(fixture.root_chat)
+            .snapshot(fixture.root_chat.into())
             .await
             .unwrap()
             .chat_loop
@@ -2770,7 +2777,11 @@ async fn family_human_main_input_after_stop_continues_the_root_loop() {
 #[tokio::test]
 async fn family_directory_aggregates_active_user_shell_instead_of_only_completed_loops() {
     let fixture = DirectedFixture::new().await;
-    let initial = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+    let initial = fixture
+        .core
+        .snapshot(fixture.root_chat.into())
+        .await
+        .unwrap();
     assert!(
         initial.delegation.is_none(),
         "this aggregation case owns a root Chat"
@@ -2803,7 +2814,7 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
     let mut shell_events = fixture.core.subscribe_user_shells();
     let shell = fixture
         .core
-        .submit_user_shell(fixture.root_chat, "sleep 30".into(), false)
+        .submit_user_shell(fixture.root_chat.into(), "sleep 30".into(), false)
         .await
         .unwrap();
     let mut last_shell = None;
@@ -2831,7 +2842,11 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
     })
     .await;
     if started.is_err() {
-        let snapshot = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+        let snapshot = fixture
+            .core
+            .snapshot(fixture.root_chat.into())
+            .await
+            .unwrap();
         panic!(
             "Shell {} did not reach Running; last state/reason: {:?}; pending permission requests: {:?}; Loop states: {:?}",
             shell.command_id,
@@ -2848,7 +2863,7 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
     }
     let root = fixture
         .core
-        .family_agents(fixture.root_chat)
+        .family_agents(fixture.root_chat.into())
         .await
         .unwrap()
         .remove(0);
@@ -2856,7 +2871,7 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
     let started_at = root.run_started_at;
     fixture
         .core
-        .stop_user_shell(fixture.root_chat, shell.command_id)
+        .stop_user_shell(fixture.root_chat.into(), shell.command_id)
         .await
         .unwrap();
     fixture.core.shutdown().await;
@@ -2901,7 +2916,7 @@ async fn directed_human_body_preserves_whitespace_after_the_routing_separator() 
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while fixture
             .core
-            .snapshot(fixture.child_chat)
+            .snapshot(fixture.child_chat.into())
             .await
             .unwrap()
             .chat_loop
@@ -2913,7 +2928,11 @@ async fn directed_human_body_preserves_whitespace_after_the_routing_separator() 
     })
     .await
     .unwrap();
-    let snapshot = fixture.core.snapshot(fixture.child_chat).await.unwrap();
+    let snapshot = fixture
+        .core
+        .snapshot(fixture.child_chat.into())
+        .await
+        .unwrap();
     let body = snapshot
         .messages
         .iter()
@@ -3733,7 +3752,7 @@ async fn recovered_pending_completion_does_not_requeue_a_persisted_notification(
                 directories.push(path);
             } else if path
                 .file_stem()
-                .is_some_and(|stem| stem == root.to_string().as_str())
+                .is_some_and(|stem| stem == root.uuid().to_string().as_str())
                 && path
                     .extension()
                     .is_some_and(|extension| extension == "jsonl")
@@ -3892,16 +3911,21 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
     .await
     .unwrap();
     core.submit(root, human.into()).await.unwrap();
-    let failed = wait_for_snapshot(&core, root, "the failed child's notice", |snapshot| {
-        snapshot.family_completions.len() == 1
-            && matches!(
-                snapshot.family_completions[0].notification,
-                SubagentNotificationDelivery::Queued
-            )
-            && snapshot.pending_inputs.is_empty()
-            && snapshot.chat_loop.state == LoopState::Idle
-            && task_notifications(snapshot).len() == 1
-    })
+    let failed = wait_for_snapshot(
+        &core,
+        root.into(),
+        "the failed child's notice",
+        |snapshot| {
+            snapshot.family_completions.len() == 1
+                && matches!(
+                    snapshot.family_completions[0].notification,
+                    SubagentNotificationDelivery::Queued
+                )
+                && snapshot.pending_inputs.is_empty()
+                && snapshot.chat_loop.state == LoopState::Idle
+                && task_notifications(snapshot).len() == 1
+        },
+    )
     .await;
     assert_eq!(failed.family_completions[0].state, LoopState::Failed);
     assert!(
@@ -3921,16 +3945,21 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
         .await
         .unwrap();
     completed(&mut events, &resumed).await;
-    let parent = wait_for_snapshot(&core, root, "the resumed child's notice", |snapshot| {
-        snapshot.family_completions.len() == 2
-            && matches!(
-                snapshot.family_completions[1].notification,
-                SubagentNotificationDelivery::Queued
-            )
-            && snapshot.pending_inputs.is_empty()
-            && snapshot.chat_loop.state == LoopState::Idle
-            && tick.executions.load(std::sync::atomic::Ordering::SeqCst) == 1
-    })
+    let parent = wait_for_snapshot(
+        &core,
+        root.into(),
+        "the resumed child's notice",
+        |snapshot| {
+            snapshot.family_completions.len() == 2
+                && matches!(
+                    snapshot.family_completions[1].notification,
+                    SubagentNotificationDelivery::Queued
+                )
+                && snapshot.pending_inputs.is_empty()
+                && snapshot.chat_loop.state == LoopState::Idle
+                && tick.executions.load(std::sync::atomic::Ordering::SeqCst) == 1
+        },
+    )
     .await;
     core.shutdown().await;
     let resumed_completion = &parent.family_completions[1];
@@ -4053,7 +4082,7 @@ async fn a_completion_wakes_a_failed_root_without_human_continue() {
     model.timing.release.notify_one();
     let delivered = wait_for_snapshot(
         &core,
-        root,
+        root.into(),
         "automatic notification after failure",
         |snapshot| {
             task_notifications(snapshot).len() == 1
@@ -4094,7 +4123,7 @@ async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_chil
         }
     }
     model.release.notify_one();
-    let delivered = wait_for_snapshot(&core, root, "the child's notice", |snapshot| {
+    let delivered = wait_for_snapshot(&core, root.into(), "the child's notice", |snapshot| {
         snapshot
             .family_completions
             .first()

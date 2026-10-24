@@ -74,7 +74,7 @@ impl ArtifactClient {
             source,
             cached: RwLock::new(None),
             renewal: Mutex::new(()),
-            identity: Uuid::new_v4(),
+            identity: tickloop_ids::generate(),
         }));
         Ok(client)
     }
@@ -94,7 +94,7 @@ impl ArtifactClient {
             source,
             cached: RwLock::new(None),
             renewal: Mutex::new(()),
-            identity: Uuid::new_v4(),
+            identity: tickloop_ids::generate(),
         }));
         client
     }

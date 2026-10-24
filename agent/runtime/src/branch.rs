@@ -6,7 +6,6 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
-use uuid::Uuid;
 
 use super::{Agent, AgentError, Chat, ChatBookkeeping, tool_results::ContentReplacementState};
 use tickloop_agent_protocol::projection;
@@ -152,7 +151,7 @@ impl Agent {
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
             message_models: BTreeMap::new(),
-            chat_loop: LoopSnapshot::new(Uuid::new_v4()),
+            chat_loop: LoopSnapshot::new(tickloop_ids::generate().into()),
             last_sequence: 0,
             permissions: Vec::new(),
             questions: Vec::new(),
@@ -175,7 +174,7 @@ impl Agent {
         let mut bookkeeping = ChatBookkeeping {
             continued_message_ids: source.bookkeeping.continued_message_ids.clone(),
             citation_sources: tickloop_agent_transcript::CitationSourcesEntry {
-                chat_id: child_chat_id,
+                chat_id: child_chat_id.into(),
                 ..source.bookkeeping.citation_sources.clone()
             },
             restored_skill_names: snapshot
@@ -216,7 +215,11 @@ impl Agent {
         let mut permission_context = self.inner.session_permissions.lock().await;
         let mut permission_candidate = permission_context.clone();
         permission_candidate
-            .register_branch(request.source_chat_id, source_loop_id, child_chat_id)
+            .register_branch(
+                request.source_chat_id.into(),
+                source_loop_id.into(),
+                child_chat_id.into(),
+            )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         if let Some(recorder) = &self.inner.recorder
             && let Some(source) = chats.get(&request.source_chat_id)
@@ -251,6 +254,7 @@ impl Agent {
         chats.insert(
             child_chat_id,
             Chat {
+                ids: tickloop_ids::IdContext::new(),
                 family_generation: 0,
                 family_stopping: false,
                 task_checkpoint_pending: false,
@@ -435,7 +439,10 @@ fn carry_citation_results(
                     record,
                     std::slice::from_ref(&messages[*original]),
                 ) {
-                    let alias = *child.message_ids.entry(index).or_insert_with(Uuid::new_v4);
+                    let alias = *child
+                        .message_ids
+                        .entry(index)
+                        .or_insert_with(tickloop_ids::generate);
                     if alias != record.message_id && !record.aliases.contains(&alias) {
                         record.aliases.push(alias);
                     }
@@ -462,7 +469,10 @@ fn carry_citation_results(
             };
             for record in &mut bookkeeping.citation_sources.calls {
                 if result_ids.contains(&record.message_id) && &record.call_id == original_call {
-                    let alias = *child.message_ids.entry(index).or_insert_with(Uuid::new_v4);
+                    let alias = *child
+                        .message_ids
+                        .entry(index)
+                        .or_insert_with(tickloop_ids::generate);
                     record.aliases.push(alias);
                 }
             }
@@ -477,7 +487,7 @@ fn carry_loop(child: &mut ChatSnapshot, source: &ChatSnapshot) {
     child.chat_loop = source.chat_loop.clone();
     // The copy subscribes on its own: a subscription id names one Loop's subscription.
     for subscription in &mut child.chat_loop.subscriptions {
-        subscription.id = Uuid::new_v4();
+        subscription.id = tickloop_ids::generate();
     }
     super::wakeup::recover_loop(child, false, super::WaitHosting::Process);
 }
@@ -846,9 +856,9 @@ fn canonical_directory(path: &std::path::Path) -> Result<PathBuf, AgentError> {
 
 fn unused_chat_id(chats: &std::collections::HashMap<ChatId, Chat>) -> ChatId {
     loop {
-        let id = Uuid::new_v4();
-        if !chats.contains_key(&id) {
-            return id;
+        let id = tickloop_ids::generate();
+        if !chats.contains_key(&tickloop_ids::Id::from(id)) {
+            return id.into();
         }
     }
 }
@@ -858,6 +868,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     use super::*;
     use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
@@ -940,15 +951,15 @@ mod tests {
             match self {
                 Self::ActiveModel => chat.active = Some(CancellationToken::new()),
                 Self::RunningDirectedSummary => chat.active = Some(CancellationToken::new()),
-                Self::ActiveRun => chat.active_run = Some(run_id),
+                Self::ActiveRun => chat.active_run = Some(run_id.into()),
                 Self::ParkedRun => {
                     chat.parked.insert(
-                        run_id,
+                        run_id.into(),
                         super::super::ParkedRun {
                             receipt: tickloop_agent_protocol::Receipt {
                                 chat_id: chat.snapshot.id,
-                                loop_id,
-                                run_id,
+                                loop_id: loop_id.into(),
+                                run_id: run_id.into(),
                             },
                             cancel: CancellationToken::new(),
                             resume: Arc::new(Notify::new()),
@@ -956,7 +967,7 @@ mod tests {
                         },
                     );
                 }
-                Self::ReadyRun => chat.ready_runs.push_back(run_id),
+                Self::ReadyRun => chat.ready_runs.push_back(run_id.into()),
                 Self::PendingClient => chat.pending_client = Some(Arc::new(UnusedModel)),
                 Self::PendingModel => chat.snapshot.pending_model = Some(model_config()),
                 Self::PendingInput => {
@@ -965,8 +976,8 @@ mod tests {
                         .push(tickloop_agent_protocol::PendingInput {
                             receipt: tickloop_agent_protocol::Receipt {
                                 chat_id: chat.snapshot.id,
-                                loop_id,
-                                run_id,
+                                loop_id: loop_id.into(),
+                                run_id: run_id.into(),
                             },
                             input: "queued work".into(),
                             contexts: Vec::new(),
@@ -987,7 +998,7 @@ mod tests {
                         .push(tickloop_agent_protocol::PendingCommand {
                             id: Uuid::new_v4(),
                             chat_id: chat.snapshot.id,
-                            loop_id: Some(loop_id),
+                            loop_id: Some(loop_id.into()),
                             command: "/status".into(),
                             queued_sequence: 1,
                             armed: true,
@@ -999,9 +1010,9 @@ mod tests {
                         .permissions
                         .push(tickloop_agent_protocol::PermissionRequest {
                             id: Uuid::new_v4(),
-                            loop_id,
+                            loop_id: loop_id.into(),
                             execution: tickloop_agent_protocol::PermissionExecution::ToolCall {
-                                run_id,
+                                run_id: run_id.into(),
                                 call_id: "busy-permission".into(),
                             },
                             name: "Bash".into(),
@@ -1018,8 +1029,8 @@ mod tests {
                         .push(tickloop_agent_protocol::QuestionRequest {
                             id: Uuid::new_v4(),
                             chat_id: chat.snapshot.id,
-                            loop_id,
-                            run_id,
+                            loop_id: loop_id.into(),
+                            run_id: run_id.into(),
                             call_id: "busy-question".into(),
                             questions: vec![tickloop_agent_protocol::Question {
                                 question: "Continue?".into(),
@@ -1037,7 +1048,7 @@ mod tests {
                 }
                 Self::Loop(state) => {
                     chat.snapshot.chat_loop.state = state.clone();
-                    chat.snapshot.chat_loop.run_id = Some(run_id);
+                    chat.snapshot.chat_loop.run_id = Some(run_id.into());
                 }
                 Self::AgentShell(state) => {
                     chat.snapshot
@@ -1072,7 +1083,7 @@ mod tests {
                             updated_at_ms: None,
                             id: Uuid::new_v4(),
                             chat_id: chat.snapshot.id,
-                            loop_id: Some(loop_id),
+                            loop_id: Some(loop_id.into()),
                             command: "sleep 30".into(),
                             cwd: chat.snapshot.folder.clone().unwrap(),
                             starts_in_background: false,
@@ -1102,8 +1113,8 @@ mod tests {
                         .push(tickloop_agent_protocol::OperationRecord {
                             task_binding: None,
                             id: Uuid::new_v4(),
-                            loop_id,
-                            run_id,
+                            loop_id: loop_id.into(),
+                            run_id: run_id.into(),
                             call_id: "busy-operation".into(),
                             name: "Bash".into(),
                             input: serde_json::json!({"command": "true"}),
@@ -1120,8 +1131,8 @@ mod tests {
     fn automatic_branch_title_uses_the_first_hundred_prompt_characters_before_its_suffix() {
         let public_seed = vec![BranchPublicItem::Message {
             source: BranchPublicSource {
-                chat_id: Uuid::from_u128(1),
-                run_id: Some(Uuid::from_u128(2)),
+                chat_id: Uuid::from_u128(1).into(),
+                run_id: Some(Uuid::from_u128(2).into()),
                 message_id: None,
                 is_agent_message: false,
             },

@@ -65,7 +65,7 @@ impl Menus {
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id: tickloop_ids::generate(),
                 title: "Judgment settings · Jev (TypeSafe)".into(),
                 context,
                 options,
@@ -85,7 +85,7 @@ impl Menus {
             return Err("Jev (TypeSafe) key entry requires an interactive terminal".into());
         }
         let menu = Menu {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             title: "Jev (TypeSafe) key".into(),
             context: vec![
                 "Enter a key for Judgment. Its contents stay hidden.".into(),

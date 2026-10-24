@@ -484,7 +484,7 @@ impl Agent {
                 }) {
                     chat.bookkeeping.tick_creation_receipts.push(
                         approval_context::TickCreationReceipt {
-                            loop_id: receipt.loop_id,
+                            loop_id: receipt.loop_id.into(),
                             operation_id: operation.id,
                             instance: instance.clone(),
                         },
@@ -500,9 +500,9 @@ impl Agent {
                 .snapshot
                 .message_ids
                 .entry(index)
-                .or_insert_with(Uuid::new_v4);
+                .or_insert_with(tickloop_ids::generate);
             let table = &mut chat.bookkeeping.citation_sources;
-            table.chat_id = receipt.chat_id;
+            table.chat_id = receipt.chat_id.into();
             table.calls.push(tickloop_agent_transcript::CitationCall {
                 call_id: call_id.into(),
                 run_id: receipt.run_id,
@@ -704,7 +704,7 @@ fn append_call_result(
         None => {
             snapshot
                 .message_ids
-                .insert(snapshot.messages.len(), Uuid::new_v4());
+                .insert(snapshot.messages.len(), tickloop_ids::generate());
             snapshot
                 .message_runs
                 .insert(snapshot.messages.len(), run_id);

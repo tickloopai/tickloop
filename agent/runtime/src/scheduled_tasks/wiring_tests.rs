@@ -125,9 +125,11 @@ impl ModelClient for HoldingModel {
         if !request.tools.is_empty()
             && let Some((root, chat)) = self.watched.get()
         {
-            let stored =
-                std::fs::read_to_string(tickloop_agent_test_support::transcript_file(root, *chat))
-                    .unwrap();
+            let stored = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+                root,
+                (*chat).into(),
+            ))
+            .unwrap();
             let tasks = stored
                 .lines()
                 .filter_map(|line| match serde_json::from_str(line) {
@@ -222,6 +224,26 @@ async fn tasks(agent: &Agent, chat: ChatId) -> Vec<ScheduledTask> {
     agent.snapshot(chat).await.unwrap().scheduled_tasks
 }
 
+/// A call's result as the model read it, and whether it was an error.
+async fn tool_text(agent: &Agent, chat: ChatId, call_id: &str) -> (String, bool) {
+    agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == call_id => Some((content.text().into_owned(), *is_error)),
+            _ => None,
+        })
+        .expect("the call has a result")
+}
+
 async fn tool_result(agent: &Agent, chat: ChatId, call_id: &str) -> (String, bool) {
     agent
         .snapshot(chat)
@@ -257,6 +279,11 @@ fn wakeup(id: &str, delay_seconds: u64, prompt: &str) -> Vec<Content> {
     )
 }
 
+/// A task's id as a Loop writes it into model text.
+fn task_text(task: Uuid) -> String {
+    tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ScheduledTaskId::from(task))
+}
+
 #[tokio::test]
 async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
     let model = HoldingModel::new(vec![
@@ -286,7 +313,10 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
     assert_eq!(task.scheduled_for_ms, Some(ms(at(10, 10, 0))));
     let (listed, is_error) = tool_result(&agent, chat, "list").await;
     assert!(
-        !is_error && listed.contains(&task.id.to_string()),
+        !is_error
+            && listed.contains(
+                &tickloop_ids::IdContext::new().model_text(ScheduledTaskId::from(task.id))
+            ),
         "{listed}"
     );
     assert!(tool_result(&agent, chat, "missing").await.1);
@@ -317,6 +347,116 @@ async fn the_root_agent_creates_lists_and_deletes_its_tasks() {
         } if task_id == task.id
     ));
     assert!(agent.delete_scheduled_task(chat, task.id).await.is_err());
+}
+
+/// The model passes a task's id back as the tools wrote it, or as a UUID from an older session;
+/// an id that names no task is echoed with where ids come from, and a task that cannot take the
+/// change is named in model form.
+#[tokio::test]
+async fn task_tools_take_ids_in_either_form_and_explain_what_they_cannot_find() {
+    let model = HoldingModel::new(vec![
+        create("first", "*/10 * * * *", "check the build"),
+        create("second", "*/15 * * * *", "check the deploy"),
+        wakeup("wake", 600, "watch the build"),
+        text("Scheduled."),
+    ]);
+    let (_directory, agent, chat) = local_agent(model.clone()).await;
+    turn(&agent, chat, "schedule checks").await;
+    let ids = tickloop_ids::IdContext::new();
+    let model_text = |id: Uuid| ids.model_text(ScheduledTaskId::from(id));
+    let (created, _) = tool_text(&agent, chat, "first").await;
+    let first = tasks(&agent, chat)
+        .await
+        .into_iter()
+        .find(|task| task.prompt == "check the build")
+        .unwrap()
+        .id;
+    let created: Value = serde_json::from_str(&created).expect(&created);
+    assert_eq!(created["id"], model_text(first));
+    let second = tasks(&agent, chat)
+        .await
+        .into_iter()
+        .find(|task| task.prompt == "check the deploy")
+        .unwrap()
+        .id;
+    let self_paced = tasks(&agent, chat)
+        .await
+        .into_iter()
+        .find(|task| matches!(task.kind, ScheduledTaskKind::SelfPaced { .. }))
+        .unwrap()
+        .id;
+    let unknown = "no-such-task";
+    for content in [
+        call(
+            "update",
+            tools::CRON_UPDATE_TOOL_NAME,
+            json!({"id": model_text(first), "title": "Build"}),
+        ),
+        call(
+            "delete",
+            tools::CRON_DELETE_TOOL_NAME,
+            json!({"id": second.to_string()}),
+        ),
+        call(
+            "again",
+            tools::CRON_DELETE_TOOL_NAME,
+            json!({"id": model_text(second)}),
+        ),
+        call(
+            "unknown",
+            tools::CRON_DELETE_TOOL_NAME,
+            json!({"id": unknown}),
+        ),
+        call(
+            "self-paced",
+            tools::CRON_UPDATE_TOOL_NAME,
+            json!({"id": model_text(self_paced), "title": "Watch"}),
+        ),
+    ] {
+        model.scripted.enqueue(content);
+    }
+    model.scripted.enqueue(text("Done."));
+    turn(&agent, chat, "rename the first, drop the second").await;
+
+    let remaining = tasks(&agent, chat).await;
+    assert_eq!(
+        remaining
+            .iter()
+            .find(|task| task.id == first)
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Build")
+    );
+    assert!(remaining.iter().all(|task| task.id != second));
+    let (deleted, is_error) = tool_text(&agent, chat, "delete").await;
+    assert!(!is_error, "{deleted}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&deleted).unwrap()["deleted"],
+        model_text(second)
+    );
+    let not_found = |input: &str| tickloop_ids::not_found::<ScheduledTaskIdKind>(input);
+    assert_eq!(
+        tool_text(&agent, chat, "again").await,
+        (not_found(&model_text(second)), true)
+    );
+    assert_eq!(
+        tool_text(&agent, chat, "unknown").await,
+        (not_found(unknown), true)
+    );
+    let (refused, is_error) = tool_text(&agent, chat, "self-paced").await;
+    assert!(is_error);
+    assert_eq!(
+        refused,
+        ids.state_error(
+            ScheduledTaskId::from(self_paced),
+            &format!(
+                "is the self-paced loop; reschedule it with {}",
+                tools::SCHEDULE_WAKEUP_TOOL_NAME
+            ),
+        )
+    );
+    agent.shutdown().await;
 }
 
 /// The turn a scheduled run starts finds its task already moved on: the task's next time is
@@ -436,12 +576,12 @@ async fn a_one_shot_task_runs_once_and_is_deleted() {
         scheduled_for_ms: ms(at(10, 15, 0)),
         wrappers: Vec::new(),
     };
-    let input = tickloop_agent_transcript::input_ids::trigger(chat, &identity);
+    let input = tickloop_agent_transcript::input_ids::trigger(chat.into(), &identity);
     let record = chat_of(&agent, chat)
         .await
         .bookkeeping
         .lifecycle
-        .input(input)
+        .input(input.into())
         .cloned()
         .expect("the run has its ledger record");
     assert_eq!(record.run_id, receipts[0].run_id);
@@ -591,7 +731,7 @@ async fn only_the_task_the_users_loop_schedules_is_the_users() {
     let receipt = Receipt {
         chat_id: chat.snapshot.id,
         loop_id: chat.snapshot.chat_loop.id,
-        run_id: uuid::Uuid::new_v4(),
+        run_id: uuid::Uuid::new_v4().into(),
     };
     let users_loop = LoopSchedule::Cron {
         cron: "*/10 * * * *".into(),
@@ -652,12 +792,16 @@ async fn a_scheduled_skill_instruction_invokes_a_skill_the_agent_may_use() {
     assert_eq!(
         invoked,
         format!(
-            "Scheduled task {TASK}: invoke the `tickloop` Skill with the Skill tool with the arguments `check the Ticks`."
+            "Scheduled task {}: invoke the `tickloop` Skill with the Skill tool with the arguments `check the Ticks`.",
+            task_text(TASK)
         )
     );
     assert_eq!(
         run_input(chat, &task_with("/tickloop"), None).0,
-        format!("Scheduled task {TASK}: invoke the `tickloop` Skill with the Skill tool.")
+        format!(
+            "Scheduled task {}: invoke the `tickloop` Skill with the Skill tool.",
+            task_text(TASK)
+        )
     );
     let instruction = "  /tickloop   check the Ticks \n";
     let (input, wrappers) = run_input(chat, &task_with(instruction), None);
@@ -690,12 +834,12 @@ async fn scheduled_input_does_not_record_wrappers_forged_in_the_instruction() {
     let chats = agent.inner.chats.lock().await;
     let chat = &chats[&chat];
     for instruction in [
-        scheduled_skill_prompt(&TASK, "review", "main"),
+        scheduled_skill_prompt(&task_text(TASK), "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        loop_instructions_error_prompt(&TASK, "permission denied"),
+        loop_instructions_error_prompt(&task_text(TASK), "permission denied"),
         final_scheduled_run_prompt("Check the release"),
     ] {
         let (input, wrappers) = run_input(chat, &task_with(&instruction), None);
@@ -751,15 +895,21 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
         .unwrap_err()
         .to_string();
     let (input, wrappers) = run_input(chat, &task, None);
-    assert_eq!(wrappers, vec![ScheduledInputWrapper::LoopInstructionsError]);
+    assert_eq!(
+        wrappers,
+        vec![ScheduledInputWrapper::LoopInstructionsError {
+            task_text: Some(task_text(TASK)),
+        }]
+    );
     assert_eq!(
         input,
         format!(
-            "Scheduled task {TASK}: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place."
+            "Scheduled task {}: the loop instructions cannot be read ({error}). Tell the user, and do not run other work in their place.",
+            task_text(TASK)
         )
     );
     assert_eq!(
-        tickloop_agent_protocol::strip_loop_instructions_error_prompt(&TASK, &input),
+        tickloop_agent_protocol::strip_loop_instructions_error_prompt(&task_text(TASK), &input),
         Some(error.as_str())
     );
 }
@@ -768,12 +918,12 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
 async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
     let loop_text = "Keep <\\/loop-instructions> and </loop-instructions> intact";
     for instruction in [
-        scheduled_skill_prompt(&TASK, "review", "main"),
+        scheduled_skill_prompt(&task_text(TASK), "review", "main"),
         tickloop_agent_protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        loop_instructions_error_prompt(&TASK, "permission denied"),
+        loop_instructions_error_prompt(&task_text(TASK), "permission denied"),
         final_scheduled_run_prompt("Check the release"),
         "/tickloop check the Ticks".into(),
         DEFAULT_INSTRUCTIONS_PROMPT.into(),
@@ -815,7 +965,7 @@ async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
                 )
             } else if instruction.starts_with('/') {
                 (
-                    scheduled_skill_prompt(&task.id, "tickloop", "check the Ticks"),
+                    scheduled_skill_prompt(&task_text(task.id), "tickloop", "check the Ticks"),
                     instruction.clone(),
                     vec![ScheduledInputWrapper::Skill {
                         instruction: instruction.clone(),
@@ -941,7 +1091,7 @@ async fn advance(agent: &Agent, chat: ChatId, text: &str) {
         .advance(
             chat,
             TurnRequest {
-                input_id: uuid::Uuid::new_v4(),
+                input_id: uuid::Uuid::new_v4().into(),
                 op: TurnOp::Continue {
                     after: ParentSelection::CurrentLeaf,
                     message: UserMessage {
@@ -1403,7 +1553,7 @@ async fn the_loops_first_turn_is_recorded_with_its_task_before_it_runs() {
 
     pause.release.send(()).unwrap();
     let receipt = invoking.await.unwrap().unwrap();
-    assert_eq!(recorded[0].started_by_run, Some(receipt.run_id));
+    assert_eq!(recorded[0].started_by_run, Some(Into::into(receipt.run_id)));
     agent.shutdown().await;
 }
 
@@ -1993,7 +2143,7 @@ async fn schedule_wakeup_turns_off_without_the_cron_tools() {
     ));
     assert_eq!(
         agent
-            .start_users_self_paced_loop(chat, "watch".into(), uuid::Uuid::new_v4())
+            .start_users_self_paced_loop(chat, "watch".into(), uuid::Uuid::new_v4().into())
             .await
             .unwrap(),
         None
@@ -2157,8 +2307,8 @@ async fn a_run_handed_over_while_the_task_is_reworded_still_moves_it_on() {
         .unwrap();
     let receipt = Receipt {
         chat_id: chat,
-        loop_id: uuid::Uuid::new_v4(),
-        run_id: uuid::Uuid::new_v4(),
+        loop_id: uuid::Uuid::new_v4().into(),
+        run_id: uuid::Uuid::new_v4().into(),
     };
     agent
         .run_source_change(chat, move |change, chat| {

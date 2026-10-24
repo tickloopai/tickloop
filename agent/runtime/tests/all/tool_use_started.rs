@@ -116,7 +116,7 @@ async fn a_started_tool_use_streams_before_its_commit_and_never_reaches_the_tran
     );
     agent.shutdown().await;
 
-    let transcript = std::fs::read_to_string(transcript_file(&root, chat)).unwrap();
+    let transcript = std::fs::read_to_string(transcript_file(&root, chat.uuid())).unwrap();
     assert!(!transcript.contains("ToolUseStarted"), "{transcript}");
     let requests = model.0.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);

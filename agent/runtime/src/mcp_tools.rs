@@ -1125,7 +1125,7 @@ impl McpHostToolProvider {
             artifact_id: metadata.id,
             content_type,
             bytes: file.bytes,
-            operation_id: uuid::Uuid::new_v4(),
+            operation_id: tickloop_ids::generate(),
             publication: metadata.publication,
         }))
     }
@@ -2338,7 +2338,7 @@ mod upgrade_tests {
             access_token: "fixture".into(),
         };
         original.admit_publication(
-            chat,
+            chat.into(),
             &credential,
             "artifact-a".into(),
             ArtifactAudience::Public,
@@ -2356,7 +2356,12 @@ mod upgrade_tests {
             membership_revision: 7,
         };
         assert_eq!(
-            restored.audience_permission(chat, &credential, "artifact-a", Some(&publication)),
+            restored.audience_permission(
+                chat.into(),
+                &credential,
+                "artifact-a",
+                Some(&publication)
+            ),
             Some(HostToolPermission::ArtifactContinuation)
         );
         for (owner, identity, artifact) in [
@@ -2398,13 +2403,13 @@ mod upgrade_tests {
             ),
         ] {
             assert_eq!(
-                restored.audience_permission(owner, &identity, artifact, Some(&publication)),
+                restored.audience_permission(owner.into(), &identity, artifact, Some(&publication)),
                 Some(HostToolPermission::PublicArtifactWrite)
             );
         }
         assert_eq!(
             restored.audience_permission(
-                chat,
+                chat.into(),
                 &credential,
                 "artifact-a",
                 Some(&ArtifactPublication {

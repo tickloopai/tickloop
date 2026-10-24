@@ -238,7 +238,10 @@ pub(super) struct EventRecovery {
 
 impl EventRecovery {
     pub(super) fn cover(&mut self, execution: ExecutionRef, snapshot: &ChatSnapshot) {
-        let covered = self.covered.entry(snapshot.id).or_insert((execution, 0));
+        let covered = self
+            .covered
+            .entry(snapshot.id.into())
+            .or_insert((execution, 0));
         if covered.0 != execution {
             *covered = (execution, 0);
         }
@@ -247,9 +250,10 @@ impl EventRecovery {
 
     fn covers(&self, event: &Event, references: &HashMap<Uuid, ExecutionRef>) -> bool {
         self.covered
-            .get(&event.chat_id)
+            .get(&event.chat_id.uuid())
             .is_some_and(|(execution, sequence)| {
-                references.get(&event.chat_id) == Some(execution) && event.sequence <= *sequence
+                references.get(&event.chat_id.uuid()) == Some(execution)
+                    && event.sequence <= *sequence
             })
     }
 
@@ -333,22 +337,24 @@ impl Inner {
         let chat = snapshot.conversation.id;
         let mut snapshots = self.snapshots.write().unwrap();
         let mut references = self.references.write().unwrap();
-        if observed_execution.is_some_and(|expected| references.get(&chat) != Some(&expected)) {
+        if observed_execution
+            .is_some_and(|expected| references.get(&chat.uuid()) != Some(&expected))
+        {
             return snapshots
-                .get(&chat)
+                .get(&chat.uuid())
                 .cloned()
                 .map(Box::new)
                 .unwrap_or(snapshot);
         }
-        if let Some(current) = snapshots.get(&chat)
+        if let Some(current) = snapshots.get(&chat.uuid())
             && current.execution == snapshot.execution
             && current.last_sequence > snapshot.last_sequence
         {
             return Box::new(current.clone());
         }
-        references.insert(chat, snapshot.execution);
+        references.insert(chat.into(), snapshot.execution);
         self.remember_status(snapshot.status());
-        snapshots.insert(chat, (*snapshot).clone());
+        snapshots.insert(chat.into(), (*snapshot).clone());
         snapshot
     }
 
@@ -361,17 +367,19 @@ impl Inner {
     ) -> Box<LiveChatStatus> {
         let chat = status.chat.id;
         let mut references = self.references.write().unwrap();
-        if observed_execution.is_some_and(|expected| references.get(&chat) != Some(&expected)) {
+        if observed_execution
+            .is_some_and(|expected| references.get(&chat.uuid()) != Some(&expected))
+        {
             return self
                 .statuses
                 .read()
                 .unwrap()
-                .get(&chat)
+                .get(&chat.uuid())
                 .cloned()
                 .map(Box::new)
                 .unwrap_or(status);
         }
-        references.insert(chat, status.execution);
+        references.insert(chat.into(), status.execution);
         Box::new(self.remember_status(*status))
     }
 
@@ -379,13 +387,13 @@ impl Inner {
     /// kept.
     fn remember_status(&self, status: LiveChatStatus) -> LiveChatStatus {
         let mut statuses = self.statuses.write().unwrap();
-        if let Some(current) = statuses.get(&status.chat.id)
+        if let Some(current) = statuses.get(&status.chat.id.uuid())
             && current.execution == status.execution
             && current.chat.last_sequence > status.chat.last_sequence
         {
             return current.clone();
         }
-        statuses.insert(status.chat.id, status.clone());
+        statuses.insert(status.chat.id.into(), status.clone());
         status
     }
 
@@ -462,7 +470,7 @@ impl EventForwarder {
             covered = self.event_delivery.lock() => covered,
         };
         if covered
-            .get(&event.chat_id)
+            .get(&event.chat_id.uuid())
             .is_some_and(|(scope, sequence)| {
                 *scope == self.execution && event.sequence <= *sequence
             })
@@ -472,8 +480,8 @@ impl EventForwarder {
                 && let Some(sender) = &*inner.recovery_probe.lock().unwrap()
             {
                 let _ = sender.send(super::recovery_tests::RecoveryFact::Skipped {
-                    chat: event.chat_id,
-                    run: event.run_id,
+                    chat: event.chat_id.into(),
+                    run: event.run_id.into(),
                     sequence: event.sequence,
                     completed: matches!(
                         event.kind,
@@ -485,7 +493,7 @@ impl EventForwarder {
         }
         #[cfg(test)]
         let fact = super::recovery_tests::RecoveryFact::Forwarded {
-            chat: event.chat_id,
+            chat: event.chat_id.into(),
             sequence: event.sequence,
         };
         let _ = self.events.send(event);
@@ -566,7 +574,7 @@ impl ConsoleExecution {
             == Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION);
         let view = ViewRef {
             session_id: client.session_id(),
-            view_id: Uuid::new_v4(),
+            view_id: tickloop_ids::generate(),
         };
         let recovery = RecoveringAgentClient::new(
             client,
@@ -742,8 +750,8 @@ impl ConsoleExecution {
         let adapter = EmbeddedAgentAccess::new(core);
         let epoch = adapter.daemon_epoch();
         let view = ViewRef {
-            session_id: Uuid::new_v4(),
-            view_id: Uuid::new_v4(),
+            session_id: tickloop_ids::generate(),
+            view_id: tickloop_ids::generate(),
         };
         let mut launch =
             LaunchSpec::embedded(std::env::current_dir().expect("test current directory"));
@@ -981,7 +989,7 @@ impl ConsoleExecution {
                 _ => {}
             }
         }
-        let command_id = command_id.unwrap_or_else(Uuid::new_v4);
+        let command_id = command_id.unwrap_or_else(tickloop_ids::generate);
         let epoch = self.daemon_epoch();
         let input_target = input_execution(&command);
         if let Some(execution) = input_target.or(match &command {
@@ -1253,7 +1261,7 @@ impl ConsoleExecution {
             if display.view.session_id != recovery.session_id() {
                 display.view = ViewRef {
                     session_id: recovery.session_id(),
-                    view_id: Uuid::new_v4(),
+                    view_id: tickloop_ids::generate(),
                 };
                 display.version = 0;
                 display.execution = None;
@@ -1376,7 +1384,7 @@ impl ConsoleExecution {
                             forwarder.forwarded_through =
                                 forwarder.forwarded_through.max(snapshot.last_sequence);
                             inner.cache_snapshot(snapshot, Some(execution));
-                            let _ = feed_gaps.send(chat);
+                            let _ = feed_gaps.send(chat.into());
                             #[cfg(test)]
                             let _ = inner.facts.send(());
                         }
@@ -1415,11 +1423,11 @@ impl ConsoleExecution {
                                 }
                             }
                             Ok(None) => {
-                                let _ = feed_gaps.send(chat);
+                                let _ = feed_gaps.send(chat.into());
                             }
                             Err(error) => {
                                 *inner.disconnected.lock().unwrap() = Some(error.to_string());
-                                let _ = feed_gaps.send(chat);
+                                let _ = feed_gaps.send(chat.into());
                             }
                         }
                         let Some(inner) = weak.upgrade() else {
@@ -1585,7 +1593,7 @@ impl ConsoleExecution {
             .snapshots
             .read()
             .unwrap()
-            .get(&snapshot.conversation.id)
+            .get(&snapshot.conversation.id.uuid())
             .map(|cached| cached.conversation.goal_history.clone());
         if let Some(history) = cached {
             snapshot.conversation.goal_history = history;
@@ -1600,7 +1608,7 @@ impl ConsoleExecution {
             .observe(ObservationRequest::Transcript {
                 record: TranscriptRef {
                     store_root: root.clone(),
-                    chat_id: snapshot.conversation.id,
+                    chat_id: snapshot.conversation.id.into(),
                 },
                 page: Page {
                     offset: 0,
@@ -1740,7 +1748,7 @@ impl ConsoleExecution {
                     .clone()
                     .into_first_create(self.effective_launch(), workdir);
                 let epoch = self.daemon_epoch();
-                let command_id = Uuid::new_v4();
+                let command_id = tickloop_ids::generate();
                 let outcome = self
                     .send_create(epoch, command_id, replay.launch.clone())
                     .await;
@@ -1810,7 +1818,7 @@ impl ConsoleExecution {
                 }
             };
             let epoch = self.daemon_epoch();
-            let command_id = Uuid::new_v4();
+            let command_id = tickloop_ids::generate();
             match self
                 .send(
                     epoch,
@@ -1865,7 +1873,7 @@ impl ConsoleExecution {
                 let chat = snapshot.conversation.id;
                 let execution = snapshot.execution;
                 self.inner.cache_snapshot(snapshot, None);
-                Ok((chat, execution))
+                Ok((chat.into(), execution))
             }
             CommandOutcome::Refused {
                 error,
@@ -2656,7 +2664,7 @@ impl ConsoleExecution {
         let execution = snapshot.execution;
         self.inner.cache_snapshot(snapshot, None);
         self.watch(execution).await?;
-        Ok((chat, submitted))
+        Ok((chat.into(), submitted))
     }
     pub(super) async fn accept_created(&self, receipt: CommandReceipt) -> CreationAcceptance {
         let result = match receipt.into_result() {
@@ -2950,7 +2958,7 @@ impl ConsoleExecution {
             .access
             .execute(CommandEnvelope {
                 daemon_epoch: self.daemon_epoch(),
-                command_id: Uuid::new_v4(),
+                command_id: tickloop_ids::generate(),
                 command: AgentCommand::Configure {
                     execution,
                     change,
@@ -3542,7 +3550,7 @@ impl ConsoleExecution {
     ) -> Result<BranchOutcome, AccessError> {
         match self
             .history(
-                request.source_chat_id,
+                request.source_chat_id.into(),
                 HistoryAction::Branch { name: request.name },
                 Some(request.request_id),
             )
@@ -3558,8 +3566,8 @@ impl ConsoleExecution {
             } => {
                 self.inner.cache_snapshot(snapshot.clone(), None);
                 Ok(BranchOutcome {
-                    source_chat_id,
-                    child_chat_id,
+                    source_chat_id: source_chat_id.into(),
+                    child_chat_id: child_chat_id.into(),
                     name,
                     snapshot: snapshot.into_snapshot(),
                     session_permissions,
@@ -3984,7 +3992,7 @@ impl ConsoleExecution {
         chat: Uuid,
         text: String,
     ) -> Result<Uuid, AccessError> {
-        let mut action = super::parse_after_turn(self, chat, &text).await?;
+        let mut action = super::parse_after_turn(self, chat.into(), &text).await?;
         if let AfterTurnAction::Submit { origin, .. } = &mut action {
             *origin = self.origin();
         }
@@ -4168,7 +4176,14 @@ mod tests {
             AccessErrorCode::VersionConflict
         );
         assert!(model.requests.lock().unwrap().is_empty());
-        assert!(runtime.snapshot(chat).await.unwrap().messages.is_empty());
+        assert!(
+            runtime
+                .snapshot(chat.into())
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
 
         let mut events = runtime.subscribe();
         let accepted = terminal
@@ -4198,7 +4213,7 @@ mod tests {
         assert_eq!(terminal.daemon_epoch(), epoch);
         assert_eq!(accepted.chat_id, chat);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
-        let snapshot = runtime.snapshot(chat).await.unwrap();
+        let snapshot = runtime.snapshot(chat.into()).await.unwrap();
         assert_eq!(snapshot.chat_loop.id, accepted.loop_id);
         assert_eq!(
             snapshot
@@ -4241,13 +4256,18 @@ mod tests {
             }]
         }
 
-        fn permission(&self, _: Uuid, _: &str, _: &Value) -> HostToolPermission {
+        fn permission(
+            &self,
+            _: tickloop_agent_protocol::ChatId,
+            _: &str,
+            _: &Value,
+        ) -> HostToolPermission {
             HostToolPermission::ReadOnly
         }
 
         async fn prepare_call_in_scope(
             &self,
-            chat: Uuid,
+            chat: tickloop_agent_protocol::ChatId,
             scope: &HostCallScope<'_>,
             name: &str,
             input: &Value,
@@ -4267,7 +4287,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _: Uuid,
+            _: tickloop_agent_protocol::ChatId,
             _: &str,
             input: Value,
             _: CancellationToken,
@@ -4437,7 +4457,14 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("frame"), "{message}");
         assert!(!message.contains("unknown acceptance"), "{message}");
-        assert!(runtime.snapshot(chat).await.unwrap().messages.is_empty());
+        assert!(
+            runtime
+                .snapshot(chat.into())
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
         assert!(model.requests.lock().unwrap().is_empty());
         let mut events = runtime.subscribe();
         terminal
@@ -4754,7 +4781,10 @@ mod tests {
             Some(&Traffic::Command),
             "the change went out without reading the Chat again"
         );
-        assert_eq!(runtime.snapshot(chat).await.unwrap().policy.mode, mode);
+        assert_eq!(
+            runtime.snapshot(chat.into()).await.unwrap().policy.mode,
+            mode
+        );
         runtime.shutdown().await;
     }
 
@@ -4830,7 +4860,7 @@ mod tests {
             ),
             "{replayed:?}"
         );
-        let created = runtime.snapshot(chat).await.unwrap();
+        let created = runtime.snapshot(chat.into()).await.unwrap();
         assert_eq!(created.model.model_id, second.model_id);
         assert_eq!(created.reasoning_effort, high);
         runtime.shutdown().await;
@@ -4883,7 +4913,7 @@ mod tests {
         assert_eq!(creates(&access), 1);
         assert!(!terminal.first_create_pending(chat));
         assert_eq!(
-            runtime.snapshot(chat).await.unwrap().policy.mode,
+            runtime.snapshot(chat.into()).await.unwrap().policy.mode,
             ExecutionMode::Plan,
             "the staged mode still applies after the late attach"
         );
@@ -4922,7 +4952,7 @@ mod tests {
             vec![chat]
         );
         assert_eq!(
-            runtime.snapshot(chat).await.unwrap().policy.mode,
+            runtime.snapshot(chat.into()).await.unwrap().policy.mode,
             ExecutionMode::Plan
         );
         runtime.shutdown().await;
@@ -5075,7 +5105,7 @@ mod tests {
         else {
             panic!("the refused mode is reported against the created Agent");
         };
-        let snapshot = runtime.snapshot(chat).await.unwrap();
+        let snapshot = runtime.snapshot(chat.into()).await.unwrap();
         assert_ne!(snapshot.policy.mode, ExecutionMode::Plan);
         assert!(
             terminal.submit(chat, "too early".into()).await.is_err(),
@@ -5200,7 +5230,7 @@ mod tests {
             ),
             (1, 1, 1, 1, 1)
         );
-        let snapshot = runtime.snapshot(chat).await.unwrap();
+        let snapshot = runtime.snapshot(chat.into()).await.unwrap();
         assert_eq!(snapshot.policy.mode, ExecutionMode::Plan);
         assert_eq!(
             snapshot.additional_directories,
@@ -5258,7 +5288,7 @@ mod tests {
         };
         assert_eq!(creates(&access), 2);
         assert_eq!(
-            runtime.snapshot(chat).await.unwrap().policy.mode,
+            runtime.snapshot(chat.into()).await.unwrap().policy.mode,
             ExecutionMode::Plan
         );
         runtime.shutdown().await;
@@ -5622,7 +5652,7 @@ mod tests {
             None,
         );
         terminal.use_user_settings(Some(view_settings.clone()));
-        let target = ConfigTarget::Agent(chat);
+        let target = ConfigTarget::Agent(chat.into());
         assert!(
             !terminal
                 .configuration(target)
@@ -5641,7 +5671,11 @@ mod tests {
         agent_settings.save_task_tools_enabled(true).unwrap();
         view_settings.save_task_tools_enabled(false).unwrap();
         assert!(
-            !terminal.status(chat).await.unwrap().task_tools_enabled,
+            !terminal
+                .status(chat.into())
+                .await
+                .unwrap()
+                .task_tools_enabled,
             "ordinary status does not read the settings store"
         );
         assert!(

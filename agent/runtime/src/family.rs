@@ -344,7 +344,7 @@ impl Agent {
             return None;
         };
         let chat_loop = &snapshot.chat_loop;
-        let result = crate::handback::completion_text(snapshot, child.run_id);
+        let result = crate::handback::completion_text(snapshot, child.run_id.into());
         let error = snapshot.events.iter().rev().find_map(|event| {
             if event.run_id == child.run_id
                 && let EventKind::Failed(error) = &event.kind
@@ -482,11 +482,11 @@ impl Agent {
         parent: ChatId,
         child: &Receipt,
     ) -> Result<Option<tickloop_agent_protocol::ToolResult>, String> {
-        let (completion, delegation) = {
+        let (completion, delegation, ids) = {
             let chats = self.inner.chats.lock().await;
-            let Some(completion) = chats
-                .get(&parent)
-                .ok_or("parent is unavailable")?
+            let parent_chat = chats.get(&parent).ok_or("parent is unavailable")?;
+            let ids = parent_chat.ids;
+            let Some(completion) = parent_chat
                 .snapshot
                 .family_completions
                 .iter()
@@ -502,13 +502,14 @@ impl Agent {
                 .get(&child.chat_id)
                 .and_then(|chat| chat.snapshot.delegation.clone())
                 .ok_or("child Agent is unavailable")?;
-            (completion, delegation)
+            (completion, delegation, ids)
         };
         let registration = self
             .subagent_registration(child.chat_id)
             .await
             .map_err(|error| error.to_string())?;
         Ok(agent_messages::child_run_result(
+            &ids,
             &completion,
             &delegation,
             registration.as_ref(),
@@ -534,6 +535,7 @@ pub(super) fn resolve_subagent_wait(
         return;
     };
     let Some(tool) = agent_messages::child_run_result(
+        &parent.ids,
         completion,
         delegation,
         Some(registration),
@@ -594,7 +596,9 @@ pub(super) fn prune_family_completions(snapshot: &mut ChatSnapshot) {
             || latest_of_loop.contains(&completion.child_run_id)
             || match completion.notification {
                 SubagentNotificationDelivery::Pending => true,
-                SubagentNotificationDelivery::Queued => queued.contains(&completion.child_run_id),
+                SubagentNotificationDelivery::Queued => {
+                    queued.contains(&completion.child_run_id.uuid())
+                }
                 _ => false,
             };
         index += 1;
@@ -648,9 +652,9 @@ impl Agent {
         let receipt = Receipt {
             chat_id,
             loop_id,
-            run_id: Uuid::nil(),
+            run_id: Uuid::nil().into(),
         };
-        let owner = PermissionOwner::new(chat_id, loop_id)
+        let owner = PermissionOwner::new(chat_id.into(), loop_id.into())
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         for prepared in &admission.reads {
             if !prepared.in_workspace {
@@ -673,7 +677,7 @@ impl Agent {
             let decision = sessions.evaluate(owner, &operation).decision;
             if snapshot
                 .policy
-                .decide_with_session(prepared, &workspace, loop_id, decision)
+                .decide_with_session(prepared, &workspace, loop_id.into(), decision)
                 != Decision::Allow
             {
                 return Err(AgentError::Invalid(
@@ -834,7 +838,7 @@ fn notification_receipt(snapshot: &ChatSnapshot) -> Receipt {
     Receipt {
         chat_id: snapshot.id,
         loop_id: snapshot.chat_loop.id,
-        run_id: snapshot.chat_loop.run_id.unwrap_or(Uuid::nil()),
+        run_id: snapshot.chat_loop.run_id.unwrap_or(Uuid::nil().into()),
     }
 }
 
@@ -848,7 +852,7 @@ mod state_tests {
             run_id,
             run_started_at: Some(100),
             state_since: Some(200),
-            ..LoopSnapshot::new(Uuid::new_v4())
+            ..LoopSnapshot::new(Uuid::new_v4().into())
         }
     }
 
@@ -897,7 +901,7 @@ mod state_tests {
             summary_state(&idle, &[shell(UserShellState::Running)]),
             LoopState::Running
         );
-        let ran = chat_loop(LoopState::Idle, Some(Uuid::new_v4()));
+        let ran = chat_loop(LoopState::Idle, Some(Uuid::new_v4().into()));
         assert_eq!(
             summary_state(&ran, &[shell(UserShellState::Failed)]),
             LoopState::Idle

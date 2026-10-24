@@ -57,7 +57,7 @@ impl Console {
         }
         let request = SuggestionRequest {
             chat,
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             cancel: CancellationToken::new(),
         };
         state.prompt_suggestion_request = Some(request.clone());

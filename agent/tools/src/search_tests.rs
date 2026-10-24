@@ -18,7 +18,14 @@ fn workspace(path: &Path) -> Workspace {
 async fn run(directory: &Path, name: &str, input: Value) -> Result<String, ToolError> {
     let output = tempfile::tempdir().unwrap();
     let tools = Tools::new(output.path().join("chat-output"));
-    let prepared = tools.prepare(&workspace(directory), name, &input).await?;
+    let prepared = tools
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace(directory),
+            name,
+            &input,
+        )
+        .await?;
     let result = tools.execute(prepared, CancellationToken::new()).await?;
     assert!(!result.is_error);
     assert!(result.output_ref.is_none());
@@ -553,7 +560,12 @@ async fn searches_outside_the_workspace_need_approval_and_inside_run_without_it(
 
     for name in [GLOB_TOOL_NAME, GREP_TOOL_NAME] {
         let inside = tools
-            .prepare(&workspace, name, &json!({"pattern":"notes"}))
+            .prepare(
+                &tickloop_ids::IdContext::new(),
+                &workspace,
+                name,
+                &json!({"pattern":"notes"}),
+            )
             .await
             .unwrap();
         assert!(inside.is_read_only && inside.in_workspace);
@@ -565,6 +577,7 @@ async fn searches_outside_the_workspace_need_approval_and_inside_run_without_it(
 
         let elsewhere = tools
             .prepare(
+                &tickloop_ids::IdContext::new(),
                 &workspace,
                 name,
                 &json!({"pattern":"notes","path":outside.path()}),
@@ -576,6 +589,7 @@ async fn searches_outside_the_workspace_need_approval_and_inside_run_without_it(
     }
     let absolute_pattern = tools
         .prepare(
+            &tickloop_ids::IdContext::new(),
             &workspace,
             GLOB_TOOL_NAME,
             &json!({"pattern": format!("{}/*.txt", outside.path().display())}),
@@ -594,6 +608,7 @@ async fn searches_outside_the_workspace_need_approval_and_inside_run_without_it(
     ] {
         let outside_listing = tools
             .prepare(
+                &tickloop_ids::IdContext::new(),
                 &workspace,
                 name,
                 &json!({"pattern":pattern,"path":outside.path()}),
@@ -623,6 +638,7 @@ async fn a_cancelled_search_stops_without_a_result() {
     for name in [GLOB_TOOL_NAME, GREP_TOOL_NAME] {
         let prepared = tools
             .prepare(
+                &tickloop_ids::IdContext::new(),
                 &workspace(directory.path()),
                 name,
                 &json!({"pattern":"notes"}),

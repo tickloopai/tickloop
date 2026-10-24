@@ -320,7 +320,9 @@ async fn a_host_created_task_that_cannot_run_is_refused() {
     }
     assert!(tasks(&agent, chat).await.is_empty());
     assert!(matches!(
-        agent.schedule_task(Uuid::new_v4(), daily_digest()).await,
+        agent
+            .schedule_task(tickloop_ids::Id::from(Uuid::new_v4()), daily_digest())
+            .await,
         Err(AgentError::NotFound)
     ));
     agent.shutdown().await;
@@ -400,7 +402,8 @@ async fn every_host_action_finds_the_task_by_its_id() {
         Err(AgentError::ScheduledTaskNotFound)
     ));
     assert!(matches!(
-        next.delete_scheduled_task(Uuid::new_v4(), missing).await,
+        next.delete_scheduled_task(tickloop_ids::Id::from(Uuid::new_v4()), missing)
+            .await,
         Err(AgentError::NotFound)
     ));
     next.shutdown().await;
@@ -844,8 +847,11 @@ async fn a_transcript_with_eight_character_task_ids_still_loads() {
             .iter()
             .any(|line| matches!(line, Line::ScheduledTasks(_)))
     );
-    let expected =
-        tickloop_agent_protocol::legacy_scheduled_task_id(chat, "0a1b2c3d", task.created_at_ms);
+    let expected = tickloop_agent_protocol::legacy_scheduled_task_id(
+        chat.uuid(),
+        "0a1b2c3d",
+        task.created_at_ms,
+    );
     for _ in 0..2 {
         let image = Arc::new(InMemoryTranscriptStore::new());
         image.seed(chat, legacy.clone(), position);
@@ -1165,7 +1171,10 @@ async fn cron_update_refuses_what_cron_create_would_and_missing_tasks() {
     );
     let (foreign, is_error) = call_result(&agent, chat, "foreign").await;
     assert!(
-        is_error && foreign.contains("does not exist or was deleted"),
+        is_error
+            && foreign.contains(&tickloop_ids::not_found::<
+                tickloop_agent_protocol::ScheduledTaskIdKind,
+            >(&elsewhere.id.to_string())),
         "{foreign}"
     );
     let (nothing, is_error) = call_result(&agent, chat, "nothing").await;
@@ -1183,7 +1192,10 @@ async fn cron_update_refuses_what_cron_create_would_and_missing_tasks() {
     complete_turn(&agent, chat, "Change the deleted one.").await;
     let (deleted, is_error) = call_result(&agent, chat, "deleted").await;
     assert!(
-        is_error && deleted.contains("does not exist or was deleted"),
+        is_error
+            && deleted.contains(&tickloop_ids::not_found::<
+                tickloop_agent_protocol::ScheduledTaskIdKind,
+            >(&task.id.to_string())),
         "{deleted}"
     );
     agent.shutdown().await;

@@ -5,11 +5,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tickloop_ids::IdContext;
 use uuid::Uuid;
 
 use crate::{
-    ChatId, HostCallContext, HostToolAuthority, InputContext, LoopId, LoopState, PermissionPolicy,
-    RunId, SessionPermissionDenial, ToolResult, Usage,
+    AgentMessageId, ChatId, HostCallContext, HostToolAuthority, InputContext, LoopId, LoopState,
+    MessageChainId, PermissionPolicy, RunId, SessionPermissionDenial, ToolResult, Usage,
 };
 
 pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
@@ -91,6 +92,30 @@ pub struct MessageCause {
     pub chain_id: Uuid,
     pub depth: u8,
     pub reply_to: Option<Uuid>,
+}
+
+impl AgentMessageSource {
+    /// The source as the receiving model reads it: the record with its Tickloop ids in the
+    /// Loop's model form.
+    pub fn model_json(&self, ids: &IdContext) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("AgentMessageSource is serializable");
+        value["message_id"] = ids.model_text(AgentMessageId::from(self.message_id)).into();
+        value["sender_chat_id"] = ids.model_text(self.sender_chat_id).into();
+        value["sender_loop_id"] = ids.model_text(self.sender_loop_id).into();
+        value["sender_run_id"] = ids.model_text(self.sender_run_id).into();
+        value["cause"]["chain_id"] = ids
+            .model_text(MessageChainId::from(self.cause.chain_id))
+            .into();
+        value["cause"]["reply_to"] = self
+            .cause
+            .reply_to
+            .map(|reply_to| ids.model_text(AgentMessageId::from(reply_to)))
+            .into();
+        if let Some(relay) = &self.relay {
+            value["relay"]["original_chat_id"] = ids.model_text(relay.original_chat_id).into();
+        }
+        value
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

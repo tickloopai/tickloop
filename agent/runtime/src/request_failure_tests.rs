@@ -138,8 +138,8 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
     let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = Receipt {
         chat_id,
-        loop_id: Uuid::new_v4(),
-        run_id: Uuid::new_v4(),
+        loop_id: Uuid::new_v4().into(),
+        run_id: Uuid::new_v4().into(),
     };
     let cancel = CancellationToken::new();
     {

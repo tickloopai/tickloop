@@ -164,9 +164,9 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
             })
             .unwrap();
         let receipt = Receipt {
-            chat_id: entry.chat_id,
-            loop_id: entry.loop_id.unwrap(),
-            run_id: entry.run_id.unwrap(),
+            chat_id: entry.chat_id.into(),
+            loop_id: entry.loop_id.unwrap().into(),
+            run_id: entry.run_id.unwrap().into(),
         };
         let (restored, warnings) = super::restore_chain(&loaded.chain);
         assert!(warnings.is_empty());
@@ -174,14 +174,15 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
             entry.model.as_ref().unwrap().requested_model,
             llm_config.model
         );
-        let mut snapshot = empty_snapshot(entry.chat_id, entry.cwd.clone(), llm_config.clone());
+        let mut snapshot =
+            empty_snapshot(entry.chat_id.into(), entry.cwd.clone(), llm_config.clone());
         let mut bookkeeping = ChatBookkeeping::default();
         restored.fill_conversation(&mut snapshot, &mut bookkeeping);
         assert!(snapshot.message_compactions.is_empty());
         snapshot.policy.mode = ExecutionMode::Auto;
         let prepared = provider
             .prepare_call(
-                entry.chat_id,
+                entry.chat_id.into(),
                 "ArtifactEdit",
                 &original,
                 CancellationToken::new(),
@@ -226,6 +227,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                 .as_deref()
                 .expect("the replayed Chat has a Folder");
             let mut context = approval_context::capture(
+                &tickloop_ids::IdContext::new(),
                 &snapshot,
                 &bookkeeping,
                 &operation,

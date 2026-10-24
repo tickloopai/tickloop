@@ -419,7 +419,10 @@ fn chat_id_opens_the_exact_chat_identity() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("Chat: {chat_id}")));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
+        "Chat: {}",
+        tickloop_ids::base62::encode(chat_id.parse().unwrap())
+    )));
 }
 
 #[tokio::test]
@@ -2972,7 +2975,15 @@ fn chat_ids(output: &std::process::Output) -> Vec<String> {
         .collect()
 }
 
+/// The stored form of a Chat id the Console printed.
+fn stored_chat(chat: &str) -> String {
+    tickloop_ids::base62::decode_either(chat)
+        .expect("the Console prints Chat ids")
+        .to_string()
+}
+
 fn saved_transcript(directory: &std::path::Path, chat: &str) -> std::path::PathBuf {
+    let chat = stored_chat(chat);
     std::fs::read_dir(directory.join("config-root").join("projects"))
         .unwrap()
         .map(|project| project.unwrap().path().join(format!("{chat}.jsonl")))
@@ -3111,8 +3122,10 @@ async fn resume_picker_and_fork_session_open_a_chat_created_by_another_process()
     let not_found = run_with_config(directory.path(), &["--resume", &missing], "").await;
     assert!(!not_found.status.success());
     assert!(
-        String::from_utf8_lossy(&not_found.stderr)
-            .contains(&format!("No conversation found with Chat ID: {missing}"))
+        String::from_utf8_lossy(&not_found.stderr).contains(&format!(
+            "No conversation found with Chat ID: {}",
+            tickloop_ids::base62::encode(missing.parse().unwrap())
+        ))
     );
     let requests = tokio::time::timeout(INTERACTION_TIMEOUT, server)
         .await
@@ -3215,11 +3228,11 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
         .collect::<Vec<_>>();
     assert_eq!(chats.len(), 2, "{transcript:?}");
     assert_ne!(chats[0], chats[1]);
-    let short_source = chats[0].replace('-', "")[..8].to_owned();
+    let source = chats[0];
     assert!(
         transcript
             .iter()
-            .any(|line| { *line == format!("Background Chat {short_source} · interrupted") }),
+            .any(|line| { *line == format!("Background Chat {source} · interrupted") }),
         "the stopped command must be reported only as a background notice: {transcript:?}"
     );
     assert!(
@@ -3273,7 +3286,7 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
         .unwrap();
     let first_chat = next_chat_line(&mut output).await;
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while registered_chat(&registration).as_deref() != Some(first_chat.as_str())
+        while registered_chat(&registration).as_deref() != Some(stored_chat(&first_chat).as_str())
             || stale.exists()
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3300,7 +3313,8 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
     let second_chat = next_chat_line(&mut output).await;
     assert_ne!(second_chat, first_chat);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while registered_chat(&registration).as_deref() != Some(second_chat.as_str()) {
+        while registered_chat(&registration).as_deref() != Some(stored_chat(&second_chat).as_str())
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -3428,7 +3442,7 @@ async fn a_background_chat_permission_request_is_announced_and_answered_by_reque
     })
     .await;
     release.send(()).unwrap();
-    let original_label = format!("Background Chat {}", &original_chat.replace('-', "")[..8]);
+    let original_label = format!("Background Chat {original_chat}");
     let notice = wait_for_line(&mut output, &mut transcript, |line| {
         line.starts_with(&format!("{original_label} · permission request "))
     })
@@ -3607,7 +3621,7 @@ async fn a_background_permission_answered_during_a_partial_foreground_reply_gets
         .read_until(|text| text.contains("Foreground reply"))
         .await;
     release_tool.send(()).unwrap();
-    let original_label = format!("Background Chat {}", &original_chat.replace('-', "")[..8]);
+    let original_label = format!("Background Chat {original_chat}");
     let request_notice = format!("{original_label} · permission request ");
     let notice = output.line_containing(&request_notice).await;
     let request_id = notice

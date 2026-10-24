@@ -250,8 +250,9 @@ pub(super) fn trigger_ledger(
         | TriggerSource::GoalContinuation { .. }
         | TriggerSource::ScheduledTask { .. } => {
             // The id is named by the delivery's whole identity, so the payload is the id itself.
-            let id = tickloop_agent_transcript::input_ids::trigger(chat_id, &source.identity());
-            lifecycle::LedgerInput::new(id, InputOp::Trigger, &id)
+            let id =
+                tickloop_agent_transcript::input_ids::trigger(chat_id.into(), &source.identity());
+            lifecycle::LedgerInput::new(id.into(), InputOp::Trigger, &id)
         }
     }
 }
@@ -484,7 +485,9 @@ impl Agent {
         chat.bookkeeping.lifecycle.record_settled(
             ledger,
             into,
-            SettledOutcome::Merged { into: into.run_id },
+            SettledOutcome::Merged {
+                into: into.run_id.into(),
+            },
             Some(tickloop_agent_transcript::TriggerRecord::of(source)),
         );
     }
@@ -697,7 +700,14 @@ impl Agent {
                     .iter()
                     .any(|pending| pending.trigger_source.is_some());
             (
-                chat.bookkeeping.lifecycle.delivered_tick_sequences(),
+                chat.bookkeeping
+                    .lifecycle
+                    .delivered_tick_sequences()
+                    .into_iter()
+                    .map(|(subscription, (sequence, input))| {
+                        (subscription, (sequence, input.uuid()))
+                    })
+                    .collect(),
                 takes_waiting_input,
             )
         };
@@ -1116,7 +1126,8 @@ impl Agent {
         if let Some(next) = self.next_run(chat_id).await? {
             self.run_task(next);
         } else {
-            self.continue_goal(chat_id, Uuid::new_v4()).await;
+            self.continue_goal(chat_id, tickloop_ids::generate().into())
+                .await;
         }
         Ok(())
     }
@@ -1443,8 +1454,8 @@ mod tests {
         let chat = Uuid::new_v4();
         let same = |left: &TriggerSource, right: &TriggerSource| {
             let (left, right) = (
-                trigger_ledger(chat, left, "first rendering"),
-                trigger_ledger(chat, right, "second rendering"),
+                trigger_ledger(chat.into(), left, "first rendering"),
+                trigger_ledger(chat.into(), right, "second rendering"),
             );
             left.id == right.id && left.digest == right.digest
         };

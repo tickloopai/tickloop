@@ -146,7 +146,7 @@ impl State {
             return false;
         }
         let mut submission = DelayedSubmission {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat: self.chat,
             owner: self.input_owner,
             history_session: self.history_session.clone(),
@@ -184,7 +184,7 @@ impl State {
         submission.restored_contexts = std::mem::take(&mut self.restored_contexts);
         submission.retry_of = self.retry_of.take();
         self.editor.replace_draft(String::new(), 0);
-        self.input_owner = Uuid::new_v4();
+        self.input_owner = tickloop_ids::generate();
         self.completion.dismiss();
         self.file_mentions.dismiss();
         self.file_mentions.update_at("", 0, 15);
@@ -452,7 +452,7 @@ mod tests {
         let chat = Uuid::new_v4();
         state.queued_inputs.push(QueuedInput {
             id: Uuid::new_v4(),
-            chat_id: chat,
+            chat_id: chat.into(),
             loop_id: None,
             kind: QueuedInputKind::Message,
             text: "native queued".into(),

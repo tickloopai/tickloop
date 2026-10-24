@@ -164,7 +164,7 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
         tickloop_agent_model::GenerationBudget::new(1_024, std::time::Duration::from_secs(10))
             .complete(
                 &client,
-                Uuid::new_v4(),
+                Uuid::new_v4().into(),
                 tickloop_agent_model::ModelRequest {
                     history_sources: vec![],
                     messages: conversation(),

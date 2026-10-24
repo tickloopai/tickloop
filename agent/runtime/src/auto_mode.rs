@@ -2,6 +2,8 @@
 //! `denialTracking.ts`, per-tool `toAutoClassifierInput`, and auto-mode messages in `utils/messages.ts`.
 
 use serde_json::json;
+use tickloop_agent_protocol::model_ids::model_json_text;
+use tickloop_ids::IdContext;
 
 use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{Classification, RuleVerdict};
@@ -60,7 +62,11 @@ fn system_prompt(stage: ApprovalStage, truncated: bool) -> String {
 }
 
 /// Serializes the trusted snapshot, already fitted to the reviewer, for the isolated LLM reviewer.
-pub(super) fn classifier_request(context: &ApprovalSnapshot, stage: ApprovalStage) -> ModelRequest {
+pub(super) fn classifier_request(
+    ids: &IdContext,
+    context: &ApprovalSnapshot,
+    stage: ApprovalStage,
+) -> ModelRequest {
     let schema = classifier_schema(&context.auto_policy);
     ModelRequest {
         history_sources: Vec::new(),
@@ -74,7 +80,10 @@ pub(super) fn classifier_request(context: &ApprovalSnapshot, stage: ApprovalStag
             Message {
                 role: Role::User,
                 content: vec![Content::Text {
-                    text: serde_json::to_string(context).expect("approval context serializes"),
+                    text: model_json_text(
+                        ids,
+                        &serde_json::to_string(context).expect("approval context serializes"),
+                    ),
                 }],
             },
         ],
@@ -323,7 +332,7 @@ mod tests {
 
     fn empty_snapshot() -> ChatSnapshot {
         super::super::empty_snapshot(
-            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4().into(),
             Some("/work".into()),
             ModelConfig {
                 provider: tickloop_agent_protocol::ModelProvider::Api,
@@ -489,9 +498,9 @@ mod tests {
         let mut snapshot = empty_snapshot();
         let loop_id = uuid::Uuid::new_v4();
         let run_id = uuid::Uuid::new_v4();
-        snapshot.message_runs.insert(0, run_id);
+        snapshot.message_runs.insert(0, run_id.into());
         let mut bookkeeping = super::super::ChatBookkeeping::default();
-        bookkeeping.run_loops.insert(run_id, loop_id);
+        bookkeeping.run_loops.insert(run_id.into(), loop_id.into());
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
         snapshot
             .prompt_execution_modes
@@ -528,8 +537,8 @@ mod tests {
         let operation = tickloop_agent_protocol::OperationRecord {
             task_binding: None,
             id: uuid::Uuid::new_v4(),
-            loop_id,
-            run_id,
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             call_id: "2".into(),
             name: "Bash".into(),
             input: json!({"command":"rm -rf src"}),
@@ -538,6 +547,7 @@ mod tests {
             result: None,
         };
         let context = super::super::approval_context::capture(
+            &tickloop_ids::IdContext::new(),
             &snapshot,
             &bookkeeping,
             &operation,
@@ -548,6 +558,7 @@ mod tests {
         )
         .unwrap();
         let request = classifier_request(
+            &tickloop_ids::IdContext::new(),
             &context,
             tickloop_agent_protocol::ApprovalStage::Authorization,
         );
@@ -569,6 +580,7 @@ mod tests {
         );
         assert_eq!(request.temperature, Some(0.0));
         let schema = classifier_request(
+            &tickloop_ids::IdContext::new(),
             &context,
             tickloop_agent_protocol::ApprovalStage::Authorization,
         )

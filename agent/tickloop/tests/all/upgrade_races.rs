@@ -272,9 +272,9 @@ fn seed_queued_tick(checkpoint: &mut Value) -> Uuid {
     let queued_sequence = snapshot["last_queue_sequence"].as_u64().unwrap() + 1;
     let pending = PendingInput {
         receipt: Receipt {
-            chat_id,
-            loop_id,
-            run_id,
+            chat_id: chat_id.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
         },
         input: QUEUED_MARKER.into(),
         contexts: Vec::new(),

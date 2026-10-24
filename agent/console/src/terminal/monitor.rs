@@ -1732,7 +1732,7 @@ pub(super) struct MonitorDetail {
 impl MonitorDetail {
     pub(super) fn new(chat: uuid::Uuid, entry: MonitorEntry) -> Self {
         Self {
-            id: uuid::Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat,
             entry,
         }
@@ -1743,7 +1743,7 @@ impl MonitorDetail {
 pub(super) fn member_facts(entry: &MonitorEntry, now_ms: u64) -> Vec<String> {
     let mut facts = vec![
         super::safe_line(&entry.title),
-        format!("Instance  {}", super::safe_line(entry.instance.as_str())),
+        format!("Instance  {}", super::safe_line(&entry.instance.public())),
         format!("Kind      {}", entry.kind),
         format!("State     {}", entry.state_label()),
         format!("Owner     {}", entry.owner.label()),
@@ -3104,7 +3104,7 @@ mod rebuild_benchmarks {
 
     fn shells() -> ShellTaskSnapshot {
         ShellTaskSnapshot {
-            chat_id: uuid::Uuid::from_u128(1),
+            chat_id: uuid::Uuid::from_u128(1).into(),
             live_revision: 1,
             tasks: Vec::new(),
         }

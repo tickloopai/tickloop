@@ -76,7 +76,7 @@ fn entry(chat: ChatId, uuid: Uuid, parent: Option<Uuid>, millisecond: u64, role:
 
 fn title(chat: ChatId) -> Line {
     Line::CustomTitle(CustomTitleEntry {
-        chat_id: chat,
+        chat_id: chat.uuid(),
         custom_title: "kept before the boundary".into(),
     })
 }
@@ -119,24 +119,57 @@ async fn write_history(under_test: &StoreUnderTest) -> History {
     let [prompt, answer, boundary, after] = [(); 4].map(|_| Uuid::new_v4());
     let store = &under_test.store;
     let registered = store
-        .register(chat, &ChatPlacement::Folder(under_test.folder.clone()))
+        .register(
+            tickloop_ids::Id::from(chat),
+            &ChatPlacement::Folder(under_test.folder.clone()),
+        )
         .await
         .unwrap();
     let first = vec![
-        title(chat),
-        entry(chat, prompt, None, 1_000, Role::User),
-        entry(chat, answer, Some(prompt), 2_000, Role::Assistant),
+        title(tickloop_ids::Id::from(chat)),
+        entry(
+            tickloop_ids::Id::from(chat),
+            prompt,
+            None,
+            1_000,
+            Role::User,
+        ),
+        entry(
+            tickloop_ids::Id::from(chat),
+            answer,
+            Some(prompt),
+            2_000,
+            Role::Assistant,
+        ),
     ];
     let first_ack = store
-        .append(chat, &batch(first.clone(), registered))
+        .append(
+            tickloop_ids::Id::from(chat),
+            &batch(first.clone(), registered),
+        )
         .await
         .unwrap();
     let second = vec![
-        entry(chat, boundary, None, 3_000, Role::System),
-        entry(chat, after, Some(boundary), 4_000, Role::User),
+        entry(
+            tickloop_ids::Id::from(chat),
+            boundary,
+            None,
+            3_000,
+            Role::System,
+        ),
+        entry(
+            tickloop_ids::Id::from(chat),
+            after,
+            Some(boundary),
+            4_000,
+            Role::User,
+        ),
     ];
     let second_ack = store
-        .append(chat, &batch(second.clone(), first_ack.position))
+        .append(
+            tickloop_ids::Id::from(chat),
+            &batch(second.clone(), first_ack.position),
+        )
         .await
         .unwrap();
     assert!(
@@ -145,7 +178,7 @@ async fn write_history(under_test: &StoreUnderTest) -> History {
         under_test.name
     );
     History {
-        chat,
+        chat: tickloop_ids::Id::from(chat),
         prompt,
         answer,
         boundary,
@@ -248,17 +281,35 @@ async fn retrying_a_committed_batch_commits_it_once() {
         let chat = Uuid::new_v4();
         let store = &under_test.store;
         let registered = store
-            .register(chat, &ChatPlacement::Folder(under_test.folder.clone()))
+            .register(
+                tickloop_ids::Id::from(chat),
+                &ChatPlacement::Folder(under_test.folder.clone()),
+            )
             .await
             .unwrap();
         let once = batch(
-            vec![entry(chat, Uuid::new_v4(), None, 1, Role::User)],
+            vec![entry(
+                tickloop_ids::Id::from(chat),
+                Uuid::new_v4(),
+                None,
+                1,
+                Role::User,
+            )],
             registered,
         );
-        let first = store.append(chat, &once).await.unwrap();
-        let retried = store.append_blocking(chat, &once).unwrap();
+        let first = store
+            .append(tickloop_ids::Id::from(chat), &once)
+            .await
+            .unwrap();
+        let retried = store
+            .append_blocking(tickloop_ids::Id::from(chat), &once)
+            .unwrap();
         assert_eq!(first, retried, "{}", under_test.name);
-        let stored = store.load(chat, LoadRange::Full).await.unwrap().unwrap();
+        let stored = store
+            .load(tickloop_ids::Id::from(chat), LoadRange::Full)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.lines.len(), 1, "{}", under_test.name);
         assert_eq!(stored.position, first.position, "{}", under_test.name);
     }
@@ -520,7 +571,7 @@ fn custom_titles(lines: &[Line]) -> Vec<String> {
 
 fn titled(chat: ChatId, title: &str) -> Line {
     Line::CustomTitle(CustomTitleEntry {
-        chat_id: chat,
+        chat_id: chat.uuid(),
         custom_title: title.into(),
     })
 }
@@ -530,22 +581,37 @@ async fn a_batch_retried_after_other_batches_and_registrations_commits_once() {
     for under_test in stores() {
         let chat = Uuid::new_v4();
         let placement = ChatPlacement::Folder(under_test.folder.clone());
-        let registered = under_test.store.register(chat, &placement).await.unwrap();
-        let first = batch(vec![titled(chat, "A")], registered);
-        let acknowledged = under_test.store.append(chat, &first).await.unwrap();
+        let registered = under_test
+            .store
+            .register(tickloop_ids::Id::from(chat), &placement)
+            .await
+            .unwrap();
+        let first = batch(vec![titled(tickloop_ids::Id::from(chat), "A")], registered);
+        let acknowledged = under_test
+            .store
+            .append(tickloop_ids::Id::from(chat), &first)
+            .await
+            .unwrap();
         // Another recorder registers the Chat again and appends before the first one retries.
         let position = under_test
             .another_handle
-            .register(chat, &placement)
+            .register(tickloop_ids::Id::from(chat), &placement)
             .await
             .unwrap();
         under_test
             .another_handle
-            .append(chat, &batch(vec![titled(chat, "B")], position))
+            .append(
+                tickloop_ids::Id::from(chat),
+                &batch(vec![titled(tickloop_ids::Id::from(chat), "B")], position),
+            )
             .await
             .unwrap();
         assert_eq!(
-            under_test.store.append(chat, &first).await.unwrap(),
+            under_test
+                .store
+                .append(tickloop_ids::Id::from(chat), &first)
+                .await
+                .unwrap(),
             acknowledged,
             "{}",
             under_test.name
@@ -553,7 +619,7 @@ async fn a_batch_retried_after_other_batches_and_registrations_commits_once() {
         assert_eq!(
             under_test
                 .another_handle
-                .append_blocking(chat, &first)
+                .append_blocking(tickloop_ids::Id::from(chat), &first)
                 .unwrap(),
             acknowledged,
             "{}",
@@ -561,7 +627,7 @@ async fn a_batch_retried_after_other_batches_and_registrations_commits_once() {
         );
         let stored = under_test
             .store
-            .load(chat, LoadRange::Full)
+            .load(tickloop_ids::Id::from(chat), LoadRange::Full)
             .await
             .unwrap()
             .unwrap();
@@ -629,18 +695,24 @@ async fn a_truncated_jsonl_file_conflicts_instead_of_acknowledging_lost_lines() 
     let store = JsonlTranscriptStore::open(directory.path().join("root")).unwrap();
     let chat = Uuid::new_v4();
     let registered = store
-        .register(chat, &ChatPlacement::Folder(directory.path().into()))
+        .register(
+            tickloop_ids::Id::from(chat),
+            &ChatPlacement::Folder(directory.path().into()),
+        )
         .await
         .unwrap();
-    let first = batch(vec![titled(chat, "A")], registered);
-    let acknowledged = store.append(chat, &first).await.unwrap();
-    truncate(&store.chat_path(chat).unwrap());
+    let first = batch(vec![titled(tickloop_ids::Id::from(chat), "A")], registered);
+    let acknowledged = store
+        .append(tickloop_ids::Id::from(chat), &first)
+        .await
+        .unwrap();
+    truncate(&store.chat_path(tickloop_ids::Id::from(chat)).unwrap());
     let durable = AppendBatch {
         durable: true,
         ..batch(Vec::new(), acknowledged.position)
     };
     for retried in [&durable, &first] {
-        match store.append(chat, retried).await {
+        match store.append(tickloop_ids::Id::from(chat), retried).await {
             Err(TranscriptError::Conflict(message)) => assert!(message.contains("truncated")),
             other => panic!("{other:?}"),
         }
@@ -649,26 +721,36 @@ async fn a_truncated_jsonl_file_conflicts_instead_of_acknowledging_lost_lines() 
     // Growth from another writer is fine.
     let grown = Uuid::new_v4();
     let registered = store
-        .register(grown, &ChatPlacement::Folder(directory.path().into()))
+        .register(
+            tickloop_ids::Id::from(grown),
+            &ChatPlacement::Folder(directory.path().into()),
+        )
         .await
         .unwrap();
     store
-        .append(grown, &batch(vec![titled(grown, "A")], registered))
+        .append(
+            tickloop_ids::Id::from(grown),
+            &batch(vec![titled(tickloop_ids::Id::from(grown), "A")], registered),
+        )
         .await
         .unwrap();
-    let path = store.chat_path(grown).unwrap();
+    let path = store.chat_path(tickloop_ids::Id::from(grown)).unwrap();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap();
     std::io::Write::write_all(
         &mut file,
-        format!("{}\n", serde_json::to_string(&titled(grown, "B")).unwrap()).as_bytes(),
+        format!(
+            "{}\n",
+            serde_json::to_string(&titled(tickloop_ids::Id::from(grown), "B")).unwrap()
+        )
+        .as_bytes(),
     )
     .unwrap();
     store
         .append(
-            grown,
+            tickloop_ids::Id::from(grown),
             &AppendBatch {
                 durable: true,
                 ..batch(Vec::new(), registered)
@@ -721,7 +803,10 @@ async fn a_fence_seen_by_a_registration_or_a_load_stops_every_write() {
         complete_turn(&agent, chat, "before the fence").await;
         memory.fence();
         let seen = if fenced_by_load {
-            agent.resume_chat(Uuid::new_v4()).await.map(|_| ())
+            agent
+                .resume_chat(tickloop_ids::Id::from(Uuid::new_v4()))
+                .await
+                .map(|_| ())
         } else {
             agent.create_chat(directory.path().into()).await.map(|_| ())
         };

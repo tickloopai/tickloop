@@ -383,12 +383,12 @@ fn needed_response(
     chain_responses: &HashSet<Uuid>,
     shown: &HashSet<Uuid>,
 ) -> bool {
-    let Some(response) = lifecycle.response(id) else {
+    let Some(response) = lifecycle.response(id.into()) else {
         return false;
     };
     let input_is_open = response.input_id.is_some_and(|input| {
         lifecycle
-            .input(input)
+            .input(input.into())
             .is_some_and(|input| !matches!(input.state, InputState::Settled { .. }))
     });
     let lost_host = matches!(
@@ -510,18 +510,18 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
         for id in &generator.responses {
             if needed_response(&full_lifecycle, *id, &chain_responses, &shown) {
                 assert_eq!(
-                    folded_lifecycle.response(*id),
-                    full_lifecycle.response(*id),
+                    folded_lifecycle.response((*id).into()),
+                    full_lifecycle.response((*id).into()),
                     "seed {seed}: response {id}"
                 );
             }
         }
         for id in &generator.inputs {
-            if let Some(input) = full_lifecycle.input(*id)
+            if let Some(input) = full_lifecycle.input((*id).into())
                 && !matches!(input.state, InputState::Settled { .. })
             {
                 assert_eq!(
-                    folded_lifecycle.input(*id),
+                    folded_lifecycle.input((*id).into()),
                     Some(input),
                     "seed {seed}: input {id}"
                 );

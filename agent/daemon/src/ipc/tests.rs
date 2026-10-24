@@ -950,9 +950,9 @@ async fn canceling_an_observation_mid_frame_never_corrupts_the_shared_connection
         },
         change: ObservationChange::Event(Event {
             sequence,
-            chat_id: Uuid::nil(),
-            loop_id: Uuid::nil(),
-            run_id: Uuid::nil(),
+            chat_id: Uuid::nil().into(),
+            loop_id: Uuid::nil().into(),
+            run_id: Uuid::nil().into(),
             kind: EventKind::Text(text.into()),
         }),
     };

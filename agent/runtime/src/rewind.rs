@@ -253,7 +253,7 @@ impl Agent {
             sequence: chat.snapshot.last_sequence,
             chat_id: chat.snapshot.id,
             loop_id: chat.snapshot.chat_loop.id,
-            run_id: Uuid::nil(),
+            run_id: Uuid::nil().into(),
             kind: EventKind::ConversationRewound { message_id },
         };
         chat.snapshot.events.push(event.clone());
@@ -281,7 +281,7 @@ impl Agent {
             None => private_project_temp_directory(folder)
                 .join(crate::file_history::FILE_HISTORY_DIRECTORY),
         }
-        .join(chat_id.to_string())
+        .join(chat_id.uuid().to_string())
     }
 
     /// 照 Claude Code `fileHistoryMakeSnapshot`：提示写入对话时只追加待定快照
@@ -862,7 +862,7 @@ mod tests {
         UserShellRecord {
             updated_at_ms: None,
             id: Uuid::new_v4(),
-            chat_id: Uuid::new_v4(),
+            chat_id: Uuid::new_v4().into(),
             loop_id: None,
             command: "sleep 1".into(),
             cwd: PathBuf::from("/tmp"),

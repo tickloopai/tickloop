@@ -199,7 +199,7 @@ impl ArtifactClient {
         Ok(metadata)
     }
     pub async fn pin(&self, id: &str, pinned: bool) -> Result<(), ArtifactError> {
-        let operation_id = Uuid::new_v4().to_string();
+        let operation_id = tickloop_ids::generate().to_string();
         let path = format!("{}/pin", self.artifact_path(id)?);
         let outcome = self
             .catalog_request::<Value>(
@@ -282,7 +282,7 @@ impl ArtifactClient {
         action: &str,
         mut body: Value,
     ) -> Result<ArtifactOperation, ArtifactError> {
-        let operation_id = Uuid::new_v4().to_string();
+        let operation_id = tickloop_ids::generate().to_string();
         body["operation_id"] = json!(operation_id);
         let base = self.artifact_path(id)?;
         let path = format!("{base}{action}");

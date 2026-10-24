@@ -322,7 +322,7 @@ impl Agent {
         instructions: Option<String>,
         cancel: CancellationToken,
     ) -> Result<CompactionOutcome, AgentError> {
-        let (original, messages, client, receipt) = {
+        let (original, messages, client, receipt, ids) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             let messages = model_messages(chat)?;
@@ -347,7 +347,7 @@ impl Agent {
             let receipt = Receipt {
                 chat_id,
                 loop_id: chat_loop.id,
-                run_id: chat_loop.run_id.unwrap_or_else(uuid::Uuid::new_v4),
+                run_id: chat_loop.run_id.unwrap_or_else(RunId::new),
             };
             let original = chat.snapshot.clone();
             self.emit(
@@ -358,7 +358,7 @@ impl Agent {
                     error: None,
                 },
             );
-            (original, messages, chat.client.clone(), receipt)
+            (original, messages, chat.client.clone(), receipt, chat.ids)
         };
         let mut summary_messages = messages.clone();
         projection::retain_public_content(&mut summary_messages);
@@ -380,7 +380,7 @@ impl Agent {
             content: vec![Content::Text {
                 text: format!(
                     "Create the continuation summary now. Current plan and progress: {}{instructions_text}",
-                    pinned_state(&original)
+                    pinned_state(&ids, &original)
                 ),
             }],
         });
@@ -478,7 +478,7 @@ impl Agent {
                         },
                         summary: projection::full_summary_message(
                             &summary,
-                            &pinned_state(&chat.snapshot),
+                            &pinned_state(&chat.ids, &chat.snapshot),
                             trigger,
                         ),
                         summarize_metadata: None,
@@ -574,14 +574,17 @@ fn changed_model(current: &ModelConfig, selected: &ModelConfig) -> bool {
     !tickloop_agent_model::compatible_private_history(current, selected)
 }
 
-fn pinned_state(snapshot: &ChatSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "loop": snapshot.chat_loop,
-        "plans": snapshot.plans,
-        "progress": snapshot.progress,
-        "pending_inputs": snapshot.pending_inputs,
-        "uncertain_operations": snapshot.current_operation_uncertainties(),
-    })
+fn pinned_state(ids: &tickloop_ids::IdContext, snapshot: &ChatSnapshot) -> serde_json::Value {
+    tickloop_agent_protocol::model_ids::model_json(
+        ids,
+        serde_json::json!({
+            "loop": snapshot.chat_loop,
+            "plans": snapshot.plans,
+            "progress": snapshot.progress,
+            "pending_inputs": snapshot.pending_inputs,
+            "uncertain_operations": snapshot.current_operation_uncertainties(),
+        }),
+    )
 }
 
 pub(super) use tickloop_agent_protocol::ESTIMATED_CONTEXT_BYTES_PER_TOKEN as ESTIMATED_UTF8_BYTES_PER_TOKEN;
@@ -735,8 +738,8 @@ mod tests {
                 chat.snapshot.delegation = Some(tickloop_agent_protocol::DelegationMetadata {
                     delegation_id: uuid::Uuid::new_v4(),
                     parent_chat_id: id,
-                    parent_loop_id: uuid::Uuid::new_v4(),
-                    parent_run_id: uuid::Uuid::new_v4(),
+                    parent_loop_id: uuid::Uuid::new_v4().into(),
+                    parent_run_id: uuid::Uuid::new_v4().into(),
                     parent_call_id: "invalid-ancestry".into(),
                     ancestors: Vec::new(),
                     task: String::new(),
@@ -822,8 +825,8 @@ mod tests {
                 });
             let receipt = Receipt {
                 chat_id: id,
-                loop_id: uuid::Uuid::new_v4(),
-                run_id: uuid::Uuid::new_v4(),
+                loop_id: uuid::Uuid::new_v4().into(),
+                run_id: uuid::Uuid::new_v4().into(),
             };
             chat.active_run = Some(receipt.run_id);
             assert!(crate::host_notes::announce_guidance_notes(
@@ -847,7 +850,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
             );
-            assert!(!chat.has_human_input_for_run(uuid::Uuid::new_v4()));
+            assert!(!chat.has_human_input_for_run(uuid::Uuid::new_v4().into()));
         }
     }
 

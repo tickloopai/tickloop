@@ -155,7 +155,7 @@ impl Fixture {
             second,
             server,
             execution,
-            loop_id: submitted.loop_id,
+            loop_id: submitted.loop_id.into(),
             request,
         }
     }

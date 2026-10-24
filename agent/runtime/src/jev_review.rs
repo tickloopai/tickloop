@@ -4,7 +4,9 @@ use super::auto_rules::{Classification, ClassificationDecision, RuleVerdict};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tickloop_agent_model::judgment::{Answer, Evaluation, EvaluationRequest, Question};
+use tickloop_agent_protocol::model_ids::model_json_text;
 use tickloop_agent_protocol::{ApprovalStage, AutoPolicy};
+use tickloop_ids::IdContext;
 
 // Bound local payload size; the provider enforces its model-specific token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 1024 * 1024;
@@ -44,10 +46,15 @@ pub(super) fn review_budget_bytes() -> usize {
 }
 
 pub(super) fn review_request(
+    ids: &IdContext,
     context: &ApprovalSnapshot,
     stage: ApprovalStage,
 ) -> Result<EvaluationRequest, AutoReview> {
-    let state = serde_json::to_value(context).expect("approval context serializes");
+    let state = serde_json::from_str(&model_json_text(
+        ids,
+        &serde_json::to_string(context).expect("approval context serializes"),
+    ))
+    .expect("an approval context with model ids is JSON");
     let questions = questions(stage, context.context_truncation.is_some());
     let request = EvaluationRequest { state, questions };
     if serde_json::to_vec(&request)

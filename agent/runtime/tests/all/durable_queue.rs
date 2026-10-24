@@ -168,7 +168,7 @@ pub(super) fn harness(
 
 pub(super) fn prompt(text: &str, after: ParentSelection) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::Continue {
             after,
             message: UserMessage {
@@ -202,10 +202,13 @@ pub(super) fn input_state(lines: &[Line], input: Uuid) -> Option<InputState> {
 }
 
 pub(super) async fn settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
-    tokio::time::timeout(WAIT, agent.settled_input(chat, input))
-        .await
-        .expect("the input settles")
-        .unwrap()
+    tokio::time::timeout(
+        WAIT,
+        agent.settled_input(chat, tickloop_ids::Id::from(input)),
+    )
+    .await
+    .expect("the input settles")
+    .unwrap()
 }
 
 #[tokio::test]
@@ -221,7 +224,7 @@ async fn a_lost_answer_continues_before_the_inputs_queued_behind_it() {
     first.advance(chat, queued.clone()).await.unwrap();
     let store = lost_holder(&first, &store, chat).await;
     assert_eq!(
-        input_state(&store.lines(chat), queued.input_id),
+        input_state(&store.lines(chat), queued.input_id.uuid()),
         Some(InputState::Accepted)
     );
 
@@ -232,11 +235,11 @@ async fn a_lost_answer_continues_before_the_inputs_queued_behind_it() {
     let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
     next.resume_chat(chat).await.unwrap();
     assert!(matches!(
-        settled(&next, chat, queued.input_id).await,
+        settled(&next, chat, queued.input_id.uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     assert!(matches!(
-        settled(&next, chat, lost.input_id).await,
+        settled(&next, chat, lost.input_id.uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     let requests = model.conversation_requests();
@@ -295,7 +298,7 @@ async fn the_third_lost_host_in_a_row_fails_the_input_and_a_handover_does_not_co
         let model = Script::new(vec![Step::Reply(text("done at last"))]);
         let last = harness(store.clone(), model.clone(), WaitHosting::Durable);
         last.resume_chat(chat).await.unwrap();
-        let outcome = settled(&last, chat, input.input_id).await;
+        let outcome = settled(&last, chat, input.input_id.uuid()).await;
         if with_handover {
             assert!(
                 matches!(outcome, SettledOutcome::Completed { .. }),
@@ -327,11 +330,11 @@ async fn a_repeated_input_still_finds_its_ledger_record_after_folding() {
     let chat = agent.create_chat_without_folder().await.unwrap();
     let first = prompt("turn 0", ParentSelection::CurrentLeaf);
     agent.advance(chat, first.clone()).await.unwrap();
-    settled(&agent, chat, first.input_id).await;
+    settled(&agent, chat, first.input_id.uuid()).await;
     for turn in 1..TURNS {
         let request = prompt(&format!("turn {turn}"), ParentSelection::CurrentLeaf);
         agent.advance(chat, request.clone()).await.unwrap();
-        settled(&agent, chat, request.input_id).await;
+        settled(&agent, chat, request.input_id.uuid()).await;
     }
     agent.sync().await.unwrap();
     agent.shutdown().await;
@@ -370,7 +373,7 @@ async fn a_repeated_input_still_finds_its_ledger_record_after_folding() {
         let snapshot = next.snapshot(chat).await.unwrap();
         let following = prompt("one more", ParentSelection::CurrentLeaf);
         next.advance(chat, following.clone()).await.unwrap();
-        settled(&next, chat, following.input_id).await;
+        settled(&next, chat, following.input_id.uuid()).await;
         loaded.push((
             serde_json::to_string(&snapshot.messages).unwrap(),
             serde_json::to_string(&snapshot.chat_loop).unwrap(),
@@ -442,7 +445,7 @@ async fn inputs_queued_behind_a_suspended_run_are_queued_again_in_their_order() 
         .advance(
             chat,
             TurnRequest {
-                input_id: Uuid::new_v4(),
+                input_id: tickloop_ids::Id::from(Uuid::new_v4()),
                 op: TurnOp::Answer {
                     request: request.id,
                     reply: tickloop_agent_runtime::QuestionReply::Answered(vec![
@@ -456,14 +459,14 @@ async fn inputs_queued_behind_a_suspended_run_are_queued_again_in_their_order() 
         .await
         .unwrap();
     assert!(matches!(
-        settled(&answering, chat, turn.input_id()).await,
+        settled(&answering, chat, (turn.input_id()).uuid()).await,
         SettledOutcome::Completed { .. }
     ));
     for follow_up in &follow_ups {
         assert_eq!(
-            settled(&answering, chat, follow_up.input_id).await,
+            settled(&answering, chat, follow_up.input_id.uuid()).await,
             SettledOutcome::Merged {
-                into: turn.receipt().run_id
+                into: (turn.receipt().run_id).uuid()
             }
         );
     }

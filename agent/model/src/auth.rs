@@ -404,7 +404,7 @@ impl CodexAuth {
         let callback_uri = format!("http://localhost:{port}{CALLBACK_PATH}");
         let verifier = new_pkce_verifier();
         let challenge = encode_base64url(&Sha256::digest(verifier.as_bytes()));
-        let state = Uuid::new_v4().simple().to_string();
+        let state = tickloop_ids::random_token();
         let mut authorize_url =
             reqwest::Url::parse(&format!("{}/oauth/authorize", self.oauth_origin))
                 .expect("trusted OAuth origin");
@@ -623,7 +623,7 @@ impl CodexAuth {
             return Err(AuthError::Cancelled);
         }
         self.login_generation_store()
-            .save(&Uuid::new_v4())
+            .save(&tickloop_ids::generate())
             .map_err(|_| AuthError::Storage("invalidate login generation"))?;
         let path = self.credential_path();
         match self.open_credential_file()? {
@@ -644,7 +644,7 @@ impl CodexAuth {
         if cancellation.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
-        let generation = Uuid::new_v4();
+        let generation = tickloop_ids::generate();
         self.login_generation_store()
             .save(&generation)
             .map_err(|_| AuthError::Storage("start login generation"))?;
@@ -924,11 +924,9 @@ fn oauth_http_client(target: &reqwest::Url) -> (Client, NetworkRoute) {
 }
 
 fn new_pkce_verifier() -> String {
-    let first = Uuid::new_v4();
-    let second = Uuid::new_v4();
     let mut random = [0_u8; 32];
-    random[..16].copy_from_slice(first.as_bytes());
-    random[16..].copy_from_slice(second.as_bytes());
+    random[..16].copy_from_slice(&tickloop_ids::random_u128().to_be_bytes());
+    random[16..].copy_from_slice(&tickloop_ids::random_u128().to_be_bytes());
     encode_base64url(&random)
 }
 

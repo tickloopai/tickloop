@@ -48,7 +48,7 @@ pub(crate) fn private_tickhost_directory() -> PrivateDirectory {
     const NAME_CHARACTERS: usize = 8;
     let name = format!(
         "{PRIVATE_TICKHOST_PREFIX}{}",
-        &Uuid::new_v4().simple().to_string()[..NAME_CHARACTERS]
+        &tickloop_ids::random_token()[..NAME_CHARACTERS]
     );
     let preferred = private_temp_root().join(&name);
     let socket = preferred

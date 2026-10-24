@@ -20,6 +20,8 @@ mod durable_tasks;
 mod durable_waits;
 #[path = "all/host_scheduled_tasks.rs"]
 mod host_scheduled_tasks;
+#[path = "all/model_ids.rs"]
+mod model_ids;
 #[path = "all/retained_budget.rs"]
 mod retained_budget;
 

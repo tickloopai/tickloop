@@ -121,7 +121,7 @@ async fn recovery_process_fixture() {
     std::fs::write(
         directory.join("fixture.json"),
         serde_json::to_vec(&Fixture {
-            chat,
+            chat: chat.uuid(),
             first,
             second,
             completed,
@@ -191,7 +191,10 @@ async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
     let model = Arc::new(ScriptedModel::new(vec![text("New instruction processed")]));
     let agent =
         Agent::open_embedded(directory.path().join("archive"), config(), model.clone()).unwrap();
-    let before = agent.resume_chat(fixture.chat).await.unwrap();
+    let before = agent
+        .resume_chat(tickloop_ids::Id::from(fixture.chat))
+        .await
+        .unwrap();
     assert_eq!(before.chat_loop.state, LoopState::Interrupted);
     assert!(before.queued_inputs().is_empty());
     assert_eq!(
@@ -201,7 +204,10 @@ async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
     assert!(model.requests.lock().unwrap().is_empty());
     let mut events = agent.subscribe();
     let resumed = agent
-        .submit(fixture.chat, "New first-goal instruction".into())
+        .submit(
+            tickloop_ids::Id::from(fixture.chat),
+            "New first-goal instruction".into(),
+        )
         .await
         .unwrap();
     loop {
@@ -212,7 +218,10 @@ async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
             _ => {}
         }
     }
-    let after = agent.snapshot(fixture.chat).await.unwrap();
+    let after = agent
+        .snapshot(tickloop_ids::Id::from(fixture.chat))
+        .await
+        .unwrap();
     assert_eq!(after.chat_loop.state, LoopState::Idle);
     assert!(after.pending_inputs.is_empty());
     let requests = model.requests.lock().unwrap().clone();
@@ -247,12 +256,15 @@ async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowl
     )]));
     let agent =
         Agent::open_embedded(directory.path().join("archive"), config(), model.clone()).unwrap();
-    let snapshot = agent.resume_chat(fixture.chat).await.unwrap();
+    let snapshot = agent
+        .resume_chat(tickloop_ids::Id::from(fixture.chat))
+        .await
+        .unwrap();
     assert!(snapshot.operations.is_empty());
     let mut events = agent.subscribe();
     let receipt = agent
         .submit(
-            fixture.chat,
+            tickloop_ids::Id::from(fixture.chat),
             "Continue without repeating the command".into(),
         )
         .await
@@ -306,13 +318,16 @@ async fn an_operation_waiting_for_permission_at_exit_is_never_executed_after_res
     )]));
     let agent =
         Agent::open_embedded(directory.path().join("archive"), config(), model.clone()).unwrap();
-    let snapshot = agent.resume_chat(fixture.chat).await.unwrap();
+    let snapshot = agent
+        .resume_chat(tickloop_ids::Id::from(fixture.chat))
+        .await
+        .unwrap();
     assert!(snapshot.permissions.is_empty());
     assert!(snapshot.operations.is_empty());
     let mut events = agent.subscribe();
     agent
         .submit(
-            fixture.chat,
+            tickloop_ids::Id::from(fixture.chat),
             "Continue without executing the old command".into(),
         )
         .await

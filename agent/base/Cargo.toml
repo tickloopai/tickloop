@@ -19,6 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["net"] }
 uuid = { version = "1", features = ["v4", "serde"] }

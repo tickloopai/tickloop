@@ -41,14 +41,14 @@ impl CompletedTaskRetention {
             return None;
         };
         let cleanup = CompletedTaskCleanup {
-            root_chat_id: board.root_chat_id,
-            root_loop_id: board.root_loop_id,
+            root_chat_id: board.root_chat_id.into(),
+            root_loop_id: board.root_loop_id.into(),
             expected_revision: board.revision,
         };
         let observation = self.observation.get_or_insert(CompletedTaskObservation {
             cleanup,
             observed_at: now,
-            task_ids: board.tasks.iter().map(|task| task.id).collect(),
+            task_ids: board.tasks.iter().map(|task| task.id.uuid()).collect(),
             dispatched: false,
         });
         if observation.cleanup.root_chat_id != cleanup.root_chat_id
@@ -63,7 +63,7 @@ impl CompletedTaskRetention {
             *observation = CompletedTaskObservation {
                 cleanup,
                 observed_at: now,
-                task_ids: board.tasks.iter().map(|task| task.id).collect(),
+                task_ids: board.tasks.iter().map(|task| task.id.uuid()).collect(),
                 dispatched: false,
             };
         }
@@ -108,8 +108,8 @@ mod tests {
         assert_eq!(
             retention.observe(Some(&board), start + Duration::from_secs(30)),
             Some(CompletedTaskCleanup {
-                root_chat_id: board.root_chat_id,
-                root_loop_id: board.root_loop_id,
+                root_chat_id: board.root_chat_id.into(),
+                root_loop_id: board.root_loop_id.into(),
                 expected_revision: board.revision,
             })
         );
@@ -163,7 +163,7 @@ mod tests {
         let start = Instant::now();
         retention.observe(Some(&board), start);
         let mut added = board.tasks[0].clone();
-        added.id = Uuid::new_v4();
+        added.id = Uuid::new_v4().into();
         board.tasks.push(added);
         board.revision += 1;
         assert_eq!(
@@ -182,7 +182,7 @@ mod tests {
         let mut retention = CompletedTaskRetention::default();
         let first = completed_board();
         let mut second = first.clone();
-        second.root_loop_id = Uuid::new_v4();
+        second.root_loop_id = Uuid::new_v4().into();
         let start = Instant::now();
         retention.observe(Some(&first), start);
         assert_eq!(

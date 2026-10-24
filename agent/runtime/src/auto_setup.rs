@@ -190,14 +190,14 @@ impl Agent {
             let mut scanner = SetupScanner {
                 workspace: Workspace { folder: Some(workdir.clone()), additional_directories: snapshot.additional_directories.clone() },
                 policy: snapshot.policy,
-                loop_id: snapshot.chat_loop.id,
+                loop_id: snapshot.chat_loop.id.into(),
                 gaps: Vec::new(),
             };
-            let batch = Uuid::new_v4();
+            let batch = tickloop_ids::generate();
             let now = unix_time_milliseconds();
             let mut candidates = Vec::new();
             let mut add = |text: String, source: String| candidates.push(AutoEnvironmentEntry {
-                id: Uuid::new_v4(), text, directory: Some(workdir.clone()), include_descendants: false,
+                id: tickloop_ids::generate(), text, directory: Some(workdir.clone()), include_descendants: false,
                 source: AutoEnvironmentEntrySource::Generated { batch, generated_at_ms: now, sources: vec![source] }, confirmed_at_ms: 0, changes: Vec::new(),
             });
             let documents = PROJECT_FILES.iter().filter_map(|file| scanner.read(&workdir.join(file)).map(|text| (*file, text))).collect::<Vec<_>>();

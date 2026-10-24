@@ -261,7 +261,7 @@ fn validate_socket_metadata(metadata: &Metadata) -> Result<(), String> {
 
 impl DaemonConnection {
     async fn shutdown(&mut self) -> Result<(), String> {
-        let request_id = Uuid::new_v4();
+        let request_id = tickloop_ids::generate();
         control::write(
             &mut self.stream,
             &Request::ShutdownDaemon {

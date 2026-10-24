@@ -102,7 +102,7 @@ impl Cloud {
 
 fn prompt(text: &str) -> TurnRequest {
     TurnRequest {
-        input_id: Uuid::new_v4(),
+        input_id: Uuid::new_v4().into(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
             message: UserMessage {
@@ -203,7 +203,9 @@ async fn a_delivery_whose_holder_died_before_acknowledging_enters_the_conversati
         let crashed = holding.run(request.clone()).await;
         assert_eq!(crashed.halt, Some(Halt::Crashed), "{crashed:?}");
         assert_eq!(
-            cloud.chats.acknowledgements(cloud.chat, request.input_id),
+            cloud
+                .chats
+                .acknowledgements(cloud.chat, request.input_id.into()),
             0
         );
 

@@ -357,7 +357,7 @@ pub(super) struct TicksPanel {
 impl TicksPanel {
     pub(super) fn new(chat: Option<Uuid>) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             chat,
             page: INSTALLED_PAGE,
             installed: Listing::Loading,

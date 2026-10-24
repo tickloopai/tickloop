@@ -46,7 +46,9 @@ impl FamilyRecords {
                 && entry.chat_id == *id
             {
                 for (loop_id, board) in &entry.boards {
-                    records.task_boards.insert((*id, *loop_id), board.clone());
+                    records
+                        .task_boards
+                        .insert(((*id), (*loop_id).into()), board.clone());
                 }
             }
             let inputs = transcript.lifecycle.iter().filter_map(|line| match line {
@@ -57,8 +59,8 @@ impl FamilyRecords {
             for entry in inputs {
                 let receipt = Receipt {
                     chat_id: *id,
-                    loop_id: entry.loop_id,
-                    run_id: entry.run_id,
+                    loop_id: entry.loop_id.into(),
+                    run_id: entry.run_id.into(),
                 };
                 task.get_or_insert_with(|| receipt.clone());
                 records.accepted.insert(entry.input_id, receipt);
@@ -107,8 +109,9 @@ impl FamilyRecords {
     /// records do not hold.
     pub(crate) fn reconcile(
         &self,
+        ids: &tickloop_ids::IdContext,
         snapshot: &ChatSnapshot,
-        message_responses: &BTreeMap<usize, Uuid>,
+        message_responses: &BTreeMap<usize, tickloop_agent_protocol::ResponseId>,
         call: &HistoryCall,
     ) -> Option<ToolResult> {
         let Content::ToolUse { name, input, .. } = snapshot
@@ -128,13 +131,14 @@ impl FamilyRecords {
                 let registration = child.registration.as_ref()?;
                 let task = &child.task;
                 if input["run_in_background"].as_bool() == Some(true) {
-                    return Some(crate::delegation::launched_result(task, registration));
+                    return Some(crate::delegation::launched_result(ids, task, registration));
                 }
                 if let Some(completion) = snapshot.family_completions.iter().find(|completion| {
                     completion.child_chat_id == task.chat_id
                         && completion.child_run_id == task.run_id
                 }) {
                     return crate::agent_messages::child_run_result(
+                        ids,
                         completion,
                         &child.delegation,
                         Some(registration),
@@ -144,6 +148,7 @@ impl FamilyRecords {
                 // The call stopped observing the child when its Run lost its host: the child
                 // goes on, and its end reaches the parent as a notification.
                 Some(crate::delegation::interrupted_observation_result(
+                    ids,
                     task,
                     Some(registration),
                 ))
@@ -151,14 +156,14 @@ impl FamilyRecords {
             SEND_AGENT_MESSAGE_TOOL_NAME => {
                 let response = message_responses.get(&call.message_index)?;
                 let message_id = tickloop_agent_transcript::input_ids::family_message(
-                    snapshot.id,
-                    *response,
+                    snapshot.id.into(),
+                    (*response).into(),
                     &call.call_id,
                 );
                 let target = self.accepted.get(&message_id)?;
                 Some(ToolResult {
-                    content: json!({"status":"accepted","message_id":message_id,"target_chat_id":target.chat_id,
-                        "target_run_id":target.run_id,
+                    content: json!({"status":"accepted","message_id":ids.model_text(tickloop_agent_protocol::AgentMessageId::from(message_id)),"target_chat_id":ids.model_text(target.chat_id),
+                        "target_run_id":ids.model_text(target.run_id),
                         "delivery":"accepted_before_interruption"})
                     .to_string(),
                     is_error: false,
@@ -179,7 +184,7 @@ impl FamilyRecords {
                     return None;
                 }
                 Some(crate::shared_tasks::reconciled_mutation_result(
-                    board, mutation,
+                    ids, board, mutation,
                 ))
             }
             _ => None,
@@ -458,12 +463,13 @@ impl Agent {
             {
                 continue;
             }
-            let completion = lost_completion(&member.registration, child_loop, child_run);
+            let completion =
+                lost_completion(&member.registration, child_loop.into(), child_run.into());
             let registration = &member.registration;
             let tool = ToolResult {
-                content: json!({"child_chat_id":child_chat,"handle":registration.handle,
+                content: json!({"child_chat_id":parent.ids.model_text(ChatId::from(child_chat)),"handle":registration.handle,
                     "description":registration.description,"created_at":registration.created_at,
-                    "child_loop_id":child_loop,"child_run_id":child_run,"parent_chat_id":member.parent,
+                    "child_loop_id":parent.ids.model_text(LoopId::from(child_loop)),"child_run_id":parent.ids.model_text(RunId::from(child_run)),"parent_chat_id":parent.ids.model_text(ChatId::from(member.parent)),
                     "status":"failed","child_state":"failed","result":"","error":LOST_BEFORE_IT_STARTED})
                 .to_string(),
                 is_error: true,

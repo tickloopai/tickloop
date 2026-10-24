@@ -1,5 +1,6 @@
 use super::*;
 use std::{sync::Arc, time::Duration};
+use tickloop_agent_protocol::SharedTaskId;
 use tickloop_agent_protocol::{CommandState, OperationState};
 use tickloop_agent_test_support::{
     call, config,
@@ -144,7 +145,13 @@ async fn competing_claims_have_one_winner_and_all_views_share_the_board() {
             snapshot.task_board
         );
         let listed = invoke(&core, receipt, "TaskList", json!({})).await.unwrap();
-        assert_eq!(listed["board"], serde_json::to_value(&board).unwrap());
+        assert_eq!(
+            listed["board"],
+            tickloop_agent_protocol::model_ids::model_json(
+                &IdContext::new(),
+                serde_json::to_value(&board).unwrap()
+            )
+        );
     }
     assert_eq!(board.tasks[0].status, Status::InProgress);
     core.shutdown().await;
@@ -156,7 +163,7 @@ async fn stale_root_release_reports_completed_task_without_mutating_it() {
     let root = &receipts[0];
     let child = &receipts[1];
     let task = create(&core, root, vec![]).await;
-    invoke(&core, root, "TaskUpdate", json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":1,"action":"assign","owner":child.chat_id.to_string()})).await.unwrap();
+    invoke(&core, root, "TaskUpdate", json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":1,"action":"assign","owner":child.chat_id.uuid().to_string()})).await.unwrap();
     invoke(&core, child, "TaskUpdate", json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":2,"action":"claim"})).await.unwrap();
     let observed = invoke(&core, root, "TaskList", json!({})).await.unwrap();
     assert_eq!(observed["board"]["tasks"][0]["revision"], 3);
@@ -184,11 +191,11 @@ async fn stale_root_release_reports_completed_task_without_mutating_it() {
     assert_eq!(conflict["current_task"]["revision"], 4);
     assert_eq!(
         conflict["current_task"]["claim"]["run_id"],
-        child.run_id.to_string()
+        IdContext::new().model_text(child.run_id)
     );
     assert_eq!(
         conflict["current_task"]["report"]["run_id"],
-        child.run_id.to_string()
+        IdContext::new().model_text(child.run_id)
     );
     assert!(
         conflict["recovery"]
@@ -202,7 +209,7 @@ async fn stale_root_release_reports_completed_task_without_mutating_it() {
 async fn dependencies_versions_and_one_active_task_are_enforced() {
     let (core, receipts) = family(None).await;
     let first = create(&core, &receipts[0], vec![]).await;
-    let blocked = create(&core, &receipts[0], vec![first.id]).await;
+    let blocked = create(&core, &receipts[0], vec![first.id.into()]).await;
     let second = create(&core, &receipts[0], vec![]).await;
     let claim = |task| json!({"mutation_id":Uuid::new_v4(),"task_id":task,"expected_revision":1,"action":"claim"});
     assert!(
@@ -247,7 +254,7 @@ async fn background_or_unknown_operations_prevent_release() {
             .commands
             .push(tickloop_agent_protocol::CommandSnapshot {
                 operation_id: op.id,
-                loop_id: receipts[1].loop_id,
+                loop_id: receipts[1].loop_id.into(),
                 command: "sleep 30".into(),
                 description: None,
                 cwd: std::env::temp_dir(),
@@ -339,7 +346,7 @@ async fn a_failed_checkpoint_retains_the_claim_and_blocks_competing_execution() 
     let store = directory.path().join("store");
     let (core, receipts) = family(Some(store.clone())).await;
     let task = create(&core, &receipts[0], vec![]).await;
-    let path = tickloop_agent_test_support::transcript_file(&store, receipts[0].chat_id);
+    let path = tickloop_agent_test_support::transcript_file(&store, receipts[0].chat_id.into());
     std::fs::remove_file(path).unwrap();
     let claim =
         |id| json!({"mutation_id":id,"task_id":task.id,"expected_revision":1,"action":"claim"});
@@ -374,7 +381,7 @@ async fn unresolved_owner_cannot_start_unbound_work_or_be_reassigned_while_activ
     invoke(&core,&receipts[1],"TaskUpdate",json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":1,"action":"claim"})).await.unwrap();
     core.settle_task_claims(&receipts[1]).await;
     let next = Receipt {
-        run_id: Uuid::new_v4(),
+        run_id: Uuid::new_v4().into(),
         ..receipts[1].clone()
     };
     {
@@ -399,7 +406,7 @@ async fn a_delegates_unrelated_later_run_does_not_own_the_old_task() {
         .await
         .unwrap();
     let next = Receipt {
-        run_id: Uuid::new_v4(),
+        run_id: Uuid::new_v4().into(),
         ..receipts[1].clone()
     };
     let fixture_cancellations = {
@@ -460,7 +467,7 @@ async fn task_command_wait_does_not_adopt_other_runs_or_unknown_results_and_hono
             json!({"command":"wait","run_in_background":true}),
         );
         if case == "other-run" {
-            op.run_id = Uuid::new_v4();
+            op.run_id = Uuid::new_v4().into();
         }
         let state = if case == "unknown" {
             CommandState::Unknown
@@ -474,8 +481,8 @@ async fn task_command_wait_does_not_adopt_other_runs_or_unknown_results_and_hono
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             let cancellations = if case.starts_with("parked-") {
                 for parked in chat.parked.values_mut() {
-                    parked.receipt.run_id = Uuid::new_v4();
-                    parked.receipt.loop_id = Uuid::new_v4();
+                    parked.receipt.run_id = Uuid::new_v4().into();
+                    parked.receipt.loop_id = Uuid::new_v4().into();
                 }
                 Vec::new()
             } else {
@@ -502,7 +509,7 @@ async fn task_command_wait_does_not_adopt_other_runs_or_unknown_results_and_hono
                 .commands
                 .push(tickloop_agent_protocol::CommandSnapshot {
                     operation_id: op.id,
-                    loop_id: receipt.loop_id,
+                    loop_id: receipt.loop_id.into(),
                     command: "wait".into(),
                     description: None,
                     cwd: std::env::temp_dir(),
@@ -579,7 +586,7 @@ async fn task_command_wait_consumes_an_already_queued_completion_once() {
             .commands
             .push(tickloop_agent_protocol::CommandSnapshot {
                 operation_id: op.id,
-                loop_id: receipt.loop_id,
+                loop_id: receipt.loop_id.into(),
                 command: "done".into(),
                 description: None,
                 cwd: std::env::temp_dir(),
@@ -620,4 +627,30 @@ async fn task_command_wait_consumes_an_already_queued_completion_once() {
         Status::InProgress
     );
     assert_eq!(snapshot.task_boards[&receipt.loop_id].tasks[0].revision, 2);
+}
+
+/// TaskGet and TaskUpdate take a task and its dependencies as TaskList wrote them or as UUIDs
+/// from an older session; an id that names nothing is echoed with where ids come from.
+#[test]
+fn task_references_resolve_in_either_form() {
+    let ids = IdContext::new();
+    let (task, dependency) = (SharedTaskId::new(), SharedTaskId::new());
+    for (task_text, dependency_text) in [
+        (ids.model_text(task), dependency.uuid().to_string()),
+        (task.uuid().to_string(), ids.model_text(dependency)),
+    ] {
+        let resolved = resolve_task_references(
+            &ids,
+            &json!({"task_id":task_text,"dependencies":[dependency_text],"title":"t"}),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            json!({"task_id":task.uuid().to_string(),"dependencies":[dependency.uuid().to_string()],"title":"t"})
+        );
+    }
+    assert_eq!(
+        resolve_task_references(&ids, &json!({"task_id":"3"})),
+        Err(tickloop_ids::not_found::<SharedTaskKind>("3"))
+    );
 }

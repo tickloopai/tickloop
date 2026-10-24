@@ -316,7 +316,7 @@ async fn run_auto_family_review(fixture: &PrivateFixture) {
         assert_eq!(reviews[1]["operation"]["tool"], "SendMessage");
         assert_eq!(
             reviews[1]["operation"]["input"]["to"],
-            child_state.conversation.id.to_string()
+            tickloop_ids::IdContext::new().model_text(child_state.conversation.id)
         );
     }
     assert!(!pty.frame().contains("Permission required"));

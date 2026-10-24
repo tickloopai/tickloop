@@ -58,7 +58,7 @@ impl ModelClient for RecordingReviewer {
     fn supports_reasoning_effort(&self, effort: tickloop_agent_protocol::ReasoningEffort) -> bool {
         self.client.supports_reasoning_effort(effort)
     }
-    async fn close_chat(&self, chat: Uuid) {
+    async fn close_chat(&self, chat: tickloop_agent_protocol::ChatId) {
         self.client.close_chat(chat).await;
     }
     async fn complete(
@@ -73,7 +73,7 @@ impl ModelClient for RecordingReviewer {
     }
     async fn complete_for_chat_with_context(
         &self,
-        chat: Uuid,
+        chat: tickloop_agent_protocol::ChatId,
         request: tickloop_agent_model::ModelRequest,
         events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         cancel: CancellationToken,

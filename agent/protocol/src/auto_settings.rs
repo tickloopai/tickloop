@@ -209,7 +209,7 @@ impl AutoRuleSettings {
                 }
                 self.environment_replacement = None;
                 self.environment_entries.push(AutoEnvironmentEntry {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     text: expected_text,
                     directory: None,
                     include_descendants: false,
@@ -233,7 +233,7 @@ impl AutoRuleSettings {
             }
             AutoRuleChange::Add { kind, text } => {
                 self.group_mut(kind).custom.push(CustomAutoRule {
-                    id: Uuid::new_v4().to_string(),
+                    id: tickloop_ids::generate().to_string(),
                     text,
                 })
             }
@@ -278,7 +278,7 @@ impl AutoRuleSettings {
                 group.custom = texts
                     .into_iter()
                     .map(|text| CustomAutoRule {
-                        id: Uuid::new_v4().to_string(),
+                        id: tickloop_ids::generate().to_string(),
                         text,
                     })
                     .collect();

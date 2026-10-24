@@ -206,7 +206,7 @@ async fn run_background_request_fixture() {
     let background = monitor.create_chat(workdir.clone()).await.unwrap();
     *monitor_access.background.lock().unwrap() = Some(monitor.reference(background).await.unwrap());
     core.set_permission_rules(
-        background,
+        background.into(),
         vec![tickloop_agent_protocol::PermissionRule {
             id: Uuid::new_v4(),
             decision: tickloop_agent_protocol::Decision::Ask,
@@ -267,7 +267,7 @@ async fn run_background_request_fixture() {
         for _ in 0..2 {
             answerer.submit(visible, "Hello".into()).await.unwrap();
         }
-        let snapshot = core.snapshot(visible).await.unwrap();
+        let snapshot = core.snapshot(visible.into()).await.unwrap();
         assert_eq!(snapshot.queued_inputs().len(), 2);
         background_phase(
             "pending-preview",
@@ -301,7 +301,7 @@ async fn run_background_request_fixture() {
             .await
     };
     assert!(rejected.is_err());
-    let snapshot = core.snapshot(background).await.unwrap();
+    let snapshot = core.snapshot(background.into()).await.unwrap();
     assert_eq!(snapshot.permissions.len() + snapshot.questions.len(), 1);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     background_phase("failed-answer", serde_json::json!({"pending":1}));
@@ -326,7 +326,7 @@ async fn run_background_request_fixture() {
         .unwrap()
         .unwrap()
         .forget();
-    let snapshot = core.snapshot(background).await.unwrap();
+    let snapshot = core.snapshot(background.into()).await.unwrap();
     assert!(snapshot.permissions.is_empty());
     assert!(snapshot.questions.is_empty());
     assert_eq!(
@@ -368,7 +368,7 @@ async fn run_background_request_fixture() {
                 .is_err()
         );
         assert_eq!(
-            core.snapshot(background).await.unwrap().permissions[0].id,
+            core.snapshot(background.into()).await.unwrap().permissions[0].id,
             next.id
         );
         monitor_access.unavailable.store(false, Ordering::Relaxed);
@@ -381,7 +381,7 @@ async fn run_background_request_fixture() {
             .unwrap()
             .unwrap()
             .forget();
-        let snapshot = core.snapshot(background).await.unwrap();
+        let snapshot = core.snapshot(background.into()).await.unwrap();
         assert!(snapshot.permissions.is_empty());
         assert_eq!(
             snapshot.chat_loop.state,

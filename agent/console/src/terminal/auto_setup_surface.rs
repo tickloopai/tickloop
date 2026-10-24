@@ -178,7 +178,7 @@ impl AutoSetupSurface {
                             self.editing_repositories = true;
                         }
                         _ => {
-                            let id = Uuid::new_v4();
+                            let id = tickloop_ids::generate();
                             self.generation = Some(id);
                             return SetupEffect::Generate(id, self.options.clone());
                         }

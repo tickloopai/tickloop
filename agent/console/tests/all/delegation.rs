@@ -444,7 +444,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
             AgentCommand::LoadRecord {
                 record: TranscriptRef {
                     store_root: store.clone(),
-                    chat_id: child,
+                    chat_id: child.into(),
                 },
                 as_new: false,
                 launch: Some(launch),
@@ -655,7 +655,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         AgentCommand::LoadRecord {
             record: TranscriptRef {
                 store_root: store.clone(),
-                chat_id: child,
+                chat_id: child.into(),
             },
             as_new: false,
             launch: Some(launch()),
@@ -720,7 +720,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         "the child never reached Herdr"
     );
 
-    let transcript = tickloop_agent_test_support::transcript_file(&store, child);
+    let transcript = tickloop_agent_test_support::transcript_file(&store, child.into());
     let single_authority = std::fs::read_to_string(&transcript)
         .unwrap()
         .lines()
@@ -772,7 +772,7 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
         );
     let call = provider
         .prepare_call_in_scope(
-            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4().into(),
             &tickloop_agent_runtime::host_tools::HostCallScope {
                 local_files: local_files.as_ref(),
                 context: Some(&HostCallContext {
@@ -791,7 +791,7 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
     let replacement = ScopedHostSocket::start(original.path.clone());
     let result = provider
         .execute_prepared(
-            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4().into(),
             call,
             tokio_util::sync::CancellationToken::new(),
         )
@@ -1136,9 +1136,11 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         assert!(requests[1].tools.iter().any(|tool| tool.name == "Subagent"));
     }
     agent.shutdown().await;
-    let transcript =
-        std::fs::read_to_string(tickloop_agent_test_support::transcript_file(&store, child))
-            .unwrap();
+    let transcript = std::fs::read_to_string(tickloop_agent_test_support::transcript_file(
+        &store,
+        child.into(),
+    ))
+    .unwrap();
     assert!(transcript.contains("\"type\":\"delegation\""));
     assert!(transcript.contains("verified child evidence"));
     let restored =
@@ -1712,10 +1714,14 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     assert_eq!(parent_result["status"], "completed");
     assert_eq!(
         parent_result["delegation_id"],
-        serde_json::to_value(metadata.delegation_id).unwrap()
+        tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::DelegationId::from(
+            metadata.delegation_id
+        ))
     );
-    let original_child_run: uuid::Uuid =
-        serde_json::from_value(parent_result["child_run_id"].clone()).unwrap();
+    let original_child_run =
+        tickloop_agent_protocol::RunId::parse(parent_result["child_run_id"].as_str().unwrap())
+            .unwrap()
+            .uuid();
     let follow_up = access
         .execute(CommandEnvelope {
             daemon_epoch: access.daemon_epoch(),
@@ -1880,7 +1886,7 @@ async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming
         .unwrap()
         .id;
     agent.shutdown().await;
-    let transcript = tickloop_agent_test_support::transcript_file(&store, child);
+    let transcript = tickloop_agent_test_support::transcript_file(&store, child.into());
     let original = std::fs::read_to_string(&transcript).unwrap();
     for remove_record in [false, true] {
         let rewritten = original
@@ -1962,7 +1968,7 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
     )
     .unwrap();
     agent.shutdown().await;
-    let transcript = tickloop_agent_test_support::transcript_file(&store, child);
+    let transcript = tickloop_agent_test_support::transcript_file(&store, child.into());
     let original = std::fs::read_to_string(&transcript).unwrap();
     for reorder in [false, true] {
         let mut initial_user = None;
@@ -2934,7 +2940,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
             tool: "Bash".into(),
             specifier: None,
             input: None,
-            loop_id: Some(initial.loop_id),
+            loop_id: Some(initial.loop_id.into()),
             persistent: false,
         }],
     )

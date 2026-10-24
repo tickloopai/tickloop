@@ -359,7 +359,7 @@ impl Agent {
                             if !live && !child.family_finishing.contains(&run) {
                                 return Err(format!(
                                     "Subagent {} has an interrupted or unknown run without a live executor; explicitly continue or stop that child before reporting completion",
-                                    child.snapshot.id
+                                    parent.ids.model_text(child.snapshot.id)
                                 ));
                             }
                             pending = true;

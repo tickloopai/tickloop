@@ -45,9 +45,9 @@ fn plain_replayed_reply_fixture() {
         .into_iter()
         .enumerate()
         .map(|(index, kind)| Event {
-            chat_id: chat,
-            loop_id,
-            run_id: run,
+            chat_id: chat.into(),
+            loop_id: loop_id.into(),
+            run_id: run.into(),
             sequence: index as u64 + 1,
             kind,
         })
@@ -56,7 +56,7 @@ fn plain_replayed_reply_fixture() {
         render_restored_observation(
             &console,
             &mut ToolPresentation::new(true),
-            chat,
+            chat.into(),
             0,
             &mut HashMap::new(),
             &mut MessageGroups::default(),
@@ -117,9 +117,9 @@ async fn model_retry_replay_updates_the_live_row_and_preserves_final_failure() {
     let console = Console::test_interactive_for_chat(chat);
     let mut observation = agent.observe(chat, 0).await.unwrap();
     let retry = |sequence, attempt| Event {
-        chat_id: chat,
-        loop_id,
-        run_id,
+        chat_id: chat.into(),
+        loop_id: loop_id.into(),
+        run_id: run_id.into(),
         sequence,
         kind: EventKind::ModelRetry {
             kind: ModelRequestKind::Conversation,
@@ -151,9 +151,9 @@ async fn model_retry_replay_updates_the_live_row_and_preserves_final_failure() {
         retry(2, 2),
         retry(3, 3),
         Event {
-            chat_id: chat,
-            loop_id,
-            run_id,
+            chat_id: chat.into(),
+            loop_id: loop_id.into(),
+            run_id: run_id.into(),
             sequence: 4,
             kind: EventKind::Failed("final failure".into()),
         },
@@ -161,7 +161,7 @@ async fn model_retry_replay_updates_the_live_row_and_preserves_final_failure() {
     render_restored_observation(
         &console,
         &mut ToolPresentation::new(true),
-        chat,
+        chat.into(),
         1,
         &mut HashMap::new(),
         &mut MessageGroups::default(),
@@ -503,8 +503,8 @@ async fn run_completed_reply_recovery_fixture() {
     };
     assert_eq!(buffered_chat, chat);
     assert!(!complete_line);
-    let running = core.snapshot(chat).await.unwrap();
-    assert_eq!(running.chat_loop.run_id, Some(run));
+    let running = core.snapshot(chat.into()).await.unwrap();
+    assert_eq!(running.chat_loop.run_id, Some(Into::into(run)));
     assert_eq!(running.chat_loop.state, LoopState::Running);
     assert!(running.events.iter().any(|event| event.sequence == sequence
         && event.run_id == run
@@ -603,7 +603,7 @@ async fn run_completed_reply_recovery_fixture() {
     assert!(!reset_required);
     assert_eq!(after, sequence);
     if route == "running" {
-        let recovered = core.snapshot(chat).await.unwrap();
+        let recovered = core.snapshot(chat.into()).await.unwrap();
         assert_eq!(recovered.chat_loop.state, LoopState::Running);
         assert_eq!(recovered.last_sequence, last_sequence);
         finish_model.send(()).unwrap();
@@ -621,9 +621,9 @@ async fn run_completed_reply_recovery_fixture() {
         .await
         .unwrap();
     }
-    let completed = core.snapshot(chat).await.unwrap();
+    let completed = core.snapshot(chat.into()).await.unwrap();
     assert_eq!(completed.chat_loop.id, running.chat_loop.id);
-    assert_eq!(completed.chat_loop.run_id, Some(run));
+    assert_eq!(completed.chat_loop.run_id, Some(Into::into(run)));
     assert_eq!(
         completed.chat_loop.state,
         if route == "interrupted" {
@@ -1136,7 +1136,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
             &console,
             &agent,
             &mut ToolPresentation::new(true),
-            chat,
+            chat.into(),
             after + u64::from(resets),
             &mut buffered,
             &mut MessageGroups::default(),
@@ -1145,15 +1145,15 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
         .unwrap();
         assert_eq!(observation.reset_required, resets);
         assert!(
-            !buffered.contains_key(&prior.run_id),
+            !buffered.contains_key(&prior.run_id.uuid()),
             "the observed prior run must finish or discard its own buffer"
         );
         assert_eq!(
-            buffered.contains_key(&current.run_id),
+            buffered.contains_key(&current.run_id.uuid()),
             !resets,
             "a successful/failed prior run must not finish this Actor's new running reply"
         );
-        let retained_other = buffered.get_mut(&other.run_id).unwrap();
+        let retained_other = buffered.get_mut(&other.run_id.uuid()).unwrap();
         assert_eq!(retained_other.chat_id, other_chat);
         assert!(
             !retained_other.has_complete_line(),
@@ -1164,7 +1164,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
             retained_other.next_line(),
             Some(("running other Actor".into(), true))
         );
-        if let Some(retained_current) = buffered.get_mut(&current.run_id) {
+        if let Some(retained_current) = buffered.get_mut(&current.run_id.uuid()) {
             assert!(!retained_current.has_complete_line());
             retained_current.finish();
             assert_eq!(
@@ -1189,10 +1189,10 @@ async fn buffer_actual_text(
             && event.run_id == receipt.run_id
             && let EventKind::Text(text) = event.kind
         {
-            let mut reply = ReplyLines::new(event.chat_id, None);
+            let mut reply = ReplyLines::new(event.chat_id.into(), None);
             reply.push(&text);
             assert!(!reply.has_complete_line());
-            buffered.insert(event.run_id, reply);
+            buffered.insert(event.run_id.into(), reply);
             return event.sequence;
         }
     }
@@ -1306,12 +1306,12 @@ fn routine_restore_pty_fixture() {
                     }
                     std::fs::write(UNARMED_INPUT_FILE, "").unwrap();
                     let (console, _input) = Console::start(false).unwrap();
-                    let after = core.snapshot(chat).await.unwrap().last_sequence;
+                    let after = core.snapshot(chat.into()).await.unwrap().last_sequence;
                     let observation = restore_view(
                         &console,
                         &agent,
                         &mut ToolPresentation::new(true),
-                        chat,
+                        chat.into(),
                         after,
                         &mut HashMap::new(),
             &mut MessageGroups::default(),
@@ -1349,8 +1349,8 @@ fn routine_restore_pty_fixture() {
                 let RecoveryFact::Completed { chat, run, sequence } = completed else {
                     unreachable!()
                 };
-                let snapshot = core.snapshot(chat).await.unwrap();
-                assert_eq!(snapshot.chat_loop.run_id, Some(run));
+                let snapshot = core.snapshot(chat.into()).await.unwrap();
+                assert_eq!(snapshot.chat_loop.run_id, Some(Into::into(run)));
                 assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
                 write_phase(serde_json::json!({"phase":"completed","completed":completed,"goal":snapshot.chat_loop.id}));
                 let passes = if route == PENDING_INPUT_ROUTE || route == RESET_ROUTE {
@@ -1373,7 +1373,7 @@ fn routine_restore_pty_fixture() {
                             &console,
                             &agent,
                             &mut ToolPresentation::new(false),
-                            chat,
+                            chat.into(),
                             sequence + 1,
                             &mut HashMap::new(),
             &mut MessageGroups::default(),
@@ -1396,8 +1396,8 @@ fn routine_restore_pty_fixture() {
                             assert_eq!(format!("{:?}", requests[1].messages).matches(RAW_TOOL_CONTENT).count(), 1);
                         }
                     }
-                    assert_eq!(core.snapshot(chat).await.unwrap().last_sequence, sequence);
-                    assert!(core.snapshot(chat).await.unwrap().pending_inputs.is_empty());
+                    assert_eq!(core.snapshot(chat.into()).await.unwrap().last_sequence, sequence);
+                    assert!(core.snapshot(chat.into()).await.unwrap().pending_inputs.is_empty());
                     write_phase(serde_json::json!({"phase":format!("restored-{pass}"),"restored":restored,"saved_inputs":saved,"model_requests":expected_requests}));
                 }
                 interaction.await.unwrap().unwrap();
@@ -1553,10 +1553,10 @@ async fn run_retained_completion_lifecycle_fixture() {
     let mut snapshots = Vec::new();
     for prompt in ["Read the first report.", "Read another report."] {
         receipts.first().map(|receipt: &Receipt| receipt.loop_id);
-        let receipt = core.submit(chat, prompt.into()).await.unwrap();
+        let receipt = core.submit(chat.into(), prompt.into()).await.unwrap();
         let snapshot = tokio::time::timeout(LAGGED_DRAIN_TIMEOUT, async {
             loop {
-                let snapshot = core.snapshot(chat).await.unwrap();
+                let snapshot = core.snapshot(chat.into()).await.unwrap();
                 if snapshot.chat_loop.run_id == Some(receipt.run_id)
                     && snapshot.chat_loop.state == LoopState::Idle
                 {
@@ -1604,7 +1604,7 @@ async fn run_retained_completion_lifecycle_fixture() {
         &console,
         &agent,
         &mut ToolPresentation::new(false),
-        chat,
+        chat.into(),
         snapshots[0].last_sequence,
         &mut HashMap::new(),
         &mut MessageGroups::default(),
@@ -1772,14 +1772,17 @@ fn plain_restore_keeps_public_history_without_internal_identity_notices() {
     let chat: Uuid = serde_json::from_value(proof["chat"].clone()).unwrap();
     let receipt: Receipt = serde_json::from_value(proof["saved"]["receipt"].clone()).unwrap();
     assert!(
-        !stdout.contains(&format!("Chat {chat} restored. Current model:")),
+        !stdout.contains(&format!(
+            "Chat {} restored. Current model:",
+            tickloop_ids::base62::encode(chat)
+        )),
         "{stdout}"
     );
     assert!(stdout.contains("Loop: Idle"), "{stdout}");
     assert!(
         stdout.contains(&format!(
             "Saved input awaiting manual continuation: Run {}\n{UNARMED_INPUT}",
-            receipt.run_id
+            receipt.run_id.public()
         )),
         "{stdout}"
     );
@@ -1885,10 +1888,13 @@ fn run_routine_restore_pty(route: &str) {
             );
             let receipt: Receipt = serde_json::from_value(saved["receipt"].clone()).unwrap();
             assert!(
-                !frame.contains(&format!("Run {}", receipt.run_id)),
+                !frame.contains(&format!("Run {}", receipt.run_id.uuid())),
                 "{frame}"
             );
-            assert!(!frame.contains(&receipt.loop_id.to_string()), "{frame}");
+            assert!(
+                !frame.contains(&receipt.loop_id.uuid().to_string()),
+                "{frame}"
+            );
         } else if route == RESET_ROUTE {
             assert_eq!(restored["restored"]["Restored"]["reset_required"], true);
             assert!(
@@ -2098,9 +2104,12 @@ async fn run_merge_boundary_fixture() {
         None,
     );
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
-    core.set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::FullAccess)
-        .await
-        .unwrap();
+    core.set_execution_mode(
+        chat.into(),
+        tickloop_agent_protocol::ExecutionMode::FullAccess,
+    )
+    .await
+    .unwrap();
     let (probe, mut facts) = mpsc::unbounded_channel();
     agent.set_recovery_probe(probe);
     let (console, input) = Console::start(true).unwrap();
@@ -2140,7 +2149,7 @@ async fn run_merge_boundary_fixture() {
         unreachable!()
     };
     let merges = core
-        .snapshot(chat)
+        .snapshot(chat.into())
         .await
         .unwrap()
         .events
@@ -2153,7 +2162,7 @@ async fn run_merge_boundary_fixture() {
     assert_eq!(
         merges,
         (0..3)
-            .map(|offset| (first_sequence + offset, into_run))
+            .map(|offset| (first_sequence + offset, into_run.into()))
             .collect::<Vec<_>>(),
         "the runtime merged the three inputs by consecutive events into one run"
     );
@@ -2163,7 +2172,7 @@ async fn run_merge_boundary_fixture() {
             matches!(fact, RecoveryFact::Restored { chat: restored, .. } if *restored == chat)
         })
         .await;
-        let last_sequence = core.snapshot(chat).await.unwrap().last_sequence;
+        let last_sequence = core.snapshot(chat.into()).await.unwrap().last_sequence;
         assert!(
             matches!(restored, RecoveryFact::Restored {after,last_sequence: restored_sequence,reset_required:false,..} if after == first_sequence && restored_sequence == last_sequence && restored_sequence >= first_sequence + 2)
         );
@@ -2185,7 +2194,7 @@ async fn run_merge_boundary_fixture() {
     requests.recv().await.unwrap();
     release_second.send(()).unwrap();
     tokio::time::timeout(RECOVERY_TIMEOUT, async {
-        while core.snapshot(chat).await.unwrap().chat_loop.state != LoopState::Idle {
+        while core.snapshot(chat.into()).await.unwrap().chat_loop.state != LoopState::Idle {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

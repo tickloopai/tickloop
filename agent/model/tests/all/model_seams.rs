@@ -146,7 +146,7 @@ async fn complete(
 ) -> Result<ModelOutput, ModelError> {
     let (events, _) = mpsc::unbounded_channel();
     client
-        .complete_for_chat(chat, request, events, CancellationToken::new())
+        .complete_for_chat(chat.into(), request, events, CancellationToken::new())
         .await
 }
 
@@ -395,7 +395,7 @@ async fn model_clients_instances_keep_their_own_private_provenance() {
     let second_output = complete(&*second, chat, request(vec![user("Hello")], Vec::new()))
         .await
         .unwrap();
-    second.close_chat(chat).await;
+    second.close_chat(chat.into()).await;
 
     complete(&*first, chat, follow_up(&first_output, false))
         .await
@@ -431,7 +431,7 @@ async fn budgeted_attempt(
     let (events, _) = mpsc::unbounded_channel();
     let result = client
         .complete_for_chat_with_context(
-            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4().into(),
             image_request(),
             events,
             CancellationToken::new(),

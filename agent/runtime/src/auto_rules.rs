@@ -71,7 +71,7 @@ impl Classification {
             let rule = policy
                 .rules
                 .iter()
-                .find(|rule| rule.id == *id)
+                .find(|rule| same_rule_id(&rule.id, id))
                 .ok_or("classifier cited an unknown rule")?;
             let matches_category = match kind {
                 AutoBlockKind::HardDeny => rule.kind == AutoRuleKind::HardDeny,
@@ -91,4 +91,13 @@ impl Classification {
             evidence: None,
         })
     }
+}
+
+/// Whether `cited` names the rule `id`: as written, or, for a custom rule's UUID, in either id
+/// form, since the reviewer may cite it as other ids in its context read.
+fn same_rule_id(id: &str, cited: &str) -> bool {
+    id == cited
+        || tickloop_ids::base62::decode_either(id)
+            .zip(tickloop_ids::base62::decode_either(cited))
+            .is_some_and(|(id, cited)| id == cited)
 }

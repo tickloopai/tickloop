@@ -189,7 +189,7 @@ async fn run_child_config_fixture() {
     );
     let root = agent.create_chat(workdir.clone()).await.unwrap();
     core.set_execution_mode(
-        root,
+        root.into(),
         if auto_permissions {
             tickloop_agent_protocol::ExecutionMode::Auto
         } else {
@@ -205,7 +205,7 @@ async fn run_child_config_fixture() {
             let rows = agent.catalog().await.unwrap();
             *latest.lock().unwrap() = format!(
                 "root mode {:?}; rows {:?}",
-                core.snapshot(root).await.unwrap().policy.mode,
+                core.snapshot(root.into()).await.unwrap().policy.mode,
                 rows.iter()
                     .map(|row| (
                         row.parent.is_some(),
@@ -223,7 +223,8 @@ async fn run_child_config_fixture() {
                         row.state == LoopState::Idle
                     }
             });
-            let root_done = core.snapshot(root).await.unwrap().chat_loop.state == LoopState::Idle;
+            let root_done =
+                core.snapshot(root.into()).await.unwrap().chat_loop.state == LoopState::Idle;
             if let Some(child) = child
                 && (requester || root_done)
             {
@@ -245,8 +246,8 @@ async fn run_child_config_fixture() {
             "root": agent.reference(root).await.unwrap(),
             "execution": child.execution,
             "chat": child.chat_id,
-            "policy": core.snapshot(child.chat_id).await.unwrap().policy,
-            "delegation": core.snapshot(child.chat_id).await.unwrap().delegation,
+            "policy": core.snapshot(child.chat_id.into()).await.unwrap().policy,
+            "delegation": core.snapshot(child.chat_id.into()).await.unwrap().delegation,
         }))
         .unwrap(),
     )
@@ -264,10 +265,10 @@ async fn run_child_config_fixture() {
     std::fs::write(
         directory.join("final.json"),
         serde_json::to_vec(&json!({
-            "root_mode": format!("{:?}", core.snapshot(root).await.unwrap().policy.mode),
-            "child_mode": format!("{:?}", core.snapshot(child.chat_id).await.unwrap().policy.mode),
-            "child_policy": core.snapshot(child.chat_id).await.unwrap().policy,
-            "child_delegation": core.snapshot(child.chat_id).await.unwrap().delegation,
+            "root_mode": format!("{:?}", core.snapshot(root.into()).await.unwrap().policy.mode),
+            "child_mode": format!("{:?}", core.snapshot(child.chat_id.into()).await.unwrap().policy.mode),
+            "child_policy": core.snapshot(child.chat_id.into()).await.unwrap().policy,
+            "child_delegation": core.snapshot(child.chat_id.into()).await.unwrap().delegation,
         }))
         .unwrap(),
     )

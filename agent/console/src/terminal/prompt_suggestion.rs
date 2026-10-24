@@ -132,7 +132,7 @@ pub(super) async fn generate(
     let output = budget
         .complete(
             client.as_ref(),
-            request.id,
+            request.id.into(),
             ModelRequest {
                 history_sources: vec![],
                 messages: vec![
@@ -160,7 +160,7 @@ pub(super) async fn generate(
     if output.is_err() {
         request.cancel.cancel();
     }
-    client.close_chat(request.id).await;
+    client.close_chat(request.id.into()).await;
     let output = match output {
         Ok(output) => output,
         Err(error) => return SuggestionResult::empty(generation_error(&error)),

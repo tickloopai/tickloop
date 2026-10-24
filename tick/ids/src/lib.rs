@@ -52,6 +52,10 @@ impl<K> Id<K> {
         Self::from_uuid(Uuid::nil())
     }
 
+    pub fn is_nil(&self) -> bool {
+        self.uuid.is_nil()
+    }
+
     /// The UUID, whose `Display` is the hyphenated storage form (file and socket names, logs).
     pub const fn uuid(self) -> Uuid {
         self.uuid
@@ -92,7 +96,12 @@ pub fn generate() -> Uuid {
 /// 32 random lowercase hex characters for secrets and unguessable names (OAuth state, staged
 /// file names). Unlike a v7 id, every character is random, so any prefix of it is too.
 pub fn random_token() -> String {
-    Uuid::new_v4().simple().to_string()
+    format!("{:032x}", random_u128())
+}
+
+/// 128 random bits for picks that need randomness rather than uniqueness.
+pub fn random_u128() -> u128 {
+    Uuid::new_v4().as_u128()
 }
 
 impl<K> Clone for Id<K> {
@@ -111,6 +120,19 @@ impl<K> PartialEq for Id<K> {
 
 impl<K> Eq for Id<K> {}
 
+/// Records that still hold a bare UUID compare with the typed id directly.
+impl<K> PartialEq<Uuid> for Id<K> {
+    fn eq(&self, other: &Uuid) -> bool {
+        self.uuid == *other
+    }
+}
+
+impl<K> PartialEq<Id<K>> for Uuid {
+    fn eq(&self, other: &Id<K>) -> bool {
+        *self == other.uuid
+    }
+}
+
 impl<K> PartialOrd for Id<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -126,12 +148,6 @@ impl<K> Ord for Id<K> {
 impl<K> Hash for Id<K> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.uuid.hash(state);
-    }
-}
-
-impl<K> Default for Id<K> {
-    fn default() -> Self {
-        Self::nil()
     }
 }
 
@@ -278,6 +294,12 @@ impl IdContext {
     /// once when the content is produced and kept with it in the Transcript.
     pub fn model_text<K: Kind>(&self, id: Id<K>) -> String {
         format!("{}{}", K::MODEL_PREFIX, base62::encode(id.uuid))
+    }
+
+    /// An id inside a serialized record whose kind the record does not carry, as model text
+    /// without a kind's prefix. Typed ids go through [`Self::model_text`].
+    pub fn model_text_of(&self, uuid: Uuid) -> String {
+        base62::encode(uuid)
     }
 
     /// The id `reference` names: base62 or a hyphenated UUID, with or without the kind's model

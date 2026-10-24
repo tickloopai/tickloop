@@ -8,6 +8,8 @@ use tickloop_agent_protocol::{
     ScheduledTaskConfirmation, ScheduledTaskCreator, ScheduledTaskDecision, ScheduledTaskKind,
     ScheduledTaskRemovalReason,
 };
+use tickloop_agent_protocol::{ScheduledTaskId, ScheduledTaskIdKind};
+use tickloop_ids::IdContext;
 use uuid::Uuid;
 
 /// Recurring and self-paced tasks run one last time this long after creation, unless the host
@@ -41,14 +43,36 @@ pub(crate) enum ScheduledTaskError {
     },
     #[error("a title must contain 1 to {MAX_SCHEDULED_TASK_TITLE_CHARS} characters")]
     BadTitle,
-    #[error("no scheduled task `{0}`: it does not exist or was deleted")]
+    #[error("no scheduled task `{}`: it does not exist or was deleted", ScheduledTaskId::from(*.0).public())]
     NotFound(Uuid),
-    #[error("scheduled task `{0}` is not waiting for confirmation")]
+    #[error("scheduled task `{}` {NOT_PENDING}", ScheduledTaskId::from(*.0).public())]
     NotPending(Uuid),
-    #[error("scheduled task `{0}` is waiting for confirmation and cannot be changed")]
+    #[error("scheduled task `{}` {PENDING}", ScheduledTaskId::from(*.0).public())]
     Pending(Uuid),
-    #[error("scheduled task `{0}` is the self-paced loop, which has no schedule to change")]
+    #[error("scheduled task `{}` {SELF_PACED}", ScheduledTaskId::from(*.0).public())]
     SelfPaced(Uuid),
+}
+
+const NOT_PENDING: &str = "is not waiting for confirmation";
+const PENDING: &str = "is waiting for confirmation and cannot be changed";
+const SELF_PACED: &str = "is the self-paced loop, which has no schedule to change";
+
+impl ScheduledTaskError {
+    /// The error as the model reads it, a task's id in its Loop's model form; an id the model
+    /// passed that names no task reads as [`tickloop_ids::not_found`].
+    pub(crate) fn model_message(&self, ids: &IdContext, reference: Option<&str>) -> String {
+        match self {
+            Self::NotFound(id) => tickloop_ids::not_found::<ScheduledTaskIdKind>(
+                reference
+                    .map_or_else(|| ids.model_text(ScheduledTaskId::from(*id)), str::to_owned)
+                    .as_str(),
+            ),
+            Self::NotPending(id) => ids.state_error(ScheduledTaskId::from(*id), NOT_PENDING),
+            Self::Pending(id) => ids.state_error(ScheduledTaskId::from(*id), PENDING),
+            Self::SelfPaced(id) => ids.state_error(ScheduledTaskId::from(*id), SELF_PACED),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// The host's rules for its scheduled tasks.

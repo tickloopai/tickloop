@@ -1413,7 +1413,7 @@ mod tests {
                 .await
                 .get_mut(&chat_id)
                 .unwrap()
-                .active_run = Some(run_id);
+                .active_run = Some(run_id.into());
             for kind in [
                 ModelRequestKind::Conversation,
                 ModelRequestKind::Title,
@@ -1435,8 +1435,8 @@ mod tests {
                 let context = RequestContext {
                     owner: RequestOwner {
                         chat_id,
-                        loop_id: run_owned.then_some(loop_id),
-                        run_id: run_owned.then_some(run_id),
+                        loop_id: run_owned.then_some(loop_id.into()),
+                        run_id: run_owned.then_some(run_id.into()),
                     },
                     kind,
                 };
@@ -1717,7 +1717,7 @@ mod tests {
         let mut foreign_candidate = original;
         let error = start_tracked_model_request(
             &mut foreign_candidate,
-            RequestContext::directed_compaction(uuid::Uuid::new_v4()),
+            RequestContext::directed_compaction(uuid::Uuid::new_v4().into()),
             model.identity(),
         )
         .unwrap_err();

@@ -44,7 +44,7 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
         .await
         .unwrap();
     let ended_turn = Uuid::new_v4();
-    agent.continue_goal(chat, ended_turn).await;
+    agent.continue_goal(chat, ended_turn.into()).await;
     // The next continuation finds the script exhausted, which fails its turn and blocks the goal.
     tokio::time::timeout(WAIT, async {
         while !matches!(
@@ -65,11 +65,11 @@ async fn a_continuation_repeated_for_the_same_turn_runs_once() {
         .change_goal(chat, vec![GoalEvent::Resume])
         .await
         .unwrap();
-    agent.continue_goal(chat, ended_turn).await;
+    agent.continue_goal(chat, ended_turn.into()).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(requests(), ran, "the repeated continuation ran nothing");
 
-    agent.continue_goal(chat, Uuid::new_v4()).await;
+    agent.continue_goal(chat, Uuid::new_v4().into()).await;
     tokio::time::timeout(WAIT, async {
         while requests() == ran {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -158,7 +158,7 @@ async fn a_continuation_refused_during_a_planned_upgrade_runs_in_the_successor()
         .inner
         .goal_continuations_held
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    original.continue_goal(chat, Uuid::new_v4()).await;
+    original.continue_goal(chat, Uuid::new_v4().into()).await;
     assert!(
         original
             .snapshot(chat)
@@ -248,7 +248,7 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
             let mut stored_goal = chat.snapshot.goal.clone().unwrap();
             stored_goal.tokens_used = 5_000;
             let stored = [Line::Goal(GoalEntry {
-                chat_id,
+                chat_id: chat_id.into(),
                 cwd: chat.snapshot.folder.clone(),
                 goal: Some(stored_goal),
             })];

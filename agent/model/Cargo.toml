@@ -32,6 +32,7 @@ tempfile = { version = "3", optional = true }
 thiserror = "2"
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

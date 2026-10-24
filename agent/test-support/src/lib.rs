@@ -325,3 +325,55 @@ pub fn title_output(request: ModelRequest) -> ModelOutput {
         stop_reason: "end_turn".into(),
     }
 }
+
+/// `text` with the model form of each UUID that `stored` (a stored record) names written as that
+/// UUID, so a comparison that ignores ids sees model text and stored text alike.
+pub fn stored_ids(text: &str, stored: &str) -> String {
+    const UUID_LENGTH: usize = 36;
+    let ids = tickloop_ids::IdContext::new();
+    let mut uuids = std::collections::BTreeSet::new();
+    for (start, _) in stored.match_indices('-') {
+        if let Some(candidate) = start
+            .checked_sub(8)
+            .and_then(|begin| stored.get(begin..begin + UUID_LENGTH))
+            && let Ok(uuid) = uuid::Uuid::try_parse(candidate)
+        {
+            uuids.insert(uuid);
+        }
+    }
+    uuids.into_iter().fold(text.to_owned(), |text, uuid| {
+        text.replace(&ids.model_text_of(uuid), &uuid.to_string())
+    })
+}
+
+/// Any id a model reads, for [`model_ids_as_uuids`].
+enum AnyModelId {}
+
+impl tickloop_ids::Kind for AnyModelId {
+    const NOUN: &'static str = "id";
+}
+
+/// `text` with each word the id context reads as an id (its model form, or a UUID) written as
+/// that id's UUID, a `hosted:` or `shell:` prefix kept, so text from runs that write ids in model
+/// form compares like text holding UUIDs.
+pub fn model_ids_as_uuids(text: &str) -> String {
+    let ids = tickloop_ids::IdContext::new();
+    let is_word = |character: char| character.is_ascii_alphanumeric() || character == '-';
+    let mut rewritten = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(is_word) {
+        rewritten.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest
+            .find(|character: char| !is_word(character))
+            .unwrap_or(rest.len());
+        let word = &rest[..end];
+        match ids.resolve(&tickloop_ids::ModelRef::<AnyModelId>::from(word)) {
+            Ok(id) => rewritten.push_str(&id.uuid().to_string()),
+            Err(_) => rewritten.push_str(word),
+        }
+        rest = &rest[end..];
+    }
+    rewritten.push_str(rest);
+    rewritten
+}

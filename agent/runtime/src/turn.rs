@@ -28,8 +28,15 @@ use tickloop_agent_transcript::{
     ResponseState, SettledOutcome,
 };
 
+/// A display node: a prompt, or an answer.
+pub enum MessageKind {}
+
+impl tickloop_ids::Kind for MessageKind {
+    const NOUN: &'static str = "message";
+}
+
 /// A display node's id: a prompt's earliest source id, or an answer's response id.
-pub type MessageId = Uuid;
+pub type MessageId = tickloop_ids::Id<MessageKind>;
 
 /// How often a wait on a Chat looks at it again when no event arrives.
 const RECHECK: Duration = Duration::from_millis(100);
@@ -335,7 +342,7 @@ impl TurnRequest {
         host_context: Option<HostCallContext>,
     ) -> Self {
         Self {
-            input_id: Uuid::new_v4(),
+            input_id: tickloop_ids::generate().into(),
             op: TurnOp::Continue {
                 after: ParentSelection::CurrentLeaf,
                 message: UserMessage {
@@ -518,7 +525,7 @@ impl Agent {
         let branch = match placement {
             Placement::Root => None,
             Placement::After(id) => {
-                ledger.display_parent = Some(id);
+                ledger.display_parent = Some(id.into());
                 self.select_branch(chat_id, id, NodeRole::ContinuationPoint)
                     .await?
             }
@@ -646,10 +653,10 @@ impl Agent {
             }
             match (&node.kind, node.parent) {
                 (DisplayKind::Answer { .. }, Some(prompt)) => {
-                    if self.on_current_chain(chat_id, prompt).await? {
+                    if self.on_current_chain(chat_id, prompt.into()).await? {
                         return Ok(None);
                     }
-                    target = prompt;
+                    target = prompt.into();
                 }
                 _ => return Err(unknown_node()),
             }
@@ -679,7 +686,7 @@ impl Agent {
                 "this Chat's Loop receives Triggers; stop it before switching branches".into(),
             ));
         }
-        let id = Uuid::new_v4();
+        let id = tickloop_ids::generate();
         chat.branch_reservation = Some(id);
         chat.active = Some(tokio_util::sync::CancellationToken::new());
         Ok(BranchReservation {
@@ -797,7 +804,7 @@ impl Agent {
             .select_branch(chat_id, prompt, NodeRole::Prompt)
             .await?;
         let reservation = switch.as_ref().map(BranchSwitch::reservation);
-        ledger.display_parent = Some(prompt);
+        ledger.display_parent = Some(prompt.into());
         let accepted = self
             .accept_regeneration(chat_id, answer, prompt, ledger, switch)
             .await;
@@ -835,7 +842,7 @@ impl Agent {
             let base = staged.as_ref().map_or(&*chat, |staged| &staged.chat);
             rewind::ensure_idle(base).map_err(|_| chat_is_busy())?;
             answered_prompt(base, answer)?;
-            if base.bookkeeping.lifecycle.response(answer).is_none() {
+            if base.bookkeeping.lifecycle.response(answer.cast()).is_none() {
                 return Err(unknown_node());
             }
             let node = chain_node(base, &chain_nodes(base), prompt)
@@ -859,9 +866,9 @@ impl Agent {
             let receipt = Receipt {
                 chat_id,
                 loop_id: chat.snapshot.chat_loop.id,
-                run_id: Uuid::new_v4(),
+                run_id: tickloop_ids::generate().into(),
             };
-            self.queue_answer_run(chat, &receipt, Some(prompt))?;
+            self.queue_answer_run(chat, &receipt, Some(prompt.into()))?;
             let queued = chat
                 .snapshot
                 .pending_inputs
@@ -904,7 +911,7 @@ impl Agent {
             let receipt = Receipt {
                 chat_id,
                 loop_id: chat.snapshot.chat_loop.id,
-                run_id: entry.run_id,
+                run_id: entry.run_id.into(),
             };
             self.queue_answer_run(chat, &receipt, answer_parent)?;
             receipt
@@ -972,13 +979,17 @@ impl Agent {
                 let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
                 let state = ledger_state(chat, input).ok_or(AgentError::NotFound)?;
                 let run = state.entry.run_id;
-                let uncertain = || uncertain_operations(chat, run);
+                let uncertain = || uncertain_operations(chat, run.into());
                 // A host that shut down runs nothing more: what it still queued is lost with it.
                 let is_live = state.is_live
                     && (!self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
-                        || chat.active_run == Some(run)
-                        || chat.parked.contains_key(&run)
-                        || chat.bookkeeping.lifecycle.active_response(run).is_some());
+                        || chat.active_run == Some(run.into())
+                        || chat.parked.contains_key(&tickloop_ids::Id::from(run))
+                        || chat
+                            .bookkeeping
+                            .lifecycle
+                            .active_response(run.into())
+                            .is_some());
                 match state.entry.state {
                     InputState::Settled { outcome } => Some(match outcome {
                         SettledOutcome::Completed { usage } => TurnOutcome::Completed { usage },
@@ -987,12 +998,14 @@ impl Agent {
                             uncertain_operations: uncertain(),
                         },
                         SettledOutcome::Failed { error } => TurnOutcome::Failed { error },
-                        SettledOutcome::Merged { into } => TurnOutcome::Merged { into },
+                        SettledOutcome::Merged { into } => {
+                            TurnOutcome::Merged { into: into.into() }
+                        }
                         SettledOutcome::Withdrawn => TurnOutcome::Withdrawn,
                         SettledOutcome::Discarded { reason } => TurnOutcome::Discarded { reason },
                     }),
                     InputState::Accepted | InputState::Started if is_live => {
-                        waiting_for_person(&chats, chat, run).map(TurnOutcome::Waiting)
+                        waiting_for_person(&chats, chat, run.into()).map(TurnOutcome::Waiting)
                     }
                     InputState::Accepted | InputState::Started => Some(TurnOutcome::Interrupted {
                         by: InterruptedBy::Host,
@@ -1024,8 +1037,8 @@ fn classify(chat: &Chat, ledger: &LedgerInput) -> Result<Admission, AgentError> 
     }
     let receipt = Receipt {
         chat_id: chat.snapshot.id,
-        loop_id: entry.loop_id,
-        run_id: entry.run_id,
+        loop_id: entry.loop_id.into(),
+        run_id: entry.run_id.into(),
     };
     if matches!(entry.state, InputState::Settled { .. }) || state.is_live {
         return Ok(Admission::Known(receipt));
@@ -1052,7 +1065,7 @@ fn classify(chat: &Chat, ledger: &LedgerInput) -> Result<Admission, AgentError> 
             }
         }
         None => Admission::Run {
-            replaces: Some(entry.run_id),
+            replaces: Some(entry.run_id.into()),
         },
     })
 }
@@ -1125,7 +1138,7 @@ fn chain_nodes(chat: &Chat) -> Vec<ChainNode> {
                 .lifecycle
                 .response_of(snapshot, &bookkeeping.message_responses, index)
             {
-                Some(response) => (response, false),
+                Some(response) => (response.uuid(), false),
                 None if snapshot.prompt_execution_modes.contains_key(&index) => {
                     match snapshot
                         .original_message_ids
@@ -1160,7 +1173,11 @@ fn chain_node(chat: &Chat, nodes: &[ChainNode], id: MessageId) -> Option<ChainNo
         .find(|node| node.id == id)
         .copied()
         .or_else(|| {
-            let parent = chat.bookkeeping.lifecycle.response(id)?.display_parent?;
+            let parent = chat
+                .bookkeeping
+                .lifecycle
+                .response(id.cast())?
+                .display_parent?;
             nodes.iter().rev().find(|node| node.id == parent).copied()
         })
 }
@@ -1176,17 +1193,17 @@ pub(crate) fn placement_cut(
         Placement::Root => Ok((messages > 0).then_some((0, None))),
         Placement::After(id) => {
             let lifecycle = &chat.bookkeeping.lifecycle;
-            match lifecycle.response(id) {
+            match lifecycle.response(id.cast()) {
                 Some(response) if !response.state.is_ended() => {
                     return Err(answer_not_ended());
                 }
                 Some(_) => {}
-                None if lifecycle.has_answer_under(id) => return Err(prompt_has_answer()),
+                None if lifecycle.has_answer_under(id.into()) => return Err(prompt_has_answer()),
                 None => {}
             }
             let nodes = chain_nodes(chat);
             let node = chain_node(chat, &nodes, id)
-                .filter(|node| node.is_prompt || lifecycle.response(id).is_some())
+                .filter(|node| node.is_prompt || lifecycle.response(id.cast()).is_some())
                 .ok_or_else(unknown_node)?;
             let is_tail = nodes.last().is_some_and(|tail| tail.first == node.first);
             Ok((!is_tail).then_some((node.last + 1, None)))
@@ -1208,13 +1225,14 @@ pub(crate) fn placement_cut(
 /// The prompt an ended answer answered.
 fn answered_prompt(chat: &Chat, answer: MessageId) -> Result<MessageId, AgentError> {
     let lifecycle = &chat.bookkeeping.lifecycle;
-    let response = lifecycle.response(answer).ok_or_else(unknown_node)?;
+    let response = lifecycle.response(answer.cast()).ok_or_else(unknown_node)?;
     if !response.state.is_ended() {
         return Err(answer_not_ended());
     }
     response
         .display_parent
-        .filter(|parent| lifecycle.response(*parent).is_none())
+        .filter(|parent| lifecycle.response((*parent).into()).is_none())
+        .map(MessageId::from)
         .ok_or_else(|| AgentError::Invalid("only an answer to a prompt can be regenerated".into()))
 }
 
@@ -1230,7 +1248,7 @@ pub(crate) fn admit_continuation(
     let tail = bookkeeping
         .lifecycle
         .latest_display_node(&chat.snapshot, &bookkeeping.message_responses);
-    let attempts = bookkeeping.lifecycle.responses_of(entry.input_id);
+    let attempts = bookkeeping.lifecycle.responses_of(entry.input_id.into());
     let is_at_tail = tail.is_some_and(|tail| {
         tail == entry.input_id
             || Some(tail) == answer_parent
@@ -1255,8 +1273,9 @@ fn ends_the_conversation(chat: &Chat, entry: &InputEntry) -> bool {
             .filter(|(_, id)| **id == entry.input_id)
             .map(|(index, _)| *index)
             .max(),
-        InputOp::Trigger | InputOp::Feedback => (0..snapshot.messages.len())
-            .find(|index| snapshot.message_runs.get(index) == Some(&entry.run_id)),
+        InputOp::Trigger | InputOp::Feedback => (0..snapshot.messages.len()).find(|index| {
+            snapshot.message_runs.get(index) == Some(&tickloop_ids::Id::from(entry.run_id))
+        }),
         _ => None,
     };
     let Some(start) = start else {
@@ -1290,7 +1309,7 @@ fn stored_endpoint(lines: &[Line], id: MessageId) -> Option<Uuid> {
     let entries = || lines.iter().filter_map(Line::chain_entry);
     let answer_end = entries()
         .rev()
-        .find(|entry| entry.response_id == Some(id))
+        .find(|entry| entry.response_id == Some(id.into()))
         .map(|entry| entry.uuid);
     let prompt_end = || {
         entries()
@@ -1299,7 +1318,7 @@ fn stored_endpoint(lines: &[Line], id: MessageId) -> Option<Uuid> {
                 entry.response_id.is_none()
                     && entry.execution_mode.is_some()
                     && !entry.continues_message
-                    && (entry.uuid == id || entry.original_message_id == Some(id))
+                    && (entry.uuid == id || entry.original_message_id == Some(id.into()))
             })
             .map(|entry| entry.uuid)
     };
@@ -1364,16 +1383,25 @@ fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Opt
         } => vec![(*child_chat, *child_run)],
         tickloop_agent_transcript::WaitKind::Children { children } => children
             .iter()
-            .filter_map(|child| chats.get(child))
-            .filter_map(|child| Some((child.snapshot.id, child.snapshot.chat_loop.run_id?)))
+            .filter_map(|child| chats.get(&ChatId::from(*child)))
+            .filter_map(|child| {
+                Some((
+                    child.snapshot.id.uuid(),
+                    child.snapshot.chat_loop.run_id?.uuid(),
+                ))
+            })
             .collect(),
         tickloop_agent_transcript::WaitKind::Question { .. }
         | tickloop_agent_transcript::WaitKind::Handover => Vec::new(),
     };
     runs.into_iter().find_map(|(member, run)| {
-        let wait = waiting_for_person(chats, chats.get(&member)?, run)?;
+        let wait = waiting_for_person(
+            chats,
+            chats.get(&tickloop_ids::Id::from(member))?,
+            run.into(),
+        )?;
         Some(TurnWait::Member {
-            chat: member,
+            chat: member.into(),
             wait: Box::new(wait),
         })
     })

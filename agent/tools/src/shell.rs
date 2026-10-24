@@ -10,6 +10,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tickloop_agent_protocol::ShellTaskKind;
+use tickloop_ids::{IdContext, ModelRef};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -296,7 +298,7 @@ pub(super) fn prepare_input(input: &Value) -> Result<(String, Operation, Value),
 /// A `TaskStop` request for one of this Loop's commands.
 #[derive(Clone, Debug)]
 pub(super) struct TaskStopInput {
-    pub(super) task_id: String,
+    pub(super) task_id: ModelRef<ShellTaskKind>,
 }
 
 pub(super) fn task_stop_definition() -> ToolDefinition {
@@ -304,7 +306,7 @@ pub(super) fn task_stop_definition() -> ToolDefinition {
         name: TASK_STOP_TOOL_NAME.into(),
         description: "
 - Stops a running background task by its ID
-- Takes a task_id parameter identifying the task to stop
+- Takes a task_id parameter identifying the task to stop: the ID the Bash result gave it
 - Returns a success or failure status
 - Use this tool when you need to terminate a long-running task
 "
@@ -338,7 +340,7 @@ pub(super) fn prepare_task_stop(input: &Value) -> Result<(String, Operation, Val
     Ok((
         ".".into(),
         Operation::TaskStop(TaskStopInput {
-            task_id: task_id.clone(),
+            task_id: ModelRef::new(task_id.clone()),
         }),
         json!({ "task_id": task_id }),
     ))
@@ -374,8 +376,16 @@ enum ProcessSnapshot {
 
 #[derive(Clone, Copy)]
 enum CommandOwner {
-    Agent { operation_id: Uuid, loop_id: Uuid },
-    User { operation_id: Uuid, chat_id: Uuid },
+    /// A command of the Agent, whose result its Loop's id context writes.
+    Agent {
+        operation_id: Uuid,
+        loop_id: Uuid,
+        ids: IdContext,
+    },
+    User {
+        operation_id: Uuid,
+        chat_id: Uuid,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -908,27 +918,37 @@ impl Registry {
         process_output(&ProcessSnapshot::User(snapshot), offset, limit)
     }
     /// Claude Code `TaskStopTool.validateInput`: the task must exist and still be running.
-    pub(super) async fn stoppable_task(&self, task_id: &str) -> Result<(), ToolError> {
-        self.running_task(task_id).await.map(|_| ())
+    pub(super) async fn stoppable_task(
+        &self,
+        ids: &IdContext,
+        task_id: &ModelRef<ShellTaskKind>,
+    ) -> Result<(), ToolError> {
+        self.running_task(ids, task_id).await.map(|_| ())
     }
 
-    async fn running_task(&self, task_id: &str) -> Result<ProcessSnapshot, ToolError> {
-        let not_found = || ToolError::Rejected(format!("No task found with ID: {task_id}"));
-        let id = Uuid::parse_str(task_id).map_err(|_| not_found())?;
+    /// The running command `task_id` names: `shell:<id>`, or the id alone, in any form.
+    async fn running_task(
+        &self,
+        ids: &IdContext,
+        task_id: &ModelRef<ShellTaskKind>,
+    ) -> Result<ProcessSnapshot, ToolError> {
+        let not_found =
+            || ToolError::Rejected(tickloop_ids::not_found::<ShellTaskKind>(task_id.as_str()));
+        let id = ids.resolve(task_id).map_err(|_| not_found())?;
         let snapshot = self
             .entries
             .lock()
             .await
-            .get(&id)
+            .get(&id.uuid())
             .map(|entry| entry.updates.borrow().snapshot.clone())
             .ok_or_else(not_found)?;
         if !matches!(
             snapshot.state(),
             CommandState::Running | CommandState::Background
         ) {
-            return Err(ToolError::Rejected(format!(
-                "Task {task_id} is not running (status: {})",
-                snapshot.task_status()
+            return Err(ToolError::Rejected(ids.state_error(
+                id,
+                &format!("is not running (status: {})", snapshot.task_status()),
             )));
         }
         Ok(snapshot)
@@ -936,18 +956,26 @@ impl Registry {
 
     /// Stops one of the Agent's commands for the model; the user's commands are left to the
     /// user.
-    pub(super) async fn stop_task(&self, task_id: &str) -> Result<ToolResult, ToolError> {
-        let snapshot = self.running_task(task_id).await?;
+    pub(super) async fn stop_task(
+        &self,
+        ids: &IdContext,
+        task_id: &ModelRef<ShellTaskKind>,
+    ) -> Result<ToolResult, ToolError> {
+        let snapshot = self.running_task(ids, task_id).await?;
         let Some(command) = snapshot.agent() else {
-            return Err(ToolError::Rejected(format!(
-                "Task {task_id} was started by the user; only the user can stop it"
-            )));
+            return Err(ToolError::Rejected(
+                ids.state_error(
+                    ids.resolve(task_id)
+                        .map_err(|error| ToolError::Rejected(error.to_string()))?,
+                    "was started by the user; only the user can stop it",
+                ),
+            ));
         };
         if let Some(entry) = self.entries.lock().await.get_mut(&command.operation_id) {
             entry.is_stopped_by_model = true;
         }
         let stopped = self.stop(command.operation_id).await?;
-        model_result::task_stopped(&stopped)
+        model_result::task_stopped(ids, &stopped)
     }
 
     pub(super) async fn is_stopped_by_model(&self, id: Uuid) -> bool {
@@ -975,11 +1003,13 @@ impl Registry {
             .map(|entry| entry.updates.borrow().snapshot.state().clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute(
         &self,
         cwd: &Path,
         input: ShellInput,
         task_output_dir: &PrivateDirectory,
+        ids: &IdContext,
         operation_id: Uuid,
         loop_id: Uuid,
         cancel: CancellationToken,
@@ -991,6 +1021,7 @@ impl Registry {
             CommandOwner::Agent {
                 operation_id,
                 loop_id,
+                ids: *ids,
             },
             cancel,
             true,
@@ -1076,6 +1107,7 @@ impl Registry {
             CommandOwner::Agent {
                 operation_id,
                 loop_id,
+                ..
             } => ProcessSnapshot::Agent(CommandSnapshot {
                 updated_at_ms: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
                 operation_id,
@@ -1190,14 +1222,15 @@ impl Registry {
                 return Ok(result);
             }
             if update.snapshot.state() == &CommandState::Background {
-                return match &update.snapshot {
-                    ProcessSnapshot::Agent(command) => Ok(model_result::background_started(
-                        command,
-                        !input.run_in_background && !command.backgrounded_on_timeout,
-                    )),
-                    ProcessSnapshot::User(_) => {
-                        process_output(&update.snapshot, 0, DEFAULT_OUTPUT_BYTES)
+                return match (&update.snapshot, owner) {
+                    (ProcessSnapshot::Agent(command), CommandOwner::Agent { ids, .. }) => {
+                        Ok(model_result::background_started(
+                            &ids,
+                            command,
+                            !input.run_in_background && !command.backgrounded_on_timeout,
+                        ))
                     }
+                    _ => process_output(&update.snapshot, 0, DEFAULT_OUTPUT_BYTES),
                 };
             }
             if receiver.changed().await.is_err() {
@@ -1457,6 +1490,8 @@ mod tests {
 
     use tokio::sync::broadcast;
 
+    use tickloop_agent_protocol::ShellTaskId;
+
     use super::*;
 
     /// A host whose commands end when a test says so, or when they are stopped.
@@ -1679,6 +1714,7 @@ mod tests {
                     &cwd,
                     input,
                     &output,
+                    &IdContext::new(),
                     operation_id,
                     Uuid::new_v4(),
                     CancellationToken::new(),
@@ -1748,6 +1784,7 @@ mod tests {
                 &approved,
                 input,
                 &workdir.output(),
+                &IdContext::new(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 CancellationToken::new(),
@@ -1784,7 +1821,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(started.content.starts_with(&format!(
-            "Command running in background with ID: {operation_id}. Output is being written to: "
+            "Command running in background with ID: {}. Output is being written to: ",
+            IdContext::new().model_text(ShellTaskId::from(operation_id))
         )));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(host.stops(operation_id).is_empty());
@@ -1799,6 +1837,56 @@ mod tests {
                 .unwrap()
                 .content,
             "finished"
+        );
+    }
+
+    /// The model names a background command to stop as the Bash result wrote it, or as its
+    /// base62 or UUID alone; anything else reads as no task.
+    #[tokio::test]
+    async fn task_stop_takes_the_task_as_written_or_its_id_alone() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let ids = IdContext::new();
+        let forms: [fn(&IdContext, Uuid) -> String; 3] = [
+            |ids, id| ids.model_text(ShellTaskId::from(id)),
+            |_, id| ShellTaskId::from(id).public(),
+            |_, id| id.to_string(),
+        ];
+        for form in forms {
+            let operation_id = Uuid::new_v4();
+            let mut background = workdir.input("sleep 5");
+            background.run_in_background = true;
+            agent_command(&registry, &workdir, background, operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let reference = ModelRef::<ShellTaskKind>::new(form(&ids, operation_id));
+            registry.stoppable_task(&ids, &reference).await.unwrap();
+            let stopped = registry.stop_task(&ids, &reference).await.unwrap();
+            let stopped: serde_json::Value = serde_json::from_str(&stopped.content).unwrap();
+            assert_eq!(
+                stopped["task_id"],
+                ids.model_text(ShellTaskId::from(operation_id))
+            );
+            assert!(!host.stops(operation_id).is_empty());
+            let Err(ToolError::Rejected(again)) = registry.stop_task(&ids, &reference).await else {
+                panic!("a stopped task stops once");
+            };
+            assert!(
+                again.starts_with(
+                    &ids.state_error(ShellTaskId::from(operation_id), "is not running (status: ")
+                ),
+                "{again}"
+            );
+        }
+        let missing = ModelRef::<ShellTaskKind>::new("shell:nothing");
+        let Err(ToolError::Rejected(error)) = registry.stop_task(&ids, &missing).await else {
+            panic!("no task is named");
+        };
+        assert_eq!(
+            error,
+            tickloop_ids::not_found::<ShellTaskKind>("shell:nothing")
         );
     }
 
@@ -1838,7 +1926,8 @@ mod tests {
         assert_eq!(
             result.content,
             format!(
-                "Command running in background with ID: {operation_id}. Output is being written to: {}",
+                "Command running in background with ID: {}. Output is being written to: {}",
+                IdContext::new().model_text(ShellTaskId::from(operation_id)),
                 output_ref.display()
             )
         );
@@ -2091,7 +2180,15 @@ mod tests {
             let cancel = cancel.clone();
             async move {
                 registry
-                    .execute(&cwd, input, &output, operation_id, Uuid::new_v4(), cancel)
+                    .execute(
+                        &cwd,
+                        input,
+                        &output,
+                        &IdContext::new(),
+                        operation_id,
+                        Uuid::new_v4(),
+                        cancel,
+                    )
                     .await
             }
         });

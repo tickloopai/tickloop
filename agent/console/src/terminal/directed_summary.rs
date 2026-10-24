@@ -12,7 +12,7 @@ use tickloop_agent_protocol::{
 
 #[derive(Clone, Copy)]
 pub(super) struct SummaryTaskMetadata {
-    pub(super) chat: Uuid,
+    pub(super) chat: tickloop_agent_protocol::ChatId,
 }
 
 pub(super) enum SummaryTaskCompletion {
@@ -44,15 +44,17 @@ impl DirectedSummaryTasks {
             .tasks
             .spawn(async move { (chat, agent.summarize_checkpoint(chat, request).await) });
         self.metadata
-            .insert(task.id(), SummaryTaskMetadata { chat });
+            .insert(task.id(), SummaryTaskMetadata { chat: chat.into() });
         direction
     }
 
-    pub(super) fn contains(&self, chat: Uuid) -> bool {
+    pub(super) fn contains(&self, chat: tickloop_agent_protocol::ChatId) -> bool {
         self.metadata.values().any(|metadata| metadata.chat == chat)
     }
 
-    pub(super) fn active_chats(&self) -> impl Iterator<Item = Uuid> + '_ {
+    pub(super) fn active_chats(
+        &self,
+    ) -> impl Iterator<Item = tickloop_agent_protocol::ChatId> + '_ {
         self.metadata.values().map(|metadata| metadata.chat)
     }
 
@@ -100,7 +102,7 @@ pub(super) fn finish_success(
 ) -> Result<DirectedSummaryEffect, String> {
     let chat = outcome.snapshot.id;
     let direction = outcome.direction;
-    console.reset_chat(chat)?;
+    console.reset_chat(chat.into())?;
     workflows::write_public_history(console, &outcome.snapshot)?;
     console.write(&format!(
         "Conversation summarized {}. ctrl+o opens the detailed transcript.\n",

@@ -70,7 +70,7 @@ impl Agent {
             .delegation
             .as_ref()
             .map_or(chat_id, |delegation| delegation.root_chat_id());
-        let family_temp = private_family_temp_directory(family_id);
+        let family_temp = private_family_temp_directory(family_id.into());
         let persistent_project = self
             .inner
             .recorder
@@ -79,11 +79,11 @@ impl Agent {
         let temporary_chat = if family_id == chat_id {
             family_temp.clone()
         } else {
-            family_temp.join(chat_id.to_string())
+            family_temp.join(chat_id.uuid().to_string())
         };
         let chat_directory = persistent_project.map_or_else(
             || temporary_chat.clone(),
-            |project| PrivateDirectory::trusted(project).join(chat_id.to_string()),
+            |project| PrivateDirectory::trusted(project).join(chat_id.uuid().to_string()),
         );
         let task_output = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
         Arc::new(
@@ -93,7 +93,7 @@ impl Agent {
                     task_output,
                     family_temp,
                 },
-                self.inner.shells.for_chat(chat_id),
+                self.inner.shells.for_chat(chat_id.into()),
             )
             .with_search_configuration(
                 snapshot.search_config.clone(),

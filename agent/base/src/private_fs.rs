@@ -10,8 +10,6 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use uuid::Uuid;
-
 /// 只有当前用户可以访问的目录权限。
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// 只有当前用户可以读写的文件权限。
@@ -146,7 +144,7 @@ pub fn replace_file_atomically(path: &Path, contents: &[u8], mode: u32) -> io::R
         ".{}.{}.{}.{TEMPORARY_FILE_SUFFIX}",
         file_name.to_string_lossy(),
         std::process::id(),
-        Uuid::new_v4().simple()
+        tickloop_ids::random_token()
     ));
     let replaced = OpenOptions::new()
         .write(true)

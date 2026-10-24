@@ -4,8 +4,9 @@
 //! go to their native tools instead.
 
 use serde_json::{Value, json};
-use tick_protocol::HOSTED_ACCESS;
+use tick_protocol::{HOSTED_ACCESS, InstanceRef, SHELL_ACCESS, ShellTaskKind};
 use tickhost_connect::{hosted::ATTACH_INPUT_BYTES, page::MAX_PAGE_SIZE};
+use tickloop_ids::{IdContext, ModelRef};
 
 use tickloop_agent_protocol::ToolDefinition;
 
@@ -19,6 +20,102 @@ pub const HIDDEN_PLACEMENT: &str = "hidden";
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 const HOSTED_REFERENCE: &str = "hosted:<instance id> from an open";
 const HERDR_UNAVAILABLE: &str = "UnsupportedCapability: this Agent does not run in Herdr, so Workspaces and Tick views in Herdr Panes are unavailable; omit placement or pass {\"type\":\"hidden\"} to open the Tick in the Tickhost alone";
+
+/// Keys of a Tick tool result that hold what the Tick itself reported; their contents are the
+/// Tick's, never rewritten.
+const TICK_CONTENT_KEYS: [&str; 5] = ["data", "descriptor", "result", "args", "state"];
+
+pub(crate) fn is_tick_tool(name: &str) -> bool {
+    matches!(
+        name,
+        READ_WORKSPACE | TICK_DESCRIBE | TICK_READ | TICK_CALL | TICK_MANAGE
+    )
+}
+
+/// A Tick tool's input with the `tick_instance_id` the model wrote resolved to the stored form.
+/// `TickManage` also takes a Shell task by its id alone, as `TaskStop` does.
+pub(crate) fn stored_instance_input(ids: &IdContext, name: &str, mut input: Value) -> Value {
+    let Some(text) = input["tick_instance_id"].as_str() else {
+        return input;
+    };
+    let instance = match InstanceRef::from_model(ids, text) {
+        Ok(instance) => Some(instance),
+        Err(_) if name == TICK_MANAGE && !text.contains(':') => ids
+            .resolve(&ModelRef::<ShellTaskKind>::from(text))
+            .ok()
+            .map(InstanceRef::shell),
+        Err(_) => None,
+    };
+    if let Some(instance) = instance {
+        input["tick_instance_id"] = instance.as_str().into();
+    }
+    input
+}
+
+/// A Tick tool's result with each Tick Instance it names, outside what the Tick reported, in the
+/// Loop's model form.
+pub(crate) fn model_tick_result(ids: &IdContext, value: Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = match (key.as_str(), value) {
+                        (key, value) if TICK_CONTENT_KEYS.contains(&key) => value,
+                        ("tick_instance_id" | "replaces" | "instance", Value::String(text)) => {
+                            Value::String(
+                                text.parse::<InstanceRef>()
+                                    .map_or(text, |instance| instance.model_text(ids)),
+                            )
+                        }
+                        (_, value) => model_tick_result(ids, value),
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| model_tick_result(ids, item))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// A Tick tool's plain-text result, such as an error, with each stored `hosted:` or `shell:`
+/// identity in it in the Loop's model form.
+pub(crate) fn model_tick_text(ids: &IdContext, text: &str) -> String {
+    const UUID_LENGTH: usize = 36;
+    let mut rewritten = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = [HOSTED_ACCESS, SHELL_ACCESS]
+        .iter()
+        .filter_map(|access| rest.find(&format!("{access}:")))
+        .min()
+    {
+        let prefix_end = start + rest[start..].find(':').expect("found above") + 1;
+        let end = prefix_end + UUID_LENGTH;
+        let instance = rest
+            .get(start..end)
+            .and_then(|candidate| candidate.parse::<InstanceRef>().ok())
+            .filter(|instance| instance.hosted_run().is_some() || instance.shell_task().is_some());
+        match instance {
+            Some(instance) => {
+                rewritten.push_str(&rest[..start]);
+                rewritten.push_str(&instance.model_text(ids));
+                rest = &rest[end..];
+            }
+            None => {
+                rewritten.push_str(&rest[..prefix_end]);
+                rest = &rest[prefix_end..];
+            }
+        }
+    }
+    rewritten.push_str(rest);
+    rewritten
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TickToolTargetError {
@@ -408,6 +505,77 @@ fn placement_schema(actions: &[Form], views: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tick_protocol::{HostedRunId, ShellTaskId};
+
+    /// A Shell task reaches TickManage as `shell:` and its id in either form, or as the id alone;
+    /// a hosted Tick as `hosted:` and its id in either form. Each is stored as a UUID.
+    #[test]
+    fn tick_tools_store_instances_the_model_names_in_any_accepted_form() {
+        let ids = IdContext::new();
+        let task = ShellTaskId::new();
+        let run = HostedRunId::new();
+        let stored_shell = InstanceRef::shell(task).as_str().to_owned();
+        let stored_hosted = InstanceRef::hosted(run).as_str().to_owned();
+        for written in [
+            ids.model_text(task),
+            format!("shell:{}", task.uuid()),
+            task.public(),
+            task.uuid().to_string(),
+        ] {
+            let input = stored_instance_input(
+                &ids,
+                TICK_MANAGE,
+                json!({"action":"subscribe","tick_instance_id":written}),
+            );
+            assert_eq!(input["tick_instance_id"], stored_shell, "{written}");
+        }
+        for written in [ids.model_text(run), format!("hosted:{}", run.uuid())] {
+            let input = stored_instance_input(&ids, TICK_READ, json!({"tick_instance_id":written}));
+            assert_eq!(input["tick_instance_id"], stored_hosted, "{written}");
+        }
+        // Outside TickManage a bare id names no access, and a name the host does not know is
+        // left for the host to refuse.
+        let bare = json!({"tick_instance_id":task.public()});
+        assert_eq!(stored_instance_input(&ids, TICK_READ, bare.clone()), bare);
+        let unknown = json!({"tick_instance_id":"hosted:nothing"});
+        assert_eq!(
+            stored_instance_input(&ids, TICK_READ, unknown.clone()),
+            unknown
+        );
+        let shell = stored_instance_input(
+            &ids,
+            TICK_READ,
+            json!({"tick_instance_id":ids.model_text(task)}),
+        );
+        assert!(
+            check_target(TICK_READ, &shell)
+                .unwrap_err()
+                .contains("Shell Tick")
+        );
+    }
+
+    #[test]
+    fn tick_tool_results_name_instances_in_model_form_but_keep_what_the_tick_reported() {
+        let ids = IdContext::new();
+        let run = HostedRunId::new();
+        let stored = InstanceRef::hosted(run).as_str().to_owned();
+        let result = model_tick_result(
+            &ids,
+            json!({"tick_instance_id":stored,"replaces":stored,"data":{"tick_instance_id":stored},"ticks":[{"tick_instance_id":stored}]}),
+        );
+        let model = ids.model_text(run);
+        assert_eq!(result["tick_instance_id"], model);
+        assert_eq!(result["replaces"], model);
+        assert_eq!(result["ticks"][0]["tick_instance_id"], model);
+        assert_eq!(result["data"]["tick_instance_id"], stored);
+        assert_eq!(
+            model_tick_text(
+                &ids,
+                &format!("{stored} is not a running hosted Tick; hosted:x stays")
+            ),
+            format!("{model} is not a running hosted Tick; hosted:x stays")
+        );
+    }
 
     fn validate(input: &Value, views: bool) -> Result<(), String> {
         validate_input(TICK_MANAGE, &tick_manage_schema(views), input, views)

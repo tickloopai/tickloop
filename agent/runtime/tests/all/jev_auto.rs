@@ -141,7 +141,7 @@ async fn fixture(
         agent.snapshot(chat).await.unwrap().policy.mode,
         ExecutionMode::Auto
     );
-    (root, agent, reviewer, chat)
+    (root, agent, reviewer, chat.uuid())
 }
 
 #[tokio::test]
@@ -233,7 +233,10 @@ async fn typed_allow_executes_and_records_separate_judgment_usage() {
         let (root, agent, reviewer, chat) = fixture(outcome, PromptPolicy::Interactive).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, "Create a symlink named reviewed".into())
+            .submit(
+                tickloop_ids::Id::from(chat),
+                "Create a symlink named reviewed".into(),
+            )
             .await
             .unwrap();
         loop {
@@ -245,7 +248,7 @@ async fn typed_allow_executes_and_records_separate_judgment_usage() {
             }
         }
         assert!(root.path().join("reviewed").symlink_metadata().is_ok());
-        let snapshot = agent.snapshot(chat).await.unwrap();
+        let snapshot = agent.snapshot(tickloop_ids::Id::from(chat)).await.unwrap();
         let checks: Vec<_> = snapshot
             .request_usage
             .entries()
@@ -278,7 +281,10 @@ async fn overall_allow_is_not_overridden_by_an_extra_confidence_gate() {
         let (root, agent, reviewer, chat) = fixture(Outcome::LowConfidence, prompt_policy).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, "Create a symlink named reviewed".into())
+            .submit(
+                tickloop_ids::Id::from(chat),
+                "Create a symlink named reviewed".into(),
+            )
             .await
             .unwrap();
         loop {
@@ -301,7 +307,10 @@ async fn invalid_answers_and_auth_failures_fall_back_to_the_chat_model() {
         let (root, agent, reviewer, chat) = fixture(outcome, PromptPolicy::Interactive).await;
         let mut events = agent.subscribe();
         agent
-            .submit(chat, "Create a symlink named reviewed".into())
+            .submit(
+                tickloop_ids::Id::from(chat),
+                "Create a symlink named reviewed".into(),
+            )
             .await
             .unwrap();
         loop {
@@ -330,7 +339,7 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
     let (root, agent, reviewer, chat) = fixture(Outcome::Allow, PromptPolicy::Interactive).await;
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: uuid::Uuid::new_v4(),
                 decision: Decision::Deny,
@@ -345,7 +354,10 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
         .unwrap();
     let mut events = agent.subscribe();
     agent
-        .submit(chat, "Create a symlink named reviewed".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create a symlink named reviewed".into(),
+        )
         .await
         .unwrap();
     loop {
@@ -362,7 +374,10 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
 
     let (root, agent, reviewer, chat) = fixture(Outcome::Wait, PromptPolicy::Interactive).await;
     agent
-        .submit(chat, "Create a symlink named reviewed".into())
+        .submit(
+            tickloop_ids::Id::from(chat),
+            "Create a symlink named reviewed".into(),
+        )
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -372,12 +387,12 @@ async fn explicit_deny_precedes_jev_and_cancellation_cannot_admit_an_action() {
     })
     .await
     .unwrap();
-    agent.interrupt(chat).await.unwrap();
+    agent.interrupt(tickloop_ids::Id::from(chat)).await.unwrap();
     agent.shutdown().await;
     assert!(root.path().join("reviewed").symlink_metadata().is_err());
     assert!(
         agent
-            .snapshot(chat)
+            .snapshot(tickloop_ids::Id::from(chat))
             .await
             .unwrap()
             .request_usage

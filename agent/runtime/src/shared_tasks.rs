@@ -1,10 +1,14 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tickloop_agent_protocol::ChatKind;
+use tickloop_agent_protocol::model_ids::model_json;
 use tickloop_agent_protocol::{
     OperationRecord, SharedTask, SharedTaskStatus as Status, TaskAssignment, TaskBoard, TaskClaim,
     TaskExecutionBinding, TaskMutationReceipt, TaskOwner, TaskReport, ToolDefinition, ToolResult,
 };
+use tickloop_agent_protocol::{SharedTaskId, SharedTaskKind};
 use tickloop_agent_transcript::{Line, TaskBoardsEntry};
+use tickloop_ids::{IdContext, ModelRef};
 
 use super::tool_execution::ToolInvocation;
 use super::*;
@@ -17,7 +21,33 @@ pub(super) fn is_task_tool(name: &str) -> bool {
     matches!(name, "TaskCreate" | "TaskGet" | "TaskList" | "TaskUpdate")
 }
 
+/// `input` with the task ids the model wrote, in `task_id` and `dependencies`, resolved to the
+/// stored form.
+fn resolve_task_references(ids: &IdContext, input: &Value) -> Result<Value, String> {
+    let resolve = |reference: &Value| -> Result<Value, String> {
+        let Some(text) = reference.as_str() else {
+            return Ok(reference.clone());
+        };
+        ids.resolve(&ModelRef::<SharedTaskKind>::from(text))
+            .map(|id| Value::String(id.uuid().to_string()))
+            .map_err(|error| error.to_string())
+    };
+    let mut resolved = input.clone();
+    if let Some(task_id) = input.get("task_id") {
+        resolved["task_id"] = resolve(task_id)?;
+    }
+    if let Some(Value::Array(dependencies)) = input.get("dependencies") {
+        resolved["dependencies"] = dependencies
+            .iter()
+            .map(resolve)
+            .collect::<Result<Vec<_>, _>>()?
+            .into();
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn reconciled_mutation_result(
+    ids: &IdContext,
     board: &TaskBoard,
     mutation: &TaskMutationReceipt,
 ) -> ToolResult {
@@ -38,7 +68,7 @@ pub(crate) fn reconciled_mutation_result(
         json!({"status":"already_applied","task":task,"notification":notification})
     };
     ToolResult {
-        content: value.to_string(),
+        content: model_json(ids, value).to_string(),
         is_error: false,
         output_ref: None,
     }
@@ -51,7 +81,7 @@ struct CreateInput {
     title: String,
     description: String,
     #[serde(default)]
-    dependencies: Vec<Uuid>,
+    dependencies: Vec<SharedTaskId>,
 }
 
 #[derive(Deserialize)]
@@ -73,14 +103,14 @@ enum UpdateAction {
     Edit {
         title: String,
         description: String,
-        dependencies: Vec<Uuid>,
+        dependencies: Vec<SharedTaskId>,
     },
 }
 
 #[derive(Deserialize)]
 struct UpdateInput {
     mutation_id: Uuid,
-    task_id: Uuid,
+    task_id: SharedTaskId,
     expected_revision: u64,
     #[serde(flatten)]
     action: UpdateAction,
@@ -126,11 +156,12 @@ pub(super) fn tool_access(chats: &HashMap<ChatId, Chat>, receipt: &Receipt) -> T
 
 pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
     let uuid = json!({"type":"string","format":"uuid"});
+    let task = json!({"type":"string","minLength":1,"description":"A task id as TaskList or TaskCreate returned it."});
     let mut tools = vec![
-        ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task in the current Loop’s task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":uuid}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task UUID, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
-        ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":uuid},"required":["task_id"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":uuid,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":uuid}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task in the current Loop’s task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task id, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
+        ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":task},"required":["task_id"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
     ];
     match access {
         TaskToolAccess::Disabled => tools.clear(),
@@ -276,7 +307,7 @@ pub(super) fn execution_binding(
         return Ok(Some(TaskExecutionBinding {
             root_chat_id: root,
             root_loop_id: loop_id,
-            task_id: task.id,
+            task_id: task.id.into(),
             revision: task.revision,
             run_id: receipt.run_id,
             generation: chats[&receipt.chat_id].family_generation,
@@ -350,8 +381,8 @@ fn text_valid(text: &str) -> Result<(), String> {
 
 fn validate_dependencies(
     board: &TaskBoard,
-    task_id: Uuid,
-    dependencies: &[Uuid],
+    task_id: SharedTaskId,
+    dependencies: &[SharedTaskId],
 ) -> Result<(), String> {
     let mut seen = HashSet::new();
     for dependency in dependencies {
@@ -517,7 +548,7 @@ fn apply_update(
     }
     task.revision += 1;
     board.revision += 1;
-    Ok(task.id)
+    Ok(task.id.into())
 }
 
 fn ensure_execution_settled(
@@ -854,8 +885,13 @@ impl Agent {
         self.record_chat_metadata(
             root.snapshot.id,
             Line::TaskBoards(TaskBoardsEntry {
-                chat_id: root.snapshot.id,
-                boards: root.snapshot.task_boards.clone(),
+                chat_id: root.snapshot.id.into(),
+                boards: root
+                    .snapshot
+                    .task_boards
+                    .iter()
+                    .map(|(loop_id, board)| (loop_id.uuid(), board.clone()))
+                    .collect(),
             }),
         );
         // Keep the reservation on write failure: the queued metadata may still reach disk.
@@ -883,7 +919,7 @@ impl Agent {
             let receipt = Receipt {
                 chat_id: chat.snapshot.id,
                 loop_id: chat_loop.id,
-                run_id: chat_loop.run_id.unwrap_or_default(),
+                run_id: chat_loop.run_id.unwrap_or(RunId::nil()),
             };
             self.publish_event(
                 chat,
@@ -974,7 +1010,9 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<ToolResult, String> {
         let name = operation.name.as_str();
-        let input = &operation.input;
+        let ids = self.chat_ids(receipt.chat_id).await;
+        let resolved_input = resolve_task_references(&ids, &operation.input)?;
+        let input = &resolved_input;
         let snapshot = self
             .snapshot(receipt.chat_id)
             .await
@@ -1016,6 +1054,7 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let (root_id, loop_id) = scope(&chats, receipt)?;
         let source = &chats[&receipt.chat_id];
+        let ids = source.ids;
         if report_review.is_some()
             && (source.snapshot.policy.revision != snapshot.policy.revision
                 || delegation::ancestor_revisions(&chats, receipt.chat_id)? != ancestor_revisions)
@@ -1049,7 +1088,8 @@ impl Agent {
                     .get(&loop_id)
                     .is_some_and(|board| {
                         board.tasks.iter().any(|task| {
-                            task.id.to_string() == input["task_id"].as_str().unwrap_or_default()
+                            task.id.uuid().to_string()
+                                == input["task_id"].as_str().unwrap_or_default()
                                 && task.status == Status::InProgress
                                 && task
                                     .owner
@@ -1104,18 +1144,22 @@ impl Agent {
                     .tasks
                     .iter()
                     .find(|task| task.id == id)
-                    .ok_or("unknown task")?;
+                    .ok_or_else(|| {
+                        tickloop_ids::not_found::<SharedTaskKind>(
+                            operation.input["task_id"].as_str().unwrap_or_default(),
+                        )
+                    })?;
                 json!({"task":task,"blocked_by":board.blocked_by(task)})
             };
             return Ok(ToolResult {
-                content: value.to_string(),
+                content: model_json(&ids, value).to_string(),
                 is_error: false,
                 output_ref: None,
             });
         }
         let mutation_id: Uuid = serde_json::from_value(input["mutation_id"].clone())
             .map_err(|error| error.to_string())?;
-        let encoded = format!("{name}:{input}");
+        let encoded = format!("{name}:{}", operation.input);
         if let Some(previous) = board.mutations.get(&mutation_id) {
             if previous.actor != receipt.chat_id || previous.input != encoded {
                 return Err("mutation_id was already used for a different operation".into());
@@ -1138,8 +1182,11 @@ impl Agent {
                 .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
                 .await;
             return Ok(ToolResult {
-                content: json!({"status":"already_applied","task":task,"notification":delivery})
-                    .to_string(),
+                content: model_json(
+                    &ids,
+                    json!({"status":"already_applied","task":task,"notification":delivery}),
+                )
+                .to_string(),
                 is_error: false,
                 output_ref: None,
             });
@@ -1164,10 +1211,10 @@ impl Agent {
                     .ok_or("task numbering exhausted")?;
                 text_valid(&create.title)?;
                 text_valid(&create.description)?;
-                let id = Uuid::new_v4();
-                validate_dependencies(&candidate, id, &create.dependencies)?;
+                let id = tickloop_ids::generate();
+                validate_dependencies(&candidate, id.into(), &create.dependencies)?;
                 candidate.tasks.push(SharedTask {
-                    id,
+                    id: id.into(),
                     title: create.title,
                     description: create.description,
                     dependencies: create.dependencies,
@@ -1196,7 +1243,10 @@ impl Agent {
                         let entry = registrations
                             .iter()
                             .find(|entry| {
-                                entry.handle == *owner || entry.child_chat_id.to_string() == *owner
+                                entry.handle == *owner
+                                    || ids
+                                        .resolve(&ModelRef::<ChatKind>::from(owner.as_str()))
+                                        .is_ok_and(|id| id == entry.child_chat_id)
                             })
                             .ok_or("unknown family member")?;
                         TaskOwner {
@@ -1237,7 +1287,13 @@ impl Agent {
                         .ok_or("unknown task")?;
                     ensure_execution_settled(&chats, task, receipt, operation.id)?;
                 }
-                let id = apply_update(&mut candidate, update, &actor, claim, assignment)?;
+                // A conflict names the task as it is now, written as the model reads ids.
+                let id = apply_update(&mut candidate, update, &actor, claim, assignment).map_err(
+                    |error| match serde_json::from_str::<Value>(&error) {
+                        Ok(conflict) => model_json(&ids, conflict).to_string(),
+                        Err(_) => error,
+                    },
+                )?;
                 if input["action"] == "complete" {
                     if let Some(review) = &report_review {
                         let task = candidate
@@ -1272,13 +1328,13 @@ impl Agent {
             .find(|task| task.id == task_id)
             .unwrap()
             .clone();
-        let notification = notify.map(|target| TaskAssignment { target: target.chat_id, message: format!("Shared task assignment: {}. Claim at its current revision before starting. Stay within your existing authorized scope. Task: {}", task.title, json!(task)), delivered: false });
+        let notification = notify.map(|target| TaskAssignment { target: target.chat_id, message: format!("Shared task assignment: {}. Claim at its current revision before starting. Stay within your existing authorized scope. Task: {}", task.title, model_json(&ids, json!(task))), delivered: false });
         candidate.mutations.insert(
             mutation_id,
             TaskMutationReceipt {
                 actor: receipt.chat_id,
                 input: encoded,
-                task_id,
+                task_id: task_id.into(),
                 task_cleared: false,
                 notification,
             },
@@ -1292,7 +1348,11 @@ impl Agent {
             .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
             .await;
         Ok(ToolResult {
-            content: json!({"status":"applied","task":task,"notification":delivery}).to_string(),
+            content: model_json(
+                &ids,
+                json!({"status":"applied","task":task,"notification":delivery}),
+            )
+            .to_string(),
             is_error: false,
             output_ref: None,
         })
@@ -1309,7 +1369,7 @@ impl Agent {
         if let Err(error) = self.refresh_task_tools_setting().await {
             return error.to_string();
         }
-        let (notification, assistant_id, registered) = {
+        let (notification, assistant_id, registered, ids) = {
             let chats = self.inner.chats.lock().await;
             if !chats[&root_id].snapshot.task_tools_enabled {
                 return "Task tools are disabled; assignment notification retained without delivery".into();
@@ -1358,12 +1418,12 @@ impl Agent {
                 self.scheduled_task_terms(),
             )
             .resolve(tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME);
-            (notification, assistant_id, registered)
+            (notification, assistant_id, registered, chat.ids)
         };
         let invocation = ToolInvocation::new(
             format!("task-assignment-{mutation_id}"),
             tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME.into(),
-            json!({"to":notification.target.to_string(),"message":notification.message}),
+            json!({"to":ids.model_text(notification.target),"message":notification.message}),
             registered,
         );
         let result = match Box::pin(self.execute_registered_call(

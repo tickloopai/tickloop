@@ -396,7 +396,7 @@ impl DurableChats {
             if row.tasks.iter().any(|task| task.view.key == key) {
                 return None;
             }
-            let id = Uuid::new_v4();
+            let id = tickloop_ids::generate();
             row.tasks.push(TaskRow {
                 view: TaskView {
                     id,
@@ -519,7 +519,7 @@ impl DurableChats {
                 .ok_or(TranscriptError::Fenced)?;
             task.view.state = TaskState::Acknowledged;
             if let TaskKind::Turn { request, .. } = &task.kind {
-                *row.acknowledged.entry(request.input_id).or_default() += 1;
+                *row.acknowledged.entry(request.input_id.uuid()).or_default() += 1;
             }
             Ok(())
         })
@@ -949,7 +949,7 @@ impl Holding {
     pub async fn run_on(&self, member: Option<ChatId>, request: TurnRequest) -> TurnReport {
         let input = request.input_id;
         self.hold(
-            input,
+            input.uuid(),
             Task {
                 member,
                 request: Box::new(request),

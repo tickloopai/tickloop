@@ -940,9 +940,9 @@ mod tests {
         let [prompt, compacted, summary, message_id] = std::array::from_fn(|_| Uuid::new_v4());
         let record = tickloop_agent_protocol::FamilyInputRecord {
             message_id,
-            target_chat_id: Uuid::new_v4(),
+            target_chat_id: Uuid::new_v4().into(),
             target_handle: "audit".into(),
-            target_run_id: Uuid::new_v4(),
+            target_run_id: Uuid::new_v4().into(),
             submitted_at: 1000,
             response: Some("Verified reply".into()),
             state: Some(tickloop_agent_protocol::LoopState::Idle),
@@ -958,7 +958,10 @@ mod tests {
                     chat_id: Uuid::nil(),
                     boards: [(
                         message_id,
-                        tickloop_agent_protocol::TaskBoard::new(Uuid::nil(), message_id),
+                        tickloop_agent_protocol::TaskBoard::new(
+                            Uuid::nil().into(),
+                            message_id.into(),
+                        ),
                     )]
                     .into(),
                 }),

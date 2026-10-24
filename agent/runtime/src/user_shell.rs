@@ -89,7 +89,7 @@ impl Agent {
                 "shell command cannot be empty or contain NUL".into(),
             ));
         }
-        let command_id = Uuid::new_v4();
+        let command_id = tickloop_ids::generate();
         let (tools, should_watch, record) = {
             let mut chats = self.inner.chats.lock().await;
             if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
@@ -171,7 +171,7 @@ impl Agent {
         }
         let tools = self.user_shell_tools(chat_id, command_id).await?;
         let command = tools
-            .background_user_shell(command_id, chat_id)
+            .background_user_shell(command_id, chat_id.into())
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let record = self.record_user_shell(chat_id, command).await?;
@@ -239,7 +239,7 @@ impl Agent {
         }
         let tools = self.user_shell_tools(chat_id, command_id).await?;
         let command = tools
-            .stop_user_shell(command_id, chat_id)
+            .stop_user_shell(command_id, chat_id.into())
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let record = self.record_user_shell(chat_id, command).await?;
@@ -274,7 +274,7 @@ impl Agent {
             .any(|command| command.operation_id == command_id)
         {
             return tools
-                .read_user_shell(command_id, chat_id, offset, limit)
+                .read_user_shell(command_id, chat_id.into(), offset, limit)
                 .await
                 .map_err(|error| AgentError::Invalid(error.to_string()));
         }
@@ -457,8 +457,14 @@ impl Agent {
             "cwd": record.cwd,
             "run_in_background": record.starts_in_background,
         });
+        let ids = self.chat_ids(chat_id).await;
         let prepared = tools
-            .prepare(&workspace, tickloop_agent_tools::BASH_TOOL_NAME, &input)
+            .prepare(
+                &ids,
+                &workspace,
+                tickloop_agent_tools::BASH_TOOL_NAME,
+                &input,
+            )
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let mut authorization = None;
@@ -470,12 +476,12 @@ impl Agent {
             let receipt = Receipt {
                 chat_id,
                 loop_id,
-                run_id: Uuid::nil(),
+                run_id: Uuid::nil().into(),
             };
             self.check_delegated_call(&receipt, &prepared.name, &prepared.input, Some(&prepared))
                 .await
                 .map_err(AgentError::Invalid)?;
-            let owner = PermissionOwner::new(chat_id, loop_id)
+            let owner = PermissionOwner::new(chat_id.into(), loop_id.into())
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let operation = SessionPermissionOperation::from_prepared(&prepared, &workspace)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
@@ -504,7 +510,7 @@ impl Agent {
             }
             if decision != Decision::Allow {
                 let request = PermissionRequest {
-                    id: Uuid::new_v4(),
+                    id: tickloop_ids::generate(),
                     loop_id,
                     execution: PermissionExecution::UserShell {
                         command_id: record.id,
@@ -602,7 +608,7 @@ impl Agent {
             let _ = self.inner.user_shell_events.send(update);
         }
         tools
-            .execute_user_shell(prepared, record.id, chat_id, cancel)
+            .execute_user_shell(prepared, record.id, chat_id.into(), cancel)
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         Ok(())
@@ -717,7 +723,8 @@ impl Agent {
         let was_announced_as_background = has_announced_background(previous);
         let input = local_messages::bash_input(&current.command);
         let announcement = local_messages::background_started(
-            current.id,
+            &chat.ids,
+            current.id.into(),
             &command.output_ref,
             !previous.starts_in_background && !command.backgrounded_on_timeout,
         );
@@ -737,7 +744,7 @@ impl Agent {
             }
             let notification = TaskNotification::for_background_command(
                 current.chat_id,
-                current.id,
+                current.id.into(),
                 None,
                 command.output_ref.clone(),
                 &current.command,
@@ -760,7 +767,12 @@ impl Agent {
             chats.get(&chat_id)?.tools.clone()
         };
         let result = tools
-            .read_user_shell(command.operation_id, chat_id, 0, CONTEXT_OUTPUT_BYTES)
+            .read_user_shell(
+                command.operation_id,
+                chat_id.into(),
+                0,
+                CONTEXT_OUTPUT_BYTES,
+            )
             .await
             .ok()?;
         let value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
@@ -863,7 +875,7 @@ fn record_to_command_snapshot(record: &UserShellRecord) -> Option<UserCommandSna
     Some(UserCommandSnapshot {
         updated_at_ms: record.updated_at_ms,
         operation_id: record.id,
-        chat_id: record.chat_id,
+        chat_id: record.chat_id.into(),
         command: record.command.clone(),
         cwd: record.cwd.clone(),
         pid: record.pid,

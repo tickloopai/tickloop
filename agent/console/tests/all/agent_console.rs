@@ -1357,7 +1357,7 @@ async fn overview_refresh_cost_with_many_long_histories() {
                     .unwrap()
                     .chat_id;
                 runtime
-                    .submit(chat, "x".repeat(history_bytes))
+                    .submit(chat.into(), "x".repeat(history_bytes))
                     .await
                     .unwrap();
             }

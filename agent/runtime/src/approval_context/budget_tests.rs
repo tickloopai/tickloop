@@ -24,7 +24,7 @@ struct Session {
 impl Session {
     fn new() -> Self {
         let mut snapshot = empty_snapshot(
-            Uuid::new_v4(),
+            Uuid::new_v4().into(),
             Some("/project".into()),
             tickloop_agent_test_support::config(),
         );
@@ -38,14 +38,16 @@ impl Session {
 
     fn run(&mut self) -> Uuid {
         let run = Uuid::new_v4();
-        self.bookkeeping.run_loops.insert(run, self.loop_id);
+        self.bookkeeping
+            .run_loops
+            .insert(run.into(), self.loop_id.into());
         run
     }
 
     fn push(&mut self, role: Role, content: Vec<Content>, run: Uuid) -> usize {
         let index = self.snapshot.messages.len();
         self.snapshot.messages.push(Message { role, content });
-        self.snapshot.message_runs.insert(index, run);
+        self.snapshot.message_runs.insert(index, run.into());
         self.snapshot.message_ids.insert(index, Uuid::new_v4());
         index
     }
@@ -87,8 +89,8 @@ impl Session {
         let operation = OperationRecord {
             task_binding: None,
             id: Uuid::new_v4(),
-            loop_id: self.loop_id,
-            run_id: run,
+            loop_id: self.loop_id.into(),
+            run_id: run.into(),
             call_id: "proposed".into(),
             name: "Bash".into(),
             input,
@@ -97,6 +99,7 @@ impl Session {
             result: None,
         };
         let complete = crate::approval_context::capture(
+            &tickloop_ids::IdContext::new(),
             &self.snapshot,
             &self.bookkeeping,
             &operation,
@@ -230,7 +233,8 @@ fn a_long_session_fits_each_reviewer_and_marks_what_was_cut() {
     assert_eq!(fitted.original_user_inputs.last().unwrap().text, current);
     let output_tokens = session.snapshot.model.max_output_tokens as usize;
     for stage in [ApprovalStage::RiskScreen, ApprovalStage::Authorization] {
-        let request = crate::auto_mode::classifier_request(&fitted, stage);
+        let request =
+            crate::auto_mode::classifier_request(&tickloop_ids::IdContext::new(), &fitted, stage);
         let (system, user) = texts(&request);
         let estimated_tokens = (system.len() + user.len())
             .div_ceil(crate::context::ESTIMATED_UTF8_BYTES_PER_TOKEN)
@@ -266,7 +270,9 @@ fn a_long_session_fits_each_reviewer_and_marks_what_was_cut() {
     assert!(json_len(&fitted) <= jev_budget);
     assert_kept_evidence(&complete, &fitted);
     for stage in [ApprovalStage::RiskScreen, ApprovalStage::Authorization] {
-        let request = crate::jev_review::review_request(&fitted, stage).unwrap();
+        let request =
+            crate::jev_review::review_request(&tickloop_ids::IdContext::new(), &fitted, stage)
+                .unwrap();
         assert!(serde_json::to_vec(&request).unwrap().len() <= JEV_REQUEST_LIMIT_BYTES);
         let tickloop_agent_model::judgment::Question::Choice { instructions, .. } =
             &request.questions["decision"]
@@ -296,19 +302,36 @@ fn a_short_session_is_reviewed_unchanged() {
         let fitted = fit(&complete, budget);
         assert_eq!(serde_json::to_string(&fitted).unwrap(), complete_json);
         for stage in [ApprovalStage::RiskScreen, ApprovalStage::Authorization] {
-            let fitted_request = crate::auto_mode::classifier_request(&fitted, stage);
-            let complete_request = crate::auto_mode::classifier_request(&complete, stage);
+            let fitted_request = crate::auto_mode::classifier_request(
+                &tickloop_ids::IdContext::new(),
+                &fitted,
+                stage,
+            );
+            let complete_request = crate::auto_mode::classifier_request(
+                &tickloop_ids::IdContext::new(),
+                &complete,
+                stage,
+            );
             assert_eq!(texts(&fitted_request), texts(&complete_request));
             assert!(
                 !texts(&fitted_request)
                     .0
                     .contains(crate::auto_rules::TRUNCATION_GUIDANCE)
             );
-            let jev = crate::jev_review::review_request(&fitted, stage).unwrap();
+            let jev =
+                crate::jev_review::review_request(&tickloop_ids::IdContext::new(), &fitted, stage)
+                    .unwrap();
             assert_eq!(
                 serde_json::to_value(&jev).unwrap(),
-                serde_json::to_value(crate::jev_review::review_request(&complete, stage).unwrap())
+                serde_json::to_value(
+                    crate::jev_review::review_request(
+                        &tickloop_ids::IdContext::new(),
+                        &complete,
+                        stage
+                    )
                     .unwrap()
+                )
+                .unwrap()
             );
             assert!(!serde_json::to_string(&jev).unwrap().contains("\"context\""));
         }

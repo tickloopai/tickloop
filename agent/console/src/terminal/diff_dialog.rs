@@ -533,7 +533,7 @@ mod tests {
                     ],
                 ),
                 source(
-                    ChangeSourceId::AgentRun(Uuid::from_u128(20)),
+                    ChangeSourceId::AgentRun(Uuid::from_u128(20).into()),
                     vec![
                         available_file(4, "run-a.txt", 1),
                         available_file(5, "run-b.txt", 30),
@@ -695,7 +695,7 @@ mod tests {
                     id: if index == 0 {
                         ChangeSourceId::Current
                     } else {
-                        ChangeSourceId::AgentRun(Uuid::from_u128(index as u128))
+                        ChangeSourceId::AgentRun(Uuid::from_u128(index as u128).into())
                     },
                     state,
                     user_prompt: None,
@@ -839,7 +839,7 @@ mod tests {
     fn repeated_changes_to_the_same_path_keep_distinct_selection_and_anchors() {
         let catalog = ChangeCatalog {
             sources: vec![source(
-                ChangeSourceId::AgentRun(Uuid::from_u128(20)),
+                ChangeSourceId::AgentRun(Uuid::from_u128(20).into()),
                 vec![
                     available_file(1, "same.txt", 2),
                     available_file(2, "same.txt", 40),

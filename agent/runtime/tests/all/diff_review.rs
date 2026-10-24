@@ -15,7 +15,7 @@ use uuid::Uuid;
 async fn require_file_change_approval(agent: &Agent, chat: Uuid, tool: &str) {
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: Uuid::new_v4(),
                 decision: Decision::Ask,
@@ -104,7 +104,7 @@ async fn permission_and_operation_share_the_immutable_prepared_review() {
         ])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Edit").await;
+    require_file_change_approval(&agent, chat.uuid(), "Edit").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Correct the delivery day".into())
@@ -205,7 +205,7 @@ async fn change_journal_contains_only_successful_file_operations() {
     ]));
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Edit").await;
+    require_file_change_approval(&agent, chat.uuid(), "Edit").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Read and update both files".into())
@@ -282,7 +282,7 @@ async fn saved_reviews_report_missing_or_corrupt_sidecars_and_are_not_listed_aft
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Write").await;
+    require_file_change_approval(&agent, chat.uuid(), "Write").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Create the report".into())
@@ -349,7 +349,7 @@ async fn missing_review_artifact_cannot_be_approved_but_can_still_be_denied() {
         )])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    require_file_change_approval(&agent, chat, "Write").await;
+    require_file_change_approval(&agent, chat.uuid(), "Write").await;
     let mut events = agent.subscribe();
     agent
         .submit(chat, "Create a reviewed file".into())

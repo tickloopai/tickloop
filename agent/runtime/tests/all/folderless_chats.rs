@@ -99,7 +99,10 @@ fn tool_result<'a>(
 /// Runs one turn of `prompt` and returns every event of its Run.
 async fn run_turn(agent: &Agent, chat: Uuid, prompt: &str) -> Vec<EventKind> {
     let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+    let receipt = agent
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
+        .await
+        .unwrap();
     let mut kinds = Vec::new();
     loop {
         let event = next_event(&mut events).await;
@@ -123,7 +126,7 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
     let model = Arc::new(ScriptedModel::new(vec![text("done")]));
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let events = run_turn(&agent, chat, "hello").await;
+    let events = run_turn(&agent, chat.uuid(), "hello").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(
@@ -176,7 +179,7 @@ async fn a_folderless_chat_offers_web_fetch_alone_and_hears_of_nothing_else() {
     let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     let chat = agent.create_chat_without_folder().await.unwrap();
     assert_eq!(agent.snapshot(chat).await.unwrap().folder, None);
-    let events = run_turn(&agent, chat, "what is new").await;
+    let events = run_turn(&agent, chat.uuid(), "what is new").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
@@ -214,7 +217,7 @@ async fn excepted_tool_names_return_disabled_results_without_any_wait() {
     ]));
     let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let events = run_turn(&agent, chat, "go").await;
+    let events = run_turn(&agent, chat.uuid(), "go").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -250,7 +253,7 @@ async fn web_fetch_is_allowed_by_the_host_rule_without_review_and_reaches_only_p
     let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let events = run_turn(&agent, chat, "read it").await;
+    let events = run_turn(&agent, chat.uuid(), "read it").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -307,7 +310,7 @@ async fn a_host_that_lets_folderless_chats_reach_anywhere_fetches_a_loopback_pag
     ]));
     let agent = folderless_agent(model.clone(), Reach::Anywhere);
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let events = run_turn(&agent, chat, "read it").await;
+    let events = run_turn(&agent, chat.uuid(), "read it").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     let completed = events
         .iter()
@@ -403,7 +406,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
     )
     .unwrap();
     let chat = folderless.create_chat_without_folder().await.unwrap();
-    run_turn(&folderless, chat, "prompt").await;
+    run_turn(&folderless, chat.uuid(), "prompt").await;
     folderless.sync().await.unwrap();
     folderless.shutdown().await;
     drop(folderless);
@@ -543,7 +546,7 @@ async fn folderless_turn_in_child() {
     let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     agent.install_own_tickhost();
     let chat = agent.create_chat_without_folder().await.unwrap();
-    let events = run_turn(&agent, chat, "fetch and search").await;
+    let events = run_turn(&agent, chat.uuid(), "fetch and search").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     agent.flush_transcripts().await;

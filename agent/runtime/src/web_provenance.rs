@@ -165,7 +165,7 @@ impl Agent {
             return;
         }
         let entry = ProvenanceEntry {
-            chat_id,
+            chat_id: chat_id.into(),
             ..chat.bookkeeping.provenance.clone()
         };
         if let Some(recorder) = &self.inner.recorder {

@@ -115,7 +115,7 @@ impl ShellTaskCenter {
             .map(|old| old.live_revision + u64::from(old.tasks != tasks))
             .unwrap_or(1);
         let snapshot = ShellTaskSnapshot {
-            chat_id: chat,
+            chat_id: chat.into(),
             live_revision,
             tasks,
         };
@@ -150,7 +150,7 @@ impl ShellTaskCenter {
             .into_iter()
             .find(|task| task.id == id)
             .ok_or(ShellTaskCenterError::TaskNotFound {
-                chat_id: chat,
+                chat_id: chat.into(),
                 task_id: id,
             })
     }
@@ -167,7 +167,7 @@ impl ShellTaskCenter {
             ShellTaskOrigin::User => TaskOrigin::User,
         };
         self.agent
-            .task_output(task.chat_id, id, origin, offset, limit)
+            .task_output(task.chat_id.into(), id, origin, offset, limit)
             .await
             .map_err(runtime_error)
     }
@@ -193,7 +193,7 @@ impl ShellTaskCenter {
         }
         let execution = self
             .agent
-            .reference(task.chat_id)
+            .reference(task.chat_id.into())
             .await
             .map_err(runtime_error)?;
         let task_ref = TaskRef {

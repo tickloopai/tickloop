@@ -131,7 +131,7 @@ impl WorkerControl {
         WorkerControlGrant {
             endpoint: self.endpoint.clone(),
             daemon_epoch: self.epoch,
-            binding: Uuid::new_v4(),
+            binding: tickloop_ids::generate(),
             capability: tickhost::host::random_token(),
             host_endpoint: self.controller.endpoint(),
         }

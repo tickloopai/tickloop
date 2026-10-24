@@ -135,7 +135,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
         .await
         .unwrap();
     fixture.shutdown().await;
-    let chat_id = actual.conversation.id.to_string();
+    let chat_id = actual.conversation.id.uuid().to_string();
     let mut resumed = PtyView::launch(fixture, &["--resume", &chat_id], &[], true);
     resumed
         .wait_for(

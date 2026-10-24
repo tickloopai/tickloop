@@ -1046,7 +1046,7 @@ impl Source for GoalSource {
                 self.process.chat,
                 TriggerSource::GoalContinuation {
                     goal_id: self.goal_id,
-                    after_run: Uuid::from_u128(u128::from(n)),
+                    after_run: tickloop_ids::Id::from(Uuid::from_u128(u128::from(n))),
                     objective_revision: self.objective_revision,
                 },
                 marker,
@@ -1437,7 +1437,8 @@ impl Source for OneTaskSource {
     /// by its record.
     async fn crash_and_reopen(self, model: Arc<ContractModel>) -> Self {
         let image = self.process.crashed().await;
-        let transcript = tickloop_agent_test_support::transcript_file(&image, self.process.chat);
+        let transcript =
+            tickloop_agent_test_support::transcript_file(&image, self.process.chat.uuid());
         let mut lines: Vec<String> = std::fs::read_to_string(&transcript)
             .unwrap()
             .lines()

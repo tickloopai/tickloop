@@ -348,7 +348,7 @@ impl SessionPermissionContext {
 
     fn next_grant_id(&self) -> SessionPermissionGrantId {
         loop {
-            let candidate = SessionPermissionGrantId(Uuid::new_v4());
+            let candidate = SessionPermissionGrantId(tickloop_ids::generate());
             if self.grants.iter().all(|grant| grant.id != candidate) {
                 return candidate;
             }

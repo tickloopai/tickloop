@@ -94,7 +94,7 @@ impl Drop for Inner {
 
 impl EmbeddedAgentAccess {
     pub fn new(agent: Agent) -> Self {
-        Self::with_epoch(agent, Uuid::new_v4())
+        Self::with_epoch(agent, tickloop_ids::generate())
     }
 
     pub fn with_epoch(agent: Agent, epoch: Uuid) -> Self {
@@ -175,15 +175,27 @@ impl EmbeddedAgentAccess {
             return Ok(None);
         };
         for (chat, root) in runtime.chat_roots() {
-            if self.inner.references.lock().await.contains_key(&chat) {
+            if self
+                .inner
+                .references
+                .lock()
+                .await
+                .contains_key(&chat.uuid())
+            {
                 continue;
             }
             if let Some(root) = root {
-                let parent = self.inner.references.lock().await.get(&root).copied();
+                let parent = self
+                    .inner
+                    .references
+                    .lock()
+                    .await
+                    .get(&root.uuid())
+                    .copied();
                 if let Some(parent) = parent {
                     let launch = self.inner.launches.lock().await.get(&parent).cloned();
                     if let Some(launch) = launch {
-                        self.register(chat, launch).await;
+                        self.register(chat.into(), launch).await;
                     }
                 }
             }
@@ -294,7 +306,7 @@ impl EmbeddedAgentAccess {
         }
         let execution = ExecutionRef {
             daemon_epoch: self.inner.epoch,
-            agent_id: Uuid::new_v4(),
+            agent_id: tickloop_ids::generate(),
             generation: 1,
         };
         references.insert(chat_id, execution);
@@ -341,7 +353,7 @@ impl EmbeddedAgentAccess {
 
     async fn snapshot(&self, execution: ExecutionRef) -> Result<LiveChatSnapshot, AccessError> {
         let chat = self.chat(execution).await?;
-        let snapshot = self.inner.agent.snapshot(chat).await?;
+        let snapshot = self.inner.agent.snapshot(chat.into()).await?;
         let mut snapshot = LiveChatSnapshot::from_snapshot(execution, snapshot, Vec::new());
         let live = self.live_facts(execution, chat).await?;
         snapshot.subagent = live.subagent;
@@ -357,7 +369,7 @@ impl EmbeddedAgentAccess {
     /// What a status query answers; the same facts a snapshot of this moment carries.
     async fn status(&self, execution: ExecutionRef) -> Result<LiveChatStatus, AccessError> {
         let chat = self.chat(execution).await?;
-        let status = self.inner.agent.status(chat).await?;
+        let status = self.inner.agent.status(chat.into()).await?;
         let live = self.live_facts(execution, chat).await?;
         let mut request_refs =
             RequestRef::pending(execution, &status.permissions, &status.questions);
@@ -389,8 +401,8 @@ impl EmbeddedAgentAccess {
             .filter(|failure| failure.execution == execution)
             .cloned()
             .collect::<Vec<_>>();
-        let mut warnings = self.inner.agent.user_settings_warnings(chat);
-        warnings.extend(self.inner.agent.transcript_load_warnings(chat));
+        let mut warnings = self.inner.agent.user_settings_warnings(chat.into());
+        warnings.extend(self.inner.agent.transcript_load_warnings(chat.into()));
         warnings.extend(transcript_write_error.clone());
         warnings.extend(
             queue_failures.iter().map(|failure| {
@@ -398,7 +410,7 @@ impl EmbeddedAgentAccess {
             }),
         );
         Ok(LiveFacts {
-            subagent: self.inner.agent.subagent_registration(chat).await?,
+            subagent: self.inner.agent.subagent_registration(chat.into()).await?,
             loop_trigger_notices: self
                 .inner
                 .agent
@@ -437,7 +449,7 @@ impl EmbeddedAgentAccess {
     ) -> Result<Option<HostCallContext>, AccessError> {
         let launch = self.inner.launches.lock().await.get(&execution).cloned();
         let context = launch.and_then(|launch| launch.host_work_context);
-        let snapshot = self.inner.agent.snapshot(chat).await?;
+        let snapshot = self.inner.agent.snapshot(chat.into()).await?;
         // A Chat without a Folder has no host Work Context.
         let Some(folder) = snapshot.folder.clone() else {
             return Ok(None);
@@ -523,14 +535,18 @@ impl EmbeddedAgentAccess {
                 self.inner
                     .agent
                     .submit_with_input_contexts_in_host_context(
-                        chat, text, contexts, paths, context,
+                        chat.into(),
+                        text,
+                        contexts,
+                        paths,
+                        context,
                     )
                     .await?,
             )),
             UserInput::Skill { name, arguments } => Ok(CommandResult::Submitted(
                 self.inner
                     .agent
-                    .invoke_skill_in_host_context(chat, &name, &arguments, context)
+                    .invoke_skill_in_host_context(chat.into(), &name, &arguments, context)
                     .await?,
             )),
             UserInput::Shell {
@@ -539,7 +555,7 @@ impl EmbeddedAgentAccess {
             } => Ok(CommandResult::ShellSubmitted(
                 self.inner
                     .agent
-                    .submit_user_shell(chat, command, background)
+                    .submit_user_shell(chat.into(), command, background)
                     .await?,
             )),
         }
@@ -550,7 +566,10 @@ impl EmbeddedAgentAccess {
             AgentCommand::AddArtifactTick { execution, tick } => {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
-                    self.inner.agent.add_artifact_tick(chat, tick).await?,
+                    self.inner
+                        .agent
+                        .add_artifact_tick(chat.into(), tick)
+                        .await?,
                 ))
             }
             AgentCommand::RemoveArtifactTick {
@@ -561,7 +580,7 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::ArtifactTicks(
                     self.inner
                         .agent
-                        .remove_artifact_tick(chat, &instance_id)
+                        .remove_artifact_tick(chat.into(), &instance_id)
                         .await?,
                 ))
             }
@@ -571,20 +590,23 @@ impl EmbeddedAgentAccess {
                 history,
             } => {
                 let chat = self.chat(execution).await?;
-                self.inner.agent.link_artifact(chat, &tick, history).await?;
+                self.inner
+                    .agent
+                    .link_artifact(chat.into(), &tick, history)
+                    .await?;
                 Ok(CommandResult::Done)
             }
             AgentCommand::ListArtifactTicks { execution } => {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
-                    self.inner.agent.artifact_ticks(chat).await?,
+                    self.inner.agent.artifact_ticks(chat.into()).await?,
                 ))
             }
             AgentCommand::ListHostedTicks { execution } => {
                 let chat = self.chat(execution).await?;
                 let members = self
                     .hosted_ticks()?
-                    .members(chat)
+                    .members(chat.into())
                     .await
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
                 Ok(CommandResult::HostedTicks(members))
@@ -595,7 +617,7 @@ impl EmbeddedAgentAccess {
             } => {
                 let chat = self.chat(execution).await?;
                 self.hosted_ticks()?
-                    .close_for_user(chat, &instance)
+                    .close_for_user(chat.into(), &instance)
                     .await
                     .map_err(hosted_access_error)?;
                 Ok(CommandResult::Done)
@@ -608,18 +630,23 @@ impl EmbeddedAgentAccess {
                 let chat = self.chat(execution).await?;
                 let reopened = self
                     .hosted_ticks()?
-                    .reopen_for_user(chat, &instance)
+                    .reopen_for_user(chat.into(), &instance)
                     .await
                     .map_err(hosted_access_error)?;
                 let membership = self
                     .inner
                     .agent
-                    .record_reopened_tick(chat, &instance, reopened.clone())
+                    .record_reopened_tick(chat.into(), &instance, reopened.clone())
                     .await?;
                 let restore_error = self
                     .inner
                     .agent
-                    .replace_tick_subscriptions(chat, &instance, &reopened, restore_subscriptions)
+                    .replace_tick_subscriptions(
+                        chat.into(),
+                        &instance,
+                        &reopened,
+                        restore_subscriptions,
+                    )
                     .await
                     .err()
                     .map(|error| error.to_string());
@@ -641,7 +668,9 @@ impl EmbeddedAgentAccess {
                         .allow_view(chat, &instance)
                         .await
                 } else {
-                    self.hosted_ticks()?.allow_view(chat, &instance).await
+                    self.hosted_ticks()?
+                        .allow_view(chat.into(), &instance)
+                        .await
                 };
                 Ok(CommandResult::HostedTickView(
                     grant.map_err(hosted_access_error)?,
@@ -655,7 +684,7 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::MonitorMembership(
                     self.inner
                         .agent
-                        .remove_monitor_member(chat, instance)
+                        .remove_monitor_member(chat.into(), instance)
                         .await?,
                 ))
             }
@@ -667,7 +696,7 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::MonitorMembership(
                     self.inner
                         .agent
-                        .mark_monitor_handled(chat, instance)
+                        .mark_monitor_handled(chat.into(), instance)
                         .await?,
                 ))
             }
@@ -684,11 +713,11 @@ impl EmbeddedAgentAccess {
                 let chat = if let Some(chat) = launch.exact_chat {
                     self.inner
                         .agent
-                        .restore_empty_chat(chat, launch.folder.clone())
+                        .restore_empty_chat(chat.into(), launch.folder.clone())
                         .await?;
                     chat
                 } else {
-                    self.inner.agent.create_chat(launch.folder.clone()).await?
+                    (self.inner.agent.create_chat(launch.folder.clone()).await?).uuid()
                 };
                 let execution = self.register(chat, launch.clone()).await;
                 self.inner
@@ -698,7 +727,7 @@ impl EmbeddedAgentAccess {
                 self.inner
                     .agent
                     .set_host_work_context(
-                        chat,
+                        chat.into(),
                         HostCallContext {
                             folder: launch.folder,
                             workspace_id: launch
@@ -714,7 +743,7 @@ impl EmbeddedAgentAccess {
                     .model
                     .and_then(|model| self.builtin_config(model).ok())
                     && model_for_persistent_selection(model.clone())
-                        != self.inner.agent.snapshot(chat).await?.model
+                        != self.inner.agent.snapshot(chat.into()).await?.model
                 {
                     let change = ConfigurationChange::Model {
                         config: model,
@@ -760,9 +789,12 @@ impl EmbeddedAgentAccess {
                 launch,
             } => {
                 let snapshot = if as_new {
-                    self.inner.agent.resume_as_new_chat(record.chat_id).await?
+                    self.inner
+                        .agent
+                        .resume_as_new_chat(record.chat_id.into())
+                        .await?
                 } else {
-                    self.inner.agent.resume_chat(record.chat_id).await?
+                    self.inner.agent.resume_chat(record.chat_id.into()).await?
                 };
                 let folder = chat_folder(&snapshot)?;
                 let launch = launch.unwrap_or_else(|| LaunchSpec::embedded(folder.clone()));
@@ -784,10 +816,10 @@ impl EmbeddedAgentAccess {
                 }
                 if let Some(delegation) = &snapshot.delegation {
                     for ancestor in delegation.lineage() {
-                        self.register(ancestor.chat_id, launch.clone()).await;
+                        self.register(ancestor.chat_id.into(), launch.clone()).await;
                     }
                 }
-                let execution = self.register(snapshot.id, launch).await;
+                let execution = self.register(snapshot.id.into(), launch).await;
                 Ok(CommandResult::Loaded {
                     execution,
                     snapshot: Box::new(self.snapshot(execution).await?),
@@ -815,24 +847,24 @@ impl EmbeddedAgentAccess {
                 else {
                     return Err(AccessError::invalid("directed family input is text only"));
                 };
-                let message_id = Uuid::new_v4();
+                let message_id = tickloop_ids::generate();
                 let source_handle = self
                     .inner
                     .agent
-                    .subagent_registration(source_chat)
+                    .subagent_registration(source_chat.into())
                     .await?
                     .map(|record| record.handle)
                     .unwrap_or_else(|| "main".into());
                 let target_handle = self
                     .inner
                     .agent
-                    .subagent_registration(target_chat)
+                    .subagent_registration(target_chat.into())
                     .await?
                     .map(|record| record.handle)
                     .unwrap_or_else(|| "main".into());
                 let directed = DirectedHumanSource {
                     message_id,
-                    source_chat_id: source_chat,
+                    source_chat_id: source_chat.into(),
                     source_handle,
                     original_submission: text,
                     original_contexts: contexts.clone(),
@@ -847,7 +879,7 @@ impl EmbeddedAgentAccess {
                 let receipt = self
                     .inner
                     .agent
-                    .submit_family_input(target_chat, directed, contexts, paths, context)
+                    .submit_family_input(target_chat.into(), directed, contexts, paths, context)
                     .await?;
                 Ok(CommandResult::FamilyInputSent {
                     source_execution,
@@ -864,7 +896,7 @@ impl EmbeddedAgentAccess {
             } => Box::pin(self.submit(execution, input, origin)).await,
             AgentCommand::ContinueLoop { execution, .. } => {
                 let chat = self.chat(execution).await?;
-                self.inner.agent.continue_loop(chat).await?;
+                self.inner.agent.continue_loop(chat.into()).await?;
                 Ok(CommandResult::Done)
             }
             AgentCommand::DecidePermission {
@@ -880,13 +912,13 @@ impl EmbeddedAgentAccess {
                 let result = if let Some(rule) = rule {
                     self.inner
                         .agent
-                        .answer_permission_with_rule(chat, request.request_id, rule)
+                        .answer_permission_with_rule(chat.into(), request.request_id, rule)
                         .await
                 } else {
                     self.inner
                         .agent
                         .answer_permission_with_comment(
-                            chat,
+                            chat.into(),
                             request.request_id,
                             allow,
                             scope,
@@ -959,7 +991,7 @@ impl EmbeddedAgentAccess {
             }
             AgentCommand::ManageGoal { execution, action } => {
                 let chat = self.chat(execution).await?;
-                self.inner.agent.manage_goal(chat, action).await?;
+                self.inner.agent.manage_goal(chat.into(), action).await?;
                 Ok(CommandResult::Done)
             }
             AgentCommand::ClearCompletedTasks {
@@ -970,7 +1002,7 @@ impl EmbeddedAgentAccess {
                 let chat = self.chat(execution).await?;
                 self.inner
                     .agent
-                    .clear_completed_tasks(chat, root_loop_id, expected_revision)
+                    .clear_completed_tasks(chat.into(), root_loop_id.into(), expected_revision)
                     .await?;
                 Ok(CommandResult::Done)
             }
@@ -985,7 +1017,7 @@ impl EmbeddedAgentAccess {
                         .await?;
                 }
                 let label = action_label(&action);
-                let command_id = self.inner.agent.queue_command(chat, label).await?;
+                let command_id = self.inner.agent.queue_command(chat.into(), label).await?;
                 self.inner
                     .queue
                     .lock()
@@ -1034,9 +1066,9 @@ impl EmbeddedAgentAccess {
         self.inner
             .agent
             .advance(
-                chat,
+                chat.into(),
                 TurnRequest {
-                    input_id: command_id,
+                    input_id: command_id.into(),
                     op: TurnOp::Answer { request, reply },
                     delivery: Delivery::Queue,
                     host_context: None,
@@ -1117,24 +1149,28 @@ impl EmbeddedAgentAccess {
         let agent = &self.inner.agent;
         match change {
             ConfigurationChange::TaskToolsEnabled { enabled } => {
-                agent.set_task_tools_enabled(chat, enabled).await?
+                agent.set_task_tools_enabled(chat.into(), enabled).await?
             }
             ConfigurationChange::Model { config, thinking } => {
                 let config = self.builtin_config(config)?;
                 let change = match thinking {
-                    Some(effort) => agent.set_model_with_thinking(chat, config, effort).await?,
-                    None => agent.set_model(chat, config).await?,
+                    Some(effort) => {
+                        agent
+                            .set_model_with_thinking(chat.into(), config, effort)
+                            .await?
+                    }
+                    None => agent.set_model(chat.into(), config).await?,
                 };
                 return Ok(CommandResult::ModelChanged(change));
             }
             ConfigurationChange::ReasoningEffort { effort } => {
-                agent.set_reasoning_effort(chat, effort).await?
+                agent.set_reasoning_effort(chat.into(), effort).await?
             }
             ConfigurationChange::ThinkingEnabled { enabled } => {
-                agent.set_thinking_enabled(chat, enabled).await?
+                agent.set_thinking_enabled(chat.into(), enabled).await?
             }
             ConfigurationChange::ExecutionMode { mode } => {
-                agent.set_execution_mode(chat, mode).await?
+                agent.set_execution_mode(chat.into(), mode).await?
             }
             ConfigurationChange::ContextWindow { tokens } => {
                 if self.inner.builtin_catalog_only.load(Ordering::SeqCst) {
@@ -1142,33 +1178,38 @@ impl EmbeddedAgentAccess {
                         "Context window is version-owned by the built-in catalog and cannot be overridden",
                     ));
                 }
-                agent.set_context_window(chat, tokens).await?
+                agent.set_context_window(chat.into(), tokens).await?
             }
-            ConfigurationChange::Search { config } => agent.set_search(chat, config).await?,
+            ConfigurationChange::Search { config } => agent.set_search(chat.into(), config).await?,
             ConfigurationChange::Directories { folder, additional } => {
-                agent.set_directories(chat, folder, additional).await?
+                agent
+                    .set_directories(chat.into(), folder, additional)
+                    .await?
             }
             ConfigurationChange::ReplaceRules { rules } => {
-                agent.set_permission_rules(chat, rules).await?
+                agent.set_permission_rules(chat.into(), rules).await?
             }
             ConfigurationChange::ProjectConstraints { rules } => {
                 agent
-                    .set_project_permission_constraints(chat, rules)
+                    .set_project_permission_constraints(chat.into(), rules)
                     .await?
             }
             ConfigurationChange::ManagedConstraints { rules } => {
                 agent
-                    .set_managed_permission_constraints(chat, rules)
+                    .set_managed_permission_constraints(chat.into(), rules)
                     .await?
             }
             ConfigurationChange::GenerateAutoEnvironment { options } => {
                 // Keep setup and its model retries out of every command-dispatch stack frame.
                 return Ok(CommandResult::AutoEnvironmentDraft(
-                    Box::pin(agent.generate_auto_environment(chat, options)).await?,
+                    Box::pin(agent.generate_auto_environment(chat.into(), options)).await?,
                 ));
             }
             ConfigurationChange::PermissionChange { change, expected } => {
-                return match agent.apply_permission_change(chat, change, expected).await {
+                return match agent
+                    .apply_permission_change(chat.into(), change, expected)
+                    .await
+                {
                     Ok(view) => Ok(CommandResult::Permissions(Box::new(view))),
                     Err(tickloop_agent_runtime::PermissionChangeError::Conflict { latest }) => {
                         Err(AccessError {
@@ -1198,7 +1239,7 @@ impl EmbeddedAgentAccess {
                 let result = agent
                     .branch_chat(BranchRequest {
                         request_id: command_id,
-                        source_chat_id: chat,
+                        source_chat_id: chat.into(),
                         name,
                     })
                     .await?;
@@ -1213,25 +1254,27 @@ impl EmbeddedAgentAccess {
                         || chat_folder(&result.snapshot).map(LaunchSpec::embedded),
                         Ok,
                     )?;
-                let execution = self.register(result.child_chat_id, launch).await;
+                let execution = self.register(result.child_chat_id.into(), launch).await;
                 Ok(CommandResult::Branch {
                     execution,
-                    source_chat_id: result.source_chat_id,
-                    child_chat_id: result.child_chat_id,
+                    source_chat_id: result.source_chat_id.into(),
+                    child_chat_id: result.child_chat_id.into(),
                     name: result.name,
                     snapshot: Box::new(self.snapshot(execution).await?),
                     session_permissions: result.session_permissions,
                 })
             }
             HistoryAction::Compact { instructions } => {
-                let result = agent.compact_with_instructions(chat, instructions).await?;
+                let result = agent
+                    .compact_with_instructions(chat.into(), instructions)
+                    .await?;
                 Ok(CommandResult::Compact {
                     summary: result.summary,
                     snapshot: Box::new(self.snapshot(execution).await?),
                 })
             }
             HistoryAction::DirectedSummary { request } => {
-                let result = agent.summarize_checkpoint(chat, request).await?;
+                let result = agent.summarize_checkpoint(chat.into(), request).await?;
                 Ok(CommandResult::DirectedSummary {
                     snapshot: Box::new(self.snapshot(execution).await?),
                     direction: result.direction,
@@ -1243,7 +1286,7 @@ impl EmbeddedAgentAccess {
                 })
             }
             HistoryAction::Rewind { message_id, mode } => {
-                let result = agent.rewind(chat, message_id, mode).await?;
+                let result = agent.rewind(chat.into(), message_id, mode).await?;
                 Ok(CommandResult::Rewind {
                     snapshot: Box::new(self.snapshot(execution).await?),
                     mode: result.mode,
@@ -1253,7 +1296,10 @@ impl EmbeddedAgentAccess {
                 })
             }
             HistoryAction::TakeBackInterruptedPrompt { run_id } => {
-                match agent.take_back_interrupted_prompt(chat, run_id).await? {
+                match agent
+                    .take_back_interrupted_prompt(chat.into(), run_id.into())
+                    .await?
+                {
                     Some(draft) => Ok(CommandResult::PromptTakenBack {
                         snapshot: Box::new(self.snapshot(execution).await?),
                         draft,
@@ -1272,23 +1318,25 @@ impl EmbeddedAgentAccess {
         let chat = self.chat(execution).await?;
         let agent = &self.inner.agent;
         match action {
-            LoopAction::Stop => Ok(CommandResult::Operations(agent.stop(chat).await?)),
-            LoopAction::Interrupt => Ok(CommandResult::Operations(agent.interrupt(chat).await?)),
+            LoopAction::Stop => Ok(CommandResult::Operations(agent.stop(chat.into()).await?)),
+            LoopAction::Interrupt => Ok(CommandResult::Operations(
+                agent.interrupt(chat.into()).await?,
+            )),
             LoopAction::SendNow { run_id } => Ok(CommandResult::Operations(
-                agent.send_now(chat, run_id).await?,
+                agent.send_now(chat.into(), run_id.into()).await?,
             )),
             LoopAction::DisableEventSources => {
-                agent.disable_event_sources_for_chat(chat).await;
+                agent.disable_event_sources_for_chat(chat.into()).await;
                 Ok(CommandResult::Done)
             }
             LoopAction::ApprovePlan { version, mode } => {
-                match agent.approve_plan(chat, version, mode).await? {
+                match agent.approve_plan(chat.into(), version, mode).await? {
                     Some(continuation) => Ok(CommandResult::Text(continuation)),
                     None => Ok(CommandResult::Done),
                 }
             }
             LoopAction::DeclinePlan { version, feedback } => {
-                match agent.decline_plan(chat, version, feedback).await? {
+                match agent.decline_plan(chat.into(), version, feedback).await? {
                     Some(receipt) => Ok(CommandResult::Submitted(receipt)),
                     None => Ok(CommandResult::Done),
                 }
@@ -1298,32 +1346,36 @@ impl EmbeddedAgentAccess {
                 change,
             } => {
                 agent
-                    .update_tick_subscription(chat, subscription_id, change)
+                    .update_tick_subscription(chat.into(), subscription_id, change)
                     .await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::TickUpdate { instance } => Ok(CommandResult::Submitted(
-                agent.tick_send_update_for_user(chat, instance).await?,
+                agent
+                    .tick_send_update_for_user(chat.into(), instance)
+                    .await?,
             )),
             LoopAction::TickManage { instance } => {
-                agent.tick_subscribe_for_user(chat, instance).await?;
+                agent.tick_subscribe_for_user(chat.into(), instance).await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::RetryDeniedOperation { record_id } => Ok(CommandResult::Submitted(
-                agent.request_denial_retry(chat, record_id).await?,
+                agent.request_denial_retry(chat.into(), record_id).await?,
             )),
             LoopAction::SetScheduledTaskPaused { task_id, paused } => {
                 agent
-                    .set_scheduled_task_paused(chat, task_id, paused)
+                    .set_scheduled_task_paused(chat.into(), task_id, paused)
                     .await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::DeleteScheduledTask { task_id } => {
-                agent.delete_scheduled_task(chat, task_id).await?;
+                agent.delete_scheduled_task(chat.into(), task_id).await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::DecideScheduledTask { task_id, decision } => {
-                agent.decide_scheduled_task(chat, task_id, decision).await?;
+                agent
+                    .decide_scheduled_task(chat.into(), task_id, decision)
+                    .await?;
                 Ok(CommandResult::Done)
             }
         }
@@ -1342,7 +1394,7 @@ impl EmbeddedAgentAccess {
             } => Ok(CommandResult::ShellSubmitted(
                 self.inner
                     .agent
-                    .submit_user_shell(chat, command, background)
+                    .submit_user_shell(chat.into(), command, background)
                     .await?,
             )),
             TaskAction::Background { task } | TaskAction::Stop { task } => {
@@ -1358,7 +1410,7 @@ impl EmbeddedAgentAccess {
                     ShellTaskAction::Stop
                 };
                 ShellTaskCenter::new(self.inner.agent.clone())
-                    .dispatch(chat, task.task_id, action)
+                    .dispatch(chat.into(), task.task_id, action)
                     .await
                     .map(CommandResult::Task)
                     .map_err(|error| AccessError::invalid(error.to_string()))
@@ -1367,7 +1419,7 @@ impl EmbeddedAgentAccess {
                 let taken = self
                     .inner
                     .agent
-                    .take_queued_inputs(chat, draft_empty)
+                    .take_queued_inputs(chat.into(), draft_empty)
                     .await?;
                 let mut queue = self.inner.queue.lock().await;
                 for input in &taken {
@@ -1380,7 +1432,7 @@ impl EmbeddedAgentAccess {
 
     async fn validate_task(&self, chat: Uuid, reference: TaskRef) -> Result<(), AccessError> {
         let tasks = ShellTaskCenter::new(self.inner.agent.clone())
-            .snapshot(chat)
+            .snapshot(chat.into())
             .await
             .map_err(|error| AccessError::invalid(error.to_string()))?
             .tasks;
@@ -1550,28 +1602,28 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::Snapshot | AgentDetailQuery::Status => {
                 unreachable!("Chat answers are read with their feed watermark")
             }
-            AgentDetailQuery::TaskToolsSetting => {
-                ObservationValue::TaskToolsSetting(self.inner.agent.task_tools_setting(chat).await?)
-            }
+            AgentDetailQuery::TaskToolsSetting => ObservationValue::TaskToolsSetting(
+                self.inner.agent.task_tools_setting(chat.into()).await?,
+            ),
             AgentDetailQuery::Operation { run_id, call_id } => ObservationValue::Operation(
                 self.inner
                     .agent
-                    .operation(chat, run_id, &call_id)
+                    .operation(chat.into(), run_id.into(), &call_id)
                     .await?
                     .map(Box::new),
             ),
             AgentDetailQuery::Events { after } => {
-                ObservationValue::Events(self.inner.agent.events_after(chat, after).await?)
+                ObservationValue::Events(self.inner.agent.events_after(chat.into(), after).await?)
             }
             AgentDetailQuery::Permissions => ObservationValue::Permissions(Box::new(
-                self.inner.agent.permissions_view(chat).await?,
+                self.inner.agent.permissions_view(chat.into()).await?,
             )),
             AgentDetailQuery::ApprovalHistory => ObservationValue::ApprovalHistory(
-                self.inner.agent.approval_history_view(chat).await?,
+                self.inner.agent.approval_history_view(chat.into()).await?,
             ),
             AgentDetailQuery::Tasks => ObservationValue::Tasks(
                 ShellTaskCenter::new(self.inner.agent.clone())
-                    .snapshot(chat)
+                    .snapshot(chat.into())
                     .await
                     .map_err(|error| AccessError::invalid(error.to_string()))?
                     .tasks,
@@ -1589,29 +1641,33 @@ impl EmbeddedAgentAccess {
                 self.validate_task(chat, task).await?;
                 ObservationValue::TaskOutput(
                     ShellTaskCenter::new(self.inner.agent.clone())
-                        .read_output(chat, task.task_id, offset, limit)
+                        .read_output(chat.into(), task.task_id, offset, limit)
                         .await
                         .map_err(|error| AccessError::invalid(error.to_string()))?,
                 )
             }
-            AgentDetailQuery::Subscriptions => {
-                ObservationValue::Subscriptions(self.inner.agent.tick_subscriptions(chat).await?)
-            }
+            AgentDetailQuery::Subscriptions => ObservationValue::Subscriptions(
+                self.inner.agent.tick_subscriptions(chat.into()).await?,
+            ),
             AgentDetailQuery::RewindPoints => ObservationValue::RewindPoints(
-                self.inner.agent.snapshot(chat).await?.rewind_points(),
+                self.inner
+                    .agent
+                    .snapshot(chat.into())
+                    .await?
+                    .rewind_points(),
             ),
             AgentDetailQuery::RewindFiles { message_id } => ObservationValue::RewindFiles(
                 self.inner
                     .agent
-                    .rewind_file_changes(chat, message_id)
+                    .rewind_file_changes(chat.into(), message_id)
                     .await?,
             ),
             AgentDetailQuery::Skills { name } => ObservationValue::Skills {
                 available: match name {
-                    Some(name) => Some(self.inner.agent.has_skill(chat, &name).await?),
+                    Some(name) => Some(self.inner.agent.has_skill(chat.into(), &name).await?),
                     None => None,
                 },
-                warnings: self.inner.agent.skill_warnings(chat).await?,
+                warnings: self.inner.agent.skill_warnings(chat.into()).await?,
             },
             AgentDetailQuery::Warnings => {
                 ObservationValue::Warnings(self.live_facts(execution, chat).await?.warnings)
@@ -1651,7 +1707,7 @@ impl EmbeddedAgentAccess {
             }
             detail => (
                 self.detail_value(execution, chat, detail).await?,
-                self.inner.agent.last_sequence(chat).await?,
+                self.inner.agent.last_sequence(chat.into()).await?,
             ),
         };
         let cursor = Cursor {
@@ -1775,7 +1831,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                 let views = self.inner.views.displayed().await;
                 let mut entries = Vec::new();
                 for (chat, execution) in references {
-                    let summary = self.inner.agent.summary(chat).await?;
+                    let summary = self.inner.agent.summary(chat.into()).await?;
                     if filter
                         .folder
                         .as_ref()
@@ -1807,7 +1863,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                             store_root,
                             chat_id: chat,
                         });
-                    let registration = self.inner.agent.subagent_registration(chat).await?;
+                    let registration = self.inner.agent.subagent_registration(chat.into()).await?;
                     entries.push(AgentSummary {
                         availability: ExecutionAvailability::Live,
                         execution,
@@ -1827,9 +1883,13 @@ impl AgentAccess for EmbeddedAgentAccess {
                         waiting_permissions: summary.waiting_permissions,
                         waiting_questions: summary.waiting_questions,
                         parent: match summary.parent_chat {
-                            Some(parent) => {
-                                self.inner.references.lock().await.get(&parent).copied()
-                            }
+                            Some(parent) => self
+                                .inner
+                                .references
+                                .lock()
+                                .await
+                                .get(&parent.uuid())
+                                .copied(),
                             None => None,
                         },
                         record,
@@ -2044,7 +2104,13 @@ async fn watch_runtime(
         if access.inner.upgrade_paused.load(Ordering::SeqCst) {
             continue;
         }
-        let mut execution = access.inner.references.lock().await.get(&chat).copied();
+        let mut execution = access
+            .inner
+            .references
+            .lock()
+            .await
+            .get(&chat.uuid())
+            .copied();
         if execution.is_none()
             && let Ok(snapshot) = access.inner.agent.snapshot(chat).await
             && let Some(delegation) = snapshot.delegation
@@ -2054,15 +2120,17 @@ async fn watch_runtime(
                 .references
                 .lock()
                 .await
-                .get(&delegation.root_chat_id())
+                .get(&(delegation.root_chat_id()).uuid())
                 .copied();
             if let Some(parent) = parent {
                 let launch = access.inner.launches.lock().await.get(&parent).cloned();
                 if let Some(launch) = launch {
                     for ancestor in delegation.lineage() {
-                        access.register(ancestor.chat_id, launch.clone()).await;
+                        access
+                            .register(ancestor.chat_id.into(), launch.clone())
+                            .await;
                     }
-                    execution = Some(access.register(chat, launch).await);
+                    execution = Some(access.register(chat.into(), launch).await);
                 }
             }
         }
@@ -2112,7 +2180,12 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
             if access.inner.upgrade_paused.load(Ordering::SeqCst) {
                 continue;
             }
-            let Ok(Some(command)) = access.inner.agent.take_next_queued_command(chat).await else {
+            let Ok(Some(command)) = access
+                .inner
+                .agent
+                .take_next_queued_command(chat.into())
+                .await
+            else {
                 continue;
             };
             let queued = access.inner.queue.lock().await.remove(&command.id);
@@ -2158,7 +2231,7 @@ async fn drive_queue(inner: Weak<Inner>, cancel: CancellationToken) {
                     let _ = access
                         .inner
                         .agent
-                        .finish_queued_command(chat, command.id)
+                        .finish_queued_command(chat.into(), command.id)
                         .await;
                     access
                         .publish(Some(execution), ObservationChange::Changed)

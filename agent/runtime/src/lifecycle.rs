@@ -127,7 +127,7 @@ impl Lifecycle {
                 input
                     .trigger
                     .as_ref()
-                    .map(|trigger| (input.run_id, trigger.identity.clone()))
+                    .map(|trigger| (RunId::from(input.run_id), trigger.identity.clone()))
             })
             .collect()
     }
@@ -146,18 +146,19 @@ impl Lifecycle {
                 "input id reused with a different payload".into(),
             )));
         }
-        if accepted.state == InputState::Accepted && input.replaces == Some(accepted.run_id) {
+        if accepted.state == InputState::Accepted && input.replaces == Some(accepted.run_id.into())
+        {
             return None;
         }
         Some(Ok(Receipt {
             chat_id,
-            loop_id: accepted.loop_id,
-            run_id: accepted.run_id,
+            loop_id: accepted.loop_id.into(),
+            run_id: accepted.run_id.into(),
         }))
     }
 
     pub(crate) fn is_input(&self, id: Uuid) -> bool {
-        self.inputs.contains_key(&id)
+        self.inputs.contains_key(&tickloop_ids::Id::from(id))
     }
 
     /// Accepts `input` as the queued input `queued`, whose content the record keeps until it
@@ -171,12 +172,12 @@ impl Lifecycle {
             input.id,
             Revised {
                 record: InputEntry {
-                    input_id: input.id,
+                    input_id: input.id.into(),
                     op: input.op,
                     digest: input.digest.clone(),
                     display_parent: input.display_parent,
-                    loop_id: receipt.loop_id,
-                    run_id: receipt.run_id,
+                    loop_id: receipt.loop_id.into(),
+                    run_id: receipt.run_id.into(),
                     timestamp: now(),
                     state: InputState::Accepted,
                     queued: Some(
@@ -269,7 +270,7 @@ impl Lifecycle {
                 input.record.state = InputState::Accepted;
                 input.record.timestamp = now();
                 input.revision = self.revision;
-                self.open_inputs.insert(input.record.run_id, *id);
+                self.open_inputs.insert(input.record.run_id.into(), *id);
                 reopened = true;
             }
         }
@@ -353,12 +354,12 @@ impl Lifecycle {
             input.id,
             Revised {
                 record: InputEntry {
-                    input_id: input.id,
+                    input_id: input.id.into(),
                     op: input.op,
                     digest: input.digest.clone(),
                     display_parent: input.display_parent,
-                    loop_id: receipt.loop_id,
-                    run_id: receipt.run_id,
+                    loop_id: receipt.loop_id.into(),
+                    run_id: receipt.run_id.into(),
                     timestamp: now(),
                     state: InputState::Settled { outcome },
                     queued: None,
@@ -412,7 +413,7 @@ impl Lifecycle {
         let mut responses = self
             .responses
             .values()
-            .filter(|response| response.record.input_id == Some(input))
+            .filter(|response| response.record.input_id == Some(input.into()))
             .map(|response| response.record.clone())
             .collect::<Vec<_>>();
         responses.sort_by_key(|response| response.attempt);
@@ -432,17 +433,17 @@ impl Lifecycle {
             .responses
             .values()
             .filter(|response| match input_id {
-                Some(input) => response.record.input_id == Some(input),
+                Some(input) => response.record.input_id == Some(input.into()),
                 None => response.record.run_id == receipt.run_id,
             })
             .count() as u32
             + 1;
         let record = ResponseEntry {
-            response_id: Uuid::new_v4(),
-            input_id,
+            response_id: tickloop_ids::generate(),
+            input_id: input_id.map(Into::into),
             attempt,
-            run_id: receipt.run_id,
-            loop_id: receipt.loop_id,
+            run_id: receipt.run_id.into(),
+            loop_id: receipt.loop_id.into(),
             display_parent: self
                 .answer_parents
                 .remove(&receipt.run_id)
@@ -451,17 +452,17 @@ impl Lifecycle {
             state: ResponseState::Started,
             without_messages: false,
         };
-        self.tail_answer = Some(record.response_id);
+        self.tail_answer = Some(record.response_id.into());
         let revision = self.next_revision();
         self.active.insert(
             receipt.run_id,
             ActiveResponse {
-                response_id: record.response_id,
+                response_id: record.response_id.into(),
                 next_message: snapshot.messages.len(),
             },
         );
         self.responses.insert(
-            record.response_id,
+            record.response_id.into(),
             Revised {
                 record: record.clone(),
                 revision,
@@ -537,7 +538,7 @@ impl Lifecycle {
         let wait_id = match &kind {
             WaitKind::Question { request, .. } => request.id,
             WaitKind::Subagent { .. } | WaitKind::Children { .. } | WaitKind::Handover => {
-                Uuid::new_v4()
+                tickloop_ids::generate()
             }
         };
         let revision = self.next_revision();
@@ -551,10 +552,10 @@ impl Lifecycle {
             Revised {
                 record: WaitEntry {
                     wait_id,
-                    chat_id: receipt.chat_id,
-                    loop_id: receipt.loop_id,
-                    run_id: receipt.run_id,
-                    response_id,
+                    chat_id: receipt.chat_id.into(),
+                    loop_id: receipt.loop_id.into(),
+                    run_id: receipt.run_id.into(),
+                    response_id: response_id.into(),
                     kind,
                     resume,
                     timestamp: now(),
@@ -605,7 +606,7 @@ impl Lifecycle {
         wait.record.state = WaitState::Appended;
         wait.record.timestamp = now();
         wait.revision = revision;
-        self.mark_resumed(response_id);
+        self.mark_resumed(response_id.into());
         true
     }
 
@@ -674,7 +675,7 @@ impl Lifecycle {
         wait.record.timestamp = now();
         wait.revision = revision;
         let response_id = wait.record.response_id;
-        self.mark_resumed(response_id);
+        self.mark_resumed(response_id.into());
         true
     }
 
@@ -711,7 +712,7 @@ impl Lifecycle {
                     WaitState::Open | WaitState::Resolved { .. }
                 ) && self
                     .responses
-                    .get(&wait.record.response_id)
+                    .get(&tickloop_ids::Id::from(wait.record.response_id))
                     .is_some_and(|response| response.record.state == ResponseState::Suspended)
             })
             .collect::<Vec<_>>();
@@ -765,6 +766,7 @@ impl Lifecycle {
                     .is_some_and(|response| response.record.display_parent == anchor)
                     && !message_responses.values().any(|claimed| claimed == answer)
             })
+            .map(ResponseId::uuid)
             .or(anchor)
     }
 
@@ -828,7 +830,7 @@ impl Lifecycle {
     ) -> Option<Uuid> {
         (0..snapshot.messages.len()).rev().find_map(|index| {
             if let Some(response) = self.response_of(snapshot, message_responses, index) {
-                return Some(response);
+                return Some(response.uuid());
             }
             snapshot
                 .prompt_execution_modes
@@ -855,7 +857,7 @@ impl Lifecycle {
             if let Line::Input(entry) = line
                 && entry.trigger.is_some()
             {
-                stored.insert(entry.input_id, entry);
+                stored.insert(entry.input_id.into(), entry);
             }
         }
         for (id, entry) in stored {
@@ -868,7 +870,7 @@ impl Lifecycle {
             }
             self.open_inputs.retain(|_, open| *open != id);
             if !matches!(entry.state, InputState::Settled { .. }) {
-                self.open_inputs.insert(entry.run_id, id);
+                self.open_inputs.insert(entry.run_id.into(), id);
             }
             self.inputs.insert(
                 id,
@@ -891,7 +893,7 @@ impl Lifecycle {
                     && input.state == InputState::Started
                     && input.queued.is_none()
             })
-            .map(|input| input.run_id)
+            .map(|input| RunId::from(input.run_id))
             .collect()
     }
 
@@ -942,9 +944,9 @@ impl Lifecycle {
             for update in updates {
                 let newest = delivered
                     .entry(update.subscription)
-                    .or_insert((update.sequence, input.record.input_id));
+                    .or_insert((update.sequence, input.record.input_id.into()));
                 if update.sequence > newest.0 {
-                    *newest = (update.sequence, input.record.input_id);
+                    *newest = (update.sequence, input.record.input_id.into());
                 }
             }
         }
@@ -964,12 +966,20 @@ impl Lifecycle {
             match line {
                 Line::Input(entry) if keeps_inputs => {
                     if matches!(entry.state, InputState::Accepted | InputState::Started) {
-                        lifecycle.open_inputs.insert(entry.run_id, entry.input_id);
-                    } else if lifecycle.open_inputs.get(&entry.run_id) == Some(&entry.input_id) {
-                        lifecycle.open_inputs.remove(&entry.run_id);
+                        lifecycle
+                            .open_inputs
+                            .insert(entry.run_id.into(), entry.input_id.into());
+                    } else if lifecycle
+                        .open_inputs
+                        .get(&tickloop_ids::Id::from(entry.run_id))
+                        == Some(&tickloop_ids::Id::from(entry.input_id))
+                    {
+                        lifecycle
+                            .open_inputs
+                            .remove(&tickloop_ids::Id::from(entry.run_id));
                     }
                     lifecycle.inputs.insert(
-                        entry.input_id,
+                        entry.input_id.into(),
                         Revised {
                             record: entry.clone(),
                             revision,
@@ -978,7 +988,7 @@ impl Lifecycle {
                 }
                 Line::Response(entry) => {
                     lifecycle.responses.insert(
-                        entry.response_id,
+                        entry.response_id.into(),
                         Revised {
                             record: entry.clone(),
                             revision,
@@ -1014,14 +1024,15 @@ impl Lifecycle {
             .responses
             .values()
             .filter(|response| {
-                !response.record.state.is_ended() && !rebuilt.contains(&response.record.response_id)
+                !response.record.state.is_ended()
+                    && !rebuilt.contains(&tickloop_ids::Id::from(response.record.response_id))
             })
             .map(|response| response.record.response_id)
             .collect::<Vec<_>>();
         for id in &orphaned {
-            self.abandon_waits(*id, AbandonReason::HostLost);
+            self.abandon_waits((*id).into(), AbandonReason::HostLost);
             let revision = self.next_revision();
-            let response = self.responses.get_mut(id).unwrap();
+            let response = self.responses.get_mut(&ResponseId::from(*id)).unwrap();
             response.record.state = ResponseState::Ended {
                 ending: ResponseEnding::Interrupted {
                     by: InterruptedBy::Host,
@@ -1042,7 +1053,7 @@ impl Lifecycle {
                 response.record.without_messages && response.record.display_parent == anchor
             })
             .max_by_key(|response| response.revision)
-            .map(|response| response.record.response_id);
+            .map(|response| ResponseId::from(response.record.response_id));
     }
 
     pub(crate) fn state(
@@ -1058,7 +1069,7 @@ impl Lifecycle {
             .chain(snapshot.original_message_ids.values())
             .any(|message| *message == id);
         Some(InputLedgerState {
-            is_live: is_live(entry.run_id),
+            is_live: is_live(entry.run_id.into()),
             responses: self.responses_of(id),
             prompt_in_conversation,
             entry,
@@ -1076,8 +1087,8 @@ pub(crate) fn replay(chat: &Chat, input: &LedgerInput) -> Option<Result<Receipt,
             .map(|state| {
                 Ok(Receipt {
                     chat_id,
-                    loop_id: state.entry.loop_id,
-                    run_id: state.entry.run_id,
+                    loop_id: state.entry.loop_id.into(),
+                    run_id: state.entry.run_id.into(),
                 })
             }),
         replay => replay,
@@ -1118,7 +1129,7 @@ impl Agent {
             chat,
             receipt,
             EventKind::ResponseStarted {
-                response_id: response.response_id,
+                response_id: response.response_id.into(),
                 attempt: response.attempt,
                 display_parent: response.display_parent,
             },

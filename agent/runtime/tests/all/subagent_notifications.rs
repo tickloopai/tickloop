@@ -53,7 +53,7 @@ async fn racing_root_stop_and_child_completion_records_and_delivers_each_run_onc
         drop(completion.release);
         let held = wait_for_snapshot(
             &core,
-            root,
+            root.uuid(),
             "completion delivery during the stop",
             |snapshot| {
                 snapshot.family_completions.len() == 1
@@ -77,16 +77,17 @@ async fn racing_root_stop_and_child_completion_records_and_delivers_each_run_onc
         drop(stopping.release);
         assert!(stop.await.unwrap().is_empty());
         core.continue_loop(root).await.unwrap();
-        let snapshot = wait_for_snapshot(&core, root, "one delivered completion", |snapshot| {
-            task_notifications(snapshot).len() == 1
-                && snapshot.pending_inputs.is_empty()
-                && matches!(
-                    snapshot.chat_loop.state,
-                    tickloop_agent_protocol::LoopState::Idle
-                        | tickloop_agent_protocol::LoopState::Interrupted
-                )
-        })
-        .await;
+        let snapshot =
+            wait_for_snapshot(&core, root.uuid(), "one delivered completion", |snapshot| {
+                task_notifications(snapshot).len() == 1
+                    && snapshot.pending_inputs.is_empty()
+                    && matches!(
+                        snapshot.chat_loop.state,
+                        tickloop_agent_protocol::LoopState::Idle
+                            | tickloop_agent_protocol::LoopState::Interrupted
+                    )
+            })
+            .await;
         assert_eq!(snapshot.family_completions.len(), 1);
         core.stop(root).await.unwrap();
         core.continue_loop(root).await.unwrap();
@@ -128,14 +129,14 @@ async fn background_completion_after_esc_starts_a_new_parent_turn() {
         }
     }
     core.interrupt(root).await.unwrap();
-    wait_for_snapshot(&core, root, "the Esc interruption", |snapshot| {
+    wait_for_snapshot(&core, root.uuid(), "the Esc interruption", |snapshot| {
         snapshot.chat_loop.state == tickloop_agent_protocol::LoopState::Interrupted
     })
     .await;
     model.release.notify_one();
     let delivered = wait_for_snapshot(
         &core,
-        root,
+        root.uuid(),
         "the background completion after Esc",
         |snapshot| {
             task_notifications(snapshot).len() == 1

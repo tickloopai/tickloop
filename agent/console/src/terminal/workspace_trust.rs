@@ -39,7 +39,7 @@ pub(super) struct WorkspaceTrust {
 impl WorkspaceTrust {
     pub(super) fn new(workdir: PathBuf) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: tickloop_ids::generate(),
             workdir,
             selected: TRUST_CANCEL_CHOICE_INDEX,
             decision: None,

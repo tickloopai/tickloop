@@ -442,7 +442,7 @@ async fn persisted_transcript_retains_provider_explanation_after_reload() {
         }
     }
     agent.shutdown().await;
-    let file = tickloop_agent_test_support::transcript_file(&root, chat);
+    let file = tickloop_agent_test_support::transcript_file(&root, chat.uuid());
     let transcript = std::fs::read_to_string(file).unwrap();
     assert!(
         transcript.contains("You've reached your monthly usage limit"),

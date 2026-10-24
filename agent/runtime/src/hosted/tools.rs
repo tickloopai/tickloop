@@ -378,7 +378,7 @@ impl HostedTickTools {
                 };
                 (
                     Operation::Open {
-                        operation: Uuid::new_v4(),
+                        operation: tickloop_ids::generate(),
                         adapter,
                         executable: FileIdentity::executable(&executable)?,
                         directory: FileIdentity::directory(&cwd)?,
@@ -449,11 +449,11 @@ impl HostedTickTools {
                 let instance = hosted_target(input)?;
                 (
                     Operation::Close {
-                        operation: Uuid::new_v4(),
+                        operation: tickloop_ids::generate(),
                         instance: instance.clone(),
                     },
                     HostToolPermission::Reviewable,
-                    format!("Close hosted Tick {instance}"),
+                    format!("Close hosted Tick {}", instance.public()),
                 )
             }
             (TICK_MANAGE, Some("reopen")) => {
@@ -474,7 +474,7 @@ impl HostedTickTools {
                 );
                 (
                     Operation::Reopen {
-                        operation: Uuid::new_v4(),
+                        operation: tickloop_ids::generate(),
                         lost,
                         title,
                     },
@@ -535,7 +535,7 @@ impl HostedTickTools {
                         instance: instance.clone(),
                     },
                     HostToolPermission::ReadOnly,
-                    format!("Describe hosted Tick {instance}"),
+                    format!("Describe hosted Tick {}", instance.public()),
                 )
             }
             (TICK_READ, _) => {
@@ -545,7 +545,7 @@ impl HostedTickTools {
                         instance: instance.clone(),
                     },
                     HostToolPermission::ReadOnly,
-                    format!("Read hosted Tick {instance}"),
+                    format!("Read hosted Tick {}", instance.public()),
                 )
             }
             (TICK_CALL, _) => {
@@ -589,7 +589,7 @@ impl HostedTickTools {
                         revision: catalog.revision,
                     },
                     permission,
-                    format!("Call {tool} on hosted Tick {instance}"),
+                    format!("Call {tool} on hosted Tick {}", instance.public()),
                 )
             }
             _ => return Err(format!("unknown hosted Tick tool: {name}")),
@@ -768,7 +768,7 @@ impl HostedTickTools {
                 ..
             } => {
                 let request = WorkerRequest::OpenHostedTick {
-                    chat,
+                    chat: chat.into(),
                     operation,
                     adapter,
                     command,
@@ -808,7 +808,7 @@ impl HostedTickTools {
                 title,
             } => {
                 let request = WorkerRequest::ReopenHostedTick {
-                    chat,
+                    chat: chat.into(),
                     operation,
                     instance: lost.clone(),
                     environment: self.environment.clone(),
@@ -827,7 +827,7 @@ impl HostedTickTools {
                 instance,
             } => {
                 let request = WorkerRequest::CloseHostedTick {
-                    chat,
+                    chat: chat.into(),
                     operation,
                     instance: instance.clone(),
                     admission: self.admission(),
@@ -951,7 +951,10 @@ impl HostedTickTools {
         };
         let receipt = self
             .daemon
-            .request(WorkerRequest::GetHostedOperationReceipt { chat, operation })
+            .request(WorkerRequest::GetHostedOperationReceipt {
+                chat: chat.into(),
+                operation,
+            })
             .await
             .map_err(|error| unknown(format!("{lost}; its receipt is unavailable: {error}")))?;
         match serde_json::from_value::<Option<Receipt>>(receipt["receipt"].clone()) {
@@ -1295,7 +1298,10 @@ impl HostedTickTools {
     ) -> Result<HostedTickPage, HostError> {
         let page = self
             .daemon
-            .request(WorkerRequest::ListHostedTicks { chat, cursor })
+            .request(WorkerRequest::ListHostedTicks {
+                chat: chat.into(),
+                cursor,
+            })
             .await?;
         serde_json::from_value(page)
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
@@ -1380,7 +1386,7 @@ impl HostedTickTools {
         let granted = self
             .daemon
             .request(WorkerRequest::AllowHostedView {
-                chat,
+                chat: chat.into(),
                 instance: instance.clone(),
             })
             .await?;
@@ -1717,7 +1723,7 @@ mod tests {
                 data_token: Some("token".into()),
                 owner: TickOwner {
                     root: "fixture-root".into(),
-                    chat,
+                    chat: chat.into(),
                 },
                 title: None,
                 state: TickState::Running,
@@ -1823,7 +1829,7 @@ mod tests {
         let instance = InstanceRef::hosted(Uuid::new_v4());
         let moved = tools
             .execute_operation(
-                Uuid::new_v4(),
+                Uuid::new_v4().into(),
                 HostedPrepared {
                     operation: Operation::Move {
                         instance,
@@ -1856,11 +1862,14 @@ mod tests {
             .unwrap();
         let chat = Uuid::new_v4();
         let herdr = std::sync::Arc::new(EmptyHerdr::default());
-        let tools = HostedTickTools::new(listing_daemon(directory.path(), chat, &[]), Vec::new())
-            .with_herdr_views(herdr_views(
-                &directory.path().join("herdr.sock"),
-                herdr.clone(),
-            ));
+        let tools = HostedTickTools::new(
+            listing_daemon(directory.path(), chat.into(), &[]),
+            Vec::new(),
+        )
+        .with_herdr_views(herdr_views(
+            &directory.path().join("herdr.sock"),
+            herdr.clone(),
+        ));
         for (name, input) in [
             (READ_WORKSPACE, json!({"workspace_id":"W1"})),
             (
@@ -1868,7 +1877,7 @@ mod tests {
                 json!({"action":"open","command":["/bin/cat"],"cwd":directory.path(),"workspace_id":"W1","placement":{"type":"new_tab"}}),
             ),
         ] {
-            let refused = tools.prepare(chat, name, &input, None).await.err();
+            let refused = tools.prepare(chat.into(), name, &input, None).await.err();
             assert!(
                 refused
                     .as_deref()
@@ -1903,11 +1912,14 @@ mod tests {
             .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let chat = Uuid::new_v4();
-        let tools = HostedTickTools::new(listing_daemon(directory.path(), chat, &[]), Vec::new());
+        let tools = HostedTickTools::new(
+            listing_daemon(directory.path(), chat.into(), &[]),
+            Vec::new(),
+        );
         let argument = "x".repeat(tickhost::host::TITLE_CHARACTERS * 4);
         let prepared = tools
             .prepare(
-                chat,
+                chat.into(),
                 TICK_MANAGE,
                 &json!({"action":"open","command":["/bin/echo", argument],"cwd":directory.path()}),
                 None,
@@ -1957,7 +1969,7 @@ mod tests {
             .prefix("htb")
             .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
             .unwrap();
-        let (chat, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (chat, other) = (ChatId::new(), ChatId::new());
         let hosted = || InstanceRef::hosted(Uuid::new_v4());
         let (running, ended, elsewhere) = (hosted(), hosted(), hosted());
         let tools = HostedTickTools::new(

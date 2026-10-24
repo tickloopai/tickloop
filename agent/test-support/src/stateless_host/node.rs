@@ -174,7 +174,10 @@ impl ClaimedTask {
                 is_done_once_accepted,
                 turn,
             } => {
-                let Ok(Some(state)) = agent.input_state(*target, *input).await else {
+                let Ok(Some(state)) = agent
+                    .input_state(*target, tickloop_ids::Id::from(*input))
+                    .await
+                else {
                     return false;
                 };
                 if *is_done_once_accepted || matches!(state.entry.state, InputState::Settled { .. })
@@ -403,7 +406,7 @@ impl Holding {
                 match self.guarded(agent.advance(target, request)).await? {
                     Ok(turn) => Ok(ClaimedWork::Turn {
                         target,
-                        input,
+                        input: input.uuid(),
                         is_done_once_accepted,
                         turn: Box::new(turn),
                     }),

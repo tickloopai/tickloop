@@ -195,7 +195,7 @@ impl TranscriptStore for JsonlTranscriptStore {
                 .to_path_buf(),
             ChatPlacement::Folderless => return Err(TranscriptError::Unsupported),
         };
-        let path = transcript_path(&directory, chat);
+        let path = transcript_path(&directory, chat.into());
         let position = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
         match chats.get_mut(&chat) {
             // Registering again keeps what the store knows of the file and its batches.
@@ -259,7 +259,7 @@ impl ChatFiles {
             .map(|file| file.path.clone());
         let path = match known {
             Some(path) => path,
-            None => match locate(&self.root, chat).map_err(storage)? {
+            None => match locate(&self.root, chat.into()).map_err(storage)? {
                 Some(path) => path,
                 None => return Ok(None),
             },
@@ -288,7 +288,10 @@ impl ChatFiles {
         let (path, exists_on_disk, known, acknowledged) = {
             let chats = self.chats.lock().unwrap();
             let file = chats.get(&chat).ok_or_else(|| {
-                TranscriptError::Storage(format!("Chat {chat} has no Transcript in this store"))
+                TranscriptError::Storage(format!(
+                    "Chat {} has no Transcript in this store",
+                    chat.public()
+                ))
             })?;
             (
                 file.path.clone(),

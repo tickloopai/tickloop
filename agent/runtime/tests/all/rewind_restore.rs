@@ -18,7 +18,7 @@ async fn run_prompt(
     prompt: &str,
 ) -> tickloop_agent_protocol::Receipt {
     let receipt = agent
-        .submit(chat, prompt.into())
+        .submit(tickloop_ids::Id::from(chat), prompt.into())
         .await
         .expect("prompt accepted");
     loop {
@@ -28,7 +28,7 @@ async fn run_prompt(
         }
         match event.kind {
             EventKind::PermissionRequested { request } => agent
-                .answer_permission(chat, request.id, true)
+                .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                 .await
                 .expect("permission accepted"),
             EventKind::Completed { .. } => return receipt,
@@ -98,8 +98,8 @@ async fn code_rewind_restores_modified_created_and_deleted_files() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "change three files").await;
-    run_prompt(&agent, &mut events, chat, "say something else").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "change three files").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "say something else").await;
     assert_eq!(read(&modified), "agent modified\n");
     assert_eq!(read(&created), "agent created\n");
     assert!(!deleted.exists());
@@ -153,8 +153,8 @@ async fn continuing_after_rewind_forks_the_transcript_and_restart_resumes_the_ne
     let agent = Agent::open_embedded(state.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "abandoned prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "abandoned prompt").await;
     let points = agent.snapshot(chat).await.unwrap().rewind_points();
 
     let outcome = agent
@@ -167,7 +167,7 @@ async fn continuing_after_rewind_forks_the_transcript_and_restart_resumes_the_ne
     assert!(!model_text(&outcome.snapshot).contains("abandoned"));
     let draft = outcome.draft.unwrap();
     assert_eq!(draft.prompt, "abandoned prompt");
-    run_prompt(&agent, &mut events, chat, "replacement prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "replacement prompt").await;
     assert!(
         !request_text(model.requests.lock().unwrap().last().unwrap()).contains("abandoned answer")
     );
@@ -175,7 +175,7 @@ async fn continuing_after_rewind_forks_the_transcript_and_restart_resumes_the_ne
     agent.shutdown().await;
     drop(agent);
 
-    let transcript = read(&transcript_file(&state, chat));
+    let transcript = read(&transcript_file(&state, chat.uuid()));
     assert!(transcript.contains("abandoned answer"));
     assert!(transcript.contains("replacement answer"));
 
@@ -187,7 +187,7 @@ async fn continuing_after_rewind_forks_the_transcript_and_restart_resumes_the_ne
     );
     assert_eq!(restored.rewind_points(), current_points);
     let mut events = reopened.subscribe();
-    run_prompt(&reopened, &mut events, chat, "prompt after restart").await;
+    run_prompt(&reopened, &mut events, chat.uuid(), "prompt after restart").await;
     let request = request_text(model.requests.lock().unwrap().last().unwrap());
     assert!(request.contains("replacement answer"));
     assert!(!request.contains("abandoned answer"));
@@ -209,12 +209,12 @@ async fn rewind_restores_the_execution_mode_of_the_target_prompt_even_after_rest
         .set_execution_mode(chat, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
     agent
         .set_execution_mode(chat, ExecutionMode::Plan)
         .await
         .unwrap();
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     agent.shutdown().await;
     drop(agent);
 
@@ -267,8 +267,8 @@ async fn forked_and_branched_chats_restore_files_changed_before_they_split() {
     let agent = Agent::open_embedded(state.clone(), config(), model.clone()).unwrap();
     let source = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, source, "change the file").await;
-    run_prompt(&agent, &mut events, source, "keep talking").await;
+    run_prompt(&agent, &mut events, source.uuid(), "change the file").await;
+    run_prompt(&agent, &mut events, source.uuid(), "keep talking").await;
     let source_points = agent.snapshot(source).await.unwrap().rewind_points();
 
     let branch = agent
@@ -311,7 +311,7 @@ async fn forked_and_branched_chats_restore_files_changed_before_they_split() {
 
     let copy = agent.resume_as_new_chat(source).await.unwrap();
     assert_ne!(copy.id, source);
-    fs::remove_dir_all(state.join("file-history").join(source.to_string())).unwrap();
+    fs::remove_dir_all(state.join("file-history").join(source.uuid().to_string())).unwrap();
     agent
         .rewind(copy.id, source_points[0].message_id, RewindMode::Code)
         .await
@@ -378,9 +378,9 @@ async fn snapshots_beyond_one_hundred_drop_the_oldest_without_breaking_rewind() 
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(replies)));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "prompt 0").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "prompt 0").await;
     for index in 1..=PROMPTS_AFTER_THE_EDIT {
-        run_prompt(&agent, &mut events, chat, &format!("prompt {index}")).await;
+        run_prompt(&agent, &mut events, chat.uuid(), &format!("prompt {index}")).await;
     }
     let points = agent.snapshot(chat).await.unwrap().rewind_points();
     assert_eq!(points.len(), PROMPTS_AFTER_THE_EDIT + 1);
@@ -430,8 +430,8 @@ async fn conversation_rewind_truncates_messages_and_binds_the_draft_to_a_new_loo
         Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    let second = run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    let second = run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
 
     let before = agent.snapshot(chat).await.unwrap();
     let point = before.rewind_points()[1].clone();
@@ -457,7 +457,7 @@ async fn conversation_rewind_truncates_messages_and_binds_the_draft_to_a_new_loo
     assert_eq!(result.snapshot.chat_loop.id, second.loop_id);
     assert_eq!(result.snapshot.chat_loop.state, LoopState::Idle);
 
-    run_prompt(&agent, &mut events, chat, &draft.prompt).await;
+    run_prompt(&agent, &mut events, chat.uuid(), &draft.prompt).await;
     let branched = agent.snapshot(chat).await.unwrap();
     assert!(!model_text(&branched).contains("abandoned second answer"));
     assert!(model_text(&branched).contains("replacement answer"));
@@ -480,7 +480,7 @@ async fn conversation_rewind_keeps_the_loop_and_its_subscriptions() {
     shell.install(&agent).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    let receipt = run_prompt(&agent, &mut events, chat, "keep checking this").await;
+    let receipt = run_prompt(&agent, &mut events, chat.uuid(), "keep checking this").await;
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[0].clone();
     shell.subscribe(&agent, chat).await;
     let subscriptions = agent.snapshot(chat).await.unwrap().chat_loop.subscriptions;
@@ -527,9 +527,9 @@ async fn code_rewind_moves_backward_and_forward_and_survives_restart() {
     let agent = Agent::open_embedded(state.clone(), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "create version one").await;
-    run_prompt(&agent, &mut events, chat, "write version two").await;
-    run_prompt(&agent, &mut events, chat, "remember version two").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "create version one").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "write version two").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "remember version two").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     let points = snapshot.rewind_points();
     let version = directory.path().join("version.txt");
@@ -588,7 +588,7 @@ async fn conversation_restore_returns_the_original_saved_input_context() {
             break;
         }
     }
-    run_prompt(&agent, &mut events, chat, "later prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "later prompt").await;
     fs::write(&referenced, "new disk content\n").unwrap();
     let point = agent.snapshot(chat).await.unwrap().rewind_points()[0].clone();
     let result = agent
@@ -617,9 +617,9 @@ async fn rewind_across_a_compaction_boundary_drops_the_boundary_and_restores_raw
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
     agent.compact(chat).await.unwrap();
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     let points = agent.snapshot(chat).await.unwrap().rewind_points();
 
     let after_compaction = agent
@@ -672,8 +672,8 @@ async fn rewind_preserves_original_private_history_after_a_model_switch() {
     let agent = Agent::new_embedded(config(), original);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    run_prompt(&agent, &mut events, chat, "first prompt").await;
-    run_prompt(&agent, &mut events, chat, "second prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "first prompt").await;
+    run_prompt(&agent, &mut events, chat.uuid(), "second prompt").await;
     agent.compact(chat).await.unwrap();
 
     let mut selected = config();

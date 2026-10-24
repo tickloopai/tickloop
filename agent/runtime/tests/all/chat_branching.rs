@@ -100,7 +100,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         )
         .await
         .unwrap();
-    wait_for_run(&mut events, source_receipt.run_id).await;
+    wait_for_run(&mut events, source_receipt.run_id.uuid()).await;
     let source_before = agent.snapshot(source_chat_id).await.unwrap();
     let stored_context = source_before.message_contexts[&0][0].clone();
     assert!(matches!(
@@ -192,7 +192,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         .unwrap();
     assert_eq!(child_receipt.loop_id, source_receipt.loop_id);
     assert_ne!(child_receipt.run_id, source_receipt.run_id);
-    wait_for_run(&mut events, child_receipt.run_id).await;
+    wait_for_run(&mut events, child_receipt.run_id.uuid()).await;
     let child = agent.snapshot(outcome.child_chat_id).await.unwrap();
     assert_eq!(child.chat_loop.run_id, Some(child_receipt.run_id));
     assert_eq!(
@@ -284,7 +284,7 @@ async fn concurrent_branch_requests_are_serialized_by_request_identity() {
         .submit(source_chat_id, "source prompt".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, source_receipt.run_id).await;
+    wait_for_run(&mut events, source_receipt.run_id.uuid()).await;
     let source_before =
         serde_json::to_value(agent.snapshot(source_chat_id).await.unwrap()).unwrap();
     let idempotent_request = BranchRequest {
@@ -362,7 +362,7 @@ async fn branch_model_seed_and_first_child_request_exclude_private_model_content
         .submit(source_chat_id, "source prompt".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, source_receipt.run_id).await;
+    wait_for_run(&mut events, source_receipt.run_id.uuid()).await;
     let source_before = agent.snapshot(source_chat_id).await.unwrap();
     assert!(
         source_before
@@ -409,7 +409,7 @@ async fn branch_model_seed_and_first_child_request_exclude_private_model_content
         .submit(branch.child_chat_id, "continue in child".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, child_receipt.run_id).await;
+    wait_for_run(&mut events, child_receipt.run_id.uuid()).await;
     {
         let requests = model.requests.lock().unwrap();
         let child_request = requests.last().unwrap();
@@ -458,12 +458,12 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
         .submit(source_chat_id, "first source prompt".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, first.run_id).await;
+    wait_for_run(&mut events, first.run_id.uuid()).await;
     let second = agent
         .submit(source_chat_id, "second source prompt".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, second.run_id).await;
+    wait_for_run(&mut events, second.run_id.uuid()).await;
     assert_ne!(first.run_id, second.run_id);
     let source_before = agent.snapshot(source_chat_id).await.unwrap();
     let source_json = serde_json::to_value(&source_before).unwrap();
@@ -517,7 +517,7 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
         inherited_ids,
         vec![
             "duplicate-call".into(),
-            format!("tl_{}_1", second.run_id.simple()),
+            format!("tl_{}_1", second.run_id.uuid().simple()),
         ]
     );
     assert_eq!(tool_result_ids(&inherited_messages), inherited_ids);
@@ -530,7 +530,7 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
         .submit(branch.child_chat_id, "continue in child".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, child.run_id).await;
+    wait_for_run(&mut events, child.run_id.uuid()).await;
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(tool_use_ids(&requests[4].messages), inherited_ids);
@@ -547,8 +547,8 @@ async fn branch_rewrites_duplicate_cross_run_call_ids_and_keeps_future_child_cal
         child_ids,
         vec![
             "duplicate-call".into(),
-            format!("tl_{}_1", second.run_id.simple()),
-            format!("tl_{}_2", child.run_id.simple()),
+            format!("tl_{}_1", second.run_id.uuid().simple()),
+            format!("tl_{}_2", child.run_id.uuid().simple()),
         ]
     );
     assert_eq!(tool_result_ids(&child_messages), child_ids);
@@ -585,7 +585,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
         .submit(source_chat_id, "inspect the fact".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, first.run_id).await;
+    wait_for_run(&mut events, first.run_id.uuid()).await;
 
     let mut shell_events = agent.subscribe_user_shells();
     let shell = agent
@@ -612,7 +612,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
         .submit(source_chat_id, "second prompt".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, second.run_id).await;
+    wait_for_run(&mut events, second.run_id.uuid()).await;
     let before_summary = agent.snapshot(source_chat_id).await.unwrap();
     let checkpoint = before_summary.rewind_points()[1].clone();
     agent
@@ -674,7 +674,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
         .submit(outcome.child_chat_id, "continue after the branch".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, child_run.run_id).await;
+    wait_for_run(&mut events, child_run.run_id.uuid()).await;
     let before_child_summary = agent.snapshot(outcome.child_chat_id).await.unwrap();
     let child_checkpoint = before_child_summary.rewind_points().pop().unwrap();
     agent
@@ -784,7 +784,7 @@ async fn failed_partial_reply_is_not_inherited_by_a_branch() {
         .submit(source_chat_id, "produce a partial".into())
         .await
         .unwrap();
-    wait_for_failed_run(&mut events, failed.run_id).await;
+    wait_for_failed_run(&mut events, failed.run_id.uuid()).await;
     let source = agent.snapshot(source_chat_id).await.unwrap();
     assert!(
         !format!("{:?}", source.conversation_messages().unwrap())
@@ -815,7 +815,7 @@ async fn failed_partial_reply_is_not_inherited_by_a_branch() {
         .submit(outcome.child_chat_id, "continue".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, continued.run_id).await;
+    wait_for_run(&mut events, continued.run_id.uuid()).await;
     {
         let requests = model.requests.lock().unwrap();
         let child_request = requests.last().unwrap();
@@ -901,7 +901,7 @@ async fn invalid_empty_and_busy_sources_have_no_branch_side_effects() {
         source_before
     );
     agent.interrupt(empty).await.unwrap();
-    wait_for_failed_run(&mut events, receipt.run_id).await;
+    wait_for_failed_run(&mut events, receipt.run_id.uuid()).await;
     agent.shutdown().await;
 }
 
@@ -916,7 +916,7 @@ async fn automatic_names_are_unique_and_explicit_names_are_validated() {
         .submit(source_chat_id, "  first   prompt  ".into())
         .await
         .unwrap();
-    wait_for_run(&mut events, receipt.run_id).await;
+    wait_for_run(&mut events, receipt.run_id.uuid()).await;
     let first = agent
         .branch_chat(BranchRequest {
             request_id: Uuid::new_v4(),
@@ -955,7 +955,10 @@ async fn wait_for_snapshot(
 ) -> ChatSnapshot {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let snapshot = agent.snapshot(chat_id).await.unwrap();
+            let snapshot = agent
+                .snapshot(tickloop_ids::Id::from(chat_id))
+                .await
+                .unwrap();
             if is_ready(&snapshot) {
                 return snapshot;
             }
@@ -992,7 +995,7 @@ fn has_task_notification(snapshot: &ChatSnapshot, task_id: Uuid) -> bool {
             message.content.iter().any(|content| {
                 matches!(content, Content::Text { text }
                 if text.starts_with("<task-notification>")
-                    && text.contains(&format!("<task-id>{task_id}</task-id>")))
+                    && text.contains(&format!("<task-id>{}</task-id>", tickloop_ids::IdContext::new().model_text(tickloop_agent_protocol::ShellTaskId::from(task_id)))))
             })
         })
 }
@@ -1014,7 +1017,7 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
         .submit_user_shell(source_chat_id, gated_shell_command(&gate), true)
         .await
         .unwrap();
-    wait_for_snapshot(&agent, source_chat_id, |snapshot| {
+    wait_for_snapshot(&agent, source_chat_id.uuid(), |snapshot| {
         snapshot.user_shells.iter().any(|record| {
             record.id == shell.command_id && record.state == UserShellState::Background
         })
@@ -1040,13 +1043,13 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
     ));
 
     std::fs::write(&gate, b"release").unwrap();
-    wait_for_snapshot(&agent, source_chat_id, |snapshot| {
+    wait_for_snapshot(&agent, source_chat_id.uuid(), |snapshot| {
         snapshot.user_shells.iter().any(|record| {
             record.id == shell.command_id && record.state == UserShellState::Completed
         })
     })
     .await;
-    let source_after = wait_for_snapshot(&agent, source_chat_id, |snapshot| {
+    let source_after = wait_for_snapshot(&agent, source_chat_id.uuid(), |snapshot| {
         has_task_notification(snapshot, shell.command_id)
     })
     .await;
@@ -1147,7 +1150,7 @@ async fn background_agent_shell_output_after_branch_stays_in_the_source_chat() {
             _ => {}
         }
     }
-    let source_command = wait_for_snapshot(&agent, source_chat_id, |snapshot| {
+    let source_command = wait_for_snapshot(&agent, source_chat_id.uuid(), |snapshot| {
         snapshot.commands.first().is_some_and(|command| {
             command.state == CommandState::Background && command.output_bytes >= 6
         })
@@ -1171,7 +1174,7 @@ async fn background_agent_shell_output_after_branch_stays_in_the_source_chat() {
     let child_messages_at_branch = outcome.snapshot.conversation_messages().unwrap();
 
     std::fs::write(&gate, b"release").unwrap();
-    let source_after = wait_for_snapshot(&agent, source_chat_id, |snapshot| {
+    let source_after = wait_for_snapshot(&agent, source_chat_id.uuid(), |snapshot| {
         snapshot.commands.iter().any(|command| {
             command.operation_id == source_command.operation_id
                 && command.state == CommandState::Completed

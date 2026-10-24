@@ -139,7 +139,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
             .submit(chat, "inspect the workspace".into())
             .await
             .unwrap();
-        wait_for_running_shell(&agent, chat, "slow-shell", &mut events).await;
+        wait_for_running_shell(&agent, chat.uuid(), "slow-shell", &mut events).await;
         let queued = agent
             .submit(chat, "include the newly queued correction".into())
             .await
@@ -193,7 +193,7 @@ async fn queued_messages_join_the_active_tool_turn_with_a_terminal_redirect() {
                 .iter()
                 .map(|entry| entry.id)
                 .collect::<Vec<_>>(),
-            vec![command_id, after_command.run_id]
+            vec![command_id, after_command.run_id.uuid()]
         );
         let correction_index = snapshot
             .messages
@@ -281,7 +281,11 @@ async fn queued_commands_form_a_persistent_barrier_between_model_inputs() {
     let queued = agent.snapshot(chat).await.unwrap().queued_inputs();
     assert_eq!(
         queued.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-        vec![before.run_id, command_id, after.run_id]
+        vec![
+            before.run_id,
+            tickloop_ids::Id::from(command_id),
+            after.run_id
+        ]
     );
 
     model.release.notify_one();
@@ -493,12 +497,12 @@ fn bash(id: &str, command: &str) -> Vec<Content> {
 
 async fn allow_bash(agent: &Agent, chat: uuid::Uuid) {
     agent
-        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .set_execution_mode(tickloop_ids::Id::from(chat), ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     agent
         .set_permission_rules(
-            chat,
+            tickloop_ids::Id::from(chat),
             vec![PermissionRule {
                 id: uuid::Uuid::new_v4(),
                 decision: Decision::Allow,
@@ -527,7 +531,7 @@ async fn wait_for_running_shell(
         }
         match event.kind {
             EventKind::PermissionRequested { request } => agent
-                .answer_permission(chat, request.id, true)
+                .answer_permission(tickloop_ids::Id::from(chat), request.id, true)
                 .await
                 .unwrap(),
             EventKind::ToolStarted {
@@ -535,7 +539,7 @@ async fn wait_for_running_shell(
             } if started == call_id => {
                 operation_id = Some(
                     agent
-                        .snapshot(chat)
+                        .snapshot(tickloop_ids::Id::from(chat))
                         .await
                         .unwrap()
                         .operations
@@ -575,13 +579,13 @@ async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    allow_bash(&agent, chat).await;
+    allow_bash(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     let active = agent
         .submit(chat, "start the long work".into())
         .await
         .unwrap();
-    wait_for_running_shell(&agent, chat, "long-shell", &mut events).await;
+    wait_for_running_shell(&agent, chat.uuid(), "long-shell", &mut events).await;
     let queued = agent.submit(chat, "how is it going".into()).await.unwrap();
     assert_eq!(
         agent
@@ -650,7 +654,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    allow_bash(&agent, chat).await;
+    allow_bash(&agent, chat.uuid()).await;
     let mut events = agent.subscribe();
     let active = agent
         .submit(chat, "start the short work".into())
@@ -663,7 +667,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
             .unwrap()
             .is_empty()
     );
-    wait_for_running_shell(&agent, chat, "short-shell", &mut events).await;
+    wait_for_running_shell(&agent, chat.uuid(), "short-shell", &mut events).await;
     let joined = agent.submit(chat, "fold this in".into()).await.unwrap();
     std::fs::write(directory.path().join("release-joined-turn"), "ready").unwrap();
     loop {
@@ -678,7 +682,7 @@ async fn send_now_leaves_the_run_that_already_answers_the_message() {
         }
     }
 
-    for run_id in [joined.run_id, uuid::Uuid::new_v4()] {
+    for run_id in [joined.run_id, tickloop_ids::Id::from(uuid::Uuid::new_v4())] {
         assert!(agent.send_now(chat, run_id).await.unwrap().is_empty());
     }
     let snapshot = agent.snapshot(chat).await.unwrap();

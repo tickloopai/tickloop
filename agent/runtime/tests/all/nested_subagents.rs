@@ -28,7 +28,7 @@ impl tickloop_agent_runtime::host_tools::HostToolProvider for MutatingHost {
     }
     fn permission(
         &self,
-        _: uuid::Uuid,
+        _: tickloop_agent_protocol::ChatId,
         _: &str,
         _: &serde_json::Value,
     ) -> tickloop_agent_runtime::host_tools::HostToolPermission {
@@ -36,7 +36,7 @@ impl tickloop_agent_runtime::host_tools::HostToolProvider for MutatingHost {
     }
     async fn execute(
         &self,
-        _: uuid::Uuid,
+        _: tickloop_agent_protocol::ChatId,
         _: &str,
         _: serde_json::Value,
         _: tokio_util::sync::CancellationToken,

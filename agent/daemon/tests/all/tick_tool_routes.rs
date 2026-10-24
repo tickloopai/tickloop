@@ -250,7 +250,7 @@ async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
                 for error in [
                     tools.call_authority(name, &input).unwrap_err(),
                     tools
-                        .prepare_call(chat, name, &input, CancellationToken::new())
+                        .prepare_call(chat.into(), name, &input, CancellationToken::new())
                         .await
                         .unwrap_err(),
                 ] {
@@ -262,7 +262,7 @@ async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
         for target in ["1234", "herdr:terminal:x:1:1"] {
             let error = tools
                 .prepare_call(
-                    chat,
+                    chat.into(),
                     "TickRead",
                     &json!({"tick_instance_id":target}),
                     CancellationToken::new(),
