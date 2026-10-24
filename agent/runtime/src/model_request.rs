@@ -644,9 +644,13 @@ impl Agent {
             if let Some(text) = tracking.captured_text.as_mut() {
                 text.push_str(&attempt_text);
             }
+            // Once reply text was shown, the Run continues from that text instead of replaying.
             let retry = match &result {
                 Err(AgentError::Model(error))
-                    if !output_started && model_context.has_remaining_attempts() =>
+                    if (!output_started
+                        || (error.kind() == ModelFailureKind::StreamInterrupted
+                            && attempt_text.is_empty()))
+                        && model_context.has_remaining_attempts() =>
                 {
                     model_error_retry_delay(error, model_context.used_attempts() - 1, context.kind)
                         .map(|(delay, max_retries)| (delay, max_retries, retry_error_label(error)))
@@ -1029,7 +1033,15 @@ fn model_error_retry_delay(
     retries: usize,
     kind: ModelRequestKind,
 ) -> Option<(Duration, usize)> {
-    let (is_retryable, retry_after) = error.retry_hint();
+    // A stream cut after its output began ran no tool and may be replayed, except an Auto review,
+    // which fails closed.
+    let (is_retryable, retry_after) = if error.kind() == ModelFailureKind::StreamInterrupted
+        && kind != ModelRequestKind::PermissionCheck
+    {
+        (true, None)
+    } else {
+        error.retry_hint()
+    };
     let is_overload = error.status() == Some(529);
     let max_retries = if kind == ModelRequestKind::PermissionCheck && is_overload {
         0
@@ -1173,6 +1185,22 @@ mod tests {
         .unwrap();
         assert!((500..=625).contains(&first_delay.as_millis()));
         assert_eq!(retries, MAX_MODEL_ERROR_RETRIES);
+        assert!(
+            model_error_retry_delay(
+                &ModelError::StreamInterruptedAfterOutput,
+                0,
+                ModelRequestKind::Conversation
+            )
+            .is_some()
+        );
+        assert!(
+            model_error_retry_delay(
+                &ModelError::StreamInterruptedAfterOutput,
+                0,
+                ModelRequestKind::PermissionCheck
+            )
+            .is_none()
+        );
         assert!(
             model_error_retry_delay(
                 &ModelError::Http { status: 402 },

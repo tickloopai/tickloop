@@ -322,11 +322,11 @@ async fn agent_falls_back_to_sse_only_before_websocket_output() {
 }
 
 #[tokio::test]
-async fn agent_never_replays_after_websocket_output_begins() {
+async fn agent_continues_from_shown_text_after_websocket_output_breaks() {
     let (_directory, state_dir) = state_with_credentials();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
-    let (requests_tx, requests_rx) = oneshot::channel();
+    let (continuation_tx, continuation_rx) = oneshot::channel();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut websocket = accept_async(stream).await.unwrap();
@@ -338,10 +338,19 @@ async fn agent_never_replays_after_websocket_output_begins() {
         ].concat();
         send_ws_stream(&mut websocket, &partial).await;
         websocket.close(None).await.unwrap();
-        let retried = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        let frame = websocket
+            .next()
             .await
-            .is_ok();
-        requests_tx.send(retried).unwrap();
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        continuation_tx
+            .send(serde_json::from_str::<Value>(&frame).unwrap())
+            .unwrap();
+        send_ws_stream(&mut websocket, &text_stream()).await;
     });
     let config = ModelCatalog::defaults()
         .profiles()
@@ -364,16 +373,25 @@ async fn agent_never_replays_after_websocket_output_begins() {
             .kind
         {
             EventKind::Text(text) if text == "Partial" => saw_partial = true,
-            EventKind::Failed(reason) => {
-                assert!(reason.contains("after output began"));
-                break;
-            }
-            EventKind::Completed { .. } => panic!("partial WebSocket response completed"),
+            EventKind::Failed(reason) => panic!("interrupted WebSocket reply failed: {reason}"),
+            EventKind::Completed { .. } => break,
             _ => {}
         }
     }
     assert!(saw_partial);
-    assert!(!requests_rx.await.unwrap());
+    let continuation = continuation_rx.await.unwrap().to_string();
+    assert!(continuation.contains("Partial"), "{continuation}");
+    assert!(
+        continuation.contains("stream was interrupted"),
+        "{continuation}"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        snapshot.messages.last().unwrap().content,
+        vec![Content::Text {
+            text: "PartialHello from Codex".into()
+        }]
+    );
     agent.shutdown().await;
 }
 

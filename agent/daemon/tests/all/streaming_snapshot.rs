@@ -478,7 +478,7 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
             ControlledReply {
                 control: failed.clone(),
                 deltas: vec!["Incomplete", " reply"],
-                outcome: Err(ModelError::StreamInterrupted),
+                outcome: Err(ModelError::ProviderFailure),
             },
             ControlledReply {
                 control: retry.clone(),

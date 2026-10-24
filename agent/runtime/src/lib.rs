@@ -138,7 +138,7 @@ use crate::file_history::FileHistory;
 use session_permissions::{PermissionOwner, SessionPermissionOperation};
 use tickloop_agent_base::output_style::OutputStyle;
 use tickloop_agent_model::{
-    ModelClient, ModelConfigExt, ModelError, ModelRequest, ModelResponseRejection,
+    ModelClient, ModelConfigExt, ModelError, ModelFailureKind, ModelRequest, ModelResponseRejection,
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
@@ -164,8 +164,9 @@ use tickloop_agent_transcript::{
 };
 
 const EVENT_REPLAY_LIMIT: usize = 1024;
-const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
+const MAX_RESPONSE_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
+const STREAM_INTERRUPTION_CONTINUATION_PROMPT: &str = "The response stream was interrupted. Continue directly from the unfinished response without repeating or summarizing it.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub use agent_messages::LIST_SUBAGENTS_TOOL_NAME;
@@ -3164,11 +3165,21 @@ impl Agent {
                     }
                     break response;
                 }
-                Err(AgentError::Model(ModelError::ResponseRejected(
-                    ModelResponseRejection::OutputLimit,
-                ))) if continuations < MAX_OUTPUT_LIMIT_CONTINUATIONS
-                    && !attempt_text.trim().is_empty() =>
-                {
+                Err(AgentError::Model(ModelError::Cancelled)) => {
+                    recovered_text.push_str(&attempt_text);
+                    self.commit_interrupted_reply(receipt, recovered_text)
+                        .await?;
+                    return Err(ModelError::Cancelled.into());
+                }
+                Err(error) => {
+                    let Some(continuation_prompt) =
+                        response_continuation_prompt(&error).filter(|_| {
+                            continuations < MAX_RESPONSE_CONTINUATIONS
+                                && !attempt_text.trim().is_empty()
+                        })
+                    else {
+                        return Err(error);
+                    };
                     let mut chats = self.inner.chats.lock().await;
                     let chat = chats
                         .get_mut(&receipt.chat_id)
@@ -3185,18 +3196,11 @@ impl Agent {
                     request.messages.push(Message {
                         role: Role::User,
                         content: vec![Content::Text {
-                            text: OUTPUT_LIMIT_CONTINUATION_PROMPT.into(),
+                            text: continuation_prompt.into(),
                         }],
                     });
                     continuations += 1;
                 }
-                Err(AgentError::Model(ModelError::Cancelled)) => {
-                    recovered_text.push_str(&attempt_text);
-                    self.commit_interrupted_reply(receipt, recovered_text)
-                        .await?;
-                    return Err(ModelError::Cancelled.into());
-                }
-                Err(error) => return Err(error),
             }
         };
         let invalid_call = response.output.content.iter().any(|content| {
@@ -5336,6 +5340,20 @@ pub(crate) fn validate_host_schema_input(
 ) -> Result<(), String> {
     tool_execution::validate_schema(schema, input, "input")
         .map_err(|reason| format!("invalid {name} input: {reason}"))
+}
+
+/// The prompt that resumes a reply cut short after its text was shown; replaying it would show
+/// that text twice.
+fn response_continuation_prompt(error: &AgentError) -> Option<&'static str> {
+    match error {
+        AgentError::Model(ModelError::ResponseRejected(ModelResponseRejection::OutputLimit)) => {
+            Some(OUTPUT_LIMIT_CONTINUATION_PROMPT)
+        }
+        AgentError::Model(error) if error.kind() == ModelFailureKind::StreamInterrupted => {
+            Some(STREAM_INTERRUPTION_CONTINUATION_PROMPT)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn reserved_host_tool_names() -> HashSet<String> {

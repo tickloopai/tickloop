@@ -23,6 +23,7 @@ enum Reply {
     PanicAfter(CancellationToken),
     Output(Vec<Content>),
     PartialError(&'static str, ModelError),
+    ThinkingError(&'static str, ModelError),
     Success(&'static str),
 }
 
@@ -103,6 +104,10 @@ impl ModelClient for FailingModel {
                 events.send(ModelDelta::Text(text.into())).unwrap();
                 Err(error)
             }
+            Reply::ThinkingError(thinking, error) => {
+                events.send(ModelDelta::Thinking(thinking.into())).unwrap();
+                Err(error)
+            }
             Reply::Success(text) => {
                 events.send(ModelDelta::Text(text.into())).unwrap();
                 Ok(ModelOutput {
@@ -117,16 +122,69 @@ impl ModelClient for FailingModel {
 }
 
 #[tokio::test]
-async fn interrupted_stream_is_not_replayed_after_text_was_shown() {
-    let model = Arc::new(FailingModel::new(vec![Reply::PartialError(
-        "Visible prefix",
-        ModelError::StreamInterrupted,
-    )]));
+async fn interrupted_stream_continues_from_the_text_already_shown() {
+    let model = Arc::new(FailingModel::new(vec![
+        Reply::PartialError("Visible prefix", ModelError::StreamInterruptedAfterOutput),
+        Reply::Success(" and the rest"),
+    ]));
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
     let (completed, error) = run_until_finished(&agent, &model).await;
-    assert!(!completed);
-    assert!(error.contains("stream ended"));
-    assert_eq!(model.request_count(), 1);
+    assert!(completed, "{error}");
+    assert_eq!(model.request_count(), 2);
+    let requests = model.requests.lock().unwrap().clone();
+    let continued = &requests[1].messages;
+    assert_eq!(continued.len(), requests[0].messages.len() + 2);
+    assert_eq!(
+        continued[continued.len() - 2].content,
+        vec![Content::Text {
+            text: "Visible prefix".into()
+        }]
+    );
+    assert_eq!(continued.last().unwrap().role, Role::User);
+    let snapshot = &agent.list_chats().await[0];
+    let reply = snapshot
+        .messages
+        .iter()
+        .rfind(|message| message.role == Role::Assistant)
+        .unwrap();
+    assert_eq!(
+        reply.content,
+        vec![Content::Text {
+            text: "Visible prefix and the rest".into()
+        }]
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn interrupted_stream_is_replayed_when_only_thinking_was_shown() {
+    let model = Arc::new(FailingModel::new(vec![
+        Reply::ThinkingError("Considering", ModelError::StreamInterruptedAfterOutput),
+        Reply::Success("Recovered"),
+    ]));
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    let (completed, error) = run_until_finished(&agent, &model).await;
+    assert!(completed, "{error}");
+    assert_eq!(model.request_count(), 2);
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests[1].messages, requests[0].messages);
+    let snapshot = &agent.list_chats().await[0];
+    assert!(snapshot.pending_thinking.is_empty());
+    assert_eq!(
+        support::model_script_requests(snapshot)[0].outcome,
+        RequestOutcome::Failed(RequestFailure::StreamInterrupted)
+    );
+    let reply = snapshot
+        .messages
+        .iter()
+        .rfind(|message| message.role == Role::Assistant)
+        .unwrap();
+    assert_eq!(
+        reply.content,
+        vec![Content::Text {
+            text: "Recovered".into()
+        }]
+    );
     agent.shutdown().await;
 }
 

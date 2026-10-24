@@ -242,7 +242,7 @@ fn assert_real_request_encoding(protocol: Protocol, request: &Value) {
 }
 
 #[tokio::test]
-async fn reasoning_only_disconnect_is_not_replayed_by_any_http_adapter() {
+async fn reasoning_only_disconnect_is_replayed_by_every_http_adapter() {
     for protocol in [
         Protocol::Messages,
         Protocol::Responses,
@@ -257,21 +257,22 @@ async fn reasoning_only_disconnect_is_not_replayed_by_any_http_adapter() {
         .await;
         let completed = run_agent_until_terminal(protocol, &server, workdir.path()).await;
         assert!(
-            !completed,
-            "{protocol:?} replayed a reasoning-only response"
+            completed,
+            "{protocol:?} did not replay a reasoning-only response"
         );
+        assert_eq!(server.request_count(), 2, "{protocol:?}");
+        let requests = server.request_bodies();
+        assert_real_request_encoding(protocol, &requests[0]);
         assert_eq!(
-            server.request_count(),
-            1,
-            "{protocol:?} sent a second HTTP request"
+            requests[1], requests[0],
+            "{protocol:?} changed the replayed request"
         );
-        assert_real_request_encoding(protocol, &server.request_bodies()[0]);
         assert!(!workdir.path().join("side-effect.txt").exists());
     }
 }
 
 #[tokio::test]
-async fn partial_tool_arguments_disconnect_without_replay_or_tool_execution() {
+async fn partial_tool_arguments_disconnect_replays_without_tool_execution() {
     for protocol in [
         Protocol::Messages,
         Protocol::Responses,
@@ -285,12 +286,11 @@ async fn partial_tool_arguments_disconnect_without_replay_or_tool_execution() {
         )
         .await;
         let completed = run_agent_until_terminal(protocol, &server, workdir.path()).await;
-        assert!(!completed, "{protocol:?} replayed an incomplete tool call");
-        assert_eq!(
-            server.request_count(),
-            1,
-            "{protocol:?} sent a second HTTP request"
+        assert!(
+            completed,
+            "{protocol:?} did not replay an incomplete tool call"
         );
+        assert_eq!(server.request_count(), 2, "{protocol:?}");
         assert_real_request_encoding(protocol, &server.request_bodies()[0]);
         assert!(
             !workdir.path().join("side-effect.txt").exists(),

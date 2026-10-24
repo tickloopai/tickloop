@@ -749,7 +749,7 @@ impl ModelClient for PartialModel {
             ModelStep::PartialFailure(partial) => {
                 let _ = events.send(ModelDelta::Text(partial.into()));
                 tokio::task::yield_now().await;
-                Err(ModelError::StreamInterrupted)
+                Err(ModelError::ProviderFailure)
             }
             ModelStep::Success(answer) => Ok(ModelOutput {
                 private_source: None,

@@ -1355,18 +1355,21 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
 async fn resuming_history_does_not_restore_a_failed_partial_reply() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    // Every continuation of the cut reply is cut again, so the run fails.
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        read_request(&mut socket).await;
-        let mut body = messages_stream("保留下来的失败片段")
-            .split("\n\n")
-            .take(3)
-            .map(|event| format!("{event}\n\n"))
-            .collect::<String>();
-        let delta = json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":"."}});
-        body.push_str(&format!("data: {delta}\n\n").repeat(1100));
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-        socket.write_all(body.as_bytes()).await.unwrap();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            let mut body = messages_stream("保留下来的失败片段")
+                .split("\n\n")
+                .take(3)
+                .map(|event| format!("{event}\n\n"))
+                .collect::<String>();
+            let delta = json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":"."}});
+            body.push_str(&format!("data: {delta}\n\n").repeat(1100));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        }
     });
     let directory = tempfile::tempdir().unwrap();
     support::cli_runtime::adopt(&directory.path().join("config-root"));
@@ -1387,7 +1390,7 @@ async fn resuming_history_does_not_restore_a_failed_partial_reply() {
         .lines()
         .find_map(|line| line.strip_prefix("Chat: "))
         .unwrap();
-    server.await.unwrap();
+    server.abort();
     for flags in [vec!["--resume", chat], Vec::new()] {
         let command = if flags.is_empty() {
             format!("/resume {chat}\n")
