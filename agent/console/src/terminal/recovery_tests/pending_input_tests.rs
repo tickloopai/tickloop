@@ -184,12 +184,13 @@ fn pending_input_pty_fixture() {
                 let (console, input) = Console::start(true).unwrap();
                 initialize_startup_console(
                     &console,
-                    &tickloop_agent_test_support::config(),
+                    Some(&tickloop_agent_test_support::config()),
                     &workdir,
                     ExecutionMode::AcceptEdits,
                     Vec::new(),
                 ).unwrap();
                 interact(&agent, workdir, &console, input, StartupState {
+                    model_selected: true,
                     launch_arguments: Vec::new(),
                     chat: StartupChat::New,
                                 user_settings: None,

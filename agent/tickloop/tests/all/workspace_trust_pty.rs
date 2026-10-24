@@ -19,6 +19,8 @@ use std::{
 
 use portable_pty::{PtySize, native_pty_system};
 
+// Explicit test selection keeps model setup separate from the directory-trust gate.
+const SETTINGS_BASELINE: &str = r#"{"defaultModel":{"provider":"deepseek-api","model":"deepseek-flash"},"promptSuggestionEnabled":false}"#;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_START: &str = "\x1b[?2026h";
 const FRAME_END: &str = "\x1b[?2026l";
@@ -42,6 +44,7 @@ impl Fixture {
             "untrusted invalid configuration",
         )
         .unwrap();
+        fs::write(root.path().join("config/settings.json"), SETTINGS_BASELINE).unwrap();
         let runtime = support::cli_runtime::adopt(&root.path().join("config"));
         tickloop_agent_client::daemon_endpoint::validate_directory(&runtime).unwrap();
         Self { root }
@@ -56,6 +59,7 @@ impl Fixture {
 
     fn environment(&self) -> Vec<(&'static str, PathBuf)> {
         vec![
+            ("TICKLOOP_FIXTURE_PRESERVE_SETTINGS", PathBuf::from("1")),
             ("HOME", self.path("home")),
             ("TICKLOOP_CONFIG_DIR", self.path("config")),
             ("TICKLOOP_TMPDIR", self.path("scratch")),
@@ -314,7 +318,10 @@ fn startup_trust_requires_the_complete_directory_before_confirmation_after_resiz
         terminal.send(b"j\r");
         thread::sleep(Duration::from_millis(100));
         assert!(terminal.child.try_wait().unwrap().is_none());
-        assert!(!fixture.path("config/settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+            SETTINGS_BASELINE
+        );
         assert!(!fixture.path("config/projects").exists());
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
         terminal.resize(80, 24);
@@ -411,7 +418,10 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
         assert_eq!(result.status.code(), Some(0));
         assert!(result.stderr.is_empty(), "{:?}", result.stderr);
         assert!(!output.lock().unwrap().contains("Error:"));
-        assert!(!fixture.path("config/settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+            SETTINGS_BASELINE
+        );
         assert!(!fixture.path("config/projects").exists());
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
     }
@@ -432,7 +442,10 @@ fn startup_trust_cancellation_is_quiet_and_precedes_project_configuration() {
                     .any(|line| line.trim_start().starts_with(['❯', '>'])
                         && line.contains("No, exit"))
             );
-            assert!(!fixture.path("config/settings.json").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+                SETTINGS_BASELINE
+            );
             assert!(!fixture.path("config/projects").exists());
             assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
             terminal.send(cancellation);
@@ -440,7 +453,10 @@ fn startup_trust_cancellation_is_quiet_and_precedes_project_configuration() {
             let output = terminal.output.lock().unwrap();
             assert!(!output.contains("Error:"), "{output}");
             assert!(!output.contains("[y/N]"));
-            assert!(!fixture.path("config/settings.json").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+                SETTINGS_BASELINE
+            );
             assert!(!fixture.path("config/projects").exists());
         }
     }
@@ -457,7 +473,10 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         terminal.send(b"y1/exit\x1b[200~yes\x1b[201~");
         thread::sleep(Duration::from_millis(80));
         assert!(terminal.frame().contains("Accessing workspace:"));
-        assert!(!fixture.path("config/settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+            SETTINGS_BASELINE
+        );
         terminal.send(navigation);
         terminal.send(b"\r\r");
         terminal.wait_for_input();
@@ -508,12 +527,12 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
         terminal.resize(80, 5);
         terminal.wait("Resize terminal");
-        fs::write(fixture.path("config/settings.json"), "{}").unwrap();
+        fs::write(fixture.path("config/settings.json"), SETTINGS_BASELINE).unwrap();
         terminal.send(b"j\r");
         thread::sleep(Duration::from_millis(80));
         assert_eq!(
             fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
-            "{}"
+            SETTINGS_BASELINE
         );
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
         terminal.resize(120, 30);
@@ -547,7 +566,7 @@ fn startup_trust_write_failure_stays_gated_and_requires_explicit_retry() {
         "invalid JSON"
     );
     assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
-    fs::write(fixture.path("config/settings.json"), "{}").unwrap();
+    fs::write(fixture.path("config/settings.json"), SETTINGS_BASELINE).unwrap();
     thread::sleep(Duration::from_millis(80));
     assert!(
         !UserSettings::in_root(&fixture.path("config"))
@@ -574,7 +593,10 @@ fn startup_trust_rejects_a_directory_replaced_after_the_question() {
     terminal.wait_for_ready_frame("directory replacement rejection", |frame| {
         frame.contains("The displayed directory changed")
     });
-    assert!(!fixture.path("config/settings.json").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+        SETTINGS_BASELINE
+    );
     assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
     terminal.send(b"\x1b");
     assert_eq!(terminal.exit_code(), 0);

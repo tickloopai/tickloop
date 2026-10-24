@@ -66,6 +66,7 @@ impl Session {
                 pixel_height: 0,
             })
             .unwrap();
+        support::cli_runtime::configure_model(&directory.join("state"));
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
         command.cwd(directory);
         command.args(arguments);

@@ -722,6 +722,26 @@ mod tests {
     const SYNCHRONIZED_FRAME_END: &str = "\x1b[?2026l";
     const TERMINAL_FRAME_SETTLE: Duration = Duration::from_millis(40);
 
+    fn has_dialog_title(frame: &str, title: &str) -> bool {
+        let with_details = format!("{title} · ");
+        frame.lines().any(|line| {
+            let line = line.trim();
+            line == title || line.starts_with(&with_details)
+        })
+    }
+
+    #[test]
+    fn setup_status_is_not_a_model_dialog() {
+        assert!(!has_dialog_title(
+            "── Ask · Choose model · Context unknown ──",
+            "Choose model"
+        ));
+        assert!(has_dialog_title(
+            "Choose model · Signed-in Providers",
+            "Choose model"
+        ));
+    }
+
     #[test]
     fn terminal_child() {
         if std::env::var_os("TICKLOOP_TEST_CODEX_OAUTH").is_none() {
@@ -855,34 +875,46 @@ mod tests {
             crate::terminal::test_runtime::RuntimeDirectories::of_config_root(&root.join("state"));
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
         let rejected_login = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", rejected_login.local_addr().unwrap());
+        command.env("TICKLOOP_TEST_CODEX_OAUTH", &origin);
         command.env(
-            "TICKLOOP_TEST_CODEX_OAUTH",
-            format!("http://{}", rejected_login.local_addr().unwrap()),
+            "TICKLOOP_TEST_CODEX_RESPONSES",
+            format!("{origin}/codex/responses"),
         );
         let rejected_login = std::thread::spawn(move || {
             use std::io::Read;
-            let (mut stream, _) = rejected_login.accept().unwrap();
-            stream.set_read_timeout(Some(PTY_TIMEOUT)).unwrap();
-            let mut headers = Vec::new();
-            while !headers.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                headers.push(byte[0]);
+            loop {
+                let (mut stream, _) = rejected_login.accept().unwrap();
+                stream.set_read_timeout(Some(PTY_TIMEOUT)).unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|length| length.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                // Automatic first-run setup discovers models for the saved account.
+                // Keep that startup discovery local to this fixture.
+                if headers.starts_with("GET /codex/models?") {
+                    let response = "{\"models\":[{\"slug\":\"gpt-6.1-sol\"}]}";
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("POST "), "{headers}");
+                let response = "{\"error\":\"controlled login refusal\"}";
+                stream.write_all(format!("HTTP/1.1 400 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).unwrap();
+                break;
             }
-            let headers = String::from_utf8(headers).unwrap();
-            assert!(headers.starts_with("POST "));
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|length| length.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            let mut body = vec![0; length];
-            stream.read_exact(&mut body).unwrap();
-            let response = "{\"error\":\"controlled login refusal\"}";
-            stream.write_all(format!("HTTP/1.1 400 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).unwrap();
         });
         command.env("TICKLOOP_AGENT_TUI", "inline");
         let home = root.join("home");
@@ -932,11 +964,9 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        wait("Ask");
-        writer.write_all(b"/provider\r").unwrap();
-        writer.flush().unwrap();
-        wait("Choose Provider");
-        writer.write_all(b"jjp").unwrap();
+        // Saved credentials without a model open the signed-in model picker.
+        wait("Choose model · Signed-in Providers");
+        writer.write_all(b"p").unwrap();
         writer.flush().unwrap();
         wait("Connection · OpenAI");
         writer.write_all(b"j\r").unwrap();
@@ -992,7 +1022,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), original);
-        for title in ["Connection · OpenAI", "Choose Provider · All"] {
+        for title in ["Connection · OpenAI", "Choose model · Signed-in Providers"] {
             let title_with_details = format!("{title} · ");
             let mark = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
@@ -1159,7 +1189,19 @@ mod tests {
                 } else if headers.starts_with("GET /codex/models?") {
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
                     assert!(headers.contains("originator: tickloop"));
-                    (json!({"models":[{"slug":"gpt-6-astra"},{"slug":"gpt-6.1-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-6-luna"}]}).to_string(), "application/json")
+                    let mut models = json!([
+                        {"slug":"gpt-6-astra"},
+                        {"slug":"gpt-6.1-sol"},
+                        {"slug":"gpt-5.6-terra"},
+                        {"slug":"gpt-6-luna"}
+                    ]);
+                    if selected_model == Some("gpt-5.6-sol") {
+                        models
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"slug":"gpt-5.6-sol"}));
+                    }
+                    (json!({"models": models}).to_string(), "application/json")
                 } else {
                     assert!(headers.starts_with("POST /codex/responses "), "{headers}");
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
@@ -1176,7 +1218,10 @@ mod tests {
                         if is_title {
                             "gpt-6-luna"
                         } else {
-                            selected_model.unwrap_or("gpt-6-astra")
+                            match selected_model {
+                                Some("gpt-5.6-sol") | None => "gpt-6-astra",
+                                Some(model) => model,
+                            }
                         }
                     );
                     model_seen = !is_title;
@@ -1320,17 +1365,19 @@ mod tests {
                 let visible = screen::visible_screen(completed.unwrap_or(&text), 150, 40);
                 let input_restored = completed.is_some()
                     && visible.contains("Tickloop v")
-                    && visible.contains("Context 0% used")
+                    && visible.contains("Context ")
                     && visible.lines().any(|line| line.trim() == "❯")
                     && [
                         "Choose model",
                         "Choose Provider",
                         "Choose connection",
+                        "Connection",
+                        "Sign in",
                         "Codex browser login",
                         "Log in to Codex",
                     ]
                     .iter()
-                    .all(|title| !visible.contains(title));
+                    .all(|title| !has_dialog_title(&visible, title));
                 if input_restored {
                     break;
                 }
@@ -1341,10 +1388,17 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        wait_for_input_after(0);
-        writer.write_all(b"/provider\r").unwrap();
-        writer.flush().unwrap();
-        wait("Choose Provider");
+        // First-run setup opens automatically. A saved, unauthenticated model
+        // starts at its connection details; Esc retains that provider in the directory.
+        if selected_model.is_some() {
+            wait("Connection · OpenAI");
+            let before_provider_return = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+            writer.flush().unwrap();
+            wait_after("Choose Provider", before_provider_return);
+        } else {
+            wait("Choose Provider");
+        }
         writer
             .write_all(if selected_model.is_some() {
                 b"\r"
@@ -1429,7 +1483,7 @@ mod tests {
         let completed_frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
         assert!(
             completed_frame.contains("Back to Provider")
-                && !completed_frame.contains("Choose model"),
+                && !has_dialog_title(&completed_frame, "Choose model"),
             "Completed login frame: {completed_frame}"
         );
         if manual_callback {
@@ -1528,6 +1582,32 @@ mod tests {
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
             wait_for_input_after(before_cancel);
+            // Dismissing setup after login must not let an ordinary message bypass
+            // model confirmation, including when a model was already saved.
+            let before_pending_message = output.lock().unwrap().len();
+            writer.write_all(b"model setup is still pending\r").unwrap();
+            writer.flush().unwrap();
+            wait_after("Choose model · Signed-in Providers", before_pending_message);
+            let before_pending_cancel = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+            writer.flush().unwrap();
+            wait_after("model setup is still pending", before_pending_cancel);
+            let pending_frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            assert!(
+                pending_frame.lines().any(|line| {
+                    line.trim_start().strip_prefix('❯').is_some_and(|text| {
+                        text.trim_start()
+                            .starts_with("model setup is still pending")
+                    })
+                }) && !has_dialog_title(&pending_frame, "Choose model"),
+                "Cancelling setup must preserve the unsent message: {pending_frame}"
+            );
+            // The blocked message is intentionally restored, not submitted. Clear it
+            // before issuing the next slash command rather than expecting an empty editor.
+            let before_pending_clear = output.lock().unwrap().len();
+            writer.write_all(b"\x03").unwrap();
+            writer.flush().unwrap();
+            wait_for_input_after(before_pending_clear);
             let before_saved_login = output.lock().unwrap().len();
             writer.write_all(b"/provider\r").unwrap();
             writer.flush().unwrap();
@@ -1551,24 +1631,15 @@ mod tests {
                     .model()
                     .unwrap();
                 assert_eq!(saved.model, "gpt-5.6-sol");
+                // Login preserves this historical identity. It is no longer in the
+                // selectable catalog; the explicit confirmation below chooses GPT Astra.
             }
-            if selected_model.is_none() {
-                // Choosing a model closes the picker.
-                let before_model_choice = output.lock().unwrap().len();
-                writer.write_all(b"\r").unwrap();
-                writer.flush().unwrap();
-                wait("Model selection:");
-                wait_for_input_after(before_model_choice);
-            } else {
-                let before_model_back = output.lock().unwrap().len();
-                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
-                writer.flush().unwrap();
-                wait_after("Choose Provider", before_model_back);
-                let before_model_cancel = output.lock().unwrap().len();
-                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
-                writer.flush().unwrap();
-                wait_for_input_after(before_model_cancel);
-            }
+            // Credentials alone do not finish setup, even for a previously saved model.
+            let before_model_choice = output.lock().unwrap().len();
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            wait("Model selection:");
+            wait_for_input_after(before_model_choice);
         }
         writer.write_all(b"hello from terminal\r").unwrap();
         writer.flush().unwrap();

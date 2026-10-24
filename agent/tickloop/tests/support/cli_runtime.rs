@@ -56,6 +56,28 @@ pub fn adopt(config_root: &Path) -> PathBuf {
     runtime
 }
 
+/// Gives ordinary interactive fixtures an explicit model and private test credential.
+/// First-run and credential tests deliberately do not call this helper.
+pub fn configure_model(config_root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(config_root).unwrap();
+    let canonical_root = config_root.canonicalize().unwrap();
+    let config_root = canonical_root.as_path();
+    std::fs::set_permissions(config_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let model = tickloop_agent_model::cards::ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-flash")
+        .unwrap();
+    tickloop_agent_config::UserSettings::in_root(config_root)
+        .save_model(&model, false)
+        .unwrap();
+    tickloop_agent_model::credentials::save_api_key(
+        config_root,
+        "DEEPSEEK_API_KEY",
+        "fixture-default-key",
+    )
+    .unwrap();
+}
+
 /// Runs `executable` with the fixture's config root when an API accepts only an executable path.
 pub fn executable_in(config_root: &Path, executable: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;

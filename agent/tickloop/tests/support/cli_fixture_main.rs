@@ -287,13 +287,26 @@ fn use_transport_fixture(path: &OsString) {
         std::env::set_var(TRANSPORT_FILE, path);
         std::env::set_var("DEEPSEEK_API_KEY", "fixture-compiled-selection-key");
     }
-    if let Ok(bytes) = std::fs::read(path)
-        && let Ok(transport) = serde_json::from_slice::<ModelConfig>(&bytes)
-        && let Some(model) = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get(&transport.provider_id, &transport.model_id)
-        && let Some(root) = std::env::var_os("TICKLOOP_CONFIG_DIR")
-    {
+    if let Some(root) = std::env::var_os("TICKLOOP_CONFIG_DIR") {
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let model = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ModelConfig>(&bytes).ok())
+            .and_then(|transport| catalog.get(&transport.provider_id, &transport.model_id))
+            .unwrap_or_else(|| catalog.get("deepseek-api", "deepseek-flash").unwrap());
+        if !model.api_key_env.is_empty() {
+            // A compiled identity must have fixture authentication even when the fake
+            // transport uses a different key or no key at all.
+            unsafe {
+                std::env::set_var(&model.api_key_env, "fixture-compiled-selection-key");
+            }
+        }
         let root = PathBuf::from(root);
+        // Trust-save tests deliberately provide malformed settings and must exercise the
+        // real gate's error handling, not have this transport helper overwrite their input.
+        if std::env::var_os("TICKLOOP_FIXTURE_PRESERVE_SETTINGS").is_some() {
+            return;
+        }
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("settings.json");
         let mut state = if path.exists() {

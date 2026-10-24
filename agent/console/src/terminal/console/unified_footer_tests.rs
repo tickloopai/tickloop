@@ -1080,9 +1080,9 @@ fn hidden_task_rows_in_short_terminals_never_take_editor_keys() {
             let hint = state.status_area.task_lines(80, 24, state.display)[0].text();
             assert!(
                 hint.contains(if initially_expanded {
-                    "Ctrl+T focus"
+                    "ctrl+t focus"
                 } else {
-                    "Ctrl+T expand"
+                    "ctrl+t expand"
                 }),
                 "{hint}"
             );
@@ -1123,7 +1123,7 @@ fn hiding_task_tools_releases_focus_and_preserves_draft_and_view_choice() {
         .status_area
         .update("Auto".into(), "fixture".into(), None, Some(board));
     let lines = state.status_area.task_lines(80, 24, state.display);
-    assert!(lines[0].text().contains("Ctrl+T focus"), "{lines:?}");
+    assert!(lines[0].text().contains("ctrl+t focus"), "{lines:?}");
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.editor.draft(), format!("{draft}xkj"));
 }

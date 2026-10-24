@@ -4921,6 +4921,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_registers_a_selected_draft_when_its_create_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, access, terminal) = recording_terminal(directory.path());
+        stage_plan(&terminal).await;
+        set(&access.refuse_agent_observation, true);
+        let Err(DraftCreationError::AttachUnavailable { chat, .. }) =
+            terminal.create_from_draft(directory.path().into()).await
+        else {
+            panic!("expected a registered but unattached draft");
+        };
+        assert!(terminal.first_create_pending(chat));
+        let console = super::super::Console::test_interactive_for_chat(chat);
+        let mut menus = super::super::Menus::new(None, Some(directory.path().into()));
+        menus.model_setup(&terminal, &console, false).await.unwrap();
+        assert!(menus.model_setup_pending());
+        assert!(!menus.model_setup_applies_to(Some(chat)));
+        set(&access.refuse_agent_observation, false);
+        let mut selected = Some(chat.into());
+        let attached = super::super::ensure_chat_with_model_setup(
+            &console,
+            &terminal,
+            &mut menus,
+            &mut selected,
+            directory.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached, chat);
+        assert_eq!(creates(&access), 1);
+        assert!(!terminal.first_create_pending(chat));
+        assert!(menus.model_setup_applies_to(Some(chat)));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn an_unconfirmed_first_create_blocks_another_create_until_its_receipt_resolves() {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());

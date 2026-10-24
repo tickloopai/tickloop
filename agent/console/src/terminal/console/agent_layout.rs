@@ -72,10 +72,10 @@ struct RowFrame {
 }
 
 impl AgentRow {
-    pub(in crate::terminal) fn glyph_role(&self, display: DisplayProfile, now: u64) -> Role {
+    pub(in crate::terminal) fn glyph_role(&self) -> Role {
         match self.group {
             AttentionGroup::NeedsInput => group_role(self.group),
-            AttentionGroup::Working => display.working_dot(now).1,
+            AttentionGroup::Working => Role::RunningMark,
             _ => self.status_role(),
         }
     }
@@ -96,7 +96,7 @@ impl AgentRow {
         now: u64,
     ) -> &'static str {
         if self.group == AttentionGroup::Working {
-            display.working_dot(now).0
+            display.working_dot(now)
         } else {
             display.glyph(self.glyph)
         }
@@ -970,7 +970,7 @@ impl OverviewState {
     ) -> RowExtras<'_> {
         RowExtras {
             glyph: row.state_glyph(display, now),
-            glyph_role: row.glyph_role(display, now),
+            glyph_role: row.glyph_role(),
             project: if terminal_columns >= WIDE_TERMINAL_COLUMNS {
                 row.project.as_str()
             } else {

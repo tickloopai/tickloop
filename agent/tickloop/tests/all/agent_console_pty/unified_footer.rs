@@ -70,7 +70,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
                 .lines()
                 .any(|line| line.contains(TASK_TITLE) && line.contains("pending"))
             && !frame.contains("unassigned")
-            && frame.contains("Enter details")
+            && frame.contains("enter details")
     })
     .await;
     pty.send(b"\r");
@@ -80,12 +80,12 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\x1b");
     pty.wait_for("Task details close first", |frame| {
-        !frame.contains("Dependencies: none") && frame.contains("Enter details")
+        !frame.contains("Dependencies: none") && frame.contains("enter details")
     })
     .await;
     pty.send(b"\x1b");
     pty.wait_for("Task list returns focus to editing", |frame| {
-        frame.contains("Ctrl+T focus")
+        frame.contains("ctrl+t focus")
     })
     .await;
     pty.send(TASK_DRAFT.as_bytes());

@@ -106,7 +106,7 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
             && frame
                 .split_once("1 tasks (0 done, 1 open)")
                 .is_some_and(|(_, tasks)| {
-                    tasks.contains("TASK-SAVED-WHEN-HIDDEN") && tasks.contains("Ctrl+T expand")
+                    tasks.contains("TASK-SAVED-WHEN-HIDDEN") && tasks.contains("ctrl+t expand")
                 })
     })
     .await;

@@ -322,6 +322,7 @@ fn working_activity_pty_fixture() {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 let startup = StartupState {
+                    model_selected: true,
                     launch_arguments: Vec::new(),
                     chat: StartupChat::Resumed(
                         Box::new(agent.snapshot(chat).await.unwrap()),

@@ -108,6 +108,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
         r#"{"shiftTabModes":["auto","acceptEdits","plan","fullAccess"]}"#,
     )
     .unwrap();
+    support::cli_runtime::configure_model(&config_root);
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 30,

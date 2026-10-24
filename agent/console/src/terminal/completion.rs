@@ -128,7 +128,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/goal",
         arguments: "[CONDITION|edit|pause|resume|clear]",
-        description: "Set a Goal or open its status, edit, pause, resume, clear and token budget menu; Ctrl+G edits the condition externally.",
+        description: "Set a Goal or open its status, edit, pause, resume, clear and token budget menu; ctrl+g edits the condition externally.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {

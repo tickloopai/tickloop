@@ -223,6 +223,7 @@ async fn run_background_request_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        model_selected: true,
         launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(monitor.snapshot(visible).await.unwrap()), false),
         user_settings: None,

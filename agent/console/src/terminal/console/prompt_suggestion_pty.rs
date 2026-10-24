@@ -97,7 +97,7 @@ fn prompt_suggestion_pty_fixture() {
                     let (console, input) = Console::start(true).unwrap();
                     crate::terminal::initialize_startup_console(
                         &console,
-                        &model,
+                        Some(&model),
                         &directory,
                         tickloop_agent_protocol::ExecutionMode::Auto,
                         vec![],
@@ -110,6 +110,7 @@ fn prompt_suggestion_pty_fixture() {
                         &console,
                         input,
                         crate::terminal::StartupState {
+                            model_selected: true,
                             launch_arguments: Vec::new(),
                             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
                             user_settings: Some(tickloop_agent_config::UserSettings::in_root(

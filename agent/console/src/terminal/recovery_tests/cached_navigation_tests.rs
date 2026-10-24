@@ -218,6 +218,7 @@ async fn run_cached_navigation_fixture() {
             &interaction_console,
             input,
             StartupState {
+                model_selected: true,
                 launch_arguments: Vec::new(),
                 chat: StartupChat::Resumed(Box::new(initial), true),
                 user_settings: None,

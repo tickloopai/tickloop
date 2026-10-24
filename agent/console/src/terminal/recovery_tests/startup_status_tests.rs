@@ -70,7 +70,7 @@ fn startup_status_pty_fixture() {
                 console.set_input_context(None, &workdir, &[]).unwrap();
                 initialize_startup_console(
                     &console,
-                    &config,
+                    Some(&config),
                     &workdir,
                     ExecutionMode::Auto,
                     Vec::new(),
@@ -82,6 +82,7 @@ fn startup_status_pty_fixture() {
                     &console,
                     input,
                     StartupState {
+                        model_selected: true,
                         launch_arguments: Vec::new(),
                         chat: StartupChat::New,
                         user_settings: None,

@@ -471,6 +471,7 @@ async fn run_completed_reply_recovery_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        model_selected: true,
         launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,
@@ -1334,6 +1335,7 @@ fn routine_restore_pty_fixture() {
                         &interaction_console,
                         input,
                         StartupState {
+                            model_selected: true,
                             launch_arguments: Vec::new(),
                             chat: StartupChat::New,
                                                 user_settings: None,
@@ -1591,6 +1593,7 @@ async fn run_retained_completion_lifecycle_fixture() {
             &interaction_console,
             input,
             StartupState {
+                model_selected: true,
                 launch_arguments: Vec::new(),
                 chat: StartupChat::Resumed(Box::new(startup_snapshot), true),
                 user_settings: None,
@@ -2115,6 +2118,7 @@ async fn run_merge_boundary_fixture() {
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
+        model_selected: true,
         launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,

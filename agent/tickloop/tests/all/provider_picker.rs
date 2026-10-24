@@ -34,7 +34,11 @@ struct Terminal {
 
 impl Terminal {
     fn start(workdir: &Path) -> Self {
-        Self::start_with_environment(workdir, &[], &[])
+        if workdir.join("state/.env").exists() {
+            Self::start_with_environment(workdir, &[], &[])
+        } else {
+            Self::start_with_environment(workdir, &[], &[(TEST_KEY_NAME, TEST_KEY)])
+        }
     }
 
     fn start_with_environment(
@@ -42,6 +46,13 @@ impl Terminal {
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) -> Self {
+        if !workdir.join("state/settings.json").exists() {
+            save_model(workdir);
+        }
+        Self::start_first_run(workdir, arguments, environment)
+    }
+
+    fn start_first_run(workdir: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Self {
         fs::create_dir_all(workdir.join("home")).unwrap();
         fs::create_dir_all(workdir.join("tmp")).unwrap();
         let runtime = support::cli_runtime::adopt(&workdir.join("state"));
@@ -207,6 +218,92 @@ impl Terminal {
         self.output.lock().unwrap().clone()
     }
 
+    fn assert_no_chats(&self) {
+        use tickloop_agent_protocol::{
+            AgentAccess, AgentFilter, ObservationRequest, ObservationValue, Page,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let client = tickloop_agent_client::LocalAgentClient::connect(
+                    self.runtime.join("daemon.sock"),
+                )
+                .await
+                .unwrap();
+                let observation = client
+                    .observe(ObservationRequest::Overview {
+                        filter: AgentFilter::default(),
+                        page: Page {
+                            offset: 0,
+                            limit: 1,
+                        },
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                let ObservationValue::Overview(chats) = observation.initial else {
+                    panic!("expected Chat overview");
+                };
+                assert!(chats.is_empty(), "model setup must not create a Chat");
+            });
+    }
+
+    fn only_chat_snapshot(&self) -> Option<Box<tickloop_agent_protocol::LiveChatSnapshot>> {
+        let mut snapshots = self.chat_snapshots();
+        assert!(snapshots.len() <= 1, "fixture must own at most one Chat");
+        snapshots.pop()
+    }
+
+    fn chat_snapshots(&self) -> Vec<Box<tickloop_agent_protocol::LiveChatSnapshot>> {
+        use tickloop_agent_protocol::{
+            AgentAccess, AgentDetailQuery, AgentFilter, ObservationRequest, ObservationValue, Page,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let client = tickloop_agent_client::LocalAgentClient::connect(
+                    self.runtime.join("daemon.sock"),
+                )
+                .await
+                .unwrap();
+                let observation = client
+                    .observe(ObservationRequest::Overview {
+                        filter: AgentFilter::default(),
+                        page: Page {
+                            offset: 0,
+                            limit: 3,
+                        },
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                let ObservationValue::Overview(chats) = observation.initial else {
+                    panic!("expected Chat overview");
+                };
+                assert!(chats.len() <= 2, "fixture must own at most two Chats");
+                let mut snapshots = Vec::new();
+                for chat in chats {
+                    let observation = client
+                        .observe(ObservationRequest::Agent {
+                            execution: chat.execution,
+                            detail: AgentDetailQuery::Snapshot,
+                            after: None,
+                        })
+                        .await
+                        .unwrap();
+                    let ObservationValue::Agent(snapshot) = observation.initial else {
+                        panic!("expected Chat snapshot");
+                    };
+                    snapshots.push(snapshot);
+                }
+                snapshots
+            })
+    }
+
     fn assert_dialog(&self, label: &str, title: &str) {
         let frame = screen::visible_screen(&self.output.lock().unwrap(), self.columns, self.rows);
         input_dialog::assert_frame(&frame, self.rows, title);
@@ -217,7 +314,9 @@ impl Terminal {
         let mark = self.mark();
         self.send(b"\x1b");
         self.wait_for_frame_after(mark, "model picker returned one level", |frame| {
-            !frame.contains("Choose model")
+            !frame
+                .lines()
+                .any(|line| line.trim_start().starts_with("Choose model ·"))
         });
         self.close_provider_picker();
     }
@@ -227,7 +326,9 @@ impl Terminal {
             let frame =
                 screen::visible_screen(&self.output.lock().unwrap(), self.columns, self.rows);
             if !frame.contains("Choose Provider")
-                && !frame.contains("Choose model")
+                && !frame
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("Choose model ·"))
                 && !frame.contains("Connection ·")
                 && !frame.lines().any(|line| line == "Settings")
                 && !frame.contains("Service account · Google")
@@ -238,7 +339,10 @@ impl Terminal {
             self.send(b"\x1b");
             self.wait_for_frame_after(mark, "provider escape processed", |_| true);
         }
-        panic!("Provider picker did not close");
+        panic!(
+            "Provider picker did not close:\n{}",
+            screen::visible_screen(&self.output.lock().unwrap(), self.columns, self.rows)
+        );
     }
 
     fn exit(&mut self) {
@@ -275,6 +379,22 @@ impl Drop for Terminal {
     }
 }
 
+fn save_model(root: &Path) {
+    let model = tickloop_agent_model::cards::ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-flash")
+        .unwrap();
+    tickloop_agent_config::UserSettings::in_root(&root.join("state"))
+        .save_model(&model, false)
+        .unwrap();
+}
+
+fn assert_saved_model(root: &Path) {
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("state/settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["defaultModel"]["provider"], "deepseek-api");
+    assert_eq!(saved["defaultModel"]["model"], "deepseek-flash");
+}
+
 fn save_key(root: &Path, key: &str) {
     tickloop_agent_model::credentials::save_api_key(&root.join("state"), TEST_KEY_NAME, key)
         .unwrap();
@@ -297,7 +417,7 @@ fn saved_builtin_key_is_reused_and_model_browsing_does_not_save_a_selection() {
     });
     terminal.assert_dialog("slash-model", "Choose model · Signed-in Providers");
     terminal.close_model_picker();
-    assert!(!root.join("state/settings.json").exists());
+    assert_saved_model(&root);
     assert_eq!(fs::read(root.join("state/.env")).unwrap(), original);
     terminal.exit();
 }
@@ -306,15 +426,10 @@ fn saved_builtin_key_is_reused_and_model_browsing_does_not_save_a_selection() {
 fn builtin_missing_key_details_setup_continues_to_models_without_applying_selection() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let mut terminal = Terminal::start(&root);
-    terminal.wait_for("deepseek-flash");
-    terminal.send(b"/provider\r");
-    terminal.wait_for("Choose Provider · All");
-    let mark = terminal.mark();
-    terminal.send(b"p");
-    terminal.wait_for_frame_after(mark, "built-in missing credential details", |frame| {
-        frame.contains("Connection · DeepSeek") && frame.contains("Set API key")
-    });
+    save_model(&root);
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Connection · DeepSeek");
+    terminal.wait_for("Set API key");
     terminal.assert_dialog("missing-credential-details", "Connection · DeepSeek");
     terminal.select_row("Set API key");
     terminal.wait_for("API key · DeepSeek");
@@ -325,7 +440,7 @@ fn builtin_missing_key_details_setup_continues_to_models_without_applying_select
         frame.contains("Choose model · DeepSeek") && frame.contains("API key saved")
     });
     terminal.assert_dialog("credential-save-return", "Choose model · DeepSeek");
-    assert!(!root.join("state/settings.json").exists());
+    assert_saved_model(&root);
     assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
     terminal.close_model_picker();
     terminal.exit();
@@ -386,7 +501,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
             .as_deref(),
         Some("committed-456-key")
     );
-    assert!(!root.join("state/settings.json").exists());
+    assert_saved_model(&root);
     assert!(
         !terminal
             .output
@@ -559,7 +674,7 @@ fn removed_model_file_command_is_rejected_and_preserves_user_files() {
         frame.contains("Model files are not supported") && frame.contains("built-in catalog")
     });
     assert_eq!(fs::read(path).unwrap(), original);
-    assert!(!root.join("state/settings.json").exists());
+    assert_saved_model(&root);
     terminal.exit();
 }
 
@@ -589,6 +704,7 @@ fn unsupported_saved_definition_has_one_notice_and_uses_builtin_default() {
         1
     );
     assert_eq!(fs::read(path).unwrap(), original);
+    terminal.close_provider_picker();
     terminal.exit();
 }
 
@@ -640,60 +756,11 @@ fn builtin_provider_models_details_and_credentials_share_the_input_dialog() {
 }
 
 #[test]
-fn first_run_model_directory_and_settings_model_use_the_input_dialog() {
+fn configured_settings_model_uses_the_input_dialog() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let mut terminal = Terminal::start(&root);
     terminal.wait_for("deepseek-flash");
-    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
-    assert!(
-        !frame.contains("Choose Provider") && !frame.contains("Choose model"),
-        "{frame}"
-    );
-    input_dialog::record_frame("first-run-composer", &frame);
-    let model_row = frame
-        .lines()
-        .enumerate()
-        .filter_map(|(row, line)| line.find("deepseek-flash").map(|column| (row, column)))
-        .last()
-        .unwrap();
-    terminal.send(
-        format!(
-            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
-            model_row.1 + 1,
-            model_row.0 + 1,
-            model_row.1 + 1,
-            model_row.0 + 1
-        )
-        .as_bytes(),
-    );
-    let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "model status click escape processed", |frame| {
-        frame.contains("esc again") && frame.contains("rewind")
-    });
-    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
-    assert!(
-        !frame.contains("Choose Provider") && !frame.contains("Choose model"),
-        "Model status is not a picker action:\n{frame}"
-    );
-    input_dialog::record_frame("model-status-click", &frame);
-    let mark = terminal.mark();
-    terminal.send(b"/model\r");
-    terminal.wait_for_frame_after(mark, "empty signed-in model list", |frame| {
-        frame.contains("Choose model · Signed-in Providers")
-    });
-    terminal.assert_dialog(
-        "first-run-model-directory",
-        "Choose model · Signed-in Providers",
-    );
-    let mark = terminal.mark();
-    terminal.select_row("Manage Providers");
-    terminal.wait_for_frame_after(mark, "add connection directory", |frame| {
-        frame.contains("Choose Provider · All")
-    });
-    terminal.assert_dialog("first-run-add-connection", "Choose Provider · All");
-    terminal.close_provider_picker();
     let mark = terminal.mark();
     terminal.send(b"/settings\r");
     terminal.wait_for_frame_after(mark, "settings entry", |frame| frame.contains("Settings"));
@@ -704,6 +771,362 @@ fn first_run_model_directory_and_settings_model_use_the_input_dialog() {
         frame.contains("Choose model · Signed-in Providers")
     });
     terminal.assert_dialog("settings-model", "Choose model · Signed-in Providers");
+    terminal.close_provider_picker();
+    terminal.exit();
+}
+
+#[test]
+fn first_run_without_credentials_opens_provider_setup_without_creating_a_chat() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Choose Provider · All");
+    terminal.assert_dialog("first-run-provider-setup", "Choose Provider · All");
+    assert!(!root.join("state/settings.json").exists());
+    assert!(!root.join("state/.env").exists());
+    terminal.assert_no_chats();
+    terminal.close_provider_picker();
+    terminal.exit();
+}
+
+#[test]
+fn first_run_with_environment_key_requires_model_confirmation_then_restart_skips_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let environment = [(TEST_KEY_NAME, TEST_KEY)];
+    let mut terminal = Terminal::start_first_run(&root, &[], &environment);
+    terminal.wait_for("Choose model · Signed-in Providers");
+    terminal.assert_dialog(
+        "first-run-model-setup",
+        "Choose model · Signed-in Providers",
+    );
+    assert!(!root.join("state/settings.json").exists());
+    assert!(!root.join("state/.env").exists());
+    terminal.assert_no_chats();
+    let mark = terminal.mark();
+    terminal.select_row("DeepSeek Flash (deepseek-flash)");
+    terminal.wait_for_frame_after(mark, "first model confirmed", |frame| {
+        frame.contains("Model selection: Applied")
+    });
+    assert_saved_model(&root);
+    terminal.assert_no_chats();
+    terminal.close_provider_picker();
+    terminal.exit();
+    drop(terminal);
+
+    let mut restarted = Terminal::start_first_run(&root, &[], &environment);
+    restarted.wait_for("deepseek-flash");
+    let frame = screen::visible_screen(
+        &restarted.visible_output(),
+        restarted.columns,
+        restarted.rows,
+    );
+    assert!(
+        !frame.contains("Choose Provider") && !frame.contains("Choose model"),
+        "{frame}"
+    );
+    restarted.assert_no_chats();
+    restarted.exit();
+}
+
+#[test]
+fn model_selected_for_shell_created_chat_is_saved_and_restart_skips_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let environment = [(TEST_KEY_NAME, TEST_KEY)];
+    let mut terminal = Terminal::start_first_run(&root, &[], &environment);
+    terminal.wait_for("Choose model · Signed-in Providers");
+    terminal.close_model_picker();
+    terminal.send(b"!true\r");
+    let deadline = Instant::now() + TIMEOUT;
+    let shell_chat = loop {
+        if let Some(snapshot) = terminal.only_chat_snapshot()
+            && snapshot
+                .user_shells
+                .iter()
+                .any(|shell| shell.command == "true" && shell.exit_code == Some(0))
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "local Shell did not finish");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!root.join("state/settings.json").exists());
+
+    let mark = terminal.mark();
+    terminal.send(b"/model\r");
+    terminal.wait_for_frame_after(mark, "Shell Chat model setup opened", |frame| {
+        frame.contains("Choose model · Signed-in Providers")
+    });
+    let mark = terminal.mark();
+    terminal.select_row("DeepSeek Flash (deepseek-flash)");
+    terminal.wait_for_frame_after(mark, "Shell Chat model selection saved", |frame| {
+        frame.contains("Model selection: Applied")
+    });
+    assert_saved_model(&root);
+    let snapshot = terminal.only_chat_snapshot().expect("Shell created a Chat");
+    assert_eq!(snapshot.execution, shell_chat.execution);
+    assert!(snapshot.last_model_run.is_none());
+    assert!(snapshot.request_usage.entries().is_empty());
+    assert!(snapshot.pending_inputs.is_empty());
+    terminal.close_provider_picker();
+    terminal.exit();
+    drop(terminal);
+
+    let mut restarted = Terminal::start_first_run(&root, &[], &environment);
+    restarted.wait_for("deepseek-flash");
+    let frame = screen::visible_screen(
+        &restarted.visible_output(),
+        restarted.columns,
+        restarted.rows,
+    );
+    assert!(
+        !frame.contains("Choose Provider") && !frame.contains("Choose model"),
+        "{frame}"
+    );
+    assert_saved_model(&root);
+    restarted.exit();
+}
+
+#[test]
+fn overview_dispatch_requires_setup_even_when_a_historical_chat_is_selected() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let environment = [(TEST_KEY_NAME, TEST_KEY)];
+    let mut original = Terminal::start_first_run(&root, &[], &environment);
+    original.wait_for("Choose model · Signed-in Providers");
+    original.close_model_picker();
+    original.send(b"!true\r");
+    let deadline = Instant::now() + TIMEOUT;
+    let historical_chat = loop {
+        if let Some(snapshot) = original.only_chat_snapshot()
+            && snapshot
+                .user_shells
+                .iter()
+                .any(|shell| shell.command == "true" && shell.exit_code == Some(0))
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "local Shell did not finish");
+        thread::sleep(Duration::from_millis(10));
+    };
+    original.exit();
+    // Keep this fixture's daemon alive: the next View resumes an existing Chat,
+    // not one registered by that View's first-run setup state.
+    let mut terminal = Terminal::start_first_run(&root, &[], &environment);
+    terminal.wait_for("Choose model · Signed-in Providers");
+    terminal.close_model_picker();
+    let mark = terminal.mark();
+    terminal.send(b"/resume\r");
+    terminal.wait_for_frame_after(mark, "historical Chat picker opened", |frame| {
+        frame.contains("Resume Chat")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "historical Chat opened without new work", |frame| {
+        frame.contains("History only; selecting this Chat starts no work.")
+            && frame.lines().any(|line| line.trim() == "❯")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b[D");
+    terminal.wait_for_frame_after(mark, "overview with historical Chat selected", |frame| {
+        frame.contains("Agents ·") && frame.contains("tab new Agent")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\t\x1b[200~keep this overview prompt unsent\x1b[201~");
+    terminal.wait_for_frame_after(mark, "overview dispatch draft entered", |frame| {
+        frame.contains("keep this overview prompt unsent")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(
+        mark,
+        "overview dispatch requires model selection",
+        |frame| frame.contains("Choose model · Signed-in Providers"),
+    );
+    terminal.assert_dialog("overview-model-setup", "Choose model · Signed-in Providers");
+    let snapshot = terminal
+        .only_chat_snapshot()
+        .expect("historical Shell Chat remains");
+    assert_eq!(snapshot.execution, historical_chat.execution);
+    assert!(snapshot.last_model_run.is_none());
+    assert!(snapshot.request_usage.entries().is_empty());
+    assert!(snapshot.pending_inputs.is_empty());
+    assert!(!root.join("state/settings.json").exists());
+    terminal.close_model_picker();
+    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
+    assert!(
+        frame.contains("keep this overview prompt unsent"),
+        "{frame}"
+    );
+    terminal.send(b"\x15");
+    terminal.exit();
+}
+
+#[test]
+fn cancelled_first_run_preserves_prompt_and_resubmitting_reopens_setup_without_chat() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Choose Provider · All");
+    terminal.close_provider_picker();
+    let mark = terminal.mark();
+    terminal.send(b"keep this unsent prompt\r");
+    terminal.wait_for_frame_after(mark, "submit reopens model setup", |frame| {
+        frame.contains("Choose Provider · All")
+    });
+    terminal.assert_no_chats();
+    terminal.close_provider_picker();
+    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
+    assert!(frame.contains("keep this unsent prompt"), "{frame}");
+    assert!(!root.join("state/settings.json").exists());
+    // Clear the preserved prompt before issuing the exit command.
+    terminal.send(b"\x15");
+    terminal.exit();
+}
+
+#[test]
+fn shell_before_model_setup_does_not_allow_a_prompt_to_bypass_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Choose Provider · All");
+    terminal.close_provider_picker();
+    terminal.send(b"!true\r");
+    let deadline = Instant::now() + TIMEOUT;
+    let shell_chat = loop {
+        if let Some(snapshot) = terminal.only_chat_snapshot()
+            && snapshot
+                .user_shells
+                .iter()
+                .any(|shell| shell.command == "true" && shell.exit_code == Some(0))
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "local Shell did not finish");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(shell_chat.last_model_run.is_none());
+    assert!(shell_chat.request_usage.entries().is_empty());
+
+    let mark = terminal.mark();
+    terminal.send(b"/compact\r");
+    terminal.wait_for_frame_after(mark, "compaction also requires model selection", |frame| {
+        frame.contains("Choose Provider · All")
+    });
+    let snapshot = terminal.only_chat_snapshot().expect("Shell created a Chat");
+    assert!(snapshot.last_model_run.is_none());
+    assert!(snapshot.request_usage.entries().is_empty());
+    terminal.close_provider_picker();
+    terminal.send(b"\x15");
+
+    let mark = terminal.mark();
+    terminal.send(b"do not send this to a model\r");
+    terminal.wait_for_frame_after(mark, "Shell Chat remains gated by model setup", |frame| {
+        frame.contains("Choose Provider · All")
+    });
+    let snapshot = terminal.only_chat_snapshot().expect("Shell created a Chat");
+    assert_eq!(snapshot.execution, shell_chat.execution);
+    assert!(snapshot.last_model_run.is_none());
+    assert!(snapshot.request_usage.entries().is_empty());
+    assert!(snapshot.pending_inputs.is_empty());
+    terminal.close_provider_picker();
+    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
+    assert!(frame.contains("do not send this to a model"), "{frame}");
+    assert!(!root.join("state/settings.json").exists());
+    terminal.send(b"\x15");
+    terminal.exit();
+}
+
+#[test]
+fn branch_of_shell_chat_before_model_setup_still_requires_model_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Choose Provider · All");
+    terminal.close_provider_picker();
+    terminal.send(b"!true\r");
+    let deadline = Instant::now() + TIMEOUT;
+    let source = loop {
+        if let Some(snapshot) = terminal.only_chat_snapshot()
+            && snapshot
+                .user_shells
+                .iter()
+                .any(|shell| shell.command == "true" && shell.exit_code == Some(0))
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "local Shell did not finish");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(source.last_model_run.is_none());
+    assert!(source.request_usage.entries().is_empty());
+
+    let mark = terminal.mark();
+    terminal.send(b"/branch pending-model-setup\r");
+    terminal.wait_for_frame_after(mark, "pending setup Chat branched", |frame| {
+        frame.contains("Branched conversation")
+            && frame.contains("pending-model-setup")
+            && frame.contains("Continue Chat?")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(
+        mark,
+        "branch input restored with receiving paused",
+        |frame| !frame.contains("Continue Chat?") && frame.lines().any(|line| line.trim() == "❯"),
+    );
+    let snapshots = terminal.chat_snapshots();
+    assert_eq!(snapshots.len(), 2, "branch must create a second Chat");
+    let branch = snapshots
+        .iter()
+        .find(|snapshot| snapshot.execution != source.execution)
+        .expect("branch has its own Chat identity")
+        .execution;
+
+    // Branch confirmation is emitted before the input editor is restored. Observe
+    // the complete draft in the editor before submitting it to the setup gate.
+    let mark = terminal.mark();
+    terminal.send(b"\x1b[200~keep this branch prompt unsent\x1b[201~");
+    terminal.wait_for_frame_after(mark, "branch prompt ready to submit", |frame| {
+        frame.contains("keep this branch prompt unsent") && frame.contains("enter send")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "branch remains gated by model setup", |frame| {
+        frame.contains("Choose Provider · All")
+    });
+    terminal.assert_dialog("branch-model-setup", "Choose Provider · All");
+    let snapshots = terminal.chat_snapshots();
+    assert_eq!(snapshots.len(), 2);
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.execution == branch)
+    );
+    for snapshot in snapshots {
+        assert!(snapshot.last_model_run.is_none());
+        assert!(snapshot.request_usage.entries().is_empty());
+        assert!(snapshot.pending_inputs.is_empty());
+    }
+    terminal.close_provider_picker();
+    let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
+    assert!(frame.contains("keep this branch prompt unsent"), "{frame}");
+    assert!(!root.join("state/settings.json").exists());
+    terminal.send(b"\x15");
+    terminal.exit();
+}
+
+#[test]
+fn saved_key_without_model_also_opens_model_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    save_key(&root, TEST_KEY);
+    let mut terminal = Terminal::start_first_run(&root, &[], &[]);
+    terminal.wait_for("Choose model · Signed-in Providers");
+    terminal.wait_for("API key saved");
+    assert!(!root.join("state/settings.json").exists());
+    terminal.assert_no_chats();
     terminal.close_provider_picker();
     terminal.exit();
 }

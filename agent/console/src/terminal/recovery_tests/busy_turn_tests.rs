@@ -274,6 +274,7 @@ fn busy_turn_pty_fixture() {
                 let settings = tickloop_agent_config::UserSettings::in_root(&workdir);
                 settings.save_prompt_suggestion_enabled(false).unwrap();
                 let startup = StartupState {
+                    model_selected: true,
                     launch_arguments: Vec::new(),
                     chat: StartupChat::Resumed(Box::new(restored), true),
                     user_settings: Some(settings),

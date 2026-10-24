@@ -479,6 +479,12 @@ struct SettingsPosition {
     context_offset: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelSetup {
+    FirstRun,
+    RepairSaved,
+}
+
 pub(super) struct Menus {
     active: Option<(Uuid, Selection)>,
     dialog_chat: Option<Uuid>,
@@ -502,6 +508,10 @@ pub(super) struct Menus {
     /// Where the next New Agent will be created; its saved project rules are shown before the
     /// first input.
     new_agent_directory: Option<PathBuf>,
+    /// Pending first-use selection or repair of an explicitly saved model.
+    model_setup: Option<ModelSetup>,
+    /// Chats created locally while first-use model selection is still pending.
+    model_setup_chats: std::collections::HashSet<Uuid>,
 }
 
 impl Default for Menus {
@@ -532,6 +542,8 @@ impl Menus {
             refresh_connections: HashMap::new(),
             model_discovery: Default::default(),
             new_agent_directory: None,
+            model_setup: None,
+            model_setup_chats: Default::default(),
         }
     }
 
@@ -1371,8 +1383,7 @@ impl Menus {
             choices.push(pending.clone());
         }
         self.provider.provider_choices = ProviderModels::group_with_catalog(choices, &catalog);
-        self.provider.current_connection = self.key_for_model(&snapshot.model);
-        self.provider.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
+        self.update_current_model(target, &snapshot.model);
         self.provider.provider_selected = self
             .provider
             .provider_choices
@@ -1381,6 +1392,105 @@ impl Menus {
             .unwrap_or(0);
         self.provider.provider_nav.focused = self.provider.current_connection.clone();
         Ok(())
+    }
+
+    /// Both initial loading and asynchronous account-check repaints restore the current model.
+    fn update_current_model(&mut self, target: ConfigTarget, model: &ModelConfig) {
+        if self.model_setup_applies_to(target.agent())
+            && self.model_setup == Some(ModelSetup::FirstRun)
+        {
+            // A runtime fallback is not a model the user has chosen.
+            self.provider.current_model = None;
+            self.provider.current_connection = None;
+        } else {
+            self.provider.current_connection = self.key_for_model(model);
+            self.provider.current_model = Some((model.provider_id.clone(), model.model_id.clone()));
+        }
+    }
+
+    pub(super) fn model_setup_pending(&self) -> bool {
+        self.model_setup.is_some()
+    }
+
+    pub(super) fn model_setup_created_chat(&mut self, chat: Uuid) {
+        if self.model_setup_pending() {
+            self.model_setup_chats.insert(chat);
+        }
+    }
+
+    pub(super) fn model_setup_applies_to(&self, chat: Option<Uuid>) -> bool {
+        self.model_setup_pending() && chat.is_none_or(|chat| self.model_setup_chats.contains(&chat))
+    }
+
+    fn model_selection_saved(&mut self, target: ConfigTarget) {
+        if self.model_setup_applies_to(target.agent()) {
+            self.model_setup = None;
+            self.model_setup_chats.clear();
+        }
+    }
+
+    /// Select a model before the first prompt, reusing the ordinary provider/credential flow.
+    pub(super) async fn model_setup(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        repair_existing: bool,
+    ) -> Result<bool, String> {
+        // First-run failures must not let a runtime fallback bypass explicit selection.
+        // Saved-model startup, however, only enters repair after a known missing credential.
+        if !repair_existing {
+            self.model_setup.get_or_insert(ModelSetup::FirstRun);
+        }
+        self.sync_dialog_chat(console)?;
+        let target = console
+            .dialog_chat()?
+            .filter(|chat| self.model_setup_chats.contains(chat))
+            .map_or(ConfigTarget::NewDraft, ConfigTarget::Agent);
+        self.load_providers(agent, target).await?;
+        let current = self
+            .provider
+            .current_connection
+            .as_ref()
+            .and_then(|key| self.connection(key).ok());
+        let current_auth = current
+            .as_ref()
+            .map_or(Ok(false), |provider| self.provider_authenticated(provider));
+        if !self.model_setup_pending() {
+            if current_auth.clone()? {
+                return Ok(false);
+            }
+            self.model_setup = Some(ModelSetup::RepairSaved);
+        }
+        let current_ready = current_auth == Ok(true);
+        self.provider.provider_nav = Default::default();
+        self.provider.model_query.clear();
+        self.provider.model_return = Some(providers::ModelPickerDraft {
+            provider: None,
+            selected: self.provider.current_model.clone(),
+            action: None,
+            choices: Vec::new(),
+        });
+        if self.model_setup == Some(ModelSetup::RepairSaved)
+            && !current_ready
+            && let Some(provider) = current
+        {
+            self.provider
+                .provider_nav
+                .back_stack
+                .push(self.directory_parent());
+            // Connection details keeps OAuth startup in the existing MenuOutcome path.
+            self.connection_details(console, target, provider, 1)?;
+        } else if self
+            .provider
+            .provider_choices
+            .iter()
+            .any(|provider| self.provider_authenticated(provider) == Ok(true))
+        {
+            self.configured_models(agent, console, target).await?;
+        } else {
+            self.back_to_providers(console, target)?;
+        }
+        Ok(true)
     }
 
     pub(super) async fn models(
@@ -2701,7 +2811,7 @@ impl Menus {
                         }
                         providers::ConnectionAction::Configure => {
                             self.provider.provider_nav.back_stack.push(parent);
-                            self.provider.provider_nav.credential_intent = Some(if self.provider_authenticated(&provider) == Ok(false) { providers::CredentialIntent::Setup } else { providers::CredentialIntent::Replace });
+                            self.provider.provider_nav.credential_intent = Some(self.configure_credential_intent(&provider));
                             return self.provider_auth(console, target, provider);
                         }
                         providers::ConnectionAction::RemoveKey | providers::ConnectionAction::SignOut => {
@@ -2864,7 +2974,10 @@ impl Menus {
                         .await
                         .map_err(|error| error.to_string());
                     match result {
-                        Ok(change) => console.write(&safe_text(&format!("Model selection: {change} · {} · Effort {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
+                        Ok(change) => {
+                            self.model_selection_saved(target);
+                            console.write(&safe_text(&format!("Model selection: {change} · {} · Effort {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?;
+                        }
                         Err(error) => {
                             self.show_model_choices(console, target, choices, index, tickloop_ids::generate())?;
                             return Err(error);
@@ -3491,6 +3604,145 @@ mod tests {
     use tickloop_agent_protocol::{Content, Message, ModelIdentity, Role};
 
     use super::*;
+
+    #[tokio::test]
+    async fn model_setup_requires_selection_but_skips_a_saved_authenticated_model() {
+        let mut model = tickloop_agent_test_support::config();
+        model.auth_source = tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv;
+        model.api_key_env.clear(); // A local connection is authenticated without credentials.
+        let agent = Agent::new_embedded(
+            model,
+            std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut saved = Menus::default();
+        assert!(!saved.model_setup(&agent, &console, true).await.unwrap());
+        assert!(!saved.model_setup_pending());
+
+        let mut first_run = Menus::default();
+        assert!(
+            first_run
+                .model_setup(&agent, &console, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(first_run.model_setup, Some(ModelSetup::FirstRun));
+        assert!(first_run.provider.current_model.is_none());
+        // Re-entry with a ready provider cannot reinterpret the fallback as a saved selection.
+        assert!(first_run.model_setup(&agent, &console, true).await.unwrap());
+        assert_eq!(first_run.model_setup, Some(ModelSetup::FirstRun));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_load_errors_preserve_the_original_pending_reason() {
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let missing = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(missing);
+        for reason in [ModelSetup::FirstRun, ModelSetup::RepairSaved] {
+            let mut menus = Menus {
+                model_setup: Some(reason),
+                ..Default::default()
+            };
+            menus.model_setup_created_chat(missing);
+            // The registered chat has no runtime configuration; load_providers must fail.
+            assert!(menus.model_setup(&agent, &console, true).await.is_err());
+            assert_eq!(menus.model_setup, Some(reason));
+            assert!(menus.model_setup_applies_to(Some(missing)));
+        }
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_credentials_do_not_gate_initial_saved_model_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_root = directory.path().join("not-a-directory");
+        std::fs::write(&invalid_root, "fixture").unwrap();
+        let model = tickloop_agent_model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap();
+        let core = tickloop_agent_runtime::Agent::new_embedded(
+            model.clone(),
+            std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.path().into());
+        launch.model = Some(model);
+        launch.config_root = Some(invalid_root);
+        let agent = Agent::from_embedded_launch(core, launch);
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        assert!(menus.model_setup(&agent, &console, true).await.is_err());
+        assert!(!menus.model_setup_pending());
+        // The same error may not bypass the first-run requirement.
+        let _ = menus.model_setup(&agent, &console, false).await;
+        assert_eq!(menus.model_setup, Some(ModelSetup::FirstRun));
+        agent.shutdown().await;
+    }
+
+    #[test]
+    fn only_a_saved_new_draft_model_finishes_setup() {
+        let mut menus = Menus {
+            model_setup: Some(ModelSetup::FirstRun),
+            ..Default::default()
+        };
+        menus.model_selection_saved(ConfigTarget::Agent(Uuid::new_v4()));
+        assert!(menus.model_setup_pending());
+        menus.model_selection_saved(ConfigTarget::NewDraft);
+        assert!(!menus.model_setup_pending());
+    }
+
+    #[test]
+    fn setup_tracks_only_chats_created_while_pending_not_history() {
+        let mut menus = Menus::default();
+        let history = Uuid::new_v4();
+        let created = Uuid::new_v4();
+        menus.model_setup_created_chat(history);
+        assert!(!menus.model_setup_chats.contains(&history));
+        menus.model_setup = Some(ModelSetup::FirstRun);
+        menus.model_setup_created_chat(created);
+        assert!(menus.model_setup_applies_to(None));
+        assert!(menus.model_setup_applies_to(Some(created)));
+        assert!(!menus.model_setup_applies_to(Some(history)));
+        menus.model_selection_saved(ConfigTarget::Agent(history));
+        assert!(menus.model_setup_pending());
+        assert!(menus.model_setup_applies_to(Some(created)));
+    }
+
+    #[test]
+    fn selecting_a_model_for_a_setup_created_chat_finishes_setup() {
+        let mut menus = Menus::default();
+        let created = Uuid::new_v4();
+        menus.model_setup = Some(ModelSetup::FirstRun);
+        menus.model_setup_created_chat(created);
+        menus.model_selection_saved(ConfigTarget::Agent(created));
+        assert!(!menus.model_setup_pending());
+        assert!(!menus.model_setup_applies_to(None));
+        assert!(!menus.model_setup_applies_to(Some(created)));
+        assert!(menus.model_setup_chats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_setup_never_marks_the_runtime_fallback_as_selected() {
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let mut menus = Menus {
+            model_setup: Some(ModelSetup::FirstRun),
+            ..Default::default()
+        };
+        menus
+            .load_providers(&agent, ConfigTarget::NewDraft)
+            .await
+            .unwrap();
+        assert!(menus.provider.current_model.is_none());
+        assert!(menus.provider.current_connection.is_none());
+        assert!(menus.model_setup_pending());
+        agent.shutdown().await;
+    }
 
     #[tokio::test]
     async fn recovery_queues_pending_requests_even_after_their_events_are_evicted() {

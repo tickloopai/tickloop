@@ -39,11 +39,11 @@ impl ThinkingPreview {
         }
     }
 
-    /// The row behind the working dot, given as its frame and colour.
+    /// The row behind the working dot, given as its frame.
     pub(super) fn spans(
         &self,
         width: usize,
-        dot: (&str, Role),
+        dot: &str,
         prefers_reduced_motion: bool,
     ) -> Vec<(String, Option<Role>)> {
         self.render(width, dot, prefers_reduced_motion)
@@ -52,12 +52,12 @@ impl ThinkingPreview {
     fn render(
         &self,
         width: usize,
-        (spinner, spinner_role): (&str, Role),
+        spinner: &str,
         prefers_reduced_motion: bool,
     ) -> Vec<(String, Option<Role>)> {
         let lead_columns = spinner.width() + SPINNER_GAP.width();
         if width <= lead_columns {
-            return vec![(spinner.into(), Some(spinner_role))];
+            return vec![(spinner.into(), Some(Role::RunningMark))];
         }
         let text = if self.line.trim().is_empty() {
             "Thinking…"
@@ -65,7 +65,7 @@ impl ThinkingPreview {
             self.line.trim_start()
         };
         let visible = truncate_to_width(text, width - lead_columns);
-        let mut row = RoleLine::role(spinner, spinner_role);
+        let mut row = RoleLine::role(spinner, Role::RunningMark);
         row.push(SPINNER_GAP, Some(Role::MutedText));
 
         self.shimmer
@@ -103,22 +103,32 @@ mod tests {
     }
 
     #[test]
+    fn working_dot_frames_keep_the_running_role_even_in_a_narrow_row() {
+        let preview = ThinkingPreview::default();
+        for dot in ["●", "◉"] {
+            for width in [1, 80] {
+                assert_eq!(
+                    preview.render(width, dot, true)[0],
+                    (dot.to_owned(), Some(Role::RunningMark))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn newest_thinking_line_replaces_the_previous_line_across_deltas() {
         let mut preview = ThinkingPreview::default();
         preview.append("First line\nSec");
         preview.append("ond line\r\n  第三行");
         preview.append("继续");
-        assert_eq!(
-            text(&preview.render(80, ("⠁", Role::RunningMark), true)),
-            "⠁ 第三行继续"
-        );
+        assert_eq!(text(&preview.render(80, "⠁", true)), "⠁ 第三行继续");
     }
 
     #[test]
     fn preview_stays_one_row_and_truncates_at_a_grapheme_boundary() {
         let mut preview = ThinkingPreview::default();
         preview.append("价格🙂继续比较这些数据");
-        let rendered = text(&preview.render(14, ("⠁", Role::RunningMark), true));
+        let rendered = text(&preview.render(14, "⠁", true));
         assert!(!rendered.contains('\n'));
         assert!(rendered.width() <= 14);
         assert!(rendered.ends_with('…'));
@@ -129,14 +139,8 @@ mod tests {
     fn appends_received_graphemes_together() {
         let mut preview = ThinkingPreview::default();
         preview.append("你🙂a");
-        assert_eq!(
-            text(&preview.render(80, ("⠁", Role::RunningMark), true)),
-            "⠁ 你🙂a"
-        );
+        assert_eq!(text(&preview.render(80, "⠁", true)), "⠁ 你🙂a");
         preview.append("\n好");
-        assert_eq!(
-            text(&preview.render(80, ("⠁", Role::RunningMark), true)),
-            "⠁ 好"
-        );
+        assert_eq!(text(&preview.render(80, "⠁", true)), "⠁ 好");
     }
 }

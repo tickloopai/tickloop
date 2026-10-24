@@ -1,7 +1,7 @@
 use tickloop_agent_config::DisplayPreferences;
 use tickloop_ui::icons::WORKING_DOT_FRAMES;
 
-use super::style::{Role, Theme, ThemeName};
+use super::style::{Theme, ThemeName};
 
 /// How long a blinking glyph stays in each phase. Every blinking glyph takes its phase from the
 /// same clock, so they blink together.
@@ -133,11 +133,10 @@ impl DisplayProfile {
         }
     }
 
-    /// The working dot at `now_ms` and its colour: plain, then ringed, on the blink clock every
+    /// The working dot at `now_ms`: plain, then ringed, on the blink clock every
     /// running Monitor row shares. Under Reduce motion it rests plain.
-    pub(super) fn working_dot(self, now_ms: u64) -> (&'static str, Role) {
-        let frame = WORKING_DOT_FRAMES[usize::from(self.blink_dimmed(now_ms))];
-        (frame, Role::RunningMark)
+    pub(super) fn working_dot(self, now_ms: u64) -> &'static str {
+        WORKING_DOT_FRAMES[usize::from(self.blink_dimmed(now_ms))]
     }
 
     /// Whether a blinking glyph is in its dimmed phase at `now_ms`; under Reduce motion it never
@@ -201,23 +200,15 @@ mod tests {
         assert_eq!(animated.glyph(Glyph::Assistant), "⏺");
         assert_eq!(animated.glyph(Glyph::ToolResult), "⎿");
         assert_eq!(animated.glyph(Glyph::AgentNeedsInput), "◆");
-        assert_eq!(animated.working_dot(0), ("●", Role::RunningMark));
-        assert_eq!(animated.working_dot(499), ("●", Role::RunningMark));
-        assert_eq!(animated.working_dot(500), ("◉", Role::RunningMark));
-        assert_eq!(
-            animated.working_dot(1_000),
-            ("●", Role::RunningMark),
-            "it loops"
-        );
+        assert_eq!(animated.working_dot(0), "●");
+        assert_eq!(animated.working_dot(499), "●");
+        assert_eq!(animated.working_dot(500), "◉");
+        assert_eq!(animated.working_dot(1_000), "●", "it loops");
 
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
-        assert_eq!(
-            still.working_dot(500),
-            ("●", Role::RunningMark),
-            "the still running glyph"
-        );
+        assert_eq!(still.working_dot(500), "●", "the still running glyph");
     }
 
     #[test]

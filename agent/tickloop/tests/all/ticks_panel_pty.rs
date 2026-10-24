@@ -49,6 +49,7 @@ impl Terminal {
                 pixel_height: 0,
             })
             .unwrap();
+        crate::support::cli_runtime::configure_model(&root.join("config"));
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
         command.args([
             "--working-directory-is-trusted",

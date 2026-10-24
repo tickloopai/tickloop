@@ -20,6 +20,80 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn configuring_an_authenticated_provider_replaces_credentials_even_during_setup() {
+        let mut model = tickloop_agent_model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap();
+        model.api_key_env = "TICKLOOP_TEST_ONBOARDING_REPLACE_KEY".into();
+        let provider = ProviderModels::group(vec![model.clone()]).remove(0);
+        let mut menus = Menus::default();
+        let mut scope = tickloop_agent_model::auth::current_provider_credential_scope(None);
+        scope.environment_keys = vec![model.api_key_env];
+        menus.provider.provider_scope = Some(scope);
+        for reason in [ModelSetup::FirstRun, ModelSetup::RepairSaved] {
+            menus.model_setup = Some(reason);
+            assert_eq!(menus.provider_authenticated(&provider), Ok(true));
+            assert_eq!(
+                menus.configure_credential_intent(&provider),
+                CredentialIntent::Replace
+            );
+        }
+        menus
+            .provider
+            .provider_scope
+            .as_mut()
+            .unwrap()
+            .environment_keys
+            .clear();
+        assert_eq!(menus.provider_authenticated(&provider), Ok(false));
+        assert_eq!(
+            menus.configure_credential_intent(&provider),
+            CredentialIntent::Setup
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_model_picker_does_not_mark_an_unselected_setup_fallback() {
+        let model = tickloop_agent_model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap();
+        let agent = Agent::new_embedded(
+            model.clone(),
+            std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let provider = ProviderModels::group(vec![model]).remove(0);
+        for target in [ConfigTarget::NewDraft, ConfigTarget::Agent(chat)] {
+            let console = Console::test_interactive_for_chat(chat);
+            let mut menus = Menus {
+                model_setup: Some(ModelSetup::FirstRun),
+                ..Default::default()
+            };
+            menus.model_setup_created_chat(chat);
+            menus.provider.provider_choices = vec![provider.clone()];
+            // Both the initial directory and an account-check repaint re-read configuration.
+            for _ in 0..2 {
+                menus
+                    .configured_model_choices(
+                        &agent,
+                        &console,
+                        target,
+                        vec![(provider.clone(), Err("Account check fixture".into()))],
+                    )
+                    .await
+                    .unwrap();
+                assert!(menus.provider.current_model.is_none());
+                assert!(menus.provider.current_connection.is_none());
+                assert!(!menus.provider.model_choices.is_empty());
+                let menu = console.menu_snapshot(menus.id().unwrap()).unwrap().unwrap();
+                assert!(menu.options.iter().all(|option| !option.contains('●')));
+            }
+        }
+        agent.shutdown().await;
+    }
+
+    #[test]
     fn lightweight_glm_models_offer_auto_off_and_on_without_fictitious_effort_levels() {
         let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
         for provider in ["zhipu-cn-api", "zai-global-api"] {
@@ -1661,11 +1735,17 @@ impl Menus {
             });
         }
         row_hints.push(format!("f {toggle} · enter Judgment settings · {escape}"));
-        let context = if empty && !searching {
+        let mut context = if empty && !searching {
             vec!["No connections configured. Add a connection to browse models.".into()]
         } else {
             Vec::new()
         };
+        if self.model_setup_applies_to(target.agent()) {
+            context.insert(
+                0,
+                "Choose a provider, then select a model to get started.".into(),
+            );
+        }
         self.dismiss(console)?;
         let menu = Menu {
             id,
@@ -1801,6 +1881,12 @@ impl Menus {
         } else {
             failure.map(provider_failure_context).unwrap_or_default()
         };
+        if self.model_setup_applies_to(target.agent()) {
+            context.push(
+                "Configure this connection, then select a model. Esc to choose another provider."
+                    .into(),
+            );
+        }
         context.extend([
             self.provider_auth_label(&provider).into(),
             format!("Endpoint: {}", endpoint_label(&config.base_url)),
@@ -1995,6 +2081,18 @@ impl Menus {
             Err(_) => "API key needs attention",
         }
     }
+    pub(super) fn configure_credential_intent(
+        &self,
+        provider: &ProviderModels,
+    ) -> CredentialIntent {
+        if self.provider_authenticated(provider) == Ok(false) {
+            CredentialIntent::Setup
+        } else {
+            // Unknown authentication must not silently treat an existing credential as absent.
+            CredentialIntent::Replace
+        }
+    }
+
     pub(super) fn provider_authenticated(&self, provider: &ProviderModels) -> Result<bool, String> {
         let config = &provider.models[0];
         if let Some(region) =
@@ -2331,11 +2429,7 @@ impl Menus {
             .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
-        self.provider.current_connection = self.key_for_model(&snapshot.model);
-        self.provider.current_model = Some((
-            snapshot.model.provider_id.clone(),
-            snapshot.model.model_id.clone(),
-        ));
+        self.update_current_model(target, &snapshot.model);
         self.provider.model_directory_status = directories
             .iter()
             .map(|(provider, directory)| {
@@ -2702,6 +2796,9 @@ impl Menus {
         let mut context = provider.as_ref().map_or_else(Vec::new, |provider| {
             vec![self.provider_auth_label(provider).into()]
         });
+        if self.model_setup_applies_to(target.agent()) {
+            context.insert(0, "Select a model to finish setup.".into());
+        }
         if choices.is_empty() && !query.is_empty() {
             context.push(safe_text(&format!("No models match “{query}”")));
         } else if choices.is_empty() {

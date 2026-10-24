@@ -192,14 +192,21 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     record_phase(&directory, "snapshot-read");
     let (console, input) = Console::start(true).unwrap();
     record_phase(&directory, "console-started");
-    crate::terminal::initialize_startup_console(&console, &model, &directory, initial_mode, vec![])
-        .unwrap();
+    crate::terminal::initialize_startup_console(
+        &console,
+        Some(&model),
+        &directory,
+        initial_mode,
+        vec![],
+    )
+    .unwrap();
     let interaction = crate::terminal::interact(
         &agent,
         directory.clone(),
         &console,
         input,
         crate::terminal::StartupState {
+            model_selected: true,
             launch_arguments: Vec::new(),
             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
             user_settings: Some(tickloop_agent_config::UserSettings::in_root(&directory)),

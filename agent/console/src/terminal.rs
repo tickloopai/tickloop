@@ -191,7 +191,7 @@ impl RunningActivity {
         if let Some(preview) = preview {
             return Ok(preview.spans(console.conversation_width()?, dot, reduced_motion));
         }
-        let mut row = style::RoleLine::role(dot.0, dot.1);
+        let mut row = style::RoleLine::role(dot, Role::RunningMark);
         row.push(" ", Some(Role::MutedText));
         shimmer.append(&mut row, &self.label, reduced_motion);
         let mut details = self
@@ -885,14 +885,14 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. Press ctrl+x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. Enter reopens directly. Actions report their result on the status line. Press ctrl+x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
-The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
+enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. Press ctrl+x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press ctrl+x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 esc interrupts the current turn and pauses an active Goal; Tick Subscriptions and Artifact feedback keep arriving.
 /stop interrupts the current turn, pauses an active Goal and pauses Triggers until Continue or your next message.
 /goal CONDITION sets the Chat's Goal, confirming replacement of an unfinished Goal; conditions are limited to 4000 characters, with longer content in a file or Artifact.
-/goal opens status, full condition, usage, the last completion check, and edit, pause/resume, clear and token budget controls; /goal edit supports Ctrl+G in the external editor.
+/goal opens status, full condition, usage, the last completion check, and edit, pause/resume, clear and token budget controls; /goal edit supports ctrl+g in the external editor.
 /goal pause, /goal resume and /goal clear act without resuming paused Trigger receiving; Continue restores receiving separately.
 Monitor keeps Goal at the bottom, outside its member list; select it and press enter for details. The status bar shows Goal usage or runtime and paused/resume guidance.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
@@ -1177,6 +1177,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
+    // A built-in preview is not a model selection, even when its API key exists.
+    let model_selected = saved_model.is_some();
     let config = saved_model.unwrap_or_else(|| {
         tickloop_agent_model::cards::ModelCatalog::defaults()
             .get(
@@ -1357,9 +1359,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
     console.configure_image_cache(image_cache_root.as_deref())?;
     console.set_input_context(None, &workdir, &[])?;
+    let needs_model_selection =
+        interactive_terminal && matches!(startup, StartupChat::New) && !model_selected;
     initialize_startup_console(
         console,
-        &config,
+        (!needs_model_selection).then_some(&config),
         &workdir,
         execution_mode_override
             .or_else(|| {
@@ -1378,6 +1382,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         input,
         StartupState {
             chat: startup,
+            model_selected,
             user_settings,
             launch_arguments: launch_arguments.into_iter().map(Into::into).collect(),
         },
@@ -1405,24 +1410,39 @@ enum StartupChat {
 
 struct StartupState {
     chat: StartupChat,
+    /// Whether settings contain a valid explicit selection, before the preview fallback.
+    model_selected: bool,
     user_settings: Option<UserSettings>,
     launch_arguments: Vec<std::ffi::OsString>,
 }
 
+const MODEL_SETUP_STATUS: &str = "Choose model";
+const MODEL_SETUP_PROMPT: &str = "Choose a model to get started";
+
 fn initialize_startup_console(
     console: &Console,
-    config: &ModelConfig,
+    config: Option<&ModelConfig>,
     workdir: &std::path::Path,
     execution_mode: ExecutionMode,
     warnings: Vec<String>,
 ) -> Result<(), String> {
     console.update_status_area(
         execution_mode.to_string(),
-        safe_text(settings::model_name(config)),
-        initial_context_usage(config),
+        config.map_or_else(
+            || MODEL_SETUP_STATUS.into(),
+            |config| safe_text(settings::model_name(config)),
+        ),
+        config.and_then(initial_context_usage),
         None,
     )?;
-    write_banner(console, config, workdir)?;
+    if let Some(config) = config {
+        write_banner(console, config, workdir)?;
+    } else {
+        console.write_roles(&startup_banner_with_model(
+            MODEL_SETUP_PROMPT.into(),
+            workdir,
+        ))?;
+    }
     show_settings_warnings(console, warnings)?;
     console.set_prompt_enabled(true)
 }
@@ -1509,6 +1529,16 @@ fn startup_banner_spans(
     config: &ModelConfig,
     workdir: &std::path::Path,
 ) -> Vec<(String, Option<Role>)> {
+    startup_banner_with_model(
+        format!("{} · {:?}", safe_text(&config.model), config.protocol),
+        workdir,
+    )
+}
+
+fn startup_banner_with_model(
+    model: String,
+    workdir: &std::path::Path,
+) -> Vec<(String, Option<Role>)> {
     let directory = workdir.to_string_lossy().into_owned();
     let directory = match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && directory.starts_with(&home) => {
@@ -1521,10 +1551,7 @@ fn startup_banner_spans(
             ("Tickloop".into(), Role::Title),
             (format!(" v{}", env!("CARGO_PKG_VERSION")), Role::MutedText),
         ],
-        vec![(
-            format!("{} · {:?}", safe_text(&config.model), config.protocol),
-            Role::MutedText,
-        )],
+        vec![(model, Role::MutedText)],
         vec![(safe_text(&directory), Role::MutedText)],
     ];
     let mut spans = Vec::new();
@@ -1633,6 +1660,24 @@ async fn finish_provider_login(
         ));
     }
     login::complete_provider_login(&mut session.flow, console, &notice)
+}
+
+/// Local management commands stay available after cancelling model setup; messages and Skills
+/// return to setup before an optimistic echo or a Chat can be created.
+fn model_setup_blocks_input(line: &str) -> bool {
+    let Some(command) = line.split_whitespace().next() else {
+        return false;
+    };
+    if !command.starts_with('/')
+        || command == "/compact"
+        || (command == "/goal" && line.trim() != "/goal")
+    {
+        return true;
+    }
+    command != "/"
+        && !completion::builtin_commands().iter().any(|spec| {
+            spec.command == command && spec.menu_group != Some(completion::CommandGroup::Skills)
+        })
 }
 
 async fn interact(
@@ -1818,7 +1863,15 @@ async fn interact_with_herdr(
         chat => (chat, None),
     };
     match startup_chat {
-        StartupChat::New => {}
+        StartupChat::New => {
+            if interactive
+                && let Err(error) = menus
+                    .model_setup(agent, console, startup.model_selected)
+                    .await
+            {
+                console.set_status(&safe_text(&error))?;
+            }
+        }
         StartupChat::Resumed(snapshot, has_history) => {
             learn_agent_colors(console, agent, &snapshot).await?;
             show_opened_chat(console, agent, &snapshot, has_history)?;
@@ -2185,7 +2238,11 @@ async fn interact_with_herdr(
                 }
                 console.update_status_area(
                     status.policy.mode.to_string(),
-                    safe_text(settings::model_name(&status.model)),
+                    if menus.model_setup_applies_to(Some(chat.into())) {
+                        MODEL_SETUP_STATUS.into()
+                    } else {
+                        safe_text(settings::model_name(&status.model))
+                    },
                     context_usage(&status),
                     visible_task_board,
                 )?;
@@ -2379,8 +2436,14 @@ async fn interact_with_herdr(
                 if let Ok(draft) = draft {
                     console.update_status_area(
                         draft.execution_mode.to_string(),
-                        safe_text(settings::model_name(&draft.model)),
-                        initial_context_usage(&draft.model),
+                        if menus.model_setup_pending() {
+                            MODEL_SETUP_STATUS.into()
+                        } else {
+                            safe_text(settings::model_name(&draft.model))
+                        },
+                        (!menus.model_setup_pending())
+                            .then(|| initial_context_usage(&draft.model))
+                            .flatten(),
                         None,
                     )?;
                 }
@@ -2917,7 +2980,7 @@ async fn interact_with_herdr(
                     let Some(root) = config_root.as_deref() else { continue; };
                     if !console.artifact_picker_matches(choice.picker)? { continue; }
                     if matches!(choice.action, artifacts_picker::ArtifactPickerAction::Add(_)) && selected_chat.is_none() {
-                        let _ = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
+                        let _ = ensure_chat_with_model_setup(console, agent, &mut menus, &mut selected_chat, &workdir).await?;
                     }
                     match artifact_ui::apply_choice(agent, console, root, selected_chat.map(Into::into), *choice).await {
                         Ok(()) => {}, Err(error) => console.artifact_picker_error(safe_text(&error))?,
@@ -3209,7 +3272,7 @@ async fn interact_with_herdr(
                         continue;
                     }
                     let directory=global.projection().dispatch_directory;
-                    let chat = match ensure_chat(console,agent,&mut selected_chat,&directory).await {
+                    let chat = match ensure_chat_with_model_setup(console,agent,&mut menus,&mut selected_chat,&directory).await {
                         Ok(chat)=>chat,
                         Err(error)=>{console.restore_rejected_shell(submission.command(),&error)?;continue;},
                     };
@@ -3330,6 +3393,17 @@ async fn interact_with_herdr(
                                 Ok(None)=>{},Err(error)=>console.set_status(&safe_text(&error.to_string()))?,
                             }
                         }
+                        continue;
+                    }
+                    if (overview_active && menus.model_setup_pending()
+                        || menus.model_setup_applies_to(selected_chat.map(Into::into)))
+                        && model_setup_blocks_input(&line)
+                    {
+                        console.restore_rejected_prompt(restored_contexts, "Choose a model before sending")?;
+                        if let Err(error) = menus.model_setup(agent, console, false).await {
+                            console.set_status(&safe_text(&error))?;
+                        }
+                        status_dirty = true;
                         continue;
                     }
                     if overview_active {
@@ -3705,6 +3779,9 @@ async fn interact_with_herdr(
                                 .is_some_and(|chat| directed_summaries.contains(chat));
                             match branch_from_terminal(console,agent,selected_chat,command,preserve_until_summary_finishes).await {
                                 Ok(outcome) => {
+                                    if menus.model_setup_applies_to(Some(outcome.source_chat_id.into())) {
+                                        menus.model_setup_created_chat(outcome.child_chat_id.into());
+                                    }
                                     menus.dismiss(console)?;
                                     outln!(console,"Branched conversation \"{}\". You are now in the new Chat {}. Use /resume {} to return to the original.",safe_line(&outcome.name),outcome.child_chat_id.public(),shown_id(outcome.source_chat_id));
                                     workflows::write_public_history(console, &outcome.snapshot)?;
@@ -3893,7 +3970,7 @@ async fn interact_with_herdr(
                             } else { outln!(console, "No Chat is selected."); }
                         },
                         _ if line == "/goal" || line.starts_with("/goal ") => {
-                            let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
+                            let chat = ensure_chat_with_model_setup(console, agent, &mut menus, &mut selected_chat, &workdir).await?;
                             if let Err(error) = menus.goal_command(agent, console, chat, &line).await {
                                 outln!(console, "{}", safe_text(&error));
                             }
@@ -6104,11 +6181,36 @@ fn normalize_state_root(root: PathBuf) -> PathBuf {
     }
 }
 
+/// Shells and local management can create a Chat without choosing a model. Remember only those
+/// new Chats, so their first model input is gated without affecting resumed history.
+async fn ensure_chat_with_model_setup(
+    console: &Console,
+    agent: &Agent,
+    menus: &mut Menus,
+    selected: &mut Option<ChatId>,
+    workdir: &std::path::Path,
+) -> Result<uuid::Uuid, String> {
+    let creating = selected.is_none_or(|chat| agent.first_create_pending(chat.into()));
+    let result = ensure_chat(
+        console,
+        agent,
+        selected,
+        workdir,
+        !menus.model_setup_pending(),
+    )
+    .await;
+    if creating && let Some(chat) = *selected {
+        menus.model_setup_created_chat(chat.into());
+    }
+    result
+}
+
 async fn ensure_chat(
     console: &Console,
     agent: &Agent,
     selected: &mut Option<ChatId>,
     workdir: &std::path::Path,
+    model_selected: bool,
 ) -> Result<uuid::Uuid, String> {
     if let Some(id) = selected
         && !agent.first_create_pending((*id).into())
@@ -6119,7 +6221,11 @@ async fn ensure_chat(
         .configuration(ConfigTarget::NewDraft)
         .await
         .map_err(|error| error.to_string())?;
-    let startup_banner = startup_banner_spans(&draft.model, workdir);
+    let startup_banner = if model_selected {
+        startup_banner_spans(&draft.model, workdir)
+    } else {
+        startup_banner_with_model(MODEL_SETUP_PROMPT.into(), workdir)
+    };
     let (id, unapplied) = match agent.create_from_draft(workdir.to_path_buf()).await {
         Ok(id) => (id, None),
         Err(DraftCreationError::NotCreated(error)) => {
@@ -6308,7 +6414,7 @@ async fn ensure_chat_for_input(
     let echoed_in = *selected;
     let creates_agent =
         retry_of.is_none() && echoed_in.is_none_or(|chat| agent.first_create_pending(chat.into()));
-    let chat = match ensure_chat(console, agent, selected, workdir).await {
+    let chat = match ensure_chat(console, agent, selected, workdir, true).await {
         Ok(chat) => chat,
         Err(error) => {
             if creates_agent && let Some(echo) = echo.take() {
@@ -7982,6 +8088,47 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn model_setup_blocks_messages_and_skills_but_keeps_local_commands() {
+        for input in [
+            "hello",
+            "  请帮我写代码  ",
+            "/tickloop",
+            "/slides draft",
+            "/my-skill args",
+            "/goal finish the task",
+            "/compact",
+            "/compact summarize this",
+        ] {
+            assert!(super::model_setup_blocks_input(input), "{input}");
+        }
+        for input in [
+            "",
+            "  ",
+            "/",
+            "/provider",
+            "/model",
+            "/settings",
+            "/exit",
+            "/help advanced",
+            "/resume saved-chat",
+            "/clear",
+        ] {
+            assert!(!super::model_setup_blocks_input(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn model_setup_banner_does_not_present_the_preview_model_as_selected() {
+        let spans = super::startup_banner_with_model(
+            super::MODEL_SETUP_PROMPT.into(),
+            std::path::Path::new("/project"),
+        );
+        let text: String = spans.into_iter().map(|(text, _)| text).collect();
+        assert!(text.contains("Choose a model"));
+        assert!(!text.contains("deepseek"));
+    }
+
+    #[test]
     fn global_overview_keeps_the_root_title_and_aggregates_requests_without_child_rows() {
         let epoch = uuid::Uuid::new_v4();
         let root = tickloop_agent_protocol::ExecutionRef {
@@ -8048,10 +8195,7 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(
-            rows[0].glyph_role(super::display::DisplayProfile::default(), 0),
-            super::style::Role::Warning
-        );
+        assert_eq!(rows[0].glyph_role(), super::style::Role::Warning);
         assert_eq!(rows[0].status_role(), super::style::Role::Warning);
     }
 
@@ -9776,7 +9920,7 @@ mod status_agents_help_tests {
         assert!(help.contains("x dismisses a finished subagent"));
         assert!(!help.contains("esc returns to the entry"));
         assert!(help.contains("Monitor's Shells group"));
-        assert!(help.contains("Ctrl+T") && help.contains("shared tasks"));
+        assert!(help.contains("ctrl+t") && help.contains("shared tasks"));
         assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
     }
 

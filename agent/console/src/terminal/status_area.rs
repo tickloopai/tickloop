@@ -782,11 +782,11 @@ impl StatusArea {
         let hint = if self.task_focus_available == Some(false) {
             "Resize to view"
         } else if focused {
-            "Ctrl+T collapse"
+            "ctrl+t collapse"
         } else if expanded {
-            "Ctrl+T focus"
+            "ctrl+t focus"
         } else {
-            "Ctrl+T expand"
+            "ctrl+t expand"
         };
         header.push(format!(") · {hint}"), Some(Role::MutedText));
         header.truncate(width);
@@ -926,7 +926,7 @@ impl StatusArea {
         }
         if focused {
             lines.push(RoleLine::role(
-                "  j/k move · Enter details · Esc back",
+                "  j/k move · enter details · esc back",
                 Role::MutedText,
             ));
         }

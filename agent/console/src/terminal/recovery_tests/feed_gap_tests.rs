@@ -287,6 +287,7 @@ async fn run_feed_gap_fixture() {
         .await
         .unwrap();
     let startup = StartupState {
+        model_selected: true,
         launch_arguments: Vec::new(),
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
         user_settings: None,
