@@ -308,6 +308,9 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
                 folderless_reach: tickloop_agent_base::network::Reach::Anywhere,
                 ..ToolPolicy::durable_chat()
             },
+            // The cloud trusts the Agent's tasks, so the task CronCreate makes is CronUpdate's
+            // to change; one waiting for confirmation would not change.
+            trust_model_scheduled_tasks: true,
             ..cloud_options(durable_chat_host_rules())
         },
     );

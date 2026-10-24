@@ -275,7 +275,7 @@ pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDe
         None => "Recurring tasks run until they are deleted.".to_owned(),
     };
     let confirmation_on_change = if terms.confirms_agent_tasks {
-        " On a host without permission requests, a task you change waits for the user to confirm it again before it times again."
+        " On a host without permission requests, a task you change waits for the user to confirm it again before it times again, and a task waiting for confirmation cannot be changed: the user confirms or rejects it first."
     } else {
         ""
     };

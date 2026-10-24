@@ -1190,7 +1190,8 @@ async fn cron_update_refuses_what_cron_create_would_and_missing_tasks() {
 }
 
 /// Where nobody is asked and the host does not trust the Agent's tasks, a task the model
-/// changes waits for the user to confirm it again, and times by its new schedule once confirmed.
+/// changes waits for the user to confirm it again, cannot change again while it waits, and
+/// times by its new schedule once confirmed.
 #[tokio::test]
 async fn a_task_the_model_changes_waits_for_confirmation_again() {
     let model = Arc::new(ScriptedModel::new(Vec::new()));
@@ -1212,9 +1213,21 @@ async fn a_task_the_model_changes_waits_for_confirmation_again() {
         "CronUpdate",
         json!({"id": task.id, "cron": "37 * * * *"}),
     ));
+    // The user is shown the task to confirm; it does not change under them.
+    model.enqueue(call(
+        "again",
+        "CronUpdate",
+        json!({"id": task.id, "prompt": "something the user did not see"}),
+    ));
     model.enqueue(text("Changed; please confirm."));
     complete_turn(&agent, chat, "Run it at :37 instead.").await;
+    let (again, is_error) = call_result(&agent, chat, "again").await;
+    assert!(
+        is_error && again.contains("waiting for confirmation"),
+        "{again}"
+    );
     let changed = tasks(&agent, chat).await.remove(0);
+    assert_eq!(changed.prompt, "hourly check");
     assert_eq!(changed.id, task.id);
     assert_eq!(
         changed.confirmation,

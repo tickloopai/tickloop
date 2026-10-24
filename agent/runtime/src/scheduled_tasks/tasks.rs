@@ -358,9 +358,9 @@ impl ScheduledTasks {
     /// Changes a task in place: its id, creation and record of past runs stay. A new schedule,
     /// zone or end times the next run from `now`, and must keep to the host's least interval
     /// and name a time before the task ends. A change to be confirmed again leaves the task
-    /// waiting for confirmation, not timing; any other change to a task waiting for
-    /// confirmation is refused, as it is confirmed or rejected instead. The self-paced loop's
-    /// prompt and title change, but it has no schedule.
+    /// waiting for confirmation, not timing. A task already waiting for confirmation is
+    /// confirmed or rejected, never changed. The self-paced loop's prompt and title change, but
+    /// it has no schedule.
     pub(crate) fn edit(
         &mut self,
         id: &Uuid,
@@ -374,7 +374,9 @@ impl ScheduledTasks {
             .position(|task| task.id == *id)
             .ok_or(ScheduledTaskError::NotFound(*id))?;
         let mut task = self.tasks[index].clone();
-        if task.confirmation == Some(ScheduledTaskConfirmation::Pending) && !edit.reconfirm {
+        // What the user confirms must be what they saw: a task waiting for confirmation does
+        // not change under them.
+        if task.confirmation == Some(ScheduledTaskConfirmation::Pending) {
             return Err(ScheduledTaskError::Pending(*id));
         }
         if let Some(prompt) = edit.prompt {
