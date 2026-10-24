@@ -36,9 +36,9 @@ const NO_NEW_LOOP_FROM_A_RUN: &str = "No self-paced loop is running, and a turn 
 /// How long a Worker's timer waits before it hands a refused run over again.
 const RETRY_DELAY_MS: u64 = 10_000;
 
-/// The time zone scheduled tasks read cron expressions in, and the clock they run by.
+/// The time zone new scheduled tasks read cron expressions in, and the clock tasks run by.
 pub(crate) struct ScheduleClock {
-    zone: Zone,
+    zone: std::sync::RwLock<Zone>,
     #[cfg(any(test, feature = "test-support"))]
     fixed_now: std::sync::Mutex<Option<DateTime<Utc>>>,
 }
@@ -46,14 +46,14 @@ pub(crate) struct ScheduleClock {
 impl ScheduleClock {
     pub(crate) fn new(zone: Zone) -> Self {
         Self {
-            zone,
+            zone: std::sync::RwLock::new(zone),
             #[cfg(any(test, feature = "test-support"))]
             fixed_now: std::sync::Mutex::new(None),
         }
     }
 
     pub(crate) fn zone(&self) -> Zone {
-        self.zone
+        *self.zone.read().unwrap()
     }
 
     pub(crate) fn now(&self) -> DateTime<Utc> {
@@ -587,7 +587,20 @@ impl Agent {
         ToolTerms {
             rules: self.inner.scheduled_task_rules,
             confirms_agent_tasks: !self.inner.trust_model_scheduled_tasks,
+            zone: self.inner.schedule_clock.zone(),
         }
+    }
+
+    /// The IANA time zone the scheduled tasks created from now on read their cron expressions
+    /// in, such as after the user changed theirs: CronCreate, ScheduleWakeup and a host-created
+    /// task without its own zone use it, even later in a turn already running. Tasks that exist
+    /// keep their zone and next run. The scheduled task tools name the zone to the model in each
+    /// request, so the host needs no other change to tell it. An unknown name is refused and
+    /// the zone stays.
+    pub fn set_time_zone(&self, zone: &str) -> Result<(), AgentError> {
+        let zone = resolve_zone(Some(zone)).map_err(AgentError::Invalid)?;
+        *self.inner.schedule_clock.zone.write().unwrap() = zone;
+        Ok(())
     }
 
     /// Who creates a task in the turn `receipt`: the user only for the one task their own

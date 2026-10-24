@@ -33,14 +33,17 @@ pub(crate) struct ToolTerms {
     /// Whether a task the Agent creates waits for the user's confirmation on a host without
     /// permission requests.
     pub confirms_agent_tasks: bool,
+    /// The user's time zone, which new tasks read their cron expressions in.
+    pub zone: chrono_tz::Tz,
 }
 
 impl ToolTerms {
-    /// Claude Code's.
+    /// Claude Code's, in UTC.
     #[cfg(test)]
     pub(crate) const DEFAULT: Self = Self {
         rules: TaskRules::DEFAULT,
         confirms_agent_tasks: true,
+        zone: chrono_tz::Tz::UTC,
     };
 }
 
@@ -228,7 +231,7 @@ pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDe
             description: format!(
                 "Schedule a prompt to run in this Chat at a future time: recurring on a cron schedule, or once at a specific time. The task belongs to this Chat; the host runs it between turns.
 
-Uses a standard 5-field cron expression in the user's local time zone: minute hour day-of-month month day-of-week. \"0 9 * * *\" means 9am local; no time zone conversion is needed. Fields take `*`, numbers, ranges `1-5`, steps `*/15` and lists `1,15`; no names, `L`, `W` or `?`.
+Uses a standard 5-field cron expression in the user's local time zone, {zone}: minute hour day-of-month month day-of-week. \"0 9 * * *\" means 9am local; no time zone conversion is needed. Fields take `*`, numbers, ranges `1-5`, steps `*/15` and lists `1,15`; no names, `L`, `W` or `?`.
 
 ## One-shot tasks (recurring: false)
 
@@ -256,6 +259,7 @@ A task runs only between turns: when it comes due while a turn is running, it wa
 
 Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
                 max = tickloop_agent_protocol::MAX_SCHEDULED_TASKS_PER_CHAT,
+                zone = terms.zone.name(),
             ),
             input_schema: json!({"type":"object","properties":{
                 "cron":{"type":"string","description":"Standard 5-field cron expression in the user's local time zone: \"M H DoM Mon DoW\"."},
@@ -266,7 +270,7 @@ Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
         },
         ToolDefinition {
             name: CRON_LIST_TOOL_NAME.into(),
-            description: format!("List this Chat's scheduled tasks with their ids, titles, schedules, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps."),
+            description: format!("List this Chat's scheduled tasks with their ids, titles, schedules, time zones, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps. Each task keeps the time zone it was created in; tasks created now use the user's, {zone}.", zone = terms.zone.name()),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
         ToolDefinition {

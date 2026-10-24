@@ -2077,6 +2077,7 @@ fn tool_descriptions_follow_the_hosts_terms() {
             min_interval: Some(Duration::from_secs(60 * 60)),
         },
         confirms_agent_tasks: false,
+        zone: chrono_tz::Asia::Shanghai,
     });
     assert!(
         !cloud.contains("7 days") && !cloud.contains("expire"),
@@ -2085,6 +2086,8 @@ fn tool_descriptions_follow_the_hosts_terms() {
     assert!(cloud.contains("Recurring tasks run until they are deleted."));
     assert!(cloud.contains("On this host a recurring task runs at most once per hour"));
     assert!(!cloud.contains("waits for the user to confirm"));
+    assert!(cloud.contains("in the user's local time zone, Asia/Shanghai"));
+    assert!(standard.contains("in the user's local time zone, UTC"));
     let names = |schedule_wakeup| {
         tools::definitions(ToolTerms::DEFAULT, schedule_wakeup)
             .into_iter()

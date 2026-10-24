@@ -971,3 +971,62 @@ async fn end_while_paused(agent: &Agent, chat: ChatId, task: Uuid, end_ms: u64) 
             .is_empty()
     );
 }
+
+/// The host switches the user's time zone while it holds the Agent: tasks the model creates
+/// from then on read their schedule in the new zone, and the tools name it, while a task
+/// created before keeps its zone and next run. An unknown zone is refused and the zone stays.
+#[tokio::test]
+async fn switching_the_time_zone_applies_to_tasks_created_after_it() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "before",
+            "CronCreate",
+            json!({"cron": "7 9 * * *", "prompt": "morning in UTC"}),
+        ),
+        text("Scheduled."),
+    ]));
+    let agent = host(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        |options| options.trust_model_scheduled_tasks = true,
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    complete_turn(&agent, chat, "Every morning at 9:07, please.").await;
+    assert!(cron_create_description(&model).contains("local time zone, UTC:"));
+    let before = tasks(&agent, chat).await.remove(0);
+    assert_eq!(before.time_zone, "UTC");
+
+    assert!(matches!(
+        agent.set_time_zone("Mars/Olympus"),
+        Err(AgentError::Invalid(message)) if message.contains("is not an IANA time zone")
+    ));
+    agent.set_time_zone("Asia/Shanghai").unwrap();
+    model.enqueue(call(
+        "after",
+        "CronCreate",
+        json!({"cron": "7 9 * * *", "prompt": "morning in Shanghai"}),
+    ));
+    model.enqueue(text("Scheduled."));
+    complete_turn(
+        &agent,
+        chat,
+        "I moved to Shanghai; also every morning there.",
+    )
+    .await;
+    assert!(cron_create_description(&model).contains("local time zone, Asia/Shanghai:"));
+    let created = tasks(&agent, chat).await;
+    assert_eq!(
+        created[0], before,
+        "the earlier task keeps its zone and next run"
+    );
+    let after = &created[1];
+    assert_eq!(after.time_zone, "Asia/Shanghai");
+    // 09:07 in Shanghai is 01:07 UTC, the next one after 10:00 UTC on the 23rd.
+    assert_eq!(after.scheduled_for_ms, Some(ms(at(24, 1, 7))));
+    let hosted = agent
+        .schedule_task(chat, NewScheduledTask::new("0 12 * * *", "lunch", true))
+        .await
+        .unwrap();
+    assert_eq!(hosted.time_zone, "Asia/Shanghai");
+    agent.shutdown().await;
+}
