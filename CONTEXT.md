@@ -238,6 +238,19 @@ _Avoid_：风格模式、Mode
 **Tickloop Skill**：
 教 Agent 观察并操作工作台、Layout 与 Tick 的系统级内置 Skill，与 Chat 工作目录和具体项目无关。它使用 `tickloop` 作为稳定名称，用户可以通过 `/tickloop` 显式调用。
 
+### ID
+
+**Tickloop ID**：
+Tickloop 自己生成的对象身份（Chat、Loop、Run、输入、Tick Instance、订阅、Shell 任务、定时任务、协作任务等），遵守以下规则：
+
+1. 身份：一律是 UUID v7，只经 `tick/ids` 的唯一入口生成，每类对象一个独立类型，不同类对象的 ID 不能互相传递。
+2. 文本形式：写给模型的文本（工具结果、通知、注入消息、host state、工具描述示例）与给用户的输出（Console、网页）里，ID 一律写成 22 位 base62（字母表按 ASCII 序 `0-9A-Za-z`，把 UUID 当作 u128 大端数值编码，左侧补 `0`；与 Tickloop Cloud 的公开 ID 逐字节一致）。给模型的写法只经当前 Loop 的 ID 上下文写出，给用户与链接的写法另有入口，两者现在相同，以后可以分别变化。Tick Instance 给模型写成 `hosted:<base62>`／`shell:<base62>`。
+3. 存储不变：Transcript、`installed.json`、文件名、socket 名等存储里保持带连字符的 UUID 写法，旧数据不迁移；Shell 输出文件路径因此仍含 UUID 写法。
+4. 解析：接受 ID 的工具参数与用户输入同时接受 base62（区分大小写）与带连字符的 UUID（不区分大小写），按长度区分，22 位为 base62、36 位为 UUID，其余拒绝；旧会话里模型看到的 UUID 继续可用。Shell 任务在 TaskStop、TaskOutput 与 TickManage 里都接受 `shell:<…>`、裸 base62 与裸 UUID。
+5. 报错：解析失败或找不到对象时原样回显传入的值（截断到 64 个字符）并说明去哪里拿正确的 ID；找到对象但状态不对（已删除、已关闭、不在运行）时用 base62 写出该对象的 ID。两类报错都由 `tick/ids` 的同一处生成。
+6. 外部 ID 不纳入：Herdr pane／workspace ID、Provider 的工具调用 ID、Artifact 服务返回的 asset／thread ID 原样使用，不编码、不解析。
+7. 由名字推导的 ID：只有 Agent 为自己排队的输入与宿主规则这一种做法（同一来源在每台宿主上得到同一 ID），算法与输出不变；旧定时任务的 UUIDv5 换算只用于读旧记录。
+
 ### 云端与宿主接口
 
 组件名在中英文文档与界面中一律使用英文原名。本节只收录开源部分会碰到的概念；托管服务的内部组件不在本仓库描述。
