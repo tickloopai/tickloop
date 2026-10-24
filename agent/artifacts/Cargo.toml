@@ -20,6 +20,7 @@ sha2 = "0.10"
 thiserror = "2"
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-oauth = { path = "../../tick/oauth" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

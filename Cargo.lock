@@ -3976,6 +3976,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tickloop-agent-base",
  "tickloop-agent-protocol",
+ "tickloop-ids",
  "tickloop-tick-oauth",
  "tickloop-tick-oauth-test-server",
  "tokio",
@@ -4328,6 +4329,15 @@ dependencies = [
  "tickloop-agent-base",
  "tickloop-tickhost-connect",
  "tokio",
+]
+
+[[package]]
+name = "tickloop-ids"
+version = "0.2.21"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

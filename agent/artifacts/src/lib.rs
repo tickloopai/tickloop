@@ -81,10 +81,6 @@ pub fn artifact_type_for_tool(tool_format: &str) -> Option<&'static ArtifactType
 pub const DEFAULT_ORIGIN: &str = "https://tickloop.ai";
 /// Every page, API route and the MCP endpoint of Tickloop Artifacts live under this path of its origin.
 pub const APP_BASE_PATH: &str = "/artifact";
-const BASE62_ALPHABET: &[u8; 62] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-/// 62^22 exceeds 2^128, so every UUID fits in 22 base62 digits, left-padded with "0".
-const SHORT_ID_LENGTH: usize = 22;
 const ORIGIN_ENV: &str = "TICKLOOP_ARTIFACT_ORIGIN";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
@@ -183,20 +179,7 @@ impl DeviceAuthorization {
 
 /// Decodes a service ID from its UUID or fixed-width base62 representation.
 pub fn parse_service_id(value: &str) -> Option<Uuid> {
-    if value.len() == 36 {
-        return Uuid::parse_str(value).ok();
-    }
-    if value.len() != SHORT_ID_LENGTH {
-        return None;
-    }
-    let mut decoded = 0_u128;
-    for digit in value.bytes() {
-        let digit = BASE62_ALPHABET
-            .iter()
-            .position(|candidate| *candidate == digit)?;
-        decoded = decoded.checked_mul(62)?.checked_add(digit as u128)?;
-    }
-    Some(Uuid::from_u128(decoded))
+    tickloop_ids::base62::decode_either(value)
 }
 
 /// The stable local identity of an Artifact, independent of its service representation.
@@ -216,16 +199,10 @@ fn deserialize_service_id<'de, D: serde::Deserializer<'de>>(
 /// any other identifier passes through unchanged.
 pub fn short_artifact_id(artifact_id: &str) -> String {
     let hyphenated = artifact_id.len() == 36;
-    let Some(uuid) = Uuid::parse_str(artifact_id).ok().filter(|_| hyphenated) else {
-        return artifact_id.to_owned();
-    };
-    let mut value = uuid.as_u128();
-    let mut digits = [BASE62_ALPHABET[0]; SHORT_ID_LENGTH];
-    for digit in digits.iter_mut().rev() {
-        *digit = BASE62_ALPHABET[(value % 62) as usize];
-        value /= 62;
+    match Uuid::parse_str(artifact_id).ok().filter(|_| hyphenated) {
+        Some(uuid) => tickloop_ids::base62::encode(uuid),
+        None => artifact_id.to_owned(),
     }
-    String::from_utf8(digits.to_vec()).expect("base62 digits are ASCII")
 }
 
 /// A canonical UUID and its public short ID identify the same artifact.

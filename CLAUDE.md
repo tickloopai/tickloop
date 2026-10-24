@@ -56,6 +56,7 @@ AI 只能在既有授权范围内执行。读取与写入授权分别判断；�
 | `agent/test-support/` | Agent 各 crate 测试共用的代码：ScriptedModel、内存与注入故障的 Transcript Store、无状态宿主的参考发布者与内存 Event Stream（含契约测试）、PTY 屏幕、传输限额与假 HTTP 服务；依赖 model、protocol、runtime 与 transcript |
 | `tickhost/host/` | 可执行文件 `tickhost`：daemon 拉起的宿主服务 `tickhost run`（协议、终端与 Shell 适配器，多视图附着）、宿主内部的隐藏 launcher `tickhost launch` 与 `tickhost stop` |
 | `tickhost/connect/` | Tickhost 业务通道与客户端、每实例 TickSession、launch 契约、打开时的程序解析（已安装 Tick 包、PATH）、Herdr socket 与视图 Pane 布局；不依赖 Agent 或旧工作台 |
+| `tick/ids/` | Tickloop 自己的 ID：唯一的 UUID v7 生成入口、每类对象一个 `Id<Kind>` 类型、与 Tickloop Cloud 逐字节一致的 22 位 base62（含共用测试向量）、模型文本出口与参数解析的 ID 上下文（`IdContext`、`ModelRef`）及统一报错；只依赖 `uuid` 与 `serde`，tickhost 与 Agent 共用 |
 | `tick/protocol/`、`tick/sdk/` | Tick 标准（版本、方法、帧与限额），以及 Tick 侧协议实现 |
 | `tick/oauth-test-server/` | 仅供测试的假 OAuth 2.0 授权服务器（127.0.0.1），Tick 与 Agent 的登录测试共用；`make build`／`install`／`package` 不包含它 |
 | `tick/oauth/` | Tick 包登录的标准 OAuth 2.0 客户端：RFC 8414 发现、7591 注册、8628 设备码轮询、6749 刷新、7009 撤销与 https／本机地址规则；带 OAuth `error` 的 400 与任何 401 算拒绝，其余非 2xx 退避重试或报网络错误；HTTP 客户端由调用方提供（Agent 用 base 的策略，包程序用自己的），不依赖 Agent crate |

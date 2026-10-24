@@ -1,0 +1,20 @@
+[package]
+name = "tickloop-ids"
+description = "Tickloop ids: UUID v7 generation, one type per kind of object, the base62 text form, and parsing and errors for ids the model passes back"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tickloop_ids"
+doctest = false
+
+[dependencies]
+serde = "1"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

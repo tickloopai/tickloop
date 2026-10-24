@@ -2,7 +2,7 @@
 members = [
     "agent/*",
     "tickhost/host", "tickhost/connect",
-    "tick/protocol", "tick/sdk", "tick/packages", "tick/oauth",
+    "tick/ids", "tick/protocol", "tick/sdk", "tick/packages", "tick/oauth",
     "tick/oauth-test-server",
     "ui",
 ]
