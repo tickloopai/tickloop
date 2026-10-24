@@ -50,10 +50,10 @@ pub(crate) struct AgentRow {
 
 /// What a row shows after its title when there is room: the newest message, path metadata and
 /// the age of its latest state change. Narrow rows drop path first, then the message, then age.
-#[derive(Default)]
 pub(in crate::terminal) struct RowExtras<'a> {
     /// The row's state glyph as the active profile draws it; empty draws none.
     pub(in crate::terminal) glyph: &'a str,
+    pub(in crate::terminal) glyph_role: Role,
     pub(in crate::terminal) project: &'a str,
     pub(in crate::terminal) workspace: Option<&'a str>,
     pub(in crate::terminal) preview: Option<&'a str>,
@@ -72,10 +72,10 @@ struct RowFrame {
 }
 
 impl AgentRow {
-    pub(in crate::terminal) fn glyph_role(&self) -> Role {
+    pub(in crate::terminal) fn glyph_role(&self, display: DisplayProfile, now: u64) -> Role {
         match self.group {
             AttentionGroup::NeedsInput => group_role(self.group),
-            AttentionGroup::Working => Role::TickMark,
+            AttentionGroup::Working => display.working_dot(now).1,
             _ => self.status_role(),
         }
     }
@@ -96,7 +96,7 @@ impl AgentRow {
         now: u64,
     ) -> &'static str {
         if self.group == AttentionGroup::Working {
-            display.spinner_at(now)
+            display.working_dot(now).0
         } else {
             display.glyph(self.glyph)
         }
@@ -147,7 +147,7 @@ impl AgentRow {
             None => ellipsize(&title, frame.title_columns),
         };
         let mut line = RoleLine::role(ROW_INDENT, Role::Text);
-        line.push(frame.glyph, Some(self.glyph_role()));
+        line.push(frame.glyph, Some(extras.glyph_role));
         line.push(title.as_str(), Some(Role::Text));
         if frame.preview_columns > 0
             && let Some(preview) = extras.preview
@@ -970,6 +970,7 @@ impl OverviewState {
     ) -> RowExtras<'_> {
         RowExtras {
             glyph: row.state_glyph(display, now),
+            glyph_role: row.glyph_role(display, now),
             project: if terminal_columns >= WIDE_TERMINAL_COLUMNS {
                 row.project.as_str()
             } else {

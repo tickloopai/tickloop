@@ -53,31 +53,19 @@ fn wide_ambiguous_glyphs_reserve_their_second_buffer_cell() {
 }
 
 #[test]
-fn the_tick_ring_steps_its_gap_round_all_eight_dots() {
-    use tickloop_ui::icons::TICK_SPINNER_FRAMES;
-    let dots = |frame: &str| {
-        let character = frame.chars().next().unwrap() as u32;
-        assert!(
-            (0x2800..=0x28ff).contains(&character),
-            "{frame} is a braille cell"
-        );
-        character - 0x2800
-    };
-    let mut passed = 0;
-    for spinner in TICK_SPINNER_FRAMES {
-        let gap = !dots(spinner) & 0xff;
-        assert_eq!(gap.count_ones(), 1, "{spinner} leaves one dot dark");
-        assert_eq!(passed & gap, 0, "{spinner} moves its gap to a new dot");
-        passed |= gap;
+fn the_working_dot_alternates_plain_and_ringed() {
+    use tickloop_ui::icons::WORKING_DOT_FRAMES;
+    assert_eq!(WORKING_DOT_FRAMES, ["●", "◉"]);
+    for frame in WORKING_DOT_FRAMES {
+        assert_eq!(unicode_width::UnicodeWidthStr::width(frame), 1, "{frame}");
     }
-    assert_eq!(passed, 0xff, "the gap goes round all eight dots");
 }
 
 #[test]
 fn status_icons_are_single_column_unicode_symbols() {
     use tickloop_ui::icons::Icon;
     assert_eq!(Icon::Connection.glyph(), "●");
-    assert_eq!(Icon::TickUpdate.glyph(), "⣾");
+    assert_eq!(Icon::TickUpdate.glyph(), "◉");
     for icon in [Icon::Connection, Icon::TickUpdate] {
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(icon.glyph()),

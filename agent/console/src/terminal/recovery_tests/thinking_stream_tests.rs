@@ -362,7 +362,7 @@ fn run_thinking_stream(route: &str) {
     fixture.wait_for("Enter a message to");
     fixture.send(b"Continue the same Thinking stream.\r");
     fixture.wait_until_shown("the thinking preview behind the spinner", |frame| {
-        tickloop_ui::icons::TICK_SPINNER_FRAMES
+        tickloop_ui::icons::WORKING_DOT_FRAMES
             .iter()
             .any(|spinner| frame.contains(&format!("{spinner} α")))
     });

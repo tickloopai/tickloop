@@ -144,9 +144,9 @@ pub(super) enum Role {
     RunningShade4,
     Subtle,
     Accent,
-    /// The brand's Tick Red, kept to the one lit tick: the working spinner, a delivered Tick
-    /// Update and the startup mark. Never a word, never a fill.
-    TickMark,
+    /// The brand mark beside the startup banner: star blue on dark, ink blue on light. Never a
+    /// word, never a fill.
+    BrandMark,
     Success,
     Error,
     Warning,
@@ -267,7 +267,7 @@ impl Role {
         Self::RunningShade4,
         Self::Subtle,
         Self::Accent,
-        Self::TickMark,
+        Self::BrandMark,
         Self::Success,
         Self::Error,
         Self::Warning,
@@ -518,7 +518,7 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(255, 255, 255), // RunningShade4
     fg(80, 80, 80),    // Subtle          <- subtle
     fg(215, 119, 87),  // Accent          <- claude
-    fg(236, 48, 19),   // TickMark        <- local: Tick Red
+    fg(149, 197, 229), // BrandMark       <- local: star blue
     fg(78, 186, 101),  // Success         <- success
     fg(255, 107, 128), // Error           <- error
     fg(255, 193, 7),   // Warning         <- warning
@@ -623,7 +623,7 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(0, 0, 0),       // RunningShade4
     fg(175, 175, 175), // Subtle
     fg(215, 119, 87),  // Accent (same in both themes)
-    fg(236, 48, 19),   // TickMark (same in both themes)
+    fg(44, 65, 92),    // BrandMark       <- local: ink blue
     fg(44, 122, 57),   // Success
     fg(171, 43, 63),   // Error
     fg(150, 108, 30),  // Warning
@@ -852,7 +852,7 @@ const fn quantise(colour: Rgb) -> u8 {
 /// Two palette entries collapse onto the grey ramp, which would make a success
 /// message indistinguishable from body text and an added diff line
 /// indistinguishable from its surroundings. Both are forced onto the colour
-/// cube instead, and Tick Red onto the cube's pure red rather than its orange.
+/// cube instead.
 const fn manual_override(colour: Rgb) -> Option<u8> {
     match (colour.red, colour.green, colour.blue) {
         (44, 122, 57) => Some(29), // Success / light
@@ -860,8 +860,6 @@ const fn manual_override(colour: Rgb) -> Option<u8> {
         // Claude Code's colour-diff sends these two indices itself below true colour.
         (2, 40, 0) => Some(22), // DiffLineAdded / dark
         (4, 71, 0) => Some(28), // DiffWordAdded / dark
-        // Tick Red's nearest cube entry is the orange 202; the brand red must read as red.
-        (236, 48, 19) => Some(196), // TickMark
         _ => None,
     }
 }
@@ -1695,29 +1693,24 @@ mod tests {
     }
 
     #[test]
-    fn tick_mark_is_tick_red_and_reads_as_red_on_every_terminal() {
-        for name in ThemeName::ALL {
+    fn brand_mark_is_star_blue_on_dark_and_ink_blue_on_light() {
+        for (name, brand) in [
+            (ThemeName::ClaudeCodeDark, Rgb::new(149, 197, 229)),
+            (ThemeName::ClaudeCodeLight, Rgb::new(44, 65, 92)),
+        ] {
             let theme = Theme::new(name);
-            let tick_red = Colour::Rgb(Rgb::new(236, 48, 19));
-            assert_eq!(theme.style(Role::TickMark).foreground, Some(tick_red));
             assert_eq!(
-                sent_colour(theme, Role::TickMark, ColourDepth::Indexed256),
-                Rgb::new(255, 0, 0),
-                "{name:?}: 256 colours send the cube's red, not its orange"
+                theme.style(Role::BrandMark).foreground,
+                Some(Colour::Rgb(brand))
             );
             for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
                 for (terminal, _) in terminal_backgrounds(name) {
-                    let ratio = emitted_contrast(tick_red, Colour::Rgb(terminal), depth);
+                    let ratio = emitted_contrast(Colour::Rgb(brand), Colour::Rgb(terminal), depth);
                     assert!(
                         ratio >= 3.0,
                         "{name:?} {depth:?} on {terminal:?}: {ratio:.2}"
                     );
                 }
-                assert_ne!(
-                    sent_colour(theme, Role::TickMark, depth),
-                    sent_colour(theme, Role::Accent, depth),
-                    "{name:?} {depth:?}: Tick Red stays apart from the accent"
-                );
             }
         }
     }
@@ -2036,7 +2029,6 @@ mod tests {
         assert_eq!(
             overridden,
             vec![
-                Role::TickMark,
                 Role::Success,
                 Role::DiffAdded,
                 Role::AgentSection,

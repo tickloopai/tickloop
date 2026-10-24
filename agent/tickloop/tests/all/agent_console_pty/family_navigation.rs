@@ -340,7 +340,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.wait_for("Main completed editor and family summary", |frame| {
         frame.contains(MAIN_REPLY)
             && TURN_SUMMARY.is_match(frame)
-            && frame.contains("⏺ Subagents 2")
+            && frame.contains("Subagents 2")
             && editor_has_focus(&captured)
     })
     .await;
@@ -374,7 +374,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.resize(TERMINAL_WIDTH, TERMINAL_HEIGHT).await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the completed family", |frame| {
-        frame.contains("⏺ Subagents 2") && !family_rows_are_visible(frame)
+        frame.contains("Subagents 2") && !family_rows_are_visible(frame)
     })
     .await;
     assert!(!pty.frame().contains("reply completed"));
@@ -392,7 +392,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         .await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the family again", |frame| {
-        frame.contains("⏺ Subagents 2") && !family_rows_are_visible(frame)
+        frame.contains("Subagents 2") && !family_rows_are_visible(frame)
     })
     .await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");

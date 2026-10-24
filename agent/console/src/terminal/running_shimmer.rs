@@ -31,11 +31,6 @@ impl RunningShimmer {
         self.started_at = Instant::now();
     }
 
-    /// How long the sweep has run, the clock the working spinner beside it steps by too.
-    pub(super) fn elapsed_ms(&self) -> u64 {
-        self.started_at.elapsed().as_millis() as u64
-    }
-
     pub(super) fn append(&self, line: &mut RoleLine, text: &str, prefers_reduced_motion: bool) {
         self.append_at(
             line,

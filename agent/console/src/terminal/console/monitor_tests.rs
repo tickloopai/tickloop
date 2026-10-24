@@ -4554,25 +4554,26 @@ fn narrow_terminal_flashes_monitor_entry_once_without_overlay_or_focus_change() 
         console
             .refresh_monitor(auto_reveal_sources(chat, "goal"))
             .unwrap();
-        let since = {
-            let mut state = console.state.lock().unwrap();
-            assert!(!state.monitor_visible());
-            assert!(!state.monitor.overlay);
-            assert!(!state.monitor.focused);
-            let since = state.monitor.entry_flash_at_ms.unwrap();
-            assert!(state.next_row_clock(since).is_some());
-            let (lines, _, _) = state.styled_frame();
-            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
-                span.text == "◉ Monitor 1" && span.role == Some(Role::Permission)
-            }));
-            state.monitor.entry_flash_at_ms = Some(since.saturating_sub(10_000));
-            let (lines, _, _) = state.styled_frame();
-            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
-                span.text == "◉ Monitor 1" && span.role == Some(Role::MutedText)
-            }));
-            state.monitor.entry_flash_at_ms = Some(since);
-            since
-        };
+        let since =
+            {
+                let mut state = console.state.lock().unwrap();
+                assert!(!state.monitor_visible());
+                assert!(!state.monitor.overlay);
+                assert!(!state.monitor.focused);
+                let since = state.monitor.entry_flash_at_ms.unwrap();
+                assert!(state.next_row_clock(since).is_some());
+                let (lines, _, _) = state.styled_frame();
+                assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.text == "Monitor 1" && span.role == Some(Role::Permission)
+                }));
+                state.monitor.entry_flash_at_ms = Some(since.saturating_sub(10_000));
+                let (lines, _, _) = state.styled_frame();
+                assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.text == "Monitor 1" && span.role == Some(Role::MutedText)
+                }));
+                state.monitor.entry_flash_at_ms = Some(since);
+                since
+            };
         console
             .refresh_monitor(auto_reveal_sources(chat, "scheduled"))
             .unwrap();
@@ -5345,7 +5346,7 @@ fn monitor_entry_span(state: &mut State) -> RoleLine {
         .styled_frame()
         .0
         .into_iter()
-        .find(|line| line.text().contains("◉ Monitor "))
+        .find(|line| line.text().contains("Monitor "))
         .unwrap()
 }
 
@@ -5374,7 +5375,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
                 let entry = line
                     .spans
                     .iter()
-                    .find(|span| span.text.contains("◉ Monitor "))
+                    .find(|span| span.text.contains("Monitor "))
                     .unwrap();
                 let role = if expanded { Role::Permission } else { expected };
                 let has_background = state.display.theme().style(role).background.is_some();
@@ -5386,7 +5387,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
                 let label = resolved
                     .spans
                     .iter()
-                    .find(|span| span.text.contains("◉ Monitor "))
+                    .find(|span| span.text.contains("Monitor "))
                     .unwrap();
                 assert_eq!(
                     label.style.background,
@@ -5427,7 +5428,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
         monitor_entry_span(&mut state)
             .spans
             .iter()
-            .any(|span| span.text.contains("◉ Monitor ") && span.role == Some(Role::MutedText))
+            .any(|span| span.text.contains("Monitor ") && span.role == Some(Role::MutedText))
     );
     assert_eq!(
         state.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds()),
@@ -5783,7 +5784,7 @@ fn collapsed_monitor_flash_render_evidence() {
         let label = resolved
             .spans
             .iter()
-            .find(|span| span.text.contains("◉ Monitor "))
+            .find(|span| span.text.contains("Monitor "))
             .unwrap();
         let expected = if elapsed == 1300 {
             Role::MutedText

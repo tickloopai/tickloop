@@ -8249,13 +8249,7 @@ impl State {
                 .items
                 .iter()
                 .any(|item| item.id == FooterItemId::Agents))
-        .then(|| {
-            format!(
-                "{} {}",
-                self.display.glyph(Glyph::Subagents),
-                self.status_area.header_label(FooterItemId::Agents)
-            )
-        })
+        .then(|| self.status_area.header_label(FooterItemId::Agents))
         .filter(|label| display_width(label) + DIVIDER_ENTRY_GAP_COLUMNS + 2 <= self.width);
         let mut agents_entry_width = agents_entry
             .as_ref()
@@ -8654,11 +8648,7 @@ impl State {
                         )
                         .is_some())
             {
-                let label = format!(
-                    "{} Monitor {}",
-                    self.display.glyph(Glyph::ProtocolTick),
-                    self.monitor.total()
-                );
+                let label = format!("Monitor {}", self.monitor.total());
                 let label_width = display_width(&label);
                 if label_width + DIVIDER_ENTRY_GAP_COLUMNS + DIVIDER_EDGE_RULE_COLUMNS <= self.width
                 {

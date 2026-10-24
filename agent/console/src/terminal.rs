@@ -187,11 +187,11 @@ impl RunningActivity {
     ) -> Result<Vec<(String, Option<Role>)>, String> {
         let display = console.display_profile()?;
         let reduced_motion = display.preferences().prefers_reduced_motion;
-        let spinner = display.spinner_at(shimmer.elapsed_ms());
+        let dot = display.working_dot(tickloop_agent_base::private_fs::unix_time_milliseconds());
         if let Some(preview) = preview {
-            return Ok(preview.spans(console.conversation_width()?, spinner, reduced_motion));
+            return Ok(preview.spans(console.conversation_width()?, dot, reduced_motion));
         }
-        let mut row = style::RoleLine::role(spinner, Role::TickMark);
+        let mut row = style::RoleLine::role(dot.0, dot.1);
         row.push(" ", Some(Role::MutedText));
         shimmer.append(&mut row, &self.label, reduced_motion);
         let mut details = self
@@ -1450,22 +1450,20 @@ async fn open_saved_chat(
     })
 }
 
-/// The brand mark in block characters beside the startup banner: eight ticks round an empty
-/// centre, the 12 o'clock one in Tick Red. Nine columns by five rows is the smallest grid where
-/// the diagonal ticks still take two cells.
-const BANNER_MARK: [&[(&str, Role)]; 5] = [
-    &[
-        (" ▄  ", Role::Text),
-        ("█", Role::TickMark),
-        ("  ▄ ", Role::Text),
-    ],
-    &[("  ▀   ▀  ", Role::Text)],
-    &[("▀▀     ▀▀", Role::Text)],
-    &[(" ▄▀ ▄ ▀▄ ", Role::Text)],
-    &[("    ▀    ", Role::Text)],
+/// The brand mark beside the startup banner: the saddle net drawn in braille, sixteen columns
+/// by eight rows.
+const BANNER_MARK: [&str; 8] = [
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡤⠶⣄⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⡼⠁⣰⠛⡆⠀⠀",
+    "⠀⢀⣤⡀⠀⠀⠀⢀⡞⢁⡴⠃⠀⢹⡀⠀",
+    "⠀⠳⢤⣹⣦⣠⣶⣯⡴⠋⠀⠀⠀⠀⣇⠀",
+    "⠀⠀⠀⠀⢳⠀⠀⠀⢳⡀⠀⠀⠀⠀⡼⠀",
+    "⠀⠀⠀⠀⠈⡇⠀⠀⠀⣇⠀⠀⢀⡼⠁⠀",
+    "⠀⠀⠀⠀⠀⢹⡀⠀⠀⢸⡀⣠⠞⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠉⠓⠦⠖⠛⠁⠀⠀⠀⠀",
 ];
 /// The mark rows the banner's three lines of text sit beside, centring them on the mark.
-const BANNER_TEXT_FIRST_ROW: usize = 1;
+const BANNER_TEXT_FIRST_ROW: usize = 2;
 const BANNER_MARK_GAP: &str = "  ";
 
 /// Startup banner following Claude Code's condensed logo: the mark, then beside it the product
@@ -1531,10 +1529,7 @@ fn startup_banner_spans(
     ];
     let mut spans = Vec::new();
     for (row, mark) in BANNER_MARK.iter().enumerate() {
-        spans.extend(
-            mark.iter()
-                .map(|(text, role)| ((*text).into(), Some(*role))),
-        );
+        spans.push(((*mark).into(), Some(Role::BrandMark)));
         if let Some(text) = row
             .checked_sub(BANNER_TEXT_FIRST_ROW)
             .and_then(|line| text_lines.get(line))
@@ -8053,7 +8048,10 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(rows[0].glyph_role(), super::style::Role::Warning);
+        assert_eq!(
+            rows[0].glyph_role(super::display::DisplayProfile::default(), 0),
+            super::style::Role::Warning
+        );
         assert_eq!(rows[0].status_role(), super::style::Role::Warning);
     }
 

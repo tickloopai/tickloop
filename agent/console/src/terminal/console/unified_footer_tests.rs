@@ -373,8 +373,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
 }
 
 #[test]
-fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states() {
-    let robot = "⏺";
+fn subagents_label_preserves_divider_bounds_and_hints_in_both_states() {
     {
         let console = fixture();
         update(&console, vec![]);
@@ -387,7 +386,7 @@ fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states() {
                 Some(Uuid::from_u128(1)),
             )
             .unwrap();
-        let label = format!("{robot} Subagents 1");
+        let label = "Subagents 1";
         for collapsed in [false, true] {
             let rendered = frame(&console);
             let mut state = console.state.lock().unwrap();
@@ -397,7 +396,7 @@ fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states() {
             assert!(lower.starts_with(&format!("─ {label} ")), "{lower}");
             assert!(lower.ends_with("Context 21% used ─"), "{lower}");
             assert_eq!(display_width(lower), state.width);
-            assert_eq!(target.categories[0].0, 2..15);
+            assert_eq!(target.categories[0].0, 2..13);
             assert_eq!(
                 rendered.iter().any(|row| row.contains("child robot probe")),
                 !collapsed
@@ -452,9 +451,9 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
         }],
     );
     for (width, prefix, suffix) in [
-        (80, "─ ⏺ Subagents 1 ", "Context 21% used ─"),
-        (55, "⏺ Subagents 1 ", "Context 21% used ─"),
-        (53, "⏺ Subagents 1 ", "Context 21% used"),
+        (80, "─ Subagents 1 ", "Context 21% used ─"),
+        (53, "Subagents 1 ", "Context 21% used ─"),
+        (51, "Subagents 1 ", "Context 21% used"),
     ] {
         console.state.lock().unwrap().resize(width, 24);
         let rendered = frame(&console);
@@ -473,11 +472,11 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
                 .skip(label.start)
                 .take(label.len())
                 .collect::<String>(),
-            "⏺ Subagents 1"
+            "Subagents 1"
         );
         let toggle = state.monitor_toggle_target.as_ref().unwrap();
         let upper = &rendered[toggle.row];
-        assert!(upper.ends_with(" ◉ Monitor 1 ─"), "{upper:?}");
+        assert!(upper.ends_with(" Monitor 1 ─"), "{upper:?}");
         assert_eq!(toggle.columns.end, state.width - 2);
         assert_eq!(
             upper
@@ -485,17 +484,17 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
                 .skip(toggle.columns.start)
                 .take(toggle.columns.len())
                 .collect::<String>(),
-            "◉ Monitor 1"
+            "Monitor 1"
         );
     }
     console.set_agent_family(vec![], None).unwrap();
-    for (width, suffix) in [(16, " ◉ Monitor 1 ─"), (15, " ◉ Monitor 1")] {
+    for (width, suffix) in [(14, " Monitor 1 ─"), (13, " Monitor 1")] {
         console.state.lock().unwrap().resize(width, 24);
         let rendered = frame(&console);
         let state = console.state.lock().unwrap();
         let toggle = state.monitor_toggle_target.as_ref().unwrap();
         assert!(rendered[toggle.row].ends_with(suffix), "{rendered:?}");
-        assert_eq!(toggle.columns.len(), 11);
+        assert_eq!(toggle.columns.len(), 9);
     }
 }
 
@@ -521,7 +520,7 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
                 .unwrap();
             let mut state = console.state.lock().unwrap();
             state.display.set_theme(theme_name);
-            let label = format!("{} Subagents 1", state.display.glyph(Glyph::Subagents));
+            let label = "Subagents 1";
             for (collapsed, focused, entry_role) in [
                 (false, false, Role::Permission),
                 (true, false, Role::MutedText),
@@ -536,10 +535,10 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
                 let (styled, _, _) = state.normal_styled_frame();
                 let lower = styled
                     .iter()
-                    .find(|line| line.text().contains(&label))
+                    .find(|line| line.text().contains(label))
                     .unwrap();
                 let resolved = lower.resolve(state.display.theme(), state.width);
-                for (segment, role) in [(label.as_str(), entry_role), (text, context_role)] {
+                for (segment, role) in [(label, entry_role), (text, context_role)] {
                     assert!(
                         lower
                             .spans
