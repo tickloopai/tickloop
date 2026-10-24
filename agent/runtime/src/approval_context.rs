@@ -354,7 +354,11 @@ fn scheduled_task_evidence(
     operation: &OperationRecord,
     history: &ToolHistory,
 ) -> Option<ScheduledTaskEvidence> {
-    if operation.name != crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME {
+    if !matches!(
+        operation.name.as_str(),
+        crate::scheduled_tasks::tools::CRON_UPDATE_TOOL_NAME
+            | crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME
+    ) {
         return None;
     }
     let task_id: uuid::Uuid = operation.input.get("id")?.as_str()?.trim().parse().ok()?;

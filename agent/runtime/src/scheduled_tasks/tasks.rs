@@ -41,7 +41,7 @@ pub(crate) enum ScheduledTaskError {
     },
     #[error("a title must contain 1 to {MAX_SCHEDULED_TASK_TITLE_CHARS} characters")]
     BadTitle,
-    #[error("no scheduled task `{0}`")]
+    #[error("no scheduled task `{0}`: it does not exist or was deleted")]
     NotFound(Uuid),
     #[error("scheduled task `{0}` is not waiting for confirmation")]
     NotPending(Uuid),
@@ -204,6 +204,9 @@ pub(crate) struct TaskEdit {
     pub title: Option<Option<String>>,
     /// The task's schedule, zone and end, all given when any of them changes.
     pub timing: Option<TimingEdit>,
+    /// The Agent made the change where nobody is asked: the task waits for the user to
+    /// confirm it again, as one it created would.
+    pub reconfirm: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -354,8 +357,10 @@ impl ScheduledTasks {
 
     /// Changes a task in place: its id, creation and record of past runs stay. A new schedule,
     /// zone or end times the next run from `now`, and must keep to the host's least interval
-    /// and name a time before the task ends. A task waiting for confirmation is confirmed or
-    /// rejected instead; the self-paced loop's prompt and title change, but it has no schedule.
+    /// and name a time before the task ends. A change to be confirmed again leaves the task
+    /// waiting for confirmation, not timing; any other change to a task waiting for
+    /// confirmation is refused, as it is confirmed or rejected instead. The self-paced loop's
+    /// prompt and title change, but it has no schedule.
     pub(crate) fn edit(
         &mut self,
         id: &Uuid,
@@ -369,7 +374,7 @@ impl ScheduledTasks {
             .position(|task| task.id == *id)
             .ok_or(ScheduledTaskError::NotFound(*id))?;
         let mut task = self.tasks[index].clone();
-        if task.confirmation == Some(ScheduledTaskConfirmation::Pending) {
+        if task.confirmation == Some(ScheduledTaskConfirmation::Pending) && !edit.reconfirm {
             return Err(ScheduledTaskError::Pending(*id));
         }
         if let Some(prompt) = edit.prompt {
@@ -404,6 +409,10 @@ impl ScheduledTasks {
                     return Err(ScheduledTaskError::NeverRuns(cron));
                 }
             }
+        }
+        if edit.reconfirm {
+            task.confirmation = Some(ScheduledTaskConfirmation::Pending);
+            clear_timing(&mut task);
         }
         self.tasks[index] = task;
         Ok(&self.tasks[index])

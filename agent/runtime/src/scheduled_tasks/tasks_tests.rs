@@ -1322,6 +1322,7 @@ fn editing_keeps_the_task_and_times_a_new_schedule_from_now() {
                 prompt: Some("check again".into()),
                 title: Some(Some("Checks".into())),
                 timing: None,
+                reconfirm: false,
             },
             RULES,
             &local(22, 10, 30, 0),

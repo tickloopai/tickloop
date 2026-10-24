@@ -143,7 +143,13 @@ mod tests {
         let rule = |id: &str| policy.rules.iter().find(|rule| rule.id == id).unwrap();
         let scheduling = rule("builtin.soft_allow.claude_code_scheduling");
         assert_eq!(scheduling.kind, AutoRuleKind::SoftAllow);
-        for tool in ["CronCreate", "CronList", "CronDelete", "ScheduleWakeup"] {
+        for tool in [
+            "CronCreate",
+            "CronList",
+            "CronUpdate",
+            "CronDelete",
+            "ScheduleWakeup",
+        ] {
             assert!(scheduling.text.contains(tool), "missing {tool}");
         }
         for boundary in [

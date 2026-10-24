@@ -148,7 +148,7 @@ pub struct ToolPolicy {
     pub tasks: bool,
     /// GetGoal, CreateGoal and UpdateGoal, and goal continuations, for a root Agent.
     pub goals: bool,
-    /// CronCreate, CronList, CronDelete and ScheduleWakeup, for the root Agent only.
+    /// CronCreate, CronList, CronUpdate, CronDelete and ScheduleWakeup, for the root Agent only.
     pub scheduled_tasks: bool,
     /// Whether the scheduled task tools include ScheduleWakeup and the user's self-paced
     /// `/loop`; turning it off keeps CronCreate, CronList and CronDelete. Every constructor
@@ -258,15 +258,17 @@ impl ToolPolicy {
 /// Artifact writes are admitted by their target's provenance instead of a rule.
 /// CronCreate and ScheduleWakeup need no review there: a task the Agent creates waits for the
 /// user's confirmation unless the host trusts it, and rescheduling keeps the instruction the
-/// task was confirmed with. CronDelete only ends the Chat's own tasks, such as a monitoring
-/// task the Agent deletes in its run once its condition holds.
-const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 8] = [
+/// task was confirmed with. CronUpdate and CronDelete only change or end the Chat's own tasks,
+/// such as a monitoring task the Agent deletes in its run once its condition holds, and a task
+/// the Agent changes waits for confirmation again as a new one would.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 9] = [
     tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
     tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
     tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
     crate::mcp_tools::ARTIFACT_READ_TOOL,
     crate::scheduled_tasks::tools::CRON_CREATE_TOOL_NAME,
+    crate::scheduled_tasks::tools::CRON_UPDATE_TOOL_NAME,
     crate::scheduled_tasks::tools::CRON_DELETE_TOOL_NAME,
     crate::scheduled_tasks::tools::SCHEDULE_WAKEUP_TOOL_NAME,
 ];

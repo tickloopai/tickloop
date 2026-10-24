@@ -2094,15 +2094,31 @@ fn tool_descriptions_follow_the_hosts_terms() {
             .map(|tool| tool.name)
             .collect::<Vec<_>>()
     };
-    assert_eq!(names(true).len(), 4);
+    assert_eq!(names(true).len(), 5);
     assert_eq!(
         names(false),
         [
             tools::CRON_CREATE_TOOL_NAME,
             tools::CRON_LIST_TOOL_NAME,
+            tools::CRON_UPDATE_TOOL_NAME,
             tools::CRON_DELETE_TOOL_NAME
         ]
     );
+    let update = tools::definitions(
+        ToolTerms {
+            zone: chrono_tz::Asia::Shanghai,
+            ..ToolTerms::DEFAULT
+        },
+        true,
+    )
+    .into_iter()
+    .find(|tool| tool.name == tools::CRON_UPDATE_TOOL_NAME)
+    .unwrap()
+    .description;
+    assert!(update.contains("do not delete the task and create a new one"));
+    assert!(update.contains("local time zone, Asia/Shanghai"));
+    assert!(update.contains("waits for the user to confirm it again"));
+    assert!(standard.contains("use CronUpdate; do not delete it and create a new one"));
 }
 
 /// The host renames or rewords a task while its run is being handed over: the run still moves

@@ -1030,3 +1030,257 @@ async fn switching_the_time_zone_applies_to_tasks_created_after_it() {
     assert_eq!(hosted.time_zone, "Asia/Shanghai");
     agent.shutdown().await;
 }
+
+/// What a tool call the model made returned: its JSON, or its error text, and whether it failed.
+async fn call_result(agent: &Agent, chat: ChatId, call_id: &str) -> (String, bool) {
+    agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            tickloop_agent_protocol::Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == call_id => Some((content.text().into_owned(), *is_error)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no result of {call_id}"))
+}
+
+/// The model changes a task in place with CronUpdate: the id stays, a new schedule is timed
+/// from now in the user's zone, and a new prompt and title are what the next run uses; the
+/// result has the shape CronCreate's has.
+#[tokio::test(flavor = "multi_thread")]
+async fn cron_update_changes_a_task_in_place() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "create",
+            "CronCreate",
+            json!({"cron": "30 9 * * *", "prompt": "check the build", "title": "Build"}),
+        ),
+        text("Scheduled."),
+    ]));
+    let agent = host(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        |options| options.trust_model_scheduled_tasks = true,
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    complete_turn(&agent, chat, "Check the build at 9:30.").await;
+    let created = tasks(&agent, chat).await.remove(0);
+    let (created_result, _) = call_result(&agent, chat, "create").await;
+
+    model.enqueue(call(
+        "update",
+        "CronUpdate",
+        json!({"id": created.id, "cron": "20 9 * * *", "prompt": "check the release", "title": "Release"}),
+    ));
+    model.enqueue(text("Moved to 9:20."));
+    complete_turn(&agent, chat, "Make it 9:20, and check the release instead.").await;
+    let (updated_result, is_error) = call_result(&agent, chat, "update").await;
+    assert!(!is_error, "{updated_result}");
+    let fields = |text: &str| {
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fields(&updated_result), fields(&created_result));
+    let updated = tasks(&agent, chat).await.remove(0);
+    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.prompt, "check the release");
+    assert_eq!(updated.title.as_deref(), Some("Release"));
+    assert_eq!(updated.scheduled_for_ms, Some(ms(at(24, 9, 20))));
+    assert_eq!(updated.created_at_ms, created.created_at_ms);
+
+    model.enqueue(text("Checked the release."));
+    agent
+        .wake_scheduled_tasks(chat, updated.next_fire_at_ms.unwrap())
+        .await
+        .unwrap();
+    agent.quiesce(chat).await;
+    let last_prompt = model
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .messages
+        .clone();
+    assert!(
+        format!("{last_prompt:?}").contains("check the release"),
+        "the next run uses the new prompt"
+    );
+    agent.shutdown().await;
+}
+
+/// CronUpdate is refused for a schedule running more often than the host allows, a task the
+/// Chat does not have (deleted, or another Chat's), and a call that changes nothing.
+#[tokio::test]
+async fn cron_update_refuses_what_cron_create_would_and_missing_tasks() {
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let agent = host(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        |options| options.scheduled_task_min_interval = Some(HOUR),
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let other = agent.create_chat_without_folder().await.unwrap();
+    let task = agent
+        .schedule_task(chat, NewScheduledTask::new("0 * * * *", "check", true))
+        .await
+        .unwrap();
+    let elsewhere = agent
+        .schedule_task(other, NewScheduledTask::new("0 * * * *", "check", true))
+        .await
+        .unwrap();
+    for reply in [
+        call(
+            "often",
+            "CronUpdate",
+            json!({"id": task.id, "cron": "*/30 * * * *"}),
+        ),
+        call(
+            "foreign",
+            "CronUpdate",
+            json!({"id": elsewhere.id, "prompt": "not mine"}),
+        ),
+        call("nothing", "CronUpdate", json!({"id": task.id})),
+        text("Done."),
+    ] {
+        model.enqueue(reply);
+    }
+    complete_turn(&agent, chat, "Change things.").await;
+    let (often, is_error) = call_result(&agent, chat, "often").await;
+    assert!(
+        is_error && often.contains("at most once per hour"),
+        "{often}"
+    );
+    let (foreign, is_error) = call_result(&agent, chat, "foreign").await;
+    assert!(
+        is_error && foreign.contains("does not exist or was deleted"),
+        "{foreign}"
+    );
+    let (nothing, is_error) = call_result(&agent, chat, "nothing").await;
+    assert!(is_error && nothing.contains("at least one of"), "{nothing}");
+    assert_eq!(tasks(&agent, chat).await, std::slice::from_ref(&task));
+    assert_eq!(tasks(&agent, other).await, [elsewhere]);
+
+    agent.delete_scheduled_task(chat, task.id).await.unwrap();
+    model.enqueue(call(
+        "deleted",
+        "CronUpdate",
+        json!({"id": task.id, "prompt": "again"}),
+    ));
+    model.enqueue(text("Gone."));
+    complete_turn(&agent, chat, "Change the deleted one.").await;
+    let (deleted, is_error) = call_result(&agent, chat, "deleted").await;
+    assert!(
+        is_error && deleted.contains("does not exist or was deleted"),
+        "{deleted}"
+    );
+    agent.shutdown().await;
+}
+
+/// Where nobody is asked and the host does not trust the Agent's tasks, a task the model
+/// changes waits for the user to confirm it again, and times by its new schedule once confirmed.
+#[tokio::test]
+async fn a_task_the_model_changes_waits_for_confirmation_again() {
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let agent = host(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        |_| {},
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let task = agent
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("7 * * * *", "hourly check", true),
+        )
+        .await
+        .unwrap();
+    model.enqueue(call(
+        "update",
+        "CronUpdate",
+        json!({"id": task.id, "cron": "37 * * * *"}),
+    ));
+    model.enqueue(text("Changed; please confirm."));
+    complete_turn(&agent, chat, "Run it at :37 instead.").await;
+    let changed = tasks(&agent, chat).await.remove(0);
+    assert_eq!(changed.id, task.id);
+    assert_eq!(
+        changed.confirmation,
+        Some(ScheduledTaskConfirmation::Pending)
+    );
+    assert_eq!(changed.next_fire_at_ms, None);
+    assert_eq!(
+        changed.kind,
+        tickloop_agent_protocol::ScheduledTaskKind::Recurring {
+            cron: "37 * * * *".into()
+        }
+    );
+    agent
+        .decide_scheduled_task(chat, task.id, ScheduledTaskDecision::Confirm)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks(&agent, chat).await[0].scheduled_for_ms,
+        Some(ms(at(23, 10, 37)))
+    );
+    agent.shutdown().await;
+}
+
+/// In the run a task started, the model changes that task: it keeps its id and times by the
+/// new schedule, and the time its old schedule named next hands nothing over.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_run_a_task_started_can_change_it() {
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let agent = host(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        |options| options.trust_model_scheduled_tasks = true,
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let task = agent
+        .schedule_task(
+            chat,
+            NewScheduledTask::new("7 * * * *", "hourly check", true),
+        )
+        .await
+        .unwrap();
+    model.enqueue(call(
+        "slower",
+        "CronUpdate",
+        json!({"id": task.id, "cron": "0 */2 * * *"}),
+    ));
+    model.enqueue(text("Every two hours from now on."));
+    let handed = agent
+        .wake_scheduled_tasks(chat, task.next_fire_at_ms.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(handed.len(), 1);
+    agent.quiesce(chat).await;
+    let (result, is_error) = call_result(&agent, chat, "slower").await;
+    assert!(!is_error, "{result}");
+    let changed = tasks(&agent, chat).await.remove(0);
+    assert_eq!(changed.id, task.id);
+    assert_eq!(changed.scheduled_for_ms, Some(ms(at(23, 12, 0))));
+    let old_next = ms(at(23, 11, 59));
+    assert!(
+        agent
+            .wake_scheduled_tasks(chat, old_next)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the old schedule's 11:07 run does not come"
+    );
+    agent.shutdown().await;
+}

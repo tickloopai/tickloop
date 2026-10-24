@@ -45,12 +45,13 @@ CronDelete 没有该声明，沿用 `src/Tool.ts` 的非只读默认设定，由
 | GetGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex get_goal 的直接执行方式接入，不经过政策分类 |
 | CronCreate | Classified；Scheduling Soft allow | 仅当前 Chat、用户任务范围和期限内的安排；不预先批准将来的实际操作 |
 | ScheduleWakeup | Classified；Scheduling Soft allow | 当前 Chat 已获授权的自定节奏 `/loop` 的重排；任务达成或用户要求取消时停止本循环，不管理其他任务 |
+| CronUpdate | Classified；有条件的 Scheduling Soft allow | 原地修改当前 Chat 的一个任务（计划、重复方式、指令或标题）；本 Loop 有确切成功创建凭据的 Agent 任务可改；用户明确要求修改的任务可改；修改后仍限于用户授权的任务范围和期限；没有修改授权的用户任务仍受 Interfere With Workloads 阻拦 |
 | CronDelete | Classified；有条件的 Scheduling Soft allow | 本 Loop 有确切成功创建凭据的 Agent 任务可清理；用户明确要求取消的任务可删除；没有取消授权的用户任务仍受 Interfere With Workloads 阻拦 |
 | CreateGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex create_goal 的直接执行方式接入；用户明确要求 Goal、token budget 的约束继续保留在工具指令中 |
 | UpdateGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex update_goal 的直接执行方式接入；完成申请仍经过 Tickloop 自己的独立完成核对，blocked 的工具指令不变 |
 
-CronDelete 的 `scheduled_task` 宿主事实只描述该 Chat 内的确切目标 id、creator 和可验证的
-creation_call_id，以及经过大小限制的 schedule/prompt 详情，供取消请求解析目标。
+CronUpdate 与 CronDelete 的 `scheduled_task` 宿主事实只描述该 Chat 内的确切目标 id、creator 和可验证的
+creation_call_id，以及经过大小限制的 schedule/prompt 详情，供修改或取消请求解析目标。
 这些详情是数据，不是新的用户授权。创建凭据要求同一 Loop 中已完成的 CronCreate，以及宿主记录的成功结果中
 返回该目标 id；还须有对应的成功工具历史。只有 creator 为 Agent 才能用该清理例外。
 用户 `/loop` 所在回合创建的用户任务也不会被误算为 Agent 自建任务。查到 id、模型叙述、

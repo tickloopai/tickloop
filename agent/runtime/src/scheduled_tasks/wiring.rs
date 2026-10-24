@@ -101,6 +101,14 @@ impl NewScheduledTask {
     }
 }
 
+/// What a CronUpdate call changes; `None` leaves that part as it is.
+struct TaskUpdate {
+    cron: Option<String>,
+    prompt: Option<String>,
+    recurring: Option<bool>,
+    title: Option<String>,
+}
+
 /// A change the host makes to a task; `None` leaves that part as it is. A new schedule,
 /// recurrence, zone or end times the next run from now.
 #[derive(Clone, Debug, Default)]
@@ -718,6 +726,28 @@ impl Agent {
                 let listed: Vec<Value> = tasks.tasks().iter().map(describe).collect();
                 return tool_result(json!({ "tasks": listed }));
             }
+            ScheduledTaskCall::Update {
+                id,
+                cron,
+                prompt,
+                recurring,
+                title,
+            } => self
+                .update_from_tool(
+                    chat,
+                    receipt,
+                    &mut tasks,
+                    id,
+                    TaskUpdate {
+                        cron,
+                        prompt,
+                        recurring,
+                        title,
+                    },
+                    zone,
+                    now,
+                )
+                .map(|task| (describe(&task), Vec::new(), Vec::new())),
             ScheduledTaskCall::Delete { id } => match tasks.delete(&id) {
                 Some(task) => Ok((
                     json!({ "deleted": task.id }),
@@ -786,6 +816,70 @@ impl Agent {
         self.revoke_scheduled(chat, &deleted);
         self.persist_scheduled_tasks(change, chat, notices);
         tool_result(value)
+    }
+
+    /// CronUpdate: changes the Chat's task `id` in place, as the host's edit does, with a new
+    /// schedule read in the Harness's current zone. Where nobody is asked and the host does not
+    /// trust the Agent's tasks, the changed task waits for the user to confirm it again. A new
+    /// schedule, or waiting for confirmation, withdraws the run the task had queued.
+    #[allow(clippy::too_many_arguments)]
+    fn update_from_tool(
+        &self,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        tasks: &mut ScheduledTasks,
+        id: Uuid,
+        update: TaskUpdate,
+        zone: Zone,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduledTask, String> {
+        let before = tasks
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ScheduledTaskError::NotFound(id).to_string())?;
+        let current_cron = match &before.kind {
+            ScheduledTaskKind::Recurring { cron } | ScheduledTaskKind::OneShot { cron } => cron,
+            ScheduledTaskKind::SelfPaced { .. } => {
+                return Err(format!(
+                    "scheduled task `{id}` is the self-paced loop; reschedule it with {}",
+                    tools::SCHEDULE_WAKEUP_TOOL_NAME
+                ));
+            }
+        };
+        let timing = (update.cron.is_some() || update.recurring.is_some())
+            .then(|| update.cron.clone().unwrap_or_else(|| current_cron.clone()))
+            .map(|cron| {
+                let schedule = Schedule::parse(&cron).map_err(|error| error.to_string())?;
+                let recurring = update
+                    .recurring
+                    .unwrap_or(matches!(before.kind, ScheduledTaskKind::Recurring { .. }));
+                Ok::<_, String>(TimingEdit {
+                    cron_task: CronTask::new(schedule, recurring),
+                    zone,
+                    ends_at_ms: before.ends_at_ms,
+                })
+            })
+            .transpose()?;
+        let changes_timing = timing.is_some();
+        let reconfirm = self.creation(chat, receipt, None).needs_confirmation;
+        let edited = tasks
+            .edit(
+                &id,
+                TaskEdit {
+                    prompt: update.prompt,
+                    title: update.title.map(Some),
+                    timing,
+                    reconfirm,
+                },
+                self.scheduled_task_rules(),
+                &now,
+            )
+            .map_err(|error| error.to_string())?
+            .clone();
+        if changes_timing || reconfirm {
+            self.withdraw_deleted_task_runs(chat, std::slice::from_ref(&before));
+        }
+        Ok(edited)
     }
 
     /// The user schedules a task through the host's interface, as with `/loop`: it needs no
@@ -946,6 +1040,7 @@ impl Agent {
                         prompt: edit.prompt,
                         title: new_title,
                         timing,
+                        reconfirm: false,
                     },
                     rules,
                     &now,

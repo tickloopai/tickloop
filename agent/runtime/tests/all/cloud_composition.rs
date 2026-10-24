@@ -150,6 +150,7 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
             return text("Done.");
         }
         let task = tool_result(&request.messages, "create").map(|result| result["task"].clone());
+        let scheduled = tool_result(&request.messages, "schedule").map(|task| task["id"].clone());
         let steps: Vec<(&str, &str, Value)> = vec![
             (
                 "fetch",
@@ -221,6 +222,12 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
             ),
             ("schedules", "CronList", json!({})),
             (
+                "reschedule",
+                "CronUpdate",
+                json!({"id": scheduled.clone(), "cron": "17 9 * * *"}),
+            ),
+            ("unschedule", "CronDelete", json!({"id": scheduled})),
+            (
                 "wakeup",
                 "ScheduleWakeup",
                 json!({"delaySeconds": 1200, "reason": "waiting for the delivery", "prompt": "Check the delivery page."}),
@@ -235,10 +242,6 @@ fn every_tool_model(page: String) -> Arc<RoutedModel> {
         text("All tools used.")
     }))
 }
-
-/// The scheduled task tool a cloud Chat offers but reviews: nothing else checks a deletion,
-/// while a task the Agent creates waits for the user's confirmation.
-const REVIEWED_SCHEDULED_TASK_TOOLS: [&str; 1] = ["CronDelete"];
 
 /// Records whether any call was reviewed or put to a person.
 fn watch_admissions(agent: &Agent) -> Arc<Mutex<Vec<String>>> {
@@ -359,7 +362,6 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .tools
         .iter()
         .map(|tool| tool.name.clone())
-        .filter(|name| !REVIEWED_SCHEDULED_TASK_TOOLS.contains(&name.as_str()))
         .collect::<BTreeSet<_>>();
     let snapshot = agent.snapshot(root).await.unwrap();
     let called = snapshot

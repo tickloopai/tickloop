@@ -15,6 +15,7 @@ use tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTR
 
 pub(crate) const CRON_CREATE_TOOL_NAME: &str = "CronCreate";
 pub(crate) const CRON_LIST_TOOL_NAME: &str = "CronList";
+pub(crate) const CRON_UPDATE_TOOL_NAME: &str = "CronUpdate";
 pub(crate) const CRON_DELETE_TOOL_NAME: &str = "CronDelete";
 pub(crate) const SCHEDULE_WAKEUP_TOOL_NAME: &str = "ScheduleWakeup";
 
@@ -52,6 +53,7 @@ pub(crate) fn is_scheduled_task_tool(name: &str) -> bool {
         name,
         CRON_CREATE_TOOL_NAME
             | CRON_LIST_TOOL_NAME
+            | CRON_UPDATE_TOOL_NAME
             | CRON_DELETE_TOOL_NAME
             | SCHEDULE_WAKEUP_TOOL_NAME
     )
@@ -83,6 +85,13 @@ pub(crate) enum ScheduledTaskCall {
         title: Option<String>,
     },
     List,
+    Update {
+        id: Uuid,
+        cron: Option<String>,
+        prompt: Option<String>,
+        recurring: Option<bool>,
+        title: Option<String>,
+    },
     Delete {
         id: Uuid,
     },
@@ -114,8 +123,25 @@ struct ListInput {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UpdateInput {
+    id: String,
+    cron: Option<String>,
+    prompt: Option<String>,
+    recurring: Option<bool>,
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteInput {
     id: String,
+}
+
+/// A task id the model passed, with a message that says where ids come from.
+fn task_id(text: &str) -> Result<Uuid, String> {
+    text.trim().parse().map_err(|_| {
+        format!("`{text}` is not a task id; {CRON_LIST_TOOL_NAME} gives each task's id")
+    })
 }
 
 #[derive(Deserialize)]
@@ -153,15 +179,43 @@ pub(crate) fn parse(name: &str, input: &Value) -> Result<ScheduledTaskCall, Stri
             serde_json::from_value::<ListInput>(input.clone()).map_err(invalid)?;
             Ok(ScheduledTaskCall::List)
         }
+        CRON_UPDATE_TOOL_NAME => {
+            let input: UpdateInput = serde_json::from_value(input.clone()).map_err(invalid)?;
+            if input.cron.is_none()
+                && input.prompt.is_none()
+                && input.recurring.is_none()
+                && input.title.is_none()
+            {
+                return Err(format!(
+                    "{name} needs at least one of `cron`, `prompt`, `recurring` and `title`"
+                ));
+            }
+            if input
+                .prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.trim().is_empty())
+            {
+                return Err(format!("{name} needs a prompt to run"));
+            }
+            let title = input
+                .title
+                .as_deref()
+                .map(title)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Ok(ScheduledTaskCall::Update {
+                id: task_id(&input.id)?,
+                cron: input.cron,
+                prompt: input.prompt,
+                recurring: input.recurring,
+                title,
+            })
+        }
         CRON_DELETE_TOOL_NAME => {
             let input: DeleteInput = serde_json::from_value(input.clone()).map_err(invalid)?;
-            let id = input.id.trim().parse().map_err(|_| {
-                format!(
-                    "`{}` is not a task id; {CRON_LIST_TOOL_NAME} gives each task's id",
-                    input.id
-                )
-            })?;
-            Ok(ScheduledTaskCall::Delete { id })
+            Ok(ScheduledTaskCall::Delete {
+                id: task_id(&input.id)?,
+            })
         }
         SCHEDULE_WAKEUP_TOOL_NAME => {
             let input: WakeupInput = serde_json::from_value(input.clone()).map_err(invalid)?;
@@ -207,7 +261,7 @@ pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDe
         .join(", ");
     let frequency_limit = terms.rules.min_interval.map_or(String::new(), |min_interval| {
         format!(
-            "\n\nOn this host a recurring task runs at most {}: any two consecutive times its expression names must be at least that far apart, and {CRON_CREATE_TOOL_NAME} refuses a schedule that runs more often. One-shot tasks are not limited.",
+            "\n\nOn this host a recurring task runs at most {}: any two consecutive times its expression names must be at least that far apart, and {CRON_CREATE_TOOL_NAME} and {CRON_UPDATE_TOOL_NAME} refuse a schedule that runs more often. One-shot tasks are not limited.",
             rate(min_interval)
         )
     });
@@ -219,6 +273,11 @@ pub(crate) fn definitions(terms: ToolTerms, schedule_wakeup: bool) -> Vec<ToolDe
             )
         }
         None => "Recurring tasks run until they are deleted.".to_owned(),
+    };
+    let confirmation_on_change = if terms.confirms_agent_tasks {
+        " On a host without permission requests, a task you change waits for the user to confirm it again before it times again."
+    } else {
+        ""
     };
     let confirmation = if terms.confirms_agent_tasks {
         "\n\nOn a host without permission requests, a task you create waits for the user to confirm it before it starts timing; only the one task the user's /loop schedules, created exactly as its \"This /loop\" section gives it, does not."
@@ -257,7 +316,9 @@ A task runs only between turns: when it comes due while a turn is running, it wa
 
 {lifetime} A Chat holds at most {max} scheduled tasks.{confirmation}
 
-Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
+To change a task that exists, such as its time or its prompt, use {CRON_UPDATE_TOOL_NAME}; do not delete it and create a new one.
+
+Returns the task id, which {CRON_UPDATE_TOOL_NAME} and {CRON_DELETE_TOOL_NAME} take.",
                 max = tickloop_agent_protocol::MAX_SCHEDULED_TASKS_PER_CHAT,
                 zone = terms.zone.name(),
             ),
@@ -272,6 +333,24 @@ Returns the task id, which {CRON_DELETE_TOOL_NAME} takes.",
             name: CRON_LIST_TOOL_NAME.into(),
             description: format!("List this Chat's scheduled tasks with their ids, titles, schedules, time zones, next run times, prompts and paused status (only the user can pause or resume tasks), including tasks waiting for the user's confirmation and the self-paced /loop task {SCHEDULE_WAKEUP_TOOL_NAME} keeps. Each task keeps the time zone it was created in; tasks created now use the user's, {zone}.", zone = terms.zone.name()),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        },
+        ToolDefinition {
+            name: CRON_UPDATE_TOOL_NAME.into(),
+            description: format!(
+                "Change a scheduled task of this Chat in place, by its id as {CRON_CREATE_TOOL_NAME} or {CRON_LIST_TOOL_NAME} gave it: its schedule, whether it recurs, its prompt or its title. Use it whenever the user wants a task changed, such as \"move it to 9:20\"; do not delete the task and create a new one, which would give it a new id and break the user's links to it.
+
+Give the id and at least one field; fields left out stay as they are. A new `cron` or `recurring` is read in the user's local time zone, {zone}, and the next run is timed from now; the run already queued for the old time is withdrawn. The task keeps its id, its end and its lifetime rules.{frequency_limit}{confirmation_on_change} The self-paced /loop task is rescheduled with {SCHEDULE_WAKEUP_TOOL_NAME} instead.
+
+Returns the changed task, as {CRON_CREATE_TOOL_NAME} returns a new one.",
+                zone = terms.zone.name(),
+            ),
+            input_schema: json!({"type":"object","properties":{
+                "id":{"type":"string","description":"The task id, a UUID."},
+                "cron":{"type":"string","description":"A new standard 5-field cron expression in the user's local time zone: \"M H DoM Mon DoW\"."},
+                "prompt":{"type":"string","minLength":1,"description":"A new prompt to run at each scheduled time."},
+                "recurring":{"type":"boolean","description":"true runs at every time the expression names; false runs once at the next one, then deletes the task."},
+                "title":{"type":"string","minLength":1,"description":format!("A new short name the user sees for the task, at most {MAX_SCHEDULED_TASK_TITLE_CHARS} characters.")}
+            },"required":["id"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: CRON_DELETE_TOOL_NAME.into(),
