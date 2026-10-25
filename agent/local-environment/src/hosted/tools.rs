@@ -40,7 +40,7 @@ use crate::{
         HIDDEN_PLACEMENT, READ_WORKSPACE, TICK_CALL, TICK_DESCRIBE, TICK_MANAGE, TICK_READ,
     },
 };
-use tickloop_agent_protocol::{
+use tickloop_harness::protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, HostedMember,
     HostedMemberState, HostedProgramExit, HostedResources, HostedViewGrant, ToolDefinition,
     ToolResult,
@@ -140,9 +140,6 @@ struct HostedPrepared {
 #[derive(Clone)]
 pub struct HostedTickTools {
     daemon: DaemonControl,
-    shell_environment: std::sync::Arc<
-        std::sync::RwLock<Option<std::sync::Arc<crate::environment::local_shells::LocalShells>>>,
-    >,
     environment: Vec<(String, String)>,
     endpoint: HostEndpointIdentity,
     /// Data bindings of the Ticks each Chat owns; another Chat of this worker never shares one.
@@ -156,26 +153,15 @@ pub struct HostedTickTools {
 }
 
 impl HostedTickTools {
-    pub(crate) fn bind_shell_environment(
-        &self,
-        grants: std::sync::Arc<crate::environment::local_shells::LocalShells>,
-    ) {
-        *self.shell_environment.write().unwrap() = Some(grants);
-    }
-
-    pub(crate) fn shell_environment(
-        &self,
-    ) -> Option<std::sync::Arc<crate::environment::local_shells::LocalShells>> {
-        self.shell_environment.read().unwrap().clone()
-    }
-
     pub(crate) async fn prepare_input_bytes(
         &self,
         chat: ChatId,
         instance: &InstanceRef,
         data: &[u8],
     ) -> Result<PreparedHostCall, String> {
-        if data.is_empty() || data.len() > crate::environment::TERMINAL_INPUT_BYTES {
+        if data.is_empty()
+            || data.len() > tickloop_harness::runtime::environment::TERMINAL_INPUT_BYTES
+        {
             return Err("terminal input is empty or exceeds the input limit".into());
         }
         if self
@@ -209,9 +195,9 @@ impl HostedTickTools {
 
     pub(crate) fn resolved_intent(
         call: &PreparedHostCall,
-        intent: crate::environment::ExecutionIntent,
-    ) -> crate::environment::ExecutionIntent {
-        use crate::environment::{ExecutionIntent, OpenSpec, ViewPlacement};
+        intent: tickloop_harness::runtime::environment::ExecutionIntent,
+    ) -> tickloop_harness::runtime::environment::ExecutionIntent {
+        use tickloop_harness::runtime::environment::{ExecutionIntent, OpenSpec, ViewPlacement};
         match call
             .payload::<HostedPrepared>()
             .map(|prepared| &prepared.operation)
@@ -280,8 +266,8 @@ impl HostedTickTools {
         &self,
         chat: ChatId,
         operation: Uuid,
-    ) -> crate::environment::ExecutionReceipt {
-        use crate::environment::{
+    ) -> tickloop_harness::runtime::environment::ExecutionReceipt {
+        use tickloop_harness::runtime::environment::{
             ExecutionError, ExecutionReceipt, ExecutionResult, OpenedExecution,
         };
         let Ok(response) = self
@@ -342,7 +328,6 @@ impl HostedTickTools {
         Self {
             endpoint: daemon.host_endpoint(),
             daemon,
-            shell_environment: Default::default(),
             environment,
             bindings: std::sync::Arc::new(Mutex::new(HashMap::new())),
             views: None,
@@ -441,7 +426,7 @@ impl HostedTickTools {
         input: &Value,
         context: Option<&HostCallContext>,
     ) -> Result<PreparedHostCall, String> {
-        crate::tick_tools::check_call(name, input, self.views.is_some())?;
+        tickloop_harness::runtime::tick_tools::check_call(name, input, self.views.is_some())?;
         let folder = context.map(|context| context.folder.as_path());
         let mut external_declaration = None;
         let mut normalized_input = input.clone();
@@ -688,7 +673,7 @@ impl HostedTickTools {
                     Some(keys) => serde_json::from_value::<Vec<String>>(keys.clone())
                         .map_err(|_| "keys must be an array of key names")?,
                 };
-                let data = super::terminal_input::encode(text, &keys)?;
+                let data = tickloop_harness::runtime::terminal_input::encode(text, &keys)?;
                 let mut typed = Vec::new();
                 if let Some(text) = text {
                     typed.push(format!("text {text:?}"));
@@ -779,7 +764,7 @@ impl HostedTickTools {
             }
             _ => return Err(format!("unknown hosted Tick tool: {name}")),
         };
-        let mut facts = tickloop_agent_protocol::PreparedApprovalFacts {
+        let mut facts = tickloop_harness::protocol::PreparedApprovalFacts {
             normalized_input: normalized_input.clone(),
             ..Default::default()
         };
@@ -912,7 +897,7 @@ impl HostedTickTools {
             let approved = *executable;
             dispatch.revalidate_before_send(move || {
                 if PreparedProgram::of(Path::new(&path)).ok() != Some(approved) {
-                    return Err(crate::environment::ExecutionError::new(
+                    return Err(tickloop_harness::runtime::environment::ExecutionError::new(
                         "TargetChanged",
                         "the executable changed before dispatch; prepare and approve again",
                     ));
@@ -994,22 +979,26 @@ impl HostedTickTools {
                 };
                 if let Some(view) = view {
                     if let Some(dispatch) = dispatch {
-                        dispatch.confirm_opened(crate::environment::ExecutionResult {
-                            result: ToolResult {
-                                content: opened.result.to_string(),
-                                is_error: false,
-                                output_ref: None,
+                        dispatch.confirm_opened(
+                            tickloop_harness::runtime::environment::ExecutionResult {
+                                result: ToolResult {
+                                    content: opened.result.to_string(),
+                                    is_error: false,
+                                    output_ref: None,
+                                },
+                                opened: Some(
+                                    tickloop_harness::runtime::environment::OpenedExecution {
+                                        instance: opened.instance.clone(),
+                                        title: opened.title.clone(),
+                                        is_terminal: opened.is_terminal,
+                                    },
+                                ),
+                                shell: None,
+                                handoff: None,
                             },
-                            opened: Some(crate::environment::OpenedExecution {
-                                instance: opened.instance.clone(),
-                                title: opened.title.clone(),
-                                is_terminal: opened.is_terminal,
-                            }),
-                            shell: None,
-                            handoff: None,
-                        });
+                        );
                         if dispatch.check().is_err()
-                            && let crate::environment::ExecutionOutcome::Completed(result) =
+                            && let tickloop_harness::runtime::environment::ExecutionOutcome::Completed(result) =
                                 dispatch.interruption(operation)
                         {
                             return HostCallResult::CompletedWithEffect(
@@ -1162,7 +1151,7 @@ impl HostedTickTools {
     }
 
     /// The authority every hosted Tick call runs under: this worker's own Tickhost.
-    pub(crate) fn authority(&self) -> HostToolAuthority {
+    pub fn authority(&self) -> HostToolAuthority {
         HostToolAuthority::Native {
             endpoint: self.endpoint.clone(),
         }
@@ -1807,23 +1796,26 @@ fn completed(value: Value) -> HostCallResult {
 
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
-    fn local_tick_tools(&self) -> Option<std::sync::Arc<HostedTickTools>> {
-        Some(std::sync::Arc::new(self.clone()))
-    }
-
     fn is_concurrency_safe(&self, name: &str, _input: &Value) -> bool {
         matches!(
             name,
-            crate::tick_tools::TICK_READ | crate::tick_tools::TICK_DESCRIBE | READ_WORKSPACE
+            tickloop_harness::runtime::tick_tools::TICK_READ
+                | tickloop_harness::runtime::tick_tools::TICK_DESCRIBE
+                | READ_WORKSPACE
         )
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {
-        crate::tick_tools::definitions(self.views.is_some())
+        tickloop_harness::runtime::tick_tools::definitions(self.views.is_some())
     }
 
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
-        crate::tick_tools::validate_input(name, schema, input, self.views.is_some())
+        tickloop_harness::runtime::tick_tools::validate_input(
+            name,
+            schema,
+            input,
+            self.views.is_some(),
+        )
     }
 
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
@@ -1851,8 +1843,8 @@ impl HostToolProvider for HostedTickTools {
         name: &str,
         input: &Value,
     ) -> Result<Option<HostToolAuthority>, String> {
-        crate::tick_tools::check_call(name, input, self.views.is_some())?;
-        if crate::tick_tools::uses_herdr_layout(name, input) {
+        tickloop_harness::runtime::tick_tools::check_call(name, input, self.views.is_some())?;
+        if tickloop_harness::runtime::tick_tools::uses_herdr_layout(name, input) {
             return Ok(self
                 .views()?
                 .endpoint()?
@@ -1862,11 +1854,47 @@ impl HostToolProvider for HostedTickTools {
     }
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
-        let context = WorkspaceHostContext::from_environment().with_tickhost();
-        let context = match &self.packages {
-            Some(packages) => context.with_tick_packages(packages),
-            None => context,
-        };
+        let mut context = WorkspaceHostContext::from_environment().with_tickhost();
+        if let Some(packages) = &self.packages {
+            context.tick_packages = packages
+                .installed()
+                .map(|installed| {
+                    installed
+                        .packages
+                        .into_iter()
+                        .map(|package| {
+                            use tickloop_harness::runtime::host_tools::{
+                                WorkspacePackageLogin, WorkspaceTickPackage,
+                            };
+                            let login = match packages.login_state(&package) {
+                                tick_packages::LoginState::LoggedIn => {
+                                    WorkspacePackageLogin::LoggedIn
+                                }
+                                tick_packages::LoginState::LoggedOut => {
+                                    WorkspacePackageLogin::LoggedOut
+                                }
+                                tick_packages::LoginState::Expired => {
+                                    WorkspacePackageLogin::Expired
+                                }
+                                tick_packages::LoginState::NotRequired => {
+                                    WorkspacePackageLogin::NotRequired
+                                }
+                                tick_packages::LoginState::Unknown => {
+                                    WorkspacePackageLogin::Unknown
+                                }
+                            };
+                            WorkspaceTickPackage {
+                                login,
+                                executable: package.executable(),
+                                name: package.manifest.name,
+                                version: package.manifest.version,
+                                description: package.manifest.description,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         Some(if self.views.is_some() {
             context.with_herdr_views()
         } else {
@@ -1954,8 +1982,9 @@ impl HostToolProvider for HostedTickTools {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before dispatch".into());
         }
-        if crate::environment::tools::is_environment_call(call) {
-            return crate::environment::tools::revalidate_call(chat, call).await;
+        if tickloop_harness::runtime::environment::tools::is_environment_call(call) {
+            return tickloop_harness::runtime::environment::tools::revalidate_call(chat, call)
+                .await;
         }
         self.revalidate_native(call).await
     }
@@ -1971,8 +2000,9 @@ impl HostToolProvider for HostedTickTools {
                 "hosted Tick operation was cancelled before dispatch".into(),
             );
         }
-        if crate::environment::tools::is_environment_call(&call) {
-            return crate::environment::tools::execute_call(chat, call, cancel).await;
+        if tickloop_harness::runtime::environment::tools::is_environment_call(&call) {
+            return tickloop_harness::runtime::environment::tools::execute_call(chat, call, cancel)
+                .await;
         }
         self.execute_native(chat, call, cancel, None).await
     }
@@ -2107,7 +2137,7 @@ mod tests {
     async fn a_view_grant_whose_answer_was_lost_created_no_pane() {
         let directory = tempfile::Builder::new()
             .prefix("htv")
-            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let socket = directory.path().join("herdr.sock");
         let _herdr_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2147,7 +2177,7 @@ mod tests {
     async fn a_herdr_call_is_not_prepared_while_no_herdr_serves_its_socket() {
         let directory = tempfile::Builder::new()
             .prefix("hte")
-            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let chat = Uuid::new_v4();
         let herdr = std::sync::Arc::new(EmptyHerdr::default());
@@ -2183,7 +2213,7 @@ mod tests {
     async fn an_open_keeps_its_whole_command_under_a_bounded_title() {
         let directory = tempfile::Builder::new()
             .prefix("hto")
-            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let chat = Uuid::new_v4();
         let tools = HostedTickTools::new(

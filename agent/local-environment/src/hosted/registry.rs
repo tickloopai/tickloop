@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing};
 
-use tickloop_agent_base::private_fs::{
+use tickloop_harness::base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically, unix_time_milliseconds,
     verify_private_directory,
 };

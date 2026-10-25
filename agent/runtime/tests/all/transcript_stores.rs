@@ -10,7 +10,7 @@ use tickloop_agent_runtime::transcript::{
     TranscriptError, TranscriptStore,
 };
 use tickloop_agent_runtime::{
-    Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
+    Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::FolderEnvironment,
 };
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
@@ -331,7 +331,7 @@ fn local_agent(store: Arc<dyn TranscriptStore>, replies: usize) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models: ChosenModels::new(Arc::new(model)),
         },
         options(ToolPolicy::local()),

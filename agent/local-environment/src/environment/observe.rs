@@ -246,7 +246,7 @@ async fn follow_terminal(
     sender: watch::Sender<ExecutionUpdate>,
     mut samples: mpsc::Receiver<Sample>,
     authority: ExecutionAuthority,
-    chat: tickloop_agent_protocol::ChatId,
+    chat: tickloop_harness::protocol::ChatId,
 ) {
     let mut connection = TerminalConnection::new(connection);
     loop {

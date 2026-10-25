@@ -1,5 +1,7 @@
 use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture, TIMEOUT};
 use super::*;
+#[cfg(test)]
+use tickloop_local_environment::AgentLocalExt;
 
 const SUGGESTION_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 

@@ -23,10 +23,7 @@ pub use store::{
 };
 
 pub(crate) use outbox::{CachedMetadata, FLUSH_INTERVAL, Settled, TranscriptOutbox};
-pub(crate) use path::{
-    TICKHOST_RUNTIME_SUBDIRECTORY, private_family_temp_directory, private_project_temp_directory,
-    private_tickhost_directory,
-};
+pub(crate) use path::{private_family_temp_directory, private_project_temp_directory};
 pub(crate) use reader::{
     LoadedTranscript, assemble, load_compaction_ancestors, load_original_user_inputs,
 };

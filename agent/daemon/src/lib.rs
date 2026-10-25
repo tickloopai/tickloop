@@ -43,8 +43,9 @@ use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model}
 
 use tickloop_agent_access::{AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec};
 use tickloop_agent_protocol::OtherTickhost;
-use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
+use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams};
 use tickloop_agent_settings::UserSettings;
+use tickloop_local_environment::environment::LocalEnvironment;
 
 mod chunked;
 pub mod daemon_control;
@@ -84,7 +85,7 @@ struct WorkerBootstrap {
     epoch: Uuid,
     launch: LaunchSpec,
     /// The worker's private grant for hosted Tick requests to its daemon.
-    control: tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant,
+    control: tickloop_local_environment::hosted::worker_control::WorkerControlGrant,
     /// The transport limits the worker serves its daemon with.
     limits: AccessLimits,
     #[serde(default)]
@@ -100,7 +101,7 @@ struct ManagedWorker {
     pid: u32,
     build_id: Option<String>,
     endpoint: PathBuf,
-    grant: tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant,
+    grant: tickloop_local_environment::hosted::worker_control::WorkerControlGrant,
     launch: LaunchSpec,
     executable: PathBuf,
     link: Arc<std::sync::RwLock<upgrade::WorkerAddress>>,
@@ -379,9 +380,9 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let tickhost = std::env::current_exe()
         .and_then(|executable| executable.canonicalize())
         .map_err(|error| error.to_string())?
-        .with_file_name(tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE);
+        .with_file_name(tickloop_local_environment::hosted::controller::TICKHOST_EXECUTABLE);
     let controller = Arc::new(
-        tickloop_agent_runtime::hosted::controller::HostController::new(
+        tickloop_local_environment::hosted::controller::HostController::new(
             &directory,
             tickhost::paths::HostPaths::from_environment(),
             epoch,
@@ -571,16 +572,17 @@ pub async fn run_worker_with_models(
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
     let models = models(bootstrap.launch.config_root.clone())?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let agent = build_runtime_with_models(
+    let (agent, environment) = build_runtime_with_models(
         &bootstrap.launch,
         models,
         Some(bootstrap.control.clone()),
         &executable,
     )
     .await?;
-    let access = Arc::new(EmbeddedAgentAccess::for_worker(
+    let access = Arc::new(EmbeddedAgentAccess::for_worker_with_environment(
         agent.clone(),
         bootstrap.epoch,
+        environment,
     ));
     if let Some(checkpoint) = bootstrap.checkpoint {
         access
@@ -641,12 +643,14 @@ pub async fn run_worker_with_models(
 
 pub async fn build_runtime(
     launch: &LaunchSpec,
-    control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
+    control: Option<tickloop_local_environment::hosted::worker_control::WorkerControlGrant>,
 ) -> Result<Agent, String> {
     // One set of model clients per Worker: their private-history provenance lives as long as it.
     let models = Arc::new(LocalModelClients::new(launch.config_root.clone()));
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    build_runtime_with_models(launch, models, control, &executable).await
+    build_runtime_with_models(launch, models, control, &executable)
+        .await
+        .map(|(agent, _)| agent)
 }
 
 /// Build the same version-owned runtime with caller-supplied model clients. `executable` is the
@@ -656,9 +660,9 @@ pub async fn build_runtime(
 pub async fn build_runtime_with_models(
     launch: &LaunchSpec,
     models: Arc<dyn ModelClients>,
-    control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
+    control: Option<tickloop_local_environment::hosted::worker_control::WorkerControlGrant>,
     executable: &Path,
-) -> Result<Agent, String> {
+) -> Result<(Agent, LocalEnvironment), String> {
     let model = launch_model(launch.model.as_ref());
     let settings = launch
         .config_root
@@ -682,7 +686,7 @@ pub async fn build_runtime_with_models(
     // spawns and views the daemon grants and with its host's own authority; a worker in a Herdr
     // View can also show them in Herdr Panes.
     let views = launch.host_work_context.as_ref().map(|work| {
-        tickloop_agent_runtime::hosted::views::HerdrViews::new(
+        tickloop_local_environment::hosted::views::HerdrViews::new(
             tickhost_connect::layout::HerdrLayout::new(
                 tickhost_connect::herdr::HerdrContext::without_view(work.socket.clone()),
             ),
@@ -690,8 +694,8 @@ pub async fn build_runtime_with_models(
         )
     });
     let hosted = control.as_ref().map(|grant| {
-        let tools = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
-            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
+        let tools = tickloop_local_environment::hosted::tools::HostedTickTools::new(
+            tickloop_local_environment::hosted::worker_control::DaemonControl::new(grant.clone()),
             launch
                 .environment
                 .iter()
@@ -718,7 +722,9 @@ pub async fn build_runtime_with_models(
     let environment = match (&control, &hosted) {
         (Some(grant), Some(hosted)) => LocalEnvironment::with(
             Arc::new(
-                tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
+                tickloop_local_environment::hosted::worker_control::DaemonControl::new(
+                    grant.clone(),
+                ),
             ),
             hosted.clone(),
         ),
@@ -727,7 +733,7 @@ pub async fn build_runtime_with_models(
     let agent = Agent::with_seams(
         HarnessSeams {
             transcripts,
-            environment: Some(Arc::new(environment)),
+            environment: Some(Arc::new(environment.clone())),
             models,
         },
         HarnessOptions {
@@ -742,11 +748,22 @@ pub async fn build_runtime_with_models(
         },
     )
     .map_err(|error| error.to_string())?;
+    environment.install(&agent);
     use tickloop_agent_runtime::tick_adapter::TickAdapters;
     let tick_tools = hosted
         .clone()
         .map(|hosted| hosted as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>);
-    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), hosted));
+    let adapters = Arc::new(TickAdapters::builtin(
+        agent.clone(),
+        hosted.map(|tools| {
+            Arc::new(
+                tickloop_agent_runtime::tick_stream::HostedTickStream::with_environment(
+                    Arc::new(environment.clone()),
+                    tools.authority(),
+                ),
+            ) as _
+        }),
+    ));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = tickloop_agent_artifacts::ArtifactClient::new(root)
@@ -764,7 +781,7 @@ pub async fn build_runtime_with_models(
             .install_host_tools(tick_tools)
             .map_err(|error| format!("cannot install Tick tools: {error}"))?;
     }
-    Ok(agent)
+    Ok((agent, environment))
 }
 
 fn validate_daemon_lock_path(lock: &File, path: &Path) -> Result<(), String> {

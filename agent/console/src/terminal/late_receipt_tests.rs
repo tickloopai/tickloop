@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tickloop_agent_daemon::EmbeddedAgentAccess;
+use tickloop_local_environment::AgentLocalExt;
 use uuid::Uuid;
 
 use tickloop_agent_access::{

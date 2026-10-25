@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { checkBoundaries } from "./check-boundaries.mjs";
 
 function metadata(edges) {
@@ -57,4 +58,18 @@ test("a migration exception permits only the recorded dependency kind and target
 
 test("new workspace packages must be classified", () => {
   assert.ok(checkBoundaries(metadata([["unclassified", "engine"]]), policy).includes("Unclassified workspace package: unclassified"));
+});
+
+
+test("Harness cannot depend on local Tickhost or package storage in any dependency kind", () => {
+  const actual = JSON.parse(readFileSync(new URL("./dependency-boundaries.json", import.meta.url), "utf8"));
+  const harness = Object.entries(actual.layers).filter(([, layer]) => ["harness", "facade"].includes(layer));
+  for (const [from] of harness) {
+    for (const to of ["tickloop-tickhost", "tickloop-tickhost-connect", "tickloop-tick-packages"]) {
+      for (const kind of ["normal", "build", "dev"]) {
+        const edgePolicy = { ...actual, exceptions: actual.exceptions.filter(edge => edge.from === from && edge.to === to && edge.kind === kind) };
+        assert.ok(checkBoundaries(metadata([[from, to, kind === "normal" ? null : kind]]), edgePolicy).some(error => error.startsWith(`${from} -> ${to} (`)), `${from} must reject ${to} (${kind})`);
+      }
+    }
+  }
 });

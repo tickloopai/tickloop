@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     Delivery, ParentSelection, TurnOp, TurnOutcome, TurnRequest, UserMessage,
-    environment::LocalEnvironment,
+    environment::FolderEnvironment,
 };
 use tickloop_agent_transcript::{InterruptedBy, ResponseEnding, ResponseState};
 
@@ -149,7 +149,7 @@ async fn repeated_turns_leave_no_instance_or_task_behind() {
                 .unwrap(),
         );
         let environment: Option<Arc<dyn ExecutionEnvironment>> =
-            has_folder.then(|| Arc::new(LocalEnvironment::bare()) as _);
+            has_folder.then(|| Arc::new(FolderEnvironment::bare()) as _);
         let agent = harness(
             Some(store),
             environment,
@@ -216,7 +216,7 @@ async fn quiesce_cancels_a_title_request_still_running_after_ten_seconds() {
     });
     let agent = harness(
         None,
-        Some(Arc::new(LocalEnvironment::bare())),
+        Some(Arc::new(FolderEnvironment::bare())),
         model.clone(),
     );
     let chat = agent.create_chat(folder.path().into()).await.unwrap();
@@ -250,7 +250,7 @@ async fn shutdown_waits_for_a_submission_admitted_before_it_registered_its_run()
     let folder = tempfile::tempdir().unwrap();
     let agent = harness(
         None,
-        Some(Arc::new(LocalEnvironment::bare())),
+        Some(Arc::new(FolderEnvironment::bare())),
         Arc::new(ScriptedModel::new(vec![text("answer")])),
     );
     let chat = agent.create_chat(folder.path().into()).await.unwrap();
@@ -319,7 +319,7 @@ fn composed(environment: bool, options: HarnessOptions) -> Result<Agent, AgentEr
     Agent::with_seams(
         HarnessSeams {
             transcripts: None,
-            environment: environment.then(|| Arc::new(LocalEnvironment::bare()) as _),
+            environment: environment.then(|| Arc::new(FolderEnvironment::bare()) as _),
             models: ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
         },
         options,

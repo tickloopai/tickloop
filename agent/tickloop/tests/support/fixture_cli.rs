@@ -6,7 +6,7 @@ use std::{
     sync::OnceLock,
 };
 
-use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
+use tickloop_local_environment::hosted::controller::TICKHOST_EXECUTABLE;
 
 /// The fixture's name as the product CLI; as [`TICKHOST_EXECUTABLE`] it runs the Tickhost.
 const TICKLOOP_EXECUTABLE: &str = "tickloop";

@@ -52,6 +52,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 vt100 = "0.16.2"
 
 [dev-dependencies]
+tickloop-local-environment = { path = "../local-environment" }
 tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 jsonschema = { version = "0.56", default-features = false }
 portable-pty = "0.9"

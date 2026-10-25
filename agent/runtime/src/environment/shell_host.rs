@@ -141,7 +141,7 @@ impl ShellHost for EnvironmentShellHost {
     }
 }
 
-pub(super) struct PortShellProcess {
+pub struct PortShellProcess {
     port: Arc<dyn ExecutionPort>,
     authority: ExecutionAuthority,
     instance: InstanceRef,
@@ -155,7 +155,7 @@ pub(super) struct PortShellProcess {
 }
 
 impl PortShellProcess {
-    pub(super) fn new(
+    pub fn new(
         port: Arc<dyn ExecutionPort>,
         authority: ExecutionAuthority,
         status: ShellStatus,
@@ -358,7 +358,7 @@ fn unknown_exit(reason: &str) -> ShellExit {
     }
 }
 
-pub(super) fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
+pub fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
     ShellSpec {
         operation: launch.operation_id,
         shell: launch.shell.to_string_lossy().into_owned(),
@@ -369,7 +369,7 @@ pub(super) fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
     }
 }
 
-pub(super) async fn prepare_shell(
+pub async fn prepare_shell(
     port: Arc<dyn ExecutionPort>,
     authority: ExecutionAuthority,
     request: ShellPreparationRequest,
@@ -443,7 +443,7 @@ impl PreparedShellStart for PreparedEnvironmentShell {
     }
 }
 
-pub(super) async fn prepare_stop(
+pub async fn prepare_stop(
     port: Arc<dyn ExecutionPort>,
     authority: ExecutionAuthority,
     task: uuid::Uuid,
@@ -490,7 +490,7 @@ impl PreparedShellStop for PreparedEnvironmentStop {
     }
 }
 
-pub(super) fn start_refusal(error: ExecutionError) -> ShellStartError {
+pub fn start_refusal(error: ExecutionError) -> ShellStartError {
     ShellStartError::NotStarted(if error.code == "Cancelled" {
         ToolError::Cancelled
     } else {
@@ -512,7 +512,10 @@ impl CurrentLocalShellHost {
             .agent
             .upgrade()
             .ok_or_else(|| ToolError::Rejected("Shell owner is unavailable".into()))?;
-        Ok(agent.shell_tasks().for_chat(self.chat))
+        Ok(agent
+            .shell_runtime()
+            .map(|runtime| runtime.for_chat(self.chat))
+            .unwrap_or_else(|| Arc::new(UnavailableShellHost)))
     }
 }
 
@@ -548,5 +551,18 @@ impl ShellHost for CurrentLocalShellHost {
         operation: uuid::Uuid,
     ) -> Result<Option<serde_json::Value>, ToolError> {
         self.current()?.retained_handoff(operation).await
+    }
+}
+
+struct UnavailableShellHost;
+#[async_trait]
+impl ShellHost for UnavailableShellHost {
+    fn is_available(&self) -> bool {
+        false
+    }
+    async fn start(&self, _: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
+        Err(ShellStartError::NotStarted(ToolError::Rejected(
+            "this Agent has no Shell execution host".into(),
+        )))
     }
 }

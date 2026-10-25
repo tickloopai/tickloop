@@ -1,4 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
+#[cfg(test)]
+use tickloop_local_environment::AgentLocalExt;
 
 use tokio::sync::Mutex;
 use uuid::Uuid;

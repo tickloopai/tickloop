@@ -1,4 +1,5 @@
 use std::{path::Path, process::Command, sync::Arc};
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::json;
 use tickloop_agent_protocol::{Decision, EventKind, ExecutionMode, PermissionPolicy};

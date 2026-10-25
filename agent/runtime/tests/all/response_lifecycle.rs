@@ -19,7 +19,7 @@ use tickloop_agent_runtime::transcript::{
 };
 use tickloop_agent_runtime::{
     Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, ParentSelection, TurnOp,
-    TurnRequest, UserMessage, environment::LocalEnvironment,
+    TurnRequest, UserMessage, environment::FolderEnvironment,
 };
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
 use tickloop_agent_test_support::{call, config, next_event, text};
@@ -152,7 +152,7 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {

@@ -16,9 +16,6 @@ const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
 const DEFAULT_TEMP_DIRECTORY: &str = "/tmp";
 const PRIVATE_TEMP_DIRECTORY_PREFIX: &str = "tickloop-private-";
 const FAMILY_TEMP_SUBDIRECTORY: &str = "sessions";
-const PRIVATE_TICKHOST_PREFIX: &str = "tickhost-";
-/// Where in its directory an Agent's own Tickhost keeps its runtime files.
-pub(crate) const TICKHOST_RUNTIME_SUBDIRECTORY: &str = "host";
 
 /// `<root>/projects/<project directory name>`. The project directory name follows Claude Code: the
 /// canonical path, NFC-normalized, with non-alphanumeric characters replaced; when the working
@@ -42,32 +39,6 @@ pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirect
     private_temp_root()
         .join(FAMILY_TEMP_SUBDIRECTORY)
         .join(root_chat_id.to_string())
-}
-
-/// `<temp dir>/tickloop-private-<uid>/tickhost-<random>`: the private runtime directory of the
-/// Tickhost used by an Agent with no daemon that has its own Tickhost installed (such as in tests),
-/// one per installation. Falls back to the default `/tmp` when the temp dir is too long to fit the
-/// socket inside it.
-pub(crate) fn private_tickhost_directory() -> PrivateDirectory {
-    const NAME_CHARACTERS: usize = 8;
-    let name = format!(
-        "{PRIVATE_TICKHOST_PREFIX}{}",
-        &tickloop_ids::random_token()[..NAME_CHARACTERS]
-    );
-    let preferred = private_temp_root().join(&name);
-    let socket = preferred
-        .path()
-        .join(TICKHOST_RUNTIME_SUBDIRECTORY)
-        .join(tickhost::paths::SOCKET_NAME);
-    if socket.as_os_str().len() <= tickhost::paths::MAX_SOCKET_PATH_BYTES {
-        return preferred;
-    }
-    let base = PathBuf::from(DEFAULT_TEMP_DIRECTORY);
-    PrivateDirectory::anchored(
-        base.canonicalize().unwrap_or(base),
-        format!("{PRIVATE_TEMP_DIRECTORY_PREFIX}{}", current_uid()),
-    )
-    .join(name)
 }
 
 fn private_temp_root() -> PrivateDirectory {

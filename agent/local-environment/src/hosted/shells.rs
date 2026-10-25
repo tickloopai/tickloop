@@ -21,8 +21,8 @@ use tickhost::{
     },
 };
 use tickhost_connect::host_error::HostError;
-use tickloop_agent_protocol::{CommandState, HostedViewGrant};
-use tickloop_agent_tools::{
+use tickloop_harness::protocol::{CommandState, HostedViewGrant};
+use tickloop_harness::tools::{
     ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError, ToolError,
 };
 use tokio::sync::{Mutex, OnceCell, watch};
@@ -32,7 +32,6 @@ use super::{
     controller::HostController,
     worker_control::{DaemonControl, IssuedSpawn, WorkerRequest},
 };
-use crate::WeakAgent;
 
 /// How often a worker checks whether the Monitor still lists an ended command it keeps.
 const MONITOR_LISTING_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -122,7 +121,7 @@ impl ShellGrants for NoDaemon {
 /// directory, under an epoch and worker identity of its own; they let an Agent without a daemon
 /// run and show commands in tests.
 pub struct OwnTickhost {
-    directory: tickloop_agent_base::private_fs::PrivateDirectory,
+    directory: tickloop_harness::base::private_fs::PrivateDirectory,
     worker: Uuid,
     idle_timeout: Duration,
     controller: OnceCell<HostController>,
@@ -136,7 +135,7 @@ impl OwnTickhost {
     /// A Tickhost that forgets an ended command nobody holds or views after `idle_timeout`.
     pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
         Self {
-            directory: crate::transcript::private_tickhost_directory(),
+            directory: crate::paths::private_tickhost_directory(),
             worker: tickloop_ids::generate(),
             idle_timeout,
             controller: OnceCell::new(),
@@ -163,7 +162,7 @@ impl OwnTickhost {
                         runtime: self
                             .directory
                             .path()
-                            .join(crate::transcript::TICKHOST_RUNTIME_SUBDIRECTORY),
+                            .join(crate::paths::TICKHOST_RUNTIME_SUBDIRECTORY),
                     },
                     tickloop_ids::generate(),
                     self.idle_timeout,
@@ -222,7 +221,7 @@ pub struct ShellTasks {
     available: std::sync::atomic::AtomicBool,
     grants: RwLock<Arc<dyn ShellGrants>>,
     /// The Agent whose Monitors decide how long an ended command stays viewable.
-    agent: OnceLock<WeakAgent>,
+    retention: OnceLock<Arc<dyn tickloop_harness::tools::ShellRetention>>,
     pending_handoffs: Mutex<Vec<Arc<Mutex<tickhost::shell::ShellStops>>>>,
     retained_handoffs:
         std::sync::Mutex<std::collections::HashMap<Uuid, (Uuid, tickhost::shell::ShellHandoff)>>,
@@ -256,7 +255,7 @@ impl ShellTasks {
         Ok(())
     }
 
-    pub(crate) fn without_grants() -> Arc<Self> {
+    pub fn without_grants() -> Arc<Self> {
         let tasks = Self::new(Arc::new(NoDaemon));
         tasks
             .available
@@ -269,14 +268,10 @@ impl ShellTasks {
             available: std::sync::atomic::AtomicBool::new(true),
             execution_environment: Default::default(),
             grants: RwLock::new(grants),
-            agent: OnceLock::new(),
+            retention: OnceLock::new(),
             pending_handoffs: Mutex::new(Vec::new()),
             retained_handoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
-    }
-
-    pub(crate) fn follow_monitor(&self, agent: WeakAgent) {
-        let _ = self.agent.set(agent);
     }
 
     /// Keeps `chat`'s ended command `task` on its spawner connection, which keeps the Tickhost
@@ -290,42 +285,25 @@ impl ShellTasks {
         connection: Arc<Mutex<tickhost::shell::ShellStops>>,
         handoff: tickhost::shell::ShellHandoff,
     ) {
-        let Some(agent) = self.agent.get().cloned() else {
-            return;
-        };
-        let Some(owner) = agent.upgrade() else {
+        let Some(retention) = self.retention.get().cloned() else {
             return;
         };
         self.retained_handoffs
             .lock()
             .unwrap()
             .insert(task, (chat, handoff));
-        let tasks = self.clone();
-        owner.inner.tasks.spawn(async move {
-            loop {
-                let Some(listing) = agent.upgrade() else {
-                    tasks.retained_handoffs.lock().unwrap().remove(&task);
-                    drop(connection);
-                    return;
-                };
-                let guard = listing.inner.upgrade_gate.clone().read_owned().await;
-                if listing.inner.shutdown.is_cancelled()
-                    || !listing.monitor_may_list_shell(chat.into(), task).await
-                {
-                    tasks.retained_handoffs.lock().unwrap().remove(&task);
-                    drop(connection);
-                    return;
-                }
-                // Waiting holds no Agent, so an Agent dropped meanwhile closes the connection.
-                let shutdown = listing.inner.shutdown.clone();
-                drop(guard);
-                drop(listing);
-                tokio::select! {
-                    _ = shutdown.cancelled() => {},
-                    _ = tokio::time::sleep(MONITOR_LISTING_CHECK_INTERVAL) => {}
-                }
+        let held = RetainedShell {
+            tasks: self.clone(),
+            task,
+            _connection: connection,
+        };
+        let observer = retention.clone();
+        retention.spawn(Box::pin(async move {
+            let _held = held;
+            while observer.is_retained(chat, task).await {
+                tokio::time::sleep(MONITOR_LISTING_CHECK_INTERVAL).await;
             }
-        });
+        }));
     }
 
     /// Replaces who grants later spawns and views: a worker's daemon, or a test's own Tickhost.
@@ -611,8 +589,8 @@ impl ShellProcess for TickhostProcess {
     async fn stop_checked(
         &mut self,
         reason: &str,
-        before_dispatch: Option<&tickloop_agent_tools::ShellStopAdmission>,
-    ) -> Result<(), tickloop_agent_tools::ShellStopError> {
+        before_dispatch: Option<&tickloop_harness::tools::ShellStopAdmission>,
+    ) -> Result<(), tickloop_harness::tools::ShellStopError> {
         if let Some(stops) = &mut self.stops {
             let mut stops = stops.lock().await;
             if let Some(admit) = before_dispatch {
@@ -620,12 +598,42 @@ impl ShellProcess for TickhostProcess {
             }
             stops.stop(reason).await.map_err(|error| {
                 if error.dispatched {
-                    tickloop_agent_tools::ShellStopError::OutcomeUnknown(error.to_string())
+                    tickloop_harness::tools::ShellStopError::OutcomeUnknown(error.to_string())
                 } else {
-                    tickloop_agent_tools::ShellStopError::NotDispatched(error.to_string())
+                    tickloop_harness::tools::ShellStopError::NotDispatched(error.to_string())
                 }
             })?;
         }
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl tickloop_harness::tools::ShellRuntime for ShellTasks {
+    fn attach(&self, retention: Arc<dyn tickloop_harness::tools::ShellRetention>) {
+        let _ = self.retention.set(retention);
+    }
+    fn for_chat(self: Arc<Self>, chat: Uuid) -> Arc<dyn ShellHost> {
+        ShellTasks::for_chat(&self, chat)
+    }
+    async fn commit_handoffs(&self) -> Result<(), String> {
+        ShellTasks::commit_handoffs(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct RetainedShell {
+    tasks: Arc<ShellTasks>,
+    task: Uuid,
+    _connection: Arc<Mutex<tickhost::shell::ShellStops>>,
+}
+impl Drop for RetainedShell {
+    fn drop(&mut self) {
+        self.tasks
+            .retained_handoffs
+            .lock()
+            .unwrap()
+            .remove(&self.task);
     }
 }

@@ -9,6 +9,7 @@ use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_settings::local_agent::opened_agent;
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::{ScriptedModel, next_event, persisted_config as config, text};
+use tickloop_local_environment::AgentLocalExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

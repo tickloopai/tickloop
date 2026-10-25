@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use tickloop_agent_protocol::{EventKind, ExecutionMode};
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
@@ -216,7 +217,7 @@ impl ScopedHostSocket {
 
     /// The Tick tools of a worker in the Herdr View this socket serves, with a daemon that runs
     /// no Ticks for it.
-    fn tools(&self) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
+    fn tools(&self) -> tickloop_local_environment::hosted::tools::HostedTickTools {
         self.tools_behind(&self.path.with_extension("daemon.sock"))
     }
 
@@ -224,13 +225,15 @@ impl ScopedHostSocket {
     fn tools_behind(
         &self,
         daemon: &std::path::Path,
-    ) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
-        tick_tools(daemon).with_herdr_views(tickloop_agent_runtime::hosted::views::HerdrViews::new(
-            tickhost_connect::layout::HerdrLayout::new(
-                tickhost_connect::herdr::HerdrContext::without_view(self.path.clone()),
+    ) -> tickloop_local_environment::hosted::tools::HostedTickTools {
+        tick_tools(daemon).with_herdr_views(
+            tickloop_local_environment::hosted::views::HerdrViews::new(
+                tickhost_connect::layout::HerdrLayout::new(
+                    tickhost_connect::herdr::HerdrContext::without_view(self.path.clone()),
+                ),
+                std::path::Path::new("/tmp/unused/tickloop"),
             ),
-            std::path::Path::new("/tmp/unused/tickloop"),
-        ))
+        )
     }
 
     fn install(&self, agent: &Agent) {
@@ -245,9 +248,11 @@ impl ScopedHostSocket {
 
 /// Tick tools behind the daemon at `daemon`, which answers every request with a listing of no
 /// Ticks.
-fn tick_tools(daemon: &std::path::Path) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
+fn tick_tools(
+    daemon: &std::path::Path,
+) -> tickloop_local_environment::hosted::tools::HostedTickTools {
     use tickhost_connect::hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame};
-    use tickloop_agent_runtime::hosted::{
+    use tickloop_local_environment::hosted::{
         tools::HostedTickTools,
         worker_control::{DaemonControl, WorkerControlGrant},
     };

@@ -547,7 +547,7 @@ mod tests {
             let agent = Agent::with_seams(
                 crate::HarnessSeams {
                     transcripts: None,
-                    environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+                    environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
                     models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("Done")]))),
                 },
                 crate::local_options(

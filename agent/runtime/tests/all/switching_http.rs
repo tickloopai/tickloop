@@ -1,6 +1,7 @@
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_settings::local_agent::opened_agent;
 use tickloop_agent_test_support::model_http_support;
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};

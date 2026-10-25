@@ -17,13 +17,11 @@ use tickhost_connect::{
     layout::HerdrLayout,
 };
 use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
-use tickloop_agent_runtime::{
-    host_tools::HostToolProvider,
-    hosted::{
-        tools::HostedTickTools,
-        views::HerdrViews,
-        worker_control::{DaemonControl, WorkerControlGrant},
-    },
+use tickloop_agent_runtime::host_tools::HostToolProvider;
+use tickloop_local_environment::hosted::{
+    tools::HostedTickTools,
+    views::HerdrViews,
+    worker_control::{DaemonControl, WorkerControlGrant},
 };
 use tokio_util::sync::CancellationToken;
 

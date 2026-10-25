@@ -292,15 +292,7 @@ mod channel {
 
     use tickloop_agent_runtime::{
         Agent, HarnessOptions, HarnessSeams,
-        environment::LocalEnvironment,
         host_tools::{HostCallResult, HostToolProvider},
-        hosted::{
-            controller::HostController,
-            tools::HostedTickTools,
-            worker_control::{
-                DaemonControl, HostedAdmission, WorkerControlGrant, WorkerRequest, root_identity,
-            },
-        },
         tick_adapter::TickAdapters,
         tick_stream::{
             CONNECTS_PER_WATCH, HostedTickStream, RECONNECT_PAUSE, RECONNECTS_PER_WATCH,
@@ -308,6 +300,14 @@ mod channel {
         },
     };
     use tickloop_agent_test_support::harness::ChosenModels;
+    use tickloop_local_environment::environment::LocalEnvironment;
+    use tickloop_local_environment::hosted::{
+        controller::HostController,
+        tools::HostedTickTools,
+        worker_control::{
+            DaemonControl, HostedAdmission, WorkerControlGrant, WorkerRequest, root_identity,
+        },
+    };
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -571,7 +571,8 @@ for line in sys.stdin:
             1,
         )
         .await;
-        let environment = LocalEnvironment::with_ticks(daemon.runtimes[0].hosted_ticks().unwrap());
+        let environment =
+            LocalEnvironment::with_ticks(daemon.environments[0].hosted_ticks().unwrap());
         let mut open = port_open(counter_program(), &daemon.root);
         open.view = view;
         view_failure_contract(
@@ -730,6 +731,7 @@ for line in sys.stdin:
         herdr: Option<std::path::PathBuf>,
         grants: Mutex<Vec<WorkerControlGrant>>,
         runtimes: Mutex<Vec<Agent>>,
+        environments: Mutex<Vec<LocalEnvironment>>,
     }
 
     #[async_trait]
@@ -740,7 +742,7 @@ for line in sys.stdin:
             epoch: Uuid,
         ) -> Result<Arc<dyn AgentAccess>, AccessError> {
             let grant = self.control.grant();
-            let runtime = match &self.herdr {
+            let (runtime, environment) = match &self.herdr {
                 Some(socket) => {
                     let mut launch = launch.clone();
                     launch.host_work_context = Some(HostWorkContext {
@@ -771,13 +773,14 @@ for line in sys.stdin:
                         );
                     }
                     let tools = Arc::new(tools);
+                    let environment = LocalEnvironment::with(
+                        Arc::new(DaemonControl::new(grant.clone())),
+                        tools.clone(),
+                    );
                     let runtime = Agent::with_seams(
                         HarnessSeams {
                             transcripts: None,
-                            environment: Some(Arc::new(LocalEnvironment::with(
-                                Arc::new(DaemonControl::new(grant.clone())),
-                                tools.clone(),
-                            ))),
+                            environment: Some(Arc::new(environment.clone())),
                             models: ChosenModels::new(self.model.clone()),
                         },
                         HarnessOptions {
@@ -785,23 +788,32 @@ for line in sys.stdin:
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
+                    environment.install(&runtime);
                     runtime.install_host_tools(tools.clone()).unwrap();
                     runtime
                         .install_tick_stream(Arc::new(TickAdapters::builtin(
                             runtime.clone(),
-                            Some(tools),
+                            Some(Arc::new(HostedTickStream::with_environment(
+                                Arc::new(environment.clone()),
+                                tools.authority(),
+                            ))),
                         )))
                         .await;
-                    runtime
+                    (runtime, environment)
                 }
             };
             let access: Arc<dyn AgentAccess> =
-                Arc::new(EmbeddedAgentAccess::for_worker(runtime.clone(), epoch));
+                Arc::new(EmbeddedAgentAccess::for_worker_with_environment(
+                    runtime.clone(),
+                    epoch,
+                    environment.clone(),
+                ));
             self.control
                 .register(&grant, access.clone(), launch.config_root.as_deref())
                 .await;
             self.grants.lock().await.push(grant);
             self.runtimes.lock().await.push(runtime);
+            self.environments.lock().await.push(environment);
             Ok(access)
         }
         async fn exited(&self, _: &Arc<dyn AgentAccess>) -> bool {
@@ -824,6 +836,7 @@ for line in sys.stdin:
         executions: Vec<tickloop_agent_access::ExecutionRef>,
         grants: Vec<WorkerControlGrant>,
         runtimes: Vec<Agent>,
+        environments: Vec<LocalEnvironment>,
         controller: Arc<HostController>,
     }
 
@@ -897,6 +910,7 @@ for line in sys.stdin:
                 herdr,
                 grants: Mutex::new(Vec::new()),
                 runtimes: Mutex::new(Vec::new()),
+                environments: Mutex::new(Vec::new()),
             });
             let daemon = DaemonServer::new(epoch, factory.clone());
             control.attach_daemon(daemon.clone());
@@ -931,6 +945,7 @@ for line in sys.stdin:
             }
             let grants = factory.grants.lock().await.clone();
             let runtimes = factory.runtimes.lock().await.clone();
+            let environments = factory.environments.lock().await.clone();
             Self {
                 _directory: directory,
                 root,
@@ -941,6 +956,7 @@ for line in sys.stdin:
                 executions,
                 grants,
                 runtimes,
+                environments,
                 controller,
             }
         }
@@ -2208,7 +2224,10 @@ for line in sys.stdin:
             tickloop_agent_runtime::tick_stream::WatchId::new(),
             tickloop_agent_runtime::tick_stream::WatchId::new(),
         );
-        let stream = HostedTickStream::new(tools.clone());
+        let stream = HostedTickStream::with_environment(
+            Arc::new(LocalEnvironment::with_ticks(tools.clone())),
+            tools.authority(),
+        );
         let authority = tools
             .tool_authorities("TickRead")
             .unwrap()
@@ -2999,7 +3018,7 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     async fn herdr_panes_only_show_views_of_ticks_that_run_in_the_tickhost() {
         use tickhost_connect::{herdr::HerdrContext, layout::HerdrLayout};
-        use tickloop_agent_runtime::hosted::views::HerdrViews;
+        use tickloop_local_environment::hosted::views::HerdrViews;
         let herdr = super::support::herdr::PrivateHerdr::start();
         let anchor = herdr.create_workspace();
         let workspace = herdr
@@ -3621,7 +3640,10 @@ for line in sys.stdin:
             tickloop_agent_runtime::tick_stream::WatchId::new(),
             tickloop_agent_runtime::tick_stream::WatchId::new(),
         );
-        let stream = HostedTickStream::new(tools.clone());
+        let stream = HostedTickStream::with_environment(
+            Arc::new(LocalEnvironment::with_ticks(tools.clone())),
+            tools.authority(),
+        );
         let authority = tools
             .tool_authorities("TickRead")
             .unwrap()
@@ -3821,7 +3843,7 @@ for line in sys.stdin:
         use std::collections::HashSet;
         use tickhost_connect::page::MAX_PAGE_SIZE;
         use tickloop_agent_protocol::HostedMemberState;
-        use tickloop_agent_runtime::hosted::worker_control::HostedTickPage;
+        use tickloop_local_environment::hosted::worker_control::HostedTickPage;
         const TICKS: usize = MAX_PAGE_SIZE + 2;
         const OPENS_AT_ONCE: usize = 26;
         let daemon = Daemon::start(1).await;
@@ -4185,7 +4207,7 @@ mod lifecycle {
         paths::HostPaths,
     };
     use tickhost_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
-    use tickloop_agent_runtime::hosted::controller::HostController;
+    use tickloop_local_environment::hosted::controller::HostController;
     use uuid::Uuid;
 
     const FLOOD: &str = r#"
@@ -4319,7 +4341,7 @@ for line in sys.stdin:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_daemon_reconciles_its_registry_with_the_running_host() {
-        use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
+        use tickloop_local_environment::hosted::registry::{LaunchRecord, LaunchState, Registry};
         let fixture = Fixture::new();
         let controller = fixture.controller();
         let config_root = fixture.directory.path().join("state");
@@ -4385,7 +4407,7 @@ for line in sys.stdin:
     /// and a host that dies leaves it ended while the Tick that did run on it is lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_keeps_an_unwatched_tick_ends_orphans_and_marks_ended_records() {
-        use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
+        use tickloop_local_environment::hosted::registry::{LaunchRecord, LaunchState, Registry};
         let idle_timeout = Duration::from_secs(2);
         let fixture = Fixture::with_idle_timeout(idle_timeout);
         let controller = fixture.controller();
@@ -4498,7 +4520,7 @@ for line in sys.stdin:
     /// host was being listed is neither dropped nor taken for lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_record_written_after_a_listing_began_waits_for_the_next_one() {
-        use tickloop_agent_runtime::hosted::{
+        use tickloop_local_environment::hosted::{
             controller::OwnerListing,
             registry::{LaunchRecord, LaunchState, Registry},
         };

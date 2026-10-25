@@ -267,7 +267,7 @@ async fn check_shell_transfer(exit_during_transfer: bool) {
             text("running"),
         ])),
     );
-    let grants = Arc::new(crate::hosted::shells::OwnTickhost::new());
+    let grants = Arc::new(tickloop_local_environment::hosted::shells::OwnTickhost::new());
     original.install_shell_grants(grants.clone());
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     original
@@ -386,7 +386,7 @@ async fn claimed_task_wait_survives_upgrade_and_finishes_in_the_same_run() {
         text("Task finished")
     }));
     let original = Agent::new_embedded(config(), model.clone());
-    let grants = Arc::new(crate::hosted::shells::OwnTickhost::new());
+    let grants = Arc::new(tickloop_local_environment::hosted::shells::OwnTickhost::new());
     original.install_shell_grants(grants.clone());
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     original.set_task_tools_enabled(chat, true).await.unwrap();
@@ -721,9 +721,11 @@ async fn unread_completed_shell_keeps_its_host_view_after_upgrade_and_idle_timeo
             text("running"),
         ])),
     );
-    let grants = Arc::new(crate::hosted::shells::OwnTickhost::with_idle_timeout(
-        Duration::from_millis(20),
-    ));
+    let grants = Arc::new(
+        tickloop_local_environment::hosted::shells::OwnTickhost::with_idle_timeout(
+            Duration::from_millis(20),
+        ),
+    );
     original.install_shell_grants(grants.clone());
     let chat = original.create_chat(directory.path().into()).await.unwrap();
     original
@@ -752,20 +754,14 @@ async fn unread_completed_shell_keeps_its_host_view_after_upgrade_and_idle_timeo
     let checkpoint = prepare(&original).await;
     let task = checkpoint.chats[0].snapshot.commands[0].operation_id;
     let successor = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
-    successor.install_shell_grants(grants);
+    let shells = successor.install_shell_grants(grants);
     successor.restore_upgrade(checkpoint).await.unwrap();
     successor.activate_upgrade().await.unwrap();
     original.shutdown_for_upgrade().await;
     successor.release_upgrade().await.unwrap();
     tokio::time::sleep(Duration::from_millis(650)).await;
     let instance = tick_protocol::InstanceRef::shell(task);
-    assert!(
-        successor
-            .shell_tasks()
-            .allow_view(chat.into(), &instance)
-            .await
-            .is_ok()
-    );
+    assert!(shells.allow_view(chat.into(), &instance).await.is_ok());
     successor.shutdown().await;
 }
 

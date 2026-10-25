@@ -640,7 +640,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
 /// worker asks for, from a Tickhost served in this test, and answers nothing else.
 fn grant_shell_spawns(directory: &Path, epoch: Uuid) -> tokio::task::JoinHandle<()> {
     use tickhost_connect::hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame};
-    use tickloop_agent_runtime::hosted::{
+    use tickloop_local_environment::hosted::{
         controller::HostController,
         worker_control::{IssuedSpawn, WorkerEnvelope, WorkerRequest},
     };
@@ -776,7 +776,7 @@ async fn a_daemon_killed_without_cleanup_never_blocks_the_next_daemon() {
 #[tokio::test]
 async fn a_real_daemon_answers_hosted_lifecycle_requests_only_for_live_grants() {
     use std::os::unix::fs::PermissionsExt;
-    use tickloop_agent_runtime::hosted::worker_control::{
+    use tickloop_local_environment::hosted::worker_control::{
         DaemonControl, WorkerControlGrant, WorkerRequest,
     };
     let temporary = tempfile::tempdir_in("/tmp").unwrap();

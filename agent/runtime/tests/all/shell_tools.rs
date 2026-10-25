@@ -7,6 +7,7 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_tools::{ToolError, Tools, Workspace, prepare};
+use tickloop_local_environment::AgentLocalExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 

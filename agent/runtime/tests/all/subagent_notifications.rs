@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_local_environment::AgentLocalExt;
 
 use tickloop_agent_protocol::EventKind;
 use tickloop_agent_runtime::Agent;

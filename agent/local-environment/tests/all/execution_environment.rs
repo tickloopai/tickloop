@@ -1,16 +1,19 @@
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
-use tickloop_agent_runtime::environment::{
+use tickloop_harness::runtime::environment::{
     ExecutionAuthority, ExecutionEnvironment, ExecutionIntent, ExecutionOutcome, ExecutionQuery,
-    ExecutionScope, LocalEnvironment, OpenSpec,
+    ExecutionScope, FolderEnvironment, OpenSpec,
 };
-use tickloop_agent_runtime::hosted::{
+use tickloop_local_environment::environment::LocalEnvironment;
+use tickloop_local_environment::hosted::{
     shells::OwnTickhost,
     tools::HostedTickTools,
     worker_control::{DaemonControl, WorkerControlGrant},
 };
 use tokio_util::sync::CancellationToken;
 
-struct PortOnlyEnvironment(tickloop_agent_test_support::execution_environment::MemoryEnvironment);
+struct PortOnlyEnvironment(
+    tickloop_harness::test_support::execution_environment::MemoryEnvironment,
+);
 
 #[tokio::test]
 async fn a_prepared_open_refuses_an_in_place_program_change_with_preserved_mtime() {
@@ -29,7 +32,7 @@ async fn a_prepared_open_refuses_an_in_place_program_change_with_preserved_mtime
         }),
         Vec::new(),
     )));
-    tickloop_agent_test_support::execution_contracts::program_change_contract(
+    tickloop_harness::test_support::execution_contracts::program_change_contract(
         &environment,
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
@@ -55,14 +58,14 @@ async fn a_prepared_open_refuses_an_in_place_program_change_with_preserved_mtime
 #[tokio::test]
 async fn shell_approval_is_bound_to_the_definition_prepared_before_the_question() {
     use serde_json::json;
-    use tickloop_agent_protocol::EventKind;
-    use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams};
-    use tickloop_agent_test_support::{
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
+    use tickloop_harness::test_support::{
         ScriptedModel, call, config, harness::ChosenModels, next_event, text,
     };
     let directory = tempfile::tempdir().unwrap();
     let environment =
-        Arc::new(tickloop_agent_test_support::execution_environment::MemoryEnvironment::new());
+        Arc::new(tickloop_harness::test_support::execution_environment::MemoryEnvironment::new());
     environment.define_shell("job", std::time::Duration::ZERO, b"approved".to_vec(), 0);
     let model = Arc::new(ScriptedModel::new(vec![
         call("shell", "Bash", json!({"command":"job"})),
@@ -119,9 +122,9 @@ async fn shell_approval_is_bound_to_the_definition_prepared_before_the_question(
 #[tokio::test]
 async fn native_environment_shell_output_and_state_have_one_owner() {
     use serde_json::json;
-    use tickloop_agent_protocol::{EventKind, ExecutionMode};
-    use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams};
-    use tickloop_agent_test_support::{
+    use tickloop_harness::protocol::{EventKind, ExecutionMode};
+    use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
+    use tickloop_harness::test_support::{
         ScriptedModel, call, config, harness::ChosenModels, next_event, text,
     };
     let directory = tempfile::tempdir().unwrap();
@@ -175,6 +178,7 @@ async fn native_environment_shell_output_and_state_have_one_owner() {
             _ => {}
         }
     }
+    environment.install(&agent);
     agent.install_host_tools(tools).unwrap();
     agent
         .submit(chat, "Run the background command".into())
@@ -204,7 +208,7 @@ async fn native_environment_shell_output_and_state_have_one_owner() {
             ExecutionAuthority::new(chat),
         )
         .unwrap();
-    let tickloop_agent_runtime::environment::ExecutionInspection::Shell(status) = port
+    let tickloop_harness::runtime::environment::ExecutionInspection::Shell(status) = port
         .inspect(ExecutionQuery::ShellStatus(
             tick_protocol::InstanceRef::shell(running.operation_id),
         ))
@@ -246,8 +250,8 @@ async fn native_environment_shell_output_and_state_have_one_owner() {
 
 #[tokio::test]
 async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() {
-    use tickloop_agent_runtime::environment::ShellSpec;
-    use tickloop_agent_test_support::{
+    use tickloop_harness::runtime::environment::ShellSpec;
+    use tickloop_harness::test_support::{
         execution_contracts::preparation_identity_contract,
         execution_environment::MemoryEnvironment,
     };
@@ -286,7 +290,7 @@ async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() 
     .await;
     let directory = tempfile::Builder::new()
         .prefix("epi")
-        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let approved = root.join("a");
@@ -323,10 +327,10 @@ async fn ended_shell_releases_its_output_fd_and_refuses_fifo_replacement_without
         fd::FromRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
-    use tickloop_agent_runtime::environment::{ExecutionInspection, ShellSpec};
+    use tickloop_harness::runtime::environment::{ExecutionInspection, ShellSpec};
     let directory = tempfile::Builder::new()
         .prefix("epf")
-        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let output = root.join("output");
@@ -365,7 +369,7 @@ async fn ended_shell_releases_its_output_fd_and_refuses_fifo_replacement_without
     let instance = started.shell.unwrap().instance;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if matches!(port.inspect(ExecutionQuery::ShellStatus(instance.clone())).await.unwrap(), ExecutionInspection::Shell(status) if status.state == tickloop_agent_protocol::CommandState::Completed) { break; }
+            if matches!(port.inspect(ExecutionQuery::ShellStatus(instance.clone())).await.unwrap(), ExecutionInspection::Shell(status) if status.state == tickloop_harness::protocol::CommandState::Completed) { break; }
             tokio::task::yield_now().await;
         }
     }).await.unwrap();
@@ -442,8 +446,8 @@ impl ExecutionEnvironment for PortOnlyEnvironment {
         scope: ExecutionScope,
         authority: ExecutionAuthority,
     ) -> Result<
-        Arc<dyn tickloop_agent_runtime::environment::ExecutionPort>,
-        tickloop_agent_runtime::environment::ExecutionError,
+        Arc<dyn tickloop_harness::runtime::environment::ExecutionPort>,
+        tickloop_harness::runtime::environment::ExecutionError,
     > {
         self.0.bind(scope, authority)
     }
@@ -452,14 +456,14 @@ impl ExecutionEnvironment for PortOnlyEnvironment {
 #[tokio::test]
 async fn a_harness_uses_its_injected_environment_for_bash() {
     use serde_json::json;
-    use tickloop_agent_protocol::{EventKind, ExecutionMode};
-    use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams};
-    use tickloop_agent_test_support::{
+    use tickloop_harness::protocol::{EventKind, ExecutionMode};
+    use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
+    use tickloop_harness::test_support::{
         ScriptedModel, call, config, harness::ChosenModels, next_event, text,
     };
     let directory = tempfile::tempdir().unwrap();
     let environment = Arc::new(PortOnlyEnvironment(
-        tickloop_agent_test_support::execution_environment::MemoryEnvironment::new(),
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new(),
     ));
     environment.0.define_shell(
         "job",
@@ -509,9 +513,9 @@ async fn a_harness_uses_its_injected_environment_for_bash() {
 #[tokio::test]
 async fn local_and_memory_shells_share_the_stop_contract() {
     use std::time::Duration;
-    use tickloop_agent_runtime::environment::ShellSpec;
-    use tickloop_agent_test_support::execution_contracts::shell_stop_contract;
-    use tickloop_agent_test_support::execution_environment::MemoryEnvironment;
+    use tickloop_harness::runtime::environment::ShellSpec;
+    use tickloop_harness::test_support::execution_contracts::shell_stop_contract;
+    use tickloop_harness::test_support::execution_environment::MemoryEnvironment;
     let memory = MemoryEnvironment::new();
     memory.define_shell("job", Duration::from_secs(300), Vec::new(), 0);
     shell_stop_contract(
@@ -532,7 +536,7 @@ async fn local_and_memory_shells_share_the_stop_contract() {
     .await;
     let directory = tempfile::Builder::new()
         .prefix("ep")
-        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let cwd = directory.path().canonicalize().unwrap();
     let output = cwd.join("output");
@@ -558,9 +562,9 @@ async fn local_and_memory_shells_share_the_stop_contract() {
 #[tokio::test]
 async fn local_and_memory_shells_share_the_exit_contract() {
     use std::time::Duration;
-    use tickloop_agent_runtime::environment::ShellSpec;
-    use tickloop_agent_test_support::execution_contracts::shell_exit_contract;
-    use tickloop_agent_test_support::execution_environment::MemoryEnvironment;
+    use tickloop_harness::runtime::environment::ShellSpec;
+    use tickloop_harness::test_support::execution_contracts::shell_exit_contract;
+    use tickloop_harness::test_support::execution_environment::MemoryEnvironment;
     let memory = MemoryEnvironment::new();
     memory.define_shell("job", Duration::from_secs(30), b"done\n".to_vec(), 0);
     shell_exit_contract(
@@ -585,7 +589,7 @@ async fn local_and_memory_shells_share_the_exit_contract() {
 
     let directory = tempfile::Builder::new()
         .prefix("ep")
-        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let cwd = directory.path().canonicalize().unwrap();
     let gate = cwd.join("gate");
@@ -622,9 +626,10 @@ async fn local_and_memory_shells_share_the_exit_contract() {
 #[tokio::test]
 async fn shell_observation_reports_one_exit_and_late_observers_only_get_a_baseline() {
     use std::time::Duration;
-    use tickloop_agent_protocol::CommandState;
-    use tickloop_agent_runtime::environment::{ExecutionInspection, ObserveRequest, ShellSpec};
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    use tickloop_harness::protocol::CommandState;
+    use tickloop_harness::runtime::environment::{ExecutionInspection, ObserveRequest, ShellSpec};
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.define_shell("job", Duration::from_secs(30), b"done\n".to_vec(), 0);
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
@@ -712,8 +717,9 @@ async fn shell_observation_reports_one_exit_and_late_observers_only_get_a_baseli
 
 #[tokio::test]
 async fn a_host_restart_ends_the_old_observation_until_an_explicit_reopen() {
-    use tickloop_agent_runtime::environment::{ExecutionLinkState, ObserveRequest};
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    use tickloop_harness::runtime::environment::{ExecutionLinkState, ObserveRequest};
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.install_program("/terminal");
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
@@ -782,10 +788,10 @@ async fn a_host_restart_ends_the_old_observation_until_an_explicit_reopen() {
 #[tokio::test]
 async fn generic_tick_tools_send_prepared_input_to_the_same_terminal() {
     use serde_json::json;
-    use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
-    use tickloop_agent_runtime::{environment::ExecutionTools, host_tools::HostToolProvider};
+    use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness::runtime::{environment::ExecutionTools, host_tools::HostToolProvider};
     let environment =
-        Arc::new(tickloop_agent_test_support::execution_environment::MemoryEnvironment::new());
+        Arc::new(tickloop_harness::test_support::execution_environment::MemoryEnvironment::new());
     environment.install_program("/terminal");
     let tools = ExecutionTools::new(
         environment,
@@ -850,13 +856,13 @@ async fn generic_tick_tools_send_prepared_input_to_the_same_terminal() {
 #[tokio::test]
 async fn generic_tick_tools_keep_a_reported_tool_failure_as_a_known_result() {
     use serde_json::json;
-    use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
-    use tickloop_agent_runtime::{
+    use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness::runtime::{
         environment::ExecutionTools,
         host_tools::{HostCallResult, HostToolProvider},
     };
     let environment =
-        Arc::new(tickloop_agent_test_support::execution_environment::MemoryEnvironment::new());
+        Arc::new(tickloop_harness::test_support::execution_environment::MemoryEnvironment::new());
     environment.install_tick_program("/counter", serde_json::from_value(json!({
         "protocol":3, "kind":"example.counter", "title":"Counter", "description":"Counter", "revision":"1",
         "tools":[{"name":"jam", "description":"A failing tool", "input_schema":{"type":"object"}, "mutates":true}],
@@ -908,12 +914,12 @@ async fn generic_tick_tools_keep_a_reported_tool_failure_as_a_known_result() {
 #[tokio::test]
 async fn terminal_sampling_ignores_a_screen_that_changed_back_to_its_baseline() {
     use std::collections::BTreeMap;
-    use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
-    use tickloop_agent_runtime::tick_stream::{
+    use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness::runtime::tick_stream::{
         HostedTickStream, StreamTasks, TickStreamEvent, TickStreamPort, WatchId,
     };
     let environment =
-        Arc::new(tickloop_agent_test_support::execution_environment::MemoryEnvironment::new());
+        Arc::new(tickloop_harness::test_support::execution_environment::MemoryEnvironment::new());
     environment.install_program("/terminal");
     let chat = tickloop_ids::generate();
     let authority = ExecutionAuthority::new(chat.into());
@@ -993,12 +999,12 @@ async fn terminal_sampling_ignores_a_screen_that_changed_back_to_its_baseline() 
 async fn the_harness_stream_consumes_memory_environment_facts_without_tickhost() {
     use serde_json::json;
     use std::collections::BTreeMap;
-    use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
-    use tickloop_agent_runtime::tick_stream::{
+    use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness::runtime::tick_stream::{
         HostedTickStream, StreamTasks, TickStreamEvent, TickStreamPort, WatchId,
     };
     let environment =
-        Arc::new(tickloop_agent_test_support::execution_environment::MemoryEnvironment::new());
+        Arc::new(tickloop_harness::test_support::execution_environment::MemoryEnvironment::new());
     environment.install_tick_program("/counter", serde_json::from_value(json!({
         "protocol":3, "kind":"example.counter", "title":"Counter", "description":"Counter", "revision":"1", "tools":[],
     })).unwrap(), json!({"count":0}), |_, _, _| Ok(json!(null)));
@@ -1073,8 +1079,9 @@ async fn the_harness_stream_consumes_memory_environment_facts_without_tickhost()
 #[tokio::test]
 async fn observation_registers_its_own_baseline_and_continues_from_a_cursor() {
     use serde_json::json;
-    use tickloop_agent_runtime::environment::ObserveRequest;
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    use tickloop_harness::runtime::environment::ObserveRequest;
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.install_tick_program("/counter", serde_json::from_value(json!({
         "protocol":3, "kind":"example.counter", "title":"Counter", "description":"Counter", "revision":"1", "tools":[],
     })).unwrap(), json!({"count":0}), |_, _, _| Ok(json!(null)));
@@ -1144,8 +1151,9 @@ async fn observation_registers_its_own_baseline_and_continues_from_a_cursor() {
 #[tokio::test]
 async fn a_tick_checks_the_prepared_revision_before_running_the_call() {
     use serde_json::json;
-    use tickloop_agent_runtime::environment::ExecutionInspection;
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    use tickloop_harness::runtime::environment::ExecutionInspection;
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.install_tick_program("/counter", serde_json::from_value(json!({
         "protocol":3, "kind":"example.counter", "title":"Counter", "description":"Counter", "revision":"1",
         "tools":[{"name":"increment", "description":"Increment", "input_schema":{"type":"object"}, "mutates":true}],
@@ -1199,7 +1207,7 @@ async fn a_tick_checks_the_prepared_revision_before_running_the_call() {
 
 #[tokio::test]
 async fn a_native_tool_preparation_cannot_be_executed_for_another_chat() {
-    use tickloop_agent_runtime::host_tools::{HostCallResult, HostToolProvider};
+    use tickloop_harness::runtime::host_tools::{HostCallResult, HostToolProvider};
     let directory = tempfile::tempdir().unwrap();
     let tools = HostedTickTools::new(
         DaemonControl::new(WorkerControlGrant {
@@ -1244,7 +1252,7 @@ async fn a_native_tool_preparation_cannot_be_executed_for_another_chat() {
 async fn revoking_authority_invalidates_even_reads_on_an_existing_port() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
-    let port = LocalEnvironment::bare()
+    let port = FolderEnvironment::bare()
         .bind(ExecutionScope { chat, folder: None }, authority.clone())
         .unwrap();
     assert!(port.inspect(ExecutionQuery::Capabilities).await.is_ok());
@@ -1260,8 +1268,9 @@ async fn revoking_authority_invalidates_even_reads_on_an_existing_port() {
 
 #[tokio::test]
 async fn a_lost_open_reply_can_only_be_queried_and_does_not_open_again() {
-    use tickloop_agent_runtime::environment::{ExecutionInspection, ExecutionReceipt};
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    use tickloop_harness::runtime::environment::{ExecutionInspection, ExecutionReceipt};
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.install_program("/program");
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
@@ -1333,7 +1342,7 @@ async fn a_prepared_open_refuses_a_replaced_program_before_contacting_the_host()
         Arc::new(OwnTickhost::new()),
         Arc::new(HostedTickTools::new(control, Vec::new())),
     );
-    tickloop_agent_test_support::execution_contracts::program_change_contract(
+    tickloop_harness::test_support::execution_contracts::program_change_contract(
         &environment,
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
@@ -1356,9 +1365,10 @@ async fn a_prepared_open_refuses_a_replaced_program_before_contacting_the_host()
 
 #[tokio::test]
 async fn the_memory_environment_refuses_the_same_program_replacement() {
-    let environment = tickloop_agent_test_support::execution_environment::MemoryEnvironment::new();
+    let environment =
+        tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
     environment.install_program("/program");
-    tickloop_agent_test_support::execution_contracts::program_change_contract(
+    tickloop_harness::test_support::execution_contracts::program_change_contract(
         &environment,
         ExecutionScope {
             chat: tickloop_ids::generate().into(),

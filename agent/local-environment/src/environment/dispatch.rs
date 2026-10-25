@@ -3,7 +3,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tickloop_agent_protocol::ChatId;
+use tickloop_harness::protocol::ChatId;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

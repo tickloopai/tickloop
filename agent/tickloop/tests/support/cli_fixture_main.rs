@@ -22,7 +22,7 @@ use tickloop_agent_client::DAEMON_RUN_ARGUMENTS;
 use tickloop_agent_daemon::WORKER_ARGUMENT;
 use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{ATTACH_ARGUMENTS, ModelConfig};
-use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
+use tickloop_local_environment::hosted::controller::TICKHOST_EXECUTABLE;
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";

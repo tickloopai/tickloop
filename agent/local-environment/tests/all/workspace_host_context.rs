@@ -15,25 +15,25 @@ use tickhost_connect::{
     host_error::HostError,
     layout::HerdrLayout,
 };
-use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_policy::skills::TICKLOOP_SKILL;
-use tickloop_agent_protocol::{
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::policy::skills::TICKLOOP_SKILL;
+use tickloop_harness::protocol::{
     Content, EventKind, HerdrInteraction, HerdrPane, HostCallContext, ModelIdentity, Role,
     SkillSource, ToolDefinition, ToolResult,
 };
-use tickloop_agent_runtime::{
+use tickloop_harness::runtime::{
     Agent,
     host_tools::{HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall},
-    hosted::{
-        tools::HostedTickTools,
-        views::HerdrViews,
-        worker_control::{DaemonControl, WorkerControlGrant},
-    },
+};
+use tickloop_local_environment::hosted::{
+    tools::HostedTickTools,
+    views::HerdrViews,
+    worker_control::{DaemonControl, WorkerControlGrant},
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
-use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
+use tickloop_harness::test_support::{ScriptedModel, call, config, next_event, text};
 
 const READ_HOST_SOURCE: &str = "ReadCapturedHostSource";
 const QUEUED_SOURCE_INPUT: &str = "Use the host source captured by this follow-up input.";
@@ -64,11 +64,11 @@ impl MergedInputModel {
 impl ModelClient for MergedInputModel {
     async fn generate_title(
         &self,
-        request: tickloop_agent_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
-        Ok(tickloop_agent_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -123,7 +123,7 @@ impl HostToolProvider for CapturedHostSource {
 
     fn permission(
         &self,
-        _: tickloop_agent_protocol::ChatId,
+        _: tickloop_harness::protocol::ChatId,
         _: &str,
         _: &Value,
     ) -> HostToolPermission {
@@ -132,7 +132,7 @@ impl HostToolProvider for CapturedHostSource {
 
     async fn prepare_call_in_scope(
         &self,
-        chat: tickloop_agent_protocol::ChatId,
+        chat: tickloop_harness::protocol::ChatId,
         scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
@@ -152,7 +152,7 @@ impl HostToolProvider for CapturedHostSource {
 
     async fn execute(
         &self,
-        _: tickloop_agent_protocol::ChatId,
+        _: tickloop_harness::protocol::ChatId,
         _: &str,
         input: Value,
         _: CancellationToken,
@@ -296,7 +296,7 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
         let mut child = Command::new(&binary);
         child
             .arg("--exact")
-            .arg(tickloop_agent_test_support::test_path!(
+            .arg(tickloop_harness::test_support::test_path!(
                 workspace_host_request_probe
             ))
             .arg("--nocapture")

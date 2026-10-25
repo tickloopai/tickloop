@@ -21,7 +21,7 @@ use tickhost_connect::{
 };
 use tokio_util::sync::CancellationToken;
 
-use tickloop_agent_protocol::{
+use tickloop_harness::protocol::{
     ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HerdrPane, HostEndpointIdentity, HostedViewGrant,
     VIEW_PANE_ENVIRONMENT,
 };

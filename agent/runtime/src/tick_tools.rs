@@ -135,7 +135,7 @@ pub enum TickToolTargetError {
 
 /// Whether the call places, moves or lists Herdr Panes, which only a worker in a Herdr View can
 /// do and which stays inside the Workspace a delegated Agent inherited.
-pub(crate) fn uses_herdr_layout(name: &str, input: &Value) -> bool {
+pub fn uses_herdr_layout(name: &str, input: &Value) -> bool {
     match name {
         READ_WORKSPACE => true,
         TICK_MANAGE => match input["action"].as_str() {
@@ -151,7 +151,7 @@ pub(crate) fn uses_herdr_layout(name: &str, input: &Value) -> bool {
 
 /// Refuses a call these tools cannot serve, decided from its input alone: an unknown tool or
 /// action, a target that is not a hosted Tick, or a Herdr Pane without Herdr `views`.
-pub(crate) fn check_call(name: &str, input: &Value, views: bool) -> Result<(), String> {
+pub fn check_call(name: &str, input: &Value, views: bool) -> Result<(), String> {
     match name {
         READ_WORKSPACE => {}
         TICK_DESCRIBE | TICK_READ | TICK_CALL => check_target(name, input)?,
@@ -185,7 +185,7 @@ fn check_target(name: &str, input: &Value) -> Result<(), String> {
 }
 
 /// The model-visible Tick tools; Herdr `views` add ReadWorkspace, placements and move.
-pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
+pub fn definitions(views: bool) -> Vec<ToolDefinition> {
     let mut definitions = Vec::new();
     if views {
         definitions.push(ToolDefinition {
@@ -230,7 +230,7 @@ fn tick_manage_description(views: bool) -> String {
     }
     parts.push(format!(
         "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
-        crate::hosted::terminal_input::KEY_NAMES
+        crate::terminal_input::KEY_NAMES
     ));
     parts.push(
         if views {
@@ -423,7 +423,7 @@ fn select_form<'a>(
 /// Checks a Tick tool input before any host is asked. TickManage must match the form its
 /// action selects, and its placement the form its type selects, so a refusal names the field to
 /// add or drop; the flat model schema then checks every value.
-pub(crate) fn validate_input(
+pub fn validate_input(
     name: &str,
     schema: &Value,
     input: &Value,

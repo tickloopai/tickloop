@@ -21,8 +21,8 @@ use tickhost_connect::{
     host_error::HostError,
     hosted::{self, HostDescription, HostOccupancy, ManagementConnection},
 };
-use tickloop_agent_protocol::{OtherTickhost, TickhostOccupancy};
-use tickloop_agent_runtime::hosted::{
+use tickloop_harness::protocol::{OtherTickhost, TickhostOccupancy};
+use tickloop_local_environment::hosted::{
     controller::{HostController, OTHER_TICKHOST_BUILD},
     registry::{LaunchRecord, LaunchState, Registry},
 };
@@ -180,7 +180,7 @@ impl Fixture {
     fn with_other_build(business: Business, description: Option<HostDescription>) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tv")
-            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let paths = HostPaths {
             runtime: directory.path().join("h"),

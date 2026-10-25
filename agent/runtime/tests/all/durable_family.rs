@@ -562,7 +562,7 @@ async fn subagent_search_local_reload_still_uses_saved_user_settings() {
     let seams = || HarnessSeams {
         transcripts: Some(store.clone()),
         environment: Some(Arc::new(
-            tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+            tickloop_agent_runtime::environment::FolderEnvironment::bare(),
         )),
         models: ChosenModels::new(model.clone()),
     };

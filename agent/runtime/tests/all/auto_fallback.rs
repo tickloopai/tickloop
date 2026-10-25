@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::json;
 use tickloop_agent_model::{

@@ -8,8 +8,8 @@ use std::{
 
 use serde_json::json;
 use tick_protocol::{InstanceRef, TickState};
-use tickloop_agent_protocol::{ChatId, CommandState, ToolResult};
-use tickloop_agent_tools::{
+use tickloop_harness::protocol::{ChatId, CommandState, ToolResult};
+use tickloop_harness::tools::{
     ShellHost, ShellLaunch, ShellProcess, ShellStartError, ShellStopError, ToolError,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -80,9 +80,9 @@ impl BoundOutput {
         if let Some(file) = self.open.lock().unwrap().as_ref() {
             return Ok(file.clone());
         }
-        let file = tickloop_agent_base::private_fs::open_without_following_links(
+        let file = tickloop_harness::base::private_fs::open_without_following_links(
             &self.path,
-            tickloop_agent_base::private_fs::OpenTarget::Entry,
+            tickloop_harness::base::private_fs::OpenTarget::Entry,
         )
         .map_err(io_error)?;
         if !file.metadata().map_err(io_error)?.is_file()
@@ -179,9 +179,9 @@ impl LocalShells {
             }
             None => {
                 let output_directory =
-                    tickloop_agent_base::private_fs::open_without_following_links(
+                    tickloop_harness::base::private_fs::open_without_following_links(
                         &parent.canonicalize().map_err(io_error)?,
-                        tickloop_agent_base::private_fs::OpenTarget::Directory {
+                        tickloop_harness::base::private_fs::OpenTarget::Directory {
                             create_mode: None,
                         },
                     )
@@ -196,9 +196,9 @@ impl LocalShells {
                     ));
                 }
                 (
-                    tickloop_agent_base::private_fs::open_without_following_links(
+                    tickloop_harness::base::private_fs::open_without_following_links(
                         &cwd,
-                        tickloop_agent_base::private_fs::OpenTarget::Directory {
+                        tickloop_harness::base::private_fs::OpenTarget::Directory {
                             create_mode: None,
                         },
                     )
@@ -234,7 +234,7 @@ impl LocalShells {
                 normalized_input: input.clone(),
                 permission: HostToolPermission::Reviewable,
                 summary: format!("Run {} in {}", spec.command, spec.cwd),
-                approval: tickloop_agent_protocol::PreparedApprovalFacts {
+                approval: tickloop_harness::protocol::PreparedApprovalFacts {
                     normalized_input: input,
                     canonical_path: Some(cwd),
                     ..Default::default()
@@ -289,7 +289,7 @@ impl LocalShells {
                 normalized_input: input.clone(),
                 permission: HostToolPermission::Reviewable,
                 summary: format!("Stop Shell {}", instance.public()),
-                approval: tickloop_agent_protocol::PreparedApprovalFacts {
+                approval: tickloop_harness::protocol::PreparedApprovalFacts {
                     normalized_input: input,
                     ..Default::default()
                 },
@@ -778,7 +778,7 @@ impl ShellHost for LocalShellHost {
         &self,
         task: Uuid,
         reason: &str,
-    ) -> Result<Option<tickloop_agent_tools::ShellStopPreparation>, ToolError> {
+    ) -> Result<Option<tickloop_harness::tools::ShellStopPreparation>, ToolError> {
         let authority = ExecutionAuthority::new(self.chat);
         let port = super::shell_port(self.backend.clone(), self.chat, authority.clone(), None);
         super::shell_host::prepare_stop(port, authority, task, reason)
@@ -787,8 +787,8 @@ impl ShellHost for LocalShellHost {
     }
     async fn prepare(
         &self,
-        request: tickloop_agent_tools::ShellPreparationRequest,
-    ) -> Result<Option<tickloop_agent_tools::ShellPreparation>, ToolError> {
+        request: tickloop_harness::tools::ShellPreparationRequest,
+    ) -> Result<Option<tickloop_harness::tools::ShellPreparation>, ToolError> {
         if !self.native.is_available() {
             return Ok(None);
         }

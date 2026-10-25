@@ -1250,7 +1250,7 @@ fn unprompted_worker(model: Arc<HoldingModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: None,
-            environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+            environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
             models: ChosenModels::new(model),
         },
         HarnessOptions {
@@ -1511,7 +1511,7 @@ async fn the_loops_first_turn_is_recorded_with_its_task_before_it_runs() {
     let agent = Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store.clone()),
-            environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+            environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
             models: ChosenModels::new(model),
         },
         HarnessOptions {

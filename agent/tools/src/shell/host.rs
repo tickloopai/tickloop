@@ -232,3 +232,20 @@ impl ShellHost for NoShellHost {
         )))
     }
 }
+
+/// The execution owner's observer of whether a completed Shell is still retained.
+#[async_trait::async_trait]
+pub trait ShellRetention: Send + Sync {
+    fn spawn(&self, task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>);
+    async fn is_retained(&self, chat: uuid::Uuid, task: uuid::Uuid) -> bool;
+}
+
+/// Live Shell ownership services used during a planned worker handoff.
+#[async_trait::async_trait]
+pub trait ShellRuntime: Send + Sync {
+    fn attach(&self, retention: std::sync::Arc<dyn ShellRetention>);
+    fn for_chat(self: std::sync::Arc<Self>, chat: uuid::Uuid) -> std::sync::Arc<dyn ShellHost>;
+    async fn commit_handoffs(&self) -> Result<(), String> {
+        Ok(())
+    }
+}

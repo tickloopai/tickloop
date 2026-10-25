@@ -3564,7 +3564,7 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
             tickloop_agent_runtime::HarnessSeams {
                 transcripts: None,
                 environment: folder.then(|| {
-                    Arc::new(tickloop_agent_runtime::environment::LocalEnvironment::bare())
+                    Arc::new(tickloop_agent_runtime::environment::FolderEnvironment::bare())
                         as Arc<dyn tickloop_agent_runtime::environment::ExecutionEnvironment>
                 }),
                 models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),

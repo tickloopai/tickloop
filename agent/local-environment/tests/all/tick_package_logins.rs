@@ -2,22 +2,21 @@
 //! `workspace_host.tick_packages`; reading it from the saved credentials is covered by
 //! `tick/packages`.
 
+use tickloop_harness::runtime::host_tools::WorkspacePackageLogin;
+
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::{Value, json};
-use tick_packages::{ApiKey, LoginState, MANIFEST_FILE_NAME, OAuthToken, PackageStore};
-use tickloop_agent_policy::skills::TICKLOOP_SKILL;
-use tickloop_agent_protocol::{Content, EventKind, Role};
-use tickloop_agent_runtime::{
-    Agent,
-    host_tools::HostToolProvider,
-    hosted::{
-        tools::HostedTickTools,
-        worker_control::{DaemonControl, WorkerControlGrant},
-    },
+use tick_packages::{ApiKey, MANIFEST_FILE_NAME, OAuthToken, PackageStore};
+use tickloop_harness::policy::skills::TICKLOOP_SKILL;
+use tickloop_harness::protocol::{Content, EventKind, Role};
+use tickloop_harness::runtime::{Agent, host_tools::HostToolProvider};
+use tickloop_harness::test_support::{ScriptedModel, config, next_event, text};
+use tickloop_local_environment::hosted::{
+    tools::HostedTickTools,
+    worker_control::{DaemonControl, WorkerControlGrant},
 };
-use tickloop_agent_test_support::{ScriptedModel, config, next_event, text};
 
 /// Hosted Tick tools whose daemon is never reached: reading login states asks nothing of it.
 fn tools(directory: &Path, packages: PackageStore) -> HostedTickTools {
@@ -83,7 +82,7 @@ fn token(expires_in: i64, refresh_token: Option<&str>) -> OAuthToken {
     }
 }
 
-fn login_of(tools: &HostedTickTools, name: &str) -> LoginState {
+fn login_of(tools: &HostedTickTools, name: &str) -> WorkspacePackageLogin {
     tools
         .workspace_host_context()
         .unwrap()
@@ -110,28 +109,34 @@ fn a_package_login_state_follows_its_saved_credentials_at_once() {
     let tools = tools(&cwd, packages.clone());
     let sample = packages.credentials("sample").unwrap();
 
-    assert_eq!(login_of(&tools, "sample"), LoginState::LoggedOut);
-    assert_eq!(login_of(&tools, "keyed"), LoginState::LoggedOut);
-    assert_eq!(login_of(&tools, "plain"), LoginState::NotRequired);
+    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::LoggedOut);
+    assert_eq!(login_of(&tools, "keyed"), WorkspacePackageLogin::LoggedOut);
+    assert_eq!(
+        login_of(&tools, "plain"),
+        WorkspacePackageLogin::NotRequired
+    );
     for (saved, state) in [
-        (token(600, None), LoginState::LoggedIn),
-        (token(-600, Some("refresh")), LoginState::LoggedIn),
-        (token(-600, None), LoginState::Expired),
+        (token(600, None), WorkspacePackageLogin::LoggedIn),
+        (
+            token(-600, Some("refresh")),
+            WorkspacePackageLogin::LoggedIn,
+        ),
+        (token(-600, None), WorkspacePackageLogin::Expired),
     ] {
         sample.lock_oauth().unwrap().save_token(&saved).unwrap();
         assert_eq!(login_of(&tools, "sample"), state, "{saved:?}");
     }
     fs::write(sample.oauth_token_path(), "{").unwrap();
-    assert_eq!(login_of(&tools, "sample"), LoginState::Unknown);
+    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::Unknown);
     sample.lock_oauth().unwrap().remove_token().unwrap();
-    assert_eq!(login_of(&tools, "sample"), LoginState::LoggedOut);
+    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::LoggedOut);
 
     packages
         .credentials("keyed")
         .unwrap()
         .save_api_key(&ApiKey::new("key").unwrap())
         .unwrap();
-    assert_eq!(login_of(&tools, "keyed"), LoginState::LoggedIn);
+    assert_eq!(login_of(&tools, "keyed"), WorkspacePackageLogin::LoggedIn);
     assert!(
         !cwd.join("runs").exists(),
         "reading login states runs no package program"
@@ -199,11 +204,11 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
         );
     }
     for login in [
-        LoginState::LoggedIn,
-        LoginState::LoggedOut,
-        LoginState::Expired,
-        LoginState::NotRequired,
-        LoginState::Unknown,
+        WorkspacePackageLogin::LoggedIn,
+        WorkspacePackageLogin::LoggedOut,
+        WorkspacePackageLogin::Expired,
+        WorkspacePackageLogin::NotRequired,
+        WorkspacePackageLogin::Unknown,
     ] {
         let login = serde_json::to_value(login).unwrap();
         assert!(

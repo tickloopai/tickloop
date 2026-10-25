@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use async_trait::async_trait;
 use serde_json::json;

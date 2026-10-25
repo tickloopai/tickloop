@@ -11,7 +11,7 @@ use std::{
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tickloop_agent_protocol::HostedViewGrant;
-use tickloop_agent_runtime::hosted::controller::HostController;
+use tickloop_local_environment::hosted::controller::HostController;
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(15);

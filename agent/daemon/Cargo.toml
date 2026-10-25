@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-local-environment = { path = "../local-environment" }
 tickloop-harness = { path = "../sdk", features = ["policy"] }
 async-trait = "0.1"
 base64 = "0.22"

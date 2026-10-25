@@ -13,7 +13,7 @@ use tickloop_agent_runtime::transcript::{
 };
 use tickloop_agent_runtime::{
     Agent, CitationStyle, HarnessOptions, HarnessSeams, SearchDefaults, ToolPolicy, WaitHosting,
-    environment::LocalEnvironment, visible_citations_at,
+    environment::FolderEnvironment, visible_citations_at,
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent_test_support::{harness::ChosenModels, transcripts::InMemoryTranscriptStore};
@@ -87,7 +87,7 @@ fn harness(
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
-            environment: local.then(|| Arc::new(LocalEnvironment::bare()) as _),
+            environment: local.then(|| Arc::new(FolderEnvironment::bare()) as _),
             models: ChosenModels::new(model),
         },
         HarnessOptions {

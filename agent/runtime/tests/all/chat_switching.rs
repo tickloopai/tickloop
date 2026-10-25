@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{

@@ -1,5 +1,6 @@
 use crate::support;
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use std::{
     path::Path,

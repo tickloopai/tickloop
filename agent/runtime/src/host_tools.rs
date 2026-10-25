@@ -275,7 +275,17 @@ pub struct WorkspaceTickPackage {
     pub description: String,
     pub executable: PathBuf,
     /// Its login state, from the credentials Tickloop saved for it.
-    pub login: tick_packages::LoginState,
+    pub login: WorkspacePackageLogin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePackageLogin {
+    LoggedIn,
+    LoggedOut,
+    Expired,
+    NotRequired,
+    Unknown,
 }
 
 impl WorkspaceHostContext {
@@ -291,28 +301,6 @@ impl WorkspaceHostContext {
     /// The same container, where this Agent can also run Ticks in the Tickhost.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
-        self
-    }
-
-    /// The same container, listing the usable Tick packages installed in `packages` with their
-    /// login states, which reading the saved credentials gives at once.
-    pub fn with_tick_packages(mut self, packages: &tick_packages::PackageStore) -> Self {
-        self.tick_packages = packages
-            .installed()
-            .map(|installed| {
-                installed
-                    .packages
-                    .into_iter()
-                    .map(|package| WorkspaceTickPackage {
-                        login: packages.login_state(&package),
-                        executable: package.executable(),
-                        name: package.manifest.name,
-                        version: package.manifest.version,
-                        description: package.manifest.description,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         self
     }
 
@@ -401,11 +389,6 @@ pub(crate) struct HostToolUpgradeCheckpoint {
 
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
-    /// The Code-side Monitor and view grants installed alongside the local tool provider.
-    fn local_tick_tools(&self) -> Option<std::sync::Arc<crate::hosted::tools::HostedTickTools>> {
-        None
-    }
-
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// Private process-transfer state. `None` defers replacement while the provider owns an

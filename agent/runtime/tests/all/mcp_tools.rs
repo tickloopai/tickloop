@@ -2135,11 +2135,11 @@ async fn artifact_login_state_is_independent_of_directory_and_connection_failure
 
 #[tokio::test]
 async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
-    use tickloop_agent_runtime::hosted::worker_control::{DaemonControl, WorkerControlGrant};
+    use tickloop_local_environment::hosted::worker_control::{DaemonControl, WorkerControlGrant};
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
-    let native = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
+    let native = tickloop_local_environment::hosted::tools::HostedTickTools::new(
         DaemonControl::new(WorkerControlGrant {
             endpoint: directory.path().join("unused-daemon.sock"),
             daemon_epoch: uuid::Uuid::new_v4(),

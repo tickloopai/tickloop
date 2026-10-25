@@ -20,7 +20,7 @@ use tickloop_agent_access::{
     RuntimeVersion,
 };
 
-use tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant;
+use tickloop_local_environment::hosted::worker_control::WorkerControlGrant;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},

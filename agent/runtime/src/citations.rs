@@ -339,7 +339,7 @@ mod tests {
         Agent::with_seams(
             crate::HarnessSeams {
                 transcripts: Some(store),
-                environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+                environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
                 models: ChosenModels::new(model),
             },
             options,

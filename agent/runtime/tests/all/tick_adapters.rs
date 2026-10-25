@@ -11,6 +11,7 @@ use tickloop_agent_runtime::{
 };
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::{ScriptedModel, config};
+use tickloop_local_environment::AgentLocalExt;
 use uuid::Uuid;
 
 /// How long a Shell watch is given to show that it publishes nothing: the Shell Tick looks at its

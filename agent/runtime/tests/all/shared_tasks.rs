@@ -8,6 +8,7 @@ use tickloop_agent_test_support::{
     routed::{RoutedModel, has_tool_result, state, tool_result},
     text,
 };
+use tickloop_local_environment::AgentLocalExt;
 use uuid::Uuid;
 
 async fn run_assignment(deny_messages: bool) {

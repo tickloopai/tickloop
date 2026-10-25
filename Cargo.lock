@@ -3950,6 +3950,7 @@ dependencies = [
  "tickloop-agent-test-support",
  "tickloop-agent-updater",
  "tickloop-ids",
+ "tickloop-local-environment",
  "tickloop-tick-installer",
  "tickloop-tick-oauth-test-server",
  "tickloop-tick-packages",
@@ -4077,6 +4078,7 @@ dependencies = [
  "tickloop-agent-tools",
  "tickloop-agent-updater",
  "tickloop-ids",
+ "tickloop-local-environment",
  "tickloop-tick-installer",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
@@ -4133,6 +4135,7 @@ dependencies = [
  "tickloop-agent-updater",
  "tickloop-harness",
  "tickloop-ids",
+ "tickloop-local-environment",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
@@ -4246,10 +4249,8 @@ dependencies = [
  "tickloop-agent-tools",
  "tickloop-agent-transcript",
  "tickloop-ids",
- "tickloop-tick-packages",
+ "tickloop-local-environment",
  "tickloop-tick-protocol",
- "tickloop-tickhost",
- "tickloop-tickhost-connect",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -4386,6 +4387,34 @@ version = "0.2.24"
 dependencies = [
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "tickloop-local-environment"
+version = "0.2.24"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "jsonschema",
+ "libc",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+ "tickloop-agent-settings",
+ "tickloop-harness",
+ "tickloop-ids",
+ "tickloop-tick-packages",
+ "tickloop-tick-protocol",
+ "tickloop-tickhost",
+ "tickloop-tickhost-connect",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing-subscriber",
  "uuid",
 ]
 

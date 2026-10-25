@@ -29,7 +29,7 @@ use tickhost_connect::{
         HostConnection, ManagementConnection, Role,
     },
 };
-use tickloop_agent_protocol::{HostedViewGrant, OtherTickhost, TickhostOccupancy};
+use tickloop_harness::protocol::{HostedViewGrant, OtherTickhost, TickhostOccupancy};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -503,7 +503,7 @@ impl HostController {
     /// What the host runs for `owner`, read across all pages of one host, and the moment the
     /// reading began: launch records written after it are newer than the listing.
     pub async fn owner_listing(&self, owner: &TickOwner) -> Result<OwnerListing, HostError> {
-        let started_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let started_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         Ok(OwnerListing {
             started_ms,
             running: self.live_instances(owner).await?,

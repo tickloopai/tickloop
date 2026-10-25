@@ -27,7 +27,8 @@
     "tickloop-agent-settings": "code",
     "tickloop-agent-policy": "harness",
     "tickloop-tick-installer": "tick",
-    "tickloop-agent-access": "code"
+    "tickloop-agent-access": "code",
+    "tickloop-local-environment": "code"
   },
   "allowed": {
     "harness": [
@@ -121,27 +122,6 @@
       "kind": "dev",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
-    },
-    {
-      "from": "tickloop-agent-runtime",
-      "to": "tickloop-tick-packages",
-      "kind": "normal",
-      "target": null,
-      "reason": "Existing OAuth/package integration; tighten when its portable contract is separated."
-    },
-    {
-      "from": "tickloop-agent-runtime",
-      "to": "tickloop-tickhost",
-      "kind": "normal",
-      "target": null,
-      "reason": "Ticket 05 extracts Local Environment; the runtime currently uses Tickhost library APIs."
-    },
-    {
-      "from": "tickloop-agent-runtime",
-      "to": "tickloop-tickhost-connect",
-      "kind": "normal",
-      "target": null,
-      "reason": "Ticket 05 extracts Local Environment; the runtime currently uses Tickhost library APIs."
     },
     {
       "from": "tickloop-agent-console",
@@ -303,6 +283,13 @@
       "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Code access through the Harness facade; Harness never depends on access."
+    },
+    {
+      "from": "tickloop-agent-runtime",
+      "to": "tickloop-local-environment",
+      "kind": "dev",
+      "target": null,
+      "reason": "Existing runtime behavior tests compose the isolated Local Environment; production Harness remains independent."
     }
   ]
 }

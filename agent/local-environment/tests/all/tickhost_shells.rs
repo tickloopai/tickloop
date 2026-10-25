@@ -8,22 +8,21 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::{Value, json};
 use tick_protocol::InstanceRef;
 use tickhost::shell::{ShellApproval, ShellIdentity, SpawnBinding, SpawnGrant};
 use tickhost_connect::{host_error::HostError, hosted};
-use tickloop_agent_base::private_fs::PrivateDirectory;
-use tickloop_agent_protocol::{CommandState, HostedViewGrant, ToolResult, UserShellState};
-use tickloop_agent_runtime::{
-    Agent,
-    hosted::{
-        shells::{OwnTickhost, ShellGrants},
-        worker_control::IssuedSpawn,
-    },
-};
-use tickloop_agent_tools::{
+use tickloop_harness::base::private_fs::PrivateDirectory;
+use tickloop_harness::protocol::{CommandState, HostedViewGrant, ToolResult, UserShellState};
+use tickloop_harness::runtime::Agent;
+use tickloop_harness::tools::{
     ChatDirectory, ExecutionContext, PreparedTool, SecondaryModel, ToolError, Tools, Workspace,
+};
+use tickloop_local_environment::hosted::{
+    shells::{OwnTickhost, ShellGrants},
+    worker_control::IssuedSpawn,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -53,12 +52,14 @@ impl Fixture {
     /// An Agent whose spawns `grants` grant, or an Agent without a daemon.
     fn granting_with(grants: Option<Arc<dyn ShellGrants>>) -> Self {
         let agent = Agent::new(
-            tickloop_agent_test_support::config(),
-            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
-        if let Some(grants) = grants {
-            agent.install_shell_grants(grants);
-        }
+        let shells = grants
+            .map(|grants| agent.install_shell_grants(grants))
+            .unwrap_or_else(tickloop_local_environment::hosted::shells::ShellTasks::without_grants);
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let workdir = root.join("work");
@@ -70,7 +71,7 @@ impl Fixture {
                 task_output: output.join("tasks"),
                 family_temp: output,
             },
-            agent.shell_tasks().for_chat(Uuid::new_v4()),
+            shells.for_chat(Uuid::new_v4()),
         );
         Self {
             _agent: agent,
@@ -138,7 +139,7 @@ fn task_id(result: &ToolResult) -> Uuid {
         .nth(1)
         .and_then(|rest| rest.split('.').next())
         .unwrap_or_else(|| panic!("no task ID in {}", result.content));
-    tickloop_agent_protocol::ShellTaskId::parse(id)
+    tickloop_harness::protocol::ShellTaskId::parse(id)
         .unwrap()
         .uuid()
 }
@@ -180,7 +181,7 @@ async fn a_command_that_outlives_its_timeout_moves_to_the_background_until_it_is
     assert_eq!(stopped.state, CommandState::Failed);
     assert_eq!(
         stopped.reason.as_deref(),
-        Some(tickloop_agent_tools::CANCELLED_COMMAND_REASON)
+        Some(tickloop_harness::tools::CANCELLED_COMMAND_REASON)
     );
     let group = stopped.pid.unwrap();
     assert!(!tickhost::shell::process_group_exists(group));
@@ -358,7 +359,7 @@ async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
         (stopped.state, stopped.reason.as_deref(), stopped.pid),
         (
             CommandState::Failed,
-            Some(tickloop_agent_tools::CANCELLED_COMMAND_REASON),
+            Some(tickloop_harness::tools::CANCELLED_COMMAND_REASON),
             None
         )
     );
@@ -447,7 +448,7 @@ impl ShellGrants for AnswerlessHost {
 async fn a_spawn_whose_answer_was_lost_is_listed_with_an_unknown_outcome_not_refused() {
     let sockets = tempfile::Builder::new()
         .prefix("ths")
-        .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let fixture = Fixture::granting_with(Some(Arc::new(AnswerlessHost::serve(sockets.path()))));
     let prepared = fixture.prepare(json!({"command":"touch probe"})).await;
@@ -495,26 +496,33 @@ async fn ended_user_shell(
     InstanceRef::shell(receipt.command_id)
 }
 
-async fn opens(agent: &Agent, chat: Uuid, instance: &InstanceRef) -> bool {
-    agent.shell_tasks().allow_view(chat, instance).await.is_ok()
+async fn opens(
+    shells: &tickloop_local_environment::hosted::shells::ShellTasks,
+    chat: Uuid,
+    instance: &InstanceRef,
+) -> bool {
+    shells.allow_view(chat, instance).await.is_ok()
 }
 
 #[tokio::test]
 async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
-    agent.install_shell_grants(Arc::new(OwnTickhost::with_idle_timeout(VIEW_IDLE_TIMEOUT)));
+    let shells =
+        agent.install_shell_grants(Arc::new(OwnTickhost::with_idle_timeout(VIEW_IDLE_TIMEOUT)));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let background = ended_user_shell(&agent, chat.uuid(), "printf background", true).await;
     let foreground = ended_user_shell(&agent, chat.uuid(), "printf foreground", false).await;
     // Nobody views either, for far longer than the Tickhost keeps an ended command nobody holds.
     tokio::time::sleep(VIEW_IDLE_TIMEOUT * 6).await;
     // Its end is unread, so Monitor still lists it; a foreground command it never lists.
-    assert!(opens(&agent, chat.uuid(), &background).await);
-    assert!(!opens(&agent, chat.uuid(), &foreground).await);
+    assert!(opens(&shells, chat.uuid(), &background).await);
+    assert!(!opens(&shells, chat.uuid(), &foreground).await);
 
     // Once its end was handled Monitor shows it a while longer, past the worker's next check.
     agent
@@ -522,14 +530,14 @@ async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
-    assert!(opens(&agent, chat.uuid(), &background).await);
+    assert!(opens(&shells, chat.uuid(), &background).await);
 
     agent
         .remove_monitor_member(chat, background.clone())
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while opens(&agent, chat.uuid(), &background).await {
+    while opens(&shells, chat.uuid(), &background).await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the Tickhost still keeps a Shell Monitor no longer lists"

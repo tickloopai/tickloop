@@ -2,6 +2,7 @@
 //! and touch no local file.
 
 use std::{path::Path, sync::Arc};
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::json;
 use tickloop_agent_base::network::Reach;
@@ -10,7 +11,7 @@ use tickloop_agent_protocol::{
     PermissionRule, PromptPolicy, Role,
 };
 use tickloop_agent_runtime::{
-    Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
+    Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::FolderEnvironment,
     transcript::JsonlTranscriptStore,
 };
 use tickloop_agent_test_support::harness::ChosenModels;
@@ -414,7 +415,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
     let local = Agent::with_seams(
         HarnessSeams {
             transcripts: None,
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models: models(),
         },
         options(),

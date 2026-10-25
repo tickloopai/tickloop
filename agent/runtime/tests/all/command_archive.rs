@@ -3,6 +3,7 @@ use tickloop_agent_protocol::{CommandState, EventKind};
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::*;
+use tickloop_local_environment::AgentLocalExt;
 
 #[tokio::test]
 async fn command_output_is_readable_only_in_the_process_that_ran_it() {

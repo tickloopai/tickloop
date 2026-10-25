@@ -24,9 +24,9 @@ use super::{
 use crate::environment::{
     ExecutionAuthority, ExecutionEnvironment, ExecutionError, ExecutionInspection, ExecutionKind,
     ExecutionLinkState, ExecutionPort, ExecutionQuery, ExecutionScope, ExecutionUpdate,
-    LocalEnvironment, ObservationCursor, ObserveRequest, TerminalDescription, TerminalRead,
+    ObservationCursor, ObserveRequest, TerminalDescription, TerminalRead,
 };
-use crate::{hosted::tools::HostedTickTools, tick_tools::TICK_READ};
+use crate::tick_tools::TICK_READ;
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 
 type Screens = Arc<Mutex<TerminalScreens>>;
@@ -73,13 +73,6 @@ pub struct HostedTickStream {
 }
 
 impl HostedTickStream {
-    pub fn new(tools: Arc<HostedTickTools>) -> Self {
-        Self::with_environment(
-            Arc::new(LocalEnvironment::with_ticks(tools.clone())),
-            tools.authority(),
-        )
-    }
-
     pub fn with_environment(
         environment: Arc<dyn ExecutionEnvironment>,
         authority: HostToolAuthority,

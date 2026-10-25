@@ -32,8 +32,9 @@ mod shell;
 pub use shell::CANCELLED_COMMAND_REASON;
 pub use shell::{
     BASH_TOOL_NAME, PreparedShellStart, PreparedShellStop, ShellExit, ShellHost, ShellLaunch,
-    ShellPreparation, ShellPreparationRequest, ShellProcess, ShellStartError, ShellStopAdmission,
-    ShellStopError, ShellStopPreparation, TASK_STOP_TOOL_NAME, UserCommandSnapshot,
+    ShellPreparation, ShellPreparationRequest, ShellProcess, ShellRetention, ShellRuntime,
+    ShellStartError, ShellStopAdmission, ShellStopError, ShellStopPreparation, TASK_STOP_TOOL_NAME,
+    UserCommandSnapshot,
 };
 mod web;
 pub mod web_provenance;

@@ -10,6 +10,7 @@ use tickloop_agent_access::{
 use tickloop_agent_console::agent_console::{AgentConsole, Destination, Intent};
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_protocol::LoopState;
+use tickloop_local_environment::AgentLocalExt;
 
 use tickloop_agent_runtime::Agent;
 use uuid::Uuid;

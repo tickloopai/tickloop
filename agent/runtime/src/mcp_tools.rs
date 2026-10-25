@@ -1622,12 +1622,6 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
-    fn local_tick_tools(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
-        self.native
-            .as_ref()
-            .and_then(|native| native.local_tick_tools())
-    }
-
     async fn shutdown(&self) {
         self.cancel_pending_login();
         self.login_polls.close();

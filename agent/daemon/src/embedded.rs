@@ -45,6 +45,7 @@ type QueuedAction = (ExecutionRef, AfterTurnAction);
 
 struct Inner {
     agent: Agent,
+    environment: Option<tickloop_local_environment::environment::LocalEnvironment>,
     epoch: Uuid,
     executions: Mutex<HashMap<ExecutionRef, Uuid>>,
     references: Mutex<HashMap<Uuid, ExecutionRef>>,
@@ -103,15 +104,20 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn with_epoch(agent: Agent, epoch: Uuid) -> Self {
-        Self::build(agent, epoch)
+        Self::build(agent, epoch, None)
     }
 
-    fn build(agent: Agent, epoch: Uuid) -> Self {
+    fn build(
+        agent: Agent,
+        epoch: Uuid,
+        environment: Option<tickloop_local_environment::environment::LocalEnvironment>,
+    ) -> Self {
         let events = agent.subscribe();
         let shells = agent.subscribe_user_shells();
         let tasks = agent.subscribe_task_notifications();
         let inner = Arc::new(Inner {
             agent,
+            environment,
             epoch,
             executions: Mutex::new(HashMap::new()),
             references: Mutex::new(HashMap::new()),
@@ -143,7 +149,19 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn for_worker(agent: Agent, epoch: Uuid) -> Self {
-        let access = Self::build(agent, epoch);
+        Self::for_worker_with_environment(
+            agent,
+            epoch,
+            tickloop_local_environment::environment::LocalEnvironment::bare(),
+        )
+    }
+
+    pub fn for_worker_with_environment(
+        agent: Agent,
+        epoch: Uuid,
+        environment: tickloop_local_environment::environment::LocalEnvironment,
+    ) -> Self {
+        let access = Self::build(agent, epoch, Some(environment));
         access.inner.verified_sources.store(true, Ordering::SeqCst);
         access
             .inner
@@ -326,13 +344,17 @@ impl EmbeddedAgentAccess {
 
     fn hosted_ticks(
         &self,
-    ) -> Result<Arc<tickloop_agent_runtime::hosted::tools::HostedTickTools>, AccessError> {
-        self.inner.agent.hosted_ticks().ok_or_else(|| {
-            AccessError::new(
-                AccessErrorCode::Unsupported,
-                "this Agent runs no hosted Ticks",
-            )
-        })
+    ) -> Result<Arc<tickloop_local_environment::hosted::tools::HostedTickTools>, AccessError> {
+        self.inner
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.hosted_ticks())
+            .ok_or_else(|| {
+                AccessError::new(
+                    AccessErrorCode::Unsupported,
+                    "this Agent runs no hosted Ticks",
+                )
+            })
     }
 
     async fn chat(&self, execution: ExecutionRef) -> Result<Uuid, AccessError> {
@@ -699,8 +721,15 @@ impl EmbeddedAgentAccess {
                 let chat = self.chat(execution).await?;
                 let grant = if instance.access() == tick_protocol::SHELL_ACCESS {
                     self.inner
-                        .agent
-                        .shell_tasks()
+                        .environment
+                        .as_ref()
+                        .and_then(|environment| environment.shell_tasks())
+                        .ok_or_else(|| {
+                            AccessError::new(
+                                AccessErrorCode::Unsupported,
+                                "this Agent runs no Shells",
+                            )
+                        })?
                         .allow_view(chat, &instance)
                         .await
                 } else {

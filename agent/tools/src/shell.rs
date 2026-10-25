@@ -26,8 +26,8 @@ mod command_tables;
 mod host;
 pub use host::{
     PreparedShellStart, PreparedShellStop, ShellExit, ShellHost, ShellLaunch, ShellPreparation,
-    ShellPreparationRequest, ShellProcess, ShellStartError, ShellStopAdmission, ShellStopError,
-    ShellStopPreparation,
+    ShellPreparationRequest, ShellProcess, ShellRetention, ShellRuntime, ShellStartError,
+    ShellStopAdmission, ShellStopError, ShellStopPreparation,
 };
 mod interpreter;
 mod model_result;

@@ -1,6 +1,8 @@
 use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture, TIMEOUT};
 use super::*;
 use tickloop_agent_test_support::screen;
+#[cfg(test)]
+use tickloop_local_environment::AgentLocalExt;
 
 const SEND_NOW_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// What a terminal speaking the kitty keyboard protocol sends for ctrl+enter.

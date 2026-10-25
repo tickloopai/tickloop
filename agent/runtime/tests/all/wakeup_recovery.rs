@@ -389,7 +389,7 @@ fn process_on(
         tickloop_agent_runtime::HarnessSeams {
             transcripts: Some(store),
             environment: Some(Arc::new(
-                tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+                tickloop_agent_runtime::environment::FolderEnvironment::bare(),
             )),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },

@@ -7,15 +7,17 @@ use tickloop_agent_settings::skills::SkillDiscovery;
 
 use serde_json::json;
 use tick_packages::{MANIFEST_FILE_NAME, PackageStore};
-use tickloop_agent_model::ModelRequest;
-use tickloop_agent_policy::skills::{SkillCaller, SkillError, SkillRegistry};
-use tickloop_agent_protocol::{Content, EventKind, ExecutionMode, LoopState, Receipt, SkillSource};
-use tickloop_agent_runtime::Agent;
+use tickloop_harness::model::ModelRequest;
+use tickloop_harness::policy::skills::{SkillCaller, SkillError, SkillRegistry};
+use tickloop_harness::protocol::{
+    Content, EventKind, ExecutionMode, LoopState, Receipt, SkillSource,
+};
+use tickloop_harness::runtime::Agent;
 
 use crate::support::{assert_extends, guidance_in_effect, mentions};
 
-use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
-use tickloop_agent_test_support::{
+use tickloop_harness::test_support::routed::{RoutedModel, has_tool_result, state};
+use tickloop_harness::test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,
 };
 
@@ -252,7 +254,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
         ));
         assert!(second.contains("Launching skill: tickloop"));
         let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Use the installed host tools as the authority for targets and capabilities")))).unwrap();
-        assert_eq!(guidance.role, tickloop_agent_protocol::Role::User);
+        assert_eq!(guidance.role, tickloop_harness::protocol::Role::User);
         assert!(
             serde_json::to_string(guidance)
                 .unwrap()
@@ -541,7 +543,7 @@ async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided()
             .contains("Already loaded analyze")
     );
     let guidance = requests[3].messages.iter().find(|message| message.content.iter().any(|block| matches!(block, Content::Text { text } if text.contains("Analyze second.md carefully.")))).unwrap();
-    assert_eq!(guidance.role, tickloop_agent_protocol::Role::User);
+    assert_eq!(guidance.role, tickloop_harness::protocol::Role::User);
     let recorded = snapshot
         .messages
         .iter()
@@ -654,7 +656,7 @@ fn install_package(
 
 /// Waits for the run `receipt` started to end.
 async fn finish(
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
     receipt: &Receipt,
 ) {
     loop {
@@ -946,33 +948,35 @@ async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() 
     }
 
     #[async_trait::async_trait]
-    impl tickloop_agent_model::ModelClient for PausedModel {
-        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+    impl tickloop_harness::model::ModelClient for PausedModel {
+        fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
             self.scripted.identity()
         }
 
         async fn generate_title(
             &self,
             request: ModelRequest,
-            events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
             cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError>
+        {
             self.scripted.generate_title(request, events, cancel).await
         }
 
         async fn complete(
             &self,
             request: ModelRequest,
-            events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
             cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError>
+        {
             if self
                 .pause_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 self.entered.notify_one();
                 tokio::select! {
-                    () = cancel.cancelled() => return Err(tickloop_agent_model::ModelError::Cancelled),
+                    () = cancel.cancelled() => return Err(tickloop_harness::model::ModelError::Cancelled),
                     () = self.resume.notified() => {},
                 }
             }
@@ -1056,7 +1060,7 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "topic",
-            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
+            tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME,
             json!({"questions":[{"question":"What should these Slides present?","header":"Topic","options":[
                 {"label":"Quarterly results","description":"Revenue and margins"},
                 {"label":"Product launch","description":"What ships and when"}
@@ -1084,7 +1088,7 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
         .answer_question(
             chat,
             question.id,
-            vec![tickloop_agent_protocol::QuestionAnswer::other(
+            vec![tickloop_harness::protocol::QuestionAnswer::other(
                 "The Q3 review",
             )],
         )
@@ -1200,22 +1204,22 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
 
 fn agent_with_project_skills(
     directory: &std::path::Path,
-    model: Arc<dyn tickloop_agent_model::ModelClient>,
+    model: Arc<dyn tickloop_harness::model::ModelClient>,
 ) -> Agent {
     Agent::with_seams(
-        tickloop_agent_runtime::HarnessSeams {
+        tickloop_harness::runtime::HarnessSeams {
             transcripts: None,
             environment: Some(Arc::new(
-                tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+                tickloop_harness::runtime::environment::FolderEnvironment::bare(),
             )),
-            models: tickloop_agent_test_support::harness::ChosenModels::new(model),
+            models: tickloop_harness::test_support::harness::ChosenModels::new(model),
         },
-        tickloop_agent_runtime::HarnessOptions {
+        tickloop_harness::runtime::HarnessOptions {
             settings: Some(Arc::new(tickloop_agent_settings::UserSettings::in_root(
                 &directory.join("config"),
             ))),
-            host: tickloop_agent_protocol::AgentHostOptions::default(),
-            ..tickloop_agent_runtime::HarnessOptions::local(config())
+            host: tickloop_harness::protocol::AgentHostOptions::default(),
+            ..tickloop_harness::runtime::HarnessOptions::local(config())
         },
     )
     .unwrap()

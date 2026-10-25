@@ -39,19 +39,16 @@ use tickloop_agent_access::{
 };
 use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
 
-use tickloop_agent_runtime::{
-    hosted::{
-        controller::HostController,
-        registry::{
-            LaunchIdentity, LaunchRecord, LaunchState, Registry, RootRegistry, TARGET_GONE,
-            Transition,
-        },
-        worker_control::{
-            ENDPOINT_NAME, HostedAdmission, HostedTickPage, IssuedSpawn, LostTick,
-            WorkerControlGrant, WorkerEnvelope, WorkerRequest, root_identity,
-        },
+use tickloop_agent_runtime::tick_tools::TICK_MANAGE;
+use tickloop_local_environment::hosted::{
+    controller::HostController,
+    registry::{
+        LaunchIdentity, LaunchRecord, LaunchState, Registry, RootRegistry, TARGET_GONE, Transition,
     },
-    tick_tools::TICK_MANAGE,
+    worker_control::{
+        ENDPOINT_NAME, HostedAdmission, HostedTickPage, IssuedSpawn, LostTick, WorkerControlGrant,
+        WorkerEnvelope, WorkerRequest, root_identity,
+    },
 };
 
 /// A worker request is small: an open carries argv, cwd and the launch environment.

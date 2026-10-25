@@ -11,6 +11,7 @@ use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,
 };
+use tickloop_local_environment::AgentLocalExt;
 use tokio_util::sync::CancellationToken;
 
 struct StagedJudgment {

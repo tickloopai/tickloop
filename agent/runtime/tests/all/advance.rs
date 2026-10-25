@@ -19,7 +19,7 @@ use tickloop_agent_runtime::transcript::{
 };
 use tickloop_agent_runtime::{
     Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, MessageId, ParentSelection, Turn,
-    TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage, environment::LocalEnvironment,
+    TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage, environment::FolderEnvironment,
 };
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 use tickloop_agent_test_support::{call, config, next_event, text};
@@ -175,7 +175,7 @@ fn harness(
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
@@ -937,7 +937,7 @@ async fn a_refused_input_at_an_explicit_parent_leaves_the_conversation_uncut() {
     let agent = Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store.clone()),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
         },
         HarnessOptions::local(text_only),

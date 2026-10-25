@@ -38,10 +38,7 @@ tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
 tickloop-agent-transcript = { path = "../transcript" }
 tickloop-ids = { path = "../../tick/ids" }
-tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
-tickloop-tickhost = { path = "../../tickhost/host" }
-tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -49,6 +46,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 [dev-dependencies]
+tickloop-local-environment = { path = "../local-environment" }
 tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 base64 = "0.22"
 percent-encoding = "2"

@@ -7,7 +7,7 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, QuestionReply, ToolPolicy,
     TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage, WaitHosting,
-    environment::LocalEnvironment, transcript::TranscriptStore,
+    environment::FolderEnvironment, transcript::TranscriptStore,
 };
 use tickloop_agent_settings::UserSettings;
 use tickloop_agent_test_support::{
@@ -110,7 +110,7 @@ async fn local_settings_override_either_host_value_and_keep_default_off() {
         let agent = Agent::with_seams(
             HarnessSeams {
                 transcripts: None,
-                environment: Some(Arc::new(LocalEnvironment::bare())),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
                 models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![]))),
             },
             options,

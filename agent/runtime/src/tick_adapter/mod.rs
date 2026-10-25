@@ -35,10 +35,7 @@ impl TickAdapters {
             adapters: registered,
         })
     }
-    pub fn builtin(
-        agent: crate::Agent,
-        hosted: Option<Arc<crate::hosted::tools::HostedTickTools>>,
-    ) -> Self {
+    pub fn builtin(agent: crate::Agent, hosted: Option<Arc<dyn TickStreamPort>>) -> Self {
         Self::new([
             Arc::new(ShellAdapter::new(agent)) as Arc<dyn TickAdapter>,
             Arc::new(HostedAdapter::new(hosted)),

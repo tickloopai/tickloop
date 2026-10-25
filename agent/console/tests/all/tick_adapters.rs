@@ -14,6 +14,7 @@ use tickloop_agent_runtime::{
     tick_stream::{InMemoryTickStream, TickObservation, TickStreamPort},
 };
 use tickloop_agent_test_support::*;
+use tickloop_local_environment::AgentLocalExt;
 use uuid::Uuid;
 
 struct CalendarAdapter {

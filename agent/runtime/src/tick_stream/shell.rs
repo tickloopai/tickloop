@@ -10,7 +10,7 @@ use std::{
 };
 
 use serde_json::json;
-use tickhost::shell::OUTPUT_TAIL_BYTES;
+const OUTPUT_TAIL_BYTES: usize = 4096;
 use tokio::sync::watch;
 use uuid::Uuid;
 

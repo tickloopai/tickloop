@@ -10,6 +10,8 @@ use tickloop_agent_protocol::{Content, ExecutionMode, Role as MessageRole};
 #[cfg(test)]
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::ScriptedModel;
+#[cfg(test)]
+use tickloop_local_environment::AgentLocalExt;
 
 const FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 const FLOW_TIMEOUT: Duration = Duration::from_secs(20);

@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    Agent,
-    tick_stream::{HostedTickStream, ShellTickStream},
-};
+use crate::{Agent, tick_stream::ShellTickStream};
 
 /// Ticks a Chat opened in the dedicated Tickhost; only a worker with a Tickhost grant follows
 /// them.
@@ -10,11 +7,8 @@ pub struct HostedAdapter {
     stream: Option<Arc<dyn TickStreamPort>>,
 }
 impl HostedAdapter {
-    pub fn new(tools: Option<Arc<crate::hosted::tools::HostedTickTools>>) -> Self {
-        Self {
-            stream: tools
-                .map(|tools| Arc::new(HostedTickStream::new(tools)) as Arc<dyn TickStreamPort>),
-        }
+    pub fn new(stream: Option<Arc<dyn TickStreamPort>>) -> Self {
+        Self { stream }
     }
 }
 impl TickAdapter for HostedAdapter {

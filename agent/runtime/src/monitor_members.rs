@@ -279,6 +279,10 @@ impl Agent {
     /// by itself unless the user removed it, or while a Loop of the Chat subscribes to it. Only a
     /// row a View keeps for its open detail is left out, which no Agent knows of.
     pub(crate) async fn monitor_may_list_shell(&self, chat_id: ChatId, task: Uuid) -> bool {
+        let _guard = self.inner.upgrade_gate.clone().read_owned().await;
+        if self.inner.shutdown.is_cancelled() {
+            return false;
+        }
         let Ok(commands) = self.commands(chat_id).await else {
             return false;
         };

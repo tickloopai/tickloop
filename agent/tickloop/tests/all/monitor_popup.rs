@@ -14,7 +14,7 @@ use std::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::{Value, json};
 use support::herdr::{HerdrClient, PLUGIN_ID, PrivateHerdr, TIMEOUT, capture, wait_until};
-use tickloop_agent_runtime::hosted::controller::HostController;
+use tickloop_local_environment::hosted::controller::HostController;
 use uuid::Uuid;
 
 const PLUGIN_DIRECTORY: &str = "herdr-popup-plugin";

@@ -134,7 +134,7 @@ impl HostToolProvider for ExecutionTools {
     }
 }
 
-pub(super) async fn prepare_on_port(
+pub async fn prepare_on_port(
     port: Arc<dyn ExecutionPort>,
     authority: ExecutionAuthority,
     chat: ChatId,
@@ -185,10 +185,8 @@ pub(super) async fn prepare_on_port(
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let data = crate::hosted::terminal_input::encode(
-                input.get("text").and_then(Value::as_str),
-                &keys,
-            )?;
+            let data =
+                crate::terminal_input::encode(input.get("text").and_then(Value::as_str), &keys)?;
             ExecutionIntent::SendInput { instance, data }
         }
         (TICK_MANAGE, Some("open")) => {
@@ -275,12 +273,12 @@ struct EnvironmentReadCall {
     description: bool,
 }
 
-pub(crate) fn is_environment_call(call: &PreparedHostCall) -> bool {
+pub fn is_environment_call(call: &PreparedHostCall) -> bool {
     call.payload::<EnvironmentPreparedCall>().is_some()
         || call.payload::<EnvironmentReadCall>().is_some()
 }
 
-pub(crate) async fn revalidate_call(chat: ChatId, call: &PreparedHostCall) -> Result<(), String> {
+pub async fn revalidate_call(chat: ChatId, call: &PreparedHostCall) -> Result<(), String> {
     if let Some(call) = call.payload::<EnvironmentPreparedCall>() {
         return call.revalidate(chat).await;
     }
@@ -301,7 +299,7 @@ pub(crate) async fn revalidate_call(chat: ChatId, call: &PreparedHostCall) -> Re
     }
 }
 
-pub(crate) async fn execute_call(
+pub async fn execute_call(
     chat: ChatId,
     call: PreparedHostCall,
     cancel: CancellationToken,

@@ -33,9 +33,9 @@ pub use harness::{
 mod host_context;
 mod host_notes;
 pub mod host_tools;
-pub mod hosted;
 mod jev_review;
 mod lifecycle;
+pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
 mod loop_lease;
 mod mcp_http;
@@ -372,7 +372,6 @@ struct Inner {
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
     /// Where Chats with a Folder run their commands and Ticks; `None` when Chats have no Folder.
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
-    local_tick_tools: std::sync::OnceLock<Arc<crate::hosted::tools::HostedTickTools>>,
     tool_policy: ToolPolicy,
     citation_style: CitationStyle,
     host_rules: Vec<PermissionRule>,
@@ -381,7 +380,7 @@ struct Inner {
     /// The permits each request to a model's vendor takes, in order.
     request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
-    shells: std::sync::RwLock<Arc<crate::hosted::shells::ShellTasks>>,
+    shells: std::sync::RwLock<Option<Arc<dyn tickloop_agent_tools::ShellRuntime>>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
     tick_stream_installed: AtomicBool,
@@ -1119,31 +1118,15 @@ impl Agent {
         .definitions()
     }
 
-    /// The environment's hosted Ticks, which its Chats' Monitors list and close directly.
-    pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
-        self.inner.environment.as_ref()?;
-        self.inner.local_tick_tools.get().cloned()
-    }
-
-    /// Grants this Agent's Shell spawns and views in a Tickhost after it was built, for an Agent
-    /// without a daemon such as a test's. Chats without a Folder run no command, so an Agent
-    /// without an environment ignores it.
-    pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
+    /// Installs execution-owner services for Shell handoff. An environment is required.
+    pub fn install_shell_runtime(&self, runtime: Arc<dyn tickloop_agent_tools::ShellRuntime>) {
         if self.inner.environment.is_some() {
-            self.shell_tasks().install_grants(grants);
+            runtime.attach(Arc::new(self.downgrade()));
+            *self.inner.shells.write().unwrap() = Some(runtime);
         }
     }
 
-    /// Runs and shows this Agent's shell commands in a Tickhost of its own, served inside this
-    /// process, for an Agent without a daemon such as a test's.
-    pub fn install_own_tickhost(&self) {
-        // An Agent without an environment runs no command, so it builds no Tickhost either.
-        if self.inner.environment.is_some() {
-            self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
-        }
-    }
-
-    pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
+    pub(crate) fn shell_runtime(&self) -> Option<Arc<dyn tickloop_agent_tools::ShellRuntime>> {
         self.inner.shells.read().unwrap().clone()
     }
 
@@ -1170,16 +1153,6 @@ impl Agent {
                     definition.name
                 )));
             }
-        }
-        if self.inner.environment.is_some()
-            && let Some(tools) = provider.local_tick_tools()
-            && self.inner.local_tick_tools.set(tools.clone()).is_ok()
-            && !self.shell_tasks().has_grants()
-            && let Some(environment) = tools.shell_environment()
-        {
-            let tasks = environment.tasks();
-            tasks.follow_monitor(self.downgrade());
-            *self.inner.shells.write().unwrap() = tasks;
         }
         *self.inner.host_tools.write().unwrap() = Some(provider);
         Ok(())
@@ -1851,7 +1824,7 @@ impl Agent {
             Arc::new(harness::OneClient(client.clone())),
             client,
             recorder,
-            Some(Arc::new(environment::LocalEnvironment::bare())),
+            Some(Arc::new(environment::FolderEnvironment::bare())),
         ))
     }
 
@@ -1902,7 +1875,7 @@ impl Agent {
             Arc::new(harness::OneClient(client.clone())),
             client,
             None,
-            Some(Arc::new(environment::LocalEnvironment::bare())),
+            Some(Arc::new(environment::FolderEnvironment::bare())),
         )
     }
 
@@ -1922,7 +1895,7 @@ impl Agent {
             Arc::new(harness::OneClient(client.clone())),
             client,
             None,
-            Some(Arc::new(environment::LocalEnvironment::bare())),
+            Some(Arc::new(environment::FolderEnvironment::bare())),
         )
     }
 
@@ -2007,8 +1980,7 @@ impl Agent {
                 host_tools: std::sync::RwLock::new(None),
                 // Until a daemon grants its spawns and views, an Agent runs and shows no shell
                 // command.
-                shells: std::sync::RwLock::new(crate::hosted::shells::ShellTasks::without_grants()),
-                local_tick_tools: std::sync::OnceLock::new(),
+                shells: std::sync::RwLock::new(None),
                 environment,
                 tool_policy,
                 citation_style,
@@ -2040,7 +2012,6 @@ impl Agent {
                 handover: CancellationToken::new(),
             }),
         };
-        agent.shell_tasks().follow_monitor(agent.downgrade());
         agent.register_trigger_source_state(Arc::new(goal::GoalSourceState));
         agent.register_trigger_source_state(Arc::new(scheduled_tasks::ScheduledTasksState));
         agent
@@ -5488,5 +5459,40 @@ mod thinking_settings_tests {
             snapshot.effective_reasoning_effort(),
             Some(tickloop_agent_protocol::ReasoningEffort::Off)
         );
+    }
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_tools::ShellRetention for WeakAgent {
+    fn spawn(&self, task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        if let Some(agent) = self.upgrade() {
+            let shutdown = agent.inner.shutdown.clone();
+            agent.inner.tasks.spawn(async move {
+                tokio::select! { _ = shutdown.cancelled() => {}, _ = task => {} }
+            });
+        }
+    }
+    async fn is_retained(&self, chat: uuid::Uuid, task: uuid::Uuid) -> bool {
+        match self.upgrade() {
+            Some(agent) => agent.monitor_may_list_shell(chat.into(), task).await,
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Agent {
+    fn install_shell_grants(
+        &self,
+        grants: Arc<dyn tickloop_local_environment::hosted::shells::ShellGrants>,
+    ) -> Arc<tickloop_local_environment::hosted::shells::ShellTasks> {
+        let tasks = tickloop_local_environment::hosted::shells::ShellTasks::new(grants);
+        self.install_shell_runtime(tasks.clone());
+        tasks
+    }
+    fn install_own_tickhost(&self) {
+        self.install_shell_grants(Arc::new(
+            tickloop_local_environment::hosted::shells::OwnTickhost::new(),
+        ));
     }
 }

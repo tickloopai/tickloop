@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{AgentHostOptions, ModelConfig};
 use tickloop_harness::runtime::{
-    Agent, AgentError, HarnessOptions, HarnessSeams, environment::LocalEnvironment,
+    Agent, AgentError, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
     transcript::JsonlTranscriptStore,
 };
 
@@ -66,7 +66,7 @@ impl LocalAgent for Agent {
         Agent::with_seams(
             HarnessSeams {
                 transcripts: Some(Arc::new(store)),
-                environment: Some(Arc::new(LocalEnvironment::bare())),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
                 models: Arc::new(OneClient(client)),
             },
             HarnessOptions {
@@ -85,7 +85,7 @@ impl LocalAgent for Agent {
         Agent::with_seams(
             HarnessSeams {
                 transcripts: None,
-                environment: Some(Arc::new(LocalEnvironment::bare())),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
                 models: Arc::new(OneClient(client)),
             },
             HarnessOptions {
@@ -105,7 +105,7 @@ pub fn opened_agent(root: PathBuf, model: ModelConfig, models: Arc<dyn ModelClie
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(Arc::new(store)),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
             models,
         },
         local_options(model, Some(settings)),

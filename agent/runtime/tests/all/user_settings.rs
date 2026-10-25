@@ -1,6 +1,7 @@
 use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_settings::local_agent::opened_agent;
+use tickloop_local_environment::AgentLocalExt;
 
 use serde_json::json;
 use tickloop_agent_base::output_style::OutputStyle;

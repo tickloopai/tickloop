@@ -680,7 +680,7 @@ mod tests {
             directory.path(),
             epoch,
             Arc::new(
-                tickloop_agent_runtime::hosted::controller::HostController::in_process(
+                tickloop_local_environment::hosted::controller::HostController::in_process(
                     directory.path(),
                     tickhost::paths::HostPaths {
                         runtime: directory.path().join("host"),

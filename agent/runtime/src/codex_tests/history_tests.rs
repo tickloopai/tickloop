@@ -37,7 +37,7 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
     Agent::with_seams(
         crate::HarnessSeams {
             transcripts: Some(Arc::new(store)),
-            environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+            environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
             models,
         },
         crate::HarnessOptions {

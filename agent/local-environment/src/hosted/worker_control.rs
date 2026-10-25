@@ -21,7 +21,7 @@ use tokio::{io::BufReader, net::UnixStream};
 use uuid::Uuid;
 
 use super::controller::LIFECYCLE_TIMEOUT;
-use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
+use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
 
 pub const ENDPOINT_NAME: &str = "worker-control.sock";
 /// How long a worker waits for the daemon: the longest lifecycle request plus transport.

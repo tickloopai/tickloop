@@ -156,7 +156,7 @@ fn stateless_host_with_a_folder(
         HarnessSeams {
             transcripts: Some(store),
             environment: Some(Arc::new(
-                tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+                tickloop_agent_runtime::environment::FolderEnvironment::bare(),
             )),
             models: ChosenModels::new(model),
         },

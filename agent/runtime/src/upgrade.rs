@@ -421,10 +421,12 @@ impl Agent {
             .await
             .take()
             .ok_or_else(|| AgentError::Invalid("Worker has no adopted upgrade".into()))?;
-        self.shell_tasks()
-            .commit_handoffs()
-            .await
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        if let Some(shells) = self.shell_runtime() {
+            shells
+                .commit_handoffs()
+                .await
+                .map_err(AgentError::Invalid)?;
+        }
         self.inner.upgrade_paused.store(false, Ordering::SeqCst);
         self.inner.upgrade_guard.lock().await.take();
         for saved in checkpoint.chats {

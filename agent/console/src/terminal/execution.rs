@@ -6,6 +6,8 @@ use std::{
 #[cfg(test)]
 use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_settings::skills::SkillDiscovery;
+#[cfg(test)]
+use tickloop_local_environment::AgentLocalExt;
 
 use tickhost_connect::herdr::{PaneIdentityError, confirm_pane};
 use tokio::sync::broadcast;

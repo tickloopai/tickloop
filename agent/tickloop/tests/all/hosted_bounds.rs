@@ -21,7 +21,7 @@ use tickhost_connect::hosted::{
     BUILD_VERSION, BUSINESS_FRAME_BYTES, BUSINESS_MAJOR, BUSINESS_MINOR, CAPABILITY_LIFECYCLE,
     read_frame, write_frame,
 };
-use tickloop_agent_runtime::hosted::{
+use tickloop_local_environment::hosted::{
     controller::{HostController, START_ATTEMPTS, START_WAIT},
     registry::{LaunchRecord, LaunchState, Registry, SHARD_BYTES},
 };

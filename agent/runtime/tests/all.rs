@@ -1,8 +1,5 @@
 //! Every agent/runtime integration test, compiled as one binary.
 
-#[path = "all/execution_environment.rs"]
-mod execution_environment;
-
 #[path = "all/advance.rs"]
 mod advance;
 #[path = "all/agent_approval_routing.rs"]
@@ -176,8 +173,6 @@ mod shell_descriptions;
 mod shell_read_only;
 #[path = "all/shell_tools.rs"]
 mod shell_tools;
-#[path = "all/skills.rs"]
-mod skills;
 #[path = "all/support/mod.rs"]
 mod support;
 #[path = "all/switching_http.rs"]
@@ -188,16 +183,8 @@ mod task_notification_runs;
 mod temp_storage;
 #[path = "all/tick_adapters.rs"]
 mod tick_adapters;
-#[path = "all/tick_package_logins.rs"]
-mod tick_package_logins;
-#[path = "all/tick_package_opens.rs"]
-mod tick_package_opens;
 #[path = "all/tick_subscriptions.rs"]
 mod tick_subscriptions;
-#[path = "all/tickhost_shells.rs"]
-mod tickhost_shells;
-#[path = "all/tickhost_versions.rs"]
-mod tickhost_versions;
 #[path = "all/tool_batches.rs"]
 mod tool_batches;
 #[path = "all/tool_results.rs"]
@@ -226,8 +213,6 @@ mod wakeup_recovery;
 mod wakeup_support;
 #[path = "all/web_tools.rs"]
 mod web_tools;
-#[path = "all/workspace_host_context.rs"]
-mod workspace_host_context;
 
 #[path = "all/shared_tasks.rs"]
 mod shared_tasks;

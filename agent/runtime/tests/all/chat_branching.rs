@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_local_environment::AgentLocalExt;
 
 use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
