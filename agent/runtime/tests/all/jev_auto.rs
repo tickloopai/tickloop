@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_model::{
@@ -172,7 +173,7 @@ async fn selected_jev_configuration_failure_falls_back_to_the_conversation_model
     let agent = Agent::new_with_user_settings_embedded(
         config(),
         model.clone(),
-        tickloop_agent_config::UserSettings::in_root(&root),
+        tickloop_agent_settings::UserSettings::in_root(&root),
     );
     agent.install_own_tickhost();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();

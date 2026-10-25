@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_model::{

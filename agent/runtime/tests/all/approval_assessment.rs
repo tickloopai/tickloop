@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::{Value, json};
 use tickloop_agent_model::judgment::{

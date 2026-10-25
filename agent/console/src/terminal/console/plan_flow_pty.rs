@@ -7,6 +7,8 @@ use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture};
 use super::*;
 use serde_json::{Value, json};
 use tickloop_agent_protocol::{Content, ExecutionMode, Role as MessageRole};
+#[cfg(test)]
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::ScriptedModel;
 
 const FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
@@ -143,7 +145,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         .unwrap();
         record_phase(&directory, "agent-opened");
         core.install_own_tickhost();
-        let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.clone());
+        let mut launch = tickloop_agent_access::LaunchSpec::embedded(directory.clone());
         launch.model = Some(model.clone());
         launch.config_root = Some(root);
         let agent = crate::terminal::execution::ConsoleExecution::from_embedded_launch(
@@ -209,7 +211,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
             model_selected: true,
             launch_arguments: Vec::new(),
             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
-            user_settings: Some(tickloop_agent_config::UserSettings::in_root(&directory)),
+            user_settings: Some(tickloop_agent_settings::UserSettings::in_root(&directory)),
         },
         Some(directory.clone()),
     );

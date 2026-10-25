@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -14,8 +15,8 @@ use tickhost_connect::{
     host_error::HostError,
     layout::HerdrLayout,
 };
-use tickloop_agent_config::skills::TICKLOOP_SKILL;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_agent_policy::skills::TICKLOOP_SKILL;
 use tickloop_agent_protocol::{
     Content, EventKind, HerdrInteraction, HerdrPane, HostCallContext, ModelIdentity, Role,
     SkillSource, ToolDefinition, ToolResult,

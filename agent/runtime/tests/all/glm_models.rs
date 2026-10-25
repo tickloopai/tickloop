@@ -1,3 +1,4 @@
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use tickloop_agent_protocol::{
     ProviderPatch, ReasoningEffort, Role, ThinkingControl, ToolDefinition,
 };
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_test_support::harness::opened_agent;
+use tickloop_agent_settings::local_agent::opened_agent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

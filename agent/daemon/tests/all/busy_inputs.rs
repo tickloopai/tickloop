@@ -9,17 +9,19 @@ use std::{
     },
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tickloop_agent_access::{
+    AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandReceipt,
+    CommandResult, ConfigurationChange, ExecutionRef, LaunchSpec, LiveChatSnapshot,
+    ObservationRequest, ObservationValue, ReceiptState, UserInput,
+};
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_protocol::{
-    AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandReceipt,
-    CommandResult, ConfigurationChange, EventKind, ExecutionRef, LaunchSpec, LiveChatSnapshot,
-    LoopState, ModelIdentity, ObservationRequest, ObservationValue, Receipt, ReceiptState,
-    UserInput,
-};
+use tickloop_agent_protocol::{EventKind, LoopState, ModelIdentity, Receipt};
+
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
@@ -115,7 +117,11 @@ impl Busy {
         });
         let runtime = match &archive {
             Some(archive) => Agent::open_embedded(archive.clone(), config(), gate.clone()).unwrap(),
-            None => Agent::new_embedded(config(), gate.clone()),
+            None => Agent::new_with_user_settings_embedded(
+                config(),
+                gate.clone(),
+                tickloop_agent_settings::UserSettings::in_root(&directory.join("config")),
+            ),
         };
         runtime.install_own_tickhost();
         let access = EmbeddedAgentAccess::new(runtime.clone());

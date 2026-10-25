@@ -2,6 +2,7 @@
 //! merge must not lose or run twice.
 
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_protocol::LoopTriggerNoticeKind;
 use tickloop_agent_runtime::Agent;
@@ -393,7 +394,10 @@ fn process_on(
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         tickloop_agent_runtime::HarnessOptions {
-            settings: Some(tickloop_agent_config::UserSettings::in_root(root)),
+            settings: Some(Arc::new(tickloop_agent_settings::UserSettings::in_root(
+                root,
+            ))),
+            local_state_root: Some(root.to_owned()),
             ..tickloop_agent_runtime::HarnessOptions::local(config())
         },
     )

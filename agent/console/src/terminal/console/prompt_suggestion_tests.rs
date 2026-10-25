@@ -247,7 +247,7 @@ fn prompt_suggestion_is_suppressed_for_typed_noninteractive_delegated_and_dialog
 #[tokio::test]
 async fn prompt_suggestion_settings_menu_saves_off_and_cancels_generation_immediately() {
     let directory = tempfile::tempdir().unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
+    let settings = tickloop_agent_settings::UserSettings::in_root(directory.path());
     let agent = crate::terminal::execution::ConsoleExecution::new_embedded(
         tickloop_agent_test_support::config(),
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),

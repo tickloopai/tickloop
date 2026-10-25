@@ -219,9 +219,10 @@ impl Terminal {
     }
 
     fn assert_no_chats(&self) {
-        use tickloop_agent_protocol::{
+        use tickloop_agent_access::{
             AgentAccess, AgentFilter, ObservationRequest, ObservationValue, Page,
         };
+
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -250,16 +251,17 @@ impl Terminal {
             });
     }
 
-    fn only_chat_snapshot(&self) -> Option<Box<tickloop_agent_protocol::LiveChatSnapshot>> {
+    fn only_chat_snapshot(&self) -> Option<Box<tickloop_agent_access::LiveChatSnapshot>> {
         let mut snapshots = self.chat_snapshots();
         assert!(snapshots.len() <= 1, "fixture must own at most one Chat");
         snapshots.pop()
     }
 
-    fn chat_snapshots(&self) -> Vec<Box<tickloop_agent_protocol::LiveChatSnapshot>> {
-        use tickloop_agent_protocol::{
+    fn chat_snapshots(&self) -> Vec<Box<tickloop_agent_access::LiveChatSnapshot>> {
+        use tickloop_agent_access::{
             AgentAccess, AgentDetailQuery, AgentFilter, ObservationRequest, ObservationValue, Page,
         };
+
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -383,7 +385,7 @@ fn save_model(root: &Path) {
     let model = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
-    tickloop_agent_config::UserSettings::in_root(&root.join("state"))
+    tickloop_agent_settings::UserSettings::in_root(&root.join("state"))
         .save_model(&model, false)
         .unwrap();
 }

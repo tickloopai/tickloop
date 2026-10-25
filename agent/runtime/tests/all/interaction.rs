@@ -5,6 +5,7 @@ use tickloop_agent_protocol::{
     Content, EventKind, INTERRUPT_MESSAGE_FOR_TOOL_USE, LoopState, QuestionAnswer,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::*;
 use tickloop_agent_tools::{ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT};
 

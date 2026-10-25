@@ -19,13 +19,15 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use tickloop_agent_access::{
+    AccessError, AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, CommandReceipt,
+    CommandResult, DisplayReceipt, DisplayUpdate, EnvironmentValue, LaunchSpec, Observation,
+    ObservationRequest, ObservationValue, Page, TranscriptRef, UserInput,
+};
 use tickloop_agent_client::LocalAgentClient;
 use tickloop_agent_daemon::{serve_daemon_listener, serve_worker_listener};
-use tickloop_agent_protocol::{
-    AccessError, AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, CommandReceipt,
-    CommandResult, Content, DisplayReceipt, DisplayUpdate, EnvironmentValue, LaunchSpec,
-    Observation, ObservationRequest, ObservationValue, Page, Protocol, TranscriptRef, UserInput,
-};
+use tickloop_agent_protocol::{Content, Protocol};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -173,7 +175,7 @@ async fn read_frame(stream: &mut UnixStream) -> Option<Value> {
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
         Err(error) => panic!("{error}"),
     };
-    assert!(length <= tickloop_agent_protocol::AccessLimits::DEFAULT.frame_bytes());
+    assert!(length <= tickloop_agent_access::AccessLimits::DEFAULT.frame_bytes());
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await.unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
@@ -777,7 +779,7 @@ async fn management_session_rejects_every_business_request_before_dispatch() {
         fixture.listener(),
         access.clone(),
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         tokio_util::sync::CancellationToken::new(),
     ));
     let request_id = Uuid::new_v4();
@@ -829,7 +831,7 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
         fixture.listener(),
         access.clone(),
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         tokio_util::sync::CancellationToken::new(),
     ));
     let request_id = Uuid::new_v4();
@@ -905,7 +907,7 @@ async fn worker_socket_has_no_cross_version_management_facade() {
         fixture.listener(),
         access.clone(),
         Uuid::new_v4(),
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     ));
     let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
         .await

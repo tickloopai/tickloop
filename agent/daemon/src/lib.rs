@@ -39,12 +39,12 @@ use tickloop_agent_client::{
         remove_stale_socket, validate_directory, validate_file,
     },
 };
-use tickloop_agent_config::UserSettings;
 use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model};
-use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
-};
+
+use tickloop_agent_access::{AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec};
+use tickloop_agent_protocol::OtherTickhost;
 use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
+use tickloop_agent_settings::UserSettings;
 
 mod chunked;
 pub mod daemon_control;
@@ -154,8 +154,8 @@ impl WorkerFactory for ProcessWorkerFactory {
 
     async fn runtime_version(
         &self,
-        routes: &[(tickloop_agent_protocol::ExecutionRef, Arc<dyn AgentAccess>)],
-    ) -> tickloop_agent_protocol::RuntimeVersion {
+        routes: &[(tickloop_agent_access::ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> tickloop_agent_access::RuntimeVersion {
         self.version(routes).await
     }
     async fn start(
@@ -659,7 +659,7 @@ pub async fn build_runtime_with_models(
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
     executable: &Path,
 ) -> Result<Agent, String> {
-    let model = launch_model(launch);
+    let model = launch_model(launch.model.as_ref());
     let settings = launch
         .config_root
         .as_ref()
@@ -731,7 +731,12 @@ pub async fn build_runtime_with_models(
             models,
         },
         HarnessOptions {
-            settings,
+            local_state_root: settings
+                .as_ref()
+                .and_then(|settings| settings.root().map(ToOwned::to_owned)),
+            settings: settings.map(|settings| {
+                Arc::new(settings) as Arc<dyn tickloop_harness::policy::settings::SettingsStore>
+            }),
             host: launch.host_options,
             ..HarnessOptions::local(model)
         },
@@ -840,3 +845,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
+
+mod access_error;
+mod records;

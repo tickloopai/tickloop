@@ -53,12 +53,12 @@ fn main() {
                 return;
             }
             Some("--runtime-info") => {
-                let info = tickloop_agent_protocol::RuntimeBinaryInfo {
+                let info = tickloop_agent_access::RuntimeBinaryInfo {
                     product_version: env!("CARGO_PKG_VERSION").into(),
                     build_id: env!("TICKLOOP_BUILD_IDENTITY").into(),
-                    protocol_major: tickloop_agent_protocol::PROTOCOL_MAJOR,
-                    protocol_minor: tickloop_agent_protocol::PROTOCOL_MINOR,
-                    handoff_version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+                    protocol_major: tickloop_agent_access::PROTOCOL_MAJOR,
+                    protocol_minor: tickloop_agent_access::PROTOCOL_MINOR,
+                    handoff_version: tickloop_agent_access::RUNTIME_HANDOFF_VERSION,
                 };
                 println!(
                     "{}",
@@ -213,9 +213,11 @@ fn fail_startup(arguments: &[std::ffi::OsString], message: &str) -> ! {
 
 async fn report_running_versions() {
     use tickloop_agent_client::daemon_endpoint::STARTUP_DEADLINE;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AccessErrorCode, AgentAccess, ObservationRequest, ObservationValue,
     };
+
     let endpoint = tickloop_agent_client::daemon_endpoint::runtime_directory()
         .join(tickloop_agent_client::daemon_endpoint::SOCKET_NAME);
     let client = match tokio::time::timeout(
@@ -290,8 +292,7 @@ async fn report_running_versions() {
         println!("Daemon compatibility: incompatible; manual migration required");
         return;
     };
-    if client.protocol().upgrade_protocol != Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION)
-    {
+    if client.protocol().upgrade_protocol != Some(tickloop_agent_access::RUNTIME_HANDOFF_VERSION) {
         println!("Automatic runtime handoff: unavailable in this daemon");
         return;
     }

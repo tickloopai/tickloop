@@ -6,7 +6,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 - **Bugs and feature requests:** open a [GitHub issue](https://github.com/tickloopai/tickloop/issues/new/choose). Search existing issues first.
 - **Security problems:** report them privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
-- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `agent/packages`, `/ticks`, `tickloop tick ...`) stay in this repository.
+- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `tick/installer`, `/ticks`, `tickloop tick ...`) stay in this repository.
 - **Larger changes:** open an issue to discuss the design before writing a lot of code, especially for changes to the Tick protocol, the permission system or process lifecycle.
 
 ## Development setup
@@ -15,6 +15,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 - The current stable Rust toolchain (edition 2024), with `rustfmt` and `clippy`.
 - [cargo-nextest](https://nexte.st/): `cargo install --locked cargo-nextest`.
 - Node.js 22 for the script tests.
+- For public API checks: `rustup toolchain install nightly-2026-10-19 --profile minimal` and `cargo install --locked cargo-public-api --version 0.52.0`.
 - Optional: [Herdr](https://github.com/herdrdev/herdr) to exercise Tick panes.
 
 ```sh
@@ -52,7 +53,11 @@ CI (`.github/workflows/ci.yml`) does not start on pushes, pull requests or relea
 make check-workspace
 ```
 
-It runs `cargo fmt --all --check` (and the same check for the Cargo launcher in `distribution/cargo`), `cargo clippy --locked --workspace --all-targets -- -D warnings` and `make test-workspace`. The last runs the `scripts/dev-agent.sh` tests with `node --test` and the whole workspace under cargo-nextest (configuration in `.config/nextest.toml`), with isolated state directories and without inherited `HERDR_*` variables. CI runs the same target with the nextest `ci` profile, which retries timing-sensitive PTY tests, and also runs `node --test` on the release and install scripts and, on Linux, clippy for the static musl target.
+It first checks dependency boundaries and the Tick public API, then runs `cargo fmt --all --check` (and the same check for the Cargo launcher in `distribution/cargo`), `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` (including every facade export) and `make test-workspace`. The last runs the development and boundary-check script tests with `node --test` and the whole workspace under cargo-nextest (configuration in `.config/nextest.toml`), with isolated state directories and without inherited `HERDR_*` variables. CI runs the same target with the nextest `ci` profile, which retries timing-sensitive PTY tests, and also runs `node --test` on the release and install scripts and, on Linux, clippy for the static musl target.
+
+`scripts/dependency-boundaries.json` classifies every workspace crate. `node scripts/check-boundaries.mjs` reads `cargo metadata`, checking normal, build and dev dependencies on every target. Transitional exceptions name an exact edge, dependency kind, target and reason; remove them as the corresponding migration lands. New packages require an explicit layer, new forbidden edges fail, and obsolete exceptions fail too.
+
+`node scripts/check-public-api.mjs` compares ids, protocol, SDK, packages, OAuth and ui against the immutable release recorded in `scripts/public-api-baseline.json`. It exports that release into an isolated directory and generates baseline and current snapshots with `cargo public-api`, all features, the same nightly toolchain and native target. Added, changed and removed signatures all fail. Snapshots remain under `target/public-api/check-*`; no checkout or existing worktree is changed. The release tag must be available locally (CI fetches full history). Update the recorded release and commit only when intentionally accepting a new public API baseline. Both versions are rebuilt on each run so platform and toolchain differences cannot masquerade as source changes.
 
 `make test` adds the Cargo launcher's tests, and `make check` its clippy and tests, to the workspace checks. The launcher's build downloads the release matching its version, so these targets need network access and fail on a version that is not released yet; maintainers run them before a release.
 

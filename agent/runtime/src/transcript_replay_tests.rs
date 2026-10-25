@@ -11,9 +11,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tickloop_agent_artifacts::ArtifactClient;
-use tickloop_agent_config::UserSettings;
 use tickloop_agent_model::{ModelClients, judgment::JevClient};
 use tickloop_agent_protocol::{Content, ExecutionMode, OperationRecord, OperationState, Receipt};
+use tickloop_agent_settings::UserSettings;
 use tickloop_agent_test_support::{ScriptedModel, config};
 use tokio_util::sync::CancellationToken;
 

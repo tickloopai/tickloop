@@ -33,13 +33,6 @@ use tickloop_agent_protocol::{Content, InputModality, ModelConfig, Protocol, Rol
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-/// Small transport limits that let tests cross the frame and chunk boundaries with little data.
-pub const TRANSPORT_LIMITS: tickloop_agent_protocol::AccessLimits =
-    match tickloop_agent_protocol::AccessLimits::new(64 << 10, 16 << 10) {
-        Ok(limits) => limits,
-        Err(_) => panic!("the test AccessLimits are valid"),
-    };
-
 /// The libtest name of a test function of the calling test binary, for tests that re-execute
 /// themselves with `--exact`; naming a function that does not exist fails to compile.
 #[macro_export]

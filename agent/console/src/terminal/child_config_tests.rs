@@ -14,10 +14,12 @@ use std::{
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use uuid::Uuid;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AgentAccess, CommandEnvelope, CommandReceipt, DisplayReceipt, DisplayUpdate,
-    ExecutionAvailability, LaunchSpec, LoopState, Observation, ObservationRequest, ViewRef,
+    ExecutionAvailability, LaunchSpec, Observation, ObservationRequest, ViewRef,
 };
+use tickloop_agent_protocol::LoopState;
+
 use tickloop_agent_test_support::{input_dialog, screen};
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_FIXTURE";
@@ -260,7 +262,7 @@ async fn run_child_config_fixture() {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(root).await.unwrap()), false),
         user_settings: config_root
             .as_deref()
-            .map(tickloop_agent_config::UserSettings::in_root),
+            .map(tickloop_agent_settings::UserSettings::in_root),
     };
     let result = interact(&agent, workdir, &console, input, startup, config_root).await;
     std::fs::write(
@@ -711,7 +713,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     let env_file = config_root.join(".env");
     let saved_key = std::fs::read(&env_file).unwrap();
     assert!(String::from_utf8_lossy(&saved_key).contains("fixture-private-jev-key"));
-    let settings_file = config_root.join(tickloop_agent_config::SETTINGS_FILE_NAME);
+    let settings_file = config_root.join(tickloop_agent_settings::SETTINGS_FILE_NAME);
     let saved_settings = std::fs::read(&settings_file).ok();
     view.send(b"\x1b");
     view.wait_for("the root Auto permissions again", |frame| {

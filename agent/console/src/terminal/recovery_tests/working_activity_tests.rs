@@ -124,7 +124,7 @@ impl AgentAccess for ActivityAccess {
         let interrupted = match &command.command {
             AgentCommand::ManageLoop {
                 execution,
-                action: tickloop_agent_protocol::LoopAction::Interrupt,
+                action: tickloop_agent_access::LoopAction::Interrupt,
             } => Some(*execution),
             _ => None,
         };
@@ -330,7 +330,7 @@ fn working_activity_pty_fixture() {
                     ),
                     user_settings: None,
                 };
-                let (console, input) = Console::start_with_display(true, tickloop_agent_config::DisplayPreferences {
+                let (console, input) = Console::start_with_display(true, tickloop_agent_settings::DisplayPreferences {
                     prefers_reduced_motion: std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only"),
                 }).unwrap();
                 console.set_prompt_enabled(true).unwrap();
@@ -610,7 +610,7 @@ fn lose_completed_events(
                 )
                 .unwrap();
                 update.change = ObservationChange::Reset {
-                    reason: tickloop_agent_protocol::ResetReason::Lagged,
+                    reason: tickloop_agent_access::ResetReason::Lagged,
                     snapshot,
                 };
             }

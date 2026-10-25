@@ -3,7 +3,8 @@
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_protocol::{Content, FEED_CHANGE_BYTES};
+use tickloop_agent_access::FEED_CHANGE_BYTES;
+use tickloop_agent_protocol::Content;
 
 const BUSY_FIXTURE_VARIABLE: &str = "TICKLOOP_BUSY_TURN_FIXTURE";
 const BUSY_STAGE_FILE: &str = "busy-stage";
@@ -271,7 +272,7 @@ fn busy_turn_pty_fixture() {
                 // A prompt suggestion after the turn sends the whole conversation to its model,
                 // as Claude Code's does, so it reads the Chat once the turn ended; it is not part
                 // of the busy turn measured here.
-                let settings = tickloop_agent_config::UserSettings::in_root(&workdir);
+                let settings = tickloop_agent_settings::UserSettings::in_root(&workdir);
                 settings.save_prompt_suggestion_enabled(false).unwrap();
                 let startup = StartupState {
                     model_selected: true,

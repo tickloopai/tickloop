@@ -529,7 +529,7 @@ async fn live_benchmark(use_jev: bool) {
     let policy_hash = format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&tickloop_agent_config::AutoSettings::default().policy()).unwrap()
+            serde_json::to_vec(&tickloop_agent_policy::AutoSettings::default().policy()).unwrap()
         )
     );
     let cases = cases()

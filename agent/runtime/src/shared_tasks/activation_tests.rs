@@ -59,7 +59,7 @@ async fn settings_are_default_off_and_apply_to_all_new_loops_without_model_calls
 #[tokio::test]
 async fn externally_saved_setting_updates_loaded_members_and_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
+    let settings = tickloop_agent_settings::UserSettings::in_root(directory.path());
     let model = Arc::new(ScriptedModel::new(vec![text("done"); 2]));
     let core = Agent::new_with_user_settings_embedded(config(), model.clone(), settings.clone());
     let chat = core
@@ -395,8 +395,8 @@ async fn explicit_setting_reads_refresh_only_the_target_configuration_without_ru
     let target_root = tempfile::tempdir().unwrap();
     let other_root = tempfile::tempdir().unwrap();
     let workdir = tempfile::tempdir().unwrap();
-    let target_settings = tickloop_agent_config::UserSettings::in_root(target_root.path());
-    let other_settings = tickloop_agent_config::UserSettings::in_root(other_root.path());
+    let target_settings = tickloop_agent_settings::UserSettings::in_root(target_root.path());
+    let other_settings = tickloop_agent_settings::UserSettings::in_root(other_root.path());
     let model = Arc::new(ScriptedModel::new(vec![]));
     let target =
         Agent::new_with_user_settings_embedded(config(), model.clone(), target_settings.clone());

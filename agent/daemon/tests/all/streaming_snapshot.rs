@@ -2,11 +2,14 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tickloop_agent_access::AgentAccess;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_protocol::{AgentAccess, Content, Event, EventKind, Role, Usage};
+use tickloop_agent_protocol::{Content, Event, EventKind, Role, Usage};
+
 use tickloop_agent_runtime::Agent;
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -188,10 +191,12 @@ async fn first_turn_paced_thinking_flood_preserves_output_without_live_event_los
 #[tokio::test]
 async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentCommand, AgentDetailQuery, CommandEnvelope, CommandResult, LaunchSpec,
         ObservationChange, ObservationRequest, ObservationValue,
     };
+
     for thinking in [false, true] {
         for (fragment, deltas) in [
             ("a".repeat(64), 256),

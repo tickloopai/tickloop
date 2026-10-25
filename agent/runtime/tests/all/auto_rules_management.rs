@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::ScriptedModel;
 
 use tickloop_agent_protocol::{

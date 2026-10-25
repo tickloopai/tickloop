@@ -3,12 +3,13 @@ use std::{
     time::Duration,
 };
 
-use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandResult, EnvironmentValue,
     ExecutionRef, LaunchSpec, ObservationRequest, ObservationValue, RuntimeVersion, UserInput,
-    UserShellState,
 };
+use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
+use tickloop_agent_protocol::UserShellState;
+
 use uuid::Uuid;
 
 use crate::support;
@@ -88,7 +89,7 @@ pub(super) async fn version(client: &LocalAgentClient) -> RuntimeVersion {
 pub(super) async fn snapshot(
     client: &LocalAgentClient,
     execution: ExecutionRef,
-) -> tickloop_agent_protocol::LiveChatSnapshot {
+) -> tickloop_agent_access::LiveChatSnapshot {
     match client
         .observe(ObservationRequest::Agent {
             execution,

@@ -27,8 +27,8 @@ use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, current_uid, replace_file_atomically,
     verify_private_directory,
 };
-use tickloop_agent_config::{MonitorPopup, UserSettings};
 use tickloop_agent_protocol::{ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedViewGrant};
+use tickloop_agent_settings::{MonitorPopup, UserSettings};
 
 pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
 const PLUGIN_NAME: &str = "Tickloop Monitor";

@@ -495,7 +495,7 @@ impl Agent {
         self.inner
             .settings
             .as_ref()
-            .and_then(|settings| settings.goal_token_budget())
+            .and_then(|settings| settings.read(None).goal_token_budget)
     }
 
     /// Applies Esc's pause of an active goal; a failure is told with the Chat's Trigger notice.
@@ -755,7 +755,7 @@ impl Agent {
                 .inner
                 .settings
                 .as_ref()
-                .and_then(|settings| settings.goal_check_model());
+                .and_then(|settings| settings.read(None).goal_check_model);
             // A check model that cannot be reached is a failed check, like a failed call.
             let checker = match check_model {
                 Some(model) => self

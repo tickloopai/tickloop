@@ -19,8 +19,8 @@ use super::hyperlink::Hyperlink;
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
 };
-use tickloop_agent_config::IMAGE_CACHE_DIRECTORY;
 use tickloop_agent_protocol::{Image, ImageMediaType};
+use tickloop_agent_settings::IMAGE_CACHE_DIRECTORY;
 
 const PLACEHOLDER_PREFIX: &str = "[Image #";
 const PLACEHOLDER_SUFFIX: char = ']';

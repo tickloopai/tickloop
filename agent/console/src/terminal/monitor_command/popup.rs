@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::terminal::popup::{HerdrSession, PLUGIN_ID, PopupPlugin};
-use tickloop_agent_config::{UserSettings, config_root_directory};
+use tickloop_agent_settings::{UserSettings, config_root_directory};
 
 const INSTALL_PROMPT: &str = "This registers Tickloop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
 const REMOVE_PROMPT: &str = "This removes Tickloop's popup plugin tickloop.monitor from the given Herdr session and sets monitorPopup to disabled; enter in Monitor then opens Ticks full screen in the current terminal, and running Ticks keep running. Remove? [y/N]";

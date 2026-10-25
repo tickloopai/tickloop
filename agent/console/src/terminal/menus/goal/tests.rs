@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::Arc;
 use tickloop_agent_protocol::{GoalPause, Receiving};
+#[cfg(test)]
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 fn goal(status: GoalStatus) -> GoalSnapshot {
     GoalSnapshot {

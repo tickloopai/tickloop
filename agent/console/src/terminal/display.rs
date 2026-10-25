@@ -1,4 +1,4 @@
-use tickloop_agent_config::DisplayPreferences;
+use tickloop_agent_settings::DisplayPreferences;
 use tickloop_ui::icons::WORKING_DOT_FRAMES;
 
 use super::style::{Theme, ThemeName};

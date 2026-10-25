@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::{Value, json};
 use tickloop_agent_protocol::{
@@ -583,7 +584,7 @@ async fn environment_draft_is_private_scoped_and_revision_checked() {
         .unwrap();
     assert_eq!(
         saved.auto_policy.environment.text,
-        tickloop_agent_config::AutoSettings::default()
+        tickloop_agent_policy::AutoSettings::default()
             .policy()
             .environment
             .text
@@ -744,7 +745,7 @@ async fn legacy_environment_migration_and_manual_edits_preserve_provenance_and_s
     assert!(entry.directory.is_none());
     assert_eq!(
         migrated.auto_policy.environment.text,
-        tickloop_agent_config::AutoSettings::default()
+        tickloop_agent_policy::AutoSettings::default()
             .policy()
             .environment
             .text

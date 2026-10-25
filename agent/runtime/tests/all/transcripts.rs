@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -1242,7 +1243,7 @@ async fn a_zero_cleanup_period_writes_no_transcript() {
 
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     complete_turn(&agent, chat, "Keep this private").await;
-    tickloop_agent_config::UserSettings::in_root(&root)
+    tickloop_agent_settings::UserSettings::in_root(&root)
         .save_thinking_enabled(false)
         .unwrap();
     agent.flush_transcripts().await;

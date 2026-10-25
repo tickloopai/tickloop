@@ -8,6 +8,7 @@ use tickloop_agent_protocol::{
     Content, Decision, EventKind, ExecutionMode, PermissionRule, Protocol, QueuedInputKind,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::{ScriptedModel, config, next_event, text};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;

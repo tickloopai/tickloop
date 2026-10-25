@@ -142,9 +142,9 @@ async fn serve_incompatible_daemon(
         let hello: Value = read(&mut business).await.unwrap().unwrap();
         assert_eq!(
             hello["Hello"]["major"],
-            tickloop_agent_protocol::PROTOCOL_MAJOR
+            tickloop_agent_access::PROTOCOL_MAJOR
         );
-        write(&mut business, &json!({"Hello":{"major":tickloop_agent_protocol::PROTOCOL_MAJOR-1,"minor":0,"daemon_epoch":epoch,"session_id":uuid::Uuid::new_v4(),"capabilities":[]}})).await.unwrap();
+        write(&mut business, &json!({"Hello":{"major":tickloop_agent_access::PROTOCOL_MAJOR-1,"minor":0,"daemon_epoch":epoch,"session_id":uuid::Uuid::new_v4(),"capabilities":[]}})).await.unwrap();
         assert!(read::<_, Value>(&mut business).await.unwrap().is_none());
         let (mut identity_probe, _) = listener.accept().await.unwrap();
         assert!(

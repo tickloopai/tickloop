@@ -1,4 +1,5 @@
 use std::{path::Path, time::Duration};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_model::{LocalModelClients, ModelClients, cards::ModelCatalog};
 use tickloop_agent_protocol::{

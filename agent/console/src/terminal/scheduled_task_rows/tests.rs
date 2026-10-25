@@ -1,6 +1,6 @@
 use super::*;
 use crate::terminal::style::{ColourDepth, ThemeName};
-use tickloop_agent_config::DisplayPreferences;
+use tickloop_agent_settings::DisplayPreferences;
 use time::UtcOffset;
 use unicode_width::UnicodeWidthStr;
 

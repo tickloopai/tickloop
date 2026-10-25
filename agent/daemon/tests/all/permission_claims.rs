@@ -10,17 +10,19 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
-use tickloop_agent_client::LocalAgentClient;
-use tickloop_agent_config::UserSettings;
-use tickloop_agent_daemon::{EmbeddedAgentAccess, serve_listener};
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandReceipt,
-    CommandResult, Decision, EventKind, ExecutionRef, LaunchSpec, LiveChatSnapshot, LoopAction,
-    LoopState, ObservationRequest, ObservationValue, PendingRequestKind, PermissionScope,
-    ReceiptState, RequestRef, UserInput,
+    CommandResult, ExecutionRef, LaunchSpec, LiveChatSnapshot, LoopAction, ObservationRequest,
+    ObservationValue, PendingRequestKind, ReceiptState, RequestRef, UserInput,
 };
+use tickloop_agent_client::LocalAgentClient;
+use tickloop_agent_daemon::{EmbeddedAgentAccess, serve_listener};
+use tickloop_agent_protocol::{Decision, EventKind, LoopState, PermissionScope};
+
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::UserSettings;
 use tokio::{net::UnixListener, task::JoinHandle};
 use uuid::Uuid;
 
@@ -87,7 +89,7 @@ impl Fixture {
                         listener,
                         embedded,
                         epoch,
-                        tickloop_agent_test_support::TRANSPORT_LIMITS,
+                        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
                     )
                     .await
                     .unwrap();

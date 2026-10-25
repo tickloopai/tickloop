@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_model::ModelRequest;

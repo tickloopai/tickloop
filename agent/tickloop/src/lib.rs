@@ -12,7 +12,7 @@ const TICK_COMMAND: &str = "tick";
 
 /// Names this build, from its sources, for the comparison between a View and the running daemon.
 pub fn name_this_build() {
-    tickloop_agent_protocol::set_build_identity(env!("TICKLOOP_BUILD_IDENTITY"));
+    tickloop_agent_access::set_build_identity(env!("TICKLOOP_BUILD_IDENTITY"));
 }
 
 /// Runs the process entry `arguments` name, or returns `None` when they name none and the

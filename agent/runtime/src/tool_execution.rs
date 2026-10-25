@@ -1,4 +1,6 @@
 use std::sync::Arc;
+#[cfg(test)]
+use tickloop_agent_settings::skills::SkillDiscovery;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +43,7 @@ enum ToolRoute {
     Plan,
     Interaction,
     /// The Skills whose listing the request sent, which its Skill calls expand against.
-    Skill(Arc<tickloop_agent_config::skills::SkillRegistry>),
+    Skill(Arc<tickloop_agent_policy::skills::SkillRegistry>),
     McpResource(Arc<dyn crate::host_tools::HostToolProvider>),
     TickSubscription,
     TickManage(Option<Arc<dyn crate::host_tools::HostToolProvider>>),
@@ -2535,9 +2537,10 @@ mod tests {
             format!("---\nname: catalog-workflow\ndescription: {description}\n---\nPrivate body"),
         )
         .unwrap();
-        let agent = Agent::new(
+        let agent = Agent::new_with_user_settings_embedded(
             tickloop_agent_test_support::config_with_window(8_192),
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+            tickloop_agent_settings::UserSettings::in_root(&directory.path().join("config")),
         );
         agent
             .trust_working_directory(directory.path().into())
@@ -2556,7 +2559,7 @@ mod tests {
                 &crate::ToolPolicy::local(),
                 crate::scheduled_tasks::tools::ToolTerms::DEFAULT,
             )
-            .resolve(tickloop_agent_config::skills::SKILL_TOOL_NAME)
+            .resolve(tickloop_agent_policy::skills::SKILL_TOOL_NAME)
             .unwrap()
             .definition
             .description
@@ -2595,7 +2598,7 @@ mod tests {
     /// Every tool this Agent defines itself, in each of its forms.
     fn built_in_definitions() -> Vec<ToolDefinition> {
         let directory = tempfile::tempdir().unwrap();
-        let skills = tickloop_agent_config::skills::SkillRegistry::discover(directory.path(), None);
+        let skills = tickloop_agent_policy::skills::SkillRegistry::discover(directory.path(), None);
         tickloop_agent_tools::Tools::definitions()
             .into_iter()
             .chain([false, true].into_iter().flat_map(plan::definitions))
@@ -2690,7 +2693,7 @@ mod tests {
             }
             segments > 1
         };
-        let named = tickloop_agent_config::skills::BUILTIN_SKILLS
+        let named = tickloop_agent_policy::skills::BUILTIN_SKILLS
             .into_iter()
             .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
             .filter(is_compound_name)

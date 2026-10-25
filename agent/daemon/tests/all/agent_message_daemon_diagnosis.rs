@@ -10,16 +10,18 @@ use std::{
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use serde_json::{Value, json};
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter,
+    CommandEnvelope, CommandResult, ExecutionAvailability, LaunchSpec, ObservationRequest,
+    ObservationValue, Page, UserInput,
+};
 use tickloop_agent_client::{LocalAgentClient, worker_link};
 use tickloop_agent_daemon::{
     DaemonServer, EmbeddedAgentAccess, WorkerFactory, serve_listener, serve_worker_listener,
 };
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter,
-    CommandEnvelope, CommandResult, Content, ExecutionAvailability, LaunchSpec, ObservationRequest,
-    ObservationValue, Page, UserInput,
-};
+use tickloop_agent_protocol::Content;
+
 use tickloop_agent_runtime::Agent;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -51,7 +53,7 @@ async fn read_json_frame(stream: &mut UnixStream) -> Option<Value> {
         }
         Err(error) => panic!("{error}"),
     };
-    assert!(length <= tickloop_agent_protocol::AccessLimits::DEFAULT.frame_bytes());
+    assert!(length <= tickloop_agent_access::AccessLimits::DEFAULT.frame_bytes());
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await.unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
@@ -72,7 +74,7 @@ async fn legacy_wire_schema_is_rejected_before_pipelined_create_can_execute() {
         listener,
         access,
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     ));
     let verification = async {
         let mut client = UnixStream::connect(socket).await.unwrap();
@@ -260,7 +262,7 @@ impl WorkerFactory for SocketWorkerFactory {
                 listener,
                 served,
                 epoch,
-                tickloop_agent_test_support::TRANSPORT_LIMITS,
+                tickloop_agent_access::test_support::TRANSPORT_LIMITS,
             )
             .await
             .unwrap();
@@ -302,7 +304,7 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         listener,
         daemon,
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     ));
     let client = LocalAgentClient::connect(directory.path().join("daemon.sock"))
         .await

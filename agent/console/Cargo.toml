@@ -28,12 +28,13 @@ sha2 = "0.10"
 similar = { version = "2.7", features = ["inline"] }
 tempfile = "3"
 thiserror = "2"
+tickloop-agent-access = { path = "../access" }
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-client = { path = "../client" }
-tickloop-agent-config = { path = "../config" }
+tickloop-agent-settings = { path = "../settings" }
 tickloop-agent-model = { path = "../model" }
-tickloop-agent-packages = { path = "../packages" }
+tickloop-tick-installer = { path = "../../tick/installer" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
 tickloop-agent-updater = { path = "../updater" }
@@ -51,8 +52,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 vt100 = "0.16.2"
 
 [dev-dependencies]
+tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 jsonschema = { version = "0.56", default-features = false }
 portable-pty = "0.9"
+tickloop-agent-access = { path = "../access", features = ["test-support"] }
 tickloop-agent-daemon = { path = "../daemon" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }

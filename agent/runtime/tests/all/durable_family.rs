@@ -548,7 +548,7 @@ async fn subagent_search_survives_durable_family_reload_including_disabled() {
 #[tokio::test]
 async fn subagent_search_local_reload_still_uses_saved_user_settings() {
     let directory = tempfile::tempdir().unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
+    let settings = tickloop_agent_settings::UserSettings::in_root(directory.path());
     settings.trust_working_directory(directory.path()).unwrap();
     let search = Some(SearchConfig::for_provider(SearchProviderKind::Tavily));
     settings.save_search_config(search.as_ref()).unwrap();
@@ -556,7 +556,7 @@ async fn subagent_search_local_reload_still_uses_saved_user_settings() {
     let model = asking_family();
     let local_options = || {
         let mut options = options(WaitHosting::Durable);
-        options.settings = Some(settings.clone());
+        options.settings = Some(Arc::new(settings.clone()));
         options
     };
     let seams = || HarnessSeams {

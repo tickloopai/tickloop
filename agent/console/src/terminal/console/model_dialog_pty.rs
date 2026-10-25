@@ -4,7 +4,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 
-use tickloop_agent_protocol::{LaunchSpec, ViewRef};
+use tickloop_agent_access::{LaunchSpec, ViewRef};
+
 use tickloop_agent_test_support::{input_dialog as dialog, screen};
 
 const DIRECTORY: &str = "TICKLOOP_MODEL_DIALOG_FIXTURE_DIR";
@@ -46,7 +47,7 @@ fn model_dialog_pty_fixture() {
             console.set_prompt_enabled(true).unwrap();
             console.record_input("Pinned model dialog fixture").unwrap();
             console.state.lock().unwrap().insert("Unsent fixture draft");
-            let mut menus = Menus::new(Some(tickloop_agent_config::UserSettings::in_root(&root)), Some(root));
+            let mut menus = Menus::new(Some(tickloop_agent_settings::UserSettings::in_root(&root)), Some(root));
             menus.models(&agent, &console, ConfigTarget::Agent(first)).await.unwrap();
             let model_menu = console.dialog_menu_id().unwrap().unwrap();
             let chrome = |phase: &str| {

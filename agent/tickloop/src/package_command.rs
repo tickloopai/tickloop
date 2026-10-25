@@ -17,7 +17,7 @@ use tick_packages::{
     validate_package_name,
 };
 use tickloop_agent_console::terminal::safe_line;
-use tickloop_agent_packages::{
+use tickloop_tick_installer::{
     InstalledVersion, MarketplaceSource, log_out, login_label, needs_no_login, start_login,
 };
 use tokio_util::sync::CancellationToken;
@@ -110,7 +110,7 @@ fn parse(arguments: &[OsString]) -> Result<PackageCommand<'_>, String> {
 }
 
 fn store() -> Result<PackageStore, String> {
-    let config_root = tickloop_agent_config::config_root_directory()
+    let config_root = tickloop_agent_settings::config_root_directory()
         .ok_or("cannot find the Tickloop config directory; set HOME or TICKLOOP_CONFIG_DIR")?;
     Ok(PackageStore::in_config_root(&config_root))
 }
@@ -119,19 +119,29 @@ fn store() -> Result<PackageStore, String> {
 async fn install(store: &PackageStore, name: &str) -> Result<(), String> {
     validate_package_name(name).map_err(|error| error.to_string())?;
     let source = MarketplaceSource::configured()?;
-    let marketplace = source.read().await?;
+    let marketplace = source
+        .read(&tickloop_agent_settings::package_http::client)
+        .await?;
     let package = marketplace.package(name).ok_or_else(|| {
         format!(
             "Tick package {name} is not in the Tick marketplace at {}",
             safe_line(&source.to_string())
         )
     })?;
-    report(tickloop_agent_packages::install(store, &source, package).await?);
+    report(
+        tickloop_tick_installer::install(
+            &tickloop_agent_settings::package_http::client,
+            store,
+            &source,
+            package,
+        )
+        .await?,
+    );
     Ok(())
 }
 
 fn install_path(store: &PackageStore, path: &Path) -> Result<(), String> {
-    report(tickloop_agent_packages::install_path(store, path)?);
+    report(tickloop_tick_installer::install_path(store, path)?);
     Ok(())
 }
 
@@ -157,7 +167,7 @@ fn report(installation: Installation) {
 }
 
 fn uninstall(store: &PackageStore, name: &str) -> Result<(), String> {
-    let uninstalled = tickloop_agent_packages::uninstall(store, name)?;
+    let uninstalled = tickloop_tick_installer::uninstall(store, name)?;
     println!(
         "Uninstalled Tick package {} {}.",
         uninstalled.name, uninstalled.version
@@ -248,12 +258,17 @@ async fn log_in_with(
     issuer: &OAuthIssuer,
     scopes: &[String],
 ) -> Result<(), String> {
-    let failed = |error: tickloop_agent_packages::LoginError| {
+    let failed = |error: tickloop_tick_installer::LoginError| {
         format!("cannot log in to {name} ({}): {error}", issuer.label)
     };
-    let login = start_login(credentials, issuer, scopes)
-        .await
-        .map_err(failed)?;
+    let login = start_login(
+        &tickloop_agent_settings::package_http::client,
+        credentials,
+        issuer,
+        scopes,
+    )
+    .await
+    .map_err(failed)?;
     println!(
         "Log in to {name} ({}): open this link in a browser on any device and confirm the code.\n\n  \
          {}\n\n  Code: {}\n\nWaiting for the approval; the code expires in {} minutes. Ctrl+C cancels.",
@@ -347,9 +362,13 @@ async fn logout(store: &PackageStore, name: &str) -> Result<(), String> {
         return Err(needs_no_login(name));
     }
     let credentials = store.credentials(name).map_err(|error| error.to_string())?;
-    let logged_out = log_out(&credentials, &package.manifest.auth)
-        .await
-        .map_err(|error| format!("cannot log out of {name}: {error}"))?;
+    let logged_out = log_out(
+        &tickloop_agent_settings::package_http::client,
+        &credentials,
+        &package.manifest.auth,
+    )
+    .await
+    .map_err(|error| format!("cannot log out of {name}: {error}"))?;
     if let Some(failure) = logged_out.revocation_failure {
         println!(
             "The authorization server did not revoke the token ({}); it is deleted here all the same.",
@@ -409,7 +428,9 @@ fn list(store: &PackageStore) -> Result<(), String> {
 /// login state, and whether this platform has a download.
 async fn list_available(store: &PackageStore) -> Result<(), String> {
     let source = MarketplaceSource::configured()?;
-    let marketplace = source.read().await?;
+    let marketplace = source
+        .read(&tickloop_agent_settings::package_http::client)
+        .await?;
     let installed = store.installed().map_err(|error| error.to_string())?;
     println!(
         "Tick marketplace {} by {}: {}",
@@ -428,7 +449,7 @@ async fn list_available(store: &PackageStore) -> Result<(), String> {
             .find(|package| package.manifest.name == name)
             .map_or(LoginState::Unknown, |package| store.login_state(package))
     };
-    let rows = tickloop_agent_packages::offers(&marketplace, &installed)
+    let rows = tickloop_tick_installer::offers(&marketplace, &installed)
         .into_iter()
         .map(|offer| {
             let package = offer.package;

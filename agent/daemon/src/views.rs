@@ -8,7 +8,7 @@ use tickhost_connect::herdr::{PaneIdentityError, confirm_pane};
 use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AfterTurnAction, AgentCommand, DisplayReceipt, DisplayUpdate,
     DisplayedView, ExecutionRef, HostLocation, InteractionSource, VIEW_LEASE_SECONDS, ViewRef,
 };

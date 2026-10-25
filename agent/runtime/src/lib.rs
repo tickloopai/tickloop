@@ -1,3 +1,4 @@
+use tickloop_agent_policy::settings::{SettingsStore, SettingsUpdate};
 mod agent_messages;
 mod agent_tasks;
 mod approval_assessment;
@@ -142,18 +143,17 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails,
-    ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
-    ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
-    CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
-    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext,
-    LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
-    MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
-    PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionScope, PromptPolicy, QueuedInput, QueuedInputKind, ReasoningEffort,
-    Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
-    SubagentRegistration, TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState,
-    VerdictEvidence, projection,
+    AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind,
+    ApprovalFallbackReason, ApprovalOutcome, ApprovalPath, ApprovalReviewerKind, AutoBlockKind,
+    AutoReviewerHealth, ChatId, ChatSnapshot, CompactionMarker, Content, Decision,
+    DelegationMetadata, DenialReference, DirectedHumanSource, DirectoryTrustPolicy, Event,
+    EventKind, ExecutionMode, HostCallContext, InputContext, LedgerError, LoopId, LoopSnapshot,
+    LoopState, Message, ModelConfig, ModelRequestKind, MonitorMembership, OperationRecord,
+    OperationState, PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution,
+    PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PromptPolicy,
+    QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
+    ResponseRejection, Role, RunId, SubagentRegistration, TaskNotification, TriggerSource, Usage,
+    UserShellRecord, UserShellState, VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -226,34 +226,6 @@ impl From<transcript::TranscriptError> for AgentError {
 impl From<projection::InvalidConversation> for AgentError {
     fn from(error: projection::InvalidConversation) -> Self {
         Self::Invalid(error.0)
-    }
-}
-
-impl From<AgentError> for AccessError {
-    fn from(error: AgentError) -> Self {
-        let code = match &error {
-            AgentError::NotFound => AccessErrorCode::NotFound,
-            AgentError::Busy => AccessErrorCode::Busy,
-            AgentError::UntrustedWorkingDirectory { .. } => {
-                AccessErrorCode::UntrustedWorkingDirectory
-            }
-            AgentError::Storage(_) | AgentError::Fenced => AccessErrorCode::Storage,
-            AgentError::Invalid(message) if message.starts_with("Unsupported:") => {
-                AccessErrorCode::Unsupported
-            }
-            _ => AccessErrorCode::Invalid,
-        };
-        let path = if let AgentError::UntrustedWorkingDirectory { path } = &error {
-            Some(path.clone())
-        } else {
-            None
-        };
-        Self {
-            code,
-            message: error.to_string(),
-            latest_permissions: None,
-            path,
-        }
     }
 }
 
@@ -344,13 +316,12 @@ struct Inner {
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
     /// Builds the client of each model a Chat selects.
     models: Arc<dyn tickloop_agent_model::ModelClients>,
-    /// User settings file; `None` for Agents that do not write settings (tests and the like).
-    settings: Option<tickloop_agent_config::UserSettings>,
+    /// Host-provided preferences and project permissions; absent when the host keeps none.
+    settings: Option<Arc<dyn SettingsStore>>,
     search: SearchDefaults,
     host_options: AgentHostOptions,
     waits: WaitHosting,
-    /// Config root containing the settings file; user Skills and Skills of installed Tick packages
-    /// are loaded from here.
+    /// Local credential and tool-output storage, supplied independently of preferences.
     config_root: Option<PathBuf>,
     /// Orders settings reads and writes within this process: writing settings and syncing loaded
     /// Chats, as well as reading settings and adding a new Chat, happen while holding it, keeping
@@ -504,7 +475,7 @@ struct Chat {
     tools: Arc<tickloop_agent_tools::Tools>,
     /// Shared with the tool registry of each model request, whose Skill calls expand against the
     /// listing that request sent even when the Chat's Skills are read again meanwhile.
-    skills: Arc<tickloop_agent_config::skills::SkillRegistry>,
+    skills: Arc<tickloop_agent_policy::skills::SkillRegistry>,
     /// Following Claude Code, replacement decisions are kept only at runtime and rebuilt from
     /// content replacement entries in the Transcript on resume.
     content_replacements: tool_results::ContentReplacementState,
@@ -519,7 +490,7 @@ struct Chat {
     feedback_cleanup_started: bool,
     /// What the user's `/loop` of each turn schedules, as the host read it: the one task the
     /// Agent may create for the user in that turn.
-    user_loops: HashMap<RunId, tickloop_agent_config::loop_skill::LoopSchedule>,
+    user_loops: HashMap<RunId, tickloop_agent_policy::loop_skill::LoopSchedule>,
     /// Local messages waiting to be written to the conversation; held while the Chat is executing,
     /// waiting or running a foreground `!` command, and written when idle or at a tool boundary.
     deferred_messages: Vec<Message>,
@@ -581,7 +552,7 @@ struct SubmissionOptions {
     trigger_commit: Option<wakeup::SourceCommit>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     /// What the user's `/loop` schedules, when the input is one.
-    user_loop: Option<tickloop_agent_config::loop_skill::LoopSchedule>,
+    user_loop: Option<tickloop_agent_policy::loop_skill::LoopSchedule>,
     /// The Run the input is answered by, when its caller chose it ahead.
     run_id: Option<RunId>,
     host_context: Option<HostCallContext>,
@@ -925,13 +896,17 @@ fn host_provider_is_confirmed(
 }
 
 /// The options of an Agent on this computer: every capability and no host rule.
+#[cfg(test)]
 fn local_options(
     model: ModelConfig,
-    settings: Option<tickloop_agent_config::UserSettings>,
+    settings: Option<tickloop_agent_settings::UserSettings>,
     host: AgentHostOptions,
 ) -> HarnessOptions {
     HarnessOptions {
-        settings,
+        local_state_root: settings
+            .as_ref()
+            .and_then(|settings| settings.root().map(Path::to_path_buf)),
+        settings: settings.map(|settings| Arc::new(settings) as Arc<dyn SettingsStore>),
         host,
         ..HarnessOptions::local(model)
     }
@@ -1090,16 +1065,17 @@ impl Agent {
     fn discover_skills(
         &self,
         folder: Option<&Path>,
-    ) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
-        Arc::new(match folder {
-            Some(folder) => tickloop_agent_config::skills::SkillRegistry::discover(
-                folder,
-                self.inner.config_root.as_deref(),
-            ),
-            None => tickloop_agent_config::skills::SkillRegistry::builtin_without_ticks(
-                self.inner.config_root.as_deref(),
-            ),
-        })
+    ) -> Arc<tickloop_agent_policy::skills::SkillRegistry> {
+        Arc::new(self.inner.settings.as_ref().map_or_else(
+            || {
+                if folder.is_some() {
+                    tickloop_agent_policy::skills::SkillRegistry::builtin()
+                } else {
+                    tickloop_agent_policy::skills::SkillRegistry::builtin_without_ticks()
+                }
+            },
+            |settings| settings.skills(folder),
+        ))
     }
 
     /// Reads a Chat's Skills again, so a Tick package installed, updated or uninstalled by
@@ -1212,7 +1188,7 @@ impl Agent {
     async fn skill_tool(
         &self,
         receipt: &Receipt,
-        skills: &tickloop_agent_config::skills::SkillRegistry,
+        skills: &tickloop_agent_policy::skills::SkillRegistry,
         input: &serde_json::Value,
     ) -> Result<tickloop_agent_protocol::ToolResult, String> {
         #[derive(Deserialize)]
@@ -1225,7 +1201,7 @@ impl Agent {
         let input = serde_json::from_value::<SkillInput>(input.clone()).map_err(|error| {
             format!(
                 "invalid {} input: {error}",
-                tickloop_agent_config::skills::SKILL_TOOL_NAME
+                tickloop_agent_policy::skills::SKILL_TOOL_NAME
             )
         })?;
         if input.skill.starts_with("tickloop-artifacts:") {
@@ -1241,7 +1217,7 @@ impl Agent {
             .expand(
                 &input.skill,
                 input.args.as_deref().unwrap_or(""),
-                tickloop_agent_config::skills::SkillCaller::Model,
+                tickloop_agent_policy::skills::SkillCaller::Model,
             )
             .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map_err(|error| error.to_string())?;
@@ -1295,7 +1271,7 @@ impl Agent {
             .read_remote_skill(&definition, None, cancel.clone())
             .await?;
         let mut invoked =
-            tickloop_agent_config::skills::expand_remote(&content, &definition, arguments)
+            tickloop_agent_policy::skills::expand_remote(&content, &definition, arguments)
                 .map_err(|error| error.to_string())?;
         invoked.run_id = Some(receipt.run_id);
         let mut chats = self.inner.chats.lock().await;
@@ -1337,7 +1313,7 @@ impl Agent {
             .filter(|definition| {
                 remote_skill_allowed(chat, &definition.source)
                     && chat.snapshot.policy.explicit_decision_with_session(
-                        tickloop_agent_config::skills::SKILL_TOOL_NAME,
+                        tickloop_agent_policy::skills::SKILL_TOOL_NAME,
                         &serde_json::json!({"skill":definition.name}),
                         receipt.loop_id.into(),
                         None,
@@ -1840,6 +1816,7 @@ impl Agent {
     /// Following Claude Code's `shouldSkipPersistence`: when the user setting `cleanupPeriodDays`
     /// is 0, Chats are not saved, same as [`Agent::new_with_user_settings_embedded`], while user
     /// settings are still read and written. Settings are read only once, on open.
+    #[cfg(test)]
     pub fn open(
         root: PathBuf,
         model: ModelConfig,
@@ -1848,6 +1825,7 @@ impl Agent {
         Self::open_with_options(root, model, client, AgentHostOptions::default())
     }
 
+    #[cfg(test)]
     pub fn open_embedded(
         root: PathBuf,
         model: ModelConfig,
@@ -1856,6 +1834,7 @@ impl Agent {
         Self::open_with_options(root, model, client, AgentHostOptions::embedded_defaults())
     }
 
+    #[cfg(test)]
     pub fn open_with_options(
         root: PathBuf,
         model: ModelConfig,
@@ -1864,7 +1843,7 @@ impl Agent {
     ) -> Result<Self, AgentError> {
         let store = transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
-        let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+        let settings = tickloop_agent_settings::UserSettings::in_root(store.root());
         let recorder = (!settings.skips_transcripts())
             .then(|| persistence::ChatRecorder::new(Arc::new(store)));
         Ok(Self::build(
@@ -1912,16 +1891,18 @@ impl Agent {
     }
 
     /// An Agent that does not save Chats but reads and writes user settings as usual.
+    #[cfg(test)]
     pub fn new_with_user_settings_embedded(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
+        settings: tickloop_agent_settings::UserSettings,
     ) -> Self {
-        Self::new_local(
-            model,
+        Self::build(
+            local_options(model, Some(settings), AgentHostOptions::embedded_defaults()),
+            Arc::new(harness::OneClient(client.clone())),
             client,
-            Some(settings),
-            AgentHostOptions::embedded_defaults(),
+            None,
+            Some(Arc::new(environment::LocalEnvironment::bare())),
         )
     }
 
@@ -1929,11 +1910,15 @@ impl Agent {
     fn new_local(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: Option<tickloop_agent_config::UserSettings>,
+        settings: Option<Arc<dyn SettingsStore>>,
         host_options: AgentHostOptions,
     ) -> Self {
         Self::build(
-            local_options(model, settings, host_options),
+            HarnessOptions {
+                settings,
+                host: host_options,
+                ..HarnessOptions::local(model)
+            },
             Arc::new(harness::OneClient(client.clone())),
             client,
             None,
@@ -1952,6 +1937,7 @@ impl Agent {
         let HarnessOptions {
             model,
             settings,
+            local_state_root,
             search,
             host: host_options,
             tools: tool_policy,
@@ -1967,14 +1953,11 @@ impl Agent {
             trust_model_scheduled_tasks,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
-        let config_root = settings
-            .as_ref()
-            .and_then(tickloop_agent_config::UserSettings::root)
-            .map(Path::to_path_buf);
+        let config_root = local_state_root;
         let task_tools_enabled = settings
             .as_ref()
             .map_or(task_tools.unwrap_or(false), |settings| {
-                settings.load().task_tools_enabled()
+                settings.read(None).task_tools_enabled
             });
         let agent = Self {
             inner: Arc::new(Inner {
@@ -2080,7 +2063,7 @@ impl Agent {
             .inner
             .settings
             .as_ref()
-            .is_some_and(|settings| settings.is_working_directory_trusted(workdir))
+            .is_some_and(|settings| settings.read(Some(workdir)).project.trusted)
             || self
                 .inner
                 .trusted_working_directories
@@ -2133,7 +2116,7 @@ impl Agent {
                 .insert(workdir);
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || settings.trust_working_directory(&workdir))
+        tokio::task::spawn_blocking(move || settings.write(SettingsUpdate::TrustDirectory(workdir)))
             .await
             .map_err(|error| AgentError::Storage(error.to_string()))?
             .map_err(|error| AgentError::Storage(error.to_string()))
@@ -2384,7 +2367,7 @@ impl Agent {
                 .expand(
                     &skill.name,
                     &skill.arguments,
-                    tickloop_agent_config::skills::SkillCaller::User,
+                    tickloop_agent_policy::skills::SkillCaller::User,
                 )
                 .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
@@ -2396,17 +2379,17 @@ impl Agent {
         };
         // The host's reading of the user's /loop: the one task the turn creates for the user.
         let user_loop = (invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
-            && invoked.name == tickloop_agent_config::skills::LOOP_SKILL_NAME)
-            .then(|| tickloop_agent_config::loop_skill::LoopSchedule::of(&skill.arguments).ok())
+            && invoked.name == tickloop_agent_policy::skills::LOOP_SKILL_NAME)
+            .then(|| tickloop_agent_policy::loop_skill::LoopSchedule::of(&skill.arguments).ok())
             .flatten();
         // The self-paced task names the turn it starts before the turn is submitted.
         let run_id = tickloop_ids::generate();
         let started_loop = match &user_loop {
-            Some(tickloop_agent_config::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
+            Some(tickloop_agent_policy::loop_skill::LoopSchedule::SelfPaced { prompt }) => {
                 self.start_users_self_paced_loop(chat_id, prompt.clone(), run_id.into())
                     .await?
             }
-            Some(tickloop_agent_config::loop_skill::LoopSchedule::Cron { .. }) | None => None,
+            Some(tickloop_agent_policy::loop_skill::LoopSchedule::Cron { .. }) | None => None,
         };
         let submitted = self
             .submit_internal(
@@ -2462,7 +2445,7 @@ impl Agent {
             .expand(
                 name,
                 arguments,
-                tickloop_agent_config::skills::SkillCaller::User,
+                tickloop_agent_policy::skills::SkillCaller::User,
             )
             .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map(|_| ())
@@ -2791,10 +2774,7 @@ impl Agent {
             recovery::before_resume(
                 &mut chat.snapshot,
                 loop_id,
-                self.inner
-                    .settings
-                    .as_ref()
-                    .and_then(tickloop_agent_config::UserSettings::root_directory),
+                self.inner.config_root.as_deref(),
             )?;
         }
         if !chat.snapshot.accepts_images()
@@ -4348,10 +4328,7 @@ impl Agent {
             recovery::before_resume(
                 &mut candidate.snapshot,
                 pending.receipt.loop_id,
-                self.inner
-                    .settings
-                    .as_ref()
-                    .and_then(tickloop_agent_config::UserSettings::root_directory),
+                self.inner.config_root.as_deref(),
             )?;
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
@@ -4604,7 +4581,7 @@ impl Agent {
             .tools
             .clone();
         let saved = config.clone();
-        self.write_user_settings(move |settings| settings.save_search_config(saved.as_ref()))
+        self.write_user_settings(move |settings| settings.write(SettingsUpdate::Search(saved)))
             .await?;
         tools
             .set_search(config.clone())
@@ -4766,7 +4743,7 @@ impl Agent {
             .collect::<Result<Vec<_>, _>>()?;
         self.require_working_directory_trust(&folder)?;
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let saved = self.load_user_settings().await?;
+        let saved = self.load_user_settings(Some(folder.clone())).await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         let folder_changed = chat.snapshot.folder.as_ref() != Some(&folder);
@@ -5392,7 +5369,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(agent_messages::definitions())
         .map(|definition| definition.name)
         .chain(std::iter::once(
-            tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),
+            tickloop_agent_policy::skills::SKILL_TOOL_NAME.into(),
         ))
         .chain(
             mcp_resources::definitions()

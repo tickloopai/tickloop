@@ -15,7 +15,6 @@ async-trait = "0.1"
 futures-util = "0.3"
 regex = "1"
 serde_json = "1"
-tickloop-agent-config = { path = "../config" }
 # The tests of every Agent crate reach the model's test-only seams through this crate.
 tickloop-agent-model = { path = "../model", features = ["test-support"] }
 tickloop-agent-protocol = { path = "../protocol" }

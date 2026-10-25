@@ -1,4 +1,5 @@
 use crate::support;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use std::{
     path::{Path, PathBuf},
@@ -17,7 +18,8 @@ use tickloop_agent_daemon::{
     DaemonServer, EmbeddedAgentAccess, WorkerFactory, serve_connection, serve_daemon_listener,
     serve_listener, serve_worker_listener,
 };
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess, AgentCommand,
     AgentDetailQuery, AgentFilter, AgentSummary, CommandEnvelope, CommandReceipt, CommandResult,
     ConfigurationChange, DisplayReceipt, DisplayUpdate, EnvironmentValue, ExecutionAvailability,
@@ -25,6 +27,7 @@ use tickloop_agent_protocol::{
     ObservationChange, ObservationRequest, ObservationValue, PROTOCOL_MAJOR, Page, ProtocolLimits,
     ReceiptState, TaskOrigin, TaskRef, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef,
 };
+
 use tickloop_agent_runtime::Agent;
 use tokio::{
     net::UnixListener,
@@ -206,7 +209,7 @@ async fn serve(
     serve_with_limits(
         directory,
         daemon,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     )
     .await
 }
@@ -552,7 +555,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         "epoch": epoch,
         "launch": launch,
         "control": control,
-        "limits": tickloop_agent_test_support::TRANSPORT_LIMITS,
+        "limits": tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     }))
     .unwrap();
     bootstrap.push(b'\n');
@@ -1395,7 +1398,7 @@ async fn controlled_connections(
                     stream,
                     daemon,
                     epoch,
-                    tickloop_agent_test_support::TRANSPORT_LIMITS,
+                    tickloop_agent_access::test_support::TRANSPORT_LIMITS,
                 )
                 .await;
             });
@@ -1663,7 +1666,7 @@ async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_chang
         listener,
         daemon,
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         tokio_util::sync::CancellationToken::new(),
     ));
     let initial = LocalAgentClient::connect(&socket).await.unwrap();
@@ -1704,7 +1707,7 @@ async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_chang
         listener,
         replacement_daemon,
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         tokio_util::sync::CancellationToken::new(),
     ));
     let error = tokio::time::timeout(Duration::from_secs(3), async {
@@ -2084,7 +2087,7 @@ fn accept_links(
                     stream,
                     served,
                     epoch,
-                    tickloop_agent_test_support::TRANSPORT_LIMITS,
+                    tickloop_agent_access::test_support::TRANSPORT_LIMITS,
                 )
                 .await;
             }));
@@ -2359,7 +2362,7 @@ async fn an_execution_feed_can_close_while_the_daemon_connection_stays_available
         listener,
         service,
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     ));
     let client = LocalAgentClient::connect(socket).await.unwrap();
     let command = create(epoch, temporary.path());
@@ -2511,7 +2514,7 @@ async fn oversized_response_fixture(
     let target = execution(inner.execute(create(epoch, directory)).await.unwrap());
     let access = Arc::new(OversizedResponseAccess {
         inner,
-        text: "x".repeat(tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes()),
+        text: "x".repeat(tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes()),
         enlarge_receipts: AtomicBool::new(true),
         executions: AtomicUsize::new(0),
     });
@@ -2521,7 +2524,7 @@ async fn oversized_response_fixture(
         listener,
         access.clone(),
         epoch,
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
     ));
     let client = LocalAgentClient::connect(socket).await.unwrap();
     (client, access, target, server)
@@ -3132,11 +3135,11 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
     let limits = &client.protocol().limits;
     assert_eq!(
         limits.frame_bytes,
-        tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes()
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes()
     );
     assert_eq!(
         limits.chunk_bytes,
-        tickloop_agent_test_support::TRANSPORT_LIMITS.chunk_bytes()
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS.chunk_bytes()
     );
     assert_eq!(limits.view_lease_seconds, VIEW_LEASE_SECONDS);
     assert!(limits.change_bytes < limits.frame_bytes);
@@ -3231,7 +3234,8 @@ async fn a_client_rejected_oversized_create_does_not_mark_acceptance_unknown() {
         .dispatch(
             LaunchSpec::embedded(temporary.path().into()),
             UserInput::Text {
-                text: "x".repeat(tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes()),
+                text: "x"
+                    .repeat(tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes()),
                 contexts: vec![],
                 paths: vec![],
             },
@@ -3291,7 +3295,7 @@ impl WorkerFactory for SocketWorkerFactory {
                 listener,
                 served,
                 epoch,
-                tickloop_agent_test_support::TRANSPORT_LIMITS,
+                tickloop_agent_access::test_support::TRANSPORT_LIMITS,
             )
             .await
             .unwrap();
@@ -3336,8 +3340,8 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
     assert_eq!(
         (announced.frame_bytes, announced.chunk_bytes),
         (
-            tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes(),
-            tickloop_agent_test_support::TRANSPORT_LIMITS.chunk_bytes()
+            tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes(),
+            tickloop_agent_access::test_support::TRANSPORT_LIMITS.chunk_bytes()
         )
     );
     let submit = |text: String| {
@@ -3363,7 +3367,8 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
         .await
         .unwrap();
     // Each prompt fits one worker frame; the history holding both must cross it in chunks.
-    let prompt = "x".repeat(tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes() * 5 / 8);
+    let prompt =
+        "x".repeat(tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes() * 5 / 8);
     for _ in 0..2 {
         client
             .execute(submit(prompt.clone()))
@@ -3385,7 +3390,7 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
     }
     let refused = client
         .execute(submit("x".repeat(
-            tickloop_agent_test_support::TRANSPORT_LIMITS.frame_bytes(),
+            tickloop_agent_access::test_support::TRANSPORT_LIMITS.frame_bytes(),
         )))
         .await
         .unwrap();

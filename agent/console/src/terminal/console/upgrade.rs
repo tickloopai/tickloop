@@ -470,7 +470,7 @@ mod tests {
         ViewSelection {
             navigation: crate::agent_console::UpgradeNavigation {
                 directory: PathBuf::from("/fixture"),
-                filter: tickloop_agent_protocol::AgentFilter::default(),
+                filter: tickloop_agent_access::AgentFilter::default(),
             },
             chat,
             overview: false,

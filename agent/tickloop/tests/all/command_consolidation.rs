@@ -61,7 +61,9 @@ fn retired_commands_do_not_execute_or_become_prompts() {
     assert!(!stdout.contains("Accepted:"));
     assert!(!stdout.contains("Codex login removed"));
     use tickloop_agent_client::LocalAgentClient;
-    use tickloop_agent_protocol::{AgentAccess as _, ObservationRequest, ObservationValue, Page};
+
+    use tickloop_agent_access::{AgentAccess as _, ObservationRequest, ObservationValue, Page};
+
     let catalog = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

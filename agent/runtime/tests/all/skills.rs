@@ -2,11 +2,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_agent_settings::skills::SkillDiscovery;
 
 use serde_json::json;
 use tick_packages::{MANIFEST_FILE_NAME, PackageStore};
-use tickloop_agent_config::skills::{SkillCaller, SkillError, SkillRegistry};
 use tickloop_agent_model::ModelRequest;
+use tickloop_agent_policy::skills::{SkillCaller, SkillError, SkillRegistry};
 use tickloop_agent_protocol::{Content, EventKind, ExecutionMode, LoopState, Receipt, SkillSource};
 use tickloop_agent_runtime::Agent;
 
@@ -218,7 +220,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
         call("skill-1", "Skill", json!({"skill": "tickloop"})),
         text("ready"),
     ]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -282,7 +284,7 @@ async fn loaded_skill_guidance_follows_its_call_once_and_keeps_every_request_a_p
         text("Analyzed."),
         text("Still guided."),
     ]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -358,7 +360,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
         ),
         text("ready"),
     ]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -421,7 +423,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
 async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("ready")]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -520,7 +522,7 @@ async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided()
         ),
         text("ready"),
     ]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -572,7 +574,7 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
     let mut outputs = (0..7).map(|_| text("ready")).collect::<Vec<_>>();
     outputs.extend([text("A compact summary"), text("continued")]);
     let model = Arc::new(ScriptedModel::new(outputs));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -996,7 +998,7 @@ async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() 
         resume: tokio::sync::Notify::new(),
         pause_next: std::sync::atomic::AtomicBool::new(true),
     });
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -1064,7 +1066,7 @@ async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_
         call("load", "Skill", json!({"skill": "slides"})),
         text("Done."),
     ]));
-    let agent = Agent::new(config(), model.clone());
+    let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
         .trust_working_directory(directory.path().into())
         .await
@@ -1194,4 +1196,27 @@ async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
             .contains("Topic: the Q3 review")
     );
     assert!(!carries_slides_guidance(&requests[2]));
+}
+
+fn agent_with_project_skills(
+    directory: &std::path::Path,
+    model: Arc<dyn tickloop_agent_model::ModelClient>,
+) -> Agent {
+    Agent::with_seams(
+        tickloop_agent_runtime::HarnessSeams {
+            transcripts: None,
+            environment: Some(Arc::new(
+                tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+            )),
+            models: tickloop_agent_test_support::harness::ChosenModels::new(model),
+        },
+        tickloop_agent_runtime::HarnessOptions {
+            settings: Some(Arc::new(tickloop_agent_settings::UserSettings::in_root(
+                &directory.join("config"),
+            ))),
+            host: tickloop_agent_protocol::AgentHostOptions::default(),
+            ..tickloop_agent_runtime::HarnessOptions::local(config())
+        },
+    )
+    .unwrap()
 }

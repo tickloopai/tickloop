@@ -1,5 +1,7 @@
 use super::*;
 use tickloop_agent_protocol::{GoalSnapshot, GoalStatus};
+#[cfg(test)]
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 #[test]
 fn goal_set_history_shows_its_recorded_condition_on_one_clipped_line() {

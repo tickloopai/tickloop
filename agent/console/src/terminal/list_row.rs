@@ -281,7 +281,7 @@ pub(super) fn format_elapsed(milliseconds: u64) -> String {
 mod tests {
     use super::*;
     use crate::monitor_rows::NextCheck;
-    use tickloop_agent_config::DisplayPreferences;
+    use tickloop_agent_settings::DisplayPreferences;
 
     fn row<'a>(name: &'a str, details: &str) -> ListRow<'a> {
         ListRow {

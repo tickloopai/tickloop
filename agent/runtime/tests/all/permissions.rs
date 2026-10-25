@@ -7,6 +7,7 @@ use tickloop_agent_protocol::{
     PermissionApprovalSource, PermissionRule, PermissionScope, PromptPolicy,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::*;
 use uuid::Uuid;
 

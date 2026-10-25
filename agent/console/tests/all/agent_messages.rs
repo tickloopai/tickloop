@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_test_support::subagents::{
     SubagentTimingModel, completed, task_notifications, wait_for_snapshot,
@@ -61,11 +62,13 @@ impl ModelClient for PausedParentModel {
 async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_message_continuation()
  {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tickloop_agent_access::{
+        AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, UserInput,
+    };
     use tickloop_agent_console::agent_console::AgentConsole;
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
-        AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, LoopState, UserInput,
-    };
+    use tickloop_agent_protocol::LoopState;
+
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
@@ -1225,10 +1228,12 @@ async fn repeated_model_call_cannot_duplicate_a_delivered_message() {
 #[tokio::test]
 async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, CommandEnvelope, CommandResult, DisplayUpdate, LaunchSpec,
         ViewRef,
     };
+
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ClarifyingModel {
         requests: Mutex::new(vec![]),
@@ -1271,7 +1276,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
-                input: tickloop_agent_protocol::UserInput::Text {
+                input: tickloop_agent_access::UserInput::Text {
                     text: "Delegate the report review.".into(),
                     contexts: vec![],
                     paths: vec![],
@@ -1662,10 +1667,12 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
 async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text_and_real_child_task()
  {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, ObservationRequest,
         ObservationValue,
     };
+
     let directory = tempfile::tempdir().unwrap();
     let literal = format!(
         "<agent-message>{}</agent-message>",
@@ -2138,11 +2145,13 @@ async fn the_root_can_stop_its_parked_child_idempotently_without_losing_context_
 #[tokio::test]
 async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_agent() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, CommandResult, DisplayUpdate,
         InteractionSource, LaunchSpec, ObservationRequest, ObservationValue, Page, UserInput,
         ViewRef,
     };
+
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
@@ -2489,20 +2498,22 @@ struct DirectedFixture {
     directory: tempfile::TempDir,
     core: Agent,
     access: tickloop_agent_daemon::EmbeddedAgentAccess,
-    root: tickloop_agent_protocol::ExecutionRef,
-    child: tickloop_agent_protocol::ExecutionRef,
+    root: tickloop_agent_access::ExecutionRef,
+    child: tickloop_agent_access::ExecutionRef,
     root_chat: Uuid,
     child_chat: Uuid,
-    origin: tickloop_agent_protocol::InteractionSource,
+    origin: tickloop_agent_access::InteractionSource,
 }
 
 impl DirectedFixture {
     async fn new() -> Self {
         use tickloop_agent_daemon::EmbeddedAgentAccess;
-        use tickloop_agent_protocol::{
+
+        use tickloop_agent_access::{
             AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, CommandResult, DisplayUpdate,
             InteractionSource, LaunchSpec, ObservationRequest, ObservationValue, Page, ViewRef,
         };
+
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(RoutedModel::new(|request| {
             if !state(request)["delegation"].is_null() {
@@ -2599,8 +2610,9 @@ impl DirectedFixture {
         &self,
         contexts: Vec<tickloop_agent_protocol::InputContext>,
         paths: Vec<std::path::PathBuf>,
-    ) -> tickloop_agent_protocol::CommandReceipt {
-        use tickloop_agent_protocol::{AgentAccess, AgentCommand, CommandEnvelope, UserInput};
+    ) -> tickloop_agent_access::CommandReceipt {
+        use tickloop_agent_access::{AgentAccess, AgentCommand, CommandEnvelope, UserInput};
+
         self.access
             .execute(CommandEnvelope {
                 daemon_epoch: self.access.daemon_epoch(),
@@ -2698,10 +2710,11 @@ async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_curre
 
 #[tokio::test]
 async fn family_human_main_input_after_stop_continues_the_root_loop() {
-    use tickloop_agent_protocol::{
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, CommandEnvelope, CommandResult, DisplayUpdate,
         InteractionSource, UserInput,
     };
+
     let fixture = DirectedFixture::new().await;
     let chat_loop = fixture
         .core
@@ -2884,9 +2897,10 @@ async fn family_directory_aggregates_active_user_shell_instead_of_only_completed
 
 #[tokio::test]
 async fn directed_human_body_preserves_whitespace_after_the_routing_separator() {
-    use tickloop_agent_protocol::{
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, CommandEnvelope, CommandResult, UserInput,
     };
+
     let fixture = DirectedFixture::new().await;
     let text = "@audit \n    print(1)\n";
     let sent = fixture

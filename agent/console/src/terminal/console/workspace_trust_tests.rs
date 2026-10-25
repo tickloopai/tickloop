@@ -89,7 +89,7 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
         state.prompt_enabled = true;
         state.insert("hidden jk draft");
         state.chat = Some(Uuid::from_u128(9001));
-        state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
+        state.monitor_preference = tickloop_agent_settings::MonitorPreference::Auto;
         state.monitor.replace(
             TickGroup::Shells,
             vec![MonitorEntry {

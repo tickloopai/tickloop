@@ -4,15 +4,17 @@ use tokio::net::UnixListener;
 use uuid::Uuid;
 
 use super::{AgentConsole, AttentionGroup};
+use tickloop_agent_access::{
+    AgentSummary, ClientMessage, ExecutionAvailability, ExecutionRef, HANDSHAKE_FRAME_BYTES,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, ServerHello, ServerMessage,
+};
 use tickloop_agent_client::{
     LocalAgentClient,
     frame::{read_frame, write_frame},
 };
-use tickloop_agent_protocol::{
-    AgentSummary, ClientMessage, ExecutionAvailability, ExecutionRef, HANDSHAKE_FRAME_BYTES,
-    LoopState, PROTOCOL_MAJOR, PROTOCOL_MINOR, ServerHello, ServerMessage,
-};
-use tickloop_agent_test_support::TRANSPORT_LIMITS;
+use tickloop_agent_protocol::LoopState;
+
+use tickloop_agent_access::test_support::TRANSPORT_LIMITS;
 
 const FRAME_BYTES: usize = TRANSPORT_LIMITS.frame_bytes();
 
@@ -22,18 +24,18 @@ struct UnknownCreation {
 }
 
 #[async_trait::async_trait]
-impl tickloop_agent_protocol::AgentAccess for UnknownCreation {
+impl tickloop_agent_access::AgentAccess for UnknownCreation {
     async fn observe(
         &self,
-        query: tickloop_agent_protocol::ObservationRequest,
-    ) -> Result<tickloop_agent_protocol::Observation, tickloop_agent_protocol::AccessError> {
+        query: tickloop_agent_access::ObservationRequest,
+    ) -> Result<tickloop_agent_access::Observation, tickloop_agent_access::AccessError> {
         assert!(matches!(
             query,
-            tickloop_agent_protocol::ObservationRequest::Receipt { .. }
+            tickloop_agent_access::ObservationRequest::Receipt { .. }
         ));
-        Ok(tickloop_agent_protocol::Observation::single(
-            tickloop_agent_protocol::ObservationValue::Receipt(None),
-            tickloop_agent_protocol::Cursor {
+        Ok(tickloop_agent_access::Observation::single(
+            tickloop_agent_access::ObservationValue::Receipt(None),
+            tickloop_agent_access::Cursor {
                 daemon_epoch: self.epoch,
                 execution: None,
                 sequence: 0,
@@ -44,19 +46,19 @@ impl tickloop_agent_protocol::AgentAccess for UnknownCreation {
 
     async fn execute(
         &self,
-        _: tickloop_agent_protocol::CommandEnvelope,
-    ) -> Result<tickloop_agent_protocol::CommandReceipt, tickloop_agent_protocol::AccessError> {
+        _: tickloop_agent_access::CommandEnvelope,
+    ) -> Result<tickloop_agent_access::CommandReceipt, tickloop_agent_access::AccessError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(tickloop_agent_protocol::AccessError::new(
-            tickloop_agent_protocol::AccessErrorCode::OutcomeUnknown,
+        Err(tickloop_agent_access::AccessError::new(
+            tickloop_agent_access::AccessErrorCode::OutcomeUnknown,
             "creation reply was lost",
         ))
     }
 
     async fn show_view(
         &self,
-        _: tickloop_agent_protocol::DisplayUpdate,
-    ) -> Result<tickloop_agent_protocol::DisplayReceipt, tickloop_agent_protocol::AccessError> {
+        _: tickloop_agent_access::DisplayUpdate,
+    ) -> Result<tickloop_agent_access::DisplayReceipt, tickloop_agent_access::AccessError> {
         unreachable!()
     }
 }
@@ -64,7 +66,9 @@ impl tickloop_agent_protocol::AgentAccess for UnknownCreation {
 #[tokio::test]
 async fn view_upgrade_keeps_dispatch_directory_and_defers_an_unknown_creation() {
     use super::Intent;
-    use tickloop_agent_protocol::{AgentFilter, LaunchSpec, UserInput};
+
+    use tickloop_agent_access::{AgentFilter, LaunchSpec, UserInput};
+
     let epoch = Uuid::new_v4();
     let access = Arc::new(UnknownCreation {
         epoch,

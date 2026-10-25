@@ -8,7 +8,7 @@ use tempfile::{SpooledData, SpooledTempFile};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
-use tickloop_agent_protocol::{AccessError, ServerMessage};
+use tickloop_agent_access::{AccessError, ServerMessage};
 
 pub(super) const RESPONSE_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -100,10 +100,11 @@ fn storage_error(error: std::io::Error) -> AccessError {
 
 #[cfg(test)]
 mod tests {
-    use tickloop_agent_protocol::{
-        Content, Cursor, Message, ObservationValue, RecordedMessage, RecordedTranscript, Role,
-        TranscriptRef,
+    use tickloop_agent_access::{
+        Cursor, ObservationValue, RecordedMessage, RecordedTranscript, TranscriptRef,
     };
+    use tickloop_agent_protocol::{Content, Message, Role};
+
     use tokio::io::AsyncReadExt;
     use uuid::Uuid;
 

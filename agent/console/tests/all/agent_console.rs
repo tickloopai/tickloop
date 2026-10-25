@@ -1,15 +1,16 @@
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{path::PathBuf, sync::Arc};
-use tickloop_agent_console::agent_console::{AgentConsole, Destination, Intent};
-use tickloop_agent_daemon::EmbeddedAgentAccess;
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter,
     AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
     DisplayReceipt, DisplayUpdate, ExecutionAvailability, ExecutionRef, HostLocation, LaunchSpec,
-    LoopState, Observation, ObservationRequest, ObservationValue, Page, ReceiptState, UserInput,
-    ViewRef,
+    Observation, ObservationRequest, ObservationValue, Page, ReceiptState, UserInput, ViewRef,
 };
+use tickloop_agent_console::agent_console::{AgentConsole, Destination, Intent};
+use tickloop_agent_daemon::EmbeddedAgentAccess;
+use tickloop_agent_protocol::LoopState;
+
 use tickloop_agent_runtime::Agent;
 use uuid::Uuid;
 

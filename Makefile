@@ -59,7 +59,7 @@ test: test-workspace
 ## these and the release workflow verifies the launcher. NEXTEST_PROFILE=ci retries flaky PTY tests.
 test-workspace:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
-	node --test scripts/dev-agent.test.mjs
+	node --test scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs
 	@mkdir -p /tmp/tickloop-test
 	TICKLOOP_CONFIG_DIR=$$(mktemp -d /tmp/tickloop-test/config.XXXXXX) \
 	TICKLOOP_TMPDIR=$$(mktemp -d /tmp/tickloop-test/tmp.XXXXXX) \
@@ -72,9 +72,13 @@ check: check-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check-workspace:
+	node --test scripts/check-agent-access.test.mjs
+	node scripts/check-agent-access.mjs
+	node scripts/check-boundaries.mjs
+	node scripts/check-public-api.mjs
 	cargo fmt --all --check
 	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
-	cargo clippy --locked --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	$(MAKE) test-workspace
 
 ## Bump the Tickloop patch version (VERSION=X.Y.Z names a higher one), check it, commit the version files and push the branch and tag,

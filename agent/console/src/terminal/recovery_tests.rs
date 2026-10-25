@@ -6,14 +6,15 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tickloop_agent_access::{
+    AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
+    DisplayReceipt, DisplayUpdate, ExecutionRef, FEED_CAPACITY, LaunchSpec, Observation,
+    ObservationChange, ObservationRequest, ObservationValue, REPLAY_CAPACITY, UserInput, ViewRef,
+};
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_model::*;
-use tickloop_agent_protocol::{
-    AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
-    DisplayReceipt, DisplayUpdate, Event, ExecutionRef, FEED_CAPACITY, LaunchSpec, LoopState,
-    ModelIdentity, ModelProvider, Observation, ObservationChange, ObservationRequest,
-    ObservationValue, Protocol, REPLAY_CAPACITY, Usage, UserInput, ViewRef,
-};
+use tickloop_agent_protocol::{Event, LoopState, ModelIdentity, ModelProvider, Protocol, Usage};
+
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

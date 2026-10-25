@@ -3,7 +3,8 @@
 //! and draws the conversation an unbroken feed draws.
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_protocol::{Content, FEED_CHANGE_BYTES, ObservationUpdate, ResetReason};
+use tickloop_agent_access::{FEED_CHANGE_BYTES, ObservationUpdate, ResetReason};
+use tickloop_agent_protocol::Content;
 
 const GAP_FIXTURE_VARIABLE: &str = "TICKLOOP_FEED_GAP_FIXTURE";
 const GAP_ROUTE_VARIABLE: &str = "TICKLOOP_FEED_GAP_ROUTE";

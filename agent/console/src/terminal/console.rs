@@ -16,7 +16,7 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, Clear, ClearType, ScrollUp};
 use crossterm::{execute, queue};
-use tickloop_agent_config::DisplayPreferences;
+use tickloop_agent_settings::DisplayPreferences;
 use tickloop_agent_tools::file_change::FileChangeReview;
 use tickloop_agent_updater::UpdateNotice;
 use tokio::sync::mpsc;
@@ -235,9 +235,10 @@ impl TerminalSurface {
 
 #[cfg(test)]
 use super::monitor::MonitorEntry;
+use tickloop_agent_access::ExecutionRef;
 use tickloop_agent_protocol::{
-    ExecutionRef, Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
-    TaskBoard, TickSubscriptionStatus,
+    Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind, TaskBoard,
+    TickSubscriptionStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -878,7 +879,7 @@ pub(super) struct State {
     diff_screen: Option<DiffScreen>,
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
     pub(super) monitor: Monitor,
-    monitor_preference: tickloop_agent_config::MonitorPreference,
+    monitor_preference: tickloop_agent_settings::MonitorPreference,
     /// Monitor's column as the user last dragged it, its separator included.
     monitor_width: Option<usize>,
     /// Whether the left button holds Monitor's separator.
@@ -887,7 +888,7 @@ pub(super) struct State {
     /// rows.
     monitor_separator: Option<(usize, std::ops::Range<usize>)>,
     /// Whether Monitor may float hosted Ticks in a Herdr popup, as the settings say.
-    monitor_popup: tickloop_agent_config::MonitorPopup,
+    monitor_popup: tickloop_agent_settings::MonitorPopup,
     /// The socket of the Herdr session this View runs inside, where Enter floats hosted Ticks.
     herdr_socket: Option<PathBuf>,
     /// A hosted Tick waiting to take this terminal; the input thread attaches it between keys.
@@ -1776,7 +1777,7 @@ impl Console {
         Ok(())
     }
 
-    pub(super) fn monitor_popup(&self) -> Result<tickloop_agent_config::MonitorPopup, String> {
+    pub(super) fn monitor_popup(&self) -> Result<tickloop_agent_settings::MonitorPopup, String> {
         Ok(self
             .state
             .lock()
@@ -1786,7 +1787,7 @@ impl Console {
 
     pub(super) fn set_monitor_popup(
         &self,
-        popup: tickloop_agent_config::MonitorPopup,
+        popup: tickloop_agent_settings::MonitorPopup,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -1844,7 +1845,7 @@ impl Console {
 
     pub(super) fn set_monitor_preference(
         &self,
-        preference: tickloop_agent_config::MonitorPreference,
+        preference: tickloop_agent_settings::MonitorPreference,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_preference = preference;
@@ -5881,7 +5882,7 @@ impl State {
             ),
             prompt_enabled: false,
             prompt_suggestion_enabled: true,
-            shift_tab_modes: tickloop_agent_config::DEFAULT_SHIFT_TAB_MODES.to_vec(),
+            shift_tab_modes: tickloop_agent_settings::DEFAULT_SHIFT_TAB_MODES.to_vec(),
             prompt_suggestion: None,
             prompt_suggestion_request: None,
             foreground_shell: false,
@@ -5977,11 +5978,11 @@ impl State {
             diff_screen: None,
             diff_screen_cache: HashMap::new(),
             monitor: Monitor::default(),
-            monitor_preference: tickloop_agent_config::MonitorPreference::Auto,
+            monitor_preference: tickloop_agent_settings::MonitorPreference::Auto,
             monitor_width: None,
             monitor_resizing: false,
             monitor_separator: None,
-            monitor_popup: tickloop_agent_config::MonitorPopup::default(),
+            monitor_popup: tickloop_agent_settings::MonitorPopup::default(),
             herdr_socket: None,
             full_screen_attach: None,
             terminal_lent: false,
@@ -6819,7 +6820,7 @@ impl State {
     /// Whether a focused Monitor covers the conversation instead of sitting beside it.
     fn monitor_overlay(&self) -> bool {
         self.monitor_side_columns().is_none()
-            || self.monitor_preference == tickloop_agent_config::MonitorPreference::Hidden
+            || self.monitor_preference == tickloop_agent_settings::MonitorPreference::Hidden
                 && !self.monitor.auto_shown
     }
 
@@ -6841,7 +6842,8 @@ impl State {
             && !self.full_review
             && (self.monitor.overlay
                 || self.monitor_side_columns().is_some()
-                    && (self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto
+                    && (self.monitor_preference
+                        == tickloop_agent_settings::MonitorPreference::Auto
                         || self.monitor.auto_shown))
     }
 
@@ -17898,7 +17900,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("audit.txt"), "evidence").unwrap();
         let target = FamilyMentionTarget {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: Uuid::new_v4(),
                 agent_id: Uuid::new_v4(),
                 generation: 1,
@@ -22311,8 +22313,8 @@ mod tests {
     #[tokio::test]
     async fn shift_tab_modes_checklist_toggles_with_space_and_saves_with_enter() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent_config::UserSettings;
         use tickloop_agent_protocol::ExecutionMode;
+        use tickloop_agent_settings::UserSettings;
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(
@@ -22382,7 +22384,7 @@ mod tests {
             Menus, OUTPUT_STYLE_SETTING_INDEX, PERMISSIONS_SETTING_INDEX,
             REDUCE_MOTION_SETTING_INDEX,
         };
-        use tickloop_agent_config::UserSettings;
+        use tickloop_agent_settings::UserSettings;
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(

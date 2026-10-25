@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Duration};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_protocol::{EventKind, MAX_SUBAGENT_DEPTH};

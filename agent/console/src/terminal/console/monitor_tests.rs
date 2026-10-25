@@ -981,7 +981,7 @@ fn monitor_width_boundary_and_overlay_do_not_change_visibility_preference() {
     assert!(!state.monitor_visible());
     assert_eq!(
         state.monitor_preference,
-        tickloop_agent_config::MonitorPreference::Auto
+        tickloop_agent_settings::MonitorPreference::Auto
     );
 }
 
@@ -1089,13 +1089,13 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
         state
             .scrollback
             .append(&format!("{}\n", "conversation ".repeat(25)));
-        state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+        state.monitor_preference = tickloop_agent_settings::MonitorPreference::Hidden;
         let (hidden, hidden_row, hidden_column) = state.frame();
         let hidden_target = state
             .monitor_toggle_target
             .as_ref()
             .map(|target| (target.row, target.columns.clone()));
-        state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
+        state.monitor_preference = tickloop_agent_settings::MonitorPreference::Auto;
         state.monitor.overlay = state.monitor_side_columns().is_none();
         let (shown, shown_row, shown_column) = state.frame();
         assert_eq!(shown, hidden, "input rows changed at {width} columns");
@@ -1194,7 +1194,7 @@ fn artifact_metadata_callback_is_filed_under_its_agent_after_a_view_switch() {
 #[test]
 fn failed_monitor_save_keeps_the_current_visibility_and_focus() {
     let directory = tempfile::tempdir().unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
+    let settings = tickloop_agent_settings::UserSettings::in_root(directory.path());
     std::fs::write(directory.path().join("settings.json"), "invalid JSON").unwrap();
     let mut state = State::new(true, 140, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1209,7 +1209,7 @@ fn failed_monitor_save_keeps_the_current_visibility_and_focus() {
     assert!(state.monitor.focused);
     assert_eq!(
         state.monitor_preference,
-        tickloop_agent_config::MonitorPreference::Auto
+        tickloop_agent_settings::MonitorPreference::Auto
     );
 }
 
@@ -1912,7 +1912,7 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
         [(true, Role::RunningMarkDim), (false, Role::ErrorMark)]
     );
     assert_eq!(monitor.next_frame_ms(2_100, 40, display), Some(2_500));
-    let still = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+    let still = DisplayProfile::new(tickloop_agent_settings::DisplayPreferences {
         prefers_reduced_motion: true,
     });
     assert_eq!(
@@ -2214,7 +2214,7 @@ fn an_emptied_monitor_keeps_its_column_and_its_label_still_hides_it() {
         state.pointer_input.take(),
         Some(InputEvent::ToggleMonitor { show: false })
     ));
-    state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+    state.monitor_preference = tickloop_agent_settings::MonitorPreference::Hidden;
     state.draw_frame(&mut Vec::new()).unwrap();
     assert_eq!(state.content_columns(), state.width);
     assert!(
@@ -3309,6 +3309,10 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
 async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
     use crate::monitor_rows::TickIntent;
     use crate::terminal::execution::ConsoleExecution;
+    use tickloop_agent_access::{
+        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
+        DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
+    };
     use tickloop_agent_daemon::EmbeddedAgentAccess;
     use tickloop_agent_protocol::*;
 
@@ -4486,7 +4490,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
 
 #[test]
 fn first_new_monitor_content_reveals_once_without_taking_input_focus_even_when_hidden() {
-    use tickloop_agent_config::MonitorPreference;
+    use tickloop_agent_settings::MonitorPreference;
     for preference in [MonitorPreference::Auto, MonitorPreference::Hidden] {
         for content in [
             "goal",
@@ -4541,8 +4545,8 @@ fn first_new_monitor_content_reveals_once_without_taking_input_focus_even_when_h
 #[test]
 fn narrow_terminal_flashes_monitor_entry_once_without_overlay_or_focus_change() {
     for preference in [
-        tickloop_agent_config::MonitorPreference::Auto,
-        tickloop_agent_config::MonitorPreference::Hidden,
+        tickloop_agent_settings::MonitorPreference::Auto,
+        tickloop_agent_settings::MonitorPreference::Hidden,
     ] {
         let chat = Uuid::new_v4();
         let console = Console::test_interactive_for_chat(chat);
@@ -4598,7 +4602,7 @@ fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
         let chat = Uuid::new_v4();
         let console = Console::test_interactive_for_chat(chat);
         console
-            .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+            .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
             .unwrap();
         console
             .refresh_monitor(auto_reveal_sources(chat, content))
@@ -4642,7 +4646,7 @@ fn monitor_reveal_budget_survives_chat_switches_and_is_independent_for_each_chat
     let second = Uuid::new_v4();
     let console = Console::test_interactive_for_chat(first);
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     console
         .refresh_monitor(auto_reveal_sources(first, "empty"))
@@ -4651,7 +4655,7 @@ fn monitor_reveal_budget_survives_chat_switches_and_is_independent_for_each_chat
         .refresh_monitor(auto_reveal_sources(first, "goal"))
         .unwrap();
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     console.state.lock().unwrap().switch_view_chat(Some(second));
     console
@@ -4673,7 +4677,7 @@ fn backgrounding_a_foreground_shell_reveals_monitor_on_tick_refresh() {
     let chat = Uuid::new_v4();
     let console = Console::test_interactive_for_chat(chat);
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     let mut sources = auto_reveal_sources(chat, "empty");
     sources.shells = tests::task_snapshot(chat, 1);
@@ -4692,7 +4696,7 @@ fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monit
     let chat = Uuid::new_v4();
     let console = Console::test_interactive_for_chat(chat);
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     let mut sources = auto_reveal_sources(chat, "goal");
     let row = tests::subscription_row(1);
@@ -4744,7 +4748,7 @@ fn initial_monitor_sources_arriving_separately_do_not_reveal_existing_content() 
     let chat = Uuid::new_v4();
     let console = Console::test_interactive_for_chat(chat);
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     let sources = auto_reveal_sources(chat, "shell");
     console.update_monitor_chat(sources.chat).unwrap();
@@ -5364,9 +5368,9 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
                 state.display.set_theme(theme);
                 state.monitor.focused = false;
                 state.monitor_preference = if expanded {
-                    tickloop_agent_config::MonitorPreference::Auto
+                    tickloop_agent_settings::MonitorPreference::Auto
                 } else {
-                    tickloop_agent_config::MonitorPreference::Hidden
+                    tickloop_agent_settings::MonitorPreference::Hidden
                 };
                 let instance = state.monitor.entries()[0].instance.clone();
                 let since = tickloop_agent_base::private_fs::unix_time_milliseconds() - elapsed;
@@ -5413,10 +5417,10 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
         }
     }
     let mut state = click_fixture(140, false, TickGroup::Shells);
-    state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+    state.monitor_preference = tickloop_agent_settings::MonitorPreference::Hidden;
     state
         .display
-        .set_preferences(tickloop_agent_config::DisplayPreferences {
+        .set_preferences(tickloop_agent_settings::DisplayPreferences {
             prefers_reduced_motion: true,
         });
     let instance = state.monitor.entries()[0].instance.clone();
@@ -5468,7 +5472,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
             .update_monitor_chat(ChatStatus::of(&snapshot))
             .unwrap();
         console
-            .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+            .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
             .unwrap();
         let message = if artifact {
             tickloop_agent_protocol::LocalMessage::ArtifactRequest {
@@ -5537,7 +5541,7 @@ fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapsh
     console.update_monitor_chat(chat_status(chat)).unwrap();
     console.refresh_monitor_ticks(shells.clone(), None).unwrap();
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     console
         .write_shell_notification(&tickloop_agent_protocol::TaskNotification {
@@ -5596,7 +5600,7 @@ fn artifact_metadata_updates_flash_live_rows_and_hidden_entries_without_replayin
         .refresh_monitor(auto_reveal_sources(chat, "artifact"))
         .unwrap();
     console
-        .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+        .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
         .unwrap();
     let instance = tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap();
     let metadata = |updated: &str| {
@@ -5704,7 +5708,7 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
                 .update_monitor_chat(ChatStatus::of(&snapshot))
                 .unwrap();
             console
-                .set_monitor_preference(tickloop_agent_config::MonitorPreference::Hidden)
+                .set_monitor_preference(tickloop_agent_settings::MonitorPreference::Hidden)
                 .unwrap();
             if history {
                 super::super::workflows::write_public_history(&console, &snapshot).unwrap();
@@ -5772,7 +5776,7 @@ fn collapsed_monitor_flash_render_evidence() {
     ] {
         let mut state = docked_subscribed_monitor_fixture(2, 30);
         state.monitor.focused = false;
-        state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+        state.monitor_preference = tickloop_agent_settings::MonitorPreference::Hidden;
         let instance = state.monitor.entries()[0].instance.clone();
         let since = tickloop_agent_base::private_fs::unix_time_milliseconds() - elapsed;
         state.monitor.flash_received(instance, since);

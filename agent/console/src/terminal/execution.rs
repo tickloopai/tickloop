@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
+#[cfg(test)]
+use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_agent_settings::skills::SkillDiscovery;
 
 use tickhost_connect::herdr::{PaneIdentityError, confirm_pane};
 use tokio::sync::broadcast;
@@ -15,28 +18,31 @@ use super::new_agent_draft::{
 use super::permissions_surface::{
     DraftPolicyRevision, PermissionsContent, PermissionsPage, PermissionsSubject,
 };
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
+    AgentFilter, AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
+    DisplayUpdate, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
+    InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction, MAX_PAGE_LIMIT,
+    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
+    PendingRequestKind, REPLAY_CAPACITY, ReceiptState, RequestRef, TaskAction, TaskOrigin, TaskRef,
+    TranscriptRef, UserInput, ViewRef,
+};
 use tickloop_agent_client::{LocalAgentClient, RecoveringAgentClient};
-use tickloop_agent_config::new_chat::new_chat_settings;
 #[cfg(test)]
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_model::judgment::jev_key_status_in;
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
-    AgentFilter, AgentSummary, ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot,
-    ChatStatus, CommandEnvelope, CommandReceipt, CommandResult, CommandSnapshot, CompactionOutcome,
-    ConfigurationChange, DirectedSummaryOutcome, DirectedSummaryRequest, DisplayUpdate, Event,
-    ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction, HostLocation, HostedMember,
-    InputContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
-    LoopState, LoopTriggerNotice, MAX_PAGE_LIMIT, ModelChange, ModelConfig, MonitorMembership,
-    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    OperationRecord, Page, PendingRequestKind, PermissionChange, PermissionRule, PermissionScope,
+    ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
+    CompactionOutcome, DirectedSummaryOutcome, DirectedSummaryRequest, Event, ExecutionMode,
+    HostedMember, InputContext, LoopState, LoopTriggerNotice, ModelChange, ModelConfig,
+    MonitorMembership, OperationRecord, PermissionChange, PermissionRule, PermissionScope,
     PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer, QueuedInput,
-    REPLAY_CAPACITY, ReasoningEffort, Receipt, ReceiptState, RequestRef, RewindMode, RewindOutcome,
-    SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskAction,
-    TaskNotification, TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus,
-    ToolResult, TranscriptRef, UserInput, UserShellReceipt, UserShellRecord, ViewRef,
+    ReasoningEffort, Receipt, RewindMode, RewindOutcome, SavedChat, ShellTask, ShellTaskOrigin,
+    ShellTaskOutputChunk, TakenBackPrompt, TaskNotification, TickSubscriptionChange,
+    TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
+use tickloop_agent_settings::new_chat::new_chat_settings;
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
 /// Why a New Agent Permissions change was not applied. Nothing was written or staged.
@@ -304,7 +310,7 @@ struct Inner {
     draft: Mutex<NewAgentDraft>,
     first_create: Mutex<Option<FirstCreateState>>,
     /// The View's settings, sharing its transient Providers; New Agent defaults save through it.
-    user_settings: Mutex<Option<tickloop_agent_config::UserSettings>>,
+    user_settings: Mutex<Option<tickloop_agent_settings::UserSettings>>,
     default_model: Mutex<Option<ModelConfig>>,
     /// Inputs whose acceptance is unknown, by execution; no further input goes there until the
     /// receipt resolves.
@@ -571,7 +577,7 @@ impl ConsoleExecution {
     ) -> Self {
         let epoch = client.daemon_epoch();
         let upgrades_supported = client.protocol().upgrade_protocol
-            == Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION);
+            == Some(tickloop_agent_access::RUNTIME_HANDOFF_VERSION);
         let view = ViewRef {
             session_id: client.session_id(),
             view_id: tickloop_ids::generate(),
@@ -717,7 +723,7 @@ impl ConsoleExecution {
         root: PathBuf,
         model: ModelConfig,
         client: Arc<dyn tickloop_agent_model::ModelClient>,
-    ) -> Result<Self, AccessError> {
+    ) -> Result<Self, tickloop_agent_runtime::AgentError> {
         let core =
             tickloop_agent_runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
         core.install_own_tickhost();
@@ -2191,8 +2197,9 @@ impl ConsoleExecution {
             return Ok(false);
         };
         let save = |write: &dyn Fn(
-            &tickloop_agent_config::UserSettings,
-        ) -> Result<(), tickloop_agent_config::SettingsError>| {
+            &tickloop_agent_settings::UserSettings,
+        )
+            -> Result<(), tickloop_agent_settings::SettingsError>| {
             write(&settings).map_err(|error| invalid(&error))
         };
         match change {
@@ -2282,7 +2289,7 @@ impl ConsoleExecution {
         let expected = expected.unwrap_or(&revision);
         let changes = match change {
             PermissionChange::UpsertRule { rule } if rule.persistent => {
-                tickloop_agent_config::ProjectRuleChanges {
+                tickloop_agent_settings::ProjectRuleChanges {
                     removed: rules
                         .iter()
                         .filter(|saved| saved.id == rule.id)
@@ -2292,7 +2299,7 @@ impl ConsoleExecution {
                 }
             }
             PermissionChange::RemoveRule { id } if rules.iter().any(|rule| rule.id == *id) => {
-                tickloop_agent_config::ProjectRuleChanges {
+                tickloop_agent_settings::ProjectRuleChanges {
                     removed: std::collections::HashSet::from([*id]),
                     added: Vec::new(),
                 }
@@ -2301,15 +2308,18 @@ impl ConsoleExecution {
         };
         match settings.update_permission_rules_cas(project, expected, [(project, &changes)]) {
             Ok(()) => Ok(RuleSave::Saved),
-            Err(tickloop_agent_config::SettingsError::Conflict) => Ok(RuleSave::Conflict),
+            Err(tickloop_agent_settings::SettingsError::Conflict) => Ok(RuleSave::Conflict),
             Err(error) => Err(invalid(&error)),
         }
     }
     /// Shares the View's settings, so New Agent defaults use its transient Providers and saves.
-    pub(super) fn use_user_settings(&self, settings: Option<tickloop_agent_config::UserSettings>) {
+    pub(super) fn use_user_settings(
+        &self,
+        settings: Option<tickloop_agent_settings::UserSettings>,
+    ) {
         *self.inner.user_settings.lock().unwrap() = settings;
     }
-    fn user_settings(&self) -> Option<tickloop_agent_config::UserSettings> {
+    fn user_settings(&self) -> Option<tickloop_agent_settings::UserSettings> {
         self.inner.user_settings.lock().unwrap().clone()
     }
     /// Later new, dispatched and resumed Agents of this View start with the model last chosen
@@ -2337,7 +2347,7 @@ impl ConsoleExecution {
         let configuration = self.configuration(ConfigTarget::NewDraft).await?;
         let project = rule_project(project)?;
         let storage =
-            |error: tickloop_agent_config::SettingsError| AccessError::storage(error.to_string());
+            |error: tickloop_agent_settings::SettingsError| AccessError::storage(error.to_string());
         let settings = self.user_settings();
         let (saved_rules, warnings, project_revision) = match &settings {
             Some(settings) => settings
@@ -2348,14 +2358,14 @@ impl ConsoleExecution {
         let (auto, auto_revision) = match &settings {
             Some(settings) => settings.auto_settings_with_revision().map_err(storage)?,
             None => (
-                tickloop_agent_config::AutoSettings::default(),
-                tickloop_agent_config::empty_auto_settings_revision(),
+                tickloop_agent_settings::AutoSettings::default(),
+                tickloop_agent_settings::empty_auto_settings_revision(),
             ),
         };
         let jev_key_status = jev_key_status_in(
             settings
                 .as_ref()
-                .and_then(tickloop_agent_config::UserSettings::root),
+                .and_then(tickloop_agent_settings::UserSettings::root),
         )
         .map_err(|error| AccessError::storage(error.to_string()))?;
         let rules = saved_rules
@@ -2420,9 +2430,9 @@ impl ConsoleExecution {
         }
         let view = &current.content;
         let settings = self.user_settings();
-        let written = |result: Result<_, tickloop_agent_config::SettingsError>| match result {
+        let written = |result: Result<_, tickloop_agent_settings::SettingsError>| match result {
             Ok(_) => Ok(()),
-            Err(tickloop_agent_config::SettingsError::Conflict) => Err(None),
+            Err(tickloop_agent_settings::SettingsError::Conflict) => Err(None),
             Err(error) => Err(Some(AccessError::storage(error.to_string()))),
         };
         let kept = match change {
@@ -2601,14 +2611,14 @@ impl ConsoleExecution {
         name: &str,
         arguments: &str,
     ) -> Result<(), String> {
-        tickloop_agent_config::skills::SkillRegistry::discover(
+        tickloop_agent_settings::skills::SkillRegistry::discover(
             workdir,
             self.inner.launch.config_root.as_deref(),
         )
         .expand(
             name,
             arguments,
-            tickloop_agent_config::skills::SkillCaller::User,
+            tickloop_agent_settings::skills::SkillCaller::User,
         )
         .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
         .map(|_| ())
@@ -2618,7 +2628,7 @@ impl ConsoleExecution {
     fn new_agent_defaults(&self) -> AgentConfiguration {
         let launch = &self.effective_launch();
         let model = tickloop_agent_model::cards::model_for_persistent_selection(
-            tickloop_agent_model::cards::launch_model(launch),
+            tickloop_agent_model::cards::launch_model(launch.model.as_ref()),
         );
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
@@ -3396,7 +3406,7 @@ impl ConsoleExecution {
 
     pub(super) async fn runtime_version(
         &self,
-    ) -> Result<tickloop_agent_protocol::RuntimeVersion, AccessError> {
+    ) -> Result<tickloop_agent_access::RuntimeVersion, AccessError> {
         match self
             .inner
             .access
@@ -4020,7 +4030,7 @@ impl ConsoleExecution {
     pub(super) fn saves_chats(&self) -> bool {
         self.inner.launch.session_persistence
             && self.inner.launch.config_root.as_ref().is_some_and(|root| {
-                !tickloop_agent_config::UserSettings::in_root(root).skips_transcripts()
+                !tickloop_agent_settings::UserSettings::in_root(root).skips_transcripts()
             })
     }
     pub(super) fn user_settings_warnings(&self, chat: Uuid) -> Vec<String> {
@@ -4116,11 +4126,13 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use tickloop_agent_daemon::serve_listener;
     use tickloop_agent_protocol::ToolDefinition;
-    use tickloop_agent_protocol::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
+
+    use tickloop_agent_access::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
+
+    use tickloop_agent_access::test_support::TRANSPORT_LIMITS;
     use tickloop_agent_runtime::host_tools::{
         HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall,
     };
-    use tickloop_agent_test_support::TRANSPORT_LIMITS;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     struct ReadInteractionSource;
@@ -5496,10 +5508,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");
-        let settings = tickloop_agent_config::UserSettings::in_root(&config_root);
+        let settings = tickloop_agent_settings::UserSettings::in_root(&config_root);
         terminal.use_user_settings(Some(settings.clone()));
         let project = directory.path().canonicalize().unwrap();
-        let saved = |settings: &tickloop_agent_config::UserSettings| {
+        let saved = |settings: &tickloop_agent_settings::UserSettings| {
             settings
                 .project_rules_with_revision(&project)
                 .unwrap()
@@ -5564,7 +5576,7 @@ mod tests {
                 &current.project_rules,
                 [(
                     project.as_path(),
-                    &tickloop_agent_config::ProjectRuleChanges {
+                    &tickloop_agent_settings::ProjectRuleChanges {
                         removed: Default::default(),
                         added: vec![elsewhere.clone()],
                     },
@@ -5641,8 +5653,8 @@ mod tests {
         let project = directory.path().canonicalize().unwrap();
         let agent_root = project.join("agent-settings");
         let view_root = project.join("view-settings");
-        let agent_settings = tickloop_agent_config::UserSettings::in_root(&agent_root);
-        let view_settings = tickloop_agent_config::UserSettings::in_root(&view_root);
+        let agent_settings = tickloop_agent_settings::UserSettings::in_root(&agent_root);
+        let view_settings = tickloop_agent_settings::UserSettings::in_root(&view_root);
         agent_settings.save_task_tools_enabled(false).unwrap();
         view_settings.save_task_tools_enabled(true).unwrap();
         let model = tickloop_agent_test_support::config();
@@ -5754,7 +5766,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");
-        terminal.use_user_settings(Some(tickloop_agent_config::UserSettings::in_root(
+        terminal.use_user_settings(Some(tickloop_agent_settings::UserSettings::in_root(
             &config_root,
         )));
         let initial_model = terminal.launch_spec().model.unwrap().model;

@@ -2,18 +2,21 @@ use std::{io::Cursor as IoCursor, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AccessLimits, AgentAccess, AgentCommand, AgentDetailQuery,
+    AgentFilter, CommandEnvelope, CommandResult, ExecutionRef, HistoryAction, LaunchSpec,
+    Observation, ObservationChange, ObservationRequest, ObservationValue, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR, Page, ProtocolLimits, ReceiptState, UserInput,
+};
 use tickloop_agent_base::image::{MAX_BASE64_BYTES, prepare};
 use tickloop_agent_client::LocalAgentClient;
 use tickloop_agent_daemon::{EmbeddedAgentAccess, serve_listener};
 use tickloop_agent_model::*;
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AccessLimits, AgentAccess, AgentCommand, AgentDetailQuery,
-    AgentFilter, CommandEnvelope, CommandResult, Content, EventKind, ExecutionRef, HistoryAction,
-    Image, ImageContext, ImageOrigin, ImageSource, InputContext, LaunchSpec, ModelIdentity,
-    ModelProvider, Observation, ObservationChange, ObservationRequest, ObservationValue,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, Protocol, ProtocolLimits, ReceiptState, RewindMode, Role,
-    Usage, UserInput,
+    Content, EventKind, Image, ImageContext, ImageOrigin, ImageSource, InputContext, ModelIdentity,
+    ModelProvider, Protocol, RewindMode, Role, Usage,
 };
+
 use tickloop_agent_runtime::Agent;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -252,7 +255,7 @@ async fn fault_proxy(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_rewind_bytes() {
     repeated_legal_images_case(
-        tickloop_agent_test_support::TRANSPORT_LIMITS,
+        tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         legal_image(40_000),
         3,
         1,
@@ -498,7 +501,7 @@ async fn repeated_legal_images_case(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
-    let limits = tickloop_agent_test_support::TRANSPORT_LIMITS;
+    let limits = tickloop_agent_access::test_support::TRANSPORT_LIMITS;
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     // Each prompt fits one request frame; the history holding two of them does not.
     let prompt = format!(
@@ -636,7 +639,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
 
 #[tokio::test]
 async fn a_response_with_a_gap_or_an_incomplete_end_never_becomes_an_observation() {
-    let limits = tickloop_agent_test_support::TRANSPORT_LIMITS;
+    let limits = tickloop_agent_access::test_support::TRANSPORT_LIMITS;
     let total_bytes = limits.frame_bytes() + 1;
     for incomplete_end in [false, true] {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();

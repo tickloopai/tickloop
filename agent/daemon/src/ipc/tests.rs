@@ -11,20 +11,22 @@ use uuid::Uuid;
 use super::server::{
     ObservationTestHooks, serve_connection, serve_connection_mode, serve_listener,
 };
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AccessLimits, AgentAccess, AgentCommand, AgentDetailQuery,
+    AgentFilter, ChunkedResponseKind, ClientMessage, CommandEnvelope, CommandReceipt, Cursor,
+    DisplayReceipt, DisplayUpdate, ExecutionRef, FEED_CAPACITY, FEED_CHANGE_BYTES,
+    HANDSHAKE_FRAME_BYTES, Observation, ObservationChange, ObservationRequest, ObservationUpdate,
+    ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, ProtocolLimits, RecordedMessage,
+    RecordedTranscript, ServerHello, ServerMessage, TranscriptRef,
+};
 use tickloop_agent_client::{
     LocalAgentClient,
     frame::{read_frame, write_frame},
     negotiate,
 };
-use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AccessLimits, AgentAccess, AgentCommand, AgentDetailQuery,
-    AgentFilter, ChunkedResponseKind, ClientMessage, CommandEnvelope, CommandReceipt, Cursor,
-    DisplayReceipt, DisplayUpdate, Event, EventKind, ExecutionRef, FEED_CAPACITY,
-    FEED_CHANGE_BYTES, HANDSHAKE_FRAME_BYTES, Observation, ObservationChange, ObservationRequest,
-    ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, ProtocolLimits,
-    RecordedMessage, RecordedTranscript, ServerHello, ServerMessage, TranscriptRef,
-};
-use tickloop_agent_test_support::TRANSPORT_LIMITS;
+use tickloop_agent_protocol::{Event, EventKind};
+
+use tickloop_agent_access::test_support::TRANSPORT_LIMITS;
 
 const FRAME_BYTES: usize = TRANSPORT_LIMITS.frame_bytes();
 /// Backpressure needs a request larger than any kernel socket buffer, so these peers keep the

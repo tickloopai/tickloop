@@ -6,6 +6,7 @@ use std::{
     },
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -846,7 +847,7 @@ async fn search_selection_is_account_independent_and_persists_for_new_agents() {
     use tickloop_agent_protocol::SearchProviderKind;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(&root);
+    let settings = tickloop_agent_settings::UserSettings::in_root(&root);
     let agent = Agent::new_with_user_settings_embedded(
         config(),
         WebModel::new(Vec::new(), PageAnswer::Text("unused")),

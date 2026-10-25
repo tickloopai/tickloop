@@ -1,13 +1,15 @@
+use tickloop_agent_access::AgentAccess;
 use tickloop_agent_model::cards::ModelCatalog;
-use tickloop_agent_protocol::AgentAccess;
 
 #[tokio::test]
 async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
     use std::sync::Arc;
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentCommand, CommandEnvelope, CommandResult, ConfigurationChange, LaunchSpec,
     };
+
     use tickloop_agent_runtime::Agent;
     use uuid::Uuid;
     let directory = tempfile::tempdir().unwrap();

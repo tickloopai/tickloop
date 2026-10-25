@@ -1,5 +1,6 @@
 use super::*;
-use tickloop_agent_protocol::{AgentAccess, LoopAction};
+
+use tickloop_agent_access::{AgentAccess, LoopAction};
 
 const REPLY: &str = "REPLY-COMMITTED-WITHOUT-NEWLINE";
 const BATCH_PROMPT: &str = "Visibility batch probe";

@@ -136,7 +136,7 @@ impl Agent {
                     .expand(
                         "tickloop",
                         "",
-                        tickloop_agent_config::skills::SkillCaller::Model,
+                        tickloop_agent_policy::skills::SkillCaller::Model,
                     )
                     .and_then(InvokedSkill::try_from)
                     .map_err(|error| AgentError::Invalid(error.to_string()))?;

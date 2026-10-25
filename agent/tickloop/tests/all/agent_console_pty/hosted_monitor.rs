@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_agent_protocol::AgentAccess;
+use tickloop_agent_access::AgentAccess;
 use tickloop_agent_test_support::kitty_keyboard::{DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard};
 use tickloop_agent_test_support::screen::SELECTED_MARK;
 
@@ -203,9 +203,7 @@ async fn hosted_members(
             match result {
                 Ok(CommandResult::HostedTicks(members)) => break members,
                 // The last Tick ending can close the host while a read-only listing is in flight.
-                Err(error)
-                    if error.code == tickloop_agent_protocol::AccessErrorCode::Unavailable =>
-                {
+                Err(error) if error.code == tickloop_agent_access::AccessErrorCode::Unavailable => {
                     last_error = Some(error);
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -800,8 +798,8 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
     let fixture = PrivateFixture::new();
     let socket = herdr.socket();
     let result = AssertUnwindSafe(async {
-        tickloop_agent_config::UserSettings::in_root(&fixture.path("config"))
-            .save_monitor_popup(tickloop_agent_config::MonitorPopup::Disabled)
+        tickloop_agent_settings::UserSettings::in_root(&fixture.path("config"))
+            .save_monitor_popup(tickloop_agent_settings::MonitorPopup::Disabled)
             .unwrap();
         let mut view = view_with_keys_ticks(
             &fixture,

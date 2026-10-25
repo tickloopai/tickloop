@@ -4,6 +4,7 @@ use tickloop_agent_protocol::{
     PermissionScope, QuestionAnswer, Receipt, Role,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::*;
 use tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME;
 use tokio::sync::broadcast::Receiver;

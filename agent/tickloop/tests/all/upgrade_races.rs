@@ -12,12 +12,13 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
-use tickloop_agent_protocol::{
-    AgentAccess, AgentCommand, AgentDetailQuery, CommandResult, EnvironmentValue, ExecutionMode,
-    ExecutionRef, LaunchSpec, LoopAction, ObservationRequest, ObservationValue, PendingInput,
-    PromptPolicy, Receipt, TriggerSource, UserInput,
+use tickloop_agent_access::{
+    AgentAccess, AgentCommand, AgentDetailQuery, CommandResult, EnvironmentValue, ExecutionRef,
+    LaunchSpec, LoopAction, ObservationRequest, ObservationValue, UserInput,
 };
+use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
+use tickloop_agent_protocol::{ExecutionMode, PendingInput, PromptPolicy, Receipt, TriggerSource};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -69,7 +70,7 @@ impl Scenario {
         let old_executable = copy_bundle(&source, &bundles.path().join("old"));
         let new_executable = copy_bundle(&source, &bundles.path().join("new"));
         let config_root = runtime.config_root().to_path_buf();
-        tickloop_agent_config::UserSettings::in_root(&config_root)
+        tickloop_agent_settings::UserSettings::in_root(&config_root)
             .trust_working_directory(workdir.path())
             .unwrap();
         let transport_path = workdir.path().join("transport.json");

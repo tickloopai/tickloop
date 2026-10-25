@@ -3,6 +3,7 @@
 //! used each instance with a tool.
 
 use std::{sync::Arc, time::Duration};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};

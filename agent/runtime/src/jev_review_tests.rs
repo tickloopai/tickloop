@@ -57,7 +57,7 @@ fn review_request(
         None,
         None,
         snapshot.folder.as_deref().unwrap(),
-        tickloop_agent_config::AutoSettings::default().policy(),
+        tickloop_agent_policy::AutoSettings::default().policy(),
     )
     .map_err(|_| AutoReview::Ask {
         diagnostics: Vec::new(),
@@ -81,7 +81,7 @@ fn one_overall_decision_replaces_the_per_rule_questionnaire() {
             .as_array()
             .unwrap()
             .len(),
-        tickloop_agent_config::AutoSettings::default()
+        tickloop_agent_policy::AutoSettings::default()
             .policy()
             .rules
             .len()
@@ -238,7 +238,7 @@ fn selected_overall_decision_has_no_per_rule_confidence_gate() {
     assert_eq!(
         verdict(
             &result,
-            &tickloop_agent_config::AutoSettings::default().policy()
+            &tickloop_agent_policy::AutoSettings::default().policy()
         ),
         Ok(RuleVerdict::Allow)
     );
@@ -249,7 +249,7 @@ fn block_categories_preserve_hard_and_user_boundaries_without_fabricated_finding
     let (snapshot, bookkeeping, operation) =
         scenario("Inspect the project", "env sh -c 'printf ok'");
     let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
-    let policy = tickloop_agent_config::AutoSettings::default().policy();
+    let policy = tickloop_agent_policy::AutoSettings::default().policy();
     for (choice, expected) in [
         (
             "block_soft",
@@ -284,7 +284,7 @@ fn both_reviewers_receive_identical_state_and_policy_guidance() {
         None,
         None,
         snapshot.folder.as_deref().unwrap(),
-        tickloop_agent_config::AutoSettings::default().policy(),
+        tickloop_agent_policy::AutoSettings::default().policy(),
     )
     .unwrap();
     let llm = crate::auto_mode::classifier_request(
@@ -335,7 +335,7 @@ fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
             None,
             None,
             snapshot.folder.as_deref().unwrap(),
-            tickloop_agent_config::AutoSettings::default().policy(),
+            tickloop_agent_policy::AutoSettings::default().policy(),
         )
         .unwrap();
         let evidence =
@@ -488,7 +488,7 @@ async fn live_jev_review_scenarios() {
             println!("{id}: invalid evaluation, no semantic decision: {error}");
             continue;
         }
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         let decision = verdict(&evaluation, &policy).unwrap();
         println!(
             "{id}: {decision:?}; model={}; usage={:?}",
@@ -540,7 +540,7 @@ async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
         None,
         None,
         snapshot.folder.as_deref().unwrap(),
-        tickloop_agent_config::AutoSettings::default().policy(),
+        tickloop_agent_policy::AutoSettings::default().policy(),
     )
     .unwrap();
     context.auto_policy.rules.clear();

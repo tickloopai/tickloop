@@ -1,4 +1,5 @@
 use crate::support;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use std::sync::Arc;
 

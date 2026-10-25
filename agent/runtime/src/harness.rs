@@ -35,8 +35,10 @@ pub struct HarnessSeams {
 pub struct HarnessOptions {
     /// The model new Chats use.
     pub model: ModelConfig,
-    /// The user's settings file; `None` reads and writes no settings.
-    pub settings: Option<tickloop_agent_config::UserSettings>,
+    /// The host's Settings Store; `None` reads and writes no settings.
+    pub settings: Option<Arc<dyn tickloop_agent_policy::settings::SettingsStore>>,
+    /// Local credential and output storage, independent of the Settings Store.
+    pub local_state_root: Option<std::path::PathBuf>,
     /// The initial search configuration of every new or restored Chat. Fixed defaults are
     /// reapplied on restore; `set_search` can still change an individual loaded Chat.
     pub search: SearchDefaults,
@@ -45,8 +47,8 @@ pub struct HarnessOptions {
     /// Permission rules the host imposes on every Chat, at the level of session rules and never
     /// saved.
     pub host_rules: Vec<PermissionRule>,
-    /// Task tools when no settings file is supplied; `None` defaults to off.
-    /// A settings file takes precedence over this host value.
+    /// Task tools when no Settings Store is supplied; `None` defaults to off.
+    /// A Settings Store takes precedence over this host value.
     pub task_tools: Option<bool>,
     pub waits: WaitHosting,
     pub citation_style: CitationStyle,
@@ -79,6 +81,7 @@ impl HarnessOptions {
         Self {
             model,
             settings: None,
+            local_state_root: None,
             search: SearchDefaults::default(),
             host: AgentHostOptions::embedded_defaults(),
             tools: ToolPolicy::local(),
@@ -386,11 +389,6 @@ impl Agent {
             tickloop_agent_tools::web_search::validate_config(config)
                 .map_err(AgentError::Invalid)?;
         }
-        if seams.environment.is_none() && options.settings.is_some() {
-            return Err(AgentError::Invalid(
-                "Chats without a Folder read no local user settings".into(),
-            ));
-        }
         if let Some(reason) = invalid_composition(seams.environment.is_some(), &options) {
             return Err(AgentError::Invalid(reason.into()));
         }
@@ -403,7 +401,7 @@ impl Agent {
         let saves_transcripts = options
             .settings
             .as_ref()
-            .is_none_or(|settings| !settings.skips_transcripts());
+            .is_none_or(|settings| !settings.read(None).skips_transcripts);
         let recorder = seams
             .transcripts
             .filter(|_| saves_transcripts)

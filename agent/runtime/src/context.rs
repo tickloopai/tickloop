@@ -865,7 +865,7 @@ mod tests {
         let original = catalog.get("deepseek-api", "deepseek-flash").unwrap();
         let replacement = catalog.get("openai-api", "gpt-6-luna").unwrap();
         let store = crate::transcript::JsonlTranscriptStore::open(root.clone()).unwrap();
-        let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+        let settings = tickloop_agent_settings::UserSettings::in_root(store.root());
         let agent = Agent::with_seams(
             crate::HarnessSeams {
                 transcripts: Some(Arc::new(store)),
@@ -875,7 +875,8 @@ mod tests {
             crate::HarnessOptions {
                 search: Default::default(),
                 model: original,
-                settings: Some(settings),
+                local_state_root: settings.root().map(ToOwned::to_owned),
+                settings: Some(std::sync::Arc::new(settings)),
                 host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
                 tools: crate::ToolPolicy::local(),
                 host_rules: Vec::new(),

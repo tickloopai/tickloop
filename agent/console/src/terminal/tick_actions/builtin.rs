@@ -310,7 +310,7 @@ impl NotFloated {
 struct HerdrPopup {
     herdr: crate::terminal::popup::HerdrSession,
     plugin: crate::terminal::popup::PopupPlugin,
-    settings: tickloop_agent_config::UserSettings,
+    settings: tickloop_agent_settings::UserSettings,
 }
 
 impl HerdrPopup {
@@ -330,7 +330,7 @@ impl HerdrPopup {
                 .await
                 .map_err(|_| NotFloated::Unavailable)?,
             plugin: PopupPlugin::for_this_executable(root).map_err(|_| NotFloated::Unavailable)?,
-            settings: tickloop_agent_config::UserSettings::in_root(root),
+            settings: tickloop_agent_settings::UserSettings::in_root(root),
         }))
     }
 
@@ -341,7 +341,7 @@ impl HerdrPopup {
             .console
             .monitor_popup()
             .map_err(|_| NotFloated::Unavailable)?
-            == tickloop_agent_config::MonitorPopup::Disabled
+            == tickloop_agent_settings::MonitorPopup::Disabled
         {
             return Err(NotFloated::TurnedOff);
         }
@@ -368,7 +368,7 @@ impl HerdrPopup {
             .await
             .map_err(NotFloated::RegistrationFailed)?;
         ctx.console
-            .set_monitor_popup(tickloop_agent_config::MonitorPopup::Enabled)
+            .set_monitor_popup(tickloop_agent_settings::MonitorPopup::Enabled)
             .map_err(NotFloated::RegistrationFailed)
     }
 

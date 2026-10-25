@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use tickloop_agent_config::{AutoSettings, SettingsError};
+use tickloop_agent_policy::AutoSettings;
+use tickloop_agent_policy::settings::{SettingsStoreError, SettingsUpdate};
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
 use super::{Agent, AgentError, ChatBookkeeping, require_folder};
@@ -241,13 +242,16 @@ impl Agent {
                 })?;
                 let expected_auto = expected_revision.auto_settings().clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    settings.update_auto_reviewer_cas(&expected_auto, reviewer)
+                    settings.write(SettingsUpdate::AutoReviewer {
+                        expected: expected_auto,
+                        reviewer,
+                    })
                 })
                 .await
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
                 match result {
                     Ok(_) => {}
-                    Err(SettingsError::Conflict) => {
+                    Err(SettingsStoreError::Conflict) => {
                         let latest = self.permissions_view_locked(chat_id).await?;
                         return Err(PermissionChangeError::Conflict {
                             latest: Box::new(latest),
@@ -266,13 +270,16 @@ impl Agent {
                 })?;
                 let expected_auto = expected_revision.auto_settings().clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    settings.update_auto_rules_cas(&expected_auto, &rules)
+                    settings.write(SettingsUpdate::AutoRules {
+                        expected: expected_auto,
+                        rules,
+                    })
                 })
                 .await
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
                 match result {
                     Ok(_) => {}
-                    Err(SettingsError::Conflict) => {
+                    Err(SettingsStoreError::Conflict) => {
                         let latest = self.permissions_view_locked(chat_id).await?;
                         return Err(PermissionChangeError::Conflict {
                             latest: Box::new(latest),
@@ -312,19 +319,14 @@ impl Agent {
                 let project_revision = expected.project_rules().to_owned();
                 let changes_for_write = changes.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    settings.update_permission_rules_cas(
-                        &workdir,
-                        &project_revision,
-                        changes_for_write
-                            .iter()
-                            .map(|(path, change)| (path.as_path(), change)),
-                    )
+                    settings
+                        .write_permissions(&changes_for_write, Some((&workdir, &project_revision)))
                 })
                 .await
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
                 match result {
                     Ok(()) => {}
-                    Err(SettingsError::Conflict) => {
+                    Err(SettingsStoreError::Conflict) => {
                         drop(chats);
                         let latest = self.permissions_view_locked(chat_id).await?;
                         return Err(PermissionChangeError::Conflict {
@@ -352,12 +354,10 @@ impl Agent {
             return Ok((None, Vec::new(), String::new()));
         };
         let project = project.to_path_buf();
-        let (rules, warnings, revision) =
-            tokio::task::spawn_blocking(move || settings.project_rules_with_revision(&project))
-                .await
-                .map_err(|error| AgentError::Storage(error.to_string()))?
-                .map_err(|error| AgentError::Storage(error.to_string()))?;
-        Ok((Some(rules), warnings, revision))
+        let project = tokio::task::spawn_blocking(move || settings.read(Some(&project)).project)
+            .await
+            .map_err(|error| AgentError::Storage(error.to_string()))?;
+        Ok((Some(project.rules), project.warnings, project.revision))
     }
 }
 

@@ -33,7 +33,7 @@ fn config() -> ModelConfig {
 /// `Agent::open_embedded` on `state` whose model switches get the client the test chooses.
 fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
     let store = crate::transcript::JsonlTranscriptStore::open(state.to_path_buf()).unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+    let settings = tickloop_agent_settings::UserSettings::in_root(store.root());
     Agent::with_seams(
         crate::HarnessSeams {
             transcripts: Some(Arc::new(store)),
@@ -41,7 +41,8 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             models,
         },
         crate::HarnessOptions {
-            settings: Some(settings),
+            local_state_root: settings.root().map(ToOwned::to_owned),
+            settings: Some(std::sync::Arc::new(settings)),
             ..crate::HarnessOptions::local(config())
         },
     )

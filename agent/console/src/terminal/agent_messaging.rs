@@ -6,11 +6,13 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
+use tickloop_agent_access::AgentSummary;
 use tickloop_agent_protocol::{
-    AgentColor, AgentSummary, ChatId, ChatSnapshot, Content, FamilyCompletion, LocalMessage,
-    LoopState, SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SubagentNotificationDelivery,
+    AgentColor, ChatId, ChatSnapshot, Content, FamilyCompletion, LocalMessage, LoopState,
+    SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SubagentNotificationDelivery,
     SubagentReportMessage, VerifiedUserRelay,
 };
+
 use uuid::Uuid;
 
 use super::{

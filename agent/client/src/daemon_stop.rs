@@ -16,7 +16,7 @@ use crate::daemon_endpoint::{
     CONNECT_INTERVAL, LOCK_NAME, SOCKET_NAME, STARTUP_DEADLINE, check_socket_length, validate_file,
 };
 use crate::daemon_management as control;
-use tickloop_agent_protocol::daemon_management::{CONTROL_MAJOR, Reply as DaemonReply, Request};
+use tickloop_agent_access::daemon_management::{CONTROL_MAJOR, Reply as DaemonReply, Request};
 
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
 struct DaemonConnection {

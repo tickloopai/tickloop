@@ -1,4 +1,5 @@
 use std::{fs, path::Path, sync::Arc};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_model::{ModelRequest, cards::model_for_persistent_selection};
