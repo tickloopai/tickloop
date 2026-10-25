@@ -60,7 +60,7 @@ jobs:
 
       - name: Validate release tag against the workspace version
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tickloop-agent") | .version')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tickloop-code") | .version')
           if ! [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [ "$RELEASE_TAG" != "v$version" ]; then
             echo "::error::Release tag $RELEASE_TAG must be v followed by the workspace version in Cargo.toml ($version)."
             exit 1

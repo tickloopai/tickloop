@@ -13,7 +13,7 @@ trap 'rm -rf "$run_directory"' 0
 trap 'exit 1' 1 2 15
 
 cargo build --locked --target-dir "$target_directory" \
-    -p tickloop-agent --bin tickloop -p tickloop-tickhost --bin tickhost
+    -p tickloop-code --bin tickloop -p tickloop-tickhost --bin tickhost
 mkdir "$bin_directory"
 for program in tickloop tickhost; do
     cp "$target_directory/debug/$program" "$bin_directory/$program"

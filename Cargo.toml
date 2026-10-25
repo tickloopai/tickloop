@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "agent/*",
+    "harness/*", "code/*",
     "tickhost/host", "tickhost/connect",
     "tick/ids", "tick/protocol", "tick/sdk", "tick/packages", "tick/oauth",
     "tick/oauth-test-server", "tick/installer",

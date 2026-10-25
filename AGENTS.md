@@ -7,7 +7,7 @@ Tickloop (tickloop.ai) is a terminal AI agent for code and office work: the `tic
 - Terms follow [CONTEXT.md](./CONTEXT.md); use its names in code, UI and discussion. Internal module boundaries are not product Tick types.
 - When a change conflicts with documented behavior, say so; never change a meaning silently. When documents and source disagree, the source wins.
 - Division of documents: agent instructions live only in AGENTS.md (no CLAUDE.md); CONTEXT.md holds term definitions only; the READMEs describe user-facing usage only.
-- `docs/` (design records `docs/design/`, ADRs `docs/adr/`, `docs/agents/`), `agent/tickloop/README.md` (the agent manual, in Chinese), `.tickloop/skills/` and `.scratch/` are maintainer-local files outside Git. Pointers to them below apply only when they exist; in a contributor's checkout, this file, CONTEXT.md, the READMEs and the source are authoritative. When reading an ADR, check its frontmatter `status` and follow "superseded by" to the ADR that replaces it.
+- `docs/` (design records `docs/design/`, ADRs `docs/adr/`, `docs/agents/`), `code/cli/README.md` (the agent manual, in Chinese), `.tickloop/skills/` and `.scratch/` are maintainer-local files outside Git. Pointers to them below apply only when they exist; in a contributor's checkout, this file, CONTEXT.md, the READMEs and the source are authoritative. When reading an ADR, check its frontmatter `status` and follow "superseded by" to the ADR that replaces it.
 - Maintainer-local supplement: @~/tickloopai/AGENTS.md (ignore when absent).
 
 ## Core behavior
@@ -28,7 +28,7 @@ Tickloop (tickloop.ai) is a terminal AI agent for code and office work: the `tic
 - When adding or changing a model tool, decide its Auto-mode handling at the same time: mark read-only tools `HostToolPermission::ReadOnly`; for tools with side effects, map them against the frozen default policy in `agent/config/src/auto_policy/` (`defaults.json`, plus the README's mapping, "not applicable" list and counts), and add tests so ordinary user requests are not wrongly denied in Auto mode while overreaching operations are still blocked. Read that directory's README first.
 - The names, parameters, behavior and result text of the general tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `TaskStop`, `WebFetch`, `WebSearch`, `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`, `Skill`) are a stable contract; parameters this project adds must be optional.
 - Every tool input schema is a flat object: top-level `type: object` with `properties`. A tool with several forms distinguishes them with an enum field and checks the per-form rules at runtime. Do not use `oneOf`/`anyOf`/`allOf`: GLM and other OpenAI-compatible models emit empty arguments for them.
-- A new model protocol is only a new adapter in `agent/model`; the runtime and tool execution contain no vendor checks. The provider catalog is compiled into the program (`agent/model/src/providers/*.yaml`, registered in `agent/model/src/cards.rs`); read the project Skill `.tickloop/skills/model-integration/` before changing models or provider integrations.
+- A new model protocol is only a new adapter in `harness/model`; the runtime and tool execution contain no vendor checks. The provider catalog is compiled into the program (`harness/model/src/providers/*.yaml`, registered in `harness/model/src/cards.rs`); read the project Skill `.tickloop/skills/model-integration/` before changing models or provider integrations.
 - A subagent's Bash and direct `!` Shell run under the frozen parent permissions, current tightening rules and single-use approval; the cwd is not an OS sandbox. A family shares its own private temporary-result/scratchpad directory; other families get no access, and symlinks escaping it are not allowed either.
 - The system Skill `tickloop` (`agent/config/skills/tickloop/SKILL.md`) must match the actual tools and permissions and describe only capabilities that exist. Each data source's argv belongs in the Skill shipped with its Tick package (`<package>:usage`), never hard-coded in the system Skill.
 
@@ -51,22 +51,22 @@ Each crate's responsibility in brief; dependencies are as declared in each `Carg
 
 | Path | Responsibility |
 | --- | --- |
-| `agent/tickloop/` | The `tickloop` executable: dispatches the Console, `update`, `daemon`, `worker`, `monitor` and `tick` (Tick package commands); end-to-end tests and the `cli_fixture` they call |
-| `agent/console/` | Agent Console: terminal UI, Monitor, `/ticks` panel |
-| `agent/client/` | AgentAccess client: Unix socket, reconnection, finding or starting the local daemon (one daemon per configuration root) |
-| `agent/daemon/` | Daemon and worker processes: AgentAccess server, embedded agent, worker supervision and the hosted control channel |
-| `agent/runtime/` | Harness: Loop, Subagents, Transcript storage and loading, Tick subscription streams, host tools, hosted and MCP |
-| `agent/protocol/` | All of the agent's wire types and the AgentAccess contract (ADR 0022) |
-| `agent/transcript/` | Transcript record format and display projection, for users that do not need the runtime |
-| `agent/model/` | Model clients, provider catalog and login, judgment |
-| `agent/tools/` | Tools, permission rules and file-change records |
+| `code/cli/` | The `tickloop` executable: dispatches the Console, `update`, `daemon`, `worker`, `monitor` and `tick` (Tick package commands); end-to-end tests and the `cli_fixture` they call |
+| `code/console/` | Agent Console: terminal UI, Monitor, `/ticks` panel |
+| `code/client/` | AgentAccess client: Unix socket, reconnection, finding or starting the local daemon (one daemon per configuration root) |
+| `code/daemon/` | Daemon and worker processes: AgentAccess server, embedded agent, worker supervision and the hosted control channel |
+| `harness/runtime/` | Harness: Loop, Subagents, Transcript storage and loading, Tick subscription streams, host tools, hosted and MCP |
+| `harness/protocol/` | All of the agent's wire types and the AgentAccess contract (ADR 0022) |
+| `harness/transcript/` | Transcript record format and display projection, for users that do not need the runtime |
+| `harness/model/` | Model clients, provider catalog and login, judgment |
+| `harness/tools/` | Tools, permission rules and file-change records |
 | `agent/config/` | User settings, Auto policy (`src/auto_policy/`) and the Skill registry (built-in Skills in `skills/`) |
-| `agent/cron/` | Scheduled-task timing: 5-field cron in the caller's time zone, `/loop` intervals, jitter and task ids |
+| `harness/cron/` | Scheduled-task timing: 5-field cron in the caller's time zone, `/loop` intervals, jitter and task ids |
 | `agent/packages/` | Tick marketplace downloads; install, update, uninstall, login and logout shared by `/ticks` and `tickloop tick` |
-| `agent/artifacts/` | Tickloop Artifacts and Accounts client |
-| `agent/updater/` | Versioned-directory installs, update checks and pinned runtime copies |
-| `agent/base/` | Low-level utilities: private files, HTTP policy, images and output styles |
-| `agent/test-support/` | Shared agent test code: ScriptedModel, Transcript Store doubles, a reference stateless host with contract tests, PTY screens, fake HTTP services |
+| `harness/artifacts/` | Tickloop Artifacts and Accounts client |
+| `code/updater/` | Versioned-directory installs, update checks and pinned runtime copies |
+| `harness/base/` | Low-level utilities: private files, HTTP policy, images and output styles |
+| `harness/test-support/` | Shared agent test code: ScriptedModel, Transcript Store doubles, a reference stateless host with contract tests, PTY screens, fake HTTP services |
 | `tickhost/host/` | The `tickhost` executable (crate `tickloop-tickhost`): the hidden `run` service the daemon starts, the hidden `launch` launcher and the public `stop` |
 | `tickhost/connect/` | Tickhost channel and client, per-instance TickSession, launch contract, program resolution on open, Herdr view Pane layout |
 | `tick/protocol/`, `tick/sdk/` | The Tick standard (versions, methods, frames and limits) and its Tick-side implementation; the specification is `tick/protocol/SPECIFICATION.md` |
@@ -82,11 +82,11 @@ Each crate's responsibility in brief; dependencies are as declared in each `Carg
 Dependency boundaries:
 
 - `tick/` and `tickhost/` depend on no `agent/` crate.
-- `agent/console` reaches the agent only through AgentAccess (`agent/client`); runtime, daemon and `tickhost/host` are only its dev-dependencies.
-- `agent/protocol` depends only on `tick/protocol`, `tick/ids` and basic libraries such as serde; `agent/transcript` only on `agent/protocol`, `tick/ids` and basic libraries.
+- `code/console` reaches the agent only through AgentAccess (`code/client`); runtime, daemon and `tickhost/host` are only its dev-dependencies.
+- `harness/protocol` depends only on `tick/protocol`, `tick/ids` and basic libraries such as serde; `harness/transcript` only on `harness/protocol`, `tick/ids` and basic libraries.
 - `tick/ids` depends only on `uuid` and `serde`; every Tickloop ID is generated through it.
 
-Integration seams: the agent's HostToolProvider and TickStreamPort (`agent/runtime`). The runtime registers Tick adapters only for `hosted` and `shell`, each providing a TickStreamPort that observes instances through Tickhost; protocol, terminal and Shell execution happen in Tickhost. Artifacts are not a Tick adapter; @tickloop feedback reaches the Loop through the Artifact Association. Shell approval stays in the Worker, and Tickhost only executes requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. The generic TickCall reads the catalog and then calls; no model tool is generated per instance.
+Integration seams: the agent's HostToolProvider and TickStreamPort (`harness/runtime`). The runtime registers Tick adapters only for `hosted` and `shell`, each providing a TickStreamPort that observes instances through Tickhost; protocol, terminal and Shell execution happen in Tickhost. Artifacts are not a Tick adapter; @tickloop feedback reaches the Loop through the Artifact Association. Shell approval stays in the Worker, and Tickhost only executes requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. The generic TickCall reads the catalog and then calls; no model tool is generated per instance.
 
 ## Read before changing
 
@@ -105,7 +105,7 @@ Integration seams: the agent's HostToolProvider and TickStreamPort (`agent/runti
 | UI style, Theme, Role table, glyphs | `docs/design/ui-theme.md`, `docs/design/agent-ui.md`; ADR 0025 |
 | Image input and model image capabilities (images only, no PDF yet) | `docs/design/image-input.md` |
 | Artifacts client | `docs/design/ai-artifacts.md`; ADR 0031, 0028 |
-| The agent's overall user-facing behavior | `agent/tickloop/README.md` |
+| The agent's overall user-facing behavior | `code/cli/README.md` |
 
 ## Verification and tickets
 

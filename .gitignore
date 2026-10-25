@@ -33,4 +33,4 @@ __pycache__/
 /.tickloop/
 /.env
 .DS_Store
-/agent/tickloop/README.md
+/code/cli/README.md

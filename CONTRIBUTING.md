@@ -63,8 +63,8 @@ It first checks dependency boundaries and the Tick public API, then runs `cargo 
 
 ### Writing tests
 
-- Each crate has at most one integration test binary, `all`: `tests/all.rs` (or `tests/all/main.rs`) plus modules in `tests/all/`. `agent/tickloop` also builds the `cli_fixture` program its tests call.
-- Put tests in the crate that owns the code. Only tests that need the full executable or `cli_fixture` belong in `agent/tickloop/tests`.
+- Each crate has at most one integration test binary, `all`: `tests/all.rs` (or `tests/all/main.rs`) plus modules in `tests/all/`. `code/cli` also builds the `cli_fixture` program its tests call.
+- Put tests in the crate that owns the code. Only tests that need the full executable or `cli_fixture` belong in `code/cli/tests`.
 - Prefer testing from the agent's tools and permissions, and from Tick subscriptions driving the Loop.
 - Protocol tests use real child processes and PTYs. Host tests use controllable adapters and an isolated Herdr.
 - Tests must only clean up resources they created.

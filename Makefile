@@ -20,7 +20,7 @@ DEV_CLOUD_ORIGIN_pre := https://pre.tickloop.ai
 DEV_CLOUD_ORIGIN_dev := $(TICKLOOP_DEV_ARTIFACT_ORIGIN)
 DEV_ENV_IS_KNOWN = $(and $(filter 1,$(words $(ENV))),$(filter $(DEV_ENVIRONMENTS),$(ENV)))
 
-CARGO_PACKAGE := -p tickloop-agent
+CARGO_PACKAGE := -p tickloop-code
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
@@ -42,7 +42,7 @@ build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost --bins
 
 install:
-	cargo install --locked --path agent/tickloop --bins
+	cargo install --locked --path code/cli --bins
 	cargo install --locked --path tickhost/host --bin tickhost
 
 ## Package the Agent and the Tickhost.

@@ -1,7 +1,7 @@
 mod content_identity;
 
 mod release_identity {
-    include!("../../agent/tickloop/build.rs");
+    include!("../../code/cli/build.rs");
 
     pub fn emit() {
         main();

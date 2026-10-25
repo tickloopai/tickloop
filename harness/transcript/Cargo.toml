@@ -1,0 +1,22 @@
+[package]
+name = "tickloop-harness-transcript"
+description = "Transcript record format: Lines, their entries, and the display projection derived from them"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tickloop-harness-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

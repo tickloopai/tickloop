@@ -3,12 +3,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HARNESS_PACKAGES = new Set([
-  "tickloop-harness", "tickloop-agent-runtime", "tickloop-agent-protocol",
-  "tickloop-agent-transcript", "tickloop-agent-model", "tickloop-agent-tools",
-  "tickloop-agent-policy", "tickloop-agent-cron", "tickloop-agent-artifacts",
-  "tickloop-agent-base", "tickloop-agent-test-support",
+  "tickloop-harness", "tickloop-harness-runtime", "tickloop-harness-protocol",
+  "tickloop-harness-transcript", "tickloop-harness-model", "tickloop-harness-tools",
+  "tickloop-harness-policy", "tickloop-harness-cron", "tickloop-harness-artifacts",
+  "tickloop-harness-base", "tickloop-harness-test-support",
 ]);
-const ACCESS_PACKAGES = new Set(["tickloop-agent-access", "tickloop-code-access"]);
+const ACCESS_PACKAGES = new Set(["tickloop-code-access", "tickloop-code-access"]);
 
 export function checkAgentAccessBoundary(metadata) {
   const members = new Set(metadata.workspace_members);

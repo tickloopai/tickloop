@@ -1,0 +1,33 @@
+[package]
+name = "tickloop-harness-test-support"
+description = "Test code shared by the Agent crates' tests: a scripted model, Transcript stores, PTY screens and model HTTP servers"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+regex = "1"
+serde_json = "1"
+# The tests of every Agent crate reach the model's test-only seams through this crate.
+tickloop-harness-model = { path = "../model", features = ["test-support"] }
+tickloop-harness-protocol = { path = "../protocol" }
+# The in-memory Transcript store implements the runtime's TranscriptStore seam.
+tickloop-harness-runtime = { path = "../runtime", features = ["test-support"] }
+tickloop-harness-transcript = { path = "../transcript" }
+tickloop-ids = { path = "../../tick/ids" }
+tickloop-tick-protocol = { path = "../../tick/protocol" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tickloop-harness-artifacts = { path = "../artifacts" }
+tickloop-harness-base = { path = "../base" }

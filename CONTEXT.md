@@ -304,7 +304,7 @@ The open-source library that advances turns per Chat: it runs the Loop, tools an
 _Avoid_: Agent Runtime, engine
 
 **Stateless Host**:
-A Harness host that keeps no Chat state resident in the process (such as Tickloop Cloud): each time it acquires a Chat Lease it advances one turn with a fresh Harness, reading and writing all state through the Transcript Store; the reference implementation and contract tests are in `agent/test-support`.
+A Harness host that keeps no Chat state resident in the process (such as Tickloop Cloud): each time it acquires a Chat Lease it advances one turn with a fresh Harness, reading and writing all state through the Transcript Store; the reference implementation and contract tests are in `harness/test-support`.
 
 **Citation Number**:
 A global number that a WebSearch or WebFetch source receives in the family root Chat's source table, never reordered or reused afterward; a host may use it instead of Markdown hyperlinks for citations.

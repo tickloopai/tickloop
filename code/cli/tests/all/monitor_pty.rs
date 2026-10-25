@@ -1,0 +1,653 @@
+use crate::support;
+use tickloop_code_settings::local_agent::LocalAgent;
+
+use tickloop_harness_test_support::screen;
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde_json::json;
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+const TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_WIDTH: usize = 140;
+const TERMINAL_HEIGHT: usize = 30;
+const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+const CURSOR_VISIBLE: &str = "\x1b[?25h";
+const CURSOR_HIDDEN: &str = "\x1b[?25l";
+
+struct Session {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    output: Arc<Mutex<String>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+impl Session {
+    fn start(
+        directory: &std::path::Path,
+        origin: Option<&str>,
+        bin: Option<&std::path::Path>,
+    ) -> Self {
+        Self::spawn(
+            directory,
+            origin,
+            bin,
+            &["--working-directory-is-trusted", "--no-session-persistence"],
+        )
+    }
+    /// Resumes a saved Chat, so its persisted Monitor membership is what the View shows.
+    fn resume(directory: &std::path::Path, chat: uuid::Uuid) -> Self {
+        Self::spawn(
+            directory,
+            None,
+            None,
+            &[
+                "--working-directory-is-trusted",
+                "--resume",
+                &chat.to_string(),
+            ],
+        )
+    }
+    fn spawn(
+        directory: &std::path::Path,
+        origin: Option<&str>,
+        bin: Option<&std::path::Path>,
+        arguments: &[&str],
+    ) -> Self {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: TERMINAL_HEIGHT as u16,
+                cols: TERMINAL_WIDTH as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        support::cli_runtime::configure_model(&directory.join("state"));
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+        command.cwd(directory);
+        command.args(arguments);
+        command.env("TICKLOOP_CONFIG_DIR", directory.join("state"));
+        support::cli_runtime::adopt(&directory.join("state"));
+        command.env("HERDR_ENV", "0");
+        command.env("TICKLOOP_AGENT_TUI", "fullscreen");
+        if let Some(origin) = origin {
+            command.env("TICKLOOP_ARTIFACT_ORIGIN", origin);
+        }
+        if let Some(bin) = bin {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+            command.env("TICK_TEST_BROWSER_LOG", directory.join("browser.log"));
+        }
+        let child = pty.slave.spawn_command(command).unwrap();
+        let writer = pty.master.take_writer().unwrap();
+        let input = pty.master.try_clone_reader().unwrap();
+        let output = Arc::new(Mutex::new(String::new()));
+        let capture = output.clone();
+        let reader = thread::spawn(move || screen::capture_output(input, capture));
+        drop(pty.slave);
+        Self {
+            child,
+            writer,
+            _master: pty.master,
+            output,
+            reader: Some(reader),
+        }
+    }
+    fn send(&mut self, input: &[u8]) {
+        self.writer.write_all(input).unwrap();
+        self.writer.flush().unwrap();
+    }
+    fn wait(&self, needle: &str) {
+        self.wait_until_shown(needle, true);
+    }
+    /// Waits until the Console paints a Shell row's `$` in the update colour, at 256 colours or
+    /// in true colour, which tells an update colour cannot show in the plain frame.
+    fn wait_for_unread_shell(&self) {
+        const UNREAD_SHELL_GLYPHS: [&str; 2] = ["\x1b[38;5;216m$", "\x1b[38;2;255;160;120m$"];
+        let deadline = Instant::now() + TIMEOUT;
+        while !UNREAD_SHELL_GLYPHS
+            .iter()
+            .any(|glyph| self.output.lock().unwrap().contains(glyph))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "PTY never painted the Shell's glyph in the update colour: {}",
+                self.frame()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn wait_without(&self, needle: &str) {
+        self.wait_until_shown(needle, false);
+    }
+    fn wait_until_shown(&self, needle: &str, shown: bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frame = screen::visible_screen(
+                &self.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame.contains(needle) == shown {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY {} {needle:?}: {}",
+                if shown {
+                    "did not display"
+                } else {
+                    "still displays"
+                },
+                frame
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn frame(&self) -> String {
+        screen::visible_screen(
+            &self.output.lock().unwrap(),
+            TERMINAL_WIDTH,
+            TERMINAL_HEIGHT,
+        )
+    }
+    fn wait_for_editor(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let captured = self.output.lock().unwrap().clone();
+            let completed = captured
+                .rfind(COMPLETED_FRAME_END)
+                .map(|end| &captured[..end + COMPLETED_FRAME_END.len()]);
+            let frame = screen::visible_screen(&captured, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+            let editor_has_focus = completed
+                .is_some_and(|output| output.rfind(CURSOR_VISIBLE) > output.rfind(CURSOR_HIDDEN));
+            if editor_has_focus
+                && (frame.contains("⏵⏵ ")
+                    || frame.contains("Triggers paused · send a message to resume"))
+                && frame.lines().any(|line| line.trim() == "❯")
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY editor did not become ready: {frame}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn keep_history_paused(&mut self) {
+        self.wait("Continue Chat?");
+        self.send(b"\x1b");
+        self.wait_without("Continue Chat?");
+        self.wait("Triggers paused · send a message to resume");
+        self.wait_for_editor();
+    }
+    fn exit(&mut self) {
+        self.wait_for_editor();
+        self.send(b"/exit\r\r");
+        let deadline = Instant::now() + TIMEOUT;
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "PTY did not exit: {}",
+                screen::visible_screen(
+                    &self.output.lock().unwrap(),
+                    TERMINAL_WIDTH,
+                    TERMINAL_HEIGHT
+                )
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[test]
+fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::start(directory.path(), None, None);
+    session.wait_for_editor();
+    assert!(!session.output.lock().unwrap().contains("Monitor 0"));
+    session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
+    session.wait("Shell running · ctrl+b background");
+    session.send(b"\x02");
+    session.wait("Shells (1)");
+    assert!(
+        session
+            .frame()
+            .lines()
+            .next()
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .1
+            .trim()
+            == "Shells (1)",
+        "{}",
+        session.frame()
+    );
+    std::fs::write(directory.path().join("finish"), "").unwrap();
+    // A clean exit adds no words or time to the row; its unread end colours its glyph.
+    session.wait_for_unread_shell();
+    assert!(!session.frame().contains("exit 0"), "{}", session.frame());
+    session.send(b"\x1b[C\x18");
+    session.wait("Press ctrl+x again to remove");
+    assert!(session.frame().contains("Shells (1)"));
+    session.send(b"\x18");
+    session.wait_without("Shells (1)");
+    // The emptied column stays, so the conversation keeps its width; /monitor hides it.
+    session.wait("Nothing to monitor");
+    session.wait_for_editor();
+    session.send(b"/monitor\r\r");
+    let settings_path = directory.path().join("state/settings.json");
+    let deadline = Instant::now() + TIMEOUT;
+    while !settings_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "Tick preference was not saved: {}",
+            session.output.lock().unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    session.exit();
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("state/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["monitor"], "hidden");
+}
+
+#[test]
+fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let endpoint = origin.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_server = stop.clone();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let server = thread::spawn(move || {
+        while !stop_server.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok((mut socket, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.trim().is_empty() {
+                    break;
+                }
+                if let Some(length) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; content_length];
+            std::io::Read::read_exact(&mut reader, &mut request_body).unwrap();
+            drop(reader);
+            let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
+            let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
+            let body = if request
+                .starts_with("GET /.well-known/oauth-authorization-server/account ")
+            {
+                json!({"issuer":format!("{endpoint}/account"),"token_endpoint":format!("{endpoint}/account/token"),"device_authorization_endpoint":format!("{endpoint}/account/device"),"userinfo_endpoint":format!("{endpoint}/account/userinfo"),"revocation_endpoint":format!("{endpoint}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+            } else if request.starts_with("POST /account/device ") {
+                json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/account/device?code=ABCD"),"expires_in":60,"interval":1})
+            } else if request.starts_with("POST /account/token ") {
+                json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"refresh_token":"fixture-refresh"})
+            } else if request.starts_with("GET /account/userinfo ") {
+                json!({"sub":user["id"],"name":user["name"],"email":user["email"]})
+            } else if request.starts_with("GET /artifact/api/v1/artifacts/pinned ") {
+                json!({"artifacts":[],"next_cursor":null})
+            } else if request.starts_with("GET /artifact/api/v1/artifacts?") {
+                json!({"artifacts":[artifact],"next_cursor":null})
+            } else if request.starts_with(&format!("PUT /artifact/api/v1/agent/links/{id} ")) {
+                let link: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
+                json!({"artifact_id":id,"binding_id":link["binding_id"],"epoch":1})
+            } else if request.starts_with("GET /artifact/api/v1/agent/feedback?") {
+                json!({"items":[],"next_cursor":null})
+            } else {
+                artifact
+            };
+            let body = body.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+    });
+    let result = std::panic::catch_unwind(|| {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let browser = bin.join(if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        });
+        std::fs::write(
+            &browser,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$TICK_TEST_BROWSER_LOG\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut session = Session::start(directory.path(), Some(&origin), Some(&bin));
+        session.wait_for_editor();
+        session.send(b"/artifacts\r");
+        session.wait("ABCD");
+        session.wait("[All]");
+        session.wait("PTY Research");
+        session.send(b"\r");
+        session.wait("Receive feedback");
+        session.send(b"\r");
+        session.wait("Artifacts (1)");
+        session.wait("Monitor 1");
+        let focus_deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frame = screen::visible_screen_with_selection(
+                &session.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame
+                .lines()
+                .filter_map(|line| line.split_once('│').map(|(_, monitor)| monitor))
+                .any(|monitor| {
+                    monitor.contains(screen::SELECTED_MARK) && monitor.contains("PTY Research")
+                })
+                && frame
+                    .lines()
+                    .last()
+                    .is_some_and(|hints| hints.contains("enter open"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < focus_deadline,
+                "added artifact must receive Monitor focus before opening: {frame}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.send(b"\r");
+        let deadline = Instant::now() + TIMEOUT;
+        let log = directory.path().join("browser.log");
+        while !log.exists() {
+            assert!(Instant::now() < deadline, "substitute browser not invoked");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().trim(),
+            "https://docs.example/a/test"
+        );
+        session.wait("ctrl+x unlink");
+        session.send(b"\x18");
+        session.wait("Press ctrl+x again to unlink");
+        assert!(session.frame().contains("PTY Research"));
+        session.send(b"\x18");
+        session.wait("Nothing to monitor");
+        assert!(!session.frame().contains("Artifact unlinked"));
+        session.exit();
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_pty() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_harness_runtime::Agent::open_embedded(
+                workdir.join("state"),
+                tickloop_harness_test_support::config(),
+                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            agent
+                .record_reopened_tick(
+                    chat,
+                    &"calendar:pty-lost".parse().unwrap(),
+                    "calendar:pty-member".parse().unwrap(),
+                )
+                .await
+                .unwrap();
+            agent.shutdown().await;
+            chat
+        });
+
+    let mut session = Session::resume(&workdir, chat.into());
+    session.keep_history_paused();
+    session.wait("Monitor 1");
+    session.wait("calendar:pty-member");
+    session.send(b"jk");
+    session.wait("❯\u{a0}jk");
+    assert!(
+        session.frame().contains("calendar:pty-member"),
+        "typing j/k edits the input while Monitor is not focused"
+    );
+    session.send(b"\x7f\x7f");
+    session.wait_without("❯\u{a0}jk");
+    session.send(b"\x1b[C");
+    session.wait("enter details · ctrl+x remove · s subscriptions · esc input");
+    session.send(b"\r");
+    session.wait("Owner     this Chat");
+    session.wait("Resources unavailable");
+    session.send(b"\x1b");
+    session.wait_without("Owner     this Chat");
+    session.send(b"\x18");
+    session.wait("Press ctrl+x again to remove");
+    assert!(session.frame().contains("calendar:pty-member"));
+    session.send(b"\x1b[B");
+    session.wait_without("Press ctrl+x again");
+    session.send(b"\x18");
+    session.wait("Press ctrl+x again to remove");
+    session.wait_without("Press ctrl+x again");
+    assert!(
+        session.frame().contains("calendar:pty-member"),
+        "expiry keeps the row"
+    );
+    session.send(b"\x18");
+    session.wait("Press ctrl+x again to remove");
+    session.send(b"\x18");
+    session.wait_without("calendar:pty-member");
+    session.wait_without("Monitor 1");
+    session.exit();
+    drop(session);
+
+    let mut restarted = Session::resume(&workdir, chat.into());
+    restarted.keep_history_paused();
+    thread::sleep(Duration::from_millis(500));
+    let frame = restarted.frame();
+    assert!(
+        !frame.contains("Monitor 1") && !frame.contains("calendar:pty-member"),
+        "the removal survives a restart: {frame}"
+    );
+    restarted.exit();
+}
+
+#[test]
+fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_in_a_real_pty() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_harness_runtime::Agent::open_embedded(
+                workdir.join("state"),
+                tickloop_harness_test_support::config(),
+                Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
+                    tickloop_harness_test_support::text("Ready"),
+                ])),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            let mut events = agent.subscribe();
+            agent
+                .submit(chat, "Prepare reminders".into())
+                .await
+                .unwrap();
+            loop {
+                match tickloop_harness_test_support::next_event(&mut events)
+                    .await
+                    .kind
+                {
+                    tickloop_harness_protocol::EventKind::Completed { .. } => break,
+                    tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            for prompt in ["First PTY reminder", "Second PTY reminder"] {
+                agent
+                    .schedule_task(
+                        chat,
+                        tickloop_harness_runtime::NewScheduledTask::new("* * * * *", prompt, true),
+                    )
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+            chat
+        });
+    let mut session = Session::resume(&workdir, chat.into());
+    session.keep_history_paused();
+    session.wait("Scheduled (2)");
+    session.send(b"\x1b[C\r");
+    session.wait("Cron: * * * * *");
+    session.send(b"\x18");
+    session.wait("Press ctrl+x again to delete this scheduled task");
+    assert!(session.frame().contains("Cron: * * * * *"));
+    session.send(b"\x18");
+    session.wait("Scheduled (1)");
+    assert!(!session.frame().contains("Scheduled task removed"));
+    session.send(b"\x18");
+    session.wait("Press ctrl+x again to delete this scheduled task");
+    assert!(session.frame().contains("Scheduled (1)"));
+    session.send(b"\x18");
+    session.wait_without("Scheduled (1)");
+    session.wait("Nothing to monitor");
+    session.exit();
+}
+
+#[test]
+fn monitor_keeps_neighbouring_ticks_visible_when_keyboard_navigation_crosses_a_page_in_a_real_pty()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_harness_runtime::Agent::open_embedded(
+                workdir.join("state"),
+                tickloop_harness_test_support::config(),
+                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            for index in 0..140 {
+                agent
+                    .record_reopened_tick(
+                        chat,
+                        &format!("calendar:lost-{index:03}").parse().unwrap(),
+                        format!("calendar:tick-{index:03}").parse().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+            chat
+        });
+    let mut session = Session::resume(&workdir, chat.into());
+    session.keep_history_paused();
+    session.wait("Ticks (140)");
+    assert!(
+        session
+            .frame()
+            .lines()
+            .next()
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .1
+            .trim()
+            .starts_with("Ticks (140)"),
+        "{}",
+        session.frame()
+    );
+    assert!(!session.frame().contains("of 140"));
+    session.send(b"\x1b[C");
+    let wait_selected = |session: &Session, title: &str| {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frame = screen::visible_screen_with_selection(
+                &session.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame
+                .lines()
+                .any(|line| line.contains(title) && line.contains(screen::SELECTED_MARK))
+            {
+                return frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selected {title:?} was not shown: {frame}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_selected(&session, "calendar:tick-000");
+    session.send(&[b'j'; 127]);
+    let before = wait_selected(&session, "calendar:tick-127");
+    assert!(before.contains('┃'), "{before}");
+    session.send(b"j");
+    let after = wait_selected(&session, "calendar:tick-128");
+    assert!(
+        after.contains("calendar:tick-127"),
+        "previous page's last row stays visible: {after}"
+    );
+    session.send(b"k");
+    let returned = wait_selected(&session, "calendar:tick-127");
+    assert!(
+        returned.contains("calendar:tick-128"),
+        "upward navigation preserves the viewport: {returned}"
+    );
+    session.send(b"\x1b");
+    session.exit();
+}

@@ -6,14 +6,14 @@ const response = (status, value) => ({ status, ok: status === 200, json: async (
 
 test("public crate audit rejects private paths, duplicate names and missing launcher files", () => {
   assert.doesNotThrow(() => auditFiles(packageFiles));
-  for (const files of [[...packageFiles, "agent/runtime/src/lib.rs"], [...packageFiles, ".env"], [...packageFiles, "README.md"], packageFiles.filter(file => file !== "src/lib.rs")]) assert.throws(() => auditFiles(files));
+  for (const files of [[...packageFiles, "harness/runtime/src/lib.rs"], [...packageFiles, ".env"], [...packageFiles, "README.md"], packageFiles.filter(file => file !== "src/lib.rs")]) assert.throws(() => auditFiles(files));
 });
 
 test("metadata must describe one dependency-free launcher at the product version", () => {
   const value = { packages: [{ name: "tickloop", version: "0.2.5", dependencies: [], targets: ["tickloop", "tl", "tickhost"].map(name => ({ name, kind: ["bin"] })) }], workspace_members: ["tickloop"] };
   assert.equal(validateMetadata(value, "0.2.5"), "0.2.5");
   assert.throws(() => validateMetadata(value, "0.2.6"));
-  const modified = structuredClone(value); modified.packages[0].dependencies.push({ name: "tickloop-agent-runtime" });
+  const modified = structuredClone(value); modified.packages[0].dependencies.push({ name: "tickloop-harness-runtime" });
   assert.throws(() => validateMetadata(modified, "0.2.5"));
 });
 

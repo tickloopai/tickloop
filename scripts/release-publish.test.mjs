@@ -21,7 +21,7 @@ test("local publishing builds every target the workflow, installer and updater k
   const triples = targets.map(target => target.triple).sort();
   const workflow = read(".github/workflows/release.yml");
   assert.deepEqual([...workflow.matchAll(/- \{ target: ([a-z0-9_-]+), runner:/g)].map(match => match[1]).sort(), triples);
-  for (const path of ["scripts/install.sh", "agent/updater/src/release.rs", "distribution/cargo/build.rs"]) {
+  for (const path of ["scripts/install.sh", "code/updater/src/release.rs", "distribution/cargo/build.rs"]) {
     const source = read(path);
     for (const triple of triples) assert.ok(source.includes(triple), `${path} lacks ${triple}`);
   }

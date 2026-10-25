@@ -1,0 +1,21 @@
+[package]
+name = "tickloop-harness-cron"
+description = "Scheduled task timing: 5-field cron in a caller-given time zone, /loop intervals, jitter and task ids"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+croner = { version = "4", default-features = false, features = ["chrono"] }
+thiserror = "2"
+tickloop-ids = { path = "../../tick/ids" }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+chrono-tz = "0.10"

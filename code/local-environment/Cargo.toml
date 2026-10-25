@@ -1,0 +1,40 @@
+[package]
+name = "tickloop-code-local-environment"
+description = "Tickloop Code local execution adapter"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+jsonschema = { version = "0.56", default-features = false }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tickloop-harness = { path = "../../harness/sdk", features = ["engine"] }
+tickloop-ids = { path = "../../tick/ids" }
+tickloop-tick-protocol = { path = "../../tick/protocol" }
+tickloop-tick-packages = { path = "../../tick/packages" }
+tickloop-tickhost = { path = "../../tickhost/host" }
+tickloop-tickhost-connect = { path = "../../tickhost/connect" }
+
+[dev-dependencies]
+tickloop-harness = { path = "../../harness/sdk", features = ["test-support"] }
+tempfile = "3"
+
+tickloop-code-settings = { path = "../settings", features = ["test-support"] }
+base64 = "0.22"
+percent-encoding = "2"
+serde_yaml_ng = "0.10"
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+

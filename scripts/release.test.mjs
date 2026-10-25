@@ -63,10 +63,10 @@ if [ -n "$RELEASE_TEST_ADD_TAG" ]; then git -C "$RELEASE_TEST_REPO" tag -f "$REL
   for (const name of ["make", "cargo"]) { writeFileSync(join(bin, name), check); chmodSync(join(bin, name), 0o700); }
   git(["init", "--bare", "-q", remote], setup); git(["init", "-q", "-b", "main"], setup);
   git(["config", "user.name", "Release Test"], setup); git(["config", "user.email", "release@example.invalid"], setup);
-  writeFileSync(join(repo, "Cargo.toml"), '[workspace]\nmembers = ["agent/*"]\n\n[workspace.package]\nversion = "0.2.0"\nedition = "2024"\n');
+  writeFileSync(join(repo, "Cargo.toml"), '[workspace]\nmembers = ["harness/*", "code/*"]\n\n[workspace.package]\nversion = "0.2.0"\nedition = "2024"\n');
   const locked = [];
-  for (const name of ["agent", "runtime"]) {
-    const directory = join(repo, "agent", name); mkdirSync(directory, { recursive: true });
+  for (const [name, path] of [["code", "code/cli"], ["harness-runtime", "harness/runtime"]]) {
+    const directory = join(repo, path); mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, "Cargo.toml"), `[package]\nname = "tickloop-${name}"\nversion.workspace = true\n`);
     locked.push(`[[package]]\nname = "tickloop-${name}"\nversion = "0.2.0"\n`);
   }
@@ -246,8 +246,8 @@ test("Cargo version edits leave external dependency versions untouched and enfor
   const changes = versionChanges(setup.repo, [{ ...product, nextVersion: "0.3.0" }]);
   assert.deepEqual([...changes.keys()].sort(), versionPaths);
   assert.match(changes.get("Cargo.lock"), /name = "external"\nversion = "0.2.0"/);
-  assert.match(changes.get("Cargo.lock"), /name = "tickloop-agent"\nversion = "0.3.0"/);
-  assert.match(changes.get("Cargo.lock"), /name = "tickloop-runtime"\nversion = "0.3.0"/);
+  assert.match(changes.get("Cargo.lock"), /name = "tickloop-code"\nversion = "0.3.0"/);
+  assert.match(changes.get("Cargo.lock"), /name = "tickloop-harness-runtime"\nversion = "0.3.0"/);
   assert.equal(nextVersion({ ...product, version: `1.0.${"9".repeat(26)}` }), `1.0.1${"0".repeat(26)}`);
   assert.throws(() => nextVersion({ ...product, version: `1.0.${"9".repeat(27)}` }), /exceeds/);
 });

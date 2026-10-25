@@ -1,0 +1,63 @@
+[package]
+name = "tickloop-harness-runtime"
+description = "Agent runtime: Loops, Subagents, Transcripts, Tick streams and host tools"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+fastrand = "2"
+futures-util = "0.3"
+http = "1"
+iana-time-zone = "0.1"
+icu_normalizer = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+jsonschema = { version = "0.56", default-features = false }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
+rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sse-stream = "0.2.4"
+thiserror = "2"
+tickloop-harness-artifacts = { path = "../artifacts" }
+tickloop-harness-base = { path = "../base" }
+tickloop-harness-policy = { path = "../policy" }
+tickloop-harness-cron = { path = "../cron" }
+tickloop-harness-model = { path = "../model" }
+tickloop-harness-protocol = { path = "../protocol" }
+tickloop-harness-tools = { path = "../tools" }
+tickloop-harness-transcript = { path = "../transcript" }
+tickloop-ids = { path = "../../tick/ids" }
+tickloop-tick-protocol = { path = "../../tick/protocol" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+
+[dev-dependencies]
+tickloop-code-local-environment = { path = "../../code/local-environment" }
+tickloop-code-settings = { path = "../../code/settings", features = ["test-support"] }
+base64 = "0.22"
+percent-encoding = "2"
+serde_yaml_ng = "0.10"
+tempfile = "3"
+tickloop-harness-test-support = { path = "../test-support" }
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[features]
+# Exposes test-only seams (a stand-in Trigger source) to the tests of the Agent crates; never
+# enabled by a build.
+test-support = []
