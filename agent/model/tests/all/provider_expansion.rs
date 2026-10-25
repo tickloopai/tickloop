@@ -65,6 +65,7 @@ fn new_catalogs_are_visible_and_keep_retired_anthropic_cards_resolvable() {
         "kimi-global-api",
         "kimi-code-oauth",
         "alibaba-cn-api",
+        "alibaba-cn-token-plan",
         "anthropic-api",
         "xai-api",
         "xai-oauth",
@@ -300,6 +301,150 @@ async fn qwen_image_schema_uses_prompted_json_and_rejects_tool_calls() {
                 }]
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn token_plan_models_keep_their_model_studio_thinking_and_json_contracts() {
+    for (model, effort, replays_reasoning) in [
+        ("qwen3.8-max", Some(ReasoningEffort::Xhigh), true),
+        ("deepseek-v4-pro", Some(ReasoningEffort::Max), true),
+        ("deepseek-v4.1-flash", Some(ReasoningEffort::Off), true),
+        ("glm-5.3", Some(ReasoningEffort::Low), false),
+    ] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let responses = vec![
+            (
+                200,
+                chat_reply(
+                    json!({"reasoning_content":"original thought","tool_calls":[{"index":0,"id":"echo-1","type":"function","function":{"name":"Echo","arguments":"{}"}}]}),
+                    "tool_calls",
+                ),
+            ),
+            (
+                200,
+                chat_reply(json!({"content":"{\"allow\":false}"}), "stop"),
+            ),
+        ];
+        let (endpoint, mut captured) = model_http_support::serve_responses(responses).await;
+        let mut config = ModelCatalog::defaults()
+            .get("alibaba-cn-token-plan", model)
+            .unwrap();
+        assert_eq!(
+            config.base_url,
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(config.api_key_env, "ALIBABA_TOKEN_PLAN_API_KEY");
+        config.base_url = endpoint;
+        save_api_key(root.path(), &config.api_key_env, "sk-sp-fixture").unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap();
+        let (events, _) = mpsc::unbounded_channel();
+        let first = client
+            .complete(request(effort), events.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let mut next = request(effort);
+        next.messages.push(Message {
+            role: Role::Assistant,
+            content: first.content,
+        });
+        next.history_sources.push(first.private_source);
+        next.messages.push(Message {
+            role: Role::User,
+            content: vec![Content::ToolResult {
+                tool_use_id: "echo-1".into(),
+                content: "done".into(),
+                is_error: false,
+            }],
+        });
+        next.history_sources.push(None);
+        next.structured_output = Some(StructuredOutput {
+            name: "verdict".into(),
+            schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"]}),
+        });
+        client
+            .complete(next, events, CancellationToken::new())
+            .await
+            .unwrap();
+        let (headers, first) = captured.recv().await.unwrap();
+        let (_, second) = captured.recv().await.unwrap();
+        assert!(
+            headers
+                .to_lowercase()
+                .contains("authorization: bearer sk-sp-fixture")
+        );
+        assert_eq!(
+            first["enable_thinking"],
+            effort != Some(ReasoningEffort::Off),
+            "{model}"
+        );
+        match effort {
+            Some(ReasoningEffort::Off) => assert!(first.get("reasoning_effort").is_none()),
+            effort => assert_eq!(
+                first["reasoning_effort"],
+                effort.unwrap().label(),
+                "{model}"
+            ),
+        }
+        assert_eq!(first["max_completion_tokens"], config.max_output_tokens);
+        assert!(first.get("max_tokens").is_none());
+        assert_eq!(
+            first.get("preserve_thinking").is_some(),
+            model.starts_with("qwen"),
+            "{model}"
+        );
+        let replayed = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            replayed.get("reasoning_content").is_some(),
+            replays_reasoning,
+            "{model}"
+        );
+        assert_eq!(
+            second.get("response_format").is_some(),
+            model.starts_with("qwen"),
+            "{model}"
+        );
+        if !model.starts_with("qwen") {
+            assert!(
+                second["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("JSON Schema")
+            );
+        }
+    }
+}
+
+#[test]
+fn token_plan_recommends_the_latest_qwen_flagship_by_default() {
+    assert_eq!(
+        tickloop_agent_model::access::AccessCatalog::defaults()
+            .recommended_model("alibaba-cn-token-plan"),
+        Some("qwen3.8-max")
+    );
+}
+
+#[test]
+fn token_plan_glm_thinking_cannot_be_turned_off() {
+    let config = ModelCatalog::defaults()
+        .get("alibaba-cn-token-plan", "glm-5.3")
+        .unwrap();
+    for effort in [
+        ReasoningEffort::Off,
+        ReasoningEffort::On,
+        ReasoningEffort::Xhigh,
+    ] {
+        assert!(
+            tickloop_agent_model::validate_reasoning_effort(&config, Some(effort)).is_err(),
+            "{effort:?}"
+        );
     }
 }
 

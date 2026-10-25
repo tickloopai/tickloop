@@ -1,0 +1,123 @@
+---
+id: alibaba-cn-token-plan
+display_name: Alibaba Bailian China Token Plan
+connection:
+  vendor: Alibaba Bailian
+  product: Token Plan
+  kind: plan
+  order: 0
+  discovery: unsupported
+  region:
+    name: China
+    order: 0
+auth: api_key_env
+api_key_env: ALIBABA_TOKEN_PLAN_API_KEY
+endpoints:
+  qwen_chat_completions: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+selection:
+  auxiliary_model: qwen3.8-flash
+  notice: "Token Plan uses its own sk-sp- key. Its terms allow only interactive use in coding and agent tools; automated scripts, application backends or unattended batch calls may suspend the subscription or ban the key."
+  series:
+  - id: qwen-max
+    name: Qwen Max
+    model: qwen3.8-max
+    family_order: 0
+    capability_order: 0
+  - id: qwen-plus
+    name: Qwen Plus
+    model: qwen3.7-plus
+    family_order: 0
+    capability_order: 1
+  - id: qwen-flash
+    name: Qwen Flash
+    model: qwen3.8-flash
+    family_order: 0
+    capability_order: 2
+  - id: deepseek-pro
+    name: DeepSeek Pro
+    model: deepseek-v4-pro
+    family_order: 1
+    capability_order: 0
+  - id: deepseek-flash
+    name: DeepSeek Flash
+    model: deepseek-v4.1-flash
+    family_order: 1
+    capability_order: 1
+  - id: glm
+    name: GLM
+    model: glm-5.3
+    family_order: 2
+    capability_order: 0
+models:
+- id: qwen3.7-plus
+  display_name: Qwen3.7-Plus
+  adapter: qwen_chat_completions
+  max_output_tokens: 65536
+  context_window_tokens: 1000000
+  thinking: toggle
+  effort_levels: []
+  input_modalities:
+  - text
+  - image
+- id: qwen3.8-max
+  display_name: Qwen3.8-Max
+  adapter: qwen_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1000000
+  thinking: toggle
+  effort_levels:
+  - low
+  - medium
+  - xhigh
+  input_modalities:
+  - text
+  - image
+- id: qwen3.8-flash
+  display_name: Qwen3.8-Flash
+  adapter: qwen_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1000000
+  thinking: toggle
+  effort_levels:
+  - low
+  - medium
+  - xhigh
+  input_modalities:
+  - text
+  - image
+- id: deepseek-v4-pro
+  display_name: DeepSeek-V4-Pro
+  adapter: qwen_chat_completions
+  max_output_tokens: 393216
+  context_window_tokens: 1000000
+  thinking: toggle
+  effort_levels:
+  - high
+  - max
+  input_modalities:
+  - text
+- id: deepseek-v4.1-flash
+  display_name: DeepSeek-V4.1-Flash
+  adapter: qwen_chat_completions
+  max_output_tokens: 393216
+  context_window_tokens: 1000000
+  thinking: toggle
+  effort_levels:
+  - low
+  - high
+  - max
+  input_modalities:
+  - text
+  - image
+- id: glm-5.3
+  display_name: GLM-5.3
+  adapter: qwen_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1000000
+  thinking: always_on
+  effort_levels:
+  - low
+  - high
+  - max
+  input_modalities:
+  - text

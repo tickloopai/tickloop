@@ -127,7 +127,7 @@ pub(super) fn encode_request(
                 || config.model.starts_with("qwen3.8-flash");
             if preserved {
                 body["preserve_thinking"] = json!(true);
-            } else {
+            } else if !super::qwen_hosts_deepseek(&config.model) {
                 for message in body["messages"].as_array_mut().expect("messages array") {
                     message
                         .as_object_mut()

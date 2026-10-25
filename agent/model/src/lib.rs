@@ -1800,16 +1800,24 @@ pub(crate) fn uses_prompted_structured_output(
         Adapter::DeepseekMessages | Adapter::MinimaxMessages
     ) || config.provider_id == "kimi-code-oauth"
         || config.adapter() == Adapter::KimiChatCompletions && config.model == kimi::CODE_MODEL_ID
+        // Model Studio offers JSON Schema only for Qwen; hosted DeepSeek and GLM lack it.
         || config.adapter() == Adapter::QwenChatCompletions
-            && request
-                .messages
-                .iter()
-                .flat_map(|message| &message.content)
-                .any(|block| match block {
-                    Content::Image { .. } => true,
-                    Content::ToolResult { content, .. } => content.has_images(),
-                    _ => false,
-                })
+            && (!config.model.starts_with("qwen")
+                || request
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| match block {
+                        Content::Image { .. } => true,
+                        Content::ToolResult { content, .. } => content.has_images(),
+                        _ => false,
+                    }))
+}
+
+/// DeepSeek V4 on Alibaba Model Studio has no `preserve_thinking`; like DeepSeek's own API it
+/// keeps the replayed `reasoning_content` of tool-call turns.
+pub(crate) fn qwen_hosts_deepseek(model: &str) -> bool {
+    model.starts_with("deepseek-")
 }
 
 fn finish_structured_response(
@@ -2695,14 +2703,14 @@ mod tests {
         for model in ["deepseek-flash", "deepseek-v4-pro"] {
             let protocols = profiles
                 .iter()
-                .filter(|profile| profile.model == model)
+                .filter(|profile| profile.provider_id == "deepseek-api" && profile.model == model)
                 .map(|profile| profile.protocol)
                 .collect::<Vec<_>>();
             assert_eq!(protocols, [Protocol::ChatCompletions]);
             let legacy_protocols = cards::ModelCatalog::defaults()
                 .profiles()
                 .into_iter()
-                .filter(|profile| profile.model == model)
+                .filter(|profile| profile.provider_id == "deepseek-api" && profile.model == model)
                 .map(|profile| profile.protocol)
                 .collect::<Vec<_>>();
             assert_eq!(legacy_protocols, [Protocol::ChatCompletions]);

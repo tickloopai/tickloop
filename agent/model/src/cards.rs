@@ -69,6 +69,7 @@ impl ModelCatalog {
                     include_str!("providers/kimi-global-api.yaml"),
                     include_str!("providers/kimi-code-oauth.yaml"),
                     include_str!("providers/alibaba-cn-api.yaml"),
+                    include_str!("providers/alibaba-cn-token-plan.yaml"),
                     include_str!("providers/google-gemini-api.yaml"),
                     include_str!("providers/google-gemini-oauth.yaml"),
                     include_str!("providers/google-vertex-service-account.yaml"),
