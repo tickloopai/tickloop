@@ -1,5 +1,8 @@
 //! Every agent/runtime integration test, compiled as one binary.
 
+#[path = "all/execution_environment.rs"]
+mod execution_environment;
+
 #[path = "all/advance.rs"]
 mod advance;
 #[path = "all/agent_approval_routing.rs"]

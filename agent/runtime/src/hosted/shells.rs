@@ -217,6 +217,9 @@ impl ShellGrants for OwnTickhost {
 
 /// The Shell tasks of this Agent that the Tickhost runs, and who grants their spawns and views.
 pub struct ShellTasks {
+    pub(crate) execution_environment:
+        std::sync::Mutex<std::sync::Weak<crate::environment::local_shells::LocalShells>>,
+    available: std::sync::atomic::AtomicBool,
     grants: RwLock<Arc<dyn ShellGrants>>,
     /// The Agent whose Monitors decide how long an ended command stays viewable.
     agent: OnceLock<WeakAgent>,
@@ -226,6 +229,25 @@ pub struct ShellTasks {
 }
 
 impl ShellTasks {
+    pub(crate) fn has_grants(&self) -> bool {
+        self.available.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn start_prepared(
+        self: &Arc<Self>,
+        chat: Uuid,
+        launch: ShellLaunch,
+        environment: Vec<(Vec<u8>, Vec<u8>)>,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+    ) -> Result<Box<dyn ShellProcess>, ShellStartError> {
+        ChatShells {
+            tasks: self.clone(),
+            chat,
+        }
+        .start_with_environment(launch, environment, dispatch)
+        .await
+    }
+
     pub(crate) async fn commit_handoffs(&self) -> Result<(), HostError> {
         let handoffs = std::mem::take(&mut *self.pending_handoffs.lock().await);
         for owner in handoffs {
@@ -234,8 +256,18 @@ impl ShellTasks {
         Ok(())
     }
 
+    pub(crate) fn without_grants() -> Arc<Self> {
+        let tasks = Self::new(Arc::new(NoDaemon));
+        tasks
+            .available
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tasks
+    }
+
     pub fn new(grants: Arc<dyn ShellGrants>) -> Arc<Self> {
         Arc::new(Self {
+            available: std::sync::atomic::AtomicBool::new(true),
+            execution_environment: Default::default(),
             grants: RwLock::new(grants),
             agent: OnceLock::new(),
             pending_handoffs: Mutex::new(Vec::new()),
@@ -299,6 +331,8 @@ impl ShellTasks {
     /// Replaces who grants later spawns and views: a worker's daemon, or a test's own Tickhost.
     pub fn install_grants(&self, grants: Arc<dyn ShellGrants>) {
         *self.grants.write().unwrap_or_else(PoisonError::into_inner) = grants;
+        self.available
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Lets one View of `chat` show its Shell task `instance` once, running or ended.
@@ -319,6 +353,10 @@ impl ShellTasks {
 
     /// The host of `chat`'s commands.
     pub fn for_chat(self: &Arc<Self>, chat: Uuid) -> Arc<dyn ShellHost> {
+        crate::environment::local_shell_host(self.clone(), chat)
+    }
+
+    pub(crate) fn native_for_chat(self: &Arc<Self>, chat: Uuid) -> Arc<dyn ShellHost> {
         Arc::new(ChatShells {
             tasks: self.clone(),
             chat,
@@ -333,7 +371,7 @@ struct ChatShells {
 
 /// The environment commands start with: the worker's own, which is the View environment it was
 /// started with.
-fn launch_environment() -> Vec<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn launch_environment() -> Vec<(Vec<u8>, Vec<u8>)> {
     std::env::vars_os()
         .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
         .collect()
@@ -341,6 +379,9 @@ fn launch_environment() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[async_trait::async_trait]
 impl ShellHost for ChatShells {
+    fn is_available(&self) -> bool {
+        self.tasks.has_grants()
+    }
     async fn retained_handoff(
         &self,
         operation: Uuid,
@@ -373,6 +414,18 @@ impl ShellHost for ChatShells {
     }
 
     async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
+        self.start_with_environment(launch, launch_environment(), None)
+            .await
+    }
+}
+
+impl ChatShells {
+    async fn start_with_environment(
+        &self,
+        launch: ShellLaunch,
+        environment: Vec<(Vec<u8>, Vec<u8>)>,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+    ) -> Result<Box<dyn ShellProcess>, ShellStartError> {
         let refused = |error: HostError| {
             ShellStartError::NotStarted(ToolError::Rejected(format!(
                 "the Tickhost cannot run the command: {error}"
@@ -386,9 +439,9 @@ impl ShellHost for ChatShells {
             cwd,
             directory,
             output,
+            output_path: _,
             cancel,
         } = launch;
-        let environment = launch_environment();
         let issued = self
             .tasks
             .grants()
@@ -414,12 +467,19 @@ impl ShellHost for ChatShells {
             description,
             environment,
         };
-        let submitted = tickhost::shell::submit(
+        let submitted = tickhost::shell::submit_checked(
             &issued.endpoint,
             &issued.grant,
             &request,
             &directory,
             &output,
+            || {
+                dispatch.map_or(Ok(()), |dispatch| {
+                    dispatch
+                        .begin()
+                        .map_err(|error| HostError::before(&error.code, error.message))
+                })
+            },
         )
         .await
         .map_err(|error| {
@@ -440,9 +500,7 @@ impl ShellHost for ChatShells {
             issued.endpoint,
         ))
     }
-}
 
-impl ChatShells {
     fn process(
         &self,
         spawned: tickhost::shell::SpawnedShell,
@@ -547,10 +605,27 @@ impl ShellProcess for TickhostProcess {
     }
 
     async fn stop(&mut self, reason: &str) {
-        // A connection that is gone already stopped the command, and one passed on belongs to a
-        // command that ended.
+        let _ = self.stop_checked(reason, None).await;
+    }
+
+    async fn stop_checked(
+        &mut self,
+        reason: &str,
+        before_dispatch: Option<&tickloop_agent_tools::ShellStopAdmission>,
+    ) -> Result<(), tickloop_agent_tools::ShellStopError> {
         if let Some(stops) = &mut self.stops {
-            let _ = stops.lock().await.stop(reason).await;
+            let mut stops = stops.lock().await;
+            if let Some(admit) = before_dispatch {
+                admit()?;
+            }
+            stops.stop(reason).await.map_err(|error| {
+                if error.dispatched {
+                    tickloop_agent_tools::ShellStopError::OutcomeUnknown(error.to_string())
+                } else {
+                    tickloop_agent_tools::ShellStopError::NotDispatched(error.to_string())
+                }
+            })?;
         }
+        Ok(())
     }
 }

@@ -462,11 +462,12 @@ impl Agent {
         });
         let ids = self.chat_ids(chat_id).await;
         let prepared = tools
-            .prepare(
+            .prepare_for_operation(
                 &ids,
                 &workspace,
                 tickloop_agent_tools::BASH_TOOL_NAME,
                 &input,
+                record.id,
             )
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;

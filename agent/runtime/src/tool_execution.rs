@@ -1733,9 +1733,10 @@ impl Agent {
                 let chat = chats.get(&receipt.chat_id).unwrap();
                 (chat.tools.clone(), chat.ids)
             };
+            let operation_id = tickloop_ids::generate();
             let prepared = if registration.is_some() {
                 tools
-                    .prepare(&ids, &workspace, &name, &input)
+                    .prepare_for_operation(&ids, &workspace, &name, &input, operation_id)
                     .await
                     .map_err(|error| error.to_string())
             } else {
@@ -1762,7 +1763,7 @@ impl Agent {
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
                         task_binding: task_binding.flatten(),
-                        id: tickloop_ids::generate(),
+                        id: operation_id,
                         loop_id: receipt.loop_id,
                         run_id: receipt.run_id,
                         call_id: id.clone(),

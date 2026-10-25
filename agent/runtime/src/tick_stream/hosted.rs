@@ -12,35 +12,27 @@ use std::{
 
 use serde_json::{Value, json};
 use tick_protocol::TickState;
-use tickhost::host::{TerminalDescription, TerminalRead, TickAdapter};
-use tickhost_connect::{
-    host_error::HostError,
-    hosted::{
-        self, BUSINESS_FRAME_BYTES, CONTROL_TIMEOUT, HostConnection, OBSERVATION_FRAME_BYTES,
-    },
-    session::{SessionLinkState, SessionObservation},
-};
-use tokio::{
-    net::unix::OwnedWriteHalf,
-    sync::{mpsc, oneshot, watch},
-};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use super::{
-    ConnectionBudget, DISCONNECTED_CODE, EventPublisher, InstanceObserver, InstanceRef,
-    PreparedTickWatch, ProtocolFeed, RECONNECT_PAUSE, StreamTasks, TickConnectionState,
-    TickMetadata, TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission, WatchId,
-    connection_state, current_observation, follow_instances, observe_protocol,
+    ConnectionBudget, EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch,
+    ProtocolFeed, RECONNECT_PAUSE, StreamTasks, TickConnectionState, TickMetadata, TickObservation,
+    TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
+    current_observation, follow_instances, observe_protocol,
 };
-use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::TICK_READ};
+use crate::environment::{
+    ExecutionAuthority, ExecutionEnvironment, ExecutionError, ExecutionInspection, ExecutionKind,
+    ExecutionLinkState, ExecutionPort, ExecutionQuery, ExecutionScope, ExecutionUpdate,
+    LocalEnvironment, ObservationCursor, ObserveRequest, TerminalDescription, TerminalRead,
+};
+use crate::{hosted::tools::HostedTickTools, tick_tools::TICK_READ};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 
 type Screens = Arc<Mutex<TerminalScreens>>;
 
 /// Samples waiting for one observer of a terminal Tick.
 const SAMPLE_QUEUE: usize = 16;
-/// Frames of a terminal Tick's host watch read ahead of the observer.
-const LINK_FRAMES: usize = 16;
 
 /// What each watch of a terminal Tick last got of its screen, where its next sample is compared,
 /// and the observers that read the screen for those samples.
@@ -69,7 +61,8 @@ struct SampleRequest {
 }
 
 pub struct HostedTickStream {
-    tools: Arc<HostedTickTools>,
+    environment: Arc<dyn ExecutionEnvironment>,
+    authority: HostToolAuthority,
     authorities: watch::Sender<BTreeMap<WatchId, HostToolAuthority>>,
     chats: watch::Sender<BTreeMap<WatchId, Uuid>>,
     /// The (Chat, instance) pairs with a live watch registration, whose binding is therefore
@@ -81,8 +74,19 @@ pub struct HostedTickStream {
 
 impl HostedTickStream {
     pub fn new(tools: Arc<HostedTickTools>) -> Self {
+        Self::with_environment(
+            Arc::new(LocalEnvironment::with_ticks(tools.clone())),
+            tools.authority(),
+        )
+    }
+
+    pub fn with_environment(
+        environment: Arc<dyn ExecutionEnvironment>,
+        authority: HostToolAuthority,
+    ) -> Self {
         Self {
-            tools,
+            environment,
+            authority,
             authorities: watch::channel(BTreeMap::new()).0,
             chats: watch::channel(BTreeMap::new()).0,
             live: Arc::default(),
@@ -93,7 +97,8 @@ impl HostedTickStream {
 
     fn scope(&self) -> HostedScope {
         HostedScope {
-            tools: self.tools.clone(),
+            environment: self.environment.clone(),
+            authority: self.authority.clone(),
             authorities: self.authorities.subscribe(),
             chats: self.chats.subscribe(),
             live: self.live.clone(),
@@ -105,7 +110,8 @@ impl HostedTickStream {
 
 #[derive(Clone)]
 struct HostedScope {
-    tools: Arc<HostedTickTools>,
+    environment: Arc<dyn ExecutionEnvironment>,
+    authority: HostToolAuthority,
     authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     chats: watch::Receiver<BTreeMap<WatchId, Uuid>>,
     live: Arc<Mutex<HashSet<(Uuid, InstanceRef)>>>,
@@ -119,7 +125,7 @@ impl HostedScope {
         let Some(HostToolAuthority::Native { .. }) = authority else {
             return Err("Hosted watch has no admitted host authority; subscribe explicitly".into());
         };
-        if authority != Some(&self.tools.authority()) {
+        if authority != Some(&self.authority) {
             return Err("Hosted watch is outside its admitted Tickhost".into());
         }
         Ok(())
@@ -209,7 +215,7 @@ async fn observe_hosted_instance(
     instance: InstanceRef,
     mut wanted: watch::Receiver<BTreeSet<WatchId>>,
     publisher: EventPublisher,
-    tasks: StreamTasks,
+    _tasks: StreamTasks,
 ) {
     let mut ready_watches = BTreeSet::new();
     loop {
@@ -227,10 +233,9 @@ async fn observe_hosted_instance(
             continue;
         }
         let feed = HostedFeed {
-            tools: scope.tools.clone(),
+            environment: scope.environment.clone(),
             chat,
             instance: instance.clone(),
-            tasks: tasks.clone(),
         };
         match feed.check_binding().await {
             Err(error) => {
@@ -246,7 +251,7 @@ async fn observe_hosted_instance(
             Ok(adapter) => {
                 scope.mark_live(chat, &instance, true);
                 let ended = match adapter {
-                    TickAdapter::Protocol => {
+                    ExecutionKind::Protocol => {
                         observe_protocol(
                             &feed,
                             &instance,
@@ -257,7 +262,8 @@ async fn observe_hosted_instance(
                         )
                         .await
                     }
-                    TickAdapter::Terminal => {
+                    ExecutionKind::Shell => return,
+                    ExecutionKind::Terminal => {
                         observe_terminal_screen(
                             &feed,
                             observer,
@@ -275,7 +281,7 @@ async fn observe_hosted_instance(
                 }
                 // A terminal Tick loses nothing while disconnected: its next sample compares with
                 // what each watch last got.
-                if adapter == TickAdapter::Protocol && !wanted.borrow().is_empty() {
+                if adapter == ExecutionKind::Protocol && !wanted.borrow().is_empty() {
                     publisher.gap_to(instance.clone(), ready_watches.iter().copied());
                 }
             }
@@ -322,18 +328,37 @@ impl WatchAdmission for OwnedWatches<'_> {
 
 /// One hosted instance as its owning Chat reaches it through the Tickhost.
 struct HostedFeed {
-    tools: Arc<HostedTickTools>,
+    environment: Arc<dyn ExecutionEnvironment>,
     chat: Uuid,
     instance: InstanceRef,
-    tasks: StreamTasks,
 }
 
 impl HostedFeed {
     /// Proves the Chat still holds a current binding for the instance before anything is read,
     /// and tells which adapter serves it.
-    async fn check_binding(&self) -> Result<TickAdapter, HostError> {
-        self.tools.data(self.chat.into(), &self.instance).await?;
-        self.tools.adapter(self.chat.into(), &self.instance).await
+    fn port(&self) -> Result<Arc<dyn ExecutionPort>, ExecutionError> {
+        self.environment.bind(
+            ExecutionScope {
+                chat: self.chat.into(),
+                folder: None,
+            },
+            ExecutionAuthority::new(self.chat.into()),
+        )
+    }
+
+    async fn check_binding(&self) -> Result<ExecutionKind, ExecutionError> {
+        match self
+            .port()?
+            .inspect(ExecutionQuery::Kind(self.instance.clone()))
+            .await?
+        {
+            ExecutionInspection::Kind(ExecutionKind::Protocol) => Ok(ExecutionKind::Protocol),
+            ExecutionInspection::Kind(ExecutionKind::Terminal) => Ok(ExecutionKind::Terminal),
+            _ => Err(ExecutionError::new(
+                "Unsupported",
+                "this is not a hosted Tick",
+            )),
+        }
     }
 
     /// Registers a host watch of a terminal Tick: what it runs, its screen now, which the host's
@@ -341,120 +366,91 @@ impl HostedFeed {
     async fn watch_terminal(
         &self,
     ) -> Result<(TerminalDescription, TerminalRead, TerminalLink), String> {
-        let mut connection = self
-            .tools
-            .data(self.chat.into(), &self.instance)
+        let port = self.port().map_err(|error| error.to_string())?;
+        let ExecutionInspection::Description(description) = port
+            .inspect(ExecutionQuery::Describe(self.instance.clone()))
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("missing terminal description".into());
+        };
+        let description = serde_json::from_value(description).map_err(|error| error.to_string())?;
+        let observed = port
+            .observe(ObserveRequest {
+                instance: self.instance.clone(),
+                after: None,
+            })
             .await
             .map_err(|error| error.to_string())?;
-        let description = connection
-            .request("describe", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        let description: TerminalDescription =
-            serde_json::from_value(description).map_err(|error| error.to_string())?;
-        let registered = connection
-            .request("watch", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        let read: TerminalRead = serde_json::from_value(registered["read"].clone())
-            .map_err(|error| error.to_string())?;
+        let baseline =
+            TerminalRead::from_read(observed.baseline).map_err(|error| error.to_string())?;
         Ok((
             description,
-            read,
-            TerminalLink::new(connection, &self.tasks),
+            baseline,
+            TerminalLink {
+                port,
+                cursor: observed.cursor,
+                updates: observed.updates,
+                saw_exit: false,
+            },
         ))
     }
 }
 
-/// A terminal Tick's host watch: the frames it pushes, in order, and the reads samples make
-/// through it.
 struct TerminalLink {
-    frames: mpsc::Receiver<Value>,
-    writer: OwnedWriteHalf,
-    next_id: u64,
+    port: Arc<dyn ExecutionPort>,
+    cursor: ObservationCursor,
+    updates: watch::Receiver<ExecutionUpdate>,
+    saw_exit: bool,
 }
 
-/// What a terminal Tick's host watch pushed.
 enum LinkEvent {
-    /// The screen text first changed since the last read through the watch.
     Changed,
     Exited,
     Ended(TickConnectionState),
 }
 
 impl TerminalLink {
-    fn new(connection: HostConnection, tasks: &StreamTasks) -> Self {
-        let (mut reader, writer) = connection.into_parts();
-        let (sender, frames) = mpsc::channel(LINK_FRAMES);
-        tasks.spawn(async move {
-            loop {
-                let frame = tokio::select! {
-                    _ = sender.closed() => return,
-                    frame = hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES) => frame,
-                };
-                // The watch's end, or a frame that cannot be read, closes the channel.
-                let Ok(Some(frame)) = frame else {
-                    return;
-                };
-                if sender.send(frame).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Self {
-            frames,
-            writer,
-            next_id: 1,
-        }
-    }
-
     async fn next_event(&mut self) -> LinkEvent {
-        match self.frames.recv().await {
-            Some(frame) => link_event(&frame),
-            None => LinkEvent::Ended(TickConnectionState::Disconnected),
-        }
-    }
-
-    /// Reads the screen through the watch, which arms the host's change signal against it.
-    /// Changes and the exit the host pushed before answering are about an earlier screen, which
-    /// the read already shows, so only the Tick's end among them counts.
-    async fn read(&mut self) -> Result<TerminalRead, TickConnectionState> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({"id":id,"method":"read","params":{}});
-        tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            hosted::write_frame(&mut self.writer, &request, BUSINESS_FRAME_BYTES),
-        )
-        .await
-        .map_err(|_| TickConnectionState::Disconnected)?
-        .map_err(|_| TickConnectionState::Disconnected)?;
         loop {
-            let frame = tokio::time::timeout(CONTROL_TIMEOUT, self.frames.recv())
-                .await
-                .ok()
-                .flatten()
-                .ok_or(TickConnectionState::Disconnected)?;
-            if frame.get("id").is_none() {
-                match link_event(&frame) {
-                    LinkEvent::Ended(state) => return Err(state),
-                    LinkEvent::Changed | LinkEvent::Exited => continue,
+            if self.updates.changed().await.is_err() {
+                return LinkEvent::Ended(TickConnectionState::Disconnected);
+            }
+            let update = self.updates.borrow_and_update().clone();
+            match update.state {
+                ExecutionLinkState::Gone => return LinkEvent::Ended(TickConnectionState::Gone),
+                ExecutionLinkState::Disconnected => {
+                    return LinkEvent::Ended(TickConnectionState::Disconnected);
+                }
+                ExecutionLinkState::ProtocolError(_) => {
+                    return LinkEvent::Ended(TickConnectionState::IdentityUncertain);
+                }
+                ExecutionLinkState::Live => {}
+            }
+            if let Some(change) = update.terminal {
+                if change.exited && !self.saw_exit {
+                    self.saw_exit = true;
+                    return LinkEvent::Exited;
+                }
+                if change.dirty {
+                    return LinkEvent::Changed;
                 }
             }
-            let read = hosted::response_result(frame, Some(id))
-                .map_err(|error| connection_state(&error.code))?;
-            return serde_json::from_value(read)
-                .map_err(|_| TickConnectionState::IdentityUncertain);
         }
     }
-}
 
-fn link_event(frame: &Value) -> LinkEvent {
-    match frame["event"].as_str() {
-        Some("changed") => LinkEvent::Changed,
-        Some("exited") => LinkEvent::Exited,
-        Some("gone") => LinkEvent::Ended(TickConnectionState::Gone),
-        _ => LinkEvent::Ended(TickConnectionState::IdentityUncertain),
+    async fn read(&mut self) -> Result<TerminalRead, TickConnectionState> {
+        match self
+            .port
+            .inspect(ExecutionQuery::Sample(self.cursor.clone()))
+            .await
+        {
+            Ok(ExecutionInspection::Read(read)) => {
+                TerminalRead::from_read(read).map_err(|error| connection_state(&error.code))
+            }
+            Ok(_) => Err(TickConnectionState::IdentityUncertain),
+            Err(error) => Err(connection_state(&error.code)),
+        }
     }
 }
 
@@ -635,21 +631,6 @@ impl ObservedScreen<'_> {
 }
 
 /// A terminal Tick's screen, read without counting as using the Tick.
-async fn read_terminal(
-    tools: &HostedTickTools,
-    chat: Uuid,
-    instance: &InstanceRef,
-) -> Result<TerminalRead, String> {
-    let read = tools
-        .data(chat.into(), instance)
-        .await
-        .map_err(|error| error.to_string())?
-        .request("read", json!({}), CONTROL_TIMEOUT)
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::from_value(read).map_err(|error| error.to_string())
-}
-
 fn terminal_observation(instance: &InstanceRef, read: TerminalRead) -> TickObservation {
     TickObservation {
         instance: instance.clone(),
@@ -697,7 +678,7 @@ async fn observe_terminal_screen(
     };
     let title = description
         .title
-        .unwrap_or_else(|| tickhost_connect::naming::command_title(&description.command));
+        .unwrap_or_else(|| description.command.join(" "));
     let (sampler, mut samples) = mpsc::channel(SAMPLE_QUEUE);
     let _registration = SamplerRegistration::register(screens, observer, sampler);
     let mut screen = ObservedScreen {
@@ -806,76 +787,37 @@ async fn observe_terminal_screen(
 
 #[async_trait::async_trait]
 impl ProtocolFeed for HostedFeed {
-    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
-        let mut connection = self.tools.data(self.chat.into(), &self.instance).await?;
-        let descriptor = connection
-            .request("describe", json!({}), CONTROL_TIMEOUT)
-            .await?;
-        serde_json::from_value(descriptor).map_err(unreadable)
+    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, ExecutionError> {
+        match self
+            .port()?
+            .inspect(ExecutionQuery::Describe(self.instance.clone()))
+            .await?
+        {
+            ExecutionInspection::Description(value) => serde_json::from_value(value)
+                .map_err(|error| ExecutionError::new("ProtocolViolation", error.to_string())),
+            _ => Err(ExecutionError::new(
+                "ProtocolViolation",
+                "description query returned no descriptor",
+            )),
+        }
     }
 
-    /// Registers a host watch: the reply carries the current content, then the host pushes
-    /// latest-only observations until the Tick ends or the connection does.
     async fn watch(
         &self,
-    ) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), HostError> {
-        let mut connection = self.tools.data(self.chat.into(), &self.instance).await?;
-        let registered = connection
-            .request("watch", json!({}), CONTROL_TIMEOUT)
+    ) -> Result<(TickState, u64, watch::Receiver<ExecutionUpdate>), ExecutionError> {
+        let observation = self
+            .port()?
+            .observe(ObserveRequest {
+                instance: self.instance.clone(),
+                after: None,
+            })
             .await?;
-        let baseline: TickState =
-            serde_json::from_value(registered["read"].clone()).map_err(unreadable)?;
-        let received = registered["received"]
-            .as_u64()
-            .ok_or_else(|| unreadable("the Tickhost registered no observation count"))?;
-        let (sender, receiver) = watch::channel(SessionObservation {
-            update: None,
-            received,
-            state: SessionLinkState::Live,
-        });
-        self.tasks.spawn(async move {
-            loop {
-                let event = tokio::select! {
-                    event = connection.next_event_within(OBSERVATION_FRAME_BYTES) => event,
-                    _ = sender.closed() => return,
-                };
-                match event {
-                    Ok(Some(event)) => match observation(&event) {
-                        Some(observation) => {
-                            sender.send_replace(observation);
-                        }
-                        None if event["event"] == "gone" => {
-                            sender.send_modify(|current| current.state = SessionLinkState::Gone);
-                            return;
-                        }
-                        None => {
-                            sender.send_modify(|current| {
-                                current.state = SessionLinkState::ProtocolError(
-                                    "the Tickhost sent a malformed watch event".into(),
-                                );
-                            });
-                            return;
-                        }
-                    },
-                    // Ending the stream without a gone event disconnects the watch.
-                    Ok(None) | Err(_) => return,
-                }
-            }
-        });
-        Ok((baseline, received, receiver))
+        Ok((
+            observation.baseline.state,
+            observation.cursor.position,
+            observation.updates,
+        ))
     }
-}
-
-/// An answer of the Tickhost this Agent could not read, which a later connection may.
-fn unreadable(error: impl std::fmt::Display) -> HostError {
-    HostError::after(DISCONNECTED_CODE, error.to_string())
-}
-
-fn observation(event: &Value) -> Option<SessionObservation> {
-    if event["event"] != "observation" {
-        return None;
-    }
-    serde_json::from_value(event["observation"].clone()).ok()
 }
 
 #[async_trait::async_trait]
@@ -887,22 +829,27 @@ impl TickStreamPort for HostedTickStream {
         _input: &Value,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<PreparedTickWatch>, String> {
-        let query = self
-            .tools
-            .prepare_call(
-                chat.into(),
-                TICK_READ,
-                &json!({"tick_instance_id":instance}),
-                cancel,
-            )
+        self.revalidate_watch(chat, instance, Some(&self.authority))
             .await?;
-        let watch = PreparedTickWatch::new(self.tools.clone(), query)?;
-        let authority = watch
-            .host_authority()?
-            .and_then(|binding| binding.authority);
-        self.revalidate_watch(chat, instance, authority.as_ref())
-            .await?;
-        Ok(Some(watch))
+        if cancel.is_cancelled() {
+            return Err("watch preparation was cancelled".into());
+        }
+        let input = json!({"tick_instance_id":instance});
+        Ok(Some(PreparedTickWatch::with_validator(
+            crate::host_tools::PreparedHostCall::new(
+                TICK_READ.into(),
+                input.clone(),
+                input,
+                crate::host_tools::HostToolPermission::ReadOnly,
+                format!("Read hosted Tick {}", instance.public()),
+            ),
+            Arc::new(EnvironmentWatchValidator {
+                environment: self.environment.clone(),
+                authority: self.authority.clone(),
+                chat,
+                instance: instance.clone(),
+            }),
+        )))
     }
 
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
@@ -938,8 +885,17 @@ impl TickStreamPort for HostedTickStream {
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&(chat, instance.clone()));
         if !is_live {
-            self.tools
-                .data(chat.into(), instance)
+            let port = self
+                .environment
+                .bind(
+                    ExecutionScope {
+                        chat: chat.into(),
+                        folder: None,
+                    },
+                    ExecutionAuthority::new(chat.into()),
+                )
+                .map_err(|error| error.to_string())?;
+            port.inspect(ExecutionQuery::Kind(instance.clone()))
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -952,26 +908,30 @@ impl TickStreamPort for HostedTickStream {
         chat: Uuid,
         instance: &InstanceRef,
     ) -> Result<Option<TickObservation>, String> {
-        let adapter = self
-            .tools
-            .adapter(chat.into(), instance)
-            .await
+        let port = self
+            .environment
+            .bind(
+                ExecutionScope {
+                    chat: chat.into(),
+                    folder: None,
+                },
+                ExecutionAuthority::new(chat.into()),
+            )
             .map_err(|error| error.to_string())?;
-        if adapter == TickAdapter::Terminal {
-            let read = read_terminal(&self.tools, chat, instance).await?;
-            return Ok(Some(terminal_observation(instance, read)));
+        let ExecutionInspection::Read(read) = port
+            .inspect(ExecutionQuery::Read(instance.clone()))
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("read query returned no state".into());
+        };
+        let mut observation = current_observation(instance, read.state);
+        if read.kind == ExecutionKind::Terminal {
+            observation.kind = ObservationKind::Terminal {
+                truncated: read.truncated,
+            };
         }
-        let mut connection = self
-            .tools
-            .data(chat.into(), instance)
-            .await
-            .map_err(|error| error.to_string())?;
-        let read = connection
-            .request("read", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        let read: TickState = serde_json::from_value(read).map_err(|error| error.to_string())?;
-        Ok(Some(current_observation(instance, read)))
+        Ok(Some(observation))
     }
 
     /// Reads a terminal Tick's screen for `watch` while it is still admitted, through the host
@@ -1008,5 +968,45 @@ impl TickStreamPort for HostedTickStream {
         let followers = tasks.clone();
         tasks.spawn(async move { follow_instances(scope, wanted, publisher, followers).await });
         TickStreamHandle { desired, events }
+    }
+}
+
+struct EnvironmentWatchValidator {
+    environment: Arc<dyn ExecutionEnvironment>,
+    authority: HostToolAuthority,
+    chat: Uuid,
+    instance: InstanceRef,
+}
+
+#[async_trait::async_trait]
+impl super::TickWatchValidator for EnvironmentWatchValidator {
+    async fn revalidate(
+        &self,
+        chat: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        if chat != self.chat || cancel.is_cancelled() {
+            return Err("watch admission is no longer valid".into());
+        }
+        let port = self
+            .environment
+            .bind(
+                ExecutionScope {
+                    chat: chat.into(),
+                    folder: None,
+                },
+                ExecutionAuthority::with_cancellation(chat.into(), cancel),
+            )
+            .map_err(|error| error.to_string())?;
+        port.inspect(ExecutionQuery::Kind(self.instance.clone()))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    fn host_authority(&self) -> Result<Option<super::WatchHostAuthority>, String> {
+        Ok(Some(super::WatchHostAuthority {
+            tool_name: TICK_READ.into(),
+            authority: Some(self.authority.clone()),
+        }))
     }
 }

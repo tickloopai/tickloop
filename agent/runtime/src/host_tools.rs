@@ -401,6 +401,11 @@ pub(crate) struct HostToolUpgradeCheckpoint {
 
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
+    /// The Code-side Monitor and view grants installed alongside the local tool provider.
+    fn local_tick_tools(&self) -> Option<std::sync::Arc<crate::hosted::tools::HostedTickTools>> {
+        None
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// Private process-transfer state. `None` defers replacement while the provider owns an

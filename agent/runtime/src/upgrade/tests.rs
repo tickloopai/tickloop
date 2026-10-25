@@ -761,8 +761,7 @@ async fn unread_completed_shell_keeps_its_host_view_after_upgrade_and_idle_timeo
     let instance = tick_protocol::InstanceRef::shell(task);
     assert!(
         successor
-            .inner
-            .shells
+            .shell_tasks()
             .allow_view(chat.into(), &instance)
             .await
             .is_ok()

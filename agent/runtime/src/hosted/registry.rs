@@ -81,6 +81,16 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
+    pub(crate) fn opened(file: &File) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified: None,
+        })
+    }
+
     pub fn executable(path: &Path) -> Result<Self, String> {
         Self::read(path, true)
     }
@@ -96,6 +106,30 @@ impl FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
             modified: with_modification.then(|| metadata.mtime()),
+        })
+    }
+}
+
+/// An in-process executable proof; the persisted launch identity keeps its existing format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedProgram {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl PreparedProgram {
+    pub(crate) fn of(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
 }

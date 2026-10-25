@@ -31,8 +31,9 @@ pub use search::{GLOB_TOOL_NAME, GREP_TOOL_NAME};
 mod shell;
 pub use shell::CANCELLED_COMMAND_REASON;
 pub use shell::{
-    BASH_TOOL_NAME, ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError,
-    TASK_STOP_TOOL_NAME, UserCommandSnapshot,
+    BASH_TOOL_NAME, PreparedShellStart, PreparedShellStop, ShellExit, ShellHost, ShellLaunch,
+    ShellPreparation, ShellPreparationRequest, ShellProcess, ShellStartError, ShellStopAdmission,
+    ShellStopError, ShellStopPreparation, TASK_STOP_TOOL_NAME, UserCommandSnapshot,
 };
 mod web;
 pub mod web_provenance;
@@ -562,6 +563,35 @@ impl Tools {
         self
     }
 
+    pub async fn prepare_for_operation(
+        &self,
+        ids: &tickloop_ids::IdContext,
+        workspace: &Workspace,
+        name: &str,
+        input: &Value,
+        operation: uuid::Uuid,
+    ) -> Result<PreparedTool, ToolError> {
+        let mut prepared = self.prepare(ids, workspace, name, input).await?;
+        match &mut prepared.operation {
+            Operation::Shell(input) => {
+                input.preparation = self
+                    .commands
+                    .prepare(
+                        &prepared.resolved_path,
+                        input,
+                        self.task_output_directory()?,
+                        operation,
+                    )
+                    .await?;
+            }
+            Operation::TaskStop(input) => {
+                input.preparation = self.commands.prepare_stop(ids, &input.task_id).await?;
+            }
+            _ => {}
+        }
+        Ok(prepared)
+    }
+
     pub async fn prepare(
         &self,
         ids: &tickloop_ids::IdContext,
@@ -871,7 +901,12 @@ impl Tools {
             }
             return self
                 .commands
-                .stop_task(&context.ids, &input.task_id)
+                .stop_prepared_task(
+                    &context.ids,
+                    &input.task_id,
+                    input.preparation.clone(),
+                    cancel,
+                )
                 .await
                 .into();
         }

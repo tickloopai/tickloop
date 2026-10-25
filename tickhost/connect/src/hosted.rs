@@ -556,8 +556,7 @@ impl HostConnection {
             &json!({"id":id,"method":method,"params":params}),
             BUSINESS_FRAME_BYTES,
         )
-        .await
-        .map_err(|error| HostError::before(&error.code, error.message))?;
+        .await?;
         let response =
             tokio::time::timeout(timeout, read_frame(&mut self.reader, BUSINESS_FRAME_BYTES))
                 .await

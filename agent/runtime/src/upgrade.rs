@@ -421,8 +421,7 @@ impl Agent {
             .await
             .take()
             .ok_or_else(|| AgentError::Invalid("Worker has no adopted upgrade".into()))?;
-        self.inner
-            .shells
+        self.shell_tasks()
             .commit_handoffs()
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;

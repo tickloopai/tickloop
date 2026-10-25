@@ -313,6 +313,395 @@ mod channel {
         counter_program, counter_request, python_program, tick_environment,
     };
 
+    const WITHHELD_CALL_REPLY: &str = r#"
+import json, sys
+value = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True}]}
+    elif method == 'tick/read':
+        result = {'seq':value,'data':{'value':value}}
+    else:
+        value += 1
+        print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':value,'data':{'value':value}}}), flush=True)
+        continue
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+    #[tokio::test]
+    async fn execution_port_dispatched_cancellation_is_shared_by_both_adapters() {
+        use tickloop_agent_runtime::environment::{ExecutionScope, OpenSpec};
+        use tickloop_agent_test_support::execution_contracts::dispatched_cancellation_contract;
+        use tickloop_agent_test_support::execution_environment::MemoryEnvironment;
+        let memory = MemoryEnvironment::new();
+        memory.install_tick_program("/counter", serde_json::from_value(json!({
+            "protocol":3,"revision":"1","kind":"example.counter","title":"Counter","description":"Counter",
+            "tools":[{"name":"increment","description":"Increment","input_schema":{"type":"object"},"mutates":true}],
+        })).unwrap(), json!({"value":0}), |data, _, _| { data["value"] = json!(data["value"].as_u64().unwrap() + 1); Ok(data.clone()) });
+        let _held = memory.hold_call_replies();
+        dispatched_cancellation_contract(
+            &memory,
+            ExecutionScope {
+                chat: tickloop_ids::generate().into(),
+                folder: Some("/".into()),
+            },
+            OpenSpec {
+                command: vec!["/counter".into()],
+                cwd: Some("/".into()),
+                protocol: true,
+                view: None,
+            },
+        )
+        .await;
+        let daemon = Daemon::start(1).await;
+        let script = daemon.root.join("withheld-reply.py");
+        std::fs::write(&script, WITHHELD_CALL_REPLY).unwrap();
+        let environment = LocalEnvironment::with(
+            Arc::new(DaemonControl::new(daemon.grants[0].clone())),
+            Arc::new(daemon.tools()),
+        );
+        dispatched_cancellation_contract(
+            &environment,
+            ExecutionScope {
+                chat: daemon.chats[0].into(),
+                folder: Some(daemon.root.to_string_lossy().into_owned()),
+            },
+            OpenSpec {
+                command: python_program(&script, &[]),
+                cwd: Some(daemon.root.to_string_lossy().into_owned()),
+                protocol: true,
+                view: None,
+            },
+        )
+        .await;
+    }
+
+    fn port_scope(
+        chat: Uuid,
+        folder: &Path,
+    ) -> tickloop_agent_runtime::environment::ExecutionScope {
+        tickloop_agent_runtime::environment::ExecutionScope {
+            chat: chat.into(),
+            folder: Some(folder.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn port_open(
+        command: Vec<String>,
+        folder: &Path,
+    ) -> tickloop_agent_runtime::environment::OpenSpec {
+        tickloop_agent_runtime::environment::OpenSpec {
+            command,
+            cwd: Some(folder.to_string_lossy().into_owned()),
+            protocol: true,
+            view: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_port_scope_and_revocation_contracts_match_both_adapters() {
+        use tickloop_agent_test_support::{
+            execution_contracts::{authority_contract, ownership_contract},
+            execution_environment::counter_environment,
+        };
+        let memory = counter_environment();
+        let first = port_scope(tickloop_ids::generate(), Path::new("/"));
+        let second = port_scope(tickloop_ids::generate(), Path::new("/"));
+        authority_contract(
+            &memory,
+            first.clone(),
+            port_open(vec!["/counter".into()], Path::new("/")),
+        )
+        .await;
+        ownership_contract(
+            &memory,
+            first,
+            &memory,
+            second,
+            port_open(vec!["/counter".into()], Path::new("/")),
+        )
+        .await;
+        let daemon = Daemon::start(2).await;
+        let first = LocalEnvironment::with_ticks(Arc::new(daemon.tools()));
+        let second = LocalEnvironment::with_ticks(Arc::new(HostedTickTools::new(
+            DaemonControl::new(daemon.grants[1].clone()),
+            tick_environment(),
+        )));
+        authority_contract(
+            &first,
+            port_scope(daemon.chats[0], &daemon.root),
+            port_open(counter_program(), &daemon.root),
+        )
+        .await;
+        ownership_contract(
+            &first,
+            port_scope(daemon.chats[0], &daemon.root),
+            &second,
+            port_scope(daemon.chats[1], &daemon.root),
+            port_open(counter_program(), &daemon.root),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_revision_contract_matches_both_adapters() {
+        use tickloop_agent_test_support::{
+            execution_contracts::revision_contract, execution_environment::counter_environment,
+        };
+        let memory = counter_environment();
+        let control = memory.clone();
+        revision_contract(
+            &memory,
+            port_scope(tickloop_ids::generate(), Path::new("/")),
+            port_open(vec!["/counter".into()], Path::new("/")),
+            |instance| async move {
+                control.change_revision(&instance, "2");
+            },
+        )
+        .await;
+        let daemon = Daemon::start(1).await;
+        let tools = Arc::new(daemon.tools());
+        let environment = LocalEnvironment::with_ticks(tools.clone());
+        let script = daemon.root.join("contract-evolving.py");
+        std::fs::write(&script, EVOLVING).unwrap();
+        let chat = daemon.chats[0];
+        revision_contract(
+            &environment,
+            port_scope(chat, &daemon.root),
+            port_open(python_program(&script, &[]), &daemon.root),
+            |instance| async move {
+                run_tool(
+                    &tools,
+                    chat,
+                    "TickCall",
+                    json!({"tick_instance_id":instance,"tool":"evolve","args":{}}),
+                )
+                .await;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_observation_contract_matches_both_adapters() {
+        use tickloop_agent_test_support::{
+            execution_contracts::observation_contract, execution_environment::counter_environment,
+        };
+        let memory = counter_environment();
+        observation_contract(
+            &memory,
+            port_scope(tickloop_ids::generate(), Path::new("/")),
+            port_open(vec!["/counter".into()], Path::new("/")),
+        )
+        .await;
+        let daemon = Daemon::start(1).await;
+        let environment = LocalEnvironment::with_ticks(Arc::new(daemon.tools()));
+        observation_contract(
+            &environment,
+            port_scope(daemon.chats[0], &daemon.root),
+            port_open(counter_program(), &daemon.root),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_restart_contract_matches_both_adapters() {
+        use tickloop_agent_test_support::{
+            execution_contracts::restart_contract, execution_environment::counter_environment,
+        };
+        let memory = counter_environment();
+        restart_contract(
+            &memory,
+            port_scope(tickloop_ids::generate(), Path::new("/")),
+            port_open(vec!["/counter".into()], Path::new("/")),
+            |_| async {
+                memory.restart();
+            },
+        )
+        .await;
+        let daemon = Daemon::start(1).await;
+        let environment = LocalEnvironment::with_ticks(Arc::new(daemon.tools()));
+        restart_contract(
+            &environment,
+            port_scope(daemon.chats[0], &daemon.root),
+            port_open(counter_program(), &daemon.root),
+            |opened| async move {
+                let business = opened["business_pid"].as_u64().unwrap() as u32;
+                let launcher = tickhost::process::sample(business).unwrap().parent;
+                let host = tickhost::process::sample(launcher).unwrap().parent;
+                unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+                assert!(super::gone(business).await);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_view_failure_contract_matches_both_adapters() {
+        use tickloop_agent_runtime::environment::{ViewPlacement, ViewPosition};
+        use tickloop_agent_test_support::{
+            execution_contracts::view_failure_contract, execution_environment::counter_environment,
+        };
+        let view = Some(ViewPlacement {
+            workspace_id: Some(HERDR_WORKSPACE.into()),
+            placement: ViewPosition::NewTab,
+        });
+        let memory = counter_environment();
+        let mut open = port_open(vec!["/counter".into()], Path::new("/"));
+        open.view = view.clone();
+        view_failure_contract(
+            &memory,
+            port_scope(tickloop_ids::generate(), Path::new("/")),
+            open,
+        )
+        .await;
+        let directory = tempfile::Builder::new()
+            .prefix("epv")
+            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
+            .unwrap();
+        let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
+        let daemon = Daemon::start_in_herdr(
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+            herdr.socket.clone(),
+            1,
+        )
+        .await;
+        let environment = LocalEnvironment::with_ticks(daemon.runtimes[0].hosted_ticks().unwrap());
+        let mut open = port_open(counter_program(), &daemon.root);
+        open.view = view;
+        view_failure_contract(
+            &environment,
+            port_scope(daemon.chats[0], &daemon.root),
+            open,
+        )
+        .await;
+    }
+
+    const RESTORING_TERMINAL: &str = r#"
+import sys, termios
+mode = termios.tcgetattr(0)
+mode[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, mode)
+def draw(value):
+    sys.stdout.write('\x1b[2J\x1b[H' + value)
+    sys.stdout.flush()
+draw('A')
+for line in sys.stdin:
+    draw(line.strip())
+"#;
+
+    #[tokio::test]
+    async fn execution_port_terminal_baselines_match_both_adapters() {
+        use tickloop_agent_test_support::{
+            execution_contracts::terminal_baseline_contract,
+            execution_environment::MemoryEnvironment,
+        };
+        let memory = Arc::new(MemoryEnvironment::new());
+        memory.install_terminal_program("/terminal", "A", |screen, input| {
+            *screen = String::from_utf8_lossy(input).trim().into()
+        });
+        let authority = HostToolAuthority::Native {
+            endpoint: HostEndpointIdentity::TrustedAdapter {
+                scope: tickloop_ids::generate(),
+            },
+        };
+        let mut open = port_open(vec!["/terminal".into()], Path::new("/"));
+        open.protocol = false;
+        terminal_baseline_contract(
+            memory,
+            port_scope(tickloop_ids::generate(), Path::new("/")),
+            authority,
+            open,
+        )
+        .await;
+        let daemon = Daemon::start(1).await;
+        let script = daemon.root.join("restoring-terminal.py");
+        std::fs::write(&script, RESTORING_TERMINAL).unwrap();
+        let tools = Arc::new(daemon.tools());
+        let authority = HostToolAuthority::Native {
+            endpoint: tools.host_endpoint().unwrap().unwrap(),
+        };
+        let environment = Arc::new(LocalEnvironment::with_ticks(tools));
+        let mut open = port_open(python_program(&script, &[]), &daemon.root);
+        open.protocol = false;
+        terminal_baseline_contract(
+            environment,
+            port_scope(daemon.chats[0], &daemon.root),
+            authority,
+            open,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_latest_delivery_contract_on_memory() {
+        use tickloop_agent_runtime::environment::ExecutionTools;
+        use tickloop_agent_test_support::{
+            ScriptedModel, execution_contracts::latest_delivery_contract,
+            execution_environment::counter_environment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(Vec::new()));
+        let environment = Arc::new(counter_environment());
+        let authority = HostToolAuthority::Native {
+            endpoint: HostEndpointIdentity::TrustedAdapter {
+                scope: tickloop_ids::generate(),
+            },
+        };
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                transcripts: None,
+                environment: Some(environment.clone()),
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions::local(tickloop_agent_test_support::config()),
+        )
+        .unwrap();
+        agent
+            .install_host_tools(Arc::new(ExecutionTools::new(
+                environment.clone(),
+                authority.clone(),
+            )))
+            .unwrap();
+        agent
+            .install_tick_stream(Arc::new(HostedTickStream::with_environment(
+                environment.clone(),
+                authority,
+            )))
+            .await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        latest_delivery_contract(
+            &agent,
+            &model,
+            environment.as_ref(),
+            port_scope(chat.into(), directory.path()),
+            port_open(vec!["/counter".into()], Path::new("/")),
+        )
+        .await;
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn execution_port_latest_delivery_contract_on_native() {
+        use tickloop_agent_test_support::{
+            ScriptedModel, execution_contracts::latest_delivery_contract,
+        };
+        let model = Arc::new(ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let environment = LocalEnvironment::with_ticks(Arc::new(daemon.tools()));
+        latest_delivery_contract(
+            &daemon.runtimes[0],
+            &model,
+            &environment,
+            port_scope(daemon.chats[0], &daemon.root),
+            port_open(counter_program(), &daemon.root),
+        )
+        .await;
+    }
+
     /// The Herdr Workspace a Herdr worker's Chats work in.
     const HERDR_WORKSPACE: &str = "workspace-a";
     /// How long a hosted test waits for its next event. It outlasts TickManage's 10-second

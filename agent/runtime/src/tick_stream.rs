@@ -801,7 +801,7 @@ impl ConnectionBudget {
 trait ProtocolFeed: Send + Sync {
     async fn descriptor(
         &self,
-    ) -> Result<tick_protocol::TickDescriptor, tickhost_connect::host_error::HostError>;
+    ) -> Result<tick_protocol::TickDescriptor, crate::environment::ExecutionError>;
 
     async fn watch(
         &self,
@@ -809,9 +809,9 @@ trait ProtocolFeed: Send + Sync {
         (
             tick_protocol::TickState,
             u64,
-            watch::Receiver<tickhost_connect::session::SessionObservation>,
+            watch::Receiver<crate::environment::ExecutionUpdate>,
         ),
-        tickhost_connect::host_error::HostError,
+        crate::environment::ExecutionError,
     >;
 }
 
@@ -944,7 +944,7 @@ async fn observe_protocol(
     ready_watches: &mut BTreeSet<WatchId>,
     scope: &dyn WatchAdmission,
 ) -> bool {
-    use tickhost_connect::session::SessionLinkState;
+    use crate::environment::ExecutionLinkState;
 
     let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     if attempted.is_empty() {
@@ -1012,8 +1012,8 @@ async fn observe_protocol(
         latest_sequence = sequence;
     }
     match initial.state {
-        SessionLinkState::Live => {}
-        SessionLinkState::Gone => {
+        ExecutionLinkState::Live => {}
+        ExecutionLinkState::Gone => {
             publisher.state_to(
                 instance.clone(),
                 TickConnectionState::Gone,
@@ -1021,11 +1021,11 @@ async fn observe_protocol(
             );
             return true;
         }
-        SessionLinkState::Disconnected => {
+        ExecutionLinkState::Disconnected => {
             let watches = cursors.keys().copied().collect();
             return settle_disconnect(feed, instance, publisher, &watches).await;
         }
-        SessionLinkState::ProtocolError(_) => {
+        ExecutionLinkState::ProtocolError(_) => {
             publisher.state_to(
                 instance.clone(),
                 TickConnectionState::IdentityUncertain,
@@ -1048,8 +1048,8 @@ async fn observe_protocol(
             return true;
         }
         match observation.state {
-            SessionLinkState::Live => {}
-            SessionLinkState::Gone => {
+            ExecutionLinkState::Live => {}
+            ExecutionLinkState::Gone => {
                 publisher.state_to(
                     instance.clone(),
                     TickConnectionState::Gone,
@@ -1057,11 +1057,11 @@ async fn observe_protocol(
                 );
                 return true;
             }
-            SessionLinkState::Disconnected => {
+            ExecutionLinkState::Disconnected => {
                 let watches = cursors.keys().copied().collect();
                 return settle_disconnect(feed, instance, publisher, &watches).await;
             }
-            SessionLinkState::ProtocolError(_) => {
+            ExecutionLinkState::ProtocolError(_) => {
                 publisher.state_to(
                     instance.clone(),
                     TickConnectionState::IdentityUncertain,
@@ -1097,7 +1097,7 @@ async fn observe_protocol(
 /// Publishes what a failed `describe` or `watch` says of the Tick to `watches`; whether that
 /// ends observing it, as a Tick that ended or whose identity is uncertain does.
 fn publish_failure(
-    error: &tickhost_connect::host_error::HostError,
+    error: &crate::environment::ExecutionError,
     instance: &InstanceRef,
     publisher: &EventPublisher,
     watches: &BTreeSet<WatchId>,
@@ -1119,7 +1119,7 @@ async fn settle_disconnect(
 ) -> bool {
     match feed.descriptor().await {
         Ok(_) => publish_failure(
-            &tickhost_connect::host_error::HostError::after(
+            &crate::environment::ExecutionError::new(
                 DISCONNECTED_CODE,
                 "the watch ended while the Tick runs",
             ),
@@ -1139,7 +1139,7 @@ struct ProtocolCursor {
 
 fn publish_protocol_update(
     instance: &InstanceRef,
-    observation: &tickhost_connect::session::SessionObservation,
+    observation: &crate::environment::ExecutionUpdate,
     targets: &BTreeSet<WatchId>,
     cursors: &mut BTreeMap<WatchId, ProtocolCursor>,
     recovery: &str,
@@ -1183,8 +1183,8 @@ fn publish_protocol_update(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tickhost_connect::host_error::HostError;
-    use tickhost_connect::session::{SessionLinkState, SessionObservation};
+    use crate::environment::ExecutionError;
+    use crate::environment::{ExecutionLinkState, ExecutionUpdate};
 
     use super::*;
 
@@ -1197,9 +1197,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProtocolFeed for EndingFeed {
-        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
+        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, ExecutionError> {
             if self.described.fetch_add(1, Ordering::SeqCst) >= self.answers {
-                return Err(HostError::before("TargetGone", "the Tick has ended"));
+                return Err(ExecutionError::new("TargetGone", "the Tick has ended"));
             }
             Ok(tick_protocol::TickDescriptor {
                 protocol: tick_protocol::NATIVE_PROTOCOL_VERSION,
@@ -1219,14 +1219,15 @@ mod tests {
             (
                 tick_protocol::TickState,
                 u64,
-                watch::Receiver<SessionObservation>,
+                watch::Receiver<ExecutionUpdate>,
             ),
-            HostError,
+            ExecutionError,
         > {
-            let (_ended, observations) = watch::channel(SessionObservation {
+            let (_ended, observations) = watch::channel(ExecutionUpdate {
                 update: None,
                 received: 0,
-                state: SessionLinkState::Live,
+                state: ExecutionLinkState::Live,
+                terminal: None,
             });
             Ok((tick_protocol::TickState::empty(), 0, observations))
         }
@@ -1295,11 +1296,11 @@ mod tests {
     }
 
     /// A protocol Tick without content yet, whose first content arrives as the test sends it.
-    struct FirstContentFeed(std::sync::Mutex<Option<watch::Receiver<SessionObservation>>>);
+    struct FirstContentFeed(std::sync::Mutex<Option<watch::Receiver<ExecutionUpdate>>>);
 
     #[async_trait::async_trait]
     impl ProtocolFeed for FirstContentFeed {
-        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
+        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, ExecutionError> {
             Ok(tick_protocol::TickDescriptor {
                 protocol: tick_protocol::NATIVE_PROTOCOL_VERSION,
                 kind: "example.loading".into(),
@@ -1318,9 +1319,9 @@ mod tests {
             (
                 tick_protocol::TickState,
                 u64,
-                watch::Receiver<SessionObservation>,
+                watch::Receiver<ExecutionUpdate>,
             ),
-            HostError,
+            ExecutionError,
         > {
             let observations = self.0.lock().unwrap().take().expect("one watch");
             Ok((tick_protocol::TickState::empty(), 0, observations))
@@ -1335,10 +1336,11 @@ mod tests {
         let instance = InstanceRef::hosted(Uuid::new_v4());
         let watch = WatchId::new();
         let (wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
-        let (content, observations) = watch::channel(SessionObservation {
+        let (content, observations) = watch::channel(ExecutionUpdate {
             update: None,
             received: 0,
-            state: SessionLinkState::Live,
+            state: ExecutionLinkState::Live,
+            terminal: None,
         });
         let feed = FirstContentFeed(std::sync::Mutex::new(Some(observations)));
         let mut ready = BTreeSet::new();
@@ -1353,14 +1355,15 @@ mod tests {
         let first_content = async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             content
-                .send(SessionObservation {
+                .send(ExecutionUpdate {
                     update: Some(tick_protocol::TickState {
                         seq: 1,
                         data: serde_json::json!({"value": 1}),
                         at: None,
                     }),
                     received: 1,
-                    state: SessionLinkState::Live,
+                    state: ExecutionLinkState::Live,
+                    terminal: None,
                 })
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;

@@ -3,9 +3,9 @@
 //! also show its Ticks in Herdr Panes and list a Workspace's Panes. Artifact and Shell references
 //! go to their native tools instead.
 
+use crate::environment::{TERMINAL_INPUT_BYTES, WORKSPACE_PAGE_SIZE};
 use serde_json::{Value, json};
 use tick_protocol::{HOSTED_ACCESS, InstanceRef, SHELL_ACCESS, ShellTaskKind};
-use tickhost_connect::{hosted::ATTACH_INPUT_BYTES, page::MAX_PAGE_SIZE};
 use tickloop_ids::{IdContext, ModelRef};
 
 use tickloop_agent_protocol::ToolDefinition;
@@ -190,8 +190,8 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
     if views {
         definitions.push(ToolDefinition {
             name: READ_WORKSPACE.into(),
-            description: format!("List the Panes of the current Herdr Workspace, or of an explicitly named Workspace, marking each Pane that shows a view of one of this Chat's Ticks, and this Chat's Ticks as the Tickhost runs them. Uses the Agent's Work Context by default; without one, lists every Workspace. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Panes come in pages of at most {MAX_PAGE_SIZE} with the complete total; pass next_cursor back as cursor until it is null. CursorExpired means the Workspace changed: list again from the first page. Listing never subscribes."),
-            input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1},"cursor":{"type":"object","properties":{"generation":{"type":"string"},"after":{"type":"string"}},"required":["generation","after"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE_SIZE}},"additionalProperties":false}),
+            description: format!("List the Panes of the current Herdr Workspace, or of an explicitly named Workspace, marking each Pane that shows a view of one of this Chat's Ticks, and this Chat's Ticks as the Tickhost runs them. Uses the Agent's Work Context by default; without one, lists every Workspace. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Panes come in pages of at most {WORKSPACE_PAGE_SIZE} with the complete total; pass next_cursor back as cursor until it is null. CursorExpired means the Workspace changed: list again from the first page. Listing never subscribes."),
+            input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1},"cursor":{"type":"object","properties":{"generation":{"type":"string"},"after":{"type":"string"}},"required":["generation","after"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":WORKSPACE_PAGE_SIZE}},"additionalProperties":false}),
         });
     }
     let target = json!({"tick_instance_id":{"type":"string","minLength":1}});
@@ -229,7 +229,7 @@ fn tick_manage_description(views: bool) -> String {
         parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions.".into());
     }
     parts.push(format!(
-        "send_input types text, then logical keys ({}), into a terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
+        "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
         crate::hosted::terminal_input::KEY_NAMES
     ));
     parts.push(

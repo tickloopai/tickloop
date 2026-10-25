@@ -183,6 +183,7 @@ pub struct WorkerEnvelope {
 
 /// The worker side: one request per connection, so a lost connection only affects its own
 /// request, whose outcome the worker then reads from the operation receipt.
+#[derive(Clone)]
 pub struct DaemonControl {
     grant: WorkerControlGrant,
 }
@@ -201,6 +202,14 @@ impl DaemonControl {
     }
 
     pub async fn request(&self, request: WorkerRequest) -> Result<Value, HostError> {
+        self.request_guarded(request, None).await
+    }
+
+    pub(crate) async fn request_guarded(
+        &self,
+        request: WorkerRequest,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+    ) -> Result<Value, HostError> {
         let envelope = WorkerEnvelope {
             daemon_epoch: self.grant.daemon_epoch,
             binding: self.grant.binding,
@@ -211,12 +220,15 @@ impl DaemonControl {
         let mut transfer_deadline = None;
         loop {
             let result = match transfer_deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, self.exchange(&frame)).await
+                Some(deadline) => tokio::time::timeout_at(deadline, self.exchange(&frame, dispatch)).await
                     .unwrap_or_else(|_| Err(HostError::after("OutcomeUnknown", "the successor daemon did not confirm the request before the transfer deadline"))),
-                None => self.exchange(&frame).await,
+                None => self.exchange(&frame, dispatch).await,
             };
             match result {
                 Err(error) if error.code == "DaemonTransferred" && !error.dispatched => {
+                    if let Some(dispatch) = dispatch {
+                        dispatch.not_dispatched();
+                    }
                     let deadline = *transfer_deadline.get_or_insert_with(|| {
                         tokio::time::Instant::now() + DAEMON_TRANSFER_RETRY_BUDGET
                     });
@@ -232,7 +244,11 @@ impl DaemonControl {
         }
     }
 
-    async fn exchange(&self, frame: &Value) -> Result<Value, HostError> {
+    async fn exchange(
+        &self,
+        frame: &Value,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+    ) -> Result<Value, HostError> {
         let stream =
             tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(&self.grant.endpoint))
                 .await
@@ -243,9 +259,12 @@ impl DaemonControl {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        write_frame(&mut writer, frame, BUSINESS_FRAME_BYTES)
-            .await
-            .map_err(|error| HostError::before(&error.code, error.message))?;
+        if let Some(dispatch) = dispatch {
+            dispatch
+                .begin()
+                .map_err(|error| HostError::before(&error.code, error.message))?;
+        }
+        write_frame(&mut writer, frame, BUSINESS_FRAME_BYTES).await?;
         let response = tokio::time::timeout(
             DAEMON_ANSWER_TIMEOUT,
             read_frame(&mut reader, BUSINESS_FRAME_BYTES),

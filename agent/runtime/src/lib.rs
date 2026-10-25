@@ -401,6 +401,7 @@ struct Inner {
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
     /// Where Chats with a Folder run their commands and Ticks; `None` when Chats have no Folder.
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+    local_tick_tools: std::sync::OnceLock<Arc<crate::hosted::tools::HostedTickTools>>,
     tool_policy: ToolPolicy,
     citation_style: CitationStyle,
     host_rules: Vec<PermissionRule>,
@@ -409,7 +410,7 @@ struct Inner {
     /// The permits each request to a model's vendor takes, in order.
     request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
-    shells: Arc<crate::hosted::shells::ShellTasks>,
+    shells: std::sync::RwLock<Arc<crate::hosted::shells::ShellTasks>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
     tick_stream_installed: AtomicBool,
@@ -1144,7 +1145,8 @@ impl Agent {
 
     /// The environment's hosted Ticks, which its Chats' Monitors list and close directly.
     pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
-        self.inner.environment.as_ref()?.hosted_ticks()
+        self.inner.environment.as_ref()?;
+        self.inner.local_tick_tools.get().cloned()
     }
 
     /// Grants this Agent's Shell spawns and views in a Tickhost after it was built, for an Agent
@@ -1152,7 +1154,7 @@ impl Agent {
     /// without an environment ignores it.
     pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
         if self.inner.environment.is_some() {
-            self.inner.shells.install_grants(grants);
+            self.shell_tasks().install_grants(grants);
         }
     }
 
@@ -1166,7 +1168,7 @@ impl Agent {
     }
 
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
-        self.inner.shells.clone()
+        self.inner.shells.read().unwrap().clone()
     }
 
     /// Registers the provider's current tools without refreshing remote directories. Call
@@ -1192,6 +1194,16 @@ impl Agent {
                     definition.name
                 )));
             }
+        }
+        if self.inner.environment.is_some()
+            && let Some(tools) = provider.local_tick_tools()
+            && self.inner.local_tick_tools.set(tools.clone()).is_ok()
+            && !self.shell_tasks().has_grants()
+            && let Some(environment) = tools.shell_environment()
+        {
+            let tasks = environment.tasks();
+            tasks.follow_monitor(self.downgrade());
+            *self.inner.shells.write().unwrap() = tasks;
         }
         *self.inner.host_tools.write().unwrap() = Some(provider);
         Ok(())
@@ -2012,12 +2024,8 @@ impl Agent {
                 host_tools: std::sync::RwLock::new(None),
                 // Until a daemon grants its spawns and views, an Agent runs and shows no shell
                 // command.
-                shells: crate::hosted::shells::ShellTasks::new(
-                    environment
-                        .as_ref()
-                        .and_then(|environment| environment.shell_grants())
-                        .unwrap_or_else(|| Arc::new(crate::hosted::shells::NoDaemon)),
-                ),
+                shells: std::sync::RwLock::new(crate::hosted::shells::ShellTasks::without_grants()),
+                local_tick_tools: std::sync::OnceLock::new(),
                 environment,
                 tool_policy,
                 citation_style,
@@ -2049,7 +2057,7 @@ impl Agent {
                 handover: CancellationToken::new(),
             }),
         };
-        agent.inner.shells.follow_monitor(agent.downgrade());
+        agent.shell_tasks().follow_monitor(agent.downgrade());
         agent.register_trigger_source_state(Arc::new(goal::GoalSourceState));
         agent.register_trigger_source_state(Arc::new(scheduled_tasks::ScheduledTasksState));
         agent

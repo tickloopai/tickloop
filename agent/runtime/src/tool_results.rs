@@ -94,6 +94,34 @@ impl Agent {
             |project| PrivateDirectory::trusted(project).join(chat_id.uuid().to_string()),
         );
         let task_output = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
+        let authority = crate::environment::ExecutionAuthority::new(chat_id);
+        let port = self
+            .inner
+            .environment
+            .as_ref()
+            .ok_or_else(|| {
+                crate::environment::ExecutionError::new("Unsupported", "no execution environment")
+            })
+            .and_then(|environment| {
+                environment.bind(
+                    crate::environment::ExecutionScope {
+                        chat: chat_id,
+                        folder: snapshot
+                            .folder
+                            .as_ref()
+                            .map(|folder| folder.to_string_lossy().into_owned()),
+                    },
+                    authority.clone(),
+                )
+            });
+        let shells = Arc::new(crate::environment::shell_host::EnvironmentShellHost::new(
+            port,
+            authority,
+            Arc::new(crate::environment::shell_host::CurrentLocalShellHost::new(
+                self.downgrade(),
+                chat_id.into(),
+            )),
+        ));
         Arc::new(
             Tools::for_chat(
                 ChatDirectory {
@@ -101,7 +129,7 @@ impl Agent {
                     task_output,
                     family_temp,
                 },
-                self.inner.shells.for_chat(chat_id.into()),
+                shells,
             )
             .with_search_configuration(
                 snapshot.search_config.clone(),

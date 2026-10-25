@@ -1,7 +1,7 @@
 //! The bytes TickManage `send_input` writes to a hosted terminal Tick: its text as it is, then its
 //! logical keys as a terminal sends them.
 
-use tickhost_connect::hosted::ATTACH_INPUT_BYTES;
+use crate::environment::TERMINAL_INPUT_BYTES;
 
 /// The logical key names `send_input` accepts, ignoring case; `Ctrl-` takes one letter or one of
 /// `@[\]^_`.
@@ -39,9 +39,9 @@ pub fn encode(text: Option<&str>, keys: &[String]) -> Result<Vec<u8>, String> {
     if bytes.is_empty() {
         return Err("send_input requires text or keys".into());
     }
-    if bytes.len() > ATTACH_INPUT_BYTES {
+    if bytes.len() > TERMINAL_INPUT_BYTES {
         return Err(format!(
-            "send_input types at most {ATTACH_INPUT_BYTES} bytes at once"
+            "send_input types at most {TERMINAL_INPUT_BYTES} bytes at once"
         ));
     }
     Ok(bytes)
@@ -82,7 +82,7 @@ mod tests {
             assert!(refused.contains(KEY_NAMES), "{refused}");
         }
         assert!(encode(Some(""), &[]).is_err());
-        assert!(encode(Some(&"x".repeat(ATTACH_INPUT_BYTES)), &[]).is_ok());
-        assert!(encode(Some(&"x".repeat(ATTACH_INPUT_BYTES)), &["Enter".into()]).is_err());
+        assert!(encode(Some(&"x".repeat(TERMINAL_INPUT_BYTES)), &[]).is_ok());
+        assert!(encode(Some(&"x".repeat(TERMINAL_INPUT_BYTES)), &["Enter".into()]).is_err());
     }
 }

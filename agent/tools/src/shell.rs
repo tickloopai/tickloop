@@ -24,7 +24,11 @@ use tickloop_agent_base::private_fs::PrivateDirectory;
 
 mod command_tables;
 mod host;
-pub use host::{ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError};
+pub use host::{
+    PreparedShellStart, PreparedShellStop, ShellExit, ShellHost, ShellLaunch, ShellPreparation,
+    ShellPreparationRequest, ShellProcess, ShellStartError, ShellStopAdmission, ShellStopError,
+    ShellStopPreparation,
+};
 mod interpreter;
 mod model_result;
 mod path_constraints;
@@ -58,6 +62,8 @@ const DISALLOWED_AUTO_BACKGROUND_COMMANDS: [&str; 1] = ["sleep"];
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ShellInput {
+    #[serde(skip)]
+    pub(super) preparation: Option<ShellPreparation>,
     command: String,
     #[serde(default, deserialize_with = "semantic_integer")]
     timeout: Option<usize>,
@@ -298,6 +304,7 @@ pub(super) fn prepare_input(input: &Value) -> Result<(String, Operation, Value),
 /// A `TaskStop` request for one of this Loop's commands.
 #[derive(Clone, Debug)]
 pub(super) struct TaskStopInput {
+    pub(super) preparation: Option<ShellStopPreparation>,
     pub(super) task_id: ModelRef<ShellTaskKind>,
 }
 
@@ -340,6 +347,7 @@ pub(super) fn prepare_task_stop(input: &Value) -> Result<(String, Operation, Val
     Ok((
         ".".into(),
         Operation::TaskStop(TaskStopInput {
+            preparation: None,
             task_id: ModelRef::new(task_id.clone()),
         }),
         json!({ "task_id": task_id }),
@@ -718,6 +726,33 @@ impl Registry {
             host,
         }
     }
+    pub(super) async fn prepare(
+        &self,
+        cwd: &Path,
+        input: &ShellInput,
+        output: &PrivateDirectory,
+        operation: Uuid,
+    ) -> Result<Option<ShellPreparation>, ToolError> {
+        output
+            .create()
+            .map_err(|error| io_error(output.path(), error))?;
+        let shell = self
+            .shell
+            .as_ref()
+            .as_ref()
+            .map_err(|error| ToolError::Rejected(error.clone()))?;
+        self.host
+            .prepare(ShellPreparationRequest {
+                operation,
+                shell: shell.clone(),
+                command: input.command.clone(),
+                cwd: cwd.into(),
+                output: output.path().join(format!("{operation}.output")),
+                description: input.description.clone(),
+            })
+            .await
+    }
+
     pub(super) fn subscribe(&self) -> broadcast::Receiver<CommandSnapshot> {
         self.events.subscribe()
     }
@@ -830,6 +865,26 @@ impl Registry {
         id: Uuid,
         owner: OwnerScope,
     ) -> Result<ProcessSnapshot, ToolError> {
+        self.stop_prepared_process(id, owner, None, CancellationToken::new())
+            .await
+    }
+
+    async fn stop_prepared_process(
+        &self,
+        id: Uuid,
+        owner: OwnerScope,
+        preparation: Option<ShellStopPreparation>,
+        cancel: CancellationToken,
+    ) -> Result<ProcessSnapshot, ToolError> {
+        if preparation
+            .as_ref()
+            .is_some_and(|prepared| prepared.target() != id)
+        {
+            return Err(ToolError::Rejected(
+                "Shell stop preparation names another task".into(),
+            ));
+        }
+        let mut previous_state = None;
         let mut updates = {
             let entries = self.entries.lock().await;
             let entry = entries.get(&id).ok_or_else(|| {
@@ -841,13 +896,36 @@ impl Registry {
                 update.snapshot.state(),
                 CommandState::Running | CommandState::Background
             ) {
+                previous_state = Some(update.snapshot.state().clone());
                 update.snapshot.set_state(CommandState::Cancelling);
                 entry.updates.send_replace(update.clone());
                 self.emit(&update.snapshot);
-                entry.cancel.cancel();
+                if preparation.is_none() {
+                    entry.cancel.cancel();
+                }
             }
             entry.updates.subscribe()
         };
+        if let (Some(prepared), Some(previous)) = (preparation, previous_state)
+            && let Err(error) = prepared.stop(cancel).await
+        {
+            let mut entries = self.entries.lock().await;
+            if let Some(entry) = entries.get_mut(&id) {
+                let mut update = entry.updates.borrow().clone();
+                if update.result.is_none() && update.snapshot.state() == &CommandState::Cancelling {
+                    update.snapshot.set_state(previous);
+                    entry.updates.send_replace(update.clone());
+                    self.emit(&update.snapshot);
+                }
+                entry.is_stopped_by_model = false;
+            }
+            return Err(ToolError::Rejected(match error {
+                ShellStopError::NotDispatched(reason) => reason,
+                ShellStopError::OutcomeUnknown(reason) => format!(
+                    "Shell stop outcome unknown after dispatch: {reason}; do not repeat the stop without inspecting the task"
+                ),
+            }));
+        }
         loop {
             let update = updates.borrow().clone();
             if update.result.is_some() {
@@ -918,6 +996,20 @@ impl Registry {
         process_output(&ProcessSnapshot::User(snapshot), offset, limit)
     }
     /// Claude Code `TaskStopTool.validateInput`: the task must exist and still be running.
+    pub(super) async fn prepare_stop(
+        &self,
+        ids: &IdContext,
+        task_id: &ModelRef<ShellTaskKind>,
+    ) -> Result<Option<ShellStopPreparation>, ToolError> {
+        let snapshot = self.running_task(ids, task_id).await?;
+        let Some(command) = snapshot.agent() else {
+            return Ok(None);
+        };
+        self.host
+            .prepare_stop(command.operation_id, CANCELLED_COMMAND_REASON)
+            .await
+    }
+
     pub(super) async fn stoppable_task(
         &self,
         ids: &IdContext,
@@ -956,10 +1048,22 @@ impl Registry {
 
     /// Stops one of the Agent's commands for the model; the user's commands are left to the
     /// user.
+    #[cfg(test)]
     pub(super) async fn stop_task(
         &self,
         ids: &IdContext,
         task_id: &ModelRef<ShellTaskKind>,
+    ) -> Result<ToolResult, ToolError> {
+        self.stop_prepared_task(ids, task_id, None, CancellationToken::new())
+            .await
+    }
+
+    pub(super) async fn stop_prepared_task(
+        &self,
+        ids: &IdContext,
+        task_id: &ModelRef<ShellTaskKind>,
+        preparation: Option<ShellStopPreparation>,
+        cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
         let snapshot = self.running_task(ids, task_id).await?;
         let Some(command) = snapshot.agent() else {
@@ -974,8 +1078,13 @@ impl Registry {
         if let Some(entry) = self.entries.lock().await.get_mut(&command.operation_id) {
             entry.is_stopped_by_model = true;
         }
-        let stopped = self.stop(command.operation_id).await?;
-        model_result::task_stopped(ids, &stopped)
+        let stopped = self
+            .stop_prepared_process(command.operation_id, OwnerScope::Agent, preparation, cancel)
+            .await?;
+        let stopped = stopped
+            .agent()
+            .ok_or_else(|| ToolError::Rejected("command belongs to the interactive user".into()))?;
+        model_result::task_stopped(ids, stopped)
     }
 
     pub(super) async fn is_stopped_by_model(&self, id: Uuid) -> bool {
@@ -1074,6 +1183,15 @@ impl Registry {
                 operation_id
             }
         };
+        if input
+            .preparation
+            .as_ref()
+            .is_some_and(|prepared| prepared.operation() != operation_id)
+        {
+            return Err(ToolError::Rejected(
+                "Shell preparation belongs to another operation".into(),
+            ));
+        }
         let directory = open_existing(cwd, true)?;
         let opened = directory.metadata().map_err(|error| io_error(cwd, error))?;
         if input.approved_directory.is_none()
@@ -1089,14 +1207,24 @@ impl Registry {
         let output_path = task_output_dir
             .path()
             .join(format!("{operation_id}.output"));
-        let output = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&output_path)
-            .map_err(|error| io_error(&output_path, error))?;
+        let output = if input
+            .preparation
+            .as_ref()
+            .is_some_and(ShellPreparation::creates_output)
+        {
+            None
+        } else {
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&output_path)
+                    .map_err(|error| io_error(&output_path, error))?,
+            )
+        };
         let initial_state = if input.run_in_background {
             CommandState::Background
         } else {
@@ -1123,7 +1251,7 @@ impl Registry {
                 exit_code: None,
                 signal: None,
                 reason: None,
-                output_ref: output_path,
+                output_ref: output_path.clone(),
                 output_bytes: 0,
             }),
             CommandOwner::User {
@@ -1142,7 +1270,7 @@ impl Registry {
                 exit_code: None,
                 signal: None,
                 reason: None,
-                output_ref: output_path,
+                output_ref: output_path.clone(),
                 output_bytes: 0,
             }),
         };
@@ -1161,19 +1289,24 @@ impl Registry {
                 handoff: None,
             },
         );
-        let started = self
-            .host
-            .start(ShellLaunch {
-                operation_id,
-                shell: shell.clone(),
-                command: input.command.clone(),
-                description: input.description.clone(),
-                cwd: cwd.into(),
-                directory,
-                output,
-                cancel: command_cancel.clone(),
-            })
-            .await;
+        let started = if let Some(prepared) = &input.preparation {
+            drop(directory);
+            prepared.start(output, command_cancel.clone()).await
+        } else {
+            self.host
+                .start(ShellLaunch {
+                    operation_id,
+                    shell: shell.clone(),
+                    command: input.command.clone(),
+                    description: input.description.clone(),
+                    cwd: cwd.into(),
+                    directory,
+                    output: output.expect("unprepared Shell uses the caller's output file"),
+                    output_path,
+                    cancel: command_cancel.clone(),
+                })
+                .await
+        };
         let foreground_timeout = input.foreground_timeout();
         let started_snapshot = match started {
             Ok(process) => {
@@ -1688,6 +1821,7 @@ mod tests {
         /// A command approved for this directory.
         fn input(&self, command: &str) -> ShellInput {
             ShellInput {
+                preparation: None,
                 command: command.into(),
                 timeout: None,
                 description: None,

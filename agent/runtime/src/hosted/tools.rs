@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    registry::{FileIdentity, TARGET_GONE},
+    registry::{FileIdentity, PreparedProgram, TARGET_GONE},
     views::{HerdrViews, WorkspaceListing, interaction_pane, not_created},
     worker_control::{DaemonControl, HostedAdmission, HostedTickPage, WorkerRequest},
 };
@@ -86,7 +86,7 @@ enum Operation {
         adapter: TickAdapter,
         command: Vec<String>,
         cwd: PathBuf,
-        executable: FileIdentity,
+        executable: PreparedProgram,
         directory: FileIdentity,
         title: String,
         /// Where a Herdr Pane shows the Tick once it runs.
@@ -137,29 +137,214 @@ struct HostedPrepared {
     operation: Operation,
 }
 
+#[derive(Clone)]
 pub struct HostedTickTools {
     daemon: DaemonControl,
+    shell_environment: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::environment::local_shells::LocalShells>>>,
+    >,
     environment: Vec<(String, String)>,
     endpoint: HostEndpointIdentity,
     /// Data bindings of the Ticks each Chat owns; another Chat of this worker never shares one.
     /// A binding goes when its Tick is closed, replaced, or missing from a complete listing.
-    bindings: Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>,
+    bindings: std::sync::Arc<Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>>,
     /// The Herdr Panes that show Ticks, for a worker in a Herdr View.
-    views: Option<HerdrViews>,
+    views: Option<std::sync::Arc<HerdrViews>>,
     /// The Tick packages installed in the worker's config root, whose programs an open finds and
     /// whose login states each model request sees.
     packages: Option<PackageStore>,
 }
 
 impl HostedTickTools {
+    pub(crate) fn bind_shell_environment(
+        &self,
+        grants: std::sync::Arc<crate::environment::local_shells::LocalShells>,
+    ) {
+        *self.shell_environment.write().unwrap() = Some(grants);
+    }
+
+    pub(crate) fn shell_environment(
+        &self,
+    ) -> Option<std::sync::Arc<crate::environment::local_shells::LocalShells>> {
+        self.shell_environment.read().unwrap().clone()
+    }
+
+    pub(crate) async fn prepare_input_bytes(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+        data: &[u8],
+    ) -> Result<PreparedHostCall, String> {
+        if data.is_empty() || data.len() > crate::environment::TERMINAL_INPUT_BYTES {
+            return Err("terminal input is empty or exceeds the input limit".into());
+        }
+        if self
+            .adapter(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?
+            != TickAdapter::Terminal
+        {
+            return Err(format!(
+                "UnsupportedCapability: {instance} is an extension Tick; operate it with TickCall and the tools it declares"
+            ));
+        }
+        let input = json!({"action":"send_input", "tick_instance_id":instance, "data":data});
+        Ok(PreparedHostCall::new(
+            TICK_MANAGE.into(),
+            input.clone(),
+            input,
+            HostToolPermission::Reviewable,
+            format!(
+                "Type {} bytes into hosted terminal Tick {instance}",
+                data.len()
+            ),
+        )
+        .with_payload(HostedPrepared {
+            operation: Operation::Input {
+                instance: instance.clone(),
+                data: data.to_vec(),
+            },
+        }))
+    }
+
+    pub(crate) fn resolved_intent(
+        call: &PreparedHostCall,
+        intent: crate::environment::ExecutionIntent,
+    ) -> crate::environment::ExecutionIntent {
+        use crate::environment::{ExecutionIntent, OpenSpec, ViewPlacement};
+        match call
+            .payload::<HostedPrepared>()
+            .map(|prepared| &prepared.operation)
+        {
+            Some(Operation::Open {
+                command,
+                cwd,
+                adapter,
+                view,
+                ..
+            }) => ExecutionIntent::Open(OpenSpec {
+                command: command.clone(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                protocol: *adapter == TickAdapter::Protocol,
+                view: view.as_ref().map(|view| ViewPlacement {
+                    workspace_id: Some(view.workspace.clone()),
+                    placement: serde_json::from_value(view.placement.summary())
+                        .expect("prepared placement has a portable form"),
+                }),
+            }),
+            _ => intent,
+        }
+    }
+
+    pub(crate) fn prepared_operation(call: &PreparedHostCall) -> Option<Uuid> {
+        match &call.payload::<HostedPrepared>()?.operation {
+            Operation::Open { operation, .. }
+            | Operation::Close { operation, .. }
+            | Operation::Reopen { operation, .. } => Some(*operation),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn revalidate_native(&self, call: &PreparedHostCall) -> Result<(), String> {
+        self.revalidate(
+            call.payload::<HostedPrepared>()
+                .ok_or("hosted Tick operation has no prepared binding")?,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_native(
+        &self,
+        chat: ChatId,
+        call: PreparedHostCall,
+        cancel: CancellationToken,
+        dispatch: Option<crate::environment::ExecutionDispatch>,
+    ) -> HostCallResult {
+        if cancel.is_cancelled() {
+            return HostCallResult::NotDispatched(
+                "hosted Tick operation was cancelled before dispatch".into(),
+            );
+        }
+        match call.into_payload::<HostedPrepared>() {
+            Ok(prepared) => {
+                self.execute_operation(chat, prepared, cancel, dispatch.as_ref())
+                    .await
+            }
+            Err(_) => HostCallResult::NotDispatched(
+                "hosted Tick operation has no prepared binding".into(),
+            ),
+        }
+    }
+
+    pub(crate) async fn execution_receipt(
+        &self,
+        chat: ChatId,
+        operation: Uuid,
+    ) -> crate::environment::ExecutionReceipt {
+        use crate::environment::{
+            ExecutionError, ExecutionReceipt, ExecutionResult, OpenedExecution,
+        };
+        let Ok(response) = self
+            .daemon
+            .request(WorkerRequest::GetHostedOperationReceipt {
+                chat: chat.into(),
+                operation,
+            })
+            .await
+        else {
+            return ExecutionReceipt::Unknown;
+        };
+        let Ok(Some(receipt)) =
+            serde_json::from_value::<Option<Receipt>>(response["receipt"].clone())
+        else {
+            return ExecutionReceipt::Unknown;
+        };
+        let result = match receipt {
+            Receipt::Opened(opened) => match self.opened(chat, json!(opened), None, None).await {
+                Ok(opened) => opened.complete(),
+                Err(_) => return ExecutionReceipt::Unknown,
+            },
+            Receipt::Closed { instance } => completed(
+                json!({"status":"closed", "host":HOSTED_HOST, "tick_instance_id":instance}),
+            ),
+            Receipt::Failed(error) if !error.dispatched => {
+                return ExecutionReceipt::NotDispatched(ExecutionError::new(
+                    error.code,
+                    error.message,
+                ));
+            }
+            _ => return ExecutionReceipt::Unknown,
+        };
+        let (result, effect) = result.into_parts();
+        let opened = match effect {
+            Some(HostEffect::OpenedTick {
+                instance,
+                title,
+                is_terminal,
+            }) => Some(OpenedExecution {
+                instance,
+                title,
+                is_terminal,
+            }),
+            _ => None,
+        };
+        ExecutionReceipt::Completed(ExecutionResult {
+            result,
+            opened,
+            shell: None,
+            handoff: None,
+        })
+    }
+
     /// `environment` is the launch environment hosted Ticks start with; the host removes
     /// inherited Herdr and Tick launch context from it.
     pub fn new(daemon: DaemonControl, environment: Vec<(String, String)>) -> Self {
         Self {
             endpoint: daemon.host_endpoint(),
             daemon,
+            shell_environment: Default::default(),
             environment,
-            bindings: Mutex::new(HashMap::new()),
+            bindings: std::sync::Arc::new(Mutex::new(HashMap::new())),
             views: None,
             packages: None,
         }
@@ -174,13 +359,13 @@ impl HostedTickTools {
 
     /// The same tools, which also show Ticks in Herdr Panes and list a Workspace's Panes.
     pub fn with_herdr_views(mut self, views: HerdrViews) -> Self {
-        self.views = Some(views);
+        self.views = Some(std::sync::Arc::new(views));
         self
     }
 
     fn views(&self) -> Result<&HerdrViews, String> {
         self.views
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| "UnsupportedCapability: this Agent does not run in Herdr".into())
     }
 
@@ -249,7 +434,7 @@ impl HostedTickTools {
         })
     }
 
-    async fn prepare(
+    pub(crate) async fn prepare(
         &self,
         chat: ChatId,
         name: &str,
@@ -380,7 +565,7 @@ impl HostedTickTools {
                     Operation::Open {
                         operation: tickloop_ids::generate(),
                         adapter,
-                        executable: FileIdentity::executable(&executable)?,
+                        executable: PreparedProgram::of(&executable)?,
                         directory: FileIdentity::directory(&cwd)?,
                         command,
                         cwd: cwd.clone(),
@@ -636,7 +821,7 @@ impl HostedTickTools {
                 view,
                 ..
             } => {
-                if FileIdentity::executable(Path::new(&command[0]))? != *executable
+                if PreparedProgram::of(Path::new(&command[0]))? != *executable
                     || FileIdentity::directory(cwd)? != *directory
                 {
                     return Err(
@@ -709,9 +894,31 @@ impl HostedTickTools {
         chat: ChatId,
         prepared: HostedPrepared,
         cancel: CancellationToken,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
     ) -> HostCallResult {
         if let Err(error) = self.revalidate(&prepared).await {
             return HostCallResult::NotDispatched(error);
+        }
+        if let (
+            Some(dispatch),
+            Operation::Open {
+                command,
+                executable,
+                ..
+            },
+        ) = (dispatch, &prepared.operation)
+        {
+            let path = command[0].clone();
+            let approved = *executable;
+            dispatch.revalidate_before_send(move || {
+                if PreparedProgram::of(Path::new(&path)).ok() != Some(approved) {
+                    return Err(crate::environment::ExecutionError::new(
+                        "TargetChanged",
+                        "the executable changed before dispatch; prepare and approve again",
+                    ));
+                }
+                Ok(())
+            });
         }
         match prepared.operation {
             Operation::ReadWorkspace { listing, .. } => {
@@ -777,7 +984,7 @@ impl HostedTickTools {
                     title: Some(title.clone()),
                     admission: self.admission(),
                 };
-                let opened = match self.lifecycle(chat, operation, request).await {
+                let opened = match self.lifecycle(chat, operation, request, dispatch).await {
                     Ok(opened) => opened,
                     Err(unresolved) => return unresolved,
                 };
@@ -786,6 +993,35 @@ impl HostedTickTools {
                     Err(unresolved) => return unresolved,
                 };
                 if let Some(view) = view {
+                    if let Some(dispatch) = dispatch {
+                        dispatch.confirm_opened(crate::environment::ExecutionResult {
+                            result: ToolResult {
+                                content: opened.result.to_string(),
+                                is_error: false,
+                                output_ref: None,
+                            },
+                            opened: Some(crate::environment::OpenedExecution {
+                                instance: opened.instance.clone(),
+                                title: opened.title.clone(),
+                                is_terminal: opened.is_terminal,
+                            }),
+                            shell: None,
+                            handoff: None,
+                        });
+                        if dispatch.check().is_err()
+                            && let crate::environment::ExecutionOutcome::Completed(result) =
+                                dispatch.interruption(operation)
+                        {
+                            return HostCallResult::CompletedWithEffect(
+                                result.result,
+                                Box::new(HostEffect::OpenedTick {
+                                    instance: opened.instance,
+                                    title: opened.title,
+                                    is_terminal: opened.is_terminal,
+                                }),
+                            );
+                        }
+                    }
                     let shown = self
                         .show(
                             chat,
@@ -814,7 +1050,7 @@ impl HostedTickTools {
                     environment: self.environment.clone(),
                     admission: self.admission(),
                 };
-                match self.lifecycle(chat, operation, request).await {
+                match self.lifecycle(chat, operation, request, dispatch).await {
                     Ok(opened) => match self.opened(chat, opened, title, Some(&lost)).await {
                         Ok(opened) => opened.complete(),
                         Err(unresolved) => unresolved,
@@ -837,7 +1073,7 @@ impl HostedTickTools {
                     Some(views) => views.panes(&instance).await.unwrap_or_default(),
                     None => Vec::new(),
                 };
-                match self.lifecycle(chat, operation, request).await {
+                match self.lifecycle(chat, operation, request, dispatch).await {
                     Ok(_) => {
                         self.bindings.lock().await.remove(&(chat, instance.clone()));
                         let mut closed = json!({"status":"closed","host":HOSTED_HOST,"tick_instance_id":instance});
@@ -865,6 +1101,11 @@ impl HostedTickTools {
                     Ok(connection) => connection,
                     Err(error) => return HostCallResult::NotDispatched(error.to_string()),
                 };
+                if let Some(dispatch) = dispatch
+                    && let Err(error) = dispatch.begin()
+                {
+                    return HostCallResult::NotDispatched(error.to_string());
+                }
                 match connection
                     .request("input", json!({"data":data}), CONTROL_TIMEOUT)
                     .await
@@ -888,6 +1129,11 @@ impl HostedTickTools {
                     Ok(connection) => connection,
                     Err(error) => return HostCallResult::NotDispatched(error.to_string()),
                 };
+                if let Some(dispatch) = dispatch
+                    && let Err(error) = dispatch.begin()
+                {
+                    return HostCallResult::NotDispatched(error.to_string());
+                }
                 match connection
                     .request(
                         "call",
@@ -936,8 +1182,9 @@ impl HostedTickTools {
         chat: ChatId,
         operation: Uuid,
         request: WorkerRequest,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
     ) -> Result<Value, HostCallResult> {
-        let lost = match self.daemon.request(request).await {
+        let lost = match self.daemon.request_guarded(request, dispatch).await {
             Ok(answer) => return Ok(answer),
             Err(error) if !error.dispatched => {
                 return Err(HostCallResult::NotDispatched(error.to_string()));
@@ -949,6 +1196,11 @@ impl HostedTickTools {
                 "{reason}; the result of operation {operation} is unknown — do not repeat it"
             ))
         };
+        if let Some(dispatch) = dispatch
+            && let Err(error) = dispatch.check()
+        {
+            return Err(unknown(format!("{lost}; {error}")));
+        }
         let receipt = self
             .daemon
             .request(WorkerRequest::GetHostedOperationReceipt {
@@ -1100,7 +1352,7 @@ impl HostedTickTools {
         )
     }
 
-    async fn read(&self, chat: ChatId, instance: &InstanceRef) -> Result<Value, String> {
+    pub(crate) async fn read(&self, chat: ChatId, instance: &InstanceRef) -> Result<Value, String> {
         let adapter = self
             .adapter(chat, instance)
             .await
@@ -1555,6 +1807,10 @@ fn completed(value: Value) -> HostCallResult {
 
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
+    fn local_tick_tools(&self) -> Option<std::sync::Arc<HostedTickTools>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn is_concurrency_safe(&self, name: &str, _input: &Value) -> bool {
         matches!(
             name,
@@ -1636,6 +1892,24 @@ impl HostToolProvider for HostedTickTools {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before preparation".into());
         }
+        if matches!(name, TICK_READ | TICK_DESCRIBE | TICK_CALL)
+            || name == TICK_MANAGE
+                && matches!(
+                    input["action"].as_str(),
+                    Some("open" | "close" | "send_input" | "reopen")
+                )
+        {
+            return crate::environment::prepare_hosted_call(
+                std::sync::Arc::new(self.clone()),
+                chat,
+                name,
+                input,
+                None,
+                cancel,
+                self.views.is_some(),
+            )
+            .await;
+        }
         self.prepare(chat, name, input, None).await
     }
 
@@ -1650,22 +1924,40 @@ impl HostToolProvider for HostedTickTools {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before preparation".into());
         }
+        if matches!(name, TICK_READ | TICK_DESCRIBE | TICK_CALL)
+            || name == TICK_MANAGE
+                && matches!(
+                    input["action"].as_str(),
+                    Some("open" | "close" | "send_input" | "reopen")
+                )
+        {
+            return crate::environment::prepare_hosted_call(
+                std::sync::Arc::new(self.clone()),
+                chat,
+                name,
+                input,
+                scope.context,
+                cancel,
+                self.views.is_some(),
+            )
+            .await;
+        }
         self.prepare(chat, name, input, scope.context).await
     }
 
     async fn revalidate_call(
         &self,
-        _chat: ChatId,
+        chat: ChatId,
         call: &PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before dispatch".into());
         }
-        let prepared = call
-            .payload::<HostedPrepared>()
-            .ok_or("hosted Tick operation has no prepared binding")?;
-        self.revalidate(prepared).await
+        if crate::environment::tools::is_environment_call(call) {
+            return crate::environment::tools::revalidate_call(chat, call).await;
+        }
+        self.revalidate_native(call).await
     }
 
     async fn execute_prepared(
@@ -1679,12 +1971,10 @@ impl HostToolProvider for HostedTickTools {
                 "hosted Tick operation was cancelled before dispatch".into(),
             );
         }
-        match call.into_payload::<HostedPrepared>() {
-            Ok(prepared) => self.execute_operation(chat, prepared, cancel).await,
-            Err(_) => HostCallResult::NotDispatched(
-                "hosted Tick operation has no prepared binding".into(),
-            ),
+        if crate::environment::tools::is_environment_call(&call) {
+            return crate::environment::tools::execute_call(chat, call, cancel).await;
         }
+        self.execute_native(chat, call, cancel, None).await
     }
 
     async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
@@ -1698,8 +1988,6 @@ impl HostToolProvider for HostedTickTools {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use tickhost::host::{TickOwner, TickRow, TickState};
     use tickhost_connect::{
         hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame},
@@ -1842,6 +2130,7 @@ mod tests {
                     },
                 },
                 CancellationToken::new(),
+                None,
             )
             .await;
         let HostCallResult::NotDispatched(result) = moved else {
@@ -1886,21 +2175,6 @@ mod tests {
             );
         }
         assert!(herdr.refused.lock().unwrap().is_empty());
-    }
-
-    async fn bound(tools: &HostedTickTools) -> HashSet<(ChatId, InstanceRef)> {
-        tools.bindings.lock().await.keys().cloned().collect()
-    }
-
-    async fn bind(tools: &HostedTickTools, chat: ChatId, instance: &InstanceRef) {
-        tools.bindings.lock().await.insert(
-            (chat, instance.clone()),
-            DataBinding {
-                endpoint: "/nonexistent/host.sock".into(),
-                data_token: "token".into(),
-                adapter: TickAdapter::Protocol,
-            },
-        );
     }
 
     /// The approval names the whole command and the launch keeps it, while the title the Chat
@@ -1959,48 +2233,5 @@ mod tests {
         ));
         assert!(!is_same_file(&other, Some(bundled.clone())));
         assert!(!is_same_file(&bundled, None));
-    }
-
-    /// A binding goes once its Tick is no longer listed running, is looked up as gone, or was
-    /// lost and reopened as a new instance; another Chat's bindings are never touched.
-    #[tokio::test]
-    async fn bindings_of_ticks_that_ended_or_were_replaced_are_forgotten() {
-        let directory = tempfile::Builder::new()
-            .prefix("htb")
-            .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
-            .unwrap();
-        let (chat, other) = (ChatId::new(), ChatId::new());
-        let hosted = || InstanceRef::hosted(Uuid::new_v4());
-        let (running, ended, elsewhere) = (hosted(), hosted(), hosted());
-        let tools = HostedTickTools::new(
-            listing_daemon(directory.path(), chat, std::slice::from_ref(&running)),
-            Vec::new(),
-        );
-
-        bind(&tools, chat, &ended).await;
-        bind(&tools, other, &elsewhere).await;
-        tools.members(chat).await.unwrap();
-        assert_eq!(
-            bound(&tools).await,
-            HashSet::from([(chat, running.clone()), (other, elsewhere.clone())])
-        );
-
-        bind(&tools, chat, &ended).await;
-        let gone = tools.data(chat, &hosted()).await.err().unwrap();
-        assert_eq!(gone.code, TARGET_GONE);
-        assert_eq!(
-            bound(&tools).await,
-            HashSet::from([(chat, running.clone()), (other, elsewhere.clone())]),
-            "looking up a gone Tick forgets every unlisted one of the Chat"
-        );
-
-        let (lost, reopened) = (hosted(), hosted());
-        bind(&tools, chat, &lost).await;
-        let opened = json!({"instance":reopened,"adapter":"protocol","terminal":{"endpoint":"/nonexistent/host.sock"},"data_token":"token"});
-        assert!(tools.opened(chat, opened, None, Some(&lost)).await.is_ok());
-        assert_eq!(
-            bound(&tools).await,
-            HashSet::from([(chat, running), (chat, reopened), (other, elsewhere)])
-        );
     }
 }

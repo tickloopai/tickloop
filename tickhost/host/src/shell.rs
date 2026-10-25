@@ -296,6 +296,17 @@ pub async fn submit(
     directory: &std::fs::File,
     output: &std::fs::File,
 ) -> Result<SubmittedShell, HostError> {
+    submit_checked(endpoint, grant, request, directory, output, || Ok(())).await
+}
+
+pub async fn submit_checked(
+    endpoint: &std::path::Path,
+    grant: &SpawnGrant,
+    request: &SpawnRequest,
+    directory: &std::fs::File,
+    output: &std::fs::File,
+    before_dispatch: impl FnOnce() -> Result<(), HostError>,
+) -> Result<SubmittedShell, HostError> {
     let mut connection = HostConnection::connect(
         endpoint,
         Role::Spawner {
@@ -308,6 +319,7 @@ pub async fn submit(
     connection
         .send_descriptors(&[directory.as_raw_fd(), output.as_raw_fd()])
         .await?;
+    before_dispatch()?;
     let spawned = connection
         .request("spawn", json!(request), CONTROL_TIMEOUT)
         .await?;
