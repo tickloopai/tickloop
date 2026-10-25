@@ -287,12 +287,20 @@ _Avoid_: short ID, serial number
 
 This section covers only concepts encountered in the open-source part; internal components of the hosted service are not described in this repository.
 
+**Tickloop Code**:
+The terminal AI agent for code and office work that the `tickloop` command starts; this repository builds it. Always written in full: a bare "Code" is not the product name.
+_Avoid_: local tickloop, CLI (as a product name)
+
+**Tickloop Chat**:
+The product through which users use Chat and Work via Web/App, run by Tickloop Cloud. Always written in full: a bare "Chat" is a conversation, never the product.
+_Avoid_: Chat (as a product name), cloud agent
+
 **Tickloop Cloud**:
-Tickloop's hosted service, through which users use Chat and Work via Web/App; Tickloop Artifacts and the website are also built and deployed by it, and its server is not in this repository. It shares the open-source Harness, AgentAccess protocol, and Tickhost with local tickloop.
+Tickloop's hosted service that runs Tickloop Chat; Tickloop Artifacts and the website are also built and deployed by it, and its server is not in this repository. It shares the open-source Harness and Tickhost with Tickloop Code.
 _Avoid_: cloud service, server
 
 **Harness**:
-The open-source library that advances turns per Chat: it runs the Loop, tools and permission approval, Subagents, and model calls, and reaches the outside only through Seams (Transcript Store, Execution Environment, Model Endpoint, Credential Source).
+The open-source library that advances turns per Chat: it runs the Loop, tools and permission approval, Subagents, and model calls, and reaches the outside only through Seams (Transcript Store, Execution Environment, Model Endpoint, Credential Source, Settings Store).
 _Avoid_: Agent Runtime, engine
 
 **Stateless Host**:
@@ -324,7 +332,7 @@ A Chat with a Folder bound; it is a state of a Chat, not a separate kind of conv
 _Avoid_: Cowork, agent mode, work mode
 
 **Tickloop Accounts**:
-Tickloop's single account and login service, a standard OIDC provider; Tickloop Cloud, Tickloop Artifacts, and local tickloop all log in with it, and terminals log in with a device code. Short name: Accounts.
+Tickloop's single account and login service, a standard OIDC provider; Tickloop Cloud, Tickloop Artifacts, and Tickloop Code all log in with it, and terminals log in with a device code. Short name: Accounts.
 _Avoid_: Account Service, IdP, authentication service, login service, SSO service
 
 **Tickloop Account**:
