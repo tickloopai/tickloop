@@ -1,4 +1,5 @@
 use crate::support::provider_transport;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::model_http_support;
 
 use tickloop_agent_model::{LocalModelClients, ModelClients, ModelRequest};

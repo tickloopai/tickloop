@@ -72,6 +72,7 @@ check: check-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check-workspace:
+	node scripts/check-settings-boundaries.mjs
 	cargo fmt --all --check
 	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings

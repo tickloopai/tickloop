@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-agent-policy = { path = "../policy" }
 async-trait = "0.1"
 base64 = "0.22"
 libc = "0.2"
@@ -21,7 +22,7 @@ sha2 = "0.10"
 tempfile = "3"
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-client = { path = "../client" }
-tickloop-agent-config = { path = "../config" }
+tickloop-agent-settings = { path = "../settings" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-runtime = { path = "../runtime" }
@@ -37,6 +38,7 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }

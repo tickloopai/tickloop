@@ -18,9 +18,12 @@ use uuid::Uuid;
 
 use super::{Agent, AgentError, Chat, ChatBookkeeping};
 use tickloop_agent_base::output_style::OutputStyle;
-use tickloop_agent_config::new_chat::new_chat_settings;
-use tickloop_agent_config::{LoadedSettings, ProjectRuleChanges, SettingsError, UserSettings};
 use tickloop_agent_model::{ModelClient, validate_reasoning_effort};
+use tickloop_agent_policy::ProjectRuleChanges;
+use tickloop_agent_policy::new_chat::new_chat_settings;
+use tickloop_agent_policy::settings::{
+    SettingsSnapshot, SettingsStore, SettingsStoreError, SettingsUpdate,
+};
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, Decision, ModelConfig, PermissionRule, ReasoningEffort,
 };
@@ -78,12 +81,16 @@ impl Agent {
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
     ) -> OutputStyle {
-        let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
+        let mut saved = self
+            .inner
+            .settings
+            .as_ref()
+            .map(|settings| settings.read(snapshot.folder.as_deref()));
         match &self.inner.search {
             super::SearchDefaults::Fixed(config) => snapshot.search_config = config.clone(),
             super::SearchDefaults::UserSettings => {
                 if let Some(saved) = &mut saved {
-                    snapshot.search_config = saved.search_config();
+                    snapshot.search_config = saved.search.clone();
                 } else if snapshot.delegation.is_none() {
                     snapshot.search_config =
                         tickloop_agent_protocol::SearchConfig::enabled_default();
@@ -101,24 +108,27 @@ impl Agent {
             },
             |_| defaults.task_tools_enabled,
         );
-        let Some(mut saved) = saved else {
+        let Some(saved) = saved else {
             return OutputStyle::default();
         };
         snapshot.context_window_tokens = defaults.context_window_tokens;
         snapshot.reasoning_effort = defaults.reasoning_effort;
         snapshot.thinking_enabled = defaults.thinking_enabled;
-        let output_style = saved.output_style();
+        let output_style = saved.output_style;
         self.replace_persistent_rules(snapshot, bookkeeping, saved);
         output_style
     }
 
     /// Reads user settings on a blocking thread; returns `None` for Agents that do not read or
     /// write settings.
-    pub(super) async fn load_user_settings(&self) -> Result<Option<LoadedSettings>, AgentError> {
+    pub(super) async fn load_user_settings(
+        &self,
+        project: Option<PathBuf>,
+    ) -> Result<Option<SettingsSnapshot>, AgentError> {
         let Some(settings) = self.inner.settings.clone() else {
             return Ok(None);
         };
-        tokio::task::spawn_blocking(move || settings.load())
+        tokio::task::spawn_blocking(move || settings.read(project.as_deref()))
             .await
             .map(Some)
             .map_err(|error| AgentError::Storage(error.to_string()))
@@ -130,7 +140,7 @@ impl Agent {
         &self,
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
-        mut saved: LoadedSettings,
+        saved: SettingsSnapshot,
     ) {
         // A Chat without a Folder belongs to no project, which persistent rules partition by.
         let Some(folder) = snapshot.folder.clone() else {
@@ -139,7 +149,7 @@ impl Agent {
         if snapshot.delegation.is_some() {
             return;
         }
-        let rules = saved.permission_rules(&folder);
+        let rules = saved.project.rules;
         snapshot.policy.rules.retain(|rule| !rule.persistent);
         bookkeeping.persistent_rule_projects =
             rules.iter().map(|rule| (rule.id, folder.clone())).collect();
@@ -148,7 +158,7 @@ impl Agent {
             .settings_warnings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(snapshot.id, saved.into_warnings());
+            .insert(snapshot.id, saved.warnings);
     }
 
     /// Chats created or resumed afterwards use this model.
@@ -165,8 +175,14 @@ impl Agent {
         config: ModelConfig,
         clear_context_window: bool,
     ) -> Result<(), AgentError> {
-        self.write_user_settings(move |settings| settings.save_model(&config, clear_context_window))
-            .await
+        self.write_user_settings(move |settings| {
+            settings.write(SettingsUpdate::Model {
+                model: config,
+                clear_context_window,
+                thinking: None,
+            })
+        })
+        .await
     }
 
     pub(super) async fn save_model_and_thinking_setting(
@@ -176,7 +192,11 @@ impl Agent {
         effort: Option<ReasoningEffort>,
     ) -> Result<(), AgentError> {
         self.write_user_settings(move |settings| {
-            settings.save_model_with_thinking(&config, clear_context_window, effort)
+            settings.write(SettingsUpdate::Model {
+                model: config,
+                clear_context_window,
+                thinking: Some(effort),
+            })
         })
         .await
     }
@@ -193,8 +213,10 @@ impl Agent {
             validate_reasoning_effort(&chat.snapshot.model, effort)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
         }
-        self.write_user_settings(move |settings| settings.save_reasoning_effort(effort))
-            .await?;
+        self.write_user_settings(move |settings| {
+            settings.write(SettingsUpdate::ReasoningEffort(effort))
+        })
+        .await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         validate_reasoning_effort(&chat.snapshot.model, effort)
@@ -215,8 +237,10 @@ impl Agent {
         if !self.inner.chats.lock().await.contains_key(&chat_id) {
             return Err(AgentError::NotFound);
         }
-        self.write_user_settings(move |settings| settings.save_task_tools_enabled(enabled))
-            .await?;
+        self.write_user_settings(move |settings| {
+            settings.write(SettingsUpdate::TaskTools(enabled))
+        })
+        .await?;
         self.apply_task_tools_setting(enabled).await;
         Ok(())
     }
@@ -234,8 +258,8 @@ impl Agent {
 
     pub(super) async fn refresh_task_tools_setting(&self) -> Result<(), AgentError> {
         let _settings_gate = self.inner.settings_writes.lock().await;
-        if let Some(mut settings) = self.load_user_settings().await? {
-            self.apply_task_tools_setting(settings.task_tools_enabled())
+        if let Some(settings) = self.load_user_settings(None).await? {
+            self.apply_task_tools_setting(settings.task_tools_enabled)
                 .await;
         }
         Ok(())
@@ -271,7 +295,10 @@ impl Agent {
             .then_some(ReasoningEffort::On)
         };
         self.write_user_settings(move |settings| {
-            settings.save_thinking_enabled_with_effort(enabled, enable_effort)
+            settings.write(SettingsUpdate::Thinking {
+                enabled,
+                effort: enable_effort,
+            })
         })
         .await?;
         let mut chats = self.inner.chats.lock().await;
@@ -292,16 +319,20 @@ impl Agent {
         &self,
         tokens: usize,
     ) -> Result<(), AgentError> {
-        self.write_user_settings(move |settings| settings.save_context_window(tokens))
-            .await
+        self.write_user_settings(move |settings| {
+            settings.write(SettingsUpdate::ContextWindow(tokens))
+        })
+        .await
     }
 
     pub async fn save_default_execution_mode(
         &self,
         mode: tickloop_agent_protocol::ExecutionMode,
     ) -> Result<(), AgentError> {
-        self.write_user_settings(move |settings| settings.save_default_execution_mode(mode))
-            .await
+        self.write_user_settings(move |settings| {
+            settings.write(SettingsUpdate::ExecutionMode(mode))
+        })
+        .await
     }
 
     /// Writes persistent rule changes to their respective project partitions in user settings.
@@ -313,25 +344,19 @@ impl Agent {
             return Ok(());
         }
         let changes = changes.clone();
-        self.write_user_settings(move |settings| {
-            settings.update_permission_rules(
-                changes
-                    .iter()
-                    .map(|(project, change)| (project.as_path(), change)),
-            )
-        })
-        .await
+        self.write_user_settings(move |settings| settings.write_permissions(&changes, None))
+            .await
     }
 
     /// Settings writes include `sync_all`, so they run on a blocking thread.
     pub(super) async fn write_user_settings(
         &self,
-        write: impl FnOnce(&UserSettings) -> Result<(), SettingsError> + Send + 'static,
+        write: impl FnOnce(&dyn SettingsStore) -> Result<(), SettingsStoreError> + Send + 'static,
     ) -> Result<(), AgentError> {
         let Some(settings) = self.inner.settings.clone() else {
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || write(&settings))
+        tokio::task::spawn_blocking(move || write(settings.as_ref()))
             .await
             .map_err(|error| AgentError::Storage(error.to_string()))?
             .map_err(|error| AgentError::Storage(error.to_string()))
@@ -391,11 +416,12 @@ impl Agent {
             return Ok(());
         };
         let project = folder.clone();
-        let (mut rules, warnings, _) =
-            tokio::task::spawn_blocking(move || settings.project_rules_with_revision(&project))
+        let project_settings =
+            tokio::task::spawn_blocking(move || settings.read(Some(&project)).project)
                 .await
-                .map_err(|error| AgentError::Storage(error.to_string()))?
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
+        let mut rules = project_settings.rules;
+        let warnings = project_settings.warnings;
         if is_delegated {
             rules.retain(|rule| matches!(rule.decision, Decision::Ask | Decision::Deny));
         }

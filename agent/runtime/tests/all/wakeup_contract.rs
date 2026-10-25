@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use tick_protocol::InstanceRef;
@@ -1368,7 +1369,7 @@ impl Source for OneTaskSource {
                 process.chat,
                 tickloop_agent_runtime::NewScheduledTask::new(
                     "0 0 * * *",
-                    tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT,
+                    tickloop_agent_policy::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT,
                     true,
                 ),
             )

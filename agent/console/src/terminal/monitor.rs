@@ -1975,10 +1975,10 @@ mod signal_tests {
     use super::*;
     use crate::monitor_rows::{MonitorRows, RowUpdate};
     use std::sync::{Arc, Mutex};
-    use tickloop_agent_config::DisplayPreferences;
     use tickloop_agent_protocol::{
         LoopState, TickLinkState, TickSubscriptionFrequency, TickSubscriptionStatus,
     };
+    use tickloop_agent_settings::DisplayPreferences;
 
     const UPDATED_AT: u64 = 10_000;
     const HANDLED_AT: u64 = 10_500;

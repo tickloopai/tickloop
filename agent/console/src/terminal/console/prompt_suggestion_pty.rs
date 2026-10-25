@@ -113,7 +113,7 @@ fn prompt_suggestion_pty_fixture() {
                             model_selected: true,
                             launch_arguments: Vec::new(),
                             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
-                            user_settings: Some(tickloop_agent_config::UserSettings::in_root(
+                            user_settings: Some(tickloop_agent_settings::UserSettings::in_root(
                                 &directory,
                             )),
                         },

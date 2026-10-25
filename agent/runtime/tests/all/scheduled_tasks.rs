@@ -2,6 +2,7 @@
 //! time the Harness reported.
 
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use chrono::{DateTime, TimeZone, Utc};
 use tickloop_agent_protocol::{AgentHostOptions, ChatId, PromptPolicy, ScheduledTask};

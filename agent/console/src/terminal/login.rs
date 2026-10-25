@@ -1095,7 +1095,7 @@ mod tests {
             let config = tickloop_agent_model::cards::ModelCatalog::defaults()
                 .get("openai-codex", model)
                 .unwrap();
-            tickloop_agent_config::UserSettings::in_root(&root.join("state"))
+            tickloop_agent_settings::UserSettings::in_root(&root.join("state"))
                 .save_model(&config, false)
                 .unwrap();
         }
@@ -1627,7 +1627,7 @@ mod tests {
                 "saved login must open models without authenticating again"
             );
             if selected_model == Some("gpt-5.6-sol") {
-                let saved = tickloop_agent_config::UserSettings::in_root(&root.join("state"))
+                let saved = tickloop_agent_settings::UserSettings::in_root(&root.join("state"))
                     .model()
                     .unwrap();
                 assert_eq!(saved.model, "gpt-5.6-sol");

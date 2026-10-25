@@ -800,8 +800,8 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
     let fixture = PrivateFixture::new();
     let socket = herdr.socket();
     let result = AssertUnwindSafe(async {
-        tickloop_agent_config::UserSettings::in_root(&fixture.path("config"))
-            .save_monitor_popup(tickloop_agent_config::MonitorPopup::Disabled)
+        tickloop_agent_settings::UserSettings::in_root(&fixture.path("config"))
+            .save_monitor_popup(tickloop_agent_settings::MonitorPopup::Disabled)
             .unwrap();
         let mut view = view_with_keys_ticks(
             &fixture,

@@ -151,7 +151,7 @@ fn progress_bar(columns: usize, percent: Option<u8>, now_ms: u64, reduced_motion
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_agent_config::DisplayPreferences;
+    use tickloop_agent_settings::DisplayPreferences;
     use tickloop_agent_updater::UpdateProgress;
 
     #[test]

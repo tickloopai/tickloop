@@ -12,7 +12,7 @@ use tickloop_agent_protocol::{MAX_SCHEDULED_TASK_TITLE_CHARS, ToolDefinition};
 
 use super::tasks::{CronTask, TaskRules, duration_words, rate, title};
 use crate::host_tools::HostToolPermission;
-use tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTRUCTIONS_PLACEHOLDER;
+use tickloop_agent_policy::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT as LOOP_INSTRUCTIONS_PLACEHOLDER;
 
 pub(crate) const CRON_CREATE_TOOL_NAME: &str = "CronCreate";
 pub(crate) const CRON_LIST_TOOL_NAME: &str = "CronList";

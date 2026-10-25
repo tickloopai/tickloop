@@ -5,7 +5,9 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_runtime::ChatSnapshotExt;
-use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent, opened_agent};
+use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_agent_settings::local_agent::opened_agent;
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{ScriptedModel, next_event, persisted_config as config, text};
 use uuid::Uuid;
 

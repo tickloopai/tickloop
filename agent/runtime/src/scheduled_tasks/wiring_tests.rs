@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_agent_settings::loop_skill::LoopFiles;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -855,12 +856,13 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
     let chats = agent.inner.chats.lock().await;
     let chat = &chats[&chat];
     let task = task_with(DEFAULT_INSTRUCTIONS_PROMPT);
+    let settings = tickloop_agent_settings::UserSettings::in_root(directory.path());
     assert!(
-        run_input(chat, &task, None)
+        run_input(chat, &task, Some(&settings))
             .0
             .contains("built-in maintenance instructions"),
         "{}",
-        run_input(chat, &task, None).0
+        run_input(chat, &task, Some(&settings)).0
     );
     std::fs::create_dir_all(directory.path().join(".tickloop")).unwrap();
     std::fs::write(
@@ -868,7 +870,7 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
         "Triage the open issues.",
     )
     .unwrap();
-    let (input, wrappers) = run_input(chat, &task, None);
+    let (input, wrappers) = run_input(chat, &task, Some(&settings));
     let origin = chat
         .snapshot
         .folder
@@ -894,7 +896,7 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
         .instructions()
         .unwrap_err()
         .to_string();
-    let (input, wrappers) = run_input(chat, &task, None);
+    let (input, wrappers) = run_input(chat, &task, Some(&settings));
     assert_eq!(
         wrappers,
         vec![ScheduledInputWrapper::LoopInstructionsError {

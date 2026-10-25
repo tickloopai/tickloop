@@ -2,6 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tickloop_agent_protocol::{AgentColor, EventKind, ExecutionMode};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
 use tickloop_agent_test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,

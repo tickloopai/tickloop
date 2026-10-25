@@ -25,7 +25,7 @@ async fn shell_view_shows(pty: &PtyView, command: &str, output: &str, status: &s
 }
 
 async fn run_shared_task_list(fixture: &PrivateFixture) {
-    tickloop_agent_config::UserSettings::in_root(&fixture.path("config"))
+    tickloop_agent_settings::UserSettings::in_root(&fixture.path("config"))
         .save_task_tools_enabled(true)
         .unwrap();
     let (base_url, mut requests, mut releases) = model_http_support::serve_responses_with_gated_responses(vec![

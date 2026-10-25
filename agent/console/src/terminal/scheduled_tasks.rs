@@ -23,7 +23,7 @@ const MINUTES_PER_DAY: u32 = HOURS_PER_DAY * MINUTES_PER_HOUR;
 fn instruction(prompt: &str) -> &str {
     if matches!(
         prompt,
-        tickloop_agent_config::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT | "/loop"
+        tickloop_agent_settings::loop_skill::DEFAULT_INSTRUCTIONS_PROMPT | "/loop"
     ) {
         "loop.md or maintenance instructions"
     } else {

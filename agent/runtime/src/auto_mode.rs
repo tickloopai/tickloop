@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn overall_decisions_validate_without_per_rule_findings() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         for block in [false, true] {
             let result = tickloop_agent_test_support::auto_classification(block);
             assert!(jsonschema::is_valid(&classifier_schema(&policy), &result));
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn complete_json_wrappers_preserve_the_classification() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         let result = tickloop_agent_test_support::auto_classification(false);
         for wrapped in [
             format!("```json\n{result}\n```"),
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn invalid_or_conflicting_decisions_never_allow() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         let raw = tickloop_agent_test_support::auto_classification(false).to_string();
         for text in [
             format!("Here is the result: {raw}"), format!("{raw}\n{raw}"),
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_user_boundary_block_can_cite_the_policy_territory_it_touches() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         let result = json!({"decision":"block_user_boundary", "reason":"Sending the file violates the user's explicit no-upload boundary", "rule_id":"builtin.soft_deny.credential_leakage"});
         assert!(
             matches!(parse_verdict(&output(&result.to_string()), &policy), Ok(RuleVerdict::Block { kind: tickloop_agent_protocol::AutoBlockKind::TaskScope, rule_id:Some(id), .. }) if id == "builtin.soft_deny.credential_leakage")
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_hard_block_preserves_the_non_overridable_category() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         let result =
             json!({"decision":"block_hard","reason":"A hard restriction applies","rule_id":null});
         assert!(matches!(
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn mismatched_policy_categories_remain_invalid_and_explain_the_specific_repair() {
-        let policy = tickloop_agent_config::AutoSettings::default().policy();
+        let policy = tickloop_agent_policy::AutoSettings::default().policy();
         for (wrong, corrected, rule_id, expected_kind) in [
             (
                 "block_hard",
@@ -554,7 +554,7 @@ mod tests {
             None,
             None,
             snapshot.folder.as_deref().unwrap(),
-            tickloop_agent_config::AutoSettings::default().policy(),
+            tickloop_agent_policy::AutoSettings::default().policy(),
         )
         .unwrap();
         let request = classifier_request(

@@ -73,7 +73,7 @@ async fn environment_setup_preview_and_save(fixture: &PrivateFixture) {
     ])
     .await;
     fixture.set_chat_model(&url);
-    let settings = tickloop_agent_config::UserSettings::in_root(&fixture.path("config"));
+    let settings = tickloop_agent_settings::UserSettings::in_root(&fixture.path("config"));
     let mut view = PtyView::start_with_flags(fixture, &["--mode", "auto"]);
     view.wait_for("new input", new_input_is_visible).await;
     view.send(b"Say SETUP-READY\r");
@@ -151,7 +151,7 @@ async fn environment_setup_preview_and_save(fixture: &PrivateFixture) {
             .policy_for_directory(&fixture.path("work").canonicalize().unwrap())
             .environment
             .text,
-        tickloop_agent_config::AutoSettings::default()
+        tickloop_agent_settings::AutoSettings::default()
             .policy()
             .environment
             .text

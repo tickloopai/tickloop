@@ -28,7 +28,7 @@ const DEFAULT_POLICY_CASES: &str =
     include_str!("../tests/fixtures/approval-parity/default-policy-review-cases.json");
 
 fn context(case: &Value) -> ApprovalSnapshot {
-    let policy = tickloop_agent_config::AutoSettings::default().policy();
+    let policy = tickloop_agent_policy::AutoSettings::default().policy();
     let owned = case["id"] == "owned_tick_cleanup";
     let instance = tick_protocol::InstanceRef::hosted(Uuid::from_u128(1));
     let mut input = case["input"].clone();

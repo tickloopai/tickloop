@@ -5,7 +5,7 @@
 use std::{collections::HashMap, future::Future, path::Path};
 
 use tick_packages::PackageStore;
-use tickloop_agent_packages::{
+use tickloop_tick_installer::{
     DeviceLogin, LoggedOut, LoginError, MarketplaceSource, needs_no_login, start_login,
 };
 use tokio::task::JoinSet;
@@ -112,7 +112,11 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.read_installed(store, panel);
             tasks.spawn(async move {
                 let marketplace = match MarketplaceSource::configured() {
-                    Ok(source) => source.read().await,
+                    Ok(source) => {
+                        source
+                            .read(&tickloop_agent_settings::package_http::client)
+                            .await
+                    }
                     Err(error) => Err(error),
                 };
                 (panel, TickPackageResult::Marketplace(marketplace))
@@ -121,9 +125,14 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
         TickPackageRequest::Install(package) => {
             tasks.spawn(async move {
                 let result = match MarketplaceSource::configured() {
-                    Ok(source) => tickloop_agent_packages::install(&store, &source, &package)
-                        .await
-                        .map(Box::new),
+                    Ok(source) => tickloop_tick_installer::install(
+                        &tickloop_agent_settings::package_http::client,
+                        &store,
+                        &source,
+                        &package,
+                    )
+                    .await
+                    .map(Box::new),
                     Err(error) => Err(error),
                 };
                 let name = package.name;
@@ -134,7 +143,7 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.spawn(async move {
                 let result = blocking({
                     let name = name.clone();
-                    move || tickloop_agent_packages::uninstall(&store, &name)
+                    move || tickloop_tick_installer::uninstall(&store, &name)
                 })
                 .await;
                 (panel, TickPackageResult::Uninstallation { name, result })
@@ -151,7 +160,13 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.running.spawn(async move {
                 let started = async {
                     let credentials = store.credentials(&name).map_err(LoginError::from)?;
-                    start_login(&credentials, &issuer, &scopes).await
+                    start_login(
+                        &tickloop_agent_settings::package_http::client,
+                        &credentials,
+                        &issuer,
+                        &scopes,
+                    )
+                    .await
                 };
                 let started = tokio::select! {
                     () = cancel.cancelled() => Err(LoginError::Cancelled),
@@ -353,6 +368,13 @@ async fn log_out(store: &PackageStore, name: &str) -> Result<LoggedOut, String> 
     let credentials = store.credentials(name).map_err(|error| error.to_string())?;
     match package.manifest.auth {
         tick_packages::PackageAuth::None => Err(needs_no_login(name)),
-        auth => tickloop_agent_packages::log_out(&credentials, &auth).await,
+        auth => {
+            tickloop_tick_installer::log_out(
+                &tickloop_agent_settings::package_http::client,
+                &credentials,
+                &auth,
+            )
+            .await
+        }
     }
 }

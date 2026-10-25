@@ -430,13 +430,28 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
             models: models(),
         },
         HarnessOptions {
-            settings: Some(tickloop_agent_config::UserSettings::in_root(
-                settings_root.path(),
+            tools: ToolPolicy::web_fetch_only(),
+            settings: Some(Arc::new(
+                tickloop_agent_policy::settings::MemorySettingsStore::new(
+                    tickloop_agent_policy::settings::SettingsSnapshot {
+                        task_tools_enabled: true,
+                        ..Default::default()
+                    },
+                ),
             )),
             ..options()
         },
     );
-    assert!(matches!(with_settings, Err(AgentError::Invalid(_))));
+    let with_settings = with_settings.unwrap();
+    let chat = with_settings.create_chat_without_folder().await.unwrap();
+    assert!(
+        with_settings
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .task_tools_enabled
+    );
+    with_settings.shutdown().await;
     assert_empty(settings_root.path());
 }
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use tickloop_agent_config::UserSettings;
 use tickloop_agent_protocol::{
     AgentHostOptions, ExecutionMode, PromptPolicy, QuestionAnswer, SharedTaskStatus,
 };
@@ -10,6 +9,7 @@ use tickloop_agent_runtime::{
     TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage, WaitHosting,
     environment::LocalEnvironment, transcript::TranscriptStore,
 };
+use tickloop_agent_settings::UserSettings;
 use tickloop_agent_test_support::{
     ScriptedModel, call, config,
     harness::ChosenModels,
@@ -106,7 +106,7 @@ async fn local_settings_override_either_host_value_and_keep_default_off() {
             settings.save_task_tools_enabled(enabled).unwrap();
         }
         let mut options = options(Some(host), WaitHosting::Process);
-        options.settings = Some(settings.clone());
+        options.settings = Some(Arc::new(settings.clone()));
         let agent = Agent::with_seams(
             HarnessSeams {
                 transcripts: None,

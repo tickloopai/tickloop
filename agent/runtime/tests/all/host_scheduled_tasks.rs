@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;

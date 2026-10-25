@@ -3,10 +3,11 @@
 //! `tick/packages`.
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::{Value, json};
 use tick_packages::{ApiKey, LoginState, MANIFEST_FILE_NAME, OAuthToken, PackageStore};
-use tickloop_agent_config::skills::TICKLOOP_SKILL;
+use tickloop_agent_policy::skills::TICKLOOP_SKILL;
 use tickloop_agent_protocol::{Content, EventKind, Role};
 use tickloop_agent_runtime::{
     Agent,

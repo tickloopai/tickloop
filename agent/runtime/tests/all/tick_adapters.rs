@@ -9,6 +9,7 @@ use tickloop_agent_runtime::{
         StreamTasks, TickObservation, TickStreamEvent, TickStreamHandle, TickStreamPort,
     },
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::{ScriptedModel, config};
 use uuid::Uuid;
 

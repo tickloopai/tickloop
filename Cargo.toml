@@ -3,7 +3,7 @@ members = [
     "agent/*",
     "tickhost/host", "tickhost/connect",
     "tick/ids", "tick/protocol", "tick/sdk", "tick/packages", "tick/oauth",
-    "tick/oauth-test-server",
+    "tick/oauth-test-server", "tick/installer",
     "ui",
 ]
 resolver = "3"

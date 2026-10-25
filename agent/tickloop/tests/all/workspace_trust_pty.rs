@@ -309,7 +309,7 @@ impl Drop for ModelProbe {
 
 #[test]
 fn startup_trust_requires_the_complete_directory_before_confirmation_after_resize() {
-    use tickloop_agent_config::UserSettings;
+    use tickloop_agent_settings::UserSettings;
     for renderer in ["inline", "fullscreen"] {
         let fixture = Fixture::new();
         fixture.valid_model();
@@ -464,7 +464,7 @@ fn startup_trust_cancellation_is_quiet_and_precedes_project_configuration() {
 
 #[test]
 fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restart() {
-    use tickloop_agent_config::UserSettings;
+    use tickloop_agent_settings::UserSettings;
     for navigation in [b"j".as_slice(), b"\x1b[B", b"\x0e"] {
         let fixture = Fixture::new();
         fixture.valid_model();
@@ -551,7 +551,7 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
 
 #[test]
 fn startup_trust_write_failure_stays_gated_and_requires_explicit_retry() {
-    use tickloop_agent_config::UserSettings;
+    use tickloop_agent_settings::UserSettings;
     let fixture = Fixture::new();
     fixture.valid_model();
     fs::write(fixture.path("config/settings.json"), "invalid JSON").unwrap();
@@ -627,7 +627,7 @@ fn startup_trust_navigation_and_repeated_enter_never_submit_a_model_request() {
 
 #[test]
 fn startup_trust_noninteractive_refusal_and_host_assertion_keep_their_contracts() {
-    use tickloop_agent_config::UserSettings;
+    use tickloop_agent_settings::UserSettings;
     for host_assertion in [false, true] {
         let fixture = Fixture::new();
         fixture.valid_model();
@@ -670,7 +670,7 @@ fn startup_trust_noninteractive_refusal_and_host_assertion_keep_their_contracts(
 
 #[test]
 fn startup_trust_persists_the_exact_home_directory() {
-    use tickloop_agent_config::UserSettings;
+    use tickloop_agent_settings::UserSettings;
     let fixture = Fixture::new();
     fixture.valid_model();
     let home = fixture.path("home");

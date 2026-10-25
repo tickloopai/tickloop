@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_agent_protocol::{

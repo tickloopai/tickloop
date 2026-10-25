@@ -21,7 +21,7 @@ use tickloop_agent_protocol::{
     ProviderPatch, ReasoningEffort, Role, ThinkingBudgets, ThinkingControl, ToolDefinition,
 };
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_test_support::harness::opened_agent;
+use tickloop_agent_settings::local_agent::opened_agent;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,

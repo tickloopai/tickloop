@@ -69,7 +69,7 @@ impl Scenario {
         let old_executable = copy_bundle(&source, &bundles.path().join("old"));
         let new_executable = copy_bundle(&source, &bundles.path().join("new"));
         let config_root = runtime.config_root().to_path_buf();
-        tickloop_agent_config::UserSettings::in_root(&config_root)
+        tickloop_agent_settings::UserSettings::in_root(&config_root)
             .trust_working_directory(workdir.path())
             .unwrap();
         let transport_path = workdir.path().join("transport.json");

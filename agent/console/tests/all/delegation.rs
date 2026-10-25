@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_protocol::{EventKind, ExecutionMode};
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};

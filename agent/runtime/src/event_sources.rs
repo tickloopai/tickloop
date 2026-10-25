@@ -1229,6 +1229,7 @@ mod feedback_admission_tests {
                 search: Default::default(),
                 model: config(),
                 settings: None,
+                local_state_root: None,
                 host: tickloop_agent_protocol::AgentHostOptions {
                     prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
                     ..tickloop_agent_protocol::AgentHostOptions::product_defaults()

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_protocol::{
     AgentHostOptions, BranchRequest, ChatId, Decision, EventKind, ExecutionMode, PermissionRule,

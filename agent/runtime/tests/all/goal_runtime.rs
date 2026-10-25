@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -1002,7 +1003,7 @@ async fn a_check_model_that_cannot_be_built_blocks_the_goal() {
     )
     .unwrap();
     let model = HoldingModel::new(vec![complete("u1"), text("Done.")], Vec::new());
-    let agent = tickloop_agent_test_support::harness::opened_agent(
+    let agent = tickloop_agent_settings::local_agent::opened_agent(
         root.path().into(),
         config(),
         Arc::new(OnlyTheChatModel(model.clone())),

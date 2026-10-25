@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_test_support::subagents::{
     SubagentTimingModel, completed, task_notifications, wait_for_snapshot,

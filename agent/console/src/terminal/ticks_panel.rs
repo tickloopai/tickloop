@@ -11,7 +11,7 @@ use tick_packages::{
     InstalledPackages, LoginState, Marketplace, MarketplacePackage, OAuthIssuer, PackageAuth,
     Uninstalled,
 };
-use tickloop_agent_packages::{
+use tickloop_tick_installer::{
     InstalledVersion, LoggedOut, LoginError, Offer, login_label, offers,
 };
 use unicode_width::UnicodeWidthStr;

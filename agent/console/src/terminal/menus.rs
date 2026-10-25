@@ -14,7 +14,7 @@ use std::{
 };
 
 use tickloop_agent_base::output_style::OutputStyle;
-use tickloop_agent_config::{DisplayPreferences, UserSettings};
+use tickloop_agent_settings::{DisplayPreferences, UserSettings};
 use tickloop_agent_tools::{
     ENTER_PLAN_MODE_TOOL_NAME,
     file_change::load_file_change_review,

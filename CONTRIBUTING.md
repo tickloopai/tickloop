@@ -6,7 +6,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 - **Bugs and feature requests:** open a [GitHub issue](https://github.com/tickloopai/tickloop/issues/new/choose). Search existing issues first.
 - **Security problems:** report them privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
-- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `agent/packages`, `/ticks`, `tickloop tick ...`) stay in this repository.
+- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `tick/installer`, `/ticks`, `tickloop tick ...`) stay in this repository.
 - **Larger changes:** open an issue to discuss the design before writing a lot of code, especially for changes to the Tick protocol, the permission system or process lifecycle.
 
 ## Development setup

@@ -28,7 +28,9 @@ use super::tasks::{
 use super::tools::{self, ScheduledTaskCall, ToolTerms};
 use crate::wakeup::{SourceChange, SourceChangeError, TriggerDelivery};
 use crate::{Agent, AgentError, Chat};
-use tickloop_agent_config::loop_skill::{DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopSchedule};
+use tickloop_agent_policy::loop_skill::{
+    DEFAULT_INSTRUCTIONS_PROMPT, LoopInstructionSource, LoopSchedule, MaintenanceInstructions,
+};
 
 /// The longest a Worker's timer sleeps before it looks at the clock again, so a machine that
 /// slept or a wall clock that moved does not delay a run for long.
@@ -196,11 +198,14 @@ pub(crate) fn resolve_zone(name: Option<&str>) -> Result<Zone, String> {
 fn run_input(
     chat: &Chat,
     task: &ScheduledTask,
-    config_root: Option<&std::path::Path>,
+    settings: Option<&dyn tickloop_agent_policy::settings::SettingsStore>,
 ) -> (String, Vec<ScheduledInputWrapper>) {
     let prompt = task.prompt.trim();
     if prompt == DEFAULT_INSTRUCTIONS_PROMPT {
-        return match LoopFiles::new(chat.snapshot.folder.as_deref(), config_root).instructions() {
+        return match settings.map_or_else(
+            || MaintenanceInstructions.instructions(),
+            |settings| settings.loop_instructions(chat.snapshot.folder.as_deref()),
+        ) {
             Ok(instructions) => (
                 instructions.prompt(),
                 vec![ScheduledInputWrapper::LoopInstructions {
@@ -1294,7 +1299,7 @@ impl Agent {
                         .find(|task| task.id == fired.task.id)?
                         .clone();
                     let (mut input, mut wrappers) =
-                        run_input(chat, &fired.task, self.inner.config_root.as_deref());
+                        run_input(chat, &fired.task, self.inner.settings.as_deref());
                     if let Some(reason) = fired.last_run
                         && !matches!(fired.task.kind, ScheduledTaskKind::OneShot { .. })
                     {

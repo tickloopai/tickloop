@@ -1,16 +1,10 @@
 //! Agents built around model clients a test controls.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::ModelConfig;
-use tickloop_agent_runtime::{
-    Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment,
-    transcript::JsonlTranscriptStore,
-};
+use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
 
 /// Serves the client the test chose last for every model a Chat selects, so a model switch gets
 /// the client the test means.
@@ -44,32 +38,7 @@ pub fn embedded_agent(model: ModelConfig, models: Arc<dyn ModelClients>) -> Agen
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models,
         },
-        local_options(model, None),
+        HarnessOptions::local(model),
     )
     .unwrap()
-}
-
-/// `Agent::open_embedded` with these model clients.
-pub fn opened_agent(root: PathBuf, model: ModelConfig, models: Arc<dyn ModelClients>) -> Agent {
-    let store = JsonlTranscriptStore::open(root).unwrap();
-    let settings = tickloop_agent_config::UserSettings::in_root(store.root());
-    Agent::with_seams(
-        HarnessSeams {
-            transcripts: Some(Arc::new(store)),
-            environment: Some(Arc::new(LocalEnvironment::bare())),
-            models,
-        },
-        local_options(model, Some(settings)),
-    )
-    .unwrap()
-}
-
-fn local_options(
-    model: ModelConfig,
-    settings: Option<tickloop_agent_config::UserSettings>,
-) -> HarnessOptions {
-    HarnessOptions {
-        settings,
-        ..HarnessOptions::local(model)
-    }
 }

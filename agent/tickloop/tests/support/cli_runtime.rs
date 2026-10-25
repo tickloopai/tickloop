@@ -67,7 +67,7 @@ pub fn configure_model(config_root: &Path) {
     let model = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
-    tickloop_agent_config::UserSettings::in_root(config_root)
+    tickloop_agent_settings::UserSettings::in_root(config_root)
         .save_model(&model, false)
         .unwrap();
     tickloop_agent_model::credentials::save_api_key(

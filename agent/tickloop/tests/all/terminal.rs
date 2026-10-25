@@ -8,7 +8,7 @@ use std::{process::Stdio, thread, time::Duration};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::{Value, json};
-use tickloop_agent_config::UserSettings;
+use tickloop_agent_settings::UserSettings;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 /// Every wait here expects success; a real CLI with its own daemon, worker and Shells needed more

@@ -83,17 +83,14 @@ impl Agent {
             return Ok((client.clone(), None));
         }
         let settings = self.inner.settings.clone();
+        let root = self.inner.config_root.clone();
         let client = tokio::task::spawn_blocking(move || {
             let config = settings
                 .as_ref()
-                .map(|settings| settings.load().jev_config())
+                .map(|settings| settings.read(None).jev)
                 .transpose()
                 .map_err(ModelError::Configuration)?
                 .unwrap_or_else(JevConfig::default);
-            let root = settings
-                .as_ref()
-                .and_then(tickloop_agent_config::UserSettings::root)
-                .map(ToOwned::to_owned);
             JevClient::bind(config, root)
         })
         .await

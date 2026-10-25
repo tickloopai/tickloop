@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tickloop_agent_protocol::{Decision, EventKind, LoopState, PermissionRule, RewindMode};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::*;
 use uuid::Uuid;
 

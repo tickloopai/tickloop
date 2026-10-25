@@ -2,6 +2,7 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tickloop_agent_protocol::{Decision, EventKind, ExecutionMode, OperationState, PermissionRule};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::local_agent::LocalAgent;
 use tickloop_agent_test_support::{
     call, config,
     routed::{RoutedModel, has_tool_result, state, tool_result},

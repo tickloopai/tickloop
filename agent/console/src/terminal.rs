@@ -8,7 +8,7 @@ use std::{
 
 use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
 
-use tickloop_agent_config::{LoadedSettings, UserSettings, config_root_directory};
+use tickloop_agent_settings::{LoadedSettings, UserSettings, config_root_directory};
 use tickloop_agent_tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
@@ -699,7 +699,7 @@ async fn await_startup_directory_trust(
 /// as do esc, ctrl+c and the end of input.
 async fn choose_at_startup(
     menu: console::Menu,
-    preferences: tickloop_agent_config::DisplayPreferences,
+    preferences: tickloop_agent_settings::DisplayPreferences,
     startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
 ) -> Result<usize, String> {
     let menu_id = menu.id;
@@ -735,7 +735,7 @@ async fn choose_at_startup(
 
 async fn connect_daemon_at_startup(
     interactive: bool,
-    preferences: tickloop_agent_config::DisplayPreferences,
+    preferences: tickloop_agent_settings::DisplayPreferences,
     startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
     launch_arguments: &[String],
 ) -> Result<Option<tickloop_agent_client::LocalAgentClient>, String> {
@@ -4997,9 +4997,9 @@ fn set_monitor_visible(
     let settings =
         settings.ok_or("No Agent state directory is configured; cannot save Monitor preference")?;
     let preference = if show {
-        tickloop_agent_config::MonitorPreference::Auto
+        tickloop_agent_settings::MonitorPreference::Auto
     } else {
-        tickloop_agent_config::MonitorPreference::Hidden
+        tickloop_agent_settings::MonitorPreference::Hidden
     };
     settings
         .save_monitor_preference(preference)

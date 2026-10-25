@@ -383,7 +383,7 @@ fn save_model(root: &Path) {
     let model = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
-    tickloop_agent_config::UserSettings::in_root(&root.join("state"))
+    tickloop_agent_settings::UserSettings::in_root(&root.join("state"))
         .save_model(&model, false)
         .unwrap();
 }

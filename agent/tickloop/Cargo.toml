@@ -30,10 +30,10 @@ harness = false
 crossterm = "0.29"
 serde_json = "1"
 tickloop-agent-client = { path = "../client" }
-tickloop-agent-config = { path = "../config" }
+tickloop-agent-settings = { path = "../settings" }
 tickloop-agent-console = { path = "../console" }
 tickloop-agent-daemon = { path = "../daemon" }
-tickloop-agent-packages = { path = "../packages" }
+tickloop-tick-installer = { path = "../../tick/installer" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-updater = { path = "../updater" }
 tickloop-tick-packages = { path = "../../tick/packages" }
@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
+tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 async-trait = "0.1"
 base64 = "0.22"
 flate2 = "1"

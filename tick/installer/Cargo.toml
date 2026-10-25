@@ -1,0 +1,23 @@
+[package]
+name = "tickloop-tick-installer"
+description = "Installing, updating and removing Tick packages from the Tick marketplace or local files, and their login and logout using caller-supplied HTTP clients, shared by the Console and tickloop tick"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false }
+tickloop-tick-oauth = { path = "../oauth" }
+tickloop-tick-packages = { path = "../packages" }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tickloop-tick-oauth-test-server = { path = "../oauth-test-server" }
+tokio-util = "0.7"

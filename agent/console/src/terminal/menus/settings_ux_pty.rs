@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tickloop_agent_daemon::EmbeddedAgentAccess;
+#[cfg(test)]
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_protocol::{
     AccessError, AgentAccess, AgentDetailQuery, CommandEnvelope, CommandReceipt, Cursor,

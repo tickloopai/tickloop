@@ -10,9 +10,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tickloop_agent_settings::local_agent::LocalAgent;
 
 use tickloop_agent_client::LocalAgentClient;
-use tickloop_agent_config::UserSettings;
 use tickloop_agent_daemon::{EmbeddedAgentAccess, serve_listener};
 use tickloop_agent_protocol::{
     AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandReceipt,
@@ -21,6 +21,7 @@ use tickloop_agent_protocol::{
     ReceiptState, RequestRef, UserInput,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_settings::UserSettings;
 use tokio::{net::UnixListener, task::JoinHandle};
 use uuid::Uuid;
 

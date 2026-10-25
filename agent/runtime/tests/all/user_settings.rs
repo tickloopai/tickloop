@@ -1,15 +1,17 @@
 use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_agent_settings::local_agent::opened_agent;
 
 use serde_json::json;
 use tickloop_agent_base::output_style::OutputStyle;
-use tickloop_agent_config::{DisplayPreferences, UserSettings};
 use tickloop_agent_model::cards::model_for_persistent_selection;
 use tickloop_agent_protocol::{
     ChatId, Content, Decision, EventKind, ModelChange, ModelConfig, PermissionRule,
     PermissionScope, ReasoningEffort,
 };
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
+use tickloop_agent_settings::{DisplayPreferences, UserSettings};
+use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent_tools::permissions::permission_rule_candidates;
 use tokio::sync::Barrier;
@@ -1324,7 +1326,7 @@ async fn resuming_retains_original_reasoning_and_projects_different_model_source
 
 #[test]
 fn monitor_preference_preserves_unknown_settings_and_defaults_invalid_values() {
-    use tickloop_agent_config::MonitorPreference;
+    use tickloop_agent_settings::MonitorPreference;
     let directory = tempfile::tempdir().unwrap();
     let settings = UserSettings::in_root(directory.path());
     std::fs::write(
@@ -1353,7 +1355,7 @@ fn monitor_preference_preserves_unknown_settings_and_defaults_invalid_values() {
 
 #[test]
 fn the_former_tick_list_setting_is_neither_read_nor_migrated() {
-    use tickloop_agent_config::MonitorPreference;
+    use tickloop_agent_settings::MonitorPreference;
     let directory = tempfile::tempdir().unwrap();
     let settings = UserSettings::in_root(directory.path());
     std::fs::write(

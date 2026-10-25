@@ -1,3 +1,5 @@
+use tickloop_agent_settings::local_agent::LocalAgent;
+use tickloop_agent_settings::local_agent::opened_agent;
 use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
@@ -9,7 +11,7 @@ use tickloop_agent_protocol::{
     BranchRequest, CommandState, Content, EventKind, ModelChange, ModelConfig, Protocol,
 };
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_test_support::harness::{embedded_agent, opened_agent};
+use tickloop_agent_test_support::harness::embedded_agent;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use uuid::Uuid;
 

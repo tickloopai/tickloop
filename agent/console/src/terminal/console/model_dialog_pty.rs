@@ -46,7 +46,7 @@ fn model_dialog_pty_fixture() {
             console.set_prompt_enabled(true).unwrap();
             console.record_input("Pinned model dialog fixture").unwrap();
             console.state.lock().unwrap().insert("Unsent fixture draft");
-            let mut menus = Menus::new(Some(tickloop_agent_config::UserSettings::in_root(&root)), Some(root));
+            let mut menus = Menus::new(Some(tickloop_agent_settings::UserSettings::in_root(&root)), Some(root));
             menus.models(&agent, &console, ConfigTarget::Agent(first)).await.unwrap();
             let model_menu = console.dialog_menu_id().unwrap().unwrap();
             let chrome = |phase: &str| {

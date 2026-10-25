@@ -31,7 +31,7 @@ sse-stream = "0.2.4"
 thiserror = "2"
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-base = { path = "../base" }
-tickloop-agent-config = { path = "../config" }
+tickloop-agent-policy = { path = "../policy" }
 tickloop-agent-cron = { path = "../cron" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-protocol = { path = "../protocol" }
@@ -49,6 +49,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 [dev-dependencies]
+tickloop-agent-settings = { path = "../settings", features = ["test-support"] }
 base64 = "0.22"
 percent-encoding = "2"
 serde_yaml_ng = "0.10"

@@ -39,12 +39,12 @@ use tickloop_agent_client::{
         remove_stale_socket, validate_directory, validate_file,
     },
 };
-use tickloop_agent_config::UserSettings;
 use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
 };
 use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
+use tickloop_agent_settings::UserSettings;
 
 mod chunked;
 pub mod daemon_control;
@@ -731,7 +731,12 @@ pub async fn build_runtime_with_models(
             models,
         },
         HarnessOptions {
-            settings,
+            local_state_root: settings
+                .as_ref()
+                .and_then(|settings| settings.root().map(ToOwned::to_owned)),
+            settings: settings.map(|settings| {
+                Arc::new(settings) as Arc<dyn tickloop_agent_policy::settings::SettingsStore>
+            }),
             host: launch.host_options,
             ..HarnessOptions::local(model)
         },
