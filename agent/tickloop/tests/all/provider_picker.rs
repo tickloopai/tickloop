@@ -434,6 +434,7 @@ fn builtin_missing_key_details_setup_continues_to_models_without_applying_select
     terminal.select_row("Set API key");
     terminal.wait_for("API key · DeepSeek");
     terminal.assert_dialog("missing-credential-editor", "API key · DeepSeek");
+    terminal.wait_for(TEST_KEY_NAME);
     let mark = terminal.mark();
     terminal.send(format!("{TEST_KEY}\r").as_bytes());
     terminal.wait_for_frame_after(mark, "built-in first setup continues to models", |frame| {

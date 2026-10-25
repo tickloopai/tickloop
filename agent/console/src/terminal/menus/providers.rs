@@ -743,6 +743,12 @@ mod tests {
                 .count(),
             4
         );
+        let alibaba: Vec<_> = choices
+            .iter()
+            .filter(|provider| provider_group(provider) == Some("Alibaba Bailian"))
+            .map(|provider| provider.models[0].api_key_env.as_str())
+            .collect();
+        assert_eq!(alibaba, ["DASHSCOPE_API_KEY", "ALIBABA_TOKEN_PLAN_API_KEY"]);
         assert_eq!(
             choices
                 .iter()
@@ -1129,6 +1135,39 @@ mod tests {
     }
 
     #[test]
+    fn api_key_page_names_the_environment_variable_of_the_connection() {
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let token_plan = catalog
+            .get("alibaba-cn-token-plan", "qwen3.8-flash")
+            .unwrap();
+        let provider = ProviderModels::group(vec![token_plan]).remove(0);
+        let context = provider.api_key_page_context(false);
+        assert_eq!(
+            context[2],
+            "Without a saved key, the Agent uses ALIBABA_TOKEN_PLAN_API_KEY from the environment it started with."
+        );
+        assert_eq!(
+            context.last().unwrap(),
+            "Saving a key does not verify account access or select a model."
+        );
+        assert_eq!(
+            provider.api_key_page_context(true).last().unwrap(),
+            "Existing key is kept until Save succeeds."
+        );
+
+        let mut without_reference = catalog.get("deepseek-api", "deepseek-flash").unwrap();
+        without_reference.api_key_env.clear();
+        let provider = ProviderModels::group(vec![without_reference]).remove(0);
+        let context = provider.api_key_page_context(false);
+        assert_eq!(context.len(), 3);
+        assert!(
+            !context
+                .iter()
+                .any(|line| line.contains("Without a saved key"))
+        );
+    }
+
+    #[test]
     fn retired_glm_card_is_not_offered_even_as_the_current_model() {
         let defaults = tickloop_agent_model::cards::ModelCatalog::defaults();
         let retired = defaults.get("zhipu-cn-api", "glm-5.2").unwrap();
@@ -1266,6 +1305,28 @@ impl ProviderModels {
             Some(vendor) => format!("{vendor} · {}", self.name()),
             None => self.name(),
         }
+    }
+
+    pub(super) fn api_key_page_context(&self, replacing: bool) -> Vec<String> {
+        let name = self.model_page_name();
+        let mut context = vec![
+            safe_text(&format!(
+                "Use an API key for {name}. Other regions/products have separate credentials."
+            )),
+            "Saved privately for this connection; saved values take precedence over the environment.".into(),
+        ];
+        let environment_key = &self.models[0].api_key_env;
+        if !environment_key.is_empty() {
+            context.push(safe_text(&format!(
+                "Without a saved key, the Agent uses {environment_key} from the environment it started with."
+            )));
+        }
+        context.push(if replacing {
+            "Existing key is kept until Save succeeds.".into()
+        } else {
+            "Saving a key does not verify account access or select a model.".into()
+        });
+        context
     }
 
     pub(super) fn supports_discovery(&self) -> bool {
@@ -3138,11 +3199,9 @@ impl Menus {
         let menu = Menu {
             id: tickloop_ids::generate(),
             title: safe_text(&format!("API key · {}", provider.model_page_name())),
-            context: vec![
-                format!("Use an API key for {}. Other regions/products have separate credentials.", provider.model_page_name()),
-                "Saved privately for this connection; saved values take precedence over the environment.".into(),
-                if self.provider.provider_nav.credential_intent == Some(CredentialIntent::Replace) { "Existing key is kept until Save succeeds.".into() } else { "Saving a key does not verify account access or select a model.".into() },
-            ],
+            context: provider.api_key_page_context(
+                self.provider.provider_nav.credential_intent == Some(CredentialIntent::Replace),
+            ),
             options: vec!["Save API key".into(), "Cancel".into()],
             selected: 0,
             confirmation: false,
