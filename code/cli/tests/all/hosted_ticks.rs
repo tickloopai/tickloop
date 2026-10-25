@@ -271,6 +271,8 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
 }
 
 mod channel {
+    mod confirmed_open;
+
     use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;

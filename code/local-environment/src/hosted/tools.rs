@@ -286,7 +286,10 @@ impl HostedTickTools {
             return ExecutionReceipt::Unknown;
         };
         let result = match receipt {
-            Receipt::Opened(opened) => match self.opened(chat, json!(opened), None, None).await {
+            Receipt::Opened(opened) => match self
+                .opened(chat, json!(opened), None, None, None, false)
+                .await
+            {
                 Ok(opened) => opened.complete(),
                 Err(_) => return ExecutionReceipt::Unknown,
             },
@@ -973,30 +976,15 @@ impl HostedTickTools {
                     Ok(opened) => opened,
                     Err(unresolved) => return unresolved,
                 };
-                let mut opened = match self.opened(chat, opened, Some(title), None).await {
+                let mut opened = match self
+                    .opened(chat, opened, Some(title), None, dispatch, view.is_some())
+                    .await
+                {
                     Ok(opened) => opened,
                     Err(unresolved) => return unresolved,
                 };
                 if let Some(view) = view {
                     if let Some(dispatch) = dispatch {
-                        dispatch.confirm_opened(
-                            tickloop_harness::runtime::environment::ExecutionResult {
-                                result: ToolResult {
-                                    content: opened.result.to_string(),
-                                    is_error: false,
-                                    output_ref: None,
-                                },
-                                opened: Some(
-                                    tickloop_harness::runtime::environment::OpenedExecution {
-                                        instance: opened.instance.clone(),
-                                        title: opened.title.clone(),
-                                        is_terminal: opened.is_terminal,
-                                    },
-                                ),
-                                shell: None,
-                                handoff: None,
-                            },
-                        );
                         if dispatch.check().is_err()
                             && let tickloop_harness::runtime::environment::ExecutionOutcome::Completed(result) =
                                 dispatch.interruption(operation)
@@ -1010,6 +998,7 @@ impl HostedTickTools {
                                 }),
                             );
                         }
+                        dispatch.begin_view();
                     }
                     let shown = self
                         .show(
@@ -1040,7 +1029,10 @@ impl HostedTickTools {
                     admission: self.admission(),
                 };
                 match self.lifecycle(chat, operation, request, dispatch).await {
-                    Ok(opened) => match self.opened(chat, opened, title, Some(&lost)).await {
+                    Ok(opened) => match self
+                        .opened(chat, opened, title, Some(&lost), dispatch, false)
+                        .await
+                    {
                         Ok(opened) => opened.complete(),
                         Err(unresolved) => unresolved,
                     },
@@ -1221,6 +1213,8 @@ impl HostedTickTools {
         opened: Value,
         title: Option<String>,
         replaces: Option<&InstanceRef>,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+        view_requested: bool,
     ) -> Result<OpenedTick, HostCallResult> {
         let instance: InstanceRef = match serde_json::from_value(opened["instance"].clone()) {
             Ok(instance) => instance,
@@ -1231,6 +1225,21 @@ impl HostedTickTools {
             }
         };
         let adapter = serde_json::from_value::<TickAdapter>(opened["adapter"].clone()).ok();
+        let mut result = json!({"status":"opened","host":HOSTED_HOST,"visibility":"hidden","tick_instance_id":instance});
+        if opened["business_pid"].is_u64() {
+            result["business_pid"] = opened["business_pid"].clone();
+        }
+        if let Some(lost) = replaces {
+            result["replaces"] = json!(lost);
+        }
+        let mut confirmed = OpenedTick {
+            is_terminal: adapter == Some(TickAdapter::Terminal),
+            instance: instance.clone(),
+            title,
+            result,
+        };
+        // The lifecycle reply is final; cancellation of enrichment must not discard it.
+        confirmed.confirm(dispatch, view_requested);
         let binding = match (
             opened["terminal"]["endpoint"].as_str(),
             opened["data_token"].as_str(),
@@ -1255,7 +1264,7 @@ impl HostedTickTools {
         // The command named the Tick until now; an extension Tick's declaration names it from here
         // on. Only the binding this open received is asked, so naming never costs a lookup of the
         // daemon.
-        let title = match (title, &binding) {
+        confirmed.title = match (confirmed.title, &binding) {
             (Some(command), Some(binding)) if binding.adapter == TickAdapter::Protocol => Some(
                 described_title(binding, &instance, &command)
                     .await
@@ -1263,19 +1272,8 @@ impl HostedTickTools {
             ),
             (title, _) => title,
         };
-        let mut result = json!({"status":"opened","host":HOSTED_HOST,"visibility":"hidden","tick_instance_id":instance});
-        if opened["business_pid"].is_u64() {
-            result["business_pid"] = opened["business_pid"].clone();
-        }
-        if let Some(lost) = replaces {
-            result["replaces"] = json!(lost);
-        }
-        Ok(OpenedTick {
-            is_terminal: adapter == Some(TickAdapter::Terminal),
-            instance,
-            title,
-            result,
-        })
+        confirmed.confirm(dispatch, view_requested);
+        Ok(confirmed)
     }
 
     /// Shows `chat`'s running `instance` in a new Herdr Pane at `placement`, with a view grant
@@ -1721,6 +1719,32 @@ struct OpenedTick {
 }
 
 impl OpenedTick {
+    fn confirm(
+        &self,
+        dispatch: Option<&crate::environment::ExecutionDispatch>,
+        view_requested: bool,
+    ) {
+        if let Some(dispatch) = dispatch {
+            dispatch.confirm_opened(
+                tickloop_harness::runtime::environment::ExecutionResult {
+                    result: ToolResult {
+                        content: self.result.to_string(),
+                        is_error: false,
+                        output_ref: None,
+                    },
+                    opened: Some(tickloop_harness::runtime::environment::OpenedExecution {
+                        instance: self.instance.clone(),
+                        title: self.title.clone(),
+                        is_terminal: self.is_terminal,
+                    }),
+                    shell: None,
+                    handoff: None,
+                },
+                view_requested,
+            );
+        }
+    }
+
     fn complete(self) -> HostCallResult {
         HostCallResult::CompletedWithEffect(
             ToolResult {
