@@ -2,13 +2,13 @@ use std::fs;
 use std::path::Path;
 use tickloop_agent_settings::skills::SkillDiscovery;
 
-use tickloop_agent_cron::{Interval, IntervalError};
 use tickloop_agent_protocol::SkillSource;
 use tickloop_agent_settings::loop_skill::{
     DEFAULT_INSTRUCTIONS_PROMPT, LoopFiles, LoopInstructions, LoopInstructionsSource, LoopRequest,
     LoopSchedule, MAINTENANCE_INSTRUCTIONS, MAX_LOOP_FILE_BYTES,
 };
 use tickloop_agent_settings::skills::{LOOP_SKILL, SkillCaller, SkillError, SkillRegistry};
+use tickloop_harness::cron::{Interval, IntervalError};
 
 fn minutes(minutes: u32) -> Interval {
     Interval::from_minutes(minutes).unwrap()

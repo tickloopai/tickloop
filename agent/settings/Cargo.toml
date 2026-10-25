@@ -26,6 +26,7 @@ tickloop-tick-packages = { path = "../../tick/packages" }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+tickloop-harness = { path = "../sdk", features = ["cron"] }
 tempfile = "3"
 tickloop-agent-test-support = { path = "../test-support" }
 time = { version = "0.3", features = ["formatting", "parsing"] }

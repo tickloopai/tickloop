@@ -147,6 +147,8 @@ struct MemorySettings {
     snapshot: SettingsSnapshot,
     projects: BTreeMap<PathBuf, ProjectSettings>,
     auto_revision: u64,
+    has_thinking_selection: bool,
+    previous_effort: Option<ReasoningEffort>,
 }
 
 impl MemorySettingsStore {
@@ -159,6 +161,8 @@ impl MemorySettingsStore {
                     .ok()
                     .and_then(|(_, revision)| revision.as_str().parse().ok())
                     .unwrap_or(0),
+                has_thinking_selection: true,
+                previous_effort: snapshot.reasoning_effort,
                 snapshot,
                 ..Default::default()
             }),
@@ -193,14 +197,29 @@ impl SettingsStore for MemorySettingsStore {
             SettingsUpdate::ReasoningEffort(effort) => {
                 if effort == Some(ReasoningEffort::On) {
                     state.snapshot.thinking_enabled = true;
+                    state.has_thinking_selection = true;
+                } else if !state.has_thinking_selection {
+                    if state.previous_effort == Some(ReasoningEffort::Off) {
+                        state.snapshot.thinking_enabled = false;
+                        state.has_thinking_selection = true;
+                    } else {
+                        state.snapshot.thinking_enabled = effort != Some(ReasoningEffort::Off);
+                    }
                 }
+                state.previous_effort = effort;
                 state.snapshot.reasoning_effort =
                     effort.filter(|effort| !matches!(effort, ReasoningEffort::Off));
             }
             SettingsUpdate::Thinking { enabled, effort } => {
                 state.snapshot.thinking_enabled = enabled;
+                state.has_thinking_selection = true;
                 if let Some(effort) = effort {
-                    state.snapshot.reasoning_effort = Some(effort);
+                    state.previous_effort = Some(effort);
+                    state.snapshot.reasoning_effort =
+                        (effort != ReasoningEffort::Off).then_some(effort);
+                } else if state.previous_effort == Some(ReasoningEffort::Off) {
+                    state.previous_effort = None;
+                    state.snapshot.reasoning_effort = None;
                 }
             }
             SettingsUpdate::Model {
@@ -212,6 +231,8 @@ impl SettingsStore for MemorySettingsStore {
                     state.snapshot.context_window_tokens = None;
                 }
                 if let Some(effort) = thinking {
+                    state.has_thinking_selection = true;
+                    state.previous_effort = effort;
                     state.snapshot.thinking_enabled = effort != Some(ReasoningEffort::Off);
                     state.snapshot.reasoning_effort =
                         effort.filter(|effort| *effort != ReasoningEffort::Off);

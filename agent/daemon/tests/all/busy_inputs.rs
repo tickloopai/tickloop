@@ -117,7 +117,11 @@ impl Busy {
         });
         let runtime = match &archive {
             Some(archive) => Agent::open_embedded(archive.clone(), config(), gate.clone()).unwrap(),
-            None => Agent::new_embedded(config(), gate.clone()),
+            None => Agent::new_with_user_settings_embedded(
+                config(),
+                gate.clone(),
+                tickloop_agent_settings::UserSettings::in_root(&directory.join("config")),
+            ),
         };
         runtime.install_own_tickhost();
         let access = EmbeddedAgentAccess::new(runtime.clone());

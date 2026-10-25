@@ -73,3 +73,37 @@ fn file_and_memory_stores_keep_preferences_and_partitioned_permission_edits() {
         );
     }
 }
+
+#[test]
+fn file_and_memory_stores_preserve_thinking_choices_across_effort_changes() {
+    use tickloop_agent_protocol::ReasoningEffort;
+    let directory = tempfile::tempdir().unwrap();
+    let stores: [Arc<dyn SettingsStore>; 2] = [
+        Arc::new(UserSettings::in_root(directory.path())),
+        Arc::new(MemorySettingsStore::default()),
+    ];
+    for store in stores {
+        store
+            .write(SettingsUpdate::ReasoningEffort(Some(ReasoningEffort::Off)))
+            .unwrap();
+        assert!(!store.read(None).thinking_enabled);
+        assert_eq!(store.read(None).reasoning_effort, None);
+        store
+            .write(SettingsUpdate::ReasoningEffort(Some(ReasoningEffort::Low)))
+            .unwrap();
+        assert!(!store.read(None).thinking_enabled);
+        store
+            .write(SettingsUpdate::Thinking {
+                enabled: true,
+                effort: None,
+            })
+            .unwrap();
+        store
+            .write(SettingsUpdate::ReasoningEffort(Some(ReasoningEffort::Off)))
+            .unwrap();
+        assert!(
+            store.read(None).thinking_enabled,
+            "an explicit thinking choice takes precedence over the legacy off effort"
+        );
+    }
+}
