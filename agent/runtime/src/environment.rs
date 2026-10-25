@@ -433,6 +433,7 @@ impl ExecutionPort for LocalPort {
             return ExecutionOutcome::NotDispatched(error);
         }
         let operation = prepared.operation();
+        let is_shell_start = matches!(prepared.facts().intent, ExecutionIntent::SpawnShell(_));
         let dispatch =
             ExecutionDispatch::new(self.authority.clone(), self.scope.chat, cancel.clone());
         let execution = async {
@@ -509,10 +510,20 @@ impl ExecutionPort for LocalPort {
                 },
             }
         };
+        tokio::pin!(execution);
         tokio::select! {
             biased;
-            _ = dispatch.interrupted() => dispatch.interruption(operation),
-            outcome = execution => outcome,
+            _ = dispatch.interrupted() => {
+                if is_shell_start && !dispatch.was_sent() && self.authority.check(self.scope.chat).is_ok() {
+                    // Settle an already-issued spawn grant before completing pre-spawn cancellation.
+                    tokio::select! {
+                        biased;
+                        _ = self.authority.revoked() => dispatch.interruption(operation),
+                        outcome = &mut execution => outcome,
+                    }
+                } else { dispatch.interruption(operation) }
+            },
+            outcome = &mut execution => outcome,
         }
     }
 }

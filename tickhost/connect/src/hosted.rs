@@ -393,10 +393,28 @@ pub async fn write_frame(
         ));
     }
     bytes.push(b'\n');
-    writer
-        .write_all(&bytes)
-        .await
-        .map_err(|error| HostError::after("Disconnected", error.to_string()))
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]).await {
+            Ok(0) => {
+                return Err(HostError {
+                    code: "Disconnected".into(),
+                    message: "frame write returned zero bytes".into(),
+                    dispatched: written != 0,
+                });
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(HostError {
+                    code: "Disconnected".into(),
+                    message: error.to_string(),
+                    dispatched: written != 0,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Verifies that the endpoint is a socket owned by this user and returns that user.
