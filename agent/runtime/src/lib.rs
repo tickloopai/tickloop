@@ -5433,35 +5433,6 @@ fn mcp_resource_authority_allowed(
     })
 }
 
-#[cfg(test)]
-mod thinking_settings_tests {
-    use super::*;
-
-    #[test]
-    fn disabled_preference_applies_only_when_model_card_allows_it() {
-        let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
-        let mut snapshot =
-            empty_snapshot(Uuid::new_v4().into(), Some(PathBuf::new()), model.clone());
-        snapshot.thinking_enabled = false;
-        assert_eq!(
-            snapshot.effective_reasoning_effort(),
-            Some(tickloop_agent_protocol::ReasoningEffort::Off)
-        );
-
-        snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get("anthropic-api", "claude-fable-5")
-            .unwrap();
-        assert_eq!(snapshot.effective_reasoning_effort(), None);
-        assert!(!snapshot.thinking_enabled);
-
-        snapshot.model = model;
-        assert_eq!(
-            snapshot.effective_reasoning_effort(),
-            Some(tickloop_agent_protocol::ReasoningEffort::Off)
-        );
-    }
-}
-
 #[async_trait::async_trait]
 impl tickloop_agent_tools::ShellRetention for WeakAgent {
     fn spawn(&self, task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
@@ -5494,5 +5465,34 @@ impl Agent {
         self.install_shell_grants(Arc::new(
             tickloop_local_environment::hosted::shells::OwnTickhost::new(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod thinking_settings_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_preference_applies_only_when_model_card_allows_it() {
+        let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
+        let mut snapshot =
+            empty_snapshot(Uuid::new_v4().into(), Some(PathBuf::new()), model.clone());
+        snapshot.thinking_enabled = false;
+        assert_eq!(
+            snapshot.effective_reasoning_effort(),
+            Some(tickloop_agent_protocol::ReasoningEffort::Off)
+        );
+
+        snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
+            .get("anthropic-api", "claude-fable-5")
+            .unwrap();
+        assert_eq!(snapshot.effective_reasoning_effort(), None);
+        assert!(!snapshot.thinking_enabled);
+
+        snapshot.model = model;
+        assert_eq!(
+            snapshot.effective_reasoning_effort(),
+            Some(tickloop_agent_protocol::ReasoningEffort::Off)
+        );
     }
 }
