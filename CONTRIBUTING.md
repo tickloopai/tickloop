@@ -67,13 +67,13 @@ It runs `cargo fmt --all --check` (and the same check for the Cargo launcher in 
 
 ## Repository layout
 
-The agent lives in `agent/` (the `tickloop` executable, Console, client, daemon, runtime and their support crates), the Tick host in `tickhost/` (the `tickhost` executable and its client), the Tick standard, SDK, package and OAuth crates and examples in `tick/`, shared terminal presentation in `ui/`, the crates.io launcher in `distribution/cargo/` and a patched crossterm copy in `vendor/crossterm/` (see `vendor/crossterm/UPSTREAM.md`). The per-crate table and the dependency boundaries are in [AGENTS.md](AGENTS.md) under “结构与接入边界”.
+The agent lives in `agent/` (the `tickloop` executable, Console, client, daemon, runtime and their support crates), the Tick host in `tickhost/` (the `tickhost` executable and its client), the Tick standard, SDK, package and OAuth crates and examples in `tick/`, shared terminal presentation in `ui/`, the crates.io launcher in `distribution/cargo/` and a patched crossterm copy in `vendor/crossterm/` (see `vendor/crossterm/UPSTREAM.md`). The per-crate table and the dependency boundaries are in [AGENTS.md](AGENTS.md) under "Structure and integration boundaries".
 
 ## Design documents and conventions
 
-- Domain terms follow [CONTEXT.md](CONTEXT.md) (Chinese). Read it before designing a change, and use its terms in code and discussion. If your change conflicts with documented behavior, say so in the pull request.
-- [`AGENTS.md`](AGENTS.md) (Chinese) holds the working rules for coding agents and doubles as a compact summary of the core behavior contracts. Design records and ADRs are kept by the maintainers outside the repository; ask in an issue when you need the background of a decision.
-- Interaction conventions for input, lists, menus and Tick views are in [AGENTS.md](AGENTS.md) under “交互约束”.
+- Domain terms follow [CONTEXT.md](CONTEXT.md). Read it before designing a change, and use its terms in code and discussion. If your change conflicts with documented behavior, say so in the pull request.
+- [`AGENTS.md`](AGENTS.md) holds the working rules for coding agents and doubles as a compact summary of the core behavior contracts. Design records and ADRs are kept by the maintainers outside the repository; ask in an issue when you need the background of a decision.
+- Interaction conventions for input, lists, menus and Tick views are in [AGENTS.md](AGENTS.md) under "Interaction rules".
 - Keep comments for non-obvious logic; prefer clear names and small, focused functions.
 - `.scratch/` is ignored by Git. It is a local workspace for maintainers' specs, tickets and evidence and is not part of the project. Public discussion happens in GitHub issues and pull requests.
 

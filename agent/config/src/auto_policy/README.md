@@ -1,12 +1,12 @@
-# 冻结默认政策接入
+# Frozen Default Policy Integration
 
-来源：Claude Code 2.1.296 的 `auto-mode defaults`，二进制 SHA-256
-`c9b5341637becbd423ddffc5b254afb645682a3868cb708bbc6cc0e7bb419937`。
+Source: `auto-mode defaults` from Claude Code 2.1.296, binary SHA-256
+`c9b5341637becbd423ddffc5b254afb645682a3868cb708bbc6cc0e7bb419937`.
 
-保留适用规则的完整正文及具体授权门槛；每阶段仍只产生一个整体模型问题。
-映射由配置测试和 Jev 测试替身验证；替身结果不等于真实 Jev 的语义验收。
+The full text and specific authorization thresholds of applicable rules are kept; each stage still produces only one overall model question.
+The mapping is verified by config tests and a Jev test double; test-double results are not semantic acceptance by the real Jev.
 
-## 产品映射
+## Product Mapping
 
 - Session-Created Job Cleanup
 - Claude Code Scheduling
@@ -22,60 +22,60 @@
 - Auto-Mode Bypass
 - Session Transcript Tampering
 
-以上条目只替换实际产品接口、来源或范围；Artifact 的账号角色和协作权限由原宿主继续执行。
-Tick 清理必须匹配同一 Loop 和实例的可信创建凭据。自动触发和 Agent 消息不产生新的人类授权。
+The entries above replace only the actual product interfaces, sources or scope; Artifact account roles and collaboration permissions are still enforced by the original host.
+Tick cleanup must match a trusted creation credential from the same Loop and instance. Automatic triggers and Agent messages do not create new human authorization.
 
-## 定时任务与 Goal
+## Scheduled Tasks and Goal
 
-2.1.296 的原生 **Claude Code Scheduling** 是 Soft allow，覆盖 CronCreate、CronDelete、
-CronList 和 RemoteTrigger；正文明确允许当前会话中的提示投递，以及写入
-`.claude/scheduled_tasks.json` 的持久任务。Tickloop 保留原文，再限定实际产品映射：
-只允许当前 Chat 的安排，RemoteTrigger 没有对应入口；自定节奏的 ScheduleWakeup 也属于该映射。
+The native **Claude Code Scheduling** rule in 2.1.296 is a Soft allow covering CronCreate, CronDelete,
+CronList and RemoteTrigger; its text explicitly allows prompt delivery within the current session, and persistent tasks written to
+`.claude/scheduled_tasks.json`. Tickloop keeps the original text and then narrows it to the actual product mapping:
+only schedules for the current Chat are allowed, and RemoteTrigger has no corresponding entry point; self-paced ScheduleWakeup also falls under this mapping.
 
-核对入口：Claude Code `src/cli/handlers/autoMode.ts` 的 `autoModeDefaultsHandler` 调用
-`src/utils/permissions/yoloClassifier.ts` 的 `getDefaultExternalAutoModeRules`，从外部政策模板抽取规则。
-本机只读源码缺失该模板，因此规则正文由上述 SHA-256 对应的官方 2.1.296 二进制导出。
-`src/tools/ScheduleCronTool/CronListTool.ts` 显式 `isReadOnly() = true`；CronCreate 和
-CronDelete 没有该声明，沿用 `src/Tool.ts` 的非只读默认设定，由分类器政策决定。
+Verification entry points: in Claude Code, `autoModeDefaultsHandler` in `src/cli/handlers/autoMode.ts` calls
+`getDefaultExternalAutoModeRules` in `src/utils/permissions/yoloClassifier.ts`, which extracts the rules from the external policy template.
+The local read-only source lacks that template, so the rule text is exported from the official 2.1.296 binary matching the SHA-256 above.
+`src/tools/ScheduleCronTool/CronListTool.ts` explicitly sets `isReadOnly() = true`; CronCreate and
+CronDelete have no such declaration, so they inherit the non-read-only default from `src/Tool.ts` and are decided by the classifier policy.
 
-| Tickloop 工具 | permission 与 Auto 处理 | 规则依据与授权边界 |
+| Tickloop tool | Permission and Auto handling | Rule basis and authorization boundary |
 | --- | --- | --- |
-| CronList | ReadOnly；不调用审查 | Read-Only Operations；Claude Code CronList 的只读设定 |
-| GetGoal | ReadOnly；不调用审查 | 只读取当前 Chat 的 Goal；按 Codex get_goal 接入，不经过政策分类 |
-| CronCreate | Classified；Scheduling Soft allow | 仅当前 Chat、用户任务范围和期限内的安排；不预先批准将来的实际操作 |
-| ScheduleWakeup | Classified；Scheduling Soft allow | 当前 Chat 已获授权的自定节奏 `/loop` 的重排；任务达成或用户要求取消时停止本循环，不管理其他任务 |
-| CronUpdate | Classified；有条件的 Scheduling Soft allow | 原地修改当前 Chat 的一个任务（计划、重复方式、指令或标题）；本 Loop 有确切成功创建凭据的 Agent 任务可改；用户明确要求修改的任务可改；修改后仍限于用户授权的任务范围和期限；没有修改授权的用户任务仍受 Interfere With Workloads 阻拦 |
-| CronDelete | Classified；有条件的 Scheduling Soft allow | 本 Loop 有确切成功创建凭据的 Agent 任务可清理；用户明确要求取消的任务可删除；没有取消授权的用户任务仍受 Interfere With Workloads 阻拦 |
-| CreateGoal | Automatic；Auto 直接执行，不调用审查 | 按 Codex create_goal 的直接执行方式接入；用户明确要求 Goal、token budget 的约束继续保留在工具指令中 |
-| UpdateGoal | ReadOnly；不调用审查 | 只报告完成或阻塞，不改变 Goal 以外的状态；按 Codex update_goal 接入，完成申请仍经过独立完成核对 |
+| CronList | ReadOnly; no review | Read-Only Operations; Claude Code's read-only setting for CronList |
+| GetGoal | ReadOnly; no review | Reads only the current Chat's Goal; integrated following Codex get_goal, not policy-classified |
+| CronCreate | Classified; Scheduling Soft allow | Only schedules in the current Chat, within the user's task scope and time limit; does not pre-approve future actual operations |
+| ScheduleWakeup | Classified; Scheduling Soft allow | Rescheduling of an already-authorized self-paced `/loop` in the current Chat; stops this loop when the task is achieved or the user asks to cancel, and does not manage other tasks |
+| CronUpdate | Classified; conditional Scheduling Soft allow | Modifies one task of the current Chat in place (schedule, recurrence, instruction or title); Agent tasks for which this Loop holds an exact successful creation credential may be modified; tasks the user explicitly asks to modify may be modified; after modification the task stays within the user-authorized task scope and time limit; user tasks without modification authorization are still blocked by Interfere With Workloads |
+| CronDelete | Classified; conditional Scheduling Soft allow | Agent tasks for which this Loop holds an exact successful creation credential may be cleaned up; tasks the user explicitly asks to cancel may be deleted; user tasks without cancellation authorization are still blocked by Interfere With Workloads |
+| CreateGoal | Automatic; Auto executes directly, no review | Integrated following Codex create_goal's direct-execution approach; constraints such as the user explicitly requesting a Goal and the token budget remain in the tool instructions |
+| UpdateGoal | ReadOnly; no review | Only reports completion or blockage and changes no state outside the Goal; integrated following Codex update_goal, and completion requests still go through an independent completion check |
 
-CronUpdate 与 CronDelete 的 `scheduled_task` 宿主事实只描述该 Chat 内的确切目标 id、creator 和可验证的
-creation_call_id，以及经过大小限制的 schedule/prompt 详情，供修改或取消请求解析目标。
-这些详情是数据，不是新的用户授权。创建凭据要求同一 Loop 中已完成的 CronCreate，以及宿主记录的成功结果中
-返回该目标 id；还须有对应的成功工具历史。只有 creator 为 Agent 才能用该清理例外。
-用户 `/loop` 所在回合创建的用户任务也不会被误算为 Agent 自建任务。查到 id、模型叙述、
-任务较新或其他 Loop 的记录均不证明所有权；缺少凭据时只能依赖真实用户的具体取消授权。
+The `scheduled_task` host facts for CronUpdate and CronDelete describe only the exact target id, creator and verifiable
+creation_call_id within that Chat, plus size-limited schedule/prompt details, so that modification or cancellation requests can resolve the target.
+These details are data, not new user authorization. A creation credential requires a completed CronCreate in the same Loop whose successful result,
+as recorded by the host, returns that target id; a matching successful tool history is also required. Only a task whose creator is Agent can use this cleanup exception.
+User tasks created in the turn of a user `/loop` are not miscounted as Agent-created tasks either. Finding an id, model narration,
+a task being newer, or records from other Loops do not prove ownership; without a credential, only a real user's specific cancellation authorization can be relied on.
 
-**Unauthorized Persistence** 与 **Account & Standing-Rule Changes** 仍完整保留。
-原生 Chat 定时任务可能跨回合、视图关闭后继续，并随 Chat 保存；Scheduling
-只为这些已授权的本产品安排清除上述两条 Soft deny。
-OS cron、systemd、shell profile、访问凭据、连接账户的 automation/webhook 等不在例外中。
-不能仅凭 CronCreate 会延后执行就误判为越权持久化，也不能借 Scheduling 为将来的敏感操作授权。
-**Scheduled-Task Fires** 继续规定：自动送达不产生新的人类授权，仍沿用原授权的范围与期限。
-Claude Code 没有对应的 Goal 工具。三个 Goal 工具按 Codex 的直接执行方式接入，
-不使用 Auto 政策映射；没有 Chat Goal Lifecycle Soft allow。GetGoal 与 UpdateGoal 只读取或报告
-Goal，标为 `HostToolPermission::ReadOnly`（Plan 下也可用）；CreateGoal 标为
-`HostToolPermission::Automatic`：Auto 下直接放行，Plan 下不执行，显式 Ask／Deny 规则仍优先。
-用户明确要求 Goal、token budget、blocked 的续跑次数等仍由工具指令约束，
-CreateGoal 的已有 Goal 校验、UpdateGoal 的独立完成核对与 Goal 状态机不受权限类别影响。
+**Unauthorized Persistence** and **Account & Standing-Rule Changes** are still kept in full.
+Native Chat scheduled tasks may span turns, continue after the view closes, and are saved with the Chat; Scheduling
+clears these two Soft deny rules only for these authorized arrangements of this product.
+OS cron, systemd, shell profiles, access credentials, automations/webhooks of connected accounts and the like are not covered by the exception.
+CronCreate must not be misjudged as unauthorized persistence merely because it defers execution, nor can Scheduling be used to authorize future sensitive operations.
+**Scheduled-Task Fires** still states: automatic delivery does not create new human authorization and keeps the scope and time limit of the original authorization.
+Claude Code has no corresponding Goal tools. The three Goal tools are integrated following Codex's direct-execution approach
+and do not use the Auto policy mapping; there is no Chat Goal Lifecycle Soft allow. GetGoal and UpdateGoal only read or report
+the Goal and are marked `HostToolPermission::ReadOnly` (also available under Plan); CreateGoal is marked
+`HostToolPermission::Automatic`: allowed directly under Auto, not executed under Plan, and explicit Ask/Deny rules still take precedence.
+Constraints such as the user explicitly requesting a Goal, the token budget and the number of continuations when blocked are still enforced by the tool instructions;
+CreateGoal's existing-Goal check, UpdateGoal's independent completion check and the Goal state machine are unaffected by the permission category.
 
-子 Agent 不提供 CronCreate、CronList、CronUpdate、CronDelete、ScheduleWakeup、GetGoal、
-CreateGoal、UpdateGoal；无需子 Agent 的独立映射，也不能通过委派扩大根 Agent 的权限。
+Subagents are not given CronCreate, CronList, CronUpdate, CronDelete, ScheduleWakeup, GetGoal,
+CreateGoal or UpdateGoal; no separate subagent mapping is needed, and delegation cannot expand the root Agent's permissions.
 
-无状态宿主的 durable Chat 另由宿主规则直接准入 CronCreate、CronUpdate、CronDelete、ScheduleWakeup
-等工具，不经 Auto 审查，见 `agent/runtime/src/harness.rs` 的 `durable_chat_host_rules`。
+For a stateless host's durable Chat, host rules directly admit tools such as CronCreate, CronUpdate, CronDelete and ScheduleWakeup
+without Auto review; see `durable_chat_host_rules` in `agent/runtime/src/harness.rs`.
 
-## 当前不适用的原生条目
+## Native Entries Not Currently Applicable
 
 - Memory Directory: No managed memory directory is provided by Tickloop.
 - Browser Trusted Navigation: The authenticated Chrome-MCP browser surface is not exposed.
@@ -87,9 +87,9 @@ CreateGoal、UpdateGoal；无需子 Agent 的独立映射，也不能通过委�
 - Browser File Upload Exfil: The authenticated Chrome-MCP browser surface is not exposed.
 - Browser Shortcut Execution: The authenticated Chrome-MCP browser surface is not exposed.
 
-不适用只指具体入口不存在，不豁免同类真实副作用；通过 Bash 或其他已暴露工具执行
-数据外发、持久化或越权行为，仍按相应通用规则判断。新增对应产品入口时需重新映射。
+Not applicable means only that the specific entry point does not exist; it does not exempt real side effects of the same kind. Data exfiltration,
+persistence or out-of-scope actions carried out through Bash or other exposed tools are still judged by the corresponding general rules. When a corresponding product entry point is added, it must be remapped.
 
-目前为 **15 Soft allow、65 Soft deny、2 Hard deny，共 82 条**，政策与内置组版本均为 8；
-两条 Hard deny 之一是 Tickloop Agent Daemon Shutdown。当前有九个不适用的原生入口。
-自定义规则和分组替换保持独立；替换掉内置 Soft allow 的用户不会被强制加回 Scheduling 例外。
+There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 8.
+One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently nine native entry points that are not applicable.
+Custom rules and group replacements stay independent; users who replace the built-in Soft allow are not forced to have the Scheduling exception added back.

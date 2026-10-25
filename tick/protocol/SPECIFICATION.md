@@ -1,84 +1,84 @@
-# Tick 协议规范
+# Tick Protocol Specification
 
-| 项 | 内容 |
+| Item | Value |
 | --- | --- |
-| 协议版本 | 3 |
-| 状态 | 草案；行为与本仓库 Tickloop 0.2 的实现一致 |
-| 日期 | 2026-10-14 |
-| 参考实现 | 宿主侧类型与校验 `tick/protocol`，Tick 侧 `tick/sdk`，示例 `tick/examples/counter.py` |
+| Protocol version | 3 |
+| Status | Draft; describes the Tickloop 0.2 implementation in this repository |
+| Date | 2026-10-14 |
+| Reference implementation | Host types and validation in `tick/protocol`; Tick-side SDK in `tick/sdk`; example in `tick/examples/counter.py` |
 
-## 与 Agent 工具和包 Skill 的分工
+## Agent tools and package guidance
 
-协议保留三个请求方法 `tick/describe`、`tick/read`、`tick/call` 和一个通知 `tick/update`。Tickloop 分别通过 TickDescribe 查询能力、TickRead 读取当前状态、TickCall 调用声明的业务工具，TickUpdate 表示更新交付事件。TickRead 不重复返回 descriptor 或工具目录。TickManage 在 Agent／宿主侧管理生命周期、视图、终端输入和 Loop 的订阅关系，不新增 Tick 程序 RPC。包 Skill 只负责启动命令、参数和登录前提，运行实例的 descriptor 是当前能力目录的权威来源。
+The protocol has three request methods (`tick/describe`, `tick/read`, `tick/call`) and one notification (`tick/update`). Tickloop exposes them through TickDescribe (capabilities), TickRead (current state), TickCall (declared operations) and TickUpdate (delivery event). TickRead does not repeat the descriptor or tool catalog. TickManage handles lifecycle, views, terminal input and Loop subscriptions in the Agent/host; it is not an additional Tick program RPC. Package Skills document launch commands and login prerequisites. A running instance's descriptor is the authoritative capability catalog.
 
 <a id="s1"></a>
 
-## 1. 概述
+## 1. Overview
 
 <a id="s1-1"></a>
 
-### 1.1 目的
+### 1.1 Purpose
 
-Tick 协议规定一个终端程序如何把自己的状态、可调用的操作和业务上的变化提供给宿主，使 AI Agent 能够读取它、调用它，并在它发生变化时被唤醒继续工作。实现了本协议的程序称为**扩展 Tick**。
+The Tick protocol defines how a terminal program exposes its state, callable operations, and business changes to a host. An AI Agent can read the program, call its tools, and resume work when new information arrives. A program implementing this protocol is a **extension Tick**.
 
-一个扩展 Tick 同时服务两方：人在它的终端界面里操作，Agent 经宿主通过本协议操作。两方面对的是同一个进程、同一份状态。
+An extension Tick serves two participants: a person using its terminal interface, and an Agent using the protocol through the host. Both interact with the same process and the same state.
 
 <a id="s1-2"></a>
 
-### 1.2 角色
+### 1.2 Roles
 
-- **Tick**：实现本协议的程序。它从标准输入读取请求，向标准输出写协议消息，在自己的控制终端上绘制界面。
-- **宿主（Host）**：启动 Tick 并与之通信的一方。在 Tickloop 中，宿主是 Tickhost 为每个 Tick 启动的 launcher 进程及其背后的 Tickhost。
-- **客户端**：通过宿主使用 Tick 的一方，通常是 Agent 的 Loop。客户端与宿主之间的接口不在本规范范围内。
-- **视图**：显示 Tick 控制终端的界面，例如 Herdr Pane 或 Monitor 浮窗。一个 Tick 可以同时有多个视图，视图的打开与关闭不影响协议会话。
+- **Tick**: the program implementing this protocol. It reads requests from standard input, writes protocol messages to standard output, and draws its interface on its controlling terminal.
+- **Host**: the party that starts and communicates with the Tick. In Tickloop, this is the launcher process started for each Tick by Tickhost, together with Tickhost itself.
+- **Client**: a party that uses a Tick through the host, usually an Agent's Loop. The interface between client and host is outside the scope of this specification.
+- **View**: an interface displaying the Tick's controlling terminal, such as a Herdr Pane or Monitor overlay. Multiple views can attach to one Tick. Opening or closing a view does not affect the protocol session.
 
 <a id="s1-3"></a>
 
-### 1.3 设计原则
+### 1.3 Design principles
 
-1. **程序就是工具。** Tick 用一份工具目录声明自己能做什么；宿主不需要为每种 Tick 编写专门的代码。
-2. **状态是最新的完整快照。** 每条更新携带完整的当前状态而不是增量，宿主只保留最新的一份。错过中间的更新不会让宿主得到错误的状态。
-3. **修改可以审批。** 工具声明自己是否会修改外部状态；调用绑定在审批时看到的目录版本上，目录变化后旧的审批不再生效。
-4. **结果未知时不重试。** 修改类调用一旦派发，超时或断线都不会被自动重发。
-5. **实现门槛低。** 只用一门语言的标准库就能写出一个合规的 Tick。
+1. **The program is the tool.** A Tick declares its capabilities in a tool catalog. The host does not need custom code for each kind of Tick.
+2. **State is a complete, current snapshot.** Each update carries the full current state, rather than a delta. The host keeps only the latest snapshot, so missing intermediate updates does not leave it with an inconsistent state.
+3. **Changes can be approved.** Tools declare whether they mutate external state. A call is bound to the catalog revision used for approval; changing the catalog invalidates that approval.
+4. **An unknown outcome is not retried.** Once a mutating call has been dispatched, a timeout or disconnection does not trigger an automatic resend.
+5. **Implementation stays small.** A language's standard library is enough to implement a compliant Tick.
 
 <a id="s1-4"></a>
 
-### 1.4 与 LSP、MCP 的关系
+### 1.4 Relationship to LSP and MCP
 
-本协议和 LSP 一样使用 JSON-RPC 2.0 并以标准输入输出为传输，区别是消息按行分隔，没有 `Content-Length` 报头（[第 3.1 节](#s3-1)）。
+Like LSP, this protocol uses JSON-RPC 2.0 over standard input and output. Unlike LSP, messages are delimited by newlines, with no `Content-Length` header ([Section 3.1](#s3-1)).
 
-本协议的工具目录与 MCP 的 tools 相近：名称、描述和 JSON Schema 形式的输入。不同之处有三点：
+The tool catalog resembles MCP tools: names, descriptions, and inputs defined with JSON Schema. Three features distinguish the Tick protocol:
 
-- Tick 还有自己的状态：带序号，可以读取，变化时通知宿主。
-- 工具调用绑定目录版本 `revision`。
-- Tick 有一个人正在使用的终端界面，协议消息与界面严格分开。
+- A Tick also has readable, sequenced state and notifies the host when it changes.
+- Tool calls are bound to a catalog `revision`.
+- A Tick has a terminal interface for people, kept separate from protocol messages.
 
-本协议没有初始化握手中的能力协商：宿主通过 `tick/describe` 的结果了解 Tick 的全部能力。
+There is no capability negotiation in an initialization handshake. The host learns the Tick's capabilities from `tick/describe`.
 
 <a id="s2"></a>
 
-## 2. 约定
+## 2. Conventions
 
 <a id="s2-1"></a>
 
-### 2.1 规范性用语
+### 2.1 Normative language
 
-本文中的“必须”“不得”“应当”“不应”“可以”分别对应 [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) 与 [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174) 中的 MUST、MUST NOT、SHOULD、SHOULD NOT 与 MAY，仅在加粗时具有规范含义。
+The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174), only when shown in bold.
 
-没有加粗的说明、示例和“注”属于说明性内容。
+Unbolded explanations, examples, and notes are informative.
 
 <a id="s2-2"></a>
 
-### 2.2 类型表示
+### 2.2 Type notation
 
-消息结构用 TypeScript 接口表示，写法与 LSP 规范相同：
+Message structures use TypeScript interfaces, following the notation of the LSP specification:
 
-- `?` 表示字段可以省略；
-- `integer` 表示 -2^53+1 到 2^53-1 之间的整数，`uinteger` 表示 0 到 2^53-1 之间的整数；
-- `object` 表示 JSON 对象；
-- 时间是 [RFC 3339](https://www.rfc-editor.org/rfc/rfc3339) 字符串；
-- 指向 JSON 内部位置的路径是 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointer。
+- `?` marks a field that may be omitted.
+- `integer` is an integer from -2^53+1 through 2^53-1; `uinteger` is an integer from 0 through 2^53-1.
+- `object` means a JSON object.
+- Timestamps are [RFC 3339](https://www.rfc-editor.org/rfc/rfc3339) strings.
+- Paths within JSON values are [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointers.
 
 ```typescript
 type integer = number;
@@ -90,42 +90,42 @@ type JSONSchema = { [key: string]: JSONValue };
 
 <a id="s2-3"></a>
 
-### 2.3 字节与大小
+### 2.3 Bytes and sizes
 
-本文所说的大小都是 UTF-8 编码后的字节数。消息体的大小按接收方重新编码后的结果计算（[第 3.5 节](#s3-5)）。
+All sizes are in UTF-8 bytes. Message body sizes are measured after the receiver re-encodes the parsed value ([Section 3.5](#s3-5)).
 
 <a id="s3"></a>
 
-## 3. 基础协议
+## 3. Base protocol
 
 <a id="s3-1"></a>
 
-### 3.1 传输
+### 3.1 Transport
 
-宿主以子进程方式启动 Tick，并为它提供三个通道：
+The host starts the Tick as a child process with three channels:
 
-| 通道 | 用途 |
+| Channel | Purpose |
 | --- | --- |
-| 标准输入 | 宿主写给 Tick 的请求 |
-| 标准输出 | Tick 写给宿主的响应与通知，只能用于协议消息 |
-| 控制终端（标准错误也连到这里） | Tick 的界面，由视图显示 |
+| Standard input | Requests from the host to the Tick |
+| Standard output | Responses and notifications from the Tick to the host; protocol messages only |
+| Controlling terminal, also connected to standard error | The Tick's interface, displayed by views |
 
-消息格式规则：
+Message framing rules:
 
-- 每条消息是一个 JSON 值，编码为 UTF-8，后接一个换行符 `\n`（U+000A）。
-- 消息内部**不得**含有未转义的换行符。
-- Tick **不得**向标准输出写任何非协议内容，包括调试输出、进度条和第三方库的打印。
-- 最后一条消息之后，Tick **必须**写出结尾的换行符；没有换行就结束的输出视为违规（[第 3.6 节](#s3-6)）。
-- Tick **必须**把每条消息整行写出：多个线程写标准输出时，一条消息的字节**不得**与另一条交错。
-- 写到标准错误的内容会显示在视图里。Tick **不应**把诊断日志写到标准错误；需要日志时，**应当**写到 Tick 自己的日志文件。
+- Each message is a UTF-8 JSON value followed by a newline `\n` (U+000A).
+- A message **MUST NOT** contain unescaped newlines.
+- A Tick **MUST NOT** write non-protocol content to standard output, including debug output, progress bars, or third-party library output.
+- A Tick **MUST** terminate the final message with a newline. Output that ends without one is a violation ([Section 3.6](#s3-6)).
+- A Tick **MUST** write each message as a complete line. When multiple threads write to standard output, bytes from different messages **MUST NOT** interleave.
+- Content written to standard error appears in the view. A Tick **SHOULD NOT** write diagnostic logs to standard error; it **SHOULD** use its own log file instead.
 
-> 注：本协议不使用 LSP 的 `Content-Length` 报头。按行分隔使最简单的实现也能用逐行读取完成解析。
+> Note: This protocol does not use LSP's `Content-Length` header. Newline framing lets even a minimal implementation parse messages with a line reader.
 
 <a id="s3-2"></a>
 
-### 3.2 消息
+### 3.2 Messages
 
-所有消息都遵循 [JSON-RPC 2.0](https://www.jsonrpc.org/specification)，并且必须带 `"jsonrpc": "2.0"`。不支持批量消息。
+All messages follow [JSON-RPC 2.0](https://www.jsonrpc.org/specification) and carry `"jsonrpc": "2.0"`. Batch messages are not supported.
 
 ```typescript
 interface Message {
@@ -160,174 +160,174 @@ interface NotificationMessage extends Message {
 }
 ```
 
-方向规则：
+Message direction:
 
-- 请求只从宿主发往 Tick。Tick **不得**向宿主发送请求。
-- Tick 发往宿主的通知只有 `tick/update`。宿主收到其他通知时**必须**忽略它并继续会话，**可以**记录或计数。
-- 宿主不向 Tick 发送通知。
+- Requests travel only from host to Tick. A Tick **MUST NOT** send requests to the host.
+- The only notification from Tick to host is `tick/update`. The host **MUST** ignore other notifications and continue the session. It **MAY** log or count them.
+- The host does not send notifications to the Tick.
 
-关于 `id`：
+Request IDs:
 
-- 宿主分配的 `id` 是无符号整数。
-- Tick 对每个请求**必须**恰好回复一次，`id` 与请求相同。
-- 响应**必须**含有 `result` 与 `error` 其中之一，且只能有一个。
-- Tick **不得**发送 `id` 为 `null` 的响应。请求无法解析或取不到 `id` 时，Tick **必须**丢弃该行且不回复，**可以**记录到自己的诊断日志（宿主不会发送这样的请求）。
+- The host assigns unsigned integer IDs.
+- A Tick **MUST** respond to each request exactly once, using the same `id`.
+- A response **MUST** contain exactly one of `result` and `error`.
+- A Tick **MUST NOT** send a response with `id: null`. If a request cannot be parsed or has no usable `id`, the Tick **MUST** discard the line without replying. It **MAY** record the event in its diagnostic log. The host does not send such requests.
 
-> 注：JSON-RPC 2.0 允许对无法解析的请求回复 `id: null` 的错误。本协议的宿主只发送合法请求，所以禁止这种响应，以便宿主把它当作明确的违规处理。
+> Note: JSON-RPC 2.0 permits errors with `id: null` for unparseable requests. This host only sends valid requests, so the Tick protocol prohibits such responses and treats them as explicit violations.
 
-方法名以 `tick/` 开头的名字保留给本协议。
+Method names beginning with `tick/` are reserved for this protocol.
 
 <a id="s3-3"></a>
 
-### 3.3 并发与顺序
+### 3.3 Concurrency and ordering
 
-- 宿主**可以**在上一个请求得到响应之前发送下一个请求。
-- 宿主同时在途的请求（包括 `tick/describe` 与 `tick/read`）不超过 8 个（[第 3.5 节](#s3-5)）。
-- Tick **可以**并发处理请求，并**可以**以任意顺序回复；宿主按 `id` 匹配响应。
-- `tick/describe` 与 `tick/read` **应当**立即作答，不等待正在执行的工具调用。
+- The host **MAY** send a new request before receiving a response to an earlier one.
+- At most 8 requests may be in flight, including `tick/describe` and `tick/read` ([Section 3.5](#s3-5)).
+- A Tick **MAY** process requests concurrently and **MAY** respond in any order. The host matches responses by `id`.
+- `tick/describe` and `tick/read` **SHOULD** respond promptly, without waiting for running tool calls.
 
-`tick/update` 可以在任何时候发出，包括初始化完成之前、在途请求的响应之前或之后。宿主按到达顺序检查更新的序号（[第 6.3 节](#s6-3)）。
+A Tick may emit `tick/update` at any time: before initialization finishes, or before or after a response to an in-flight request. The host checks update sequence numbers in arrival order ([Section 6.3](#s6-3)).
 
 <a id="s3-4"></a>
 
-### 3.4 错误码
+### 3.4 Error codes
 
-Tick 在响应中使用下列错误码。宿主根据错误码判断这次调用有没有产生效果。
+Ticks use the following error codes. The host uses the code to determine whether a call may have had an effect.
 
-| 代码 | 名称 | 含义 | 宿主的理解 |
+| Code | Name | Meaning | Host interpretation |
 | --- | --- | --- | --- |
-| -32600 | InvalidRequest | 请求不是合法的 JSON-RPC 请求 | 未执行 |
-| -32601 | MethodNotFound | 方法不存在 | 未执行 |
-| -32602 | InvalidParams | 参数不对，或工具不存在 | 未执行 |
-| -32001 | UnsupportedJsonRpc | 请求的 `jsonrpc` 不是 `"2.0"` | 未执行 |
-| -32003 | FrameTooLarge | 请求超过 Tick 接受的大小 | 未执行 |
-| -32004 | RevisionMismatch | `tick/call` 的 `revision` 与当前目录不符 | 未执行，目录已变化 |
-| -32000 | ToolFailed | 工具已运行，但失败了 | 已执行 |
-| 其他 | — | 由 Tick 定义 | 已执行 |
+| -32600 | InvalidRequest | Not a valid JSON-RPC request | Not executed |
+| -32601 | MethodNotFound | Unknown method | Not executed |
+| -32602 | InvalidParams | Invalid parameters or unknown tool | Not executed |
+| -32001 | UnsupportedJsonRpc | `jsonrpc` is not `"2.0"` | Not executed |
+| -32003 | FrameTooLarge | Request exceeds the Tick's accepted size | Not executed |
+| -32004 | RevisionMismatch | Call `revision` does not match the current catalog | Not executed; catalog changed |
+| -32000 | ToolFailed | Tool ran but failed | Executed |
+| Other | — | Defined by the Tick | Executed |
 
-- Tick 用“未执行”类错误码回复的调用，**必须**没有产生任何效果。
-- 工具运行到一半失败、可能已经产生部分效果时，Tick **必须**使用 -32000 或其他“已执行”类错误码。
-- `message` **应当**是一句能直接给人看的说明。`data` **可以**携带结构化的细节。
+- A call answered with a “not executed” error **MUST** have had no effect.
+- If a tool fails after starting and may have had partial effects, the Tick **MUST** use -32000 or another “executed” error code.
+- `message` **SHOULD** be a human-readable explanation. `data` **MAY** carry structured details.
 
 <a id="s3-5"></a>
 
-### 3.5 限额
+### 3.5 Limits
 
-| 项目 | 上限 | 超出时 |
+| Item | Limit | If exceeded |
 | --- | --- | --- |
-| 单个请求 | 512 KiB | 宿主不发送，Tick 收不到 |
-| `tick/describe` 的结果 | 512 KiB（编码后） | 初始化失败；运行中则这次请求失败 |
-| 单条 `tick/update` | 512 KiB（编码后） | 违规，会话结束 |
-| 单个响应行 | 8 MiB | 违规，会话结束 |
-| 单个响应的 `result` | 8 MiB（编码后） | 这次调用的结果按“未知”处理，会话继续；Tick 自己发现结果超限时回 -32000 |
-| 同时在途的请求（包括 `tick/describe` 与 `tick/read`） | 8 个 | 宿主不发送，向客户端报告忙 |
+| Request | 512 KiB | The host does not send it; the Tick never receives it |
+| `tick/describe` result | 512 KiB after encoding | Initialization fails, or the request fails during normal operation |
+| `tick/update` notification | 512 KiB after encoding | Protocol violation; session ends |
+| Response line | 8 MiB | Protocol violation; session ends |
+| Response `result` | 8 MiB after encoding | Outcome reported as unknown; session continues. A Tick that detects its own oversized result returns -32000 |
+| In-flight requests, including `tick/describe` and `tick/read` | 8 | The host does not send another request and reports busy to the client |
 
-- 编码后大小指宿主解析后重新编码的字节数。数字的写法不同，重新编码后可能变长（例如 `1e15` 编码为 `1000000000000000.0`），Tick **应当**为此留出余量。
-- 宿主**可以**设置更严格的总量限制，例如所有在途调用的响应缓冲合计 64 MiB。
+- Encoded size is measured after the host parses and re-encodes the value. Number representations can grow, for example from `1e15` to `1000000000000000.0`. A Tick **SHOULD** leave headroom.
+- The host **MAY** impose stricter aggregate limits, such as 64 MiB of response buffers across all in-flight calls.
 
 <a id="s3-6"></a>
 
-### 3.6 违规
+### 3.6 Violations
 
-下列情况是协议违规。宿主**必须**结束会话：在途请求全部按结果未知处理，并结束 Tick 进程。
+The following are protocol violations. The host **MUST** end the session, treat all in-flight requests as having unknown outcomes, and terminate the Tick process:
 
-- 一行不是合法 JSON，或 `jsonrpc` 不是 `"2.0"`；
-- 一行既没有整数 `id` 也没有 `method`（包括 `id` 为 `null` 或字符串的响应）；
-- 输出在没有换行符的情况下结束；
-- 单行超过 8 MiB；
-- 不合规的 `tick/update`（[第 8.2 节](#s8-2)）。
+- A line is not valid JSON, or `jsonrpc` is not `"2.0"`.
+- A line has neither an integer `id` nor a `method`, including responses with a null or string `id`.
+- Output ends without a terminating newline.
+- A line exceeds 8 MiB.
+- A `tick/update` violates its requirements ([Section 8.2](#s8-2)).
 
-下列情况只让对应的请求失败，会话继续：
+The following fail only the affected request; the session continues:
 
-- 响应同时含有或同时缺少 `result` 与 `error`；
-- `tick/read` 的结果违反序号规则（[第 6.3 节](#s6-3)）；
-- `result` 编码后超过 8 MiB。
+- A response contains both `result` and `error`, or neither.
+- A `tick/read` result violates the sequence rules ([Section 6.3](#s6-3)).
+- An encoded `result` exceeds 8 MiB.
 
-宿主收到与在途请求都不匹配的 `id` 时，**必须**丢弃该响应。
+The host **MUST** discard a response whose `id` does not match an in-flight request.
 
 <a id="s4"></a>
 
-## 4. 生命周期
+## 4. Lifecycle
 
 <a id="s4-1"></a>
 
-### 4.1 启动
+### 4.1 Startup
 
-宿主以用户给出的命令启动 Tick：
+The host starts the Tick using the command supplied by the user:
 
-- `argv` 与命令相同，`argv[0]` 为解析后的绝对路径；
-- 工作目录为打开 Tick 时指定的目录；
-- 环境中带有下列变量：
+- `argv` matches the command, with `argv[0]` resolved to an absolute path.
+- The working directory is the one specified when opening the Tick.
+- The environment includes:
 
-| 变量 | 内容 |
+| Variable | Value |
 | --- | --- |
-| `TICKLOOP_INSTANCE_ID` | 本次运行的实例身份，形如 `hosted:<id>` |
+| `TICKLOOP_INSTANCE_ID` | This run's instance identity, in the form `hosted:<id>` |
 | `TERM` | `xterm-256color` |
 
-- `TICKLOOP_INSTANCE_ID` 只供 Tick 写日志或区分自己的多个运行，不出现在任何协议消息中，也不是凭据。
-- Tick **可以**根据它是否存在来判断自己是被宿主启动的，还是由人在终端里直接运行的。
-- 其他以 `TICKLOOP_` 开头的变量属于宿主内部，Tick **不得**依赖它们。
+- `TICKLOOP_INSTANCE_ID` is for logging or distinguishing concurrent runs. It is absent from protocol messages and is not a credential.
+- A Tick **MAY** use its presence to distinguish host startup from a person launching it directly in a terminal.
+- Other variables beginning with `TICKLOOP_` are internal to the host. A Tick **MUST NOT** depend on them.
 
-Tick 运行在一个以视图终端为控制终端的会话中，处于前台进程组：
+The Tick runs in the foreground process group of a session whose controlling terminal is the view terminal:
 
-- 初始尺寸为 120 列 × 30 行；
-- 视图尺寸变化时，宿主调整终端尺寸，Tick 由内核收到 `SIGWINCH`；
-- 尺寸变化不经过协议。
+- Initial size is 120 columns by 30 rows.
+- When a view changes size, the host resizes the terminal and the kernel sends `SIGWINCH` to the Tick.
+- Resizing does not use the protocol.
 
 <a id="s4-2"></a>
 
-### 4.2 初始化
+### 4.2 Initialization
 
-启动后，宿主依次发送：
+After startup, the host sends, in order:
 
-1. `tick/describe`，检查结果（[第 5.3 节](#s5-3)）；
-2. `tick/read`，取得初始状态。
+1. `tick/describe`, then validates its result ([Section 5.3](#s5-3)).
+2. `tick/read`, to obtain initial state.
 
-规则：
+Rules:
 
-- 每个请求**必须**在 10 秒内得到响应。
-- 从启动到初始化完成，总共不超过 10 秒。
-- 任何一步失败、超时，或结果不合规，初始化失败：宿主结束 Tick 进程，实例不会出现在客户端中，失败原因与视图屏幕上的前 256 个字符会一起报告给客户端。
-- Tick **可以**在初始化完成前发出 `tick/update`，宿主照常接收。
+- Each request **MUST** receive a response within 10 seconds.
+- The total time from startup through initialization is at most 10 seconds.
+- Any failure, timeout, or invalid result fails initialization. The host terminates the Tick process; the instance does not appear in the client. The failure reason and the first 256 characters of the view screen are reported to the client.
+- A Tick **MAY** emit `tick/update` before initialization completes. The host receives these updates normally.
 
 <a id="s4-3"></a>
 
-### 4.3 版本
+### 4.3 Versioning
 
-`tick/describe` 的结果中 `protocol` 字段声明 Tick 实现的协议版本。宿主请求中不携带版本。
+The `protocol` field in `tick/describe` declares the version implemented by the Tick. Host requests do not carry a version.
 
-- 宿主只接受自己实现的版本。版本不符时，初始化失败，错误信息说明两边的版本，例如 `unsupported Tick protocol version 2; this host speaks Tick protocol 3`。
-- Tick 收不到这条错误；它显示在视图里，并报告给客户端。
-- 不改变已有字段含义的扩展（例如新增可选字段）不改变协议版本。
-- 宿主**必须**忽略 `tick/describe` 结果和状态中不认识的字段；Tick **应当**忽略请求参数中不认识的字段。
+- The host accepts only the version it implements. A mismatch fails initialization, with an error naming both versions, for example: `unsupported Tick protocol version 2; this host speaks Tick protocol 3`.
+- The Tick does not receive this error. It appears in the view and is reported to the client.
+- Extensions that preserve existing field meanings, such as new optional fields, do not change the protocol version.
+- The host **MUST** ignore unknown fields in descriptors and state. A Tick **SHOULD** ignore unknown request parameters.
 
 <a id="s4-4"></a>
 
-### 4.4 运行
+### 4.4 Operation
 
-初始化完成后，宿主在需要时发送请求：
+After initialization, the host sends requests as needed:
 
-| 时机 | 请求 |
+| Event | Request |
 | --- | --- |
-| 客户端查询 Tick 的能力 | `tick/describe` |
-| 客户端读取 Tick | `tick/read` |
-| 客户端准备调用工具 | `tick/describe`，取得目录与 `revision` |
-| 客户端调用工具（审批之后） | `tick/call` |
-| 建立或恢复订阅的观察流 | `tick/describe` |
-| 交付时缓存中没有可用的状态 | `tick/read` |
+| Client queries the Tick's capabilities | `tick/describe` |
+| Client reads the Tick | `tick/read` |
+| Client prepares a tool call | `tick/describe`, to obtain the catalog and `revision` |
+| Client calls a tool after approval | `tick/call` |
+| Subscription observation stream is established or restored | `tick/describe` |
+| No usable cached state is available at delivery time | `tick/read` |
 
-- 宿主**可以**在任何时候发送 `tick/describe` 与 `tick/read`，次数不限。
-- 这两个方法**必须**没有副作用，并且**应当**在几毫秒内作答。
+- The host **MAY** send `tick/describe` and `tick/read` at any time, without a limit on the total number of requests.
+- Both methods **MUST** be free of side effects and **SHOULD** respond within a few milliseconds.
 
 <a id="s4-5"></a>
 
-### 4.5 结束
+### 4.5 Shutdown
 
-宿主结束 Tick 时，向 Tick 所在的进程组发送 `SIGTERM`，之后**可以**不经宽限直接发送 `SIGKILL`。宿主不保证在结束前关闭标准输入。
+To terminate a Tick, the host sends `SIGTERM` to its process group. It **MAY** then send `SIGKILL` without a grace period. The host does not guarantee that it will close standard input first.
 
-- Tick **不得**依赖退出前的清理来保存重要数据。
-- Tick 读到标准输入结束（EOF）时，**应当**等在途的调用完成后退出。
-- Tick 自行退出时，会话随之结束：宿主把在途请求按结果未知处理，客户端看到实例已结束。退出码不属于协议。
+- A Tick **MUST NOT** rely on shutdown cleanup to save important data.
+- On standard-input EOF, a Tick **SHOULD** wait for in-flight calls to finish, then exit.
+- If a Tick exits on its own, the session ends. The host treats in-flight requests as having unknown outcomes, and the client sees that the instance has ended. The exit code is not part of the protocol.
 
 <a id="s5"></a>
 
@@ -335,18 +335,18 @@ Tick 运行在一个以视图终端为控制终端的会话中，处于前台进
 
 <a id="s5-1"></a>
 
-### 5.1 请求
+### 5.1 Request
 
 ```typescript
 // method: "tick/describe"
 interface DescribeParams {}
 ```
 
-宿主发送 `params: {}`。
+The host sends `params: {}`.
 
 <a id="s5-2"></a>
 
-### 5.2 结果
+### 5.2 Result
 
 ```typescript
 interface TickDescriptor {
@@ -393,45 +393,45 @@ interface StateSeries {
 
 <a id="s5-3"></a>
 
-### 5.3 校验规则
+### 5.3 Validation
 
-宿主**必须**拒绝不满足下列条件的结果：
+The host **MUST** reject a result unless all of the following hold:
 
-- `protocol` 等于宿主实现的版本；
-- `kind` 与 `title` 去掉首尾空白后不为空；
-- `revision` 不为空字符串；
-- 每个工具的 `name` 去掉首尾空白后不为空，并且在目录内唯一；
-- 每个工具的 `input_schema` 是对象，并且是合法的 JSON Schema；
-- `recover_with` 如果存在，指向目录中一个 `mutates` 为 `false` 的工具；
-- `state.series` 中每个 `path` 为空字符串或以 `/` 开头，并且互不相同；
-- 结果编码后不超过 512 KiB。
+- `protocol` equals the version implemented by the host.
+- `kind` and `title` are nonempty after trimming whitespace.
+- `revision` is not an empty string.
+- Each tool's `name` is nonempty after trimming whitespace and unique within the catalog.
+- Each `input_schema` is an object and a valid JSON Schema.
+- If present, `recover_with` names a catalog tool whose `mutates` is `false`.
+- Each `state.series` path is empty or starts with `/`, and paths are unique.
+- The encoded result is no larger than 512 KiB.
 
 <a id="s5-4"></a>
 
 ### 5.4 `kind`
 
-`kind` 是程序自报的类型。它与实例身份的前缀（`hosted:`、`shell:`、`artifact:`）无关，同一个 `kind` 可以同时有多个实例。
+`kind` is the program's self-declared type. It is unrelated to the instance identity prefix (`hosted:`, `shell:`, or `artifact:`). Multiple instances may have the same `kind`.
 
-`kind` **应当**是以点分隔的小写名字，第一段标明发布者，例如 `example.counter`、`acme.orderbook`。
+A `kind` **SHOULD** be a lowercase, dot-separated name whose first component identifies the publisher, such as `example.counter` or `acme.orderbook`.
 
 <a id="s5-5"></a>
 
 ### 5.5 `revision`
 
-`revision` 命名当前的工具目录：
+`revision` identifies the current tool catalog:
 
-- 目录中任何工具的名称、描述、输入 Schema 或 `mutates` 发生变化时，Tick **必须**换用一个新的 `revision`。
-- 目录在运行期间不变的 Tick **可以**一直使用同一个值。
-- `revision` 是不透明字符串，宿主只比较相等与否。
+- A Tick **MUST** assign a new `revision` whenever a tool's name, description, input schema, or `mutates` changes.
+- A Tick whose catalog does not change during its lifetime **MAY** use a constant revision.
+- `revision` is an opaque string. The host compares it only for equality.
 
 <a id="s5-6"></a>
 
 ### 5.6 `mutates`
 
-- 一次调用可能改变调用结果以外的任何东西时，Tick **必须**把该工具声明为 `mutates: true`。这些东西包括：Tick 自己的状态、界面上的业务内容、文件，以及远端服务。
-- 只读取信息的查询工具声明为 `mutates: false`。
+- If a call can change anything beyond its own result, the Tick **MUST** declare the tool as `mutates: true`. This includes its own state, business content in its interface, files, and remote services.
+- Query tools that only read information declare `mutates: false`.
 
-宿主依据 `mutates` 决定调用前是否需要审批，以及结果未知时能否重试。把修改类工具声明为 `false` 会绕过用户的审批（[第 10 节](#s10)）。
+The host uses `mutates` to decide whether approval is needed before a call and whether an unknown outcome may be retried. Declaring a mutating tool as `false` bypasses approval ([Section 10](#s10)).
 
 <a id="s6"></a>
 
@@ -439,7 +439,7 @@ interface StateSeries {
 
 <a id="s6-1"></a>
 
-### 6.1 请求
+### 6.1 Request
 
 ```typescript
 // method: "tick/read"
@@ -448,7 +448,7 @@ interface ReadParams {}
 
 <a id="s6-2"></a>
 
-### 6.2 结果
+### 6.2 Result
 
 ```typescript
 interface TickState {
@@ -461,29 +461,29 @@ interface TickState {
 }
 ```
 
-- `data` 是 Tick 当前的完整业务状态，不是相对于上一次的增量。
-- `data` 为 `null` 表示还没有内容，例如数据仍在加载。
-- 如果 `at` 存在，它**必须**是合法的 RFC 3339 时间。
+- `data` is the Tick's complete current business state, not a delta from the previous state.
+- Null `data` means no content is available yet, for example while data is loading.
+- If present, `at` **MUST** be a valid RFC 3339 timestamp.
 
 <a id="s6-3"></a>
 
-### 6.3 序号规则
+### 6.3 Sequence rules
 
-`seq` 是 Tick 为自己的状态维护的序号：
+The Tick maintains `seq` as the sequence number of its state:
 
-- 宿主在发送 `tick/read` 时记下“读取下限”：上一次 `tick/read` 结果的 `seq` 与此前已收到的最后一条 `tick/update` 的 `seq` 中较大的一个。`tick/read` 结果的 `seq` **必须**不小于读取下限。
-- `tick/read` 结果不与它前后到达的 `tick/update` 比较：Tick 可以在回复读取之前或之后紧接着发出更新，携带相同或更早的状态。
+- When sending `tick/read`, the host records a read floor: the greater of the previous read result's `seq` and the last update's `seq` received so far. The read result's `seq` **MUST** be at least this floor.
+- The read result is not compared with updates arriving around it. A Tick may send an update immediately before or after a read response, carrying the same or an earlier state.
 
 <a id="s6-4"></a>
 
-### 6.4 状态的设计
+### 6.4 Designing state
 
-状态是供 Agent 判断要不要行动的摘要，不是全部数据。下面是说明性的建议：
+State is a summary that helps the Agent decide whether to act, not a copy of all available data. The following guidance is informative:
 
-- 典型状态**应当**在 4 KiB 左右或更小。宿主交付订阅时会按预算裁剪：所有条目合计 16 KiB，多个条目时每条 4 KiB。
-- 大块内容放在查询工具后面，状态中写明对应的工具名。例如 K 线明细用 `candles` 工具按区间读取。
-- 状态中按时间排列的数组应当在 `state.series` 中声明，宿主裁剪时会保留最新的一端。没有声明的数组会保留首尾。
-- 光标位置、滚动、选中项、配色等界面细节不属于状态。
+- Typical state **SHOULD** fit within roughly 4 KiB. Subscription delivery trims to a budget of 16 KiB in total, with 4 KiB per item when multiple items are delivered.
+- Expose large content through query tools and name those tools in the state. For example, a `candles` tool can retrieve chart details for a time range.
+- Declare chronological arrays in `state.series` so trimming preserves the newest end. Undeclared arrays retain their beginning and end.
+- Cursor position, scrolling, selection, colors, and other presentation details are not business state.
 
 <a id="s7"></a>
 
@@ -491,7 +491,7 @@ interface TickState {
 
 <a id="s7-1"></a>
 
-### 7.1 请求
+### 7.1 Request
 
 ```typescript
 // method: "tick/call"
@@ -507,30 +507,30 @@ interface CallParams {
 
 <a id="s7-2"></a>
 
-### 7.2 处理
+### 7.2 Handling a call
 
-Tick 收到 `tick/call` 后：
+On receiving `tick/call`, the Tick:
 
-1. `revision` 与当前目录不同时，**必须**以 -32004 回复且不执行。
-2. 工具不存在，或 `args` 不合要求时，**必须**以 -32602 回复且不执行。宿主在发送前已按 `input_schema` 检查过 `args`，但 Tick **应当**自行检查，不依赖宿主。
-3. 执行工具，以 `result` 回复其结果；失败时按[第 3.4 节](#s3-4)回复错误。
+1. **MUST** return -32004 without executing if `revision` differs from its current catalog.
+2. **MUST** return -32602 without executing if the tool is unknown or `args` is invalid. The host validates arguments against `input_schema` before sending, but the Tick **SHOULD** validate them independently.
+3. Executes the tool and returns its output as `result`, or an error as described in [Section 3.4](#s3-4).
 
-结果可以是任何 JSON 值。它只返回给发起调用的客户端，不改变状态序号；工具改变了状态时，Tick 另外发出 `tick/update`（[第 8 节](#s8)）。
+The result may be any JSON value. It goes only to the calling client and does not change the state sequence number. If the tool changes state, the Tick emits a separate `tick/update` ([Section 8](#s8)).
 
 <a id="s7-3"></a>
 
-### 7.3 超时与结果未知
+### 7.3 Timeouts and unknown outcomes
 
-- `tick/call` 的超时为 60 秒。超时后宿主不再等待，并向客户端报告“结果未知”。
-- 本协议没有取消消息。超时之后 Tick 仍可能完成调用，迟到的响应会被宿主接收或丢弃，但不会改变已报告的结果。
-- 宿主**不得**自动重发 `mutates: true` 工具的调用。超时、会话结束或违规导致结果未知时，由客户端或用户决定下一步。
-- 运行时间可能超过 60 秒的操作，**应当**设计为立即返回、在后台继续，并通过 `tick/update` 报告进展与结果。
+- `tick/call` has a 60-second timeout. After it expires, the host stops waiting and reports an unknown outcome to the client.
+- The protocol has no cancellation message. A Tick may finish after timeout. A late response may be received or discarded, but it does not change the outcome already reported.
+- The host **MUST NOT** automatically resend a call to a `mutates: true` tool. When timeout, session termination, or a violation leaves the outcome unknown, the client or user decides what to do next.
+- Operations that may take more than 60 seconds **SHOULD** return immediately, continue in the background, and report progress and results through `tick/update`.
 
 <a id="s7-4"></a>
 
-### 7.4 幂等
+### 7.4 Idempotency
 
-宿主不会自动重试修改类调用，所以 Tick 不需要为重试去重。会修改远端服务的工具，**应当**在结果或状态中给出足以核对是否已生效的信息，例如订单号或新值。
+Because the host does not automatically retry mutating calls, the Tick does not need retry deduplication. Tools that change a remote service **SHOULD** include enough information in the result or state to check whether the change took effect, such as an order ID or the new value.
 
 <a id="s8"></a>
 
@@ -538,63 +538,63 @@ Tick 收到 `tick/call` 后：
 
 <a id="s8-1"></a>
 
-### 8.1 通知
+### 8.1 Notification
 
 ```typescript
 // method: "tick/update"
 // params: TickState
 ```
 
-Tick 的业务状态发生变化时发出。参数是变化之后的完整状态。
+A Tick emits this notification when its business state changes. Parameters contain the complete state after the change.
 
 <a id="s8-2"></a>
 
-### 8.2 规则
+### 8.2 Requirements
 
-每条 `tick/update` **必须**满足下列条件，否则宿主按违规结束会话（[第 3.6 节](#s3-6)）：
+Every `tick/update` **MUST** meet all of the following requirements. Otherwise the host ends the session as a protocol violation ([Section 3.6](#s3-6)):
 
-- `data` 不为 `null`；
-- `seq` 严格大于此前任何一条 `tick/update` 的 `seq`；
-- `at` 如果存在，是合法的 RFC 3339 时间；
-- 编码后不超过 512 KiB。
+- `data` is not null.
+- `seq` is strictly greater than the `seq` of every previous `tick/update`.
+- If present, `at` is a valid RFC 3339 timestamp.
+- Encoded size does not exceed 512 KiB.
 
 <a id="s8-3"></a>
 
-### 8.3 什么是一次更新
+### 8.3 What counts as an update
 
-一次更新表示业务上的变化，例如新的一根 K 线、一条新资讯，或工具调用改变的值。
+An update represents a business change, such as a new candle, a news item, or a value changed by a tool call.
 
-光标移动、滚动、重绘、尺寸变化、配色变化**不得**发出更新。
+Cursor movement, scrolling, repaints, resizing, and color changes **MUST NOT** emit updates.
 
-宿主只保留最新的一份状态，订阅到期时把最新状态交给客户端，并说明合并了几次更新。所以：
+The host retains only the latest state. At the subscription interval, it delivers that state to the client and reports how many updates were merged. Therefore:
 
-- Tick **可以**在输出受阻时丢弃尚未写出的旧更新，只写出最新的一条；
-- 更新的频率**不应**高于界面刷新的需要。
+- When output is blocked, a Tick **MAY** drop older updates that have not yet been written and send only the newest one.
+- Update frequency **SHOULD NOT** exceed what the interface needs for refreshes.
 
 <a id="s9"></a>
 
-## 9. 恢复
+## 9. Recovery
 
-订阅只交付最新状态，中间的变化可能被合并掉。需要完整历史的客户端通过 `recover_with` 指定的查询工具读取：
+Subscriptions deliver only the latest state, so intermediate changes may be merged away. Clients needing history can read it through the query tool named by `recover_with`:
 
-- `recover_with` 指向的工具**必须**是 `mutates: false`。
-- 宿主不会自动调用它，只把它的名字随交付告诉客户端，由客户端决定是否调用。
-- 没有声明 `recover_with` 的 Tick 表示错过的变化无法补回。
+- This tool **MUST** declare `mutates: false`.
+- The host does not call it automatically. It includes the tool name with delivery, and the client decides whether to call it.
+- A Tick without `recover_with` does not provide a way to recover missed changes through this mechanism.
 
 <a id="s10"></a>
 
-## 10. 安全考虑
+## 10. Security considerations
 
-- **权限。** Tick 以启动它的用户的权限运行，可以访问该用户能访问的一切。用户**应当**只运行自己信任的 Tick。
-- **审批依赖 Tick 的声明。** 宿主按 `mutates` 决定是否需要审批。Tick 作者**必须**如实声明；宿主和客户端**应当**向用户展示工具的名称、参数与描述，供用户判断。
-- **目录变化使审批失效。** 审批绑定 `revision`，目录变化后旧的调用以 -32004 被拒绝。这防止工具在审批之后被替换成另一个含义。
-- **输出是不可信的数据。** 状态、工具结果和错误消息会进入模型的上下文。宿主与客户端**必须**把它们当作数据而不是指令，不得因为其中的文字扩大授权。Tick **不应**在状态中放入凭据、令牌或个人敏感信息。
-- **标准输出的完整性。** 任何写到标准输出的非协议内容都会使会话结束。Tick **应当**在启动时就把可能打印的库重定向到别处。
-- **实例身份不是凭据。** `TICKLOOP_INSTANCE_ID` 只用于日志与区分运行，不能用来认证。
+- **Permissions.** A Tick runs with the permissions of the user who started it and can access what that user can access. Users **SHOULD** run only Ticks they trust.
+- **Approval relies on declarations.** The host uses `mutates` to determine whether approval is needed. Tick authors **MUST** declare it truthfully. Hosts and clients **SHOULD** show the tool name, arguments, and description so users can assess the call.
+- **Catalog changes invalidate approval.** Approval is bound to `revision`. A call prepared against an old catalog is rejected with -32004, preventing a tool from changing meaning after approval.
+- **Output is untrusted data.** State, tool results, and error messages enter the model context. Hosts and clients **MUST** treat them as data rather than instructions, and must not expand authorization based on their contents. Ticks **SHOULD NOT** put credentials, tokens, or sensitive personal information in state.
+- **Standard-output integrity.** Non-protocol output ends the session. A Tick **SHOULD** redirect libraries that may print to standard output as early as startup.
+- **Instance identity is not a credential.** `TICKLOOP_INSTANCE_ID` is only for logging and distinguishing runs, not authentication.
 
-## 附录 A 示例会话
+## Appendix A Example session
 
-`→` 是宿主写到 Tick 标准输入的行，`←` 是 Tick 写到标准输出的行。为便于阅读，部分行折成多行，实际传输时每条消息占一行。
+`→` marks a line written by the host to the Tick's standard input. `←` marks a line written by the Tick to standard output. Some lines are wrapped for readability; on the wire, each message occupies one line.
 
 ```text
 → {"jsonrpc":"2.0","id":1,"method":"tick/describe","params":{}}
@@ -623,9 +623,9 @@ Tick 的业务状态发生变化时发出。参数是变化之后的完整状态
 ← {"jsonrpc":"2.0","id":4,"error":{"code":-32004,"message":"the Tick Tool catalog changed; describe the Tick and prepare the call again"}}
 ```
 
-## 附录 B 最小实现
+## Appendix B Minimal implementation
 
-下面的 Tick 只用 Python 标准库，保存一行笔记，并提供一个修改类工具。它满足本规范对 Tick 的全部“必须”要求，但没有并发处理请求，也没有绘制界面。
+This Tick uses only the Python standard library. It stores a single note and exposes one mutating tool. It satisfies the Tick-side MUST requirements of this specification, but does not process requests concurrently or draw an interface.
 
 ```python
 #!/usr/bin/env python3
@@ -671,17 +671,17 @@ for line in sys.stdin:
         send({"id": request["id"], "error": {"code": error.code, "message": str(error)}})
 ```
 
-## 附录 C Tick 实现检查清单
+## Appendix C Implementation checklist
 
-- [ ] 标准输出只写协议消息，每条一行，以换行结尾，多线程写入时整行原子。
-- [ ] 每个请求恰好回复一次，`id` 与请求相同，从不回复 `id: null`。
-- [ ] `tick/describe` 与 `tick/read` 没有副作用，立即作答。
-- [ ] 目录的任何变化都换用新的 `revision`，`revision` 不符时以 -32004 拒绝且不执行。
-- [ ] 修改类工具都声明 `mutates: true`。
-- [ ] “未执行”类错误码只用于确实没有产生效果的调用。
-- [ ] 每条 `tick/update` 携带完整状态，`data` 非空，`seq` 严格递增。
-- [ ] `tick/read` 的 `seq` 不倒退，不小于已发出的最后一条更新。
-- [ ] 界面变化（光标、滚动、重绘）不发更新。
-- [ ] 状态保持在几 KiB 以内，大块内容放在查询工具后面，时间序列在 `state.series` 中声明。
-- [ ] 超过 60 秒的操作改为后台进行，用更新报告结果。
-- [ ] 收到 `SIGTERM` 或标准输入结束时尽快退出，不依赖退出前的清理。
+- [ ] Write only protocol messages to standard output, one complete, newline-terminated line at a time, atomically across threads.
+- [ ] Respond exactly once to each request with the matching `id`; never respond with `id: null`.
+- [ ] Make `tick/describe` and `tick/read` side-effect-free and prompt.
+- [ ] Change `revision` whenever the catalog changes. Reject mismatched revisions with -32004 without executing.
+- [ ] Declare every mutating tool as `mutates: true`.
+- [ ] Use “not executed” error codes only when the call has had no effect.
+- [ ] Send complete, non-null state in every `tick/update`, with strictly increasing `seq`.
+- [ ] Keep read sequence numbers from moving backwards or falling below the last emitted update.
+- [ ] Do not emit updates for presentation changes such as cursor movement, scrolling, or repaints.
+- [ ] Keep state within a few KiB, expose large content through query tools, and declare time series in `state.series`.
+- [ ] Run operations longer than 60 seconds in the background and report results through updates.
+- [ ] Exit promptly on `SIGTERM` or standard-input EOF, without relying on shutdown cleanup.
