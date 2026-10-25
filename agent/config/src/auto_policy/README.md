@@ -4,8 +4,7 @@
 `c9b5341637becbd423ddffc5b254afb645682a3868cb708bbc6cc0e7bb419937`。
 
 保留适用规则的完整正文及具体授权门槛；每阶段仍只产生一个整体模型问题。
-此前默认政策载荷有实际 Jev 容量验证记录，完整语义验收及必要宿主事实仍按 04 工单推进。
-本次新增映射使用配置测试和 Jev 测试替身验证；不把替身结果当作真实 Jev 语义验收。
+映射由配置测试和 Jev 测试替身验证；替身结果不等于真实 Jev 的语义验收。
 
 ## 产品映射
 
@@ -41,14 +40,14 @@ CronDelete 没有该声明，沿用 `src/Tool.ts` 的非只读默认设定，由
 
 | Tickloop 工具 | permission 与 Auto 处理 | 规则依据与授权边界 |
 | --- | --- | --- |
-| CronList | ReadOnly；不调用 Jev | Read-Only Operations；Claude Code CronList 的只读设定 |
-| GetGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex get_goal 的直接执行方式接入，不经过政策分类 |
+| CronList | ReadOnly；不调用审查 | Read-Only Operations；Claude Code CronList 的只读设定 |
+| GetGoal | ReadOnly；不调用审查 | 只读取当前 Chat 的 Goal；按 Codex get_goal 接入，不经过政策分类 |
 | CronCreate | Classified；Scheduling Soft allow | 仅当前 Chat、用户任务范围和期限内的安排；不预先批准将来的实际操作 |
 | ScheduleWakeup | Classified；Scheduling Soft allow | 当前 Chat 已获授权的自定节奏 `/loop` 的重排；任务达成或用户要求取消时停止本循环，不管理其他任务 |
 | CronUpdate | Classified；有条件的 Scheduling Soft allow | 原地修改当前 Chat 的一个任务（计划、重复方式、指令或标题）；本 Loop 有确切成功创建凭据的 Agent 任务可改；用户明确要求修改的任务可改；修改后仍限于用户授权的任务范围和期限；没有修改授权的用户任务仍受 Interfere With Workloads 阻拦 |
 | CronDelete | Classified；有条件的 Scheduling Soft allow | 本 Loop 有确切成功创建凭据的 Agent 任务可清理；用户明确要求取消的任务可删除；没有取消授权的用户任务仍受 Interfere With Workloads 阻拦 |
-| CreateGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex create_goal 的直接执行方式接入；用户明确要求 Goal、token budget 的约束继续保留在工具指令中 |
-| UpdateGoal | Automatic；Auto 直接执行，不调用 Jev | 按 Codex update_goal 的直接执行方式接入；完成申请仍经过 Tickloop 自己的独立完成核对，blocked 的工具指令不变 |
+| CreateGoal | Automatic；Auto 直接执行，不调用审查 | 按 Codex create_goal 的直接执行方式接入；用户明确要求 Goal、token budget 的约束继续保留在工具指令中 |
+| UpdateGoal | ReadOnly；不调用审查 | 只报告完成或阻塞，不改变 Goal 以外的状态；按 Codex update_goal 接入，完成申请仍经过独立完成核对 |
 
 CronUpdate 与 CronDelete 的 `scheduled_task` 宿主事实只描述该 Chat 内的确切目标 id、creator 和可验证的
 creation_call_id，以及经过大小限制的 schedule/prompt 详情，供修改或取消请求解析目标。
@@ -64,15 +63,17 @@ OS cron、systemd、shell profile、访问凭据、连接账户的 automation/we
 不能仅凭 CronCreate 会延后执行就误判为越权持久化，也不能借 Scheduling 为将来的敏感操作授权。
 **Scheduled-Task Fires** 继续规定：自动送达不产生新的人类授权，仍沿用原授权的范围与期限。
 Claude Code 没有对应的 Goal 工具。三个 Goal 工具按 Codex 的直接执行方式接入，
-不使用 Auto 政策映射；没有 Chat Goal Lifecycle Soft allow。复用现有
-`HostToolPermission::Automatic`，不把改变 Goal 状态的工具标记为 ReadOnly，也不新增权限变体。
-Automatic 在 Auto 下默认直接放行；其既有的 Plan 拒绝执行、显式权限 Ask/Deny 规则优先语义不变。
-因此 GetGoal 也沿同一个 Automatic 边界，在 Plan 下不执行；没有为它增加只读豁免。
-用户明确要求 Goal、token budget、blocked 的续跑次数等仍由现有工具指令约束，
-CreateGoal 的已有 Goal 校验、UpdateGoal 的独立完成核对与 Goal 状态机均保持不变。
+不使用 Auto 政策映射；没有 Chat Goal Lifecycle Soft allow。GetGoal 与 UpdateGoal 只读取或报告
+Goal，标为 `HostToolPermission::ReadOnly`（Plan 下也可用）；CreateGoal 标为
+`HostToolPermission::Automatic`：Auto 下直接放行，Plan 下不执行，显式 Ask／Deny 规则仍优先。
+用户明确要求 Goal、token budget、blocked 的续跑次数等仍由工具指令约束，
+CreateGoal 的已有 Goal 校验、UpdateGoal 的独立完成核对与 Goal 状态机不受权限类别影响。
 
-子 Agent 不提供 CronCreate、CronList、CronDelete、ScheduleWakeup、GetGoal、CreateGoal、
-UpdateGoal；无需子 Agent 的独立映射，也不能通过委派扩大根 Agent 的权限。
+子 Agent 不提供 CronCreate、CronList、CronUpdate、CronDelete、ScheduleWakeup、GetGoal、
+CreateGoal、UpdateGoal；无需子 Agent 的独立映射，也不能通过委派扩大根 Agent 的权限。
+
+无状态宿主的 durable Chat 另由宿主规则直接准入 CronCreate、CronUpdate、CronDelete、ScheduleWakeup
+等工具，不经 Auto 审查，见 `agent/runtime/src/harness.rs` 的 `durable_chat_host_rules`。
 
 ## 当前不适用的原生条目
 
@@ -89,8 +90,6 @@ UpdateGoal；无需子 Agent 的独立映射，也不能通过委派扩大根 Ag
 不适用只指具体入口不存在，不豁免同类真实副作用；通过 Bash 或其他已暴露工具执行
 数据外发、持久化或越权行为，仍按相应通用规则判断。新增对应产品入口时需重新映射。
 
-目前为 **15 Soft allow、65 Soft deny、2 Hard deny，共 82 条**，政策与内置组版本均为 8。
-相较此前实际配置的 14/65/2，只恢复 Scheduling 一条 Soft allow；Goal 不经过政策分类。
-当前有九个不适用的原生入口。第二条 Hard deny 是既有的 Tickloop Agent Daemon Shutdown，
-此前 README 的“1 Hard deny”遗漏了它；本次没有改变任何 Hard deny 或 Soft deny。
+目前为 **15 Soft allow、65 Soft deny、2 Hard deny，共 82 条**，政策与内置组版本均为 8；
+两条 Hard deny 之一是 Tickloop Agent Daemon Shutdown。当前有九个不适用的原生入口。
 自定义规则和分组替换保持独立；替换掉内置 Soft allow 的用户不会被强制加回 Scheduling 例外。

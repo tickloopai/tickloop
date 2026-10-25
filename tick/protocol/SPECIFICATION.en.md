@@ -1,4 +1,4 @@
-<!-- source-sha256: 0eed43408210a7d6473e527f2790edb37e6a43b6d359f75aef606d0ed11baa7e -->
+<!-- source-sha256: 5c8752282ac0e2d46c2d77eca4d14ce749f874c4cef4b9524b0fdbba6dd3762f -->
 
 # Tick Protocol Specification
 
@@ -13,13 +13,19 @@
 
 The protocol has three request methods (`tick/describe`, `tick/read`, `tick/call`) and one notification (`tick/update`). Tickloop exposes them through TickDescribe (capabilities), TickRead (current state), TickCall (declared operations) and TickUpdate (delivery event). TickRead does not repeat the descriptor or tool catalog. TickManage handles lifecycle, views, terminal input and Loop subscriptions in the Agent/host; it is not an additional Tick program RPC. Package Skills document launch commands and login prerequisites. A running instance's descriptor is the authoritative capability catalog.
 
+<a id="s1"></a>
+
 ## 1. Overview
+
+<a id="s1-1"></a>
 
 ### 1.1 Purpose
 
 The Tick protocol defines how a terminal program exposes its state, callable operations, and business changes to a host. An AI Agent can read the program, call its tools, and resume work when new information arrives. A program implementing this protocol is a **extension Tick**.
 
 An extension Tick serves two participants: a person using its terminal interface, and an Agent using the protocol through the host. Both interact with the same process and the same state.
+
+<a id="s1-2"></a>
 
 ### 1.2 Roles
 
@@ -28,6 +34,8 @@ An extension Tick serves two participants: a person using its terminal interface
 - **Client**: a party that uses a Tick through the host, usually an Agent's Loop. The interface between client and host is outside the scope of this specification.
 - **View**: an interface displaying the Tick's controlling terminal, such as a Herdr Pane or Monitor overlay. Multiple views can attach to one Tick. Opening or closing a view does not affect the protocol session.
 
+<a id="s1-3"></a>
+
 ### 1.3 Design principles
 
 1. **The program is the tool.** A Tick declares its capabilities in a tool catalog. The host does not need custom code for each kind of Tick.
@@ -35,6 +43,8 @@ An extension Tick serves two participants: a person using its terminal interface
 3. **Changes can be approved.** Tools declare whether they mutate external state. A call is bound to the catalog revision used for approval; changing the catalog invalidates that approval.
 4. **An unknown outcome is not retried.** Once a mutating call has been dispatched, a timeout or disconnection does not trigger an automatic resend.
 5. **Implementation stays small.** A language's standard library is enough to implement a compliant Tick.
+
+<a id="s1-4"></a>
 
 ### 1.4 Relationship to LSP and MCP
 
@@ -48,13 +58,19 @@ The tool catalog resembles MCP tools: names, descriptions, and inputs defined wi
 
 There is no capability negotiation in an initialization handshake. The host learns the Tick's capabilities from `tick/describe`.
 
+<a id="s2"></a>
+
 ## 2. Conventions
+
+<a id="s2-1"></a>
 
 ### 2.1 Normative language
 
 The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174), only when shown in bold.
 
 Unbolded explanations, examples, and notes are informative.
+
+<a id="s2-2"></a>
 
 ### 2.2 Type notation
 
@@ -74,11 +90,17 @@ type JSONValue = string | number | boolean | null | JSONValue[] | { [key: string
 type JSONSchema = { [key: string]: JSONValue };
 ```
 
+<a id="s2-3"></a>
+
 ### 2.3 Bytes and sizes
 
 All sizes are in UTF-8 bytes. Message body sizes are measured after the receiver re-encodes the parsed value ([Section 3.5](#s3-5)).
 
+<a id="s3"></a>
+
 ## 3. Base protocol
+
+<a id="s3-1"></a>
 
 ### 3.1 Transport
 
@@ -100,6 +122,8 @@ Message framing rules:
 - Content written to standard error appears in the view. A Tick **SHOULD NOT** write diagnostic logs to standard error; it **SHOULD** use its own log file instead.
 
 > Note: This protocol does not use LSP's `Content-Length` header. Newline framing lets even a minimal implementation parse messages with a line reader.
+
+<a id="s3-2"></a>
 
 ### 3.2 Messages
 
@@ -155,6 +179,8 @@ Request IDs:
 
 Method names beginning with `tick/` are reserved for this protocol.
 
+<a id="s3-3"></a>
+
 ### 3.3 Concurrency and ordering
 
 - The host **MAY** send a new request before receiving a response to an earlier one.
@@ -163,6 +189,8 @@ Method names beginning with `tick/` are reserved for this protocol.
 - `tick/describe` and `tick/read` **SHOULD** respond promptly, without waiting for running tool calls.
 
 A Tick may emit `tick/update` at any time: before initialization finishes, or before or after a response to an in-flight request. The host checks update sequence numbers in arrival order ([Section 6.3](#s6-3)).
+
+<a id="s3-4"></a>
 
 ### 3.4 Error codes
 
@@ -183,6 +211,8 @@ Ticks use the following error codes. The host uses the code to determine whether
 - If a tool fails after starting and may have had partial effects, the Tick **MUST** use -32000 or another “executed” error code.
 - `message` **SHOULD** be a human-readable explanation. `data` **MAY** carry structured details.
 
+<a id="s3-5"></a>
+
 ### 3.5 Limits
 
 | Item | Limit | If exceeded |
@@ -196,6 +226,8 @@ Ticks use the following error codes. The host uses the code to determine whether
 
 - Encoded size is measured after the host parses and re-encodes the value. Number representations can grow, for example from `1e15` to `1000000000000000.0`. A Tick **SHOULD** leave headroom.
 - The host **MAY** impose stricter aggregate limits, such as 64 MiB of response buffers across all in-flight calls.
+
+<a id="s3-6"></a>
 
 ### 3.6 Violations
 
@@ -215,7 +247,11 @@ The following fail only the affected request; the session continues:
 
 The host **MUST** discard a response whose `id` does not match an in-flight request.
 
+<a id="s4"></a>
+
 ## 4. Lifecycle
+
+<a id="s4-1"></a>
 
 ### 4.1 Startup
 
@@ -240,6 +276,8 @@ The Tick runs in the foreground process group of a session whose controlling ter
 - When a view changes size, the host resizes the terminal and the kernel sends `SIGWINCH` to the Tick.
 - Resizing does not use the protocol.
 
+<a id="s4-2"></a>
+
 ### 4.2 Initialization
 
 After startup, the host sends, in order:
@@ -254,6 +292,8 @@ Rules:
 - Any failure, timeout, or invalid result fails initialization. The host terminates the Tick process; the instance does not appear in the client. The failure reason and the first 256 characters of the view screen are reported to the client.
 - A Tick **MAY** emit `tick/update` before initialization completes. The host receives these updates normally.
 
+<a id="s4-3"></a>
+
 ### 4.3 Versioning
 
 The `protocol` field in `tick/describe` declares the version implemented by the Tick. Host requests do not carry a version.
@@ -263,13 +303,16 @@ The `protocol` field in `tick/describe` declares the version implemented by the 
 - Extensions that preserve existing field meanings, such as new optional fields, do not change the protocol version.
 - The host **MUST** ignore unknown fields in descriptors and state. A Tick **SHOULD** ignore unknown request parameters.
 
+<a id="s4-4"></a>
+
 ### 4.4 Operation
 
 After initialization, the host sends requests as needed:
 
 | Event | Request |
 | --- | --- |
-| Client reads the Tick | `tick/read`, followed by `tick/describe` |
+| Client queries the Tick's capabilities | `tick/describe` |
+| Client reads the Tick | `tick/read` |
 | Client prepares a tool call | `tick/describe`, to obtain the catalog and `revision` |
 | Client calls a tool after approval | `tick/call` |
 | Subscription observation stream is established or restored | `tick/describe` |
@@ -277,6 +320,8 @@ After initialization, the host sends requests as needed:
 
 - The host **MAY** send `tick/describe` and `tick/read` at any time, without a limit on the total number of requests.
 - Both methods **MUST** be free of side effects and **SHOULD** respond within a few milliseconds.
+
+<a id="s4-5"></a>
 
 ### 4.5 Shutdown
 
@@ -286,7 +331,11 @@ To terminate a Tick, the host sends `SIGTERM` to its process group. It **MAY** t
 - On standard-input EOF, a Tick **SHOULD** wait for in-flight calls to finish, then exit.
 - If a Tick exits on its own, the session ends. The host treats in-flight requests as having unknown outcomes, and the client sees that the instance has ended. The exit code is not part of the protocol.
 
+<a id="s5"></a>
+
 ## 5. tick/describe
+
+<a id="s5-1"></a>
 
 ### 5.1 Request
 
@@ -296,6 +345,8 @@ interface DescribeParams {}
 ```
 
 The host sends `params: {}`.
+
+<a id="s5-2"></a>
 
 ### 5.2 Result
 
@@ -342,6 +393,8 @@ interface StateSeries {
 }
 ```
 
+<a id="s5-3"></a>
+
 ### 5.3 Validation
 
 The host **MUST** reject a result unless all of the following hold:
@@ -355,11 +408,15 @@ The host **MUST** reject a result unless all of the following hold:
 - Each `state.series` path is empty or starts with `/`, and paths are unique.
 - The encoded result is no larger than 512 KiB.
 
+<a id="s5-4"></a>
+
 ### 5.4 `kind`
 
 `kind` is the program's self-declared type. It is unrelated to the instance identity prefix (`hosted:`, `shell:`, or `artifact:`). Multiple instances may have the same `kind`.
 
 A `kind` **SHOULD** be a lowercase, dot-separated name whose first component identifies the publisher, such as `example.counter` or `acme.orderbook`.
+
+<a id="s5-5"></a>
 
 ### 5.5 `revision`
 
@@ -369,6 +426,8 @@ A `kind` **SHOULD** be a lowercase, dot-separated name whose first component ide
 - A Tick whose catalog does not change during its lifetime **MAY** use a constant revision.
 - `revision` is an opaque string. The host compares it only for equality.
 
+<a id="s5-6"></a>
+
 ### 5.6 `mutates`
 
 - If a call can change anything beyond its own result, the Tick **MUST** declare the tool as `mutates: true`. This includes its own state, business content in its interface, files, and remote services.
@@ -376,7 +435,11 @@ A `kind` **SHOULD** be a lowercase, dot-separated name whose first component ide
 
 The host uses `mutates` to decide whether approval is needed before a call and whether an unknown outcome may be retried. Declaring a mutating tool as `false` bypasses approval ([Section 10](#s10)).
 
+<a id="s6"></a>
+
 ## 6. tick/read
+
+<a id="s6-1"></a>
 
 ### 6.1 Request
 
@@ -384,6 +447,8 @@ The host uses `mutates` to decide whether approval is needed before a call and w
 // method: "tick/read"
 interface ReadParams {}
 ```
+
+<a id="s6-2"></a>
 
 ### 6.2 Result
 
@@ -402,12 +467,16 @@ interface TickState {
 - Null `data` means no content is available yet, for example while data is loading.
 - If present, `at` **MUST** be a valid RFC 3339 timestamp.
 
+<a id="s6-3"></a>
+
 ### 6.3 Sequence rules
 
 The Tick maintains `seq` as the sequence number of its state:
 
 - When sending `tick/read`, the host records a read floor: the greater of the previous read result's `seq` and the last update's `seq` received so far. The read result's `seq` **MUST** be at least this floor.
 - The read result is not compared with updates arriving around it. A Tick may send an update immediately before or after a read response, carrying the same or an earlier state.
+
+<a id="s6-4"></a>
 
 ### 6.4 Designing state
 
@@ -418,7 +487,11 @@ State is a summary that helps the Agent decide whether to act, not a copy of all
 - Declare chronological arrays in `state.series` so trimming preserves the newest end. Undeclared arrays retain their beginning and end.
 - Cursor position, scrolling, selection, colors, and other presentation details are not business state.
 
+<a id="s7"></a>
+
 ## 7. tick/call
+
+<a id="s7-1"></a>
 
 ### 7.1 Request
 
@@ -434,6 +507,8 @@ interface CallParams {
 }
 ```
 
+<a id="s7-2"></a>
+
 ### 7.2 Handling a call
 
 On receiving `tick/call`, the Tick:
@@ -444,6 +519,8 @@ On receiving `tick/call`, the Tick:
 
 The result may be any JSON value. It goes only to the calling client and does not change the state sequence number. If the tool changes state, the Tick emits a separate `tick/update` ([Section 8](#s8)).
 
+<a id="s7-3"></a>
+
 ### 7.3 Timeouts and unknown outcomes
 
 - `tick/call` has a 60-second timeout. After it expires, the host stops waiting and reports an unknown outcome to the client.
@@ -451,11 +528,17 @@ The result may be any JSON value. It goes only to the calling client and does no
 - The host **MUST NOT** automatically resend a call to a `mutates: true` tool. When timeout, session termination, or a violation leaves the outcome unknown, the client or user decides what to do next.
 - Operations that may take more than 60 seconds **SHOULD** return immediately, continue in the background, and report progress and results through `tick/update`.
 
+<a id="s7-4"></a>
+
 ### 7.4 Idempotency
 
 Because the host does not automatically retry mutating calls, the Tick does not need retry deduplication. Tools that change a remote service **SHOULD** include enough information in the result or state to check whether the change took effect, such as an order ID or the new value.
 
+<a id="s8"></a>
+
 ## 8. tick/update
+
+<a id="s8-1"></a>
 
 ### 8.1 Notification
 
@@ -466,6 +549,8 @@ Because the host does not automatically retry mutating calls, the Tick does not 
 
 A Tick emits this notification when its business state changes. Parameters contain the complete state after the change.
 
+<a id="s8-2"></a>
+
 ### 8.2 Requirements
 
 Every `tick/update` **MUST** meet all of the following requirements. Otherwise the host ends the session as a protocol violation ([Section 3.6](#s3-6)):
@@ -474,6 +559,8 @@ Every `tick/update` **MUST** meet all of the following requirements. Otherwise t
 - `seq` is strictly greater than the `seq` of every previous `tick/update`.
 - If present, `at` is a valid RFC 3339 timestamp.
 - Encoded size does not exceed 512 KiB.
+
+<a id="s8-3"></a>
 
 ### 8.3 What counts as an update
 
@@ -486,6 +573,8 @@ The host retains only the latest state. At the subscription interval, it deliver
 - When output is blocked, a Tick **MAY** drop older updates that have not yet been written and send only the newest one.
 - Update frequency **SHOULD NOT** exceed what the interface needs for refreshes.
 
+<a id="s9"></a>
+
 ## 9. Recovery
 
 Subscriptions deliver only the latest state, so intermediate changes may be merged away. Clients needing history can read it through the query tool named by `recover_with`:
@@ -493,6 +582,8 @@ Subscriptions deliver only the latest state, so intermediate changes may be merg
 - This tool **MUST** declare `mutates: false`.
 - The host does not call it automatically. It includes the tool name with delivery, and the client decides whether to call it.
 - A Tick without `recover_with` does not provide a way to recover missed changes through this mechanism.
+
+<a id="s10"></a>
 
 ## 10. Security considerations
 

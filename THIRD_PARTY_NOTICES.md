@@ -2,17 +2,15 @@
 
 This file records the source and applicable license of third-party code adapted into Tickloop. Tickloop itself is licensed under the [MIT License](./LICENSE); the code listed here keeps its upstream license. Other dependencies retain their own licenses.
 
-## Former Herdr layout adaptation
+## Historical: Herdr layout adaptation
 
 - Upstream project: [Herdr](https://github.com/herdrdev/herdr).
 - Reference revision: `120c682008a85dc17d7a13cc619a2fd5d25f3924`.
 - Upstream source: [src/layout.rs at the reference revision](https://github.com/herdrdev/herdr/blob/120c682008a85dc17d7a13cc619a2fd5d25f3924/src/layout.rs).
-- Former adapted source: `crates/tickloop/src/layout/tree.rs` and its regression tests, removed together with the in-development workspace.
+- Former adapted source: `crates/tickloop/src/layout/tree.rs` and its regression tests, in source versions that predate this repository's history; removed together with the in-development workspace.
 - Applicable upstream license: Apache License, Version 2.0, as declared in Herdr's package metadata and [LICENSE at the reference revision](https://github.com/herdrdev/herdr/blob/120c682008a85dc17d7a13cc619a2fd5d25f3924/LICENSE). An unmodified copy is included in [licenses/Herdr-Apache-2.0.txt](./licenses/Herdr-Apache-2.0.txt).
 
-The former adaptation changed Herdr's Pane terminology to Tickloop's Panel terminology and adjusted its layout types. This attribution and the license copy remain for historical source versions. The referenced upstream layout file contains no separate copyright attribution, and the reference checkout has no top-level NOTICE file.
-
-Current Tickloop connects to an independently running Herdr through its API; it does not build or distribute that former layout implementation. Herdr's repository is not a Tickloop build dependency. This notice covers the former adapted source, not unrelated components or dependencies in Herdr.
+The former adaptation renamed Herdr's Pane to Panel and adjusted its layout types. This attribution and the license copy remain for those historical source versions; the referenced upstream file has no separate copyright attribution, and the reference checkout has no top-level NOTICE file. Current Tickloop does not contain, build or distribute that layout code: it connects to an independently running Herdr through its API, and Herdr is not a build dependency.
 
 ## Longbridge Terminal pure functions
 
@@ -24,11 +22,11 @@ Current Tickloop connects to an independently running Herdr through its API; it 
 
 The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units. Longbridge Terminal is a source reference, not a build dependency. The symbol normalization, header keys and rate limiter adapted from it moved with the financial Ticks to [tickloopai/ticks](https://github.com/tickloopai/ticks), which carries its own notice.
 
-## Former CLI Candlestick Chart glyph rules
+## Historical: CLI Candlestick Chart glyph rules
 
 - Upstream: [cli-candlestick-chart](https://github.com/Julien-R44/cli-candlestick-chart).
 - Reference copy: Longbridge Terminal revision `b834538`, `crates/cli-candlestick-chart/src/chart_renderer.rs`.
-- Former adapted source: `ui/src/charts.rs`, `candle_glyph`; it moved with the financial Ticks to [tickloopai/ticks](https://github.com/tickloopai/ticks), which carries its own notice.
+- Former adapted source: `candle_glyph` in `ui/src/charts.rs`, removed from this repository when the financial Ticks moved to [tickloopai/ticks](https://github.com/tickloopai/ticks) (commit `47b224b`); that repository carries its own notice.
 - Applicable license for candle glyph rules: MIT. The copyright notice and license are included in [licenses/Cli-Candlestick-Chart-MIT.txt](./licenses/Cli-Candlestick-Chart-MIT.txt), which remains for historical source versions.
 
 ## Crossterm input patch
