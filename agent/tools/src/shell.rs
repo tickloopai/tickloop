@@ -44,10 +44,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// How often a running command's output size is published.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
-/// 单个任务输出文件上限。Claude Code 为 5GB；Tickloop 按工单 34 的决定保留 64 MiB，由运行命令的
-/// Tickhost 执行。
+/// Size limit for a single task output file. Claude Code uses 5GB; per the decision in ticket 34
+/// Tickloop keeps 64 MiB, enforced by the Tickhost running the command.
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
-/// 命令被停止或随 Agent 关闭而终止时记录的原因。
+/// The reason recorded when a command is stopped or terminated because the Agent shut down.
 pub const CANCELLED_COMMAND_REASON: &str = "cancelled";
 const TIMED_OUT_REASON: &str = "timed_out";
 const OUTPUT_LIMIT_REASON: &str = "output_limit_exceeded";
@@ -1084,7 +1084,8 @@ impl Registry {
         task_output_dir
             .create()
             .map_err(|error| io_error(task_output_dir.path(), error))?;
-        // 照 Claude Code `initTaskOutput`：独占创建且不跟随符号链接，路径在任务启动时确定。
+        // Following Claude Code's `initTaskOutput`: created exclusively without following symlinks,
+        // with the path fixed when the task starts.
         let output_path = task_output_dir
             .path()
             .join(format!("{operation_id}.output"));

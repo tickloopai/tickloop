@@ -17,7 +17,8 @@ use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// 按顺序回复；普通请求（带工具）与摘要请求（不带工具）各有队列，回复带固定用量。
+/// Replies in order; regular requests (with tools) and summary requests (without tools) each have
+/// their own queue, and replies carry fixed usage.
 struct UsageModel {
     requests: Mutex<Vec<ModelRequest>>,
     answers: Mutex<VecDeque<String>>,
@@ -134,7 +135,7 @@ fn message_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
-/// 发给模型的对话，去掉宿主生成的 system 消息。
+/// The conversation sent to the model, without host-generated system messages.
 fn conversation(request: &ModelRequest) -> Vec<Message> {
     request
         .messages
@@ -211,7 +212,8 @@ async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process
     let resumed_model = UsageModel::new(&["fourth answer"], &[]);
     let resumed = reopen_with_window(&root, resumed_model.clone(), 5_000_000);
     let restored = resumed.resume_chat(chat).await.unwrap();
-    // 边界之前的消息不再加载：对话链从边界开始，只有边界、摘要与之后的消息。
+    // Messages before the boundary are no longer loaded: the chain starts at the boundary, with
+    // only the boundary, the summary and later messages.
     assert_eq!(restored.messages.len(), 4);
     assert!(restored.is_compact_boundary(0));
     assert!(restored.is_compact_summary(1));
@@ -337,7 +339,8 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         complete_turn(&agent, chat, &format!("large prompt {turn} {large}")).await;
     }
     agent.compact(chat).await.unwrap();
-    // 模拟进程在压缩完成后立即被强制结束：只保留此刻已经落盘的内容。
+    // Simulate the process being forcibly ended right after compaction: keep only what has reached
+    // disk at this moment.
     let path = transcript_file(&root, chat.uuid());
     let original = std::fs::read_to_string(&path).unwrap();
     agent.shutdown().await;
@@ -348,14 +351,15 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         .iter()
         .position(|line| line.contains("\"compact_boundary\""))
         .unwrap();
-    // 只保留边界之后压缩时写出的链上条目，去掉之后重新追加的元数据：
-    // 标题与 Branch 来源只能从边界之前读取。
+    // Keep only the chain entries written after the boundary during compaction, dropping metadata
+    // re-appended later: the title and Branch source can only be read from before the boundary.
     let is_metadata = |line: &str| {
         ["custom-title", "branch-origin", "last-prompt"]
             .iter()
             .any(|kind| line.starts_with(&format!("{{\"type\":\"{kind}\"")))
     };
-    // 边界之前再插入一条时间更新的叶子：小文件会进入这一支，大文件跳过边界之前的内容。
+    // Insert a leaf with a newer time before the boundary: a small file enters this branch, while a
+    // large file skips content before the boundary.
     let mut stale_leaf = serde_json::from_str::<serde_json::Value>(
         lines
             .iter()
@@ -383,7 +387,8 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("small answer")]));
     let resumed = reopen_with_window(&root, resumed_model.clone(), 50_000_000);
     let restored = resumed.resume_chat(chat).await.unwrap();
-    // 边界、摘要，以及照 Claude Code 恢复时在末尾 user 消息后追加的哨兵。
+    // Boundary, summary, and the sentinel appended after the trailing user message on resume,
+    // following Claude Code.
     assert_eq!(restored.messages.len(), 3);
     assert!(restored.is_compact_boundary(0));
     assert_eq!(
@@ -650,7 +655,8 @@ async fn branch_and_fork_after_a_directed_summary_keep_the_summary_and_restart_u
         Some("suffix summary")
     );
     let copy = resumed.resume_as_new_chat(source).await.unwrap();
-    // 摘要是最后一条 user 消息，恢复时照 Claude Code 追加不请求回复的哨兵。
+    // The summary is the last user message, so resume appends the no-reply sentinel, following
+    // Claude Code.
     assert_eq!(
         texts(&copy)[..summarized.messages.len()],
         texts(&summarized)[..]
@@ -665,7 +671,8 @@ async fn branch_and_fork_after_a_directed_summary_keep_the_summary_and_restart_u
     reopened.shutdown().await;
 }
 
-/// 重启后恢复出的对话、rewind 位置、压缩标记与 Loop 与写入进程中的内存状态一致。
+/// After a restart, the restored conversation, rewind points, compaction markers and Loop match the
+/// in-memory state of the writing process.
 fn assert_restored_like(restored: &ChatSnapshot, in_process: &ChatSnapshot, label: &str) {
     assert_eq!(texts(restored), texts(in_process), "{label}");
     assert_eq!(
@@ -704,10 +711,11 @@ fn assert_restored_like(restored: &ChatSnapshot, in_process: &ChatSnapshot, labe
 #[tokio::test]
 async fn stacked_directed_summaries_restart_exactly_like_the_process() {
     use SummaryDirection::{FromHere, UpToHere};
-    // (第一次方向, 第一次选点, 第二次方向, 第二次选点)；选点是当时 rewind_points 中的序号。
+    // (first direction, first pick, second direction, second pick); a pick is an index into
+    // rewind_points at that time.
     let stacks = [
         (FromHere, 2, FromHere, 3),
-        // 第二次选点在第一次保留区段内，且早于之后的消息。
+        // The second pick is within the first kept range and earlier than the later messages.
         (UpToHere, 1, UpToHere, 1),
         (FromHere, 2, UpToHere, 1),
         (UpToHere, 1, FromHere, 1),
@@ -808,7 +816,8 @@ async fn rewinding_to_the_first_preserved_prompt_restarts_without_reviving_aband
     }
 }
 
-/// 定向摘要（文件中留下更早的边界）之后全量压缩，再 rewind 越过全量压缩边界继续对话。
+/// Full compaction after a directed summary (leaving an earlier boundary in the file), then rewind
+/// across the full compaction boundary and continue the conversation.
 async fn rewind_across_a_full_compaction_after_a_directed_summary(prompt_padding: &str) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");

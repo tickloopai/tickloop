@@ -247,7 +247,8 @@ impl Agent {
         Ok(record)
     }
 
-    /// 按操作查看 `!` 命令输出；命令状态只在本进程内保留，重启后不可用。
+    /// Views `!` command output by operation; command state is kept only within this process and is
+    /// unavailable after a restart.
     pub async fn read_user_shell_output(
         &self,
         chat_id: ChatId,
@@ -398,7 +399,9 @@ impl Agent {
                     if has_preceding_model_run {
                         None
                     } else {
-                        // 命令输入在结束或转入后台时与结果一起写入；此前暂存的消息先写出，保持先后顺序。
+                        // The command input is written together with the result when it finishes or
+                        // moves to the background; messages held before that are written first,
+                        // preserving order.
                         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
                         let record = &mut chat.snapshot.user_shells[index];
                         record.set_state(UserShellState::WaitingPermission);
@@ -847,7 +850,8 @@ fn foreground_result(record: &UserShellRecord, output: Option<UserShellOutput>) 
     local_messages::bash_output("", &stderr)
 }
 
-/// 转入后台时已写过后台提示：记录处于后台，或从后台进入停止中。
+/// A background notice was already written when moving to the background: the record is in the
+/// background, or went from the background to stopping.
 fn has_announced_background(record: &UserShellRecord) -> bool {
     record.state == UserShellState::Background
         || (record.state == UserShellState::Cancelling && record.starts_in_background)

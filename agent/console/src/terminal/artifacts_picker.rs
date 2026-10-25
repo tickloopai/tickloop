@@ -580,7 +580,7 @@ impl ArtifactsPicker {
             lines.push(line);
         }
         let hint = if self.delete.is_some() {
-            "Delete permanently · 无法撤销 · enter confirm · esc cancel".into()
+            "Delete permanently · cannot be undone · enter confirm · esc cancel".into()
         } else if self.rename.is_some() {
             "Rename · enter save · ctrl+g editor · esc cancel".into()
         } else if let Some(error) = &self.error {
@@ -758,7 +758,7 @@ mod tests {
                 .frame(80, 12, DisplayProfile::default())
                 .lines
                 .iter()
-                .any(|line| line.text().contains("无法撤销"))
+                .any(|line| line.text().contains("cannot be undone"))
         );
         assert!(matches!(
             picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

@@ -101,7 +101,7 @@ const BACKGROUND_LAUNCH_PREFIXES: [&str; 2] = [
     "Command running in background with ID: ",
     "Command was manually backgrounded by user with ID: ",
 ];
-/// 照 Claude Code 的 `InterruptedByUser` 呈现中断标记。
+/// Renders the interruption marker following Claude Code's `InterruptedByUser`.
 const RESPONSE_CONTINUATION: &str = "     ";
 const INTERRUPTED: &str = "Interrupted · What should the Agent do instead?";
 #[cfg(test)]
@@ -1879,7 +1879,8 @@ pub(super) fn archived_tool_result(
     )
 }
 
-/// 本地消息的对话呈现，照 Claude Code：`!` 命令、`⎿` 输出块、中断标记与任务通知。
+/// Conversation rendering of local messages, following Claude Code: `!` commands, `⎿` output
+/// blocks, interruption markers and task notifications.
 pub(super) fn typed_local_message(text: &str, is_agent_message: bool) -> Option<LocalMessage> {
     LocalMessage::parse(text).filter(|message| {
         !matches!(message, LocalMessage::AgentCommunication { .. }) || is_agent_message

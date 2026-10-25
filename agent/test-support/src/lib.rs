@@ -276,7 +276,7 @@ pub async fn next_event_within(
         .expect("event channel closed")
 }
 
-/// Transcript 夹具：按 id 在 `<root>/projects/*/` 中查找 Chat 的 Transcript 文件。
+/// Transcript fixture: finds a Chat's Transcript file by id under `<root>/projects/*/`.
 pub fn transcript_file(root: &std::path::Path, chat: uuid::Uuid) -> std::path::PathBuf {
     std::fs::read_dir(root.join("projects"))
         .unwrap()
@@ -285,7 +285,8 @@ pub fn transcript_file(root: &std::path::Path, chat: uuid::Uuid) -> std::path::P
         .unwrap_or_else(|| panic!("Transcript for Chat {chat} does not exist"))
 }
 
-/// 从第一条满足条件的行开始截断 Transcript，模拟进程在这些条目写入前崩溃。
+/// Truncates the Transcript from the first line matching the condition, simulating a process crash
+/// before those entries were written.
 pub fn truncate_transcript_before(path: &std::path::Path, is_cut: impl Fn(&str) -> bool) {
     let text = std::fs::read_to_string(path).unwrap();
     let kept = text
@@ -300,7 +301,7 @@ pub fn truncate_transcript_before(path: &std::path::Path, is_cut: impl Fn(&str) 
     std::fs::write(path, kept).unwrap();
 }
 
-/// 匹配某个工具调用的结果条目。
+/// Matches the result entry of a given tool call.
 pub fn is_tool_result_line(line: &str, call_id: &str) -> bool {
     line.contains("\"tool_result\"") && line.contains(&format!("\"tool_use_id\":\"{call_id}\""))
 }

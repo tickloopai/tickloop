@@ -39,7 +39,8 @@ async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     }
 }
 
-/// 发给模型的对话消息（去掉每次请求都会重建的宿主 system 消息），逐条序列化用于逐字节比较。
+/// Conversation messages sent to the model (minus the host system messages rebuilt on every
+/// request), serialized one by one for byte-for-byte comparison.
 fn conversation(request: &ModelRequest) -> Vec<String> {
     request
         .messages
@@ -85,7 +86,7 @@ fn format_file_size(size: usize) -> String {
     trim(kilobytes / 1024.0, "MB")
 }
 
-/// Claude Code `buildLargeToolResultMessage` 与 `generatePreview`（测试内容为 ASCII）。
+/// Claude Code's `buildLargeToolResultMessage` and `generatePreview` (test content is ASCII).
 fn expected_replacement(path: &Path, content: &str) -> String {
     let (preview, has_more) = if content.len() <= PREVIEW_SIZE {
         (content, false)
@@ -106,7 +107,8 @@ fn expected_replacement(path: &Path, content: &str) -> String {
     )
 }
 
-/// Transcript 同级的 Chat 目录（Agent 使用 canonical 根目录，替换文本中的路径同样是 canonical）。
+/// The Chat directory next to the Transcript (the Agent uses the canonical root, so paths in the
+/// replacement text are canonical too).
 fn chat_directory(root: &Path, chat: ChatId) -> PathBuf {
     transcript_file(root, chat.uuid())
         .canonicalize()
@@ -178,9 +180,11 @@ async fn a_large_search_result_is_persisted_and_the_next_request_is_identical_af
     resumed.shutdown().await;
 }
 
-/// 在工作目录中生成五个子目录，每个子目录的 Glob 结果约 44–48K 字符：单个结果都低于
-/// 50K 的单工具阈值，合计超过 200K 的单条消息预算。Glob 最多列出 100 个文件，路径相对
-/// 工作目录显示，所以每个子目录恰好 100 个文件，用长目录名与文件名凑足每行长度。
+/// Creates five subdirectories in the working directory, each with a Glob result of about 44–48K
+/// characters: each result is below the 50K per-tool threshold, while together they exceed the 200K
+/// per-message budget. Glob lists at most 100 files with paths relative to the working directory,
+/// so each subdirectory has exactly 100 files, with long directory and file names padding each
+/// line.
 fn budget_fixture(workdir: &Path) -> Vec<Content> {
     const LISTED_FILES: usize = 100;
     let mut calls = Vec::new();
@@ -218,7 +222,8 @@ async fn assert_resumed_request_matches(
     complete_turn(&agent, chat, "Continue after restart").await;
     let sent = conversation(&requests(&model)[0]);
     assert!(sent.len() >= expected_prefix.len(), "{sent:?}");
-    // 对话可能含数 MB 的提示，只报告第一处不同消息的开头。
+    // The conversation may contain prompts of several MB, so only report the start of the first
+    // differing message.
     const REPORTED_PREFIX: usize = 400;
     if let Some(index) =
         (0..expected_prefix.len()).find(|index| sent[*index] != expected_prefix[*index])
@@ -326,9 +331,11 @@ async fn message_budget_replacements_survive_resume_fork_and_branch_byte_for_byt
     assert_resumed_request_matches(&root, branch, &expected_with_answer, true).await;
 }
 
-/// 超过 5MB 的 Transcript 做定向摘要后，加载时跳过新边界之前的内容；保留消息中被预算替换的
-/// 结果的替换记录随边界重写到边界之后，重启、`--fork-session` 式恢复为新 Chat（新文件同样超过 5MB）与 Branch 后下一轮
-/// 请求仍与摘要进程逐字节一致。
+/// After a directed summary on a Transcript over 5MB, loading skips content before the new
+/// boundary; replacement records for budget-replaced results in preserved messages are rewritten
+/// after the boundary along with it, so after a restart, a `--fork-session`-style resume into a new
+/// Chat (whose new file also exceeds 5MB) and a Branch, the next request is still byte-for-byte
+/// identical to the summarizing process.
 #[tokio::test]
 async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcript_survive_restart_new_chat_resume_and_branch()
  {
@@ -678,8 +685,8 @@ async fn large_results_with_repeated_or_unsafe_call_ids_are_still_persisted_afte
     resumed.shutdown().await;
 }
 
-/// 与 Agent 相同的用户临时目录：`TICKLOOP_TMPDIR`（未设置时 `/tmp`）解析符号链接后的
-/// `tickloop-private-<uid>`。
+/// The same user temp directory as the Agent: `tickloop-private-<uid>` under `TICKLOOP_TMPDIR`
+/// (`/tmp` when unset) with symlinks resolved.
 fn user_temp_directory() -> PathBuf {
     let base = std::env::var_os("TICKLOOP_TMPDIR")
         .filter(|value| !value.is_empty())
@@ -700,7 +707,8 @@ fn family_temp_directory(chat: uuid::Uuid) -> PathBuf {
     sessions.join(chat.to_string())
 }
 
-/// 测试结束时移除预先布置在系统临时目录中的家族临时空间（符号链接只删除链接本身）。
+/// At test end, removes the family temp space pre-planted in the system temp directory (for a
+/// symlink, only the link itself is removed).
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -717,8 +725,9 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// 模拟共享 `/tmp` 上的另一用户预先布置家族临时空间：`tamper` 布置目录并返回要读取的文件。
-/// 该文件的只读访问必须请求授权，后台任务输出必须拒绝写入该目录。
+/// Simulates another user on a shared `/tmp` pre-planting the family temp space: `tamper` plants
+/// the directory and returns the file to read. Read-only access to that file must ask for
+/// permission, and background task output must refuse to write to that directory.
 async fn assert_untrusted_family_temp_directory(
     tamper: impl Fn(&Path, &Path) -> PathBuf,
     expected_reason: &str,

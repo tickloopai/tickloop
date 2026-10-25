@@ -48,13 +48,15 @@ pub enum BranchPublicItem {
     },
 }
 
-/// Branch 的来源。来源 Chat 与名称随 Transcript 保存（`branch-origin` 与 `custom-title` 元数据）；
-/// 创建请求与复制种子只在创建 Branch 的进程内存中。
+/// Where a Branch came from. The source Chat and the name are saved with the Transcript
+/// (`branch-origin` and `custom-title` metadata); the creation request and the copy seed exist only
+/// in the memory of the process that created the Branch.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BranchOrigin {
     pub source_chat_id: ChatId,
     pub name: String,
-    /// 从 Transcript 恢复的 Branch 没有这部分，公开对话按子 Chat 自身的消息投影。
+    /// A Branch restored from the Transcript has no such part; its public conversation is projected
+    /// from the child Chat's own messages.
     #[serde(default)]
     pub creation: Option<BranchCreation>,
 }
@@ -69,8 +71,9 @@ pub struct BranchCreation {
     pub source_fingerprint: String,
     pub created_at_ms: u64,
     pub model_seed_message_count: usize,
-    /// 复制对话在子 Chat 中的起始位置。向前保留的定向摘要在保留消息之前插入压缩边界，
-    /// 复制对话随之后移。
+    /// Where the copied conversation starts in the child Chat. A backward-keeping directional
+    /// summary inserts a compact boundary before the kept messages, shifting the copied
+    /// conversation later accordingly.
     #[serde(default)]
     pub model_seed_start: usize,
     pub public_seed: Vec<BranchPublicItem>,
@@ -78,7 +81,8 @@ pub struct BranchCreation {
 }
 
 impl BranchCreation {
-    /// 截断或压缩拆散了复制种子：之后公开对话按子 Chat 自身的消息投影。
+    /// Truncation or compaction broke up the copy seed: from then on the public conversation is
+    /// projected from the child Chat's own messages.
     pub fn clear_seed(&mut self) {
         self.model_seed_message_count = 0;
         self.model_seed_start = 0;
@@ -113,10 +117,12 @@ impl RewindMode {
     }
 }
 
-/// rewind 与定向摘要可以选择的位置：当前对话中的一条用户提示。
+/// A position that rewind and directional summaries can pick: a user prompt in the current
+/// conversation.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RewindPoint {
-    /// 提示在 Transcript 中的 uuid，也是文件回滚快照关联的消息 id。
+    /// The prompt's uuid in the Transcript, which is also the message id file-rewind snapshots are
+    /// associated with.
     pub message_id: Uuid,
     pub message_index: usize,
     pub prompt: String,
@@ -138,8 +144,9 @@ pub struct TakenBackPrompt {
     pub contexts: Vec<InputContext>,
 }
 
-/// 恢复代码的结果。照 Claude Code，单个文件失败时跳过该文件继续；找不到目标提示的快照时
-/// 不改动任何文件，`error` 说明原因。
+/// Result of restoring code. Following Claude Code, a failure on one file skips that file and
+/// continues; when no snapshot is found for the target prompt, no file is changed and `error`
+/// explains why.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CodeRewind {
     pub changed_files: Vec<PathBuf>,
@@ -156,7 +163,7 @@ pub struct RewindOutcome {
     pub draft: Option<RewindDraft>,
 }
 
-/// 照 Claude Code `createCompactBoundaryMessage` 的 `content`。
+/// Follows the `content` of Claude Code's `createCompactBoundaryMessage`.
 pub const COMPACT_BOUNDARY_TEXT: &str = "Conversation compacted";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,27 +173,29 @@ pub enum CompactTrigger {
     Auto,
 }
 
-/// 照 Claude Code `compactMetadata`。Tickloop 不写 `preservedSegment`。
+/// Follows Claude Code's `compactMetadata`. Tickloop does not write `preservedSegment`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CompactBoundary {
     pub trigger: CompactTrigger,
     pub pre_tokens: usize,
     pub user_context: Option<String>,
     pub messages_summarized: Option<usize>,
-    /// 边界被之后的 Summarize from here 作为保留消息带到新边界之后。这样的边界在 Transcript 中
-    /// 接在前一条消息后面，不再是对话链的起点。
+    /// The boundary was carried past a newer boundary as a kept message by a later Summarize from
+    /// here. Such a boundary follows the previous message in the Transcript and is no longer the
+    /// start of the conversation chain.
     #[serde(default)]
     pub preserved_by_later_summary: bool,
     /// Host-copied original prompts from the active chain, never model summaries.
     #[serde(default)]
     pub original_user_inputs: Option<Vec<OriginalUserInput>>,
-    /// 压缩时的模型，只在本进程内有效：rewind 越过边界重新暴露私有推理时用来判断兼容性。
-    /// 恢复后边界之前的消息不在内存中，无需保存。
+    /// The model at compaction time, valid only within this process: used to check compatibility
+    /// when a rewind past the boundary re-exposes private reasoning. After resume the messages
+    /// before the boundary are not in memory, so it need not be saved.
     #[serde(skip)]
     pub model: Option<Box<ModelConfig>>,
 }
 
-/// 照 Claude Code `summarizeMetadata`。
+/// Follows Claude Code's `summarizeMetadata`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SummarizeMetadata {
     pub messages_summarized: usize,
@@ -197,7 +206,8 @@ pub struct SummarizeMetadata {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum CompactionMarker {
     Boundary(CompactBoundary),
-    /// 摘要保留了消息时带 `summarize_metadata`，否则照 Claude Code 只在完整记录中显示。
+    /// Carries `summarize_metadata` when the summary kept messages; otherwise, following Claude
+    /// Code, it is shown only in the full transcript.
     Summary {
         summarize_metadata: Option<SummarizeMetadata>,
     },
@@ -212,13 +222,13 @@ pub enum SummaryDirection {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DirectedSummaryRequest {
-    /// 选中的用户提示，见 [`RewindPoint::message_id`]。
+    /// The selected user prompt; see [`RewindPoint::message_id`].
     pub message_id: Uuid,
     pub direction: SummaryDirection,
     pub guidance: Option<String>,
 }
 
-/// 模型可见对话中的一项：普通消息或压缩摘要。
+/// One item of the model-visible conversation: an ordinary message or a compact summary.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ActiveConversationItem {
     RawMessage {
@@ -241,7 +251,7 @@ pub struct DirectedSummaryDraft {
 pub struct DirectedSummaryOutcome {
     pub snapshot: ChatSnapshot,
     pub direction: SummaryDirection,
-    /// 模型给出的摘要文字。
+    /// The summary text produced by the model.
     pub summary: String,
     pub guidance: Option<String>,
     pub messages_summarized: usize,
@@ -258,10 +268,10 @@ pub enum CompactionStatus {
     Failed,
 }
 
-/// 全量压缩的结果。
+/// Result of a full compaction.
 #[derive(Clone, Debug)]
 pub struct CompactionOutcome {
-    /// 模型给出的摘要文字。
+    /// The summary text produced by the model.
     pub summary: String,
     pub snapshot: ChatSnapshot,
 }

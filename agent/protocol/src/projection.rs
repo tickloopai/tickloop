@@ -23,12 +23,13 @@ pub struct VisibleGuidance {
 #[error("{0}")]
 pub struct InvalidConversation(pub String);
 
-/// 照 Claude Code `getCompactUserSummaryMessage` 的开头。
+/// Follows the opening of Claude Code's `getCompactUserSummaryMessage`.
 const FULL_SUMMARY_PREFIX: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 
 const FULL_SUMMARY_PINNED_STATE: &str = "\n\nGoals and plans retained by the host:\n";
 
-/// 照 Claude Code `getCompactUserSummaryMessage` 的 `suppressFollowUpQuestions` 分支，自动压缩使用。
+/// Follows the `suppressFollowUpQuestions` branch of Claude Code's `getCompactUserSummaryMessage`;
+/// used by automatic compaction.
 const CONTINUE_WITHOUT_QUESTIONS: &str = "\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
 
 const DIRECTED_SUMMARY_PREFIX: &str =
@@ -49,13 +50,14 @@ impl ChatSnapshot {
         )
     }
 
-    /// 压缩摘要消息中模型给出的摘要文字；不是压缩摘要时返回 `None`。
+    /// The summary text produced by the model in a compact summary message; `None` when this is not
+    /// a compact summary.
     pub fn compact_summary_text(&self, message_index: usize) -> Option<String> {
         self.is_compact_summary(message_index)
             .then(|| summary_text(&self.messages[message_index]))
     }
 
-    /// 最后一条压缩摘要的摘要文字。
+    /// The summary text of the last compact summary.
     pub fn latest_compact_summary(&self) -> Option<String> {
         self.message_compactions
             .iter()
@@ -63,7 +65,8 @@ impl ChatSnapshot {
             .find_map(|(index, _)| self.compact_summary_text(*index))
     }
 
-    /// 照 Claude Code `getMessagesAfterCompactBoundary`：模型可见的对话从最后一个边界开始。
+    /// Following Claude Code's `getMessagesAfterCompactBoundary`: the model-visible conversation
+    /// starts at the last boundary.
     pub fn active_start(&self) -> usize {
         self.boundary_indexes().last().copied().unwrap_or(0)
     }
@@ -122,14 +125,16 @@ impl ChatSnapshot {
             .collect()
     }
 
-    /// 模型可见的对话（最后一个压缩边界之后），压缩摘要单独成项。
+    /// The model-visible conversation (after the last compact boundary), with compact summaries as
+    /// separate items.
     pub fn active_conversation_projection(
         &self,
     ) -> Result<Vec<ActiveConversationItem>, InvalidConversation> {
         self.conversation_projection_from(self.active_start())
     }
 
-    /// 从 `start` 起的对话，压缩摘要单独成项；工具调用配对只校验模型可见的部分。
+    /// The conversation from `start`, with compact summaries as separate items; tool call pairing
+    /// is checked only for the model-visible part.
     fn conversation_projection_from(
         &self,
         start: usize,
@@ -162,7 +167,7 @@ impl ChatSnapshot {
         self.events.clone()
     }
 
-    /// 当前对话中可以 rewind 的用户提示，按对话顺序排列。
+    /// User prompts in the current conversation that can be rewound to, in conversation order.
     pub fn rewind_points(&self) -> Vec<RewindPoint> {
         self.prompt_execution_modes
             .keys()
@@ -215,8 +220,10 @@ impl ChatSnapshot {
         self.public_items_from(self.active_start())
     }
 
-    /// 人看到的整段对话：压缩只裁剪模型上下文，边界之前仍在内存中的消息照常显示，每次压缩在
-    /// 原位置留下摘要项。照 Claude Code 全屏模式保留压缩前消息的做法。
+    /// The whole conversation as a person sees it: compaction only trims the model context,
+    /// messages before the boundary that are still in memory are shown as usual, and each
+    /// compaction leaves a summary item in place. Follows Claude Code's fullscreen mode, which
+    /// keeps pre-compaction messages.
     pub fn full_public_conversation_items(
         &self,
     ) -> Result<Vec<BranchPublicItem>, InvalidConversation> {
@@ -288,9 +295,10 @@ impl ChatSnapshot {
     }
 }
 
-/// 照 Claude Code `getCompactUserSummaryMessage`：自动压缩要求模型不再提问、直接继续，手动
-/// `/compact` 不带继续指令。Tickloop 在摘要之后附带宿主保存的目标与计划；Claude Code 附加的
-/// Transcript 路径没有照搬（不持久化的 Agent 没有文件）。
+/// Following Claude Code's `getCompactUserSummaryMessage`: automatic compaction tells the model not
+/// to ask further questions and to continue directly, while a manual `/compact` carries no continue
+/// instruction. Tickloop appends the Goal and plan saved by the host after the summary; the
+/// Transcript path Claude Code appends is not copied (an Agent that does not persist has no file).
 pub fn full_summary_message(
     summary: &str,
     pinned_state: &serde_json::Value,
@@ -310,7 +318,7 @@ pub fn directed_summary_message(summary: &str) -> Message {
     user_text(format!("{DIRECTED_SUMMARY_PREFIX}{summary}"))
 }
 
-/// 摘要消息中模型给出的摘要文字，供界面显示。
+/// The summary text produced by the model in a summary message, for display.
 pub fn summary_text(message: &Message) -> String {
     let text = message
         .content
@@ -451,8 +459,10 @@ pub fn history_calls(snapshot: &ChatSnapshot) -> Result<Vec<HistoryCall>, Invali
     history_calls_in(snapshot, 0..snapshot.messages.len())
 }
 
-/// 给定消息范围内的工具调用与结果配对。模型投影只看最后一个压缩边界之后的消息，
-/// 这样压缩前的调用 id 不会影响投影，重启后只加载边界之后的内容时投影不变。
+/// Pairs tool calls with results within the given message range. The model projection looks only at
+/// messages after the last compact boundary, so call ids from before compaction do not affect the
+/// projection, and the projection is unchanged after a restart that loads only the content after
+/// the boundary.
 pub fn history_calls_in(
     snapshot: &ChatSnapshot,
     range: std::ops::Range<usize>,
@@ -567,8 +577,9 @@ pub fn projected_messages(
     )
 }
 
-/// 发给模型的对话，以及每条消息投影自的原始消息下标（合成的工具结果没有下标）。
-/// 照 Claude Code `getMessagesAfterCompactBoundary`，只投影最后一个压缩边界之后的消息。
+/// The conversation sent to the model, plus the index of the original message each message was
+/// projected from (synthesized tool results have no index). Following Claude Code's
+/// `getMessagesAfterCompactBoundary`, only messages after the last compact boundary are projected.
 pub fn projected_messages_with_sources(
     snapshot: &ChatSnapshot,
     denial_references: &BTreeMap<usize, DenialReference>,
@@ -580,7 +591,8 @@ pub fn projected_messages_with_sources(
     Ok(projected)
 }
 
-/// 最后一个压缩边界之后、给定范围内的消息投影，去掉私有推理与空消息。定向摘要用它构造摘要请求。
+/// Projects the messages within the given range after the last compact boundary, dropping private
+/// reasoning and empty messages. Directional summaries use it to build the summary request.
 pub fn public_projection_of(
     snapshot: &ChatSnapshot,
     denial_references: &BTreeMap<usize, DenialReference>,

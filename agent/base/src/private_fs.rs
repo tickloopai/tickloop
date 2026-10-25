@@ -1,5 +1,7 @@
-//! Tickloop 自己写入的文件共用的底层原语：私有权限位、私有目录的创建与校验、同目录临时文件
-//! 原子替换、从根目录逐段不跟随符号链接地打开路径，以及写入记录用的毫秒时间戳。
+//! Low-level primitives shared by files Tickloop writes itself: private permission bits, creating
+//! and checking private directories, atomic replacement via a temporary file in the same directory,
+//! opening paths component by component from the root without following symlinks, and millisecond
+//! timestamps for written records.
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -10,16 +12,17 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 只有当前用户可以访问的目录权限。
+/// Directory permissions that only the current user can access.
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-/// 只有当前用户可以读写的文件权限。
+/// File permissions that only the current user can read and write.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 const MODE_BITS: u32 = 0o7777;
 const GROUP_OTHER_PERMISSION_BITS: u32 = 0o077;
 const TEMPORARY_FILE_SUFFIX: &str = "tmp";
 const TEMPORARY_DIRECTORY_DESCRIPTION: &str = "temporary directory";
 
-/// 以私有目录权限递归创建目录（已存在时沿用，权限受 umask 约束）。
+/// Recursively creates directories with private directory permissions (existing ones are reused;
+/// permissions are subject to umask).
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -28,12 +31,13 @@ pub fn create_private_directory(path: &Path) -> io::Result<()> {
 }
 
 pub fn current_uid() -> u32 {
-    // SAFETY: getuid 没有前置条件，也不会失败。
+    // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
 
-/// 确认 `path` 是当前用户拥有、没有 group/other 权限位的真实目录（不是符号链接）。
-/// `description` 说明目录的用途，出现在拒绝使用的错误中。
+/// Ensures `path` is a real directory (not a symlink) owned by the current user with no group/other
+/// permission bits. `description` states what the directory is for and appears in the rejection
+/// error.
 pub fn verify_private_directory(path: &Path, description: &str) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     let uid = current_uid();
@@ -58,12 +62,13 @@ pub fn verify_private_directory(path: &Path, description: &str) -> io::Result<()
     ))
 }
 
-/// Tickloop 自己写入的目录。位于用户配置目录下时照常创建；位于系统临时目录下时，
-/// 其他用户可以在共享的 `/tmp` 中抢先布置目录或符号链接，因此锚点以下
-/// 每一层都必须是当前用户拥有、没有 group/other 权限位的真实目录。
+/// A directory Tickloop writes itself. Under the user config directory it is created normally;
+/// under the system temp directory, other users can pre-plant directories or symlinks in the shared
+/// `/tmp`, so every level below the anchor must be a real directory owned by the current user with
+/// no group/other permission bits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateDirectory {
-    /// 可信的基础目录；`None` 表示整条路径可信。
+    /// The trusted base directory; `None` means the whole path is trusted.
     anchor: Option<PathBuf>,
     path: PathBuf,
 }
@@ -92,7 +97,8 @@ impl PrivateDirectory {
         }
     }
 
-    /// 创建目录（已存在时沿用），失败或校验不通过时返回说明原因的错误。
+    /// Creates the directory (reusing an existing one); on failure or a failed check, returns an
+    /// error explaining why.
     pub fn create(&self) -> io::Result<()> {
         let Some(anchor) = &self.anchor else {
             return create_private_directory(&self.path);
@@ -131,8 +137,10 @@ impl PrivateDirectory {
     }
 }
 
-/// 原子替换 `path`：在同一目录以 `mode` 独占创建临时文件（不跟随符号链接），写入并同步到磁盘后
-/// 改名替换。任何时刻 `path` 要么是完整的旧内容，要么是完整的新内容；失败时删除临时文件。
+/// Atomically replaces `path`: exclusively creates a temporary file with `mode` in the same
+/// directory (without following symlinks), writes and syncs it to disk, then renames it over. At
+/// any moment `path` holds either the complete old content or the complete new content; on failure
+/// the temporary file is removed.
 pub fn replace_file_atomically(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -163,19 +171,22 @@ pub fn replace_file_atomically(path: &Path, contents: &[u8], mode: u32) -> io::R
     replaced
 }
 
-/// [`open_without_following_links`] 对路径最后一段的要求。
+/// What [`open_without_following_links`] requires of the last path component.
 #[derive(Clone, Copy, Debug)]
 pub enum OpenTarget {
-    /// 最后一段可以是任何类型的目录项（中间各段仍必须是目录）。
+    /// The last component may be any kind of directory entry (intermediate components must still be
+    /// directories).
     Entry,
-    /// 每一段都必须是目录。`create_mode` 给出时以该模式补建缺失的层级（受 umask 约束），
-    /// 否则缺失时返回 `NotFound`。
+    /// Every component must be a directory. With `create_mode`, missing levels are created with
+    /// that mode (subject to umask); otherwise a missing one returns `NotFound`.
     Directory { create_mode: Option<u32> },
 }
 
-/// 从根目录逐段以 `O_NOFOLLOW` 打开绝对、规范化的路径：每一段都相对上一段的目录描述符打开，
-/// 打开过程中把某一层替换成符号链接也无法把访问重定向到别处。任何一段是符号链接时返回 `ELOOP`，
-/// 应为目录的一段不是目录时返回 `ENOTDIR`。以 `O_NONBLOCK` 打开，最后一段是 FIFO 时不会阻塞。
+/// Opens an absolute, normalized path component by component from the root with `O_NOFOLLOW`: each
+/// component is opened relative to the previous directory's descriptor, so replacing a level with a
+/// symlink mid-way cannot redirect the access elsewhere. Returns `ELOOP` when any component is a
+/// symlink, and `ENOTDIR` when a component that should be a directory is not one. Opens with
+/// `O_NONBLOCK`, so a FIFO as the last component does not block.
 pub fn open_without_following_links(path: &Path, target: OpenTarget) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -215,7 +226,8 @@ pub fn open_without_following_links(path: &Path, target: OpenTarget) -> io::Resu
         if let (Err(error), Some(mode)) = (&opened, create_mode)
             && error.kind() == io::ErrorKind::NotFound
         {
-            // SAFETY: 目录描述符有效，名称是以 NUL 结尾的单个路径段。
+            // SAFETY: The directory descriptor is valid and the name is a single NUL-terminated
+            // path component.
             if unsafe { libc::mkdirat(handle.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) }
                 != 0
             {
@@ -232,16 +244,18 @@ pub fn open_without_following_links(path: &Path, target: OpenTarget) -> io::Resu
 }
 
 fn open_at(directory: &File, name: &CString, flags: libc::c_int) -> io::Result<File> {
-    // SAFETY: 目录描述符有效，名称是以 NUL 结尾的单个路径段。
+    // SAFETY: The directory descriptor is valid and the name is a single NUL-terminated path
+    // component.
     let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openat 成功返回的描述符未被其他对象持有，所有权交给 `File`。
+    // SAFETY: The descriptor returned by a successful openat is not held by anything else;
+    // ownership passes to `File`.
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-/// 自 Unix 纪元以来的毫秒数；系统时钟早于纪元时为 0。
+/// Milliseconds since the Unix epoch; 0 when the system clock is before the epoch.
 pub fn unix_time_milliseconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

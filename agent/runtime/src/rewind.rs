@@ -1,7 +1,9 @@
-//! Rewind，照 Claude Code `rewindConversationTo` 与 `fileHistoryRewind` 实现。
+//! Rewind, implemented following Claude Code's `rewindConversationTo` and `fileHistoryRewind`.
 //!
-//! 对话只截断内存：rewind 到某条提示时丢弃它及之后的消息，下一条消息接在最后保留的消息之后，
-//! 在同一 Transcript 中形成分叉，被放弃的消息仍留在文件中。代码按目标提示的文件回滚快照恢复。
+//! The conversation is truncated only in memory: rewinding to a prompt drops it and every later
+//! message, and the next message follows the last kept message, forming a fork in the same
+//! Transcript while the abandoned messages stay in the file. Code is restored from the target
+//! prompt's file rollback snapshot.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,13 +28,16 @@ use tickloop_agent_protocol::{
 };
 
 impl Agent {
-    /// 照 Claude Code 的 Rewind 选择器：按模式恢复代码、对话或两者。先恢复代码，再截断对话；
-    /// 代码恢复失败不妨碍对话恢复。
+    /// Following Claude Code's Rewind selector: restores code, conversation or both depending on
+    /// the mode. Code is restored first, then the conversation is truncated; a failed code restore
+    /// does not prevent the conversation restore.
     ///
-    /// 分三段执行：持锁校验空闲、预先算出截断后的对话（出错不改动任何东西）并占住该 Chat；
-    /// 释放锁后在阻塞线程中恢复文件，其他 Chat 照常运行；重新加锁后截断对话并释放占用。
-    /// 占用期间该 Chat 不能开始 Run、压缩、定向摘要、Branch 或另一次 rewind，期间排队的输入
-    /// 在释放占用后照常开始。
+    /// Runs in three stages: under the lock, check the Chat is idle, precompute the truncated
+    /// conversation (an error changes nothing), and occupy the Chat; release the lock and restore
+    /// files in a blocking thread while other Chats keep running; relock, truncate the conversation
+    /// and release the occupation. While occupied, the Chat cannot start a Run, compaction,
+    /// directed summary, Branch or another rewind; input queued meanwhile starts normally after the
+    /// occupation is released.
     pub async fn rewind(
         &self,
         chat_id: ChatId,
@@ -70,7 +75,7 @@ impl Agent {
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = self.clone();
-        // 放进宿主任务，调用方放弃等待时也会释放占用。
+        // Run inside a host task so the occupation is released even if the caller stops waiting.
         self.inner.tasks.spawn(async move {
             let restored = match history {
                 Some(history) => {
@@ -113,10 +118,13 @@ impl Agent {
             .map_err(|_| AgentError::Invalid("rewind task ended unexpectedly".into()))?
     }
 
-    /// 照 Claude Code 中断后的自动恢复（`REPL.tsx` 在 `onQuery` 收尾处以
-    /// `messagesAfterAreOnlySynthetic` 判断后调用 `restoreMessageSync`）：用户中断的 `run_id` 还没有
-    /// 助手文字或工具调用时，对话截断到它的提示之前，模型此后看不到这条提示，Transcript 中留作
-    /// 被放弃的分支。条件不满足时不改动任何东西并返回 `None`，中断照常留在对话中。
+    /// Following Claude Code's automatic restore after an interrupt (`REPL.tsx` calls
+    /// `restoreMessageSync` at the end of `onQuery` after checking
+    /// `messagesAfterAreOnlySynthetic`): when the user-interrupted `run_id` has no assistant text
+    /// or tool calls yet, the conversation is truncated to before its prompt, so the model no
+    /// longer sees that prompt, and the Transcript keeps it as an abandoned branch. When the
+    /// conditions are not met, nothing changes and `None` is returned, leaving the interrupt in the
+    /// conversation as usual.
     pub async fn take_back_interrupted_prompt(
         &self,
         chat_id: ChatId,
@@ -144,8 +152,9 @@ impl Agent {
         }))
     }
 
-    /// rewind 的第三段：按文件恢复结果与模式截断对话。对话以占用结束时的快照重新计算，
-    /// 保留占用期间排队的输入等变化。
+    /// Third stage of rewind: truncates the conversation according to the file restore result and
+    /// the mode. The conversation is recomputed from the snapshot at the end of the occupation,
+    /// keeping changes such as input queued during it.
     fn finish_rewind(
         &self,
         chat: &mut Chat,
@@ -196,7 +205,8 @@ impl Agent {
         })
     }
 
-    /// 恢复到目标提示时会被改变的文件，不改动磁盘。没有该提示的快照时返回 `None`。
+    /// Files that restoring to the target prompt would change, without touching disk. Returns
+    /// `None` when the prompt has no snapshot.
     pub async fn rewind_file_changes(
         &self,
         chat_id: ChatId,
@@ -218,8 +228,9 @@ impl Agent {
             .map_err(|error| AgentError::Invalid(format!("file comparison ended: {error}")))
     }
 
-    /// 换上截断到第 `index` 条消息之前的对话（`message_id` 是被截掉的第一条）：Transcript 中
-    /// 下一条消息接在保留的最后一条之后，各 View 收到 `ConversationRewound` 后重画对话。
+    /// Switches to the conversation truncated before message `index` (`message_id` is the first one
+    /// cut off): in the Transcript the next message follows the last kept one, and each View
+    /// redraws the conversation on receiving `ConversationRewound`.
     pub(super) fn replace_conversation(
         &self,
         chat: &mut Chat,
@@ -263,7 +274,8 @@ impl Agent {
         let _ = self.inner.events.send(event);
     }
 
-    /// 文件回滚备份目录：持久化时照 Claude Code 为 `<root>/file-history/<chatId>`。
+    /// File rollback backup directory: `<root>/file-history/<chatId>` when persisting, following
+    /// Claude Code.
     pub(super) fn file_history_directory(
         &self,
         chat_id: ChatId,
@@ -276,18 +288,21 @@ impl Agent {
             .and_then(|recorder| recorder.file_history_root())
         {
             Some(directory) => PrivateDirectory::trusted(directory),
-            // 不持久化时不在工作目录写文件，备份放在系统临时目录的项目目录下（工单 54），
-            // 创建时逐层校验属主、权限位与符号链接。
+            // When not persisting, nothing is written in the working directory: backups go under
+            // the project directory in the system temp directory (ticket 54), with ownership,
+            // permission bits and symlinks checked at each level on creation.
             None => private_project_temp_directory(folder)
                 .join(crate::file_history::FILE_HISTORY_DIRECTORY),
         }
         .join(chat_id.uuid().to_string())
     }
 
-    /// 照 Claude Code `fileHistoryMakeSnapshot`：提示写入对话时只追加待定快照
-    /// （`append_input_message`），这里按提示顺序逐个在锁外算出备份、持锁提交，
-    /// 再以提示 id 写入 Transcript。Run 开始时与合并输入之后调用，先于本轮任何工具执行，
-    /// 快照因此记录的是本轮编辑之前的文件，编辑跟踪的快照更新也总写在它之后。
+    /// Following Claude Code's `fileHistoryMakeSnapshot`: writing a prompt to the conversation only
+    /// appends a pending snapshot (`append_input_message`); here, in prompt order, each snapshot's
+    /// backups are computed outside the lock, committed under the lock, and written to the
+    /// Transcript under the prompt id. Called when a Run starts and after merging input, before any
+    /// tool runs in this turn, so the snapshot records the files before this turn's edits, and
+    /// edit-tracking snapshot updates are always written after it.
     pub(super) async fn complete_file_history_snapshots(&self, chat_id: ChatId) {
         loop {
             let plan = {
@@ -334,9 +349,10 @@ impl Agent {
         }
     }
 
-    /// 照 Claude Code `fileHistoryTrackEdit`：编辑工具执行前为未跟踪的文件建首版备份，
-    /// 以发起编辑的 assistant 消息为键写入快照更新。备份失败（包括文件已被替换为符号链接或
-    /// 不是普通文件）只放弃跟踪，不阻止编辑。
+    /// Following Claude Code's `fileHistoryTrackEdit`: before an edit tool runs, makes the initial
+    /// backup for an untracked file and writes the snapshot update keyed by the assistant message
+    /// that issued the edit. A failed backup (including a file replaced by a symlink or not a
+    /// regular file) only gives up tracking and does not block the edit.
     pub(super) async fn track_file_edit(&self, chat_id: ChatId, path: &Path, message_id: Uuid) {
         let directory = {
             let chats = self.inner.chats.lock().await;
@@ -410,8 +426,9 @@ pub(super) fn conversation_before(
     candidate.message_usage.split_off(&index);
     candidate.message_sources.split_off(&index);
     candidate.message_models.split_off(&index);
-    // 照 Claude Code：rewind 越过压缩边界时，边界随截断的消息一起丢弃，模型重新看到边界之前的
-    // 原始对话；下一条消息在 Transcript 中从边界之前分叉。
+    // Following Claude Code: when rewind crosses a compaction boundary, the boundary is dropped
+    // along with the truncated messages, and the model sees the original conversation before the
+    // boundary again; the next message forks in the Transcript from before the boundary.
     candidate.message_compactions.split_off(&index);
     if let Some(creation) = candidate
         .branch_origin
@@ -434,9 +451,11 @@ pub(super) fn conversation_before(
     Ok((candidate, candidate_bookkeeping))
 }
 
-/// 用户中断的 `run_id` 可以撤回的提示。照 Claude Code 的守卫：Chat 已空闲且没有排队的输入（中断
-/// 后排队的输入已开始就是用户已经往下走了），查看的不是委派的子 Agent；对话中最后一条提示属于
-/// 这一轮且这一轮被打断，提示之后只有不算回应的消息。
+/// The prompt the user-interrupted `run_id` can retract. Following Claude Code's guard: the Chat is
+/// idle with no queued input (queued input having started after the interrupt means the user has
+/// already moved on), and the viewed Agent is not a delegated Subagent; the last prompt in the
+/// conversation belongs to this turn, the turn was interrupted, and only messages that do not count
+/// as a response follow the prompt.
 fn interrupted_prompt(chat: &Chat, run_id: RunId) -> Option<RewindPoint> {
     let snapshot = &chat.snapshot;
     if snapshot.delegation.is_some() || ensure_idle(chat).is_err() {
@@ -462,9 +481,10 @@ fn interrupted_prompt(chat: &Chat, run_id: RunId) -> Option<RewindPoint> {
     snapshot.rewind_point_at(index)
 }
 
-/// 照 Claude Code `messagesAfterAreOnlySynthetic`：中断标记和没有文字、工具调用的助手消息
-/// （例如只有思考）不算回应，其他消息都算；宿主写给模型的 host note 像 Claude Code 的 meta
-/// 附件，也不算，由调用方按下标排除。
+/// Following Claude Code's `messagesAfterAreOnlySynthetic`: interrupt markers and assistant
+/// messages with no text or tool calls (for example, thinking only) do not count as a response, and
+/// all other messages do; host notes written to the model, like Claude Code's meta attachments, do
+/// not count either and are excluded by index by the caller.
 fn is_not_a_response(message: &Message) -> bool {
     match message.role {
         Role::Assistant => message.content.iter().all(|content| match content {
@@ -530,7 +550,8 @@ mod tests {
     const WRITE_PREFIX: &str = "write ";
     const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// 提示以 `write ` 开头时先 Read 再以 Write 把其余文字写进 tracked.txt，其他请求只回复文字。
+    /// When the prompt starts with `write `, Reads first and then Writes the remaining text into
+    /// tracked.txt; other requests get a text-only reply.
     struct EditingModel;
 
     #[async_trait]
@@ -634,7 +655,8 @@ mod tests {
         first_tracked: PathBuf,
     }
 
-    /// 两个 Chat 各自在自己的工作目录中编辑过 tracked.txt，之后的提示会为它建快照。
+    /// Two Chats have each edited tracked.txt in their own working directory, so later prompts
+    /// snapshot it.
     async fn two_chats_with_tracked_files() -> TwoChats {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();

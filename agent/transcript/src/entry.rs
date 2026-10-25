@@ -10,7 +10,8 @@ use tickloop_agent_protocol::{
     ToolResult, ToolResultContent, Usage,
 };
 
-/// Transcript 中的一行。未知类型原样保留并原样写回，保证旧版本能读取、也不丢掉新版本写入的记录。
+/// One line in the Transcript. Unknown types are kept and written back unchanged, so older versions
+/// can read the file without dropping records written by newer versions.
 /// A store keeps each Line as its JSON; the local store writes one per line of a JSONL file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -40,9 +41,11 @@ pub enum Line {
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
-    /// 照 Claude Code：文件回滚快照，按消息 id 关联到链上消息。
+    /// Following Claude Code: a file-rewind snapshot, associated with a message on the chain by
+    /// message id.
     FileHistorySnapshot(FileHistorySnapshotEntry),
-    /// 照 Claude Code：大工具结果的替换决定，恢复时重建，同一 Chat 的条目逐条累积。
+    /// Following Claude Code: a replacement decision for a large tool result, rebuilt on resume;
+    /// entries of the same Chat accumulate one by one.
     ContentReplacement(ContentReplacementEntry),
     /// An answer's lifecycle; the latest record of a response id wins.
     Response(ResponseEntry),
@@ -319,37 +322,45 @@ pub struct ChainEntry {
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contexts: Option<serde_json::Value>,
-    /// Tickloop 扩展：同一条内存消息拆成多个条目时（向结果消息追加的并行工具结果），后续条目
-    /// 标记为接续父条目所在的消息，加载时合并回同一条消息。Claude Code 的每个工具结果本来就是
-    /// 独立的 user 消息，Tickloop 在内存中把并行结果合在一条消息里，所以保留这个字段。
+    /// Tickloop extension: when one in-memory message is split into several entries (parallel tool
+    /// results appended to a result message), later entries are marked as continuing the message of
+    /// their parent entry and are merged back into one message on load. In Claude Code each tool
+    /// result is already a separate user message; Tickloop combines parallel results into one
+    /// in-memory message, hence this field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continues_message: bool,
-    /// 照 Claude Code system 条目的 `subtype`；压缩边界为 [`COMPACT_BOUNDARY_SUBTYPE`]。
+    /// Follows the `subtype` of Claude Code's system entries; a compact boundary is
+    /// [`COMPACT_BOUNDARY_SUBTYPE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_metadata: Option<CompactMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_compact_summary: bool,
-    /// 照 Claude Code：定向摘要保留了消息时，摘要消息记录被摘要的消息数、用户补充说明和方向。
+    /// Following Claude Code: when a directional summary keeps messages, the summary message
+    /// records the number of summarized messages, the user's extra instructions and the direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summarize_metadata: Option<SummarizeMetadataEntry>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_visible_in_transcript_only: bool,
-    /// assistant 条目的用量（Claude Code 记在 `message.usage`，Tickloop 的消息结构没有该字段）。
+    /// Usage of an assistant entry (Claude Code records it in `message.usage`; Tickloop's message
+    /// structure has no such field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// assistant 条目生成该消息的模型（Claude Code 记在 `message.model`，Tickloop 的消息结构
-    /// 没有该字段）。恢复时据此判断历史中的私有推理是否来自当前模型。
+    /// The model that generated an assistant entry's message (Claude Code records it in
+    /// `message.model`; Tickloop's message structure has no such field). On resume it decides
+    /// whether private reasoning in the history came from the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_source: Option<PrivateHistorySource>,
-    /// 条目所属 run 的 Loop（有 `runId` 时记录）。恢复时据此把计划与进度工具调用归到各自的 Loop。
+    /// The Loop of the run the entry belongs to (recorded when there is a `runId`). On resume it
+    /// assigns plan and progress tool calls to their own Loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_id: Option<Uuid>,
-    /// 照 Claude Code 消息的 `slug`：Chat 的计划文件名前缀，生成之后写在每个条目上；
-    /// 恢复时按链上第一个 slug 关联计划文件。
+    /// Follows the `slug` of Claude Code messages: the Chat's plan file name prefix, written on
+    /// every entry once generated; on resume the plan file is associated through the first slug on
+    /// the chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
     /// The answer this entry is part of: its assistant messages, tool results, interruption
@@ -359,8 +370,9 @@ pub struct ChainEntry {
     /// The ledger input this user prompt entered with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_id: Option<Uuid>,
-    /// Loop 条目（system，subtype 为 `loop_*`）记录的 Loop 完整状态；run id 记在 `runId`。
-    /// 这类条目挂在对话链上，但不是对话消息，不进入发给模型的消息。
+    /// The full Loop state recorded by a Loop entry (system, with subtype `loop_*`); the run id is
+    /// in `runId`. Such entries hang on the conversation chain but are not conversation messages
+    /// and never enter the messages sent to the model.
     #[serde(rename = "loop", default, skip_serializing_if = "Option::is_none")]
     pub loop_record: Option<LoopRecord>,
 }
@@ -394,11 +406,13 @@ impl ChainEntry {
 }
 
 pub const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
-/// Loop 条目的 subtype。恢复时以链上最后一条的完整状态为准；其他 subtype 的 Loop 条目是一个 Chat
-/// 有多个 Loop 时的旧格式，恢复时丢弃。
+/// Subtype of Loop entries. On resume the full state in the last such entry on the chain wins; Loop
+/// entries with other subtypes are the old format from when one Chat had several Loops and are
+/// discarded on resume.
 pub const LOOP_SUBTYPE: &str = "chat_loop";
 
-/// Loop 在对话链上的完整状态。状态、接收开关与订阅按原始 JSON 保存，本模块不解析其结构。
+/// The full state of a Loop on the conversation chain. The state, receive switch and subscriptions
+/// are stored as raw JSON; this module does not parse their structure.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LoopRecord {
@@ -408,7 +422,7 @@ pub struct LoopRecord {
     pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,
     pub state: serde_json::Value,
-    /// 接收开关；暂停时带原因（`/stop` 或历史装载）。
+    /// Receive switch; carries a reason when paused (`/stop` or history load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiving: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -420,7 +434,8 @@ pub struct LoopRecord {
     pub plan_version: Option<u64>,
     #[serde(default)]
     pub plan_approval_pending: bool,
-    /// 与 `plan_version` 同时写出的进度步骤（原始 JSON）；链上之后的进度工具调用覆盖它。
+    /// Progress steps (raw JSON) written together with `plan_version`; later progress tool calls on
+    /// the chain override them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<serde_json::Value>,
     /// Unix milliseconds when the runtime moved the Loop into `state`, kept as raw JSON so an
@@ -440,7 +455,7 @@ impl LoopRecord {
     }
 }
 
-/// 照 Claude Code `compactMetadata`。
+/// Follows Claude Code's `compactMetadata`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactMetadata {
@@ -466,7 +481,8 @@ pub enum CompactTriggerEntry {
     Auto,
 }
 
-/// 照 Claude Code `preservedSegment`：保留的消息不重写，加载时据此重接父指针。
+/// Follows Claude Code's `preservedSegment`: kept messages are not rewritten, and on load their
+/// parent pointers are reattached from this.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreservedSegmentEntry {
@@ -484,7 +500,7 @@ pub struct SummarizeMetadataEntry {
     pub direction: PartialCompactDirection,
 }
 
-/// 照 Claude Code `PartialCompactDirection`。
+/// Follows Claude Code's `PartialCompactDirection`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialCompactDirection {
@@ -544,9 +560,10 @@ pub struct ForkedFrom {
     pub message_uuid: Option<Uuid>,
 }
 
-/// 照 Claude Code `file-history-snapshot`：`message_id` 是关联的链上消息，更新条目
-/// （`is_snapshot_update`）以发起编辑的消息为键，替换 `snapshot.messageId` 对应的快照。
-/// 快照本体按原始 JSON 保存，本模块不解析其结构。
+/// Follows Claude Code's `file-history-snapshot`: `message_id` is the associated message on the
+/// chain; an update entry (`is_snapshot_update`) is keyed by the message that started the edit and
+/// replaces the snapshot for `snapshot.messageId`. The snapshot body is stored as raw JSON; this
+/// module does not parse its structure.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileHistorySnapshotEntry {
@@ -562,8 +579,8 @@ pub struct ContentReplacementEntry {
     pub replacements: Vec<ContentReplacementRecord>,
 }
 
-/// Claude Code `ContentReplacementRecord`：`replacement` 是模型看到的原文，恢复时直接套用，
-/// 不按当前代码重新生成。
+/// Claude Code's `ContentReplacementRecord`: `replacement` is the original text the model saw; on
+/// resume it is applied as is rather than regenerated by the current code.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ContentReplacementRecord {

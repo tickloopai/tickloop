@@ -608,7 +608,7 @@ fn plan_state(snapshot: &ChatSnapshot) -> Vec<LoopPlanState> {
     state
 }
 
-/// `<root>/plans` 中以该 Loop 结尾的计划文件路径。
+/// Path of the plan file in `<root>/plans` ending with this Loop.
 fn plan_file_paths(root: &Path, loop_id: LoopId) -> Vec<PathBuf> {
     let suffix = format!("-loop-{}.md", loop_id.uuid());
     let mut paths = std::fs::read_dir(root.join("plans"))
@@ -624,7 +624,7 @@ fn plan_file_paths(root: &Path, loop_id: LoopId) -> Vec<PathBuf> {
     paths
 }
 
-/// 计划文件去掉首行版本注释后的正文。
+/// The plan file's body without the first-line version comment.
 fn plan_body(text: &str) -> String {
     let (header, body) = text
         .split_once('\n')
@@ -636,7 +636,7 @@ fn plan_body(text: &str) -> String {
     body.to_owned()
 }
 
-/// `<root>/plans` 中以该 Loop 结尾的计划文件正文。
+/// Body of the plan file in `<root>/plans` ending with this Loop.
 fn plan_files(root: &Path, loop_id: LoopId) -> Vec<String> {
     let mut contents = plan_file_paths(root, loop_id)
         .into_iter()
@@ -789,7 +789,8 @@ async fn rewinding_keeps_the_current_plan_version_and_restart_agrees() {
         .unwrap();
     run_turn(&agent, chat, "Continue it").await;
     let before = agent.snapshot(chat).await.unwrap();
-    // 计划文件不随 rewind 恢复（照 Claude Code），版本保持单调，批准不会复用旧版本号。
+    // Plan files are not restored by rewind (following Claude Code); versions stay monotonic, so
+    // approvals never reuse an old version number.
     assert_eq!(plan_of(&before, goal), (2, "Second plan.".into()));
     agent.shutdown().await;
     drop(agent);
@@ -807,8 +808,8 @@ async fn rewinding_keeps_the_current_plan_version_and_restart_agrees() {
     restarted.shutdown().await;
 }
 
-/// 在 `root` 中打开 Agent，新建 Chat 并按顺序运行各轮（每轮沿用第一轮的 Loop），关闭后返回
-/// Chat 与 Loop。
+/// Opens an Agent in `root`, creates a Chat and runs the turns in order (each turn reusing the
+/// first turn's Loop), then closes it and returns the Chat and Loop.
 async fn run_and_shut_down(
     root: &Path,
     workdir: &Path,
@@ -1028,7 +1029,8 @@ async fn plan_files_are_replaced_whole_and_a_failed_write_keeps_the_previous_ver
     std::fs::hard_link(&path, &first_file).unwrap();
 
     run_turn(&agent, chat, "Revise it").await;
-    // 新内容写入新文件后替换，旧文件的其他链接看到的仍是完整的旧内容。
+    // New content is written to a new file and then swapped in; other links to the old file still
+    // see the complete old content.
     assert_eq!(
         plan_body(&std::fs::read_to_string(&first_file).unwrap()),
         "First plan."
@@ -1115,7 +1117,7 @@ async fn tampered_plan_slugs_cannot_reach_outside_the_plans_directory() {
             ),
         )
         .unwrap();
-        // 按篡改后的 slug 直接拼接路径时会读到的计划文件。
+        // The plan file that would be read if the path were joined directly from the tampered slug.
         let decoy = root
             .join("plans")
             .join(format!("{tampered}-loop-{}.md", goal.uuid()));

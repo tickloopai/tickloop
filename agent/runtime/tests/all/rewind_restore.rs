@@ -453,7 +453,7 @@ async fn conversation_rewind_truncates_messages_and_binds_the_draft_to_a_new_loo
     );
     let draft = result.draft.unwrap();
     assert_eq!(draft.prompt, "second prompt");
-    // rewind 只截断对话，Chat 的 Loop 保留。
+    // Rewind only truncates the conversation; the Chat's Loop is kept.
     assert_eq!(result.snapshot.chat_loop.id, second.loop_id);
     assert_eq!(result.snapshot.chat_loop.state, LoopState::Idle);
 
@@ -637,7 +637,8 @@ async fn rewind_across_a_compaction_boundary_drops_the_boundary_and_restores_raw
         !message_text(&after_compaction.snapshot.conversation_messages().unwrap())
             .contains("first answer")
     );
-    // 照 Claude Code：截断越过边界时边界随之丢弃，模型重新看到边界之前的原始对话。
+    // Following Claude Code: when truncation crosses a boundary, the boundary is dropped with it,
+    // and the model sees the original conversation before the boundary again.
     let before_compaction = agent
         .rewind(chat, points[0].message_id, RewindMode::Conversation)
         .await

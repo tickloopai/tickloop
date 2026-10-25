@@ -2532,8 +2532,9 @@ async fn permission_comments_cannot_create_session_or_persistent_authority() {
     }
 }
 
-/// 会话授权只在本 Chat 的 Loop 内生效、重启后消失；照 Claude Code"不再询问"，持久授权写入用户
-/// 设置中当前工作目录的分区，对重启后的新 Chat 同样生效。
+/// Session grants apply only within this Chat's Loop and disappear after a restart; following
+/// Claude Code's "don't ask again", persistent grants are written to the current working
+/// directory's partition in user settings and also apply to new Chats after a restart.
 #[tokio::test]
 async fn persistent_grants_cover_the_project_after_restart_but_session_grants_stay_with_their_chat()
 {

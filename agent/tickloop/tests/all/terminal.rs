@@ -3742,7 +3742,8 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
     );
 }
 
-/// `cleanupPeriodDays` 为 0 时不保存 Chat：`-c` 说明原因，帮助文本介绍这个设置。
+/// When `cleanupPeriodDays` is 0 the Chat is not saved: `-c` explains why, and the help text
+/// describes the setting.
 #[test]
 fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     let directory = tempfile::tempdir().unwrap();

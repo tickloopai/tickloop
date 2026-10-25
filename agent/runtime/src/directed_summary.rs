@@ -1,10 +1,13 @@
-//! 定向摘要，照 Claude Code `partialCompactConversation`（选择器中的 Summarize from here／
-//! up to here）。
+//! Directed summary, following Claude Code's `partialCompactConversation` (Summarize from here / up
+//! to here in the selector).
 //!
-//! 摘要成功后对话替换为压缩边界、摘要消息和保留的消息：向前保留时为边界、选点之前的消息、
-//! 摘要；向后保留时为边界、摘要、选点及之后的消息。保留的消息换上新的 id，按内存顺序直线重写
-//! 在新边界之后（边界不带保留区段，见 `CompactionLayout::apply`）。被拒绝、失败或取消的摘要
-//! 不改变对话，也不写入 Transcript。
+//! After a successful summary, the conversation is replaced by a compaction boundary, the summary
+//! message and the preserved messages: when preserving earlier messages, the boundary, the messages
+//! before the selected point, then the summary; when preserving later messages, the boundary, the
+//! summary, then the selected point and the messages after it. Preserved messages get new ids and
+//! are rewritten in a straight line in memory order after the new boundary (the boundary carries no
+//! preserved segment, see `CompactionLayout::apply`). Rejected, failed or cancelled summaries leave
+//! the conversation unchanged and write nothing to the Transcript.
 
 use std::sync::Arc;
 
@@ -287,8 +290,10 @@ impl Agent {
     }
 }
 
-/// 照 Claude Code `partialCompactConversation` 划分摘要范围与保留的消息。选点必须在最后一个
-/// 压缩边界之后；向后保留时，保留消息中的旧边界和旧摘要被去掉（新摘要已覆盖它们）。
+/// Following Claude Code's `partialCompactConversation`, splits the summary range from the
+/// preserved messages. The selected point must be after the last compaction boundary; when
+/// preserving later messages, old boundaries and old summaries are removed from the preserved
+/// messages (the new summary already covers them).
 fn prepare_plan(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,

@@ -33,7 +33,7 @@ use tickloop_agent_tools::{
 mod prompts;
 pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reminder};
 
-/// 计划文件的目录与文件名 `<slug>-loop-<loopId>.md` 的组成部分。
+/// Components of the plan file's directory and file name `<slug>-loop-<loopId>.md`.
 const PLANS_DIRECTORY: &str = "plans";
 pub(crate) const PLAN_LOOP_SEPARATOR: &str = "-loop-";
 const PLAN_FILE_EXTENSION: &str = ".md";
@@ -47,10 +47,12 @@ const MAX_PLAN_FILE_BYTES: usize = MAX_PLAN_BYTES + MAX_PLAN_HEADER_BYTES;
 const MAX_PLAN_SLUG_BYTES: usize = 64;
 const MAX_TODOS: usize = 100;
 const MAX_TODO_TEXT_BYTES: usize = 4096;
-/// 照 Claude Code `MAX_SLUG_RETRIES`：生成的 slug 已被计划文件占用时重新生成。
+/// Following Claude Code's `MAX_SLUG_RETRIES`: regenerate when the generated slug is already taken
+/// by a plan file.
 const MAX_SLUG_RETRIES: usize = 10;
 
-/// 照 Claude Code `generateWordSlug` 的"形容词-动词-名词"格式，词表取自其词表的前一部分。
+/// Following the "adjective-verb-noun" format of Claude Code's `generateWordSlug`, with words taken
+/// from the first part of its word lists.
 const SLUG_ADJECTIVES: [&str; 32] = [
     "abundant",
     "ancient",
@@ -193,16 +195,19 @@ impl TodoWriteInput {
     }
 }
 
-/// 计划文件中的计划内容，以及宿主提交计划时写出的版本行。
+/// Plan content in the plan file, along with the version line the host wrote when the plan was
+/// submitted.
 struct PlanFile {
-    /// 版本行记录的版本；从未提交过的草稿没有版本行。
+    /// Version recorded by the version line; a never-submitted draft has no version line.
     version: Option<u64>,
-    /// 版本行的摘要与内容相符，即内容正是以 `version` 提交的计划，之后没有再被编辑。
+    /// The version line's digest matches the content, i.e. the content is exactly the plan
+    /// submitted as `version` and has not been edited since.
     is_submitted: bool,
     markdown: String,
 }
 
-/// 链上 Loop 条目携带的计划版本与进度。`position` 是条目之前的消息数。
+/// Plan version and progress carried by a Loop entry on the chain. `position` is the number of
+/// messages before the entry.
 pub(super) struct PlanCheckpoint {
     pub position: usize,
     pub plan_version: Option<u64>,
@@ -221,7 +226,8 @@ pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
             description: prompts::enter_plan_mode_description(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         });
-        // 照 Claude Code 的 `.passthrough()`：不声明 additionalProperties，其他字段被接受并忽略。
+        // Following Claude Code's `.passthrough()`: additionalProperties is not declared, so other
+        // fields are accepted and ignored.
         definitions.push(ToolDefinition {
             name: EXIT_PLAN_MODE_TOOL_NAME.into(),
             description: prompts::exit_plan_mode_description(),
@@ -242,7 +248,8 @@ pub(super) fn plans_directory(root: &Path) -> PathBuf {
     root.join(PLANS_DIRECTORY)
 }
 
-/// slug 由小写字母单词以连字符连接。链上的 slug 可能被篡改，拼接路径前必须通过校验。
+/// A slug is lowercase-letter words joined by hyphens. Slugs on the chain may be tampered with and
+/// must pass validation before being joined into a path.
 pub(super) fn is_valid_plan_slug(slug: &str) -> bool {
     slug.len() <= MAX_PLAN_SLUG_BYTES
         && slug
@@ -295,13 +302,15 @@ pub(super) fn current_plan_file(
     plan_file_path(directory, bookkeeping.plan_slug.as_deref()?, loop_id).ok()
 }
 
-/// 计划目录必须是当前用户拥有、没有 group/other 权限位的真实目录，与系统临时目录中的私有目录
-/// 校验一致；否则拒绝读写其中的计划文件。
+/// The plan directory must be a real directory owned by the current user with no group/other
+/// permission bits, matching the validation of private directories in the system temp directory;
+/// otherwise reading and writing plan files in it is refused.
 fn verify_plans_directory(directory: &Path) -> io::Result<()> {
     verify_private_directory(directory, PLANS_DIRECTORY_DESCRIPTION)
 }
 
-/// 照 Claude Code `getPlanSlug`：随机生成 slug，已有计划文件使用该 slug 时重试，最多 10 次。
+/// Following Claude Code's `getPlanSlug`: generates a random slug, retrying up to 10 times when an
+/// existing plan file uses that slug.
 pub(super) fn generate_plan_slug(directory: Option<&Path>) -> String {
     let random_slug = || {
         let random = tickloop_ids::random_u128();
@@ -344,8 +353,10 @@ fn plan_digest(markdown: &str) -> String {
         .collect()
 }
 
-/// 把版本行与内容写入同目录的临时文件并同步到磁盘，再改名替换计划文件：任何时刻计划文件
-/// 要么是完整的旧版本，要么是完整的新版本。失败时删除临时文件。返回写出的完整文本。
+/// Writes the version line and content to a temp file in the same directory and syncs it to disk,
+/// then renames it over the plan file: at any moment the plan file is either the complete old
+/// version or the complete new version. Deletes the temp file on failure. Returns the full text
+/// written.
 pub(super) fn write_plan_file(
     directory: &Path,
     slug: &str,
@@ -364,11 +375,13 @@ pub(super) fn write_plan_file(
     Ok(contents)
 }
 
-/// 读取计划文件：不跟随符号链接，只接受普通文件，超过大小上限视为读取失败。
+/// Reads the plan file: does not follow symlinks, accepts only regular files, and treats exceeding
+/// the size limit as a read failure.
 fn read_plan_file(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<PlanFile> {
     let path = plan_file_path(directory, slug, loop_id)?;
     verify_plans_directory(directory)?;
-    // O_NONBLOCK 避免打开被放在该路径上的 FIFO 时阻塞；对普通文件没有影响。
+    // O_NONBLOCK avoids blocking when opening a FIFO placed at this path; it has no effect on
+    // regular files.
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -417,9 +430,10 @@ fn read_plan_file(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<P
     Ok(plan_file)
 }
 
-/// 照 Claude Code `copyPlanForFork`：`--fork-session` 与 Branch 使用新的 slug，把计划内容写入新文件，
-/// 之后双方各自修改互不影响。复制失败的计划不进入新 Chat，只保留其版本号，之后的计划从更大的
-/// 版本继续。
+/// Following Claude Code's `copyPlanForFork`: `--fork-session` and Branch use a new slug and write
+/// the plan content to a new file, after which each side edits it independently. A plan that failed
+/// to copy does not enter the new Chat; only its version number is kept, and later plans continue
+/// from a larger version.
 pub(super) fn copy_plans_to_new_slug(
     snapshot: &mut ChatSnapshot,
     bookkeeping: &mut ChatBookkeeping,
@@ -444,7 +458,7 @@ pub(super) fn copy_plans_to_new_slug(
     bookkeeping.plan_slug = Some(slug);
 }
 
-/// Loop 已使用过的最高计划版本，包括内容不可用的计划。
+/// Highest plan version the Loop has used, including plans whose content is unavailable.
 pub(super) fn highest_plan_version(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
@@ -458,14 +472,19 @@ pub(super) fn highest_plan_version(
     current.max(bookkeeping.unavailable_plan_versions.get(&loop_id).copied())
 }
 
-/// 沿对话链重建 Loop 的计划版本与进度：Loop 条目携带的检查点与之后成功的计划、进度工具调用
-/// 按链上顺序生效。版本取检查点与调用结果中较大的值；进度取最后一次生效的内容。返回恢复时发现的
-/// 问题，供加载警告显示。
+/// Rebuilds the Loop's plan version and progress along the conversation chain: checkpoints carried
+/// by Loop entries and subsequent successful plan and progress tool calls take effect in chain
+/// order. The version is the larger of the checkpoint and the call results; progress is the last
+/// effective content. Returns problems found during resume, for load warnings.
 ///
-/// 计划内容从计划文件读取，并与链上记录核对：文件版本行记录的版本等于重建的版本、且摘要与内容
-/// 相符，才沿用该版本；否则文件在链上记录之外发生过变化，计划以大于文件与链上版本的新版本恢复，
-/// 按旧版本号的批准都不会命中。链上没有记录但文件带有宿主写出的版本行时同样按新版本恢复；
-/// 从未提交过的草稿不是计划。文件缺失或不可读时保留已知的最高版本，之后的计划从更大的版本继续。
+/// Plan content is read from the plan file and checked against the chain record: the version is
+/// kept only when the version recorded by the file's version line equals the rebuilt version and
+/// the digest matches the content; otherwise the file changed outside the chain record, and the
+/// plan is restored with a new version greater than both the file and chain versions, so approvals
+/// keyed by old version numbers cannot match. When the chain has no record but the file has a
+/// host-written version line, it is likewise restored with a new version; a never-submitted draft
+/// is not a plan. When the file is missing or unreadable, the highest known version is kept and
+/// later plans continue from a larger version.
 pub(super) fn rebuild_plans_and_progress(
     snapshot: &mut ChatSnapshot,
     bookkeeping: &mut ChatBookkeeping,
@@ -476,7 +495,8 @@ pub(super) fn rebuild_plans_and_progress(
         Version(u64),
         Progress(Vec<TodoItem>),
     }
-    // 排序键：位置为 p 的检查点在第 p 条消息之前（2p），结果位于第 r 条消息的调用紧随其后（2r+1）。
+    // Sort key: a checkpoint at position p comes before message p (2p); a result follows right
+    // after its call in message r (2r+1).
     let loop_id = snapshot.chat_loop.id;
     let mut changes = Vec::new();
     for checkpoint in checkpoints {
@@ -527,7 +547,8 @@ pub(super) fn rebuild_plans_and_progress(
         .iter()
         .rev()
         .find_map(|checkpoint| checkpoint.plan_version.map(|_| checkpoint.approval_pending));
-    // 与 `--fork-session` 相同，换用新的 slug；旧 slug 无法安全定位计划文件，已记录版本的计划按缺失处理。
+    // Same as `--fork-session`, switch to a new slug; the old slug cannot safely locate the plan
+    // file, so plans with recorded versions are treated as missing.
     let mut location = directory.zip(bookkeeping.plan_slug.clone());
     if let Some(slug) = bookkeeping
         .plan_slug

@@ -75,7 +75,8 @@ async fn recovery_process_fixture() {
             Content::ToolUse {
                 id: "shell-unknown".into(),
                 name: "Bash".into(),
-                // 先等待一次 Transcript 冲刷，再产生副作用并强制结束进程。
+                // Wait for one Transcript flush first, then cause the side effect and force the
+                // process to end.
                 input: serde_json::json!({"command":format!("sleep 0.5; printf 'one effect\\n' >> side_effect.txt; kill -KILL {}",std::process::id())}),
             },
         ]]))
@@ -182,8 +183,8 @@ fn run_fixture(directory: &Path, mode: &str) -> Fixture {
     serde_json::from_slice(&std::fs::read(directory.join("fixture.json")).unwrap()).unwrap()
 }
 
-/// 照 Claude Code，排队输入不随 Chat 保存：恢复后运行中的一轮转为已中断，之前排队的输入不会
-/// 进入之后的请求。
+/// Following Claude Code, queued input is not saved with the Chat: after resume, the running turn
+/// becomes interrupted and the previously queued input does not enter later requests.
 #[tokio::test]
 async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
     let directory = tempfile::tempdir().unwrap();
@@ -241,8 +242,9 @@ async fn reopening_interrupts_the_loop_and_forgets_its_queued_inputs() {
     agent.shutdown().await;
 }
 
-/// 照 Claude Code，操作记录不随 Chat 保存：崩溃时执行中的工具在恢复后只剩对话中的调用，
-/// 补上结果未知的错误结果；继续目标不需要确认，也不会重放命令。
+/// Following Claude Code, operation records are not saved with the Chat: a tool executing at crash
+/// time leaves only its call in the conversation after resume, which gets an outcome-unknown error
+/// result; continuing the goal needs no confirmation and does not replay the command.
 #[tokio::test]
 async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowledgement() {
     let directory = tempfile::tempdir().unwrap();
@@ -297,7 +299,8 @@ async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowl
                 && *error
                 && content.contains("unknown"))
     );
-    // 照 Claude Code：恢复时末尾是工具结果，先追加"从中断处继续"，再追加不请求回复的哨兵。
+    // Following Claude Code: when the conversation ends with a tool result on resume, append
+    // "continue from where it left off" first, then the no-reply sentinel.
     assert!(requests[0].messages.iter().flat_map(|message| &message.content).any(
         |content| matches!(content, Content::Text { text } if text == "Continue from where you left off.")
     ));
@@ -307,7 +310,8 @@ async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowl
     agent.shutdown().await;
 }
 
-/// 等待权限时退出：恢复后没有挂起的权限请求，未批准的调用补错误结果，继续目标不会执行它。
+/// Exiting while waiting for permission: after resume there is no pending permission request, the
+/// unapproved call gets an error result, and continuing the goal does not execute it.
 #[tokio::test]
 async fn an_operation_waiting_for_permission_at_exit_is_never_executed_after_resume() {
     let directory = tempfile::tempdir().unwrap();

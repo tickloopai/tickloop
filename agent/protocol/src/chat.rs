@@ -54,7 +54,8 @@ pub struct ChatSnapshot {
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
     pub monitor: MonitorMembership,
-    /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
+    /// The in-process request usage ledger (not persisted; following Claude Code, usage is recorded
+    /// only on assistant messages).
     #[serde(skip)]
     pub request_usage: RequestUsageLedger,
     pub id: ChatId,
@@ -72,7 +73,8 @@ pub struct ChatSnapshot {
     pub generated_title: Option<String>,
     /// The Chat's Folder; `None` for a Chat without one, which reaches no local files.
     pub folder: Option<PathBuf>,
-    /// Chat 当前使用的模型，只在本进程内有效；恢复时使用宿主当前选择的模型。
+    /// The model the Chat currently uses, valid only within this process; on resume the host's
+    /// currently selected model is used.
     #[serde(skip, default = "ModelConfig::unselected")]
     pub model: ModelConfig,
     #[serde(skip)]
@@ -118,10 +120,11 @@ pub struct ChatSnapshot {
     /// told, as in an older Transcript or after compaction dropped the notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced_host_tools: Option<BTreeSet<String>>,
-    /// 压缩边界与压缩摘要消息（链上字段）。
+    /// Compact boundaries and compact summary messages (chain field).
     #[serde(default)]
     pub message_compactions: BTreeMap<usize, CompactionMarker>,
-    /// assistant 消息的用量（链上字段）。定向摘要保留的消息在恢复时照 Claude Code 清零。
+    /// Usage of assistant messages (chain field). Following Claude Code, messages kept by a
+    /// directional summary have it zeroed on resume.
     #[serde(default)]
     pub message_usage: BTreeMap<usize, Usage>,
     #[serde(default)]
@@ -133,7 +136,8 @@ pub struct ChatSnapshot {
     pub goal: Option<crate::GoalSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goal_history: Vec<crate::GoalHistoryEntry>,
-    /// The Chat's one Loop, there from the Chat's creation. 链上字段：由对话链上的 Loop 条目重放得到。
+    /// The Chat's one Loop, there from the Chat's creation. Chain field: rebuilt by replaying the
+    /// Loop entries on the conversation chain.
     pub chat_loop: LoopSnapshot,
     /// The fields through `pending_model` are process-local state and are not persisted with the
     /// Chat. Recovery starts them from defaults; persistent rules and context limits come from
@@ -164,19 +168,22 @@ pub struct ChatSnapshot {
     pub context_window_tokens: Option<usize>,
     #[serde(skip)]
     pub pending_model: Option<ModelConfig>,
-    /// 各 Loop 的计划与进度。计划内容写在 `<root>/plans/<slug>-loop-<loopId>.md`，版本与进度
-    /// 恢复时由对话链重建；批准时选择的模式只在本进程内有效。
+    /// Plan and progress of each Loop. Plan content is written to
+    /// `<root>/plans/<slug>-loop-<loopId>.md`; the version and progress are rebuilt from the
+    /// conversation chain on resume, and the mode chosen at approval is valid only within this
+    /// process.
     #[serde(default)]
     pub plans: Vec<Plan>,
     #[serde(default)]
     pub progress: Vec<Progress>,
-    /// 本进程内的 Agent 命令状态，不随 Chat 保存，重启后不可见。
+    /// In-process Agent command state; not saved with the Chat and not visible after a restart.
     #[serde(skip)]
     pub commands: Vec<CommandSnapshot>,
-    /// 本进程内的 `!` 命令状态，不随 Chat 保存，重启后不可见。
+    /// In-process `!` command state; not saved with the Chat and not visible after a restart.
     #[serde(skip)]
     pub user_shells: Vec<UserShellRecord>,
-    /// 本进程内最后一次模型回复所在的 run，只用于显示流式回复；不随 Chat 保存。
+    /// The run of the most recent model reply in this process, used only to display streaming
+    /// replies; not saved with the Chat.
     #[serde(skip)]
     pub last_model_run: Option<RunId>,
 }
@@ -230,7 +237,7 @@ impl ChatSnapshot {
         )
     }
 
-    /// 本进程内结果未知的操作，作为宿主状态告知模型。
+    /// In-process operations with an unknown outcome, reported to the model as host state.
     pub fn current_operation_uncertainties(&self) -> Vec<serde_json::Value> {
         self.operations
             .iter()
@@ -549,7 +556,7 @@ pub struct UserShellRecord {
     pub output_bytes: u64,
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
-    /// 提交时的对话消息数，只用于 Task Center 排序。
+    /// The number of conversation messages at submission, used only for Task Center ordering.
     pub submitted_at_message: usize,
     /// Unix milliseconds when the Shell entered its current state; output growth does not move it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -681,7 +688,7 @@ impl AgentHostOptions {
     }
 }
 
-/// 一个 Transcript 在项目目录中的摘要，供 Chat 选择器使用。
+/// Summary of a Transcript in the project directory, for the Chat picker.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SavedChat {
     pub id: ChatId,

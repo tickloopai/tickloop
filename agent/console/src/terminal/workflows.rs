@@ -730,7 +730,8 @@ fn user_command_status(command: &UserShellRecord) -> String {
     status
 }
 
-/// 当前 Run 已流出但尚未写入对话的文字，只由运行期事件推出，不随 Chat 保存。
+/// Text the current Run has streamed but not yet written into the conversation, derived only
+/// from runtime events and not saved with the Chat.
 pub(super) fn pending_reply(snapshot: &ChatSnapshot) -> String {
     let visible_events = snapshot.events.iter().collect::<Vec<_>>();
     let Some(streaming_run) = visible_events

@@ -62,7 +62,8 @@ fn workspace() -> Workspace {
     }
 }
 
-/// 第一条提示让模型执行 `edits`，第二条提示只回复文字，使第一条提示的快照可以恢复。
+/// The first prompt has the model perform `edits`, and the second prompt only replies with text, so
+/// the first prompt's snapshot can be restored.
 async fn chat_after_edits(
     workspace: &Workspace,
     edits: Vec<Vec<tickloop_agent_protocol::Content>>,

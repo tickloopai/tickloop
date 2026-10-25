@@ -374,7 +374,8 @@ fn rule(tool: &str, persistent: bool) -> PermissionRule {
     }
 }
 
-/// 运行一轮对话；遇到权限请求时按 `scope` 批准。返回这一轮是否请求过权限。
+/// Runs one conversation turn, approving permission requests with `scope`. Returns whether this
+/// turn requested permission.
 async fn run_turn(agent: &Agent, chat: ChatId, prompt: &str, scope: PermissionScope) -> bool {
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, prompt.into()).await.unwrap();
@@ -668,7 +669,8 @@ async fn a_saved_shell_prefix_rule_applies_in_current_and_future_sessions() {
     restarted.shutdown().await;
 }
 
-/// 启动参数指定的模型优先于设置文件：Agent 使用调用方给出的配置创建新 Chat。
+/// A model given by launch arguments takes precedence over the settings file: the Agent creates new
+/// Chats with the configuration the caller provides.
 #[tokio::test]
 async fn an_explicit_host_model_takes_precedence_over_the_saved_selection() {
     let directory = tempfile::tempdir().unwrap();
@@ -708,8 +710,9 @@ async fn an_explicit_host_model_takes_precedence_over_the_saved_selection() {
     );
 }
 
-/// 照 Claude Code `updateSettingsForSource`：写入时读取现有文件并合并，保留其他键；
-/// 用临时文件加重命名原子替换；文件不是合法 JSON 时报错且不覆盖。
+/// Following Claude Code's `updateSettingsForSource`: a write reads the existing file and merges
+/// into it, keeping other keys; it replaces the file atomically via a temp file and rename; when
+/// the file is not valid JSON it reports an error and does not overwrite.
 #[tokio::test]
 async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invalid_json() {
     let directory = tempfile::tempdir().unwrap();
@@ -778,7 +781,7 @@ async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invali
     let leftovers = std::fs::read_dir(&root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        // `settings.json.lock` 是跨进程写入锁，保留在原处。
+        // `settings.json.lock` is the cross-process write lock and stays in place.
         .filter(|name| {
             name.starts_with("settings") && name != "settings.json" && name != "settings.json.lock"
         })
@@ -816,8 +819,10 @@ async fn rules_of(agent: &Agent, chat: ChatId) -> Vec<PermissionRule> {
     agent.snapshot(chat).await.unwrap().policy.rules
 }
 
-/// 持久规则属于添加时的项目分区：`/cwd` 换目录后旧目录的规则不再生效、新目录的规则载入，
-/// 会话规则保留；在新目录中的删除不影响旧目录，回到旧目录后删除写回旧目录的分区。
+/// Persistent rules belong to the project partition they were added in: after `/cwd` changes
+/// directory, the old directory's rules stop applying and the new directory's rules load, while
+/// session rules are kept; a deletion in the new directory does not affect the old one, and after
+/// returning to the old directory a deletion is written back to its partition.
 #[tokio::test]
 async fn persistent_rules_follow_the_working_directory_partition() {
     let directory = tempfile::tempdir().unwrap();
@@ -891,7 +896,8 @@ async fn persistent_rules_follow_the_working_directory_partition() {
     agent.shutdown().await;
 }
 
-/// 持久规则按完整内容比较：同 id 由 Allow 改为 Deny 视为删旧加新，重启后仍为 Deny。
+/// Persistent rules are compared by full content: changing the same id from Allow to Deny counts as
+/// deleting the old and adding the new, and it is still Deny after a restart.
 #[tokio::test]
 async fn changing_a_persistent_rule_in_place_is_saved() {
     let directory = tempfile::tempdir().unwrap();
@@ -936,7 +942,8 @@ async fn changing_a_persistent_rule_in_place_is_saved() {
     second.shutdown().await;
 }
 
-/// 本进程已加载的同项目 Chat 立即得到持久规则的增删改；其他项目的 Chat 不受影响。
+/// Same-project Chats loaded by this process immediately get persistent rule additions, deletions
+/// and changes; Chats in other projects are unaffected.
 #[tokio::test]
 async fn persistent_rule_changes_reach_other_loaded_chats_of_the_project() {
     let directory = tempfile::tempdir().unwrap();
@@ -1020,8 +1027,9 @@ async fn persistent_rule_changes_reach_other_loaded_chats_of_the_project() {
     agent.shutdown().await;
 }
 
-/// 两个实例交错增删各自的持久规则：读-改-写在 `settings.json.lock` 的独占锁内完成，
-/// 已删除的规则不会被另一个实例基于旧内容的写入复活，也不会丢失对方的新增。
+/// Two instances interleave adding and deleting their own persistent rules: read-modify-write
+/// happens under the exclusive lock on `settings.json.lock`, so deleted rules are not revived by
+/// the other instance writing from stale content, and the other side's additions are not lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_instances_never_resurrect_or_lose_persistent_rules() {
     const ROUNDS: usize = 40;
@@ -1072,8 +1080,9 @@ async fn concurrent_instances_never_resurrect_or_lose_persistent_rules() {
     assert!(model.requests.lock().unwrap().is_empty());
 }
 
-/// 设置文件无效时不静默丢弃：新建与恢复 Chat 都能读到警告，写入报错且文件保持原样；
-/// 单条无效规则被跳过并报告；嵌套键类型错误时写入报错，不覆盖其他内容。
+/// An invalid settings file is not silently discarded: both new and resumed Chats see the warning,
+/// and writes report an error and leave the file unchanged; a single invalid rule is skipped and
+/// reported; a nested key with the wrong type makes writes fail without overwriting other content.
 #[tokio::test]
 async fn invalid_settings_are_reported_and_never_overwritten() {
     let directory = tempfile::tempdir().unwrap();
@@ -1160,8 +1169,9 @@ async fn invalid_settings_are_reported_and_never_overwritten() {
     reopened.shutdown().await;
 }
 
-/// 照 Claude Code `writeFileSyncAndFlush_DEPRECATED`：设置文件是符号链接时写入链接目标，
-/// 临时文件在目标目录中创建，链接本身保留。
+/// Following Claude Code's `writeFileSyncAndFlush_DEPRECATED`: when the settings file is a symlink,
+/// writes go to the link target, the temp file is created in the target directory, and the link
+/// itself is kept.
 #[tokio::test]
 async fn settings_writes_follow_a_symlinked_settings_file() {
     let directory = tempfile::tempdir().unwrap();

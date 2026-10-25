@@ -184,7 +184,8 @@ impl Agent {
         self.compact_with_instructions(chat_id, None).await
     }
 
-    /// 照 Claude Code `/compact [instructions]`：补充说明只用于这次摘要请求，不写入压缩边界。
+    /// Following Claude Code's `/compact [instructions]`: the extra instructions are used only for
+    /// this summary request and are not written to the compaction boundary.
     pub async fn compact_with_instructions(
         &self,
         chat_id: ChatId,
@@ -312,9 +313,11 @@ impl Agent {
         Ok(())
     }
 
-    /// 照 Claude Code `compactConversation`：摘要成功后在对话末尾追加压缩边界与摘要消息。
-    /// 边界之前的消息仍留在本进程内存中（rewind 可以越过边界），模型只看到边界之后的内容；
-    /// 失败、被拒绝或取消的摘要不改变对话，也不写入 Transcript。
+    /// Following Claude Code's `compactConversation`: after a successful summary, appends a
+    /// compaction boundary and the summary message to the end of the conversation. Messages before
+    /// the boundary stay in this process's memory (rewind can cross the boundary), and the model
+    /// sees only content after the boundary; failed, rejected or cancelled summaries leave the
+    /// conversation unchanged and write nothing to the Transcript.
     async fn compact_history(
         &self,
         chat_id: ChatId,

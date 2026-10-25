@@ -114,7 +114,8 @@ pub(crate) fn text_only() -> Vec<InputModality> {
 }
 
 impl ModelConfig {
-    /// 从 Transcript 重建或反序列化快照时的占位模型；恢复流程随后换成宿主当前选择的模型。
+    /// Placeholder model when rebuilding from the Transcript or deserializing a snapshot; the
+    /// resume flow then swaps in the host's currently selected model.
     pub fn unselected() -> Self {
         Self {
             provider: ModelProvider::Api,
@@ -242,8 +243,9 @@ impl ImageSource {
     }
 }
 
-/// 照 Anthropic tool_result 的 `content`（Codex `FunctionCallOutputBody`）：纯字符串或内容块数组。
-/// 字符串形式与旧 Transcript 的写法相同，两种形式都能直接反序列化。
+/// Follows the `content` of Anthropic's tool_result (Codex `FunctionCallOutputBody`): a plain
+/// string or an array of content blocks. The string form matches how older Transcripts were
+/// written, and both forms deserialize directly.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
@@ -279,7 +281,8 @@ impl From<Image> for ToolResultBlock {
 }
 
 impl ToolResultContent {
-    /// 按文字使用工具结果的地方（界面、预算、摘要）读取的文本：数组形式只取文字块，以换行连接。
+    /// The text read by places that use tool results as text (UI, budgets, summaries): the array
+    /// form takes only text blocks, joined with newlines.
     pub fn text(&self) -> Cow<'_, str> {
         match self {
             Self::Text(text) => Cow::Borrowed(text),

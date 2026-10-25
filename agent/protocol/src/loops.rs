@@ -356,13 +356,14 @@ impl TriggerSource {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LoopTriggerNoticeKind {
-    /// 另一个 Tickloop 进程持有该 Chat 的 Trigger 租约，本进程等待接手。
+    /// Another Tickloop process holds this Chat's Trigger lease; this process waits to take over.
     HeldByAnotherProcess,
-    /// 租约或接收状态无法读写，或锁由另一台主机持有；需要用户处理。
+    /// The lease or receive state cannot be read or written, or the lock is held by another host;
+    /// the user needs to handle it.
     Warning,
 }
 
-/// 宿主状态中需要让用户看到的 Trigger 租约情况。
+/// The Trigger lease situation in host state that the user needs to see.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LoopTriggerNotice {
     pub chat_id: ChatId,

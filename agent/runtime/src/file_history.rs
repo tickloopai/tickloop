@@ -1,15 +1,22 @@
-//! 文件回滚备份（file-history），照 Claude Code `utils/fileHistory.ts` 实现。
+//! File rollback backups (file-history), implemented following Claude Code's
+//! `utils/fileHistory.ts`.
 //!
-//! Agent 编辑文件之前为未跟踪的文件建首版备份；每条用户提示为全部跟踪中的文件建快照
-//! （未变化复用上一版，变化则版本加一，已删除记为空），最多保留 100 个。rewind 取目标
-//! 消息最后一个快照恢复文件。备份放在 `<root>/file-history/<chatId>/`，文件名为路径的
-//! SHA-256 前 16 位十六进制加版本号。与 Claude Code 一样不加文件锁，也不协调多个进程
-//! 同时修改同一文件。
+//! Before the Agent edits a file, an initial backup is made for files not yet tracked; each user
+//! prompt takes a snapshot of every tracked file (unchanged files reuse the previous version,
+//! changed files bump the version, deleted files are recorded as empty), keeping at most 100.
+//! Rewind restores files from the last snapshot of the target message. Backups live in
+//! `<root>/file-history/<chatId>/`, named by the first 16 hex digits of the path's SHA-256 plus the
+//! version number. Like Claude Code, there is no file locking and no coordination of multiple
+//! processes modifying the same file at once.
 //!
-//! 与 Claude Code 不同，读写被跟踪的文件时不跟随符号链接：从根目录逐段以 `O_NOFOLLOW` 打开父目录，
-//! 在该目录内读取、`unlinkat` 删除，或写临时文件后 `renameat` 替换。文件或其父目录被替换为符号链接、
-//! 或不再是普通文件时，快照不备份它，rewind 把它记为失败并跳过，不读入也不改动工作区外的文件。
-//! 跟踪键是文件工具解析后的 canonical 路径，逐段检查不会误拒工作目录本身所在的路径。
+//! Unlike Claude Code, reading and writing tracked files does not follow symlinks: parent
+//! directories are opened segment by segment from the root with `O_NOFOLLOW`, and the file is read,
+//! removed with `unlinkat`, or replaced by writing a temporary file and `renameat` within that
+//! directory. When a file or its parent directory has been replaced by a symlink, or is no longer a
+//! regular file, the snapshot does not back it up and rewind records it as a failure and skips it,
+//! neither reading nor modifying files outside the workspace. Tracking keys are the canonical paths
+//! resolved by the file tools, so the per-segment check does not wrongly reject the path containing
+//! the working directory itself.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -30,19 +37,22 @@ use tickloop_agent_base::private_fs::{
 };
 use tickloop_agent_base::timestamp::now_timestamp;
 
-/// 状态根目录（或不持久化时的项目临时目录）下存放各 Chat 备份的目录。
+/// Directory under the state root (or the project temp directory when not persisting) holding each
+/// Chat's backups.
 pub(crate) const FILE_HISTORY_DIRECTORY: &str = "file-history";
-/// 照 Claude Code `MAX_SNAPSHOTS`。
+/// Following Claude Code's `MAX_SNAPSHOTS`.
 pub(crate) const MAX_SNAPSHOTS: usize = 100;
 const BACKUP_NAME_HASH_HEX_LENGTH: usize = 16;
 const FIRST_VERSION: u32 = 1;
-/// 恢复时补建的工作区目录照 `create_dir_all` 以 0777 创建，实际权限由 umask 决定。
+/// Workspace directories recreated during restore are created as 0777 like `create_dir_all`; the
+/// actual permissions are determined by the umask.
 const WORKSPACE_DIRECTORY_MODE: u32 = 0o777;
 const STAGED_FILE_PREFIX: &str = ".tickloop-file-history-";
 const PERMISSION_BITS: u32 = 0o7777;
 const COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 
-/// 某个文件在一个快照中的版本；`backup_file_name` 为空表示该版本中文件不存在。
+/// A file's version in one snapshot; an empty `backup_file_name` means the file does not exist in
+/// that version.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileHistoryBackup {
@@ -51,8 +61,9 @@ pub(crate) struct FileHistoryBackup {
     pub backup_time: String,
 }
 
-/// 一条用户提示对应的快照。路径是绝对路径（与 Claude Code 缩短为相对工作目录的路径不同，
-/// Tickloop 的工作目录可以用 `/cwd` 改变，绝对路径才能稳定地找回文件）。
+/// The snapshot for one user prompt. Paths are absolute (unlike Claude Code, which shortens them
+/// relative to the working directory: Tickloop's working directory can change via `/cwd`, so only
+/// absolute paths reliably find the file again).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileHistorySnapshot {
@@ -61,7 +72,8 @@ pub(crate) struct FileHistorySnapshot {
     pub timestamp: String,
 }
 
-/// 按目标快照恢复文件的结果。单个文件失败时照 Claude Code 跳过该文件继续处理其他文件。
+/// Result of restoring files to a target snapshot. When a single file fails, it is skipped and the
+/// others are still processed, following Claude Code.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FileRestoreReport {
     pub changed_files: Vec<PathBuf>,
@@ -74,13 +86,14 @@ pub(crate) enum FileHistoryError {
     SnapshotNotFound,
 }
 
-/// 一个 Chat 的文件回滚状态。
+/// File rollback state of one Chat.
 #[derive(Clone, Debug)]
 pub(crate) struct FileHistory {
     directory: PrivateDirectory,
     snapshots: Vec<FileHistorySnapshot>,
     tracked_files: BTreeSet<String>,
-    /// 已随提示追加、备份尚未算出的快照，按提示顺序排列。
+    /// Snapshots already appended with their prompts whose backups are not yet computed, in prompt
+    /// order.
     pending_snapshots: Vec<PendingSnapshot>,
 }
 
@@ -90,7 +103,8 @@ struct PendingSnapshot {
     tracked_files: Vec<String>,
 }
 
-/// 在 Chat 锁外为一个待定快照计算备份所需的输入，由 [`FileHistory::next_snapshot_plan`] 给出。
+/// Input for computing a pending snapshot's backups outside the Chat lock, given by
+/// [`FileHistory::next_snapshot_plan`].
 #[derive(Debug)]
 pub(crate) struct SnapshotPlan {
     message_id: Uuid,
@@ -101,13 +115,14 @@ pub(crate) struct SnapshotPlan {
 #[derive(Debug)]
 struct PlannedFile {
     key: String,
-    /// 上一个快照中的版本，用来判断文件是否变化。
+    /// Version in the previous snapshot, used to tell whether the file changed.
     previous: Option<FileHistoryBackup>,
-    /// 生成计划时待定快照中的版本；提交时不一致说明期间已被编辑跟踪改写，保留改写后的版本。
+    /// Version in the pending snapshot when the plan was made; a mismatch at commit means edit
+    /// tracking rewrote it in the meantime, and the rewritten version is kept.
     expected: Option<FileHistoryBackup>,
 }
 
-/// [`SnapshotPlan::compute`] 的结果，交给 [`FileHistory::commit_snapshot`] 提交。
+/// Result of [`SnapshotPlan::compute`], committed via [`FileHistory::commit_snapshot`].
 #[derive(Debug)]
 pub(crate) struct ComputedSnapshot {
     message_id: Uuid,
@@ -153,7 +168,8 @@ impl FileHistory {
         Self::restore(directory, Vec::new())
     }
 
-    /// 照 Claude Code `fileHistoryRestoreStateFromLog`：从对话链上的快照重建跟踪集合。
+    /// Following Claude Code's `fileHistoryRestoreStateFromLog`: rebuilds the tracked set from the
+    /// snapshots on the conversation chain.
     pub(crate) fn restore(
         directory: PrivateDirectory,
         snapshots: Vec<FileHistorySnapshot>,
@@ -191,7 +207,8 @@ impl FileHistory {
             .any(|snapshot| snapshot.message_id == message_id)
     }
 
-    /// 只保留属于 `message_ids` 的快照，用于 Branch 只带走分出点之前的对话。
+    /// Keeps only the snapshots belonging to `message_ids`, so a Branch carries only the
+    /// conversation before the branch point.
     pub(crate) fn retain_messages(&mut self, message_ids: &HashSet<Uuid>) {
         self.snapshots
             .retain(|snapshot| message_ids.contains(&snapshot.message_id));
@@ -204,8 +221,10 @@ impl FileHistory {
             .collect();
     }
 
-    /// 定向摘要把保留的提示重写成新条目后，快照随提示换用新 id。返回换了 id 且已算出备份的
-    /// 快照，调用方以新 id 重新写入 Transcript；待定快照提交时再以新 id 写入。
+    /// After a directed summary rewrites the kept prompts as new entries, the snapshots follow the
+    /// prompts to their new ids. Returns the snapshots whose id changed and whose backups are
+    /// already computed, which the caller rewrites to the Transcript under the new id; pending
+    /// snapshots are written under the new id when committed.
     pub(crate) fn rename_messages(
         &mut self,
         renamed: &HashMap<Uuid, Uuid>,
@@ -229,8 +248,9 @@ impl FileHistory {
             .collect()
     }
 
-    /// 编辑前是否需要为文件建首版备份。照 Claude Code：还没有任何快照时不跟踪；
-    /// 最近一个快照已跟踪该文件时由下一次快照检查变化，不改写首版备份。
+    /// Whether an initial backup is needed before editing the file. Following Claude Code: nothing
+    /// is tracked while there are no snapshots yet; when the latest snapshot already tracks the
+    /// file, the next snapshot checks for changes and the initial backup is not rewritten.
     pub(crate) fn needs_backup(&self, path: &Path) -> bool {
         let Some(key) = tracking_key(path) else {
             return false;
@@ -240,9 +260,10 @@ impl FileHistory {
             .is_some_and(|latest| !latest.tracked_file_backups.contains_key(key))
     }
 
-    /// 照 Claude Code `fileHistoryTrackEdit` 的提交阶段：把首版备份补记到最近一个快照。
-    /// 返回更新后的快照，调用方以 `isSnapshotUpdate` 写入 Transcript；期间已被其他
-    /// 编辑跟踪时返回 `None`。
+    /// Following the commit phase of Claude Code's `fileHistoryTrackEdit`: records the initial
+    /// backup into the latest snapshot. Returns the updated snapshot, which the caller writes to
+    /// the Transcript as `isSnapshotUpdate`; returns `None` when another edit started tracking the
+    /// file in the meantime.
     pub(crate) fn commit_tracked_edit(
         &mut self,
         path: &Path,
@@ -258,7 +279,8 @@ impl FileHistory {
         Some(latest.clone())
     }
 
-    /// 同步完成 `fileHistoryTrackEdit`：需要时建首版备份并补记到最近快照。
+    /// Completes `fileHistoryTrackEdit` synchronously: makes the initial backup when needed and
+    /// records it into the latest snapshot.
     #[cfg(test)]
     pub(crate) fn track_edit(&mut self, path: &Path) -> io::Result<Option<FileHistorySnapshot>> {
         if !self.needs_backup(path) {
@@ -268,9 +290,11 @@ impl FileHistory {
         Ok(self.commit_tracked_edit(path, backup))
     }
 
-    /// 照 Claude Code `fileHistoryMakeSnapshot` 的开头：随提示在对话中的位置立即追加快照，
-    /// 先沿用上一个快照中的版本，由 [`Self::next_snapshot_plan`]、[`SnapshotPlan::compute`]
-    /// 与 [`Self::commit_snapshot`] 在锁外算出备份后替换。超过 `MAX_SNAPSHOTS` 时移除最早的快照。
+    /// Following the start of Claude Code's `fileHistoryMakeSnapshot`: appends the snapshot
+    /// immediately at the prompt's position in the conversation, initially reusing the versions
+    /// from the previous snapshot, and replaces them once [`Self::next_snapshot_plan`],
+    /// [`SnapshotPlan::compute`] and [`Self::commit_snapshot`] have computed the backups outside
+    /// the lock. Removes the oldest snapshot beyond `MAX_SNAPSHOTS`.
     pub(crate) fn begin_snapshot(&mut self, message_id: Uuid) {
         let latest = self.snapshots.last();
         let tracked_files = latest
@@ -311,7 +335,8 @@ impl FileHistory {
         }
     }
 
-    /// 最早的待定快照的计算计划；快照必须按提示顺序逐个提交，后一个才能以前一个为基准。
+    /// Computation plan for the oldest pending snapshot; snapshots must be committed one by one in
+    /// prompt order so that each can use the previous one as its baseline.
     pub(crate) fn next_snapshot_plan(&self) -> Option<SnapshotPlan> {
         let pending = self.pending_snapshots.first()?;
         let index = self
@@ -339,8 +364,10 @@ impl FileHistory {
         })
     }
 
-    /// 提交锁外算出的快照。单个文件备份失败时该文件沿用上一个快照中的版本（上一个快照也没有时
-    /// 不记入）；计划生成后被编辑跟踪改写的条目保持不变。快照已被淘汰或不再待定时返回 `None`。
+    /// Commits a snapshot computed outside the lock. When backing up a single file fails, that file
+    /// keeps its version from the previous snapshot (and is not recorded if the previous snapshot
+    /// lacks it too); entries rewritten by edit tracking after the plan was made stay unchanged.
+    /// Returns `None` when the snapshot has been evicted or is no longer pending.
     pub(crate) fn commit_snapshot(
         &mut self,
         computed: ComputedSnapshot,
@@ -367,7 +394,7 @@ impl FileHistory {
         Some(snapshot.clone())
     }
 
-    /// 同步完成一次 `fileHistoryMakeSnapshot`。
+    /// Completes one `fileHistoryMakeSnapshot` synchronously.
     #[cfg(test)]
     pub(crate) fn make_snapshot(&mut self, message_id: Uuid) -> FileHistorySnapshot {
         self.begin_snapshot(message_id);
@@ -377,8 +404,9 @@ impl FileHistory {
         self.snapshots.last().cloned().unwrap()
     }
 
-    /// 照 Claude Code `applySnapshot`：目标为空时删除文件；快照中没有的文件用首版备份；
-    /// 内容不同才复制回去。找不到目标消息的快照时报错，不改动任何文件。
+    /// Following Claude Code's `applySnapshot`: deletes the file when the target is empty; uses the
+    /// initial backup for files absent from the snapshot; copies back only when the content
+    /// differs. Errors without touching any file when no snapshot of the target message is found.
     pub(crate) fn rewind(&self, message_id: Uuid) -> Result<FileRestoreReport, FileHistoryError> {
         let target = self.target_snapshot(message_id)?;
         let mut report = FileRestoreReport::default();
@@ -399,9 +427,10 @@ impl FileHistory {
         Ok(report)
     }
 
-    /// 照 Claude Code `fileHistoryHasAnyChanges`／`fileHistoryGetDiffStats`：
-    /// 恢复到目标消息时会改变的文件，不改动磁盘。没有该消息的快照时返回 `None`。
-    /// 无法安全比较的文件（例如已被替换为符号链接）也列出，rewind 时会报告失败。
+    /// Following Claude Code's `fileHistoryHasAnyChanges`/`fileHistoryGetDiffStats`: the files that
+    /// restoring to the target message would change, without touching disk. Returns `None` when the
+    /// message has no snapshot. Files that cannot be compared safely (for example, replaced by a
+    /// symlink) are also listed; rewind will report them as failures.
     pub(crate) fn files_changed_by_rewind(&self, message_id: Uuid) -> Option<Vec<PathBuf>> {
         let target = self.target_snapshot(message_id).ok()?;
         Some(
@@ -430,8 +459,9 @@ impl FileHistory {
         )
     }
 
-    /// 同一组快照换到另一个备份目录，不复制备份文件；与 [`Self::copy_backups_to`] 配合，
-    /// 让 Branch 在 Chat 锁内建立状态、在锁外复制备份。
+    /// The same snapshots moved to another backup directory without copying backup files; together
+    /// with [`Self::copy_backups_to`], lets a Branch build its state inside the Chat lock and copy
+    /// backups outside it.
     pub(crate) fn relocated(&self, directory: PrivateDirectory) -> Self {
         Self {
             directory,
@@ -441,8 +471,9 @@ impl FileHistory {
         }
     }
 
-    /// 照 Claude Code `copyFileHistoryForResume`：把备份硬链接到 `directory`，失败时改为复制。
-    /// 返回备份全部复制成功、应当写入新 Transcript 的快照。
+    /// Following Claude Code's `copyFileHistoryForResume`: hard-links the backups into `directory`,
+    /// falling back to copying. Returns the snapshots whose backups were all copied successfully
+    /// and should be written to the new Transcript.
     pub(crate) fn copy_backups_to(&self, directory: &PrivateDirectory) -> Vec<FileHistorySnapshot> {
         let Ok(target) = open_backup_directory(directory, true) else {
             return Vec::new();
@@ -465,7 +496,8 @@ impl FileHistory {
             .collect()
     }
 
-    /// [`Self::relocated`] 与 [`Self::copy_backups_to`] 一起完成，用于已在 Chat 锁外、以新 chatId 恢复的 Chat（`--fork-session`）。
+    /// [`Self::relocated`] and [`Self::copy_backups_to`] in one step, for a Chat already outside
+    /// the Chat lock and resumed under a new chatId (`--fork-session`).
     pub(crate) fn copy_to(&self, directory: PrivateDirectory) -> (Self, Vec<FileHistorySnapshot>) {
         let recorded = self.copy_backups_to(&directory);
         (self.relocated(directory), recorded)
@@ -479,8 +511,8 @@ impl FileHistory {
             .ok_or(FileHistoryError::SnapshotNotFound)
     }
 
-    /// 目标快照中的备份名；快照未跟踪该文件时照 Claude Code 退回首版备份。
-    /// 外层 `None` 表示找不到可用的备份。
+    /// Backup name in the target snapshot; when the snapshot does not track the file, falls back to
+    /// the initial backup following Claude Code. An outer `None` means no usable backup was found.
     fn target_backup_name(
         &self,
         target: &FileHistorySnapshot,
@@ -498,7 +530,7 @@ impl FileHistory {
         })
     }
 
-    /// 返回 `true` 表示文件被改动。
+    /// Returns `true` when the file was changed.
     fn apply_backup(&self, path: &Path, backup_file_name: Option<&str>) -> io::Result<bool> {
         #[cfg(test)]
         test_pause::wait_if_paused(path);
@@ -515,7 +547,8 @@ impl FileHistory {
         backup.file.rewind()?;
         let (parent, file_name) = split_path(path)?;
         let parent_directory = open_directory(parent, Some(WORKSPACE_DIRECTORY_MODE))?;
-        // 比较之后文件可能被替换；再确认一次，符号链接或非普通文件不写。
+        // The file may have been replaced after the comparison; check again and do not write
+        // symlinks or non-regular files.
         ensure_regular_or_missing(&parent_directory, &file_name)?;
         publish_copy(
             &parent_directory,
@@ -528,8 +561,9 @@ impl FileHistory {
 }
 
 impl SnapshotPlan {
-    /// 照 Claude Code `fileHistoryMakeSnapshot` 的逐文件处理：未变化复用上一版，变化则版本加一，
-    /// 已删除记为空。读写文件，应在 `spawn_blocking` 中调用。
+    /// Following the per-file handling of Claude Code's `fileHistoryMakeSnapshot`: unchanged files
+    /// reuse the previous version, changed files bump the version, deleted files are recorded as
+    /// empty. Reads and writes files, so it should be called in `spawn_blocking`.
     pub(crate) fn compute(self) -> ComputedSnapshot {
         let files = self
             .files
@@ -557,7 +591,7 @@ impl SnapshotPlan {
     }
 }
 
-/// 只跟踪 UTF-8 路径：快照以 JSON 对象的键保存路径。
+/// Only UTF-8 paths are tracked: snapshots store paths as JSON object keys.
 fn tracking_key(path: &Path) -> Option<&str> {
     path.to_str()
 }
@@ -567,7 +601,8 @@ fn backup_file_name(path: &str, version: u32) -> String {
     format!("{}@v{version}", &digest[..BACKUP_NAME_HASH_HEX_LENGTH])
 }
 
-/// 照 Claude Code `fileHistoryTrackEdit` 的备份阶段：为编辑前的文件建首版备份。
+/// Following the backup phase of Claude Code's `fileHistoryTrackEdit`: makes the initial backup of
+/// the file before it is edited.
 pub(crate) fn create_first_backup(
     directory: &PrivateDirectory,
     path: &Path,
@@ -575,8 +610,10 @@ pub(crate) fn create_first_backup(
     create_backup(directory, path, FIRST_VERSION)
 }
 
-/// 照 Claude Code `createBackup`：源文件不存在时记为空；否则复制到备份目录并保留权限位。
-/// 源文件或其父目录是符号链接、或源文件不是普通文件时返回说明原因的错误，不建备份。
+/// Following Claude Code's `createBackup`: records empty when the source file does not exist;
+/// otherwise copies it into the backup directory, preserving permission bits. Returns an error
+/// explaining why, without making a backup, when the source file or its parent directory is a
+/// symlink or the source file is not a regular file.
 fn create_backup(
     directory: &PrivateDirectory,
     path: &Path,
@@ -660,9 +697,11 @@ enum EntryKind {
     Other,
 }
 
-/// 打开备份目录：从根目录逐段以 `O_NOFOLLOW` 打开，确认每一层都是真实目录，`create` 时以 0700
-/// 补建缺失的层级；之后按 [`PrivateDirectory`] 校验（系统临时目录下逐层校验属主与权限位）。
-/// `create` 为假且目录不存在时返回 `NotFound`。
+/// Opens the backup directory: opens it segment by segment from the root with `O_NOFOLLOW`,
+/// confirming each level is a real directory, and with `create` recreates missing levels as 0700;
+/// then validates it as a [`PrivateDirectory`] (under the system temp directory, ownership and
+/// permission bits are checked at each level). Returns `NotFound` when `create` is false and the
+/// directory does not exist.
 fn open_backup_directory(directory: &PrivateDirectory, create: bool) -> io::Result<File> {
     let opened = open_directory(directory.path(), create.then_some(PRIVATE_DIRECTORY_MODE))?;
     directory.create()?;
@@ -678,7 +717,8 @@ fn open_backup_file(directory: &PrivateDirectory, name: &str) -> io::Result<Opti
     open_regular_file_at(&backup_directory, &c_string(name.as_bytes())?)
 }
 
-/// 不跟随符号链接地打开被跟踪的文件；文件或父目录不存在时返回 `None`。
+/// Opens a tracked file without following symlinks; returns `None` when the file or its parent
+/// directory does not exist.
 fn open_tracked_file(path: &Path) -> io::Result<Option<OpenedFile>> {
     let (parent, name) = split_path(path)?;
     match open_directory(parent, None) {
@@ -688,7 +728,8 @@ fn open_tracked_file(path: &Path) -> io::Result<Option<OpenedFile>> {
     }
 }
 
-/// 目标版本为空时 rewind 是否可能删除文件；无法安全判断时按存在处理，由 rewind 报告失败。
+/// Whether rewind might delete the file when the target version is empty; when this cannot be
+/// determined safely, the file is treated as existing and rewind reports the failure.
 fn tracked_entry_may_exist(path: &Path) -> bool {
     let Ok((parent, name)) = split_path(path) else {
         return true;
@@ -699,7 +740,8 @@ fn tracked_entry_may_exist(path: &Path) -> bool {
     }
 }
 
-/// 照 Claude Code 删除目标版本为空的文件；只删除普通文件，父目录不存在时视为已删除。
+/// Deletes a file whose target version is empty, following Claude Code; only regular files are
+/// deleted, and a missing parent directory counts as already deleted.
 fn remove_tracked_file(path: &Path) -> io::Result<bool> {
     let (parent, name) = split_path(path)?;
     let directory = match open_directory(parent, None) {
@@ -711,7 +753,8 @@ fn remove_tracked_file(path: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     ensure_regular_or_missing(&directory, &name)?;
-    // SAFETY: 目录描述符有效，名称是以 NUL 结尾的单个路径段。
+    // SAFETY: The directory descriptor is valid and the name is a single NUL-terminated path
+    // segment.
     if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
         let error = io::Error::last_os_error();
         return match error.kind() {
@@ -737,8 +780,9 @@ fn c_string(bytes: &[u8]) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 }
 
-/// 从根目录逐段以 `O_NOFOLLOW` 打开目录。`create_mode` 给出时以该模式补建缺失的层级
-/// （受 umask 约束），否则缺失时返回 `NotFound`。任何一层是符号链接或不是目录时报错。
+/// Opens a directory segment by segment from the root with `O_NOFOLLOW`. With `create_mode`,
+/// missing levels are created with that mode (subject to the umask); otherwise a missing level
+/// returns `NotFound`. Errors when any level is a symlink or not a directory.
 fn open_directory(path: &Path, create_mode: Option<u32>) -> io::Result<File> {
     open_without_following_links(path, OpenTarget::Directory { create_mode }).map_err(|error| {
         match error.raw_os_error() {
@@ -752,7 +796,8 @@ fn open_directory(path: &Path, create_mode: Option<u32>) -> io::Result<File> {
 
 fn entry_kind_at(directory: &File, name: &CStr) -> io::Result<Option<EntryKind>> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: 目录描述符有效，名称以 NUL 结尾，`status` 足够容纳 `stat` 结构。
+    // SAFETY: The directory descriptor is valid, the name is NUL-terminated, and `status` is large
+    // enough to hold a `stat` struct.
     let result = unsafe {
         libc::fstatat(
             directory.as_raw_fd(),
@@ -768,7 +813,7 @@ fn entry_kind_at(directory: &File, name: &CStr) -> io::Result<Option<EntryKind>>
             _ => Err(error),
         };
     }
-    // SAFETY: fstatat 成功时已写满 `status`。
+    // SAFETY: fstatat has fully written `status` on success.
     let file_type = unsafe { status.assume_init() }.st_mode & libc::S_IFMT;
     Ok(Some(match file_type {
         libc::S_IFREG => EntryKind::Regular,
@@ -793,7 +838,8 @@ fn not_regular_error() -> io::Error {
     io::Error::other("the file is not a regular file")
 }
 
-/// 不跟随符号链接地打开目录中的普通文件；不存在时返回 `None`。
+/// Opens a regular file in the directory without following symlinks; returns `None` when it does
+/// not exist.
 fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<OpenedFile>> {
     match entry_kind_at(directory, name)? {
         None => return Ok(None),
@@ -802,7 +848,8 @@ fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<Open
         Some(EntryKind::Other) => return Err(not_regular_error()),
     }
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    // SAFETY: 目录描述符有效，名称是以 NUL 结尾的单个路径段；成功时返回的描述符归 `File` 所有。
+    // SAFETY: The directory descriptor is valid and the name is a single NUL-terminated path
+    // segment; on success the returned descriptor is owned by the `File`.
     let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
     if descriptor < 0 {
         let error = io::Error::last_os_error();
@@ -812,7 +859,8 @@ fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<Open
             _ => Err(error),
         };
     }
-    // SAFETY: openat 成功返回的描述符未被其他对象持有，所有权交给 `File`。
+    // SAFETY: The descriptor returned by a successful openat is held by nothing else; ownership
+    // passes to the `File`.
     let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -821,12 +869,14 @@ fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<Open
     Ok(Some(OpenedFile { file, metadata }))
 }
 
-/// 在目录内写临时文件、设置权限位后 `renameat` 替换 `name`；失败时删除临时文件。
-/// 替换的是目录项本身，即使 `name` 此时是符号链接也不会写到链接指向的位置。
+/// Writes a temporary file in the directory, sets its permission bits, then replaces `name` with
+/// `renameat`; the temporary file is removed on failure. The directory entry itself is replaced, so
+/// even if `name` is a symlink at that moment, nothing is written to the link's target.
 fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> io::Result<()> {
     let staged = c_string(format!("{STAGED_FILE_PREFIX}{}", tickloop_ids::generate()).as_bytes())?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: 目录描述符有效，名称以 NUL 结尾；成功时返回的描述符归 `File` 所有。
+    // SAFETY: The directory descriptor is valid and the name is NUL-terminated; on success the
+    // returned descriptor is owned by the `File`.
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -838,11 +888,12 @@ fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> 
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openat 成功返回的描述符未被其他对象持有，所有权交给 `File`。
+    // SAFETY: The descriptor returned by a successful openat is held by nothing else; ownership
+    // passes to the `File`.
     let mut staged_file = unsafe { File::from_raw_fd(descriptor) };
     let published = (|| {
         io::copy(source, &mut staged_file)?;
-        // SAFETY: 描述符有效。
+        // SAFETY: The descriptor is valid.
         if unsafe {
             libc::fchmod(
                 staged_file.as_raw_fd(),
@@ -852,7 +903,7 @@ fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> 
         {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: 两个名称都在同一个有效的目录描述符下，且以 NUL 结尾。
+        // SAFETY: Both names are under the same valid directory descriptor and are NUL-terminated.
         if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
@@ -867,7 +918,7 @@ fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> 
         Ok(())
     })();
     if published.is_err() {
-        // SAFETY: 目录描述符有效，名称以 NUL 结尾。
+        // SAFETY: The directory descriptor is valid and the name is NUL-terminated.
         unsafe { libc::unlinkat(directory.as_raw_fd(), staged.as_ptr(), 0) };
     }
     published
@@ -877,7 +928,8 @@ fn link_or_copy(source: &File, target: &File, name: &str) -> bool {
     let Ok(name) = c_string(name.as_bytes()) else {
         return false;
     };
-    // SAFETY: 两个目录描述符有效，名称以 NUL 结尾；flags 为 0 时不跟随符号链接。
+    // SAFETY: Both directory descriptors are valid and the names are NUL-terminated; with flags 0,
+    // symlinks are not followed.
     let linked = unsafe {
         libc::linkat(
             source.as_raw_fd(),
@@ -902,8 +954,10 @@ fn link_or_copy(source: &File, target: &File, name: &str) -> bool {
     }
 }
 
-/// 照 Claude Code `checkOriginFileChanged`：一方存在一方缺失算变化；权限或大小不同算变化；
-/// 原文件修改时间早于备份时不再比较内容；否则比较内容。
+/// Following Claude Code's `checkOriginFileChanged`: one side existing and the other missing counts
+/// as changed; differing permissions or size count as changed; when the original file's
+/// modification time is earlier than the backup's, the content is not compared; otherwise the
+/// content is compared.
 fn origin_changed(original: Option<&mut OpenedFile>, backup: Option<&mut OpenedFile>) -> bool {
     let (original, backup) = match (original, backup) {
         (None, None) => return false,
@@ -936,7 +990,7 @@ fn same_content(left: &mut File, right: &mut File) -> io::Result<bool> {
     }
 }
 
-/// 读满缓冲区或读到文件末尾。
+/// Reads until the buffer is full or the end of the file is reached.
 fn read_chunk(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
@@ -954,7 +1008,8 @@ fn modified_nanos(metadata: &Metadata) -> i128 {
     i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec())
 }
 
-/// 测试接缝：让读写指定路径的 file-history 操作在阻塞线程中停住，直到测试放行。
+/// Test seam: makes file-history operations reading or writing a given path stop in the blocking
+/// thread until the test releases them.
 #[cfg(test)]
 pub(crate) mod test_pause {
     use std::collections::HashMap;
@@ -962,14 +1017,15 @@ pub(crate) mod test_pause {
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
 
-    /// 测试没有放行时自动放行的期限，出错的测试不会一直挂起。
+    /// Deadline after which the pause releases itself if the test has not, so a failing test does
+    /// not hang forever.
     const PAUSE_LIMIT: Duration = Duration::from_secs(5);
 
     type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
     static GATES: Mutex<Option<HashMap<PathBuf, Gate>>> = Mutex::new(None);
 
-    /// 一次性暂停；丢弃时放行。
+    /// A one-shot pause; released when dropped.
     pub(crate) struct Pause {
         pub(crate) entered: mpsc::Receiver<()>,
         _release: mpsc::Sender<()>,
@@ -1014,7 +1070,8 @@ mod tests {
         ))
     }
 
-    /// 逐段 `O_NOFOLLOW` 打开要求 canonical 路径（macOS 的临时目录位于符号链接 `/var` 之下）。
+    /// Per-segment `O_NOFOLLOW` opening requires canonical paths (the macOS temp directory sits
+    /// under the symlink `/var`).
     fn canonical_temp_directory() -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();

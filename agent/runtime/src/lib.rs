@@ -339,22 +339,25 @@ impl Agent {
 }
 
 struct Inner {
-    /// 本进程当前选择的模型；新建与恢复的 Chat 使用它，`set_model` 随选择更新。
+    /// The model currently selected in this process; new and resumed Chats use it, and `set_model`
+    /// updates it with the selection.
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
     /// Builds the client of each model a Chat selects.
     models: Arc<dyn tickloop_agent_model::ModelClients>,
-    /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
+    /// User settings file; `None` for Agents that do not write settings (tests and the like).
     settings: Option<tickloop_agent_config::UserSettings>,
     search: SearchDefaults,
     host_options: AgentHostOptions,
     waits: WaitHosting,
-    /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
+    /// Config root containing the settings file; user Skills and Skills of installed Tick packages
+    /// are loaded from here.
     config_root: Option<PathBuf>,
-    /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
-    /// 持有它时完成，保证已加载的 Chat 与设置文件一致。总在 `chats` 锁之前获取。
+    /// Orders settings reads and writes within this process: writing settings and syncing loaded
+    /// Chats, as well as reading settings and adding a new Chat, happen while holding it, keeping
+    /// loaded Chats consistent with the settings file. Always acquired before the `chats` lock.
     settings_writes: Mutex<()>,
     task_tools_enabled: AtomicBool,
-    /// 最近一次为各 Chat 读取用户设置时发现的问题。
+    /// Problems found the last time user settings were read for each Chat.
     settings_warnings: std::sync::Mutex<HashMap<ChatId, Vec<String>>>,
     provider_failures:
         std::sync::Mutex<HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>>,
@@ -380,7 +383,7 @@ struct Inner {
     /// Every task this instance spawns; `shutdown` waits for all of them.
     tasks: agent_tasks::AgentTasks,
     recorder: Option<persistence::ChatRecorder>,
-    /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
+    /// Trigger leases held by this process; returned when Inner is released.
     chat_leases: loop_lease::ChatLeases,
     /// The Trigger sources' own states, taken over from the store with each newly taken lease.
     trigger_source_states: std::sync::RwLock<Vec<Arc<dyn wakeup::TriggerSourceState>>>,
@@ -445,14 +448,18 @@ struct ChatBookkeeping {
     dependency_baseline: Option<BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
-    /// 规则集中每条持久规则所属的项目分区（规范化的工作目录），删除或修改时写回该分区。
+    /// Project partition (normalized working directory) owning each persistent rule in the rule
+    /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
-    /// 照 Claude Code：Chat 的计划文件名前缀，第一次设置计划时生成，记录在之后的每个链上条目中。
+    /// Following Claude Code: the Chat's plan file name prefix, generated when a plan is first set
+    /// and recorded in every later chain entry.
     plan_slug: Option<String>,
-    /// 计划内容不可用（恢复时计划文件缺失或不可读、`--fork-session`／Branch 复制失败）的 Loop 已使用过的
-    /// 最高计划版本；该 Loop 之后的计划从更大的版本继续，版本号不会被复用。
+    /// Highest plan version already used by a Loop whose plan content is unavailable (plan file
+    /// missing or unreadable on resume, `--fork-session`/Branch copy failed); that Loop's later
+    /// plans continue from a larger version, so version numbers are never reused.
     unavailable_plan_versions: BTreeMap<LoopId, u64>,
-    /// 本 Chat 中各 run 所属的 Loop，写入链上条目的 `loopId`；恢复时由条目重建。
+    /// The Loop owning each run in this Chat, written as `loopId` on chain entries; rebuilt from
+    /// the entries on resume.
     run_loops: BTreeMap<RunId, LoopId>,
     /// Shells whose completion notification waits among the deferred messages.
     deferred_notifications: Vec<tick_protocol::InstanceRef>,
@@ -490,13 +497,15 @@ struct Chat {
     client: Arc<dyn ModelClient>,
     pending_client: Option<Arc<dyn ModelClient>>,
     pending_model_thinking: Option<PendingModelThinking>,
-    /// Chat 的工具；其 Chat 目录持久化时为 Transcript 同级的 `<chatId>/`，不持久化时位于
-    /// 系统临时目录的项目目录下，外存的工具结果与文件改动 review 写在这里。
+    /// The Chat's tools; its Chat directory is `<chatId>/` next to the Transcript when persisted,
+    /// or under the project directory in the system temp directory when not, and externalized tool
+    /// results and file change reviews are written there.
     tools: Arc<tickloop_agent_tools::Tools>,
     /// Shared with the tool registry of each model request, whose Skill calls expand against the
     /// listing that request sent even when the Chat's Skills are read again meanwhile.
     skills: Arc<tickloop_agent_config::skills::SkillRegistry>,
-    /// 照 Claude Code，替换决定只在运行期保存，恢复时由 Transcript 中的内容替换条目重建。
+    /// Following Claude Code, replacement decisions are kept only at runtime and rebuilt from
+    /// content replacement entries in the Transcript on resume.
     content_replacements: tool_results::ContentReplacementState,
     /// `None` for a Chat without a Folder, which edits no local file.
     file_history: Option<FileHistory>,
@@ -510,9 +519,11 @@ struct Chat {
     /// What the user's `/loop` of each turn schedules, as the host read it: the one task the
     /// Agent may create for the user in that turn.
     user_loops: HashMap<RunId, tickloop_agent_config::loop_skill::LoopSchedule>,
-    /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
+    /// Local messages waiting to be written to the conversation; held while the Chat is executing,
+    /// waiting or running a foreground `!` command, and written when idle or at a tool boundary.
     deferred_messages: Vec<Message>,
-    /// 由用户中断或停止而取消的 Run；只有这些 Run 保留部分回复并写中断标记。
+    /// Runs cancelled by a user interrupt or stop; only these Runs keep partial replies and write
+    /// an interrupt marker.
     user_cancelled_runs: HashSet<RunId>,
     /// Loaded when the Chat opens in this process and unaffected by later settings changes.
     output_style: OutputStyle,
@@ -670,9 +681,10 @@ pub(crate) fn chat_is_busy() -> AgentError {
 
 #[derive(Clone, Copy)]
 enum MessageBoundary {
-    /// Chat 没有执行中或等待中的 Run，也没有整理上下文。
+    /// The Chat has no executing or waiting Run and is not reorganizing its context.
     Idle,
-    /// 当前 Run 刚写完一轮工具结果，下一次模型请求尚未开始。
+    /// The current Run just finished writing a round of tool results, and the next model request
+    /// has not started.
     ToolResults,
 }
 
@@ -828,7 +840,8 @@ impl Chat {
         approval_context::originals_for_active_chain(&self.snapshot, &self.bookkeeping)
             .is_ok_and(|inputs| inputs.iter().any(|input| input.run_id == run))
     }
-    /// 前台 `!` 命令运行或停止中时，Chat 不接受压缩，也不写入其他本地消息。
+    /// While a foreground `!` command is running or stopping, the Chat accepts no compaction and
+    /// writes no other local messages.
     fn has_foreground_user_shell(&self) -> bool {
         self.snapshot.user_shells.iter().any(|record| {
             matches!(
@@ -944,8 +957,8 @@ fn require_folder(snapshot: &ChatSnapshot) -> Result<&Path, AgentError> {
         .ok_or_else(|| AgentError::Invalid(FOLDERLESS_CHAT.into()))
 }
 
-/// 新 Chat 的初始快照。
-/// 权限请求仍可回答：请求存在、其 Run 未取消且 Loop 正在等待权限；批准文件改动时 review 与请求一致。
+/// A permission request can still be answered: the request exists, its Run is not cancelled and the
+/// Loop is waiting for permission; when approving a file change, the review matches the request.
 fn answerable_permission_request(
     chat: &Chat,
     request_id: Uuid,
@@ -1061,7 +1074,8 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
 }
 
 impl Drop for Inner {
-    /// 最后一个 Agent 句柄释放时，同步写出尚未冲刷的 Transcript 条目。
+    /// When the last Agent handle is released, synchronously writes out Transcript entries not yet
+    /// flushed.
     fn drop(&mut self) {
         self.shutdown.cancel();
         if let Some(recorder) = &self.recorder {
@@ -1808,11 +1822,12 @@ impl Agent {
         Ok(chat.interrupt())
     }
 
-    /// 打开以 `root` 为根目录的持久化 Agent。打开时不加载任何 Chat；
-    /// 用 [`Agent::resume_chat`] 按 id 恢复，用 [`Agent::saved_chats`] 列出已保存的 Chat。
+    /// Opens a persistent Agent rooted at `root`. No Chat is loaded on open; use
+    /// [`Agent::resume_chat`] to resume one by id and [`Agent::saved_chats`] to list saved Chats.
     ///
-    /// 照 Claude Code `shouldSkipPersistence`：用户设置的 `cleanupPeriodDays` 为 0 时不保存 Chat，与
-    /// [`Agent::new_with_user_settings_embedded`] 相同，仍读写用户设置。设置只在打开时读取一次。
+    /// Following Claude Code's `shouldSkipPersistence`: when the user setting `cleanupPeriodDays`
+    /// is 0, Chats are not saved, same as [`Agent::new_with_user_settings_embedded`], while user
+    /// settings are still read and written. Settings are read only once, on open.
     pub fn open(
         root: PathBuf,
         model: ModelConfig,
@@ -1849,12 +1864,13 @@ impl Agent {
         ))
     }
 
-    /// 是否把 Chat 保存为 Transcript：不持久化的 Agent、以及 `cleanupPeriodDays` 为 0 时为 `false`。
+    /// Whether Chats are saved as Transcripts: `false` for Agents without persistence and when
+    /// `cleanupPeriodDays` is 0.
     pub fn saves_chats(&self) -> bool {
         self.inner.recorder.is_some()
     }
 
-    /// 本进程已加载（创建或恢复）的 Chat。
+    /// Chats loaded (created or resumed) by this process.
     pub async fn list_chats(&self) -> Vec<ChatSnapshot> {
         self.inner
             .chats
@@ -1865,7 +1881,8 @@ impl Agent {
             .collect()
     }
 
-    /// 不持久化、也不读写用户设置的 Agent：Chat 只存在于本进程内存中。
+    /// An Agent that neither persists nor reads or writes user settings: Chats exist only in this
+    /// process's memory.
     pub fn new(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
         Self::new_local(model, client, None, AgentHostOptions::default())
     }
@@ -1882,7 +1899,7 @@ impl Agent {
         Self::new_local(model, client, None, host_options)
     }
 
-    /// 不保存 Chat、但照常读写用户设置的 Agent。
+    /// An Agent that does not save Chats but reads and writes user settings as usual.
     pub fn new_with_user_settings_embedded(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
@@ -4748,7 +4765,8 @@ impl Agent {
         let directory_changed =
             folder_changed || chat.snapshot.additional_directories != additional;
         if folder_changed {
-            // 持久规则属于工作目录的分区：换目录时换成新目录的持久规则，会话规则保留。
+            // Persistent rules belong to the working directory's partition: changing directories
+            // swaps in the new directory's persistent rules, while session rules are kept.
             chat.skills = self.discover_skills(Some(&folder));
             chat.snapshot.folder = Some(folder);
             if let Some(saved) = saved {

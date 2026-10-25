@@ -1,8 +1,10 @@
-//! 运行时与 Transcript 的适配层。
+//! Adapter layer between the runtime and the Transcript.
 //!
-//! `Agent::save` 只把 Chat 标脏；后台冲刷任务最多每 100ms 取一次已提交的快照，
-//! 与已写出的内容做差分，把新的链上条目追加到 `TranscriptStore`。Chat 快照不整体保存：恢复时按
-//! id 加载 Transcript，由对话链与元数据重建 Chat，并执行 Claude Code 的恢复后处理。
+//! `Agent::save` only marks the Chat dirty; a background flush task takes the committed snapshot at
+//! most every 100ms, diffs it against what was already written, and appends the new chain entries
+//! to `TranscriptStore`. Chat snapshots are not saved whole: on resume the Transcript is loaded by
+//! id, the Chat is rebuilt from the conversation chain and metadata, and Claude Code's post-resume
+//! processing runs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read;
@@ -47,11 +49,13 @@ use tickloop_agent_transcript::{
     SubagentsEntry, SummarizeMetadataEntry,
 };
 
-/// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
+/// Following Claude Code: when the conversation ends with a tool result on resume, this meta user
+/// message is appended to continue from where it was interrupted.
 const CONTINUE_FROM_INTERRUPTION: &str = "Continue from where you left off.";
-/// 照 Claude Code `NO_RESPONSE_REQUESTED`：末尾是 user 消息时追加的 assistant 哨兵。
+/// Following Claude Code's `NO_RESPONSE_REQUESTED`: the assistant sentinel appended when the
+/// conversation ends with a user message.
 const NO_RESPONSE_REQUESTED: &str = "No response requested.";
-/// 从 Transcript 恢复的 Branch 没有标题时使用的名称。
+/// Name used when a Branch restored from a Transcript has no title.
 const UNTITLED_BRANCH_NAME: &str = "Branch";
 
 pub(super) enum CitationCommitError {
@@ -80,18 +84,21 @@ pub(super) struct ChatRecorder {
 }
 
 struct ChatLog {
-    /// 与 `snapshot.messages` 一一对应的已写出条目。
+    /// Written entries corresponding one-to-one with `snapshot.messages`.
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
-    /// 下一条新消息的父条目。通常是最后写出的条目；压缩后照 Claude Code 是摘要消息，
-    /// 保留的消息不重写，不移动这个游标。
+    /// Parent entry of the next new message. Usually the last written entry; after compaction it is
+    /// the summary message, following Claude Code, and preserved messages are not rewritten and do
+    /// not move this cursor.
     parent_cursor: Option<Uuid>,
-    /// 加载时发现、需要让用户知道的问题。
+    /// Problems found while loading that the user needs to know about.
     load_warnings: Vec<String>,
-    /// 本进程为该文件写出的最后一批链上条目的时间。之后的批次时间严格递增，rewind 后接续的
-    /// 条目即使与被放弃分叉写于同一毫秒，也会成为时间更新的叶子。
+    /// Time of the last batch of chain entries this process wrote to the file. Later batch times
+    /// strictly increase, so entries continued after a rewind become the newer leaf even when
+    /// written in the same millisecond as the abandoned fork.
     last_entry_milliseconds: u64,
-    /// 当前对话链上 Loop 最后记录的完整状态；快照中的 Loop 与之不同时追加 Loop 条目。
+    /// Full Loop state last recorded on the current conversation chain; a Loop entry is appended
+    /// when the Loop in the snapshot differs from it.
     recorded_loop: Option<LoopEntryContent>,
     /// The lifecycle and ledger revision written last.
     recorded_lifecycle: u64,
@@ -169,12 +176,13 @@ pub(super) struct ChatLoad {
     pub leaf: Option<Uuid>,
 }
 
-/// Loop 条目记录的内容：完整状态与 run id。
+/// Contents recorded by a Loop entry: the full state and the run id.
 type LoopEntryContent = (LoopRecord, Option<RunId>);
 
-/// 之后的条目接在链上最后一个条目之后，包括叶子之后接回的尾随 Loop 条目（例如一轮回复
-/// 结束后写出的停止）；接在最后一条消息之后会让这些 Loop 条目脱离新链，已停止的 Loop 复活。
-/// 恢复时过滤掉的消息不作为父条目。
+/// Subsequent entries attach after the last entry on the chain, including trailing Loop entries
+/// reattached after the leaf (such as a stop written after a reply turn ends); attaching after the
+/// last message would detach those Loop entries from the new chain and revive a stopped Loop.
+/// Messages filtered out on resume are not used as parents.
 fn adopted_parent_cursor(links: &[MessageLink], loaded: &LoadedTranscript) -> Option<Uuid> {
     let kept_uuids = links
         .iter()
@@ -561,8 +569,10 @@ impl ChatRecorder {
         Ok(true)
     }
 
-    /// 以新 chatId 恢复的 Chat（`--fork-session`）写入工作目录所属项目中的新 Transcript：已加载的消息作为新条目重写，
-    /// 标题照 Claude Code 随元数据带到新 Transcript，Branch 来源以新 chatId 重新记录。
+    /// A Chat resumed under a new chatId (`--fork-session`) is written to a new Transcript in the
+    /// project of its working directory: loaded messages are rewritten as new entries, the title is
+    /// carried to the new Transcript with the metadata following Claude Code, and the Branch origin
+    /// is re-recorded under the new chatId.
     async fn register_resumed_copy(
         &self,
         chat_id: ChatId,
@@ -627,7 +637,8 @@ impl ChatRecorder {
         Ok(())
     }
 
-    /// 把 Branch 的来源与标题排入子 Chat 的 Transcript；子 Chat 与来源放在一起。
+    /// Queues the Branch origin and title into the child Chat's Transcript; the child Chat is
+    /// placed alongside its origin.
     pub(super) async fn register_branch(
         &self,
         source: &ChatSnapshot,
@@ -695,7 +706,8 @@ impl ChatRecorder {
         Ok(())
     }
 
-    /// 照 Claude Code `recordContentReplacement`：替换决定作为元数据条目追加到 Chat 的 Transcript。
+    /// Following Claude Code's `recordContentReplacement`: replacement decisions are appended to
+    /// the Chat's Transcript as metadata entries.
     fn enqueue_content_replacements(
         &self,
         chat_id: ChatId,
@@ -711,8 +723,9 @@ impl ChatRecorder {
         );
     }
 
-    /// rewind 截断对话前调用：先写出截断前尚未写出的消息，被放弃的消息照 Claude Code 留在
-    /// 文件中；之后的条目接在最后保留的消息后面，在同一文件中形成分叉。
+    /// Called before a rewind truncates the conversation: first writes out messages not yet written
+    /// before truncation; abandoned messages stay in the file, following Claude Code. Subsequent
+    /// entries attach after the last kept message, forming a fork in the same file.
     pub(super) fn truncate(
         &self,
         snapshot: &ChatSnapshot,
@@ -725,24 +738,31 @@ impl ChatRecorder {
             log.links.truncate(message_count);
             log.meta_messages.retain(|index| *index < message_count);
             log.parent_cursor = log.links.last().and_then(|link| link.uuids.last().copied());
-            // 截断点之后的 Loop 条目不在新的对话链上；下一次同步为 Loop 重记完整状态。
+            // Loop entries after the truncation point are not on the new conversation chain; the
+            // next sync re-records the full Loop state.
             log.recorded_loop = None;
         }
         self.mark_dirty(chat_id);
     }
 
-    /// 压缩与定向摘要提交时、替换内存快照之前调用。先写出压缩前尚未写出的消息，再追加新的
-    /// 边界（父指针为空，逻辑父指针指向压缩前最后一条）与摘要，并为 Loop 重记状态；
-    /// 这些条目作为同一批入队，保证大文件跳过边界之前的内容时 Loop、计划与进度不丢失。
+    /// Called when compaction or a directed summary commits, before replacing the in-memory
+    /// snapshot. First writes out messages not yet written before compaction, then appends the new
+    /// boundary (null parent pointer, logical parent pointing at the last pre-compaction message)
+    /// and the summary, and re-records the Loop state; these entries are queued as one batch so the
+    /// Loop, plan and progress are not lost when a large file skips content before the boundary.
     ///
-    /// 全量压缩照 Claude Code `recordTranscript`：保留的消息沿用原条目，下一条消息接在摘要之后。
-    /// 定向摘要偏离 Claude Code，不写保留区段：边界之后按内存顺序把对话中的消息作为新条目直线
-    /// 重写（uuid 取 `compacted` 中已换新的消息 id），`renamed_snapshots` 中随提示换了 id 的文件
-    /// 回滚快照以新 id 重新写入；被摘要的旧条目留在文件中成为被放弃的分支，下一条消息接在内存
-    /// 对话的最后一条之后。
+    /// Full compaction follows Claude Code's `recordTranscript`: preserved messages keep their
+    /// original entries and the next message attaches after the summary. Directed summaries deviate
+    /// from Claude Code and do not write preserved segments: after the boundary, the conversation's
+    /// messages are rewritten as new entries in a straight line in memory order (uuids taken from
+    /// the renewed message ids in `compacted`), and file-history snapshots in `renamed_snapshots`
+    /// whose ids changed with their prompts are rewritten under the new ids; the summarized old
+    /// entries stay in the file as an abandoned branch, and the next message attaches after the
+    /// last message of the in-memory conversation.
     ///
-    /// 边界之后对话中仍存在的工具结果的内容替换决定同批重新记录：超过 5MB 的 Transcript 加载时
-    /// 跳过边界之前的记录，否则保留消息中被替换的结果会以原文发送。
+    /// Content replacement decisions for tool results still in the conversation after the boundary
+    /// are re-recorded in the same batch: loading a Transcript over 5MB skips records before the
+    /// boundary, otherwise replaced results in preserved messages would be sent as original text.
     pub(super) fn compact(
         &self,
         chat: &Chat,
@@ -786,8 +806,9 @@ impl ChatRecorder {
             .enqueue_group(compacted.id, lines, source_states, events_through);
     }
 
-    /// 压缩后对话中需要新写的链上条目，同时把已写出条目的对应表换成压缩后的对话。已写出的条目
-    /// 与压缩前的对话对不上时返回 `None`，不做任何修改。
+    /// Chain entries that must be newly written for the compacted conversation, while switching the
+    /// written-entry mapping to the compacted conversation. Returns `None` without changing
+    /// anything when the written entries do not match the pre-compaction conversation.
     fn compaction_lines(
         &self,
         snapshot: &ChatSnapshot,
@@ -807,8 +828,9 @@ impl ChatRecorder {
         let git_branch = folder.and_then(current_git_branch);
         let mut lines = Vec::new();
         let mut parent = None;
-        // 压缩边界让对话链断开，边界之前的 Loop 条目不再在链上：为 Loop 重记完整状态。全量压缩
-        // 写在摘要之后；定向摘要写在保留的消息之后。
+        // The compaction boundary breaks the conversation chain, so Loop entries before the
+        // boundary are no longer on the chain: re-record the full Loop state. Full compaction
+        // writes it after the summary; a directed summary writes it after the preserved messages.
         let loop_position = if keeps_existing {
             layout.sources.len()
         } else {
@@ -899,7 +921,8 @@ impl ChatRecorder {
                 },
             ));
         }
-        // 边界之前的计划与进度工具调用不再在链上：在全部消息之后记下当时的计划版本与进度。
+        // Plan and progress tool calls before the boundary are no longer on the chain: record the
+        // plan version and progress at that point after all messages.
         if let Some(content) = plan_entry_content(compacted, compacted_bookkeeping) {
             lines.push(record_loop(
                 log,
@@ -942,7 +965,8 @@ impl ChatRecorder {
         Some(super::plan::plans_directory(self.local.as_ref()?.root()))
     }
 
-    /// 照 Claude Code `recordFileHistorySnapshot`：快照作为元数据条目追加到 Chat 的 Transcript。
+    /// Following Claude Code's `recordFileHistorySnapshot`: snapshots are appended to the Chat's
+    /// Transcript as metadata entries.
     pub(super) fn record_file_history_snapshot(
         &self,
         chat_id: ChatId,
@@ -1009,8 +1033,10 @@ impl ChatRecorder {
         );
     }
 
-    /// 差分依据：运行时对消息只有三种修改：追加新消息；向最后一条消息追加内容块（并行工具
-    /// 结果），写成标记接续该消息的新条目；rewind 截断对话，由 `truncate` 事先同步到已写出的条目。
+    /// Basis for the diff: the runtime modifies messages in only three ways: appending a new
+    /// message; appending content blocks to the last message (parallel tool results), written as a
+    /// new entry marked as continuing that message; and rewind truncating the conversation, synced
+    /// to the written entries beforehand by `truncate`.
     fn sync_chat(
         &self,
         snapshot: &ChatSnapshot,
@@ -1028,8 +1054,10 @@ impl ChatRecorder {
         let mut lines = Vec::new();
         let mut parent = log.parent_cursor;
         let first_new_message = log.links.len();
-        // Loop 与链上记录不同时写出。当前链段尚未记录的 Loop 写在本批第一条新消息之前，已记录的
-        // Loop 的变化写在本批末尾。rewind 截断后会为 Loop 重记状态。
+        // Write the Loop when it differs from the chain record. A Loop not yet recorded in the
+        // current chain segment is written before the first new message of this batch; changes to
+        // an already recorded Loop are written at the end of the batch. A rewind truncation
+        // re-records the Loop state.
         let loop_content = loop_entry_content(snapshot, bookkeeping);
         let first_records_loop = log.recorded_loop.is_none();
         let mut loop_update = (log.recorded_loop.as_ref() != Some(&loop_content)).then(|| {
@@ -1048,7 +1076,8 @@ impl ChatRecorder {
                     role: message.role,
                     content: message.content[blocks..].to_vec(),
                 };
-                // 接在最后写出的条目之后：消息之后可能已经有 Loop 条目。
+                // Attach after the last written entry: there may already be Loop entries after the
+                // message.
                 let mut entry = chain_entry(
                     snapshot,
                     bookkeeping,
@@ -1155,8 +1184,9 @@ impl ChatRecorder {
                 },
             ));
         }
-        // 首次写入当前链段的 Loop：链上缺少它之前的计划与进度工具调用（Branch、`--fork-session`、
-        // rewind 截断），在本批末尾记下当时的计划版本与进度。
+        // First write of the Loop in the current chain segment: the chain lacks the plan and
+        // progress tool calls before it (Branch, `--fork-session`, rewind truncation), so record
+        // the plan version and progress at that point at the end of this batch.
         if first_records_loop && let Some(content) = plan_entry_content(snapshot, bookkeeping) {
             lines.push(record_loop(
                 log,
@@ -1179,7 +1209,8 @@ impl ChatRecorder {
         Some(lines)
     }
 
-    /// 恢复后接管已有文件：已加载的消息沿用文件中的条目，之后的条目接在叶子后面。
+    /// Takes over the existing file after resume: loaded messages keep their entries in the file,
+    /// and subsequent entries attach after the leaf.
     fn adopt(
         &self,
         chat_id: ChatId,
@@ -1441,8 +1472,9 @@ fn chain_entry(
     };
     ChainEntry {
         uuid,
-        // 照 Claude Code `insertMessageChain`：压缩边界的父指针为空，对话链在边界处断开。被之后的
-        // 定向摘要保留的旧边界接在前一条消息之后，保持直线链。
+        // Following Claude Code's `insertMessageChain`: a compaction boundary has a null parent
+        // pointer, so the conversation chain breaks at the boundary. Old boundaries preserved by a
+        // later directed summary attach after the previous message, keeping the chain straight.
         parent_uuid: if boundary.is_some_and(|boundary| !boundary.preserved_by_later_summary) {
             None
         } else {
@@ -1531,7 +1563,8 @@ fn chain_entry(
     }
 }
 
-/// Loop 在对话链上的完整状态。等待 Chat 继续的 Trigger 一并记录，重启后仍能由用户重新武装。
+/// Full Loop state on the conversation chain. Triggers waiting for the Chat to continue are
+/// recorded too, so the user can still re-arm them after a restart.
 fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) -> LoopEntryContent {
     let chat_loop = &snapshot.chat_loop;
     (
@@ -1570,7 +1603,8 @@ fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) ->
     )
 }
 
-/// 带计划版本与进度的 Loop 状态；Loop 既没有计划也没有进度时返回 `None`。
+/// Loop state with plan version and progress; returns `None` when the Loop has neither a plan nor
+/// progress.
 fn plan_entry_content(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
@@ -1589,7 +1623,8 @@ fn plan_entry_content(
     Some((record, run_id))
 }
 
-/// 把 Loop 状态写成接在 `parent` 之后的 system 条目，并记为链上的最新状态。
+/// Writes the Loop state as a system entry attached after `parent` and records it as the latest
+/// state on the chain.
 fn record_loop(
     log: &mut ChatLog,
     snapshot: &ChatSnapshot,
@@ -1645,7 +1680,8 @@ fn record_loop(
     Line::System(entry)
 }
 
-/// Tickloop 不写 `preservedSegment`（见 `ChatRecorder::compact`）；读取时仍兼容带区段的文件。
+/// Tickloop does not write `preservedSegment` (see `ChatRecorder::compact`); reading still supports
+/// files with segments.
 fn compact_metadata_entry(
     boundary: &CompactBoundary,
     display_leaf: Option<Uuid>,
@@ -1678,8 +1714,9 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
             pre_tokens: metadata.pre_tokens,
             user_context: metadata.user_context.clone(),
             messages_summarized: metadata.messages_summarized,
-            // 链上有父条目的边界不是对话链的起点：Tickloop 重写的保留边界，或 Claude Code
-            // 保留区段重接后的边界。
+            // A boundary with a parent entry on the chain is not the start of the conversation
+            // chain: either a preserved boundary rewritten by Tickloop, or a boundary after Claude
+            // Code's preserved-segment relink.
             preserved_by_later_summary: entry.parent_uuid.is_some(),
             original_user_inputs: metadata.original_user_inputs.clone(),
             model: None,
@@ -1700,7 +1737,8 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
     })
 }
 
-/// 用户输入的纯文本提示；本地消息（中断标记、`!` 命令、任务通知）不算。
+/// A plain-text prompt typed by the user; local messages (interrupt markers, `!` commands, task
+/// notifications) do not count.
 fn typed_prompt(message: &Message) -> Option<String> {
     let text = message
         .content
@@ -1719,7 +1757,8 @@ fn typed_prompt(message: &Message) -> Option<String> {
     .then_some(text)
 }
 
-/// 从工作目录向上查找 `.git/HEAD`；工作树中的 `.git` 文件按 `gitdir:` 跳转。不启动 git 进程。
+/// Searches upward from the working directory for `.git/HEAD`; a `.git` file in a worktree is
+/// followed via `gitdir:`. Does not spawn a git process.
 fn current_git_branch(folder: &Path) -> Option<String> {
     for directory in folder.ancestors() {
         let dot_git = directory.join(".git");
@@ -1763,13 +1802,15 @@ struct RestoredChain {
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
     message_of_entry: HashMap<Uuid, usize>,
-    /// 链上当前格式的 Loop 条目，按链上顺序，连同条目之前的消息数。
+    /// Current-format Loop entries on the chain, in chain order, with the number of messages before
+    /// each entry.
     loop_records: Vec<(usize, LoopEntryContent)>,
-    /// 条目记录的 run 所属 Loop。
+    /// The Loop owning the run recorded by the entry.
     run_loops: BTreeMap<RunId, LoopId>,
-    /// 照 Claude Code `getSlugFromLog`：链上第一个带 slug 的条目。链上第一个 slug 无效（可能被
-    /// 篡改）时取之后第一个有效的 slug（恢复时换用的新 slug 写在之后的条目上）；都无效时保留
-    /// 第一个，由重建计划时警告并换用新的 slug。
+    /// Following Claude Code's `getSlugFromLog`: the first entry on the chain with a slug. When the
+    /// first slug on the chain is invalid (possibly tampered with), take the first valid slug after
+    /// it (a new slug switched to on resume is written on later entries); when none is valid, keep
+    /// the first one, and rebuilding the plan warns and switches to a new slug.
     plan_slug: Option<String>,
 }
 
@@ -2019,7 +2060,7 @@ fn restored_execution_mode(value: &serde_json::Value) -> (ExecutionMode, Option<
 }
 
 impl RestoredChain {
-    /// 去掉给定下标的消息，其余消息依次前移。
+    /// Removes the messages at the given indices, shifting the remaining messages forward.
     fn without(&self, removed: &BTreeSet<usize>) -> Self {
         let mut kept = Self {
             messages: Vec::new(),
@@ -2118,8 +2159,10 @@ struct RecoveredSnapshot {
     meta_messages: HashSet<usize>,
 }
 
-/// 由对话链与元数据重建 Chat：工作目录取链上最后一个条目的 `cwd`，Branch 来源取 `branch-origin`
-/// 与标题元数据。`removed` 是本次恢复照 Claude Code 删除的消息；`scheduled_now` 是定时任务所用的时钟。
+/// Rebuilds the Chat from the conversation chain and metadata: the working directory is the `cwd`
+/// of the last entry on the chain, and the Branch origin comes from `branch-origin` and the title
+/// metadata. `removed` lists the messages this resume deleted following Claude Code;
+/// `scheduled_now` is the clock used by Scheduled Tasks.
 #[allow(clippy::too_many_arguments)]
 fn recover_transcript(
     chat_id: ChatId,
@@ -2323,7 +2366,8 @@ fn recover_transcript(
     )
 }
 
-/// Branch 来源元数据属于写入这份 Transcript 的 Chat；名称取标题，没有有效标题时使用默认名称。
+/// Branch origin metadata belongs to the Chat that wrote this Transcript; the name is the title, or
+/// the default name when there is no valid title.
 fn restored_branch_origin(
     loaded: &LoadedTranscript,
     source_chat_id: ChatId,
@@ -2387,7 +2431,7 @@ impl RestoredChain {
         !self.loop_records.is_empty()
     }
 
-    /// 链上 Loop 条目携带的计划版本与进度。
+    /// Plan version and progress carried by Loop entries on the chain.
     fn plan_checkpoints(&self) -> Vec<super::plan::PlanCheckpoint> {
         self.loop_records
             .iter()
@@ -2404,8 +2448,9 @@ impl RestoredChain {
             .collect()
     }
 
-    /// 沿对话链按顺序重放 Loop 条目：每条以完整状态覆盖 Loop。无法解析的条目跳过；没有条目时
-    /// 保留新 Chat 的 Loop。
+    /// Replays Loop entries in order along the conversation chain: each entry overwrites the Loop
+    /// with its full state. Unparseable entries are skipped; with no entries the new Chat's Loop is
+    /// kept.
     fn replay_loop(&self, snapshot: &mut ChatSnapshot) {
         snapshot.failure_events.clear();
         for (_, (record, run_id)) in &self.loop_records {
@@ -2573,9 +2618,10 @@ fn no_store_to_switch() -> AgentError {
     AgentError::Invalid("this Chat keeps no Transcript to select another branch from".into())
 }
 
-/// 照 Claude Code `deserializeMessagesWithInterruptDetection`：末尾是工具结果时先追加
-/// "从中断处继续"的 meta 消息；之后只要末尾是 user 消息，就追加不请求回复的哨兵。
-/// meta 消息不参与中断判定。
+/// Following Claude Code's `deserializeMessagesWithInterruptDetection`: when the conversation ends
+/// with a tool result, first append the "continue from where it was interrupted" meta message;
+/// then, whenever it ends with a user message, append the no-response-requested sentinel. Meta
+/// messages do not count toward interrupt detection.
 fn append_interruption_messages(snapshot: &mut ChatSnapshot, meta_messages: &mut HashSet<usize>) {
     let last_turn_message = |snapshot: &ChatSnapshot| {
         (0..snapshot.messages.len())
@@ -2611,8 +2657,9 @@ fn append_interruption_messages(snapshot: &mut ChatSnapshot, meta_messages: &mut
     }
 }
 
-/// 照 Claude Code `buildFileHistorySnapshotChain`：沿对话链收集文件回滚快照，更新条目替换
-/// 同一消息的旧快照；不在当前链上的快照（被放弃的分叉）不生效。
+/// Following Claude Code's `buildFileHistorySnapshotChain`: collects file-history snapshots along
+/// the conversation chain, with update entries replacing older snapshots of the same message;
+/// snapshots not on the current chain (abandoned forks) have no effect.
 fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot> {
     let mut snapshots: Vec<FileHistorySnapshot> = Vec::new();
     let mut index_by_message = HashMap::new();
@@ -2904,7 +2951,8 @@ impl Agent {
         }
     }
 
-    /// 持久化入口：只把 Chat 标脏，由后台冲刷任务写入 Transcript。
+    /// Persistence entry point: only marks the Chat dirty; the background flush task writes the
+    /// Transcript.
     pub(super) fn save(&self, snapshot: &ChatSnapshot) {
         if let Some(recorder) = &self.inner.recorder {
             recorder.mark_dirty(snapshot.id);
@@ -3038,7 +3086,8 @@ impl Agent {
         }
     }
 
-    /// 立即把本进程已加载的全部 Chat 写入 Transcript。进程随后直接退出时使用。
+    /// Immediately writes all Chats loaded by this process to their Transcripts. Used when the
+    /// process is about to exit directly.
     pub async fn flush_transcripts(&self) {
         let Some(recorder) = &self.inner.recorder else {
             return;
@@ -3077,7 +3126,8 @@ impl Agent {
         }
     }
 
-    /// 退出时照 Claude Code：先冲刷，再把元数据重新追加到每个 Transcript 末尾。
+    /// On exit, following Claude Code: flush first, then re-append metadata to the end of each
+    /// Transcript.
     pub(super) async fn close_transcripts(&self) {
         let Some(recorder) = &self.inner.recorder else {
             return;
@@ -3091,7 +3141,8 @@ impl Agent {
         recorder.flush().await;
     }
 
-    /// 记录本次新做出的内容替换决定。不持久化的 Agent 只保留运行期状态。
+    /// Records the content replacement decisions newly made this time. An Agent without persistence
+    /// keeps only runtime state.
     pub(super) fn record_content_replacements(
         &self,
         snapshot: &ChatSnapshot,
@@ -3103,8 +3154,8 @@ impl Agent {
         self.save(snapshot);
     }
 
-    /// 尚未解决的 Transcript 写入失败。写入失败不影响运行，失败的条目留在队列中，
-    /// 之后每次冲刷都会重试；重试成功后返回 `None`。
+    /// Unresolved Transcript write failure. Write failures do not affect running; failed entries
+    /// stay in the queue and every later flush retries them; returns `None` once a retry succeeds.
     pub fn transcript_write_error(&self) -> Option<String> {
         self.inner
             .recorder
@@ -3112,7 +3163,8 @@ impl Agent {
             .and_then(|recorder| recorder.outbox.unresolved_error())
     }
 
-    /// 加载该 Chat 的 Transcript 时发现的问题（例如保留区段校验失败后加载了完整历史）。
+    /// Problems found while loading this Chat's Transcript (for example, loading the full history
+    /// after preserved-segment validation failed).
     pub fn transcript_load_warnings(&self, chat_id: ChatId) -> Vec<String> {
         self.inner
             .recorder
@@ -3128,11 +3180,13 @@ impl Agent {
             .unwrap_or_default()
     }
 
-    /// 照 Claude Code 压缩后的 `reAppendSessionMetadata`：冲刷后把标题等元数据重新追加到文件
-    /// 末尾，让只读尾部的列表仍能取到。
+    /// Following Claude Code's post-compaction `reAppendSessionMetadata`: after flushing,
+    /// re-appends metadata such as the title to the end of the file so listings that read only the
+    /// tail can still find it.
     ///
-    /// Claude Code 同时清空按 sessionId 缓存的 uuid 集合（`clearSessionMessagesCache`），下次写入时从
-    /// 文件重新读取；Tickloop 的去重集合由写入器随写入增量维护，与文件内容一致，无需重建。
+    /// Claude Code also clears the uuid set cached per sessionId (`clearSessionMessagesCache`) and
+    /// rereads it from the file on the next write; Tickloop's dedup set is maintained incrementally
+    /// by the writer as it writes and matches the file contents, so no rebuild is needed.
     pub(super) async fn reappend_transcript_metadata(&self, chat_id: ChatId) {
         let Some(recorder) = &self.inner.recorder else {
             return;
@@ -3146,7 +3200,7 @@ impl Agent {
         }
     }
 
-    /// 列出工作目录所属项目中已保存的 Chat，按最近活动时间从新到旧排列。
+    /// Lists saved Chats in the project of the working directory, most recent activity first.
     pub async fn saved_chats(&self, folder: &Path) -> Result<Vec<SavedChat>, AgentError> {
         let Some(local) = self
             .inner
@@ -3177,8 +3231,9 @@ impl Agent {
             .collect())
     }
 
-    /// 按 id 恢复 Chat。已在本进程内存中时直接返回该实例；否则从 Transcript 加载，
-    /// 执行恢复后处理，但不自动继续任何工作。
+    /// Resumes a Chat by id. Returns the instance directly when it is already in this process's
+    /// memory; otherwise loads it from the Transcript and runs post-resume processing, without
+    /// automatically continuing any work.
     pub async fn resume_chat(&self, chat_id: ChatId) -> Result<ChatSnapshot, AgentError> {
         // A durable host holds a family whole: every member comes in with the Chat.
         if self.inner.waits == WaitHosting::Durable {
@@ -3278,8 +3333,9 @@ impl Agent {
         self.snapshot(chat_id).await
     }
 
-    /// 照 Claude Code `--fork-session`：从 Transcript 加载对话，换上新的 chatId，
-    /// 写入新的 Transcript；原文件保持不变，原 Chat 不进入本进程。
+    /// Following Claude Code's `--fork-session`: loads the conversation from the Transcript,
+    /// switches to a new chatId, and writes a new Transcript; the original file stays unchanged and
+    /// the original Chat does not enter this process.
     pub async fn resume_as_new_chat(
         &self,
         source_chat_id: ChatId,
@@ -3472,7 +3528,9 @@ impl Agent {
         family: Option<&super::family_load::FamilyRecords>,
     ) -> Result<ChatSnapshot, AgentError> {
         let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
-        // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
+        // Replacement decisions, file-history backups and metadata all belong to the Chat that
+        // wrote this Transcript: itself on resume, the source Chat when resuming under a new
+        // chatId.
         let source_chat_id = match &target {
             RestoreTarget::Resume => chat_id,
             RestoreTarget::NewChat { source } => *source,
@@ -3516,7 +3574,8 @@ impl Agent {
             content_replacements,
             replacement_records,
         } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits, family)?;
-        // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
+        // Mutually exclusive with settings writes until the Chat joins this process, so persistent
+        // rule changes written meanwhile do not miss this Chat.
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
         if let Some(delegation) = &mut snapshot.delegation {
@@ -3552,7 +3611,8 @@ impl Agent {
             }
             RestoreTarget::NewChat { .. } => {
                 snapshot.chat_loop.event_sources.clear();
-                // 照 Claude Code `copyPlanForFork`：以新 chatId 恢复时使用新的 slug 并复制计划文件。
+                // Following Claude Code's `copyPlanForFork`: when resuming under a new chatId, use
+                // a new slug and copy the plan file.
                 super::plan::copy_plans_to_new_slug(
                     &mut snapshot,
                     &mut bookkeeping,
@@ -3567,16 +3627,20 @@ impl Agent {
                         loaded.warnings,
                     )
                     .await?;
-                // 重写的对话以压缩边界开头；替换决定与文件回滚快照写在对话之后，新文件超过 5MB
-                // 时加载不会随边界之前的内容跳过它们。
+                // The rewritten conversation starts with a compaction boundary; replacement
+                // decisions and file-history snapshots are written after the conversation, so when
+                // the new file exceeds 5MB, loading does not skip them along with the content
+                // before the boundary.
                 recorder.enqueue_sync(&snapshot, &bookkeeping);
-                // 照 Claude Code `processResumedConversation`：以新 chatId 重新记录源 Chat
-                // 的全部替换决定；替换文本仍指向源 Chat 目录中的外存文件。
+                // Following Claude Code's `processResumedConversation`: re-record all of the source
+                // Chat's replacement decisions under the new chatId; the replacement text still
+                // points to the externalized files in the source Chat's directory.
                 if !replacement_records.is_empty() {
                     recorder.enqueue_content_replacements(chat_id, replacement_records);
                 }
-                // 照 Claude Code `copyFileHistoryForResume`：备份硬链接到新 Chat 的目录，
-                // 复制成功的快照以新 chatId 重新记录。
+                // Following Claude Code's `copyFileHistoryForResume`: backups are hard-linked into
+                // the new Chat's directory, and successfully copied snapshots are re-recorded under
+                // the new chatId.
                 if let (Some(history), Some(folder)) = (file_history.take(), folder.as_deref()) {
                     let (copied, recorded) =
                         history.copy_to(self.file_history_directory(chat_id, folder));
@@ -3765,9 +3829,9 @@ impl StagedBranch {
 }
 
 pub(super) enum RestoreTarget {
-    /// 继续写入原 Transcript。
+    /// Continue writing to the original Transcript.
     Resume,
-    /// 写入新 chatId 的 Transcript。
+    /// Write to the Transcript of the new chatId.
     NewChat { source: ChatId },
 }
 

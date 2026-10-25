@@ -16,10 +16,12 @@ use uuid::Uuid;
 use super::retained::RetainedFold;
 use super::store::{AppendAck, AppendBatch, BatchId, StorePosition, TranscriptError};
 
-/// 照 Claude Code `FLUSH_INTERVAL_MS`：条目先排队，最多每 100ms 批量追加一次。
+/// Following Claude Code's `FLUSH_INTERVAL_MS`: entries are queued first and appended in batches at
+/// most every 100ms.
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 同类元数据的最后一条；退出时重新追加到 Transcript 末尾，让列表只读尾部就能取到。
+/// The last entry of each kind of metadata; re-appended to the end of the Transcript on exit so
+/// listing can find it by reading only the tail.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
     pub task_boards: Option<TaskBoardsEntry>,
@@ -466,7 +468,8 @@ impl TranscriptOutbox {
             .map(|outbox| outbox.position)
     }
 
-    /// 仍未解决的写入失败：某个 Chat 最近一次追加失败且之后没有成功追加过，或存储已拒绝它。
+    /// Unresolved write failures: a Chat whose latest append failed with no successful append
+    /// since, or that the store has rejected.
     pub(crate) fn unresolved_error(&self) -> Option<String> {
         self.chats
             .lock()

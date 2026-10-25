@@ -56,7 +56,7 @@ pub struct ShellTaskCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTask {
     pub id: Uuid,
-    /// 任务所属的 Chat。
+    /// The Chat the task belongs to.
     pub chat_id: ChatId,
     pub origin: ShellTaskOrigin,
     pub owner: ShellTaskOwner,

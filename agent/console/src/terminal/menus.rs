@@ -220,7 +220,8 @@ struct RewindPoint {
     message_id: Uuid,
     message_index: usize,
     prompt: String,
-    /// 恢复代码会改变的文件；选中该提示后才比较磁盘，`None` 表示这条提示没有文件快照。
+    /// Files that restoring code would change; the disk is compared only after this prompt is
+    /// selected, and `None` means the prompt has no file snapshot.
     changed_files: Option<Vec<PathBuf>>,
 }
 
@@ -268,7 +269,8 @@ fn directed_summary_request(
 }
 
 impl RewindPoint {
-    /// 照 Claude Code：只有恢复代码会改变文件时才提供恢复代码的选项。
+    /// Following Claude Code: the restore-code options are offered only when restoring code would
+    /// change files.
     fn can_restore_code(&self) -> bool {
         self.changed_files
             .as_ref()

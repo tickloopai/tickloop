@@ -4,14 +4,15 @@ use tickloop_agent_protocol::{
 };
 use uuid::Uuid;
 
-/// 与 `runtime/persistence.rs` 恢复对话时追加的消息文本一致，取自 Claude Code
-/// `conversationRecovery.ts`。
+/// Matches the message text appended by `runtime/persistence.rs` when restoring a conversation,
+/// taken from Claude Code's `conversationRecovery.ts`.
 const CONTINUE_FROM_INTERRUPTION: &str = "Continue from where you left off.";
 const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 
-/// 照 Claude Code：续跑 meta 消息不进入 `shouldShowUserMessage`，`AssistantTextMessage`
-/// 对 `NO_RESPONSE_REQUESTED` 不渲染；两者只留在模型请求中。Transcript 的 meta 标记不在
-/// 快照中，续跑消息按原文识别。
+/// Following Claude Code: the continuation meta message does not pass `shouldShowUserMessage`,
+/// and `AssistantTextMessage` does not render `NO_RESPONSE_REQUESTED`; both stay only in model
+/// requests. The Transcript's meta flag is not in the snapshot, so continuation messages are
+/// recognized by their exact text.
 pub(super) fn is_interruption_placeholder(role: Role, text: &str) -> bool {
     match role {
         Role::User => text == CONTINUE_FROM_INTERRUPTION,
@@ -117,7 +118,7 @@ pub(super) enum ConversationBlockKind {
     User {
         text: String,
     },
-    /// 照 Claude Code 的压缩边界：之前的消息不再发给模型。
+    /// Following Claude Code's compact boundary: earlier messages are no longer sent to the model.
     CompactBoundary,
     CompactSummary {
         summary: String,

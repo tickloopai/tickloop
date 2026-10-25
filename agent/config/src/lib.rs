@@ -1,14 +1,19 @@
-//! 用户设置文件 `<root>/settings.json`，对应 Claude Code 的用户设置 `~/.claude/settings.json`。
+//! The user settings file `<root>/settings.json`, corresponding to Claude Code's user settings
+//! `~/.claude/settings.json`.
 //!
-//! 照 Claude Code `updateSettingsForSource`：每次写入先读取文件并合并，只改动本次涉及的键，
-//! 其他键原样保留；文件不是合法 JSON、或写入路径上的键类型不对时报错且不覆盖。写入时先写
-//! 临时文件再重命名，读取方不会看到写了一半的文件；设置文件是符号链接时照 Claude Code
-//! `writeFileSyncAndFlush_DEPRECATED` 写入链接目标。读-改-写在 `settings.json.lock` 的独占锁内
-//! 完成，多个进程并发写入不会丢失对方的改动。
+//! Following Claude Code's `updateSettingsForSource`: every write first reads the file and merges
+//! into it, changing only the keys involved in this write and keeping all other keys as they are;
+//! if the file is not valid JSON, or a key on the write path has the wrong type, the write fails
+//! without overwriting. Writes go to a temporary file that is then renamed, so readers never see a
+//! half-written file; when the settings file is a symlink, the link target is written, following
+//! Claude Code's `writeFileSyncAndFlush_DEPRECATED`. The read-modify-write happens under an
+//! exclusive lock on `settings.json.lock`, so concurrent writes from several processes do not lose
+//! each other's changes.
 //!
-//! 读取时照 Claude Code `parseSettingsFile`：文件不存在或只有空白按没有设置处理；文件无效、
-//! 不可读或某个值无效时该项不生效，并把问题作为警告返回，不静默丢弃（持久 Deny／Ask 规则
-//! 失效是需要用户知道的）。
+//! Reading follows Claude Code's `parseSettingsFile`: a missing file or one with only whitespace
+//! means no settings; when the file is invalid or unreadable, or a value is invalid, that item does
+//! not take effect and the problem is returned as a warning instead of being silently dropped
+//! (users need to know when persistent Deny/Ask rules stop applying).
 
 mod auto_policy;
 pub mod loop_skill;
@@ -67,20 +72,23 @@ const TASK_TOOLS_ENABLED_KEY: &str = "taskToolsEnabled";
 const GOAL_TOKEN_BUDGET_KEY: &str = "goalTokenBudget";
 /// The model that checks a goal's reported completion; unset, the Chat's own model checks it.
 const GOAL_CHECK_MODEL_KEY: &str = "goalCheckModel";
-/// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tickloop 不按
-/// 天数自动删除任何文件，正数与未设置一样保存 Chat。
+/// Follows the name and values of Claude Code's `cleanupPeriodDays`, but only 0 has a meaning: do
+/// not write the Transcript. Tickloop never deletes files automatically by age; positive values
+/// save the Chat just like an unset value.
 const CLEANUP_PERIOD_DAYS_KEY: &str = "cleanupPeriodDays";
-/// 按项目目录分区的设置，参照 Claude Code 全局配置中的 `projects[<目录>]`。
+/// Settings partitioned by project directory, modeled on `projects[<directory>]` in Claude Code's
+/// global config.
 const PROJECTS_KEY: &str = "projects";
 const PERMISSIONS_KEY: &str = "permissions";
 const RULES_KEY: &str = "rules";
 const AUTO_APPROVAL_KEY: &str = "autoApproval";
 const AUTO_SETTINGS_SCHEMA_VERSION: u64 = 1;
 const TRUST_ACCEPTED_KEY: &str = "hasTrustDialogAccepted";
-/// 替换设置文件时沿用的原文件权限位。
+/// Permission bits of the original file, kept when replacing the settings file.
 const PRESERVED_PERMISSION_BITS: u32 = 0o777;
 const LOCK_FILE_SUFFIX: &str = ".lock";
-/// 解析符号链接的最大层数，与 Linux `MAXSYMLINKS` 相同；Claude Code 只解析一层。
+/// Maximum number of symlink levels to resolve, the same as Linux `MAXSYMLINKS`; Claude Code
+/// resolves only one level.
 const MAX_SYMLINK_HOPS: usize = 40;
 
 #[derive(Debug, thiserror::Error)]
@@ -124,13 +132,15 @@ impl Default for AutoSettings {
     }
 }
 
-/// 写入路径上类型不对的键；`update` 补上文件路径换成 [`SettingsError::InvalidEntry`]。
+/// A key with the wrong type on the write path; `update` adds the file path and turns it into
+/// [`SettingsError::InvalidEntry`].
 struct InvalidEntry {
     key: String,
     expected: String,
 }
 
-/// 设置文件中的持久权限规则；所属项目由它所在的 `projects` 分区表达，因此不带 Loop。
+/// A persistent permission rule in the settings file; its project is expressed by the `projects`
+/// partition it sits in, so it carries no Loop.
 #[derive(Deserialize, Serialize)]
 struct SavedRule {
     id: Uuid,
@@ -156,8 +166,9 @@ impl From<SavedRule> for PermissionRule {
     }
 }
 
-/// 一个项目分区中持久规则的改动：先删除 id 在 `removed` 或 `added` 中的规则，再追加 `added`，
-/// 因此内容改变的规则（同 id）被替换。
+/// A change to the persistent rules of one project partition: first remove rules whose id is in
+/// `removed` or `added`, then append `added`, so a rule whose content changed (same id) is
+/// replaced.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectRuleChanges {
     pub removed: HashSet<Uuid>,
@@ -170,9 +181,11 @@ pub const IMAGE_CACHE_DIRECTORY: &str = "image-cache";
 pub const PASTE_CACHE_DIRECTORY: &str = "paste-cache";
 pub const PASTE_FILE_EXTENSION: &str = ".txt";
 
-/// Tickloop 状态根目录：`TICKLOOP_CONFIG_DIR` 非空时使用它，否则为用户主目录下的 `.tickloop`。
-/// 主目录取自 `std::env::home_dir()`：`$HOME` 缺失或为空时回退到账户数据库。
-/// 两者都不可用时返回 `None`，调用方不写盘。Tick 包的程序独立运行时用同一规则找到凭据。
+/// The Tickloop state root: `TICKLOOP_CONFIG_DIR` when it is non-empty, otherwise `.tickloop` under
+/// the user's home directory. The home directory comes from `std::env::home_dir()`, which falls
+/// back to the account database when `$HOME` is missing or empty. Returns `None` when neither is
+/// available, and the caller writes nothing to disk. Tick package programs running on their own use
+/// the same rule to find their credentials.
 pub fn config_root_directory() -> Option<PathBuf> {
     tick_packages::default_config_root()
 }
@@ -182,7 +195,7 @@ pub struct UserSettings {
     path: PathBuf,
 }
 
-/// 一次读取的设置内容，以及读取各项时发现的问题。
+/// Settings content from one read, along with the problems found while reading each item.
 #[derive(Debug)]
 pub struct LoadedSettings {
     path: PathBuf,
@@ -524,7 +537,8 @@ impl LoadedSettings {
         })
     }
 
-    /// `cleanupPeriodDays` 的值；不是非负整数时不生效并记为警告。
+    /// The value of `cleanupPeriodDays`; a value that is not a non-negative integer does not take
+    /// effect and is recorded as a warning.
     fn cleanup_period_days(&mut self) -> Option<u64> {
         let value = self.settings.get(CLEANUP_PERIOD_DAYS_KEY)?;
         if let Some(days) = value.as_u64() {
@@ -536,7 +550,8 @@ impl LoadedSettings {
         None
     }
 
-    /// 在 `project`（规范化的工作目录）中保存的持久权限规则；无效的条目被跳过并记为警告。
+    /// Persistent permission rules saved for `project` (the normalized working directory); invalid
+    /// entries are skipped and recorded as warnings.
     pub fn permission_rules(&mut self, project: &Path) -> Vec<PermissionRule> {
         let mut problems = Vec::new();
         let rules = saved_project_rules(&self.settings, project, &mut problems);
@@ -657,7 +672,7 @@ impl UserSettings {
         Self { path }
     }
 
-    /// Tickloop 状态根目录下的设置文件。
+    /// The settings file under the Tickloop state root.
     pub fn in_root(root: &Path) -> Self {
         Self::new(root.join(SETTINGS_FILE_NAME))
     }
@@ -675,8 +690,9 @@ impl UserSettings {
         self.path.parent()
     }
 
-    /// 读取设置文件。文件无效或不可读时内容为空，问题记为警告。`cleanupPeriodDays` 是进程级设置，
-    /// 每次读取都检查它，让无效的值和其他设置问题一样出现在警告中。
+    /// Reads the settings file. When the file is invalid or unreadable, the content is empty and
+    /// the problem is recorded as a warning. `cleanupPeriodDays` is a process-wide setting checked
+    /// on every read, so an invalid value shows up in the warnings like any other settings problem.
     pub fn load(&self) -> LoadedSettings {
         let (settings, warnings, read_error) = match self.read_object() {
             Ok(settings) => (settings, Vec::new(), None),
@@ -704,7 +720,8 @@ impl UserSettings {
         loaded
     }
 
-    /// `cleanupPeriodDays` 为 0 时不写 Transcript（照 Claude Code `shouldSkipPersistence`）。
+    /// When `cleanupPeriodDays` is 0, the Transcript is not written (following Claude Code's
+    /// `shouldSkipPersistence`).
     pub fn skips_transcripts(&self) -> bool {
         self.load().cleanup_period_days() == Some(0)
     }
@@ -792,7 +809,8 @@ impl UserSettings {
         })
     }
 
-    /// 保存模型选择；`clear_context_window` 为真时同时删除上下文窗口设置（窗口属于之前的模型）。
+    /// Saves the model selection; when `clear_context_window` is true, also removes the context
+    /// window setting (the window belonged to the previous model).
     pub fn save_model(
         &self,
         model: &ModelConfig,
@@ -1015,7 +1033,8 @@ impl UserSettings {
         })
     }
 
-    /// 按项目分区写入持久规则的改动，其他项目与键不变；路径上任何键类型不对时整体不写。
+    /// Writes a change to the persistent rules of a project partition, leaving other projects and
+    /// keys unchanged; nothing is written if any key on the path has the wrong type.
     pub fn update_permission_rules<'a>(
         &self,
         changes: impl IntoIterator<Item = (&'a Path, &'a ProjectRuleChanges)>,
@@ -1171,7 +1190,8 @@ impl UserSettings {
         self.replace_file(&contents).map_err(write_error)
     }
 
-    /// 读取整个设置对象；文件不存在或只有空白时为空对象。
+    /// Reads the whole settings object; an empty object when the file is missing or contains only
+    /// whitespace.
     fn read_object(&self) -> Result<Map<String, Value>, SettingsError> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -1193,7 +1213,8 @@ impl UserSettings {
         }
     }
 
-    /// 在 `settings.json.lock` 的独占锁内读取、修改并原子替换设置文件。
+    /// Reads, modifies and atomically replaces the settings file under an exclusive lock on
+    /// `settings.json.lock`.
     fn update(
         &self,
         edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), InvalidEntry>,
@@ -1226,8 +1247,9 @@ impl UserSettings {
         PathBuf::from(path)
     }
 
-    /// 照 Claude Code `writeFileSyncAndFlush_DEPRECATED`：设置文件是符号链接时写入链接目标，
-    /// 临时文件与重命名都在目标所在目录进行，链接本身保留。
+    /// Following Claude Code's `writeFileSyncAndFlush_DEPRECATED`: when the settings file is a
+    /// symlink, writes the link target; the temporary file and the rename both happen in the
+    /// target's directory, and the link itself is kept.
     fn replace_file(&self, contents: &[u8]) -> io::Result<()> {
         let target = resolve_symlinks(&self.path);
         let mode = std::fs::metadata(&target)
@@ -1240,8 +1262,10 @@ impl UserSettings {
     }
 }
 
-/// 持有期间独占 `path` 上的建议锁（`flock`）。锁随文件关闭释放，进程崩溃时由内核释放，
-/// 不会留下需要按时间判断过期的锁；锁文件本身保留，删除它会让等待者锁在已脱离路径的文件上。
+/// Holds an exclusive advisory lock (`flock`) on `path` while alive. The lock is released when the
+/// file is closed, or by the kernel if the process crashes, so no lock is left behind that would
+/// need age-based expiry; the lock file itself is kept, because deleting it would let waiters lock
+/// a file already detached from the path.
 fn lock_exclusively(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -1395,7 +1419,8 @@ fn project_key(project: &Path) -> String {
     project.to_string_lossy().into_owned()
 }
 
-/// 取对象中 `key` 对应的对象；不存在时插入空对象，不是对象时报错（不覆盖用户的内容）。
+/// Gets the object for `key` in an object; inserts an empty object when missing, and errors when
+/// the value is not an object (the user's content is never overwritten).
 fn object_entry<'a>(
     object: &'a mut Map<String, Value>,
     key: &str,
@@ -1493,7 +1518,8 @@ mod tests {
         assert_eq!(saved[EFFORT_LEVEL_KEY], "high");
     }
 
-    /// 另一个进程持有 `settings.json.lock` 时写入等待，释放后才读-改-写，不会基于旧内容覆盖。
+    /// While another process holds `settings.json.lock`, a write waits and only does its
+    /// read-modify-write after release, so it never overwrites based on stale content.
     #[test]
     fn a_held_settings_lock_delays_the_write_until_release() {
         let directory = tempfile::tempdir().unwrap();
@@ -1526,7 +1552,8 @@ mod tests {
         assert_eq!(settings.permission_rules(&project).len(), 1);
     }
 
-    /// 多个线程交错增删同一分区的规则：每个线程最后留下的规则都在，删除的规则都不复活。
+    /// Several threads interleave adding and removing rules in the same partition: every rule each
+    /// thread last left in place is present, and no removed rule comes back.
     #[test]
     fn interleaved_writers_keep_every_change() {
         const WRITERS: usize = 4;

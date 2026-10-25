@@ -1,18 +1,24 @@
-//! 大工具结果外存，照 Claude Code `utils/toolResultStorage.ts`。
+//! Externalized storage for large tool results, following Claude Code's
+//! `utils/toolResultStorage.ts`.
 //!
-//! 两种机制与 Claude Code 相同：
-//! - **单个结果**：工具结果写入对话前，超过该工具阈值的内容写入
-//!   `<Chat 目录>/tool-results/<toolUseId>.txt`，对话中保存带路径和预览的替换文本。
-//! - **单条消息预算**：发请求前，同一条 user 消息中的工具结果合计超过预算时，把最大的、
-//!   模型从未见过的结果外存并替换。替换决定作为内容替换条目写入 Transcript，恢复时重建，
-//!   保证之后每次请求逐字节一致；已见过但未替换的结果永远不再替换。
+//! Both mechanisms match Claude Code:
+//! - **Per result**: before a tool result is written to the conversation, content over that tool's
+//!   threshold is written to `<Chat directory>/tool-results/<toolUseId>.txt`, and the conversation
+//!   keeps replacement text with the path and a preview.
+//! - **Per-message budget**: before sending a request, when the tool results in one user message
+//!   together exceed the budget, the largest results the model has never seen are externalized and
+//!   replaced. Replacement decisions are written to the Transcript as content replacement entries
+//!   and rebuilt on resume, keeping every later request byte-for-byte identical; results already
+//!   seen but not replaced are never replaced.
 //!
-//! 预算与外存都按工具结果的文字（[`ToolResultContent::text`]）计算，因此文件扩展名总是
-//! `.txt`（Claude Code 内容块数组写 `.json`）。长度照 Claude Code 按 UTF-16 码元计算。
+//! Both the budget and externalization use the tool result's text ([`ToolResultContent::text`]), so
+//! the file extension is always `.txt` (Claude Code writes `.json` for content block arrays).
+//! Lengths are counted in UTF-16 code units, following Claude Code.
 //!
-//! 调用 id 由模型提供，可能含文件名不允许的字符，也可能跨 Run 重复（请求中重复的 id 投影为
-//! 唯一的 `tl_` id）。因此预算状态按请求中的投影 id 键控，恢复时同样按投影重建；替换只套用到
-//! 与之生成时内容一致的结果上。
+//! Call ids come from the model and may contain characters not allowed in file names, or repeat
+//! across Runs (repeated ids in a request are projected to unique `tl_` ids). So the budget state
+//! is keyed by the projected id in the request and rebuilt by the same projection on resume; a
+//! replacement is only applied to a result whose content matches what it was generated from.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,16 +43,18 @@ use tickloop_agent_tools::{
 };
 use tickloop_agent_transcript::ContentReplacementRecord;
 
-/// Chat 目录中大工具结果的子目录。
+/// Subdirectory of the Chat directory for large tool results.
 const TOOL_RESULTS_SUBDIRECTORY: &str = "tool-results";
-/// Claude Code `DEFAULT_MAX_RESULT_SIZE_CHARS`：各工具声明的上限再受此值约束。
+/// Claude Code's `DEFAULT_MAX_RESULT_SIZE_CHARS`: each tool's declared limit is further capped by
+/// this value.
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 /// Claude Code `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS`。
 const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS: usize = 200_000;
-/// Claude Code 大多数工具声明的 `maxResultSizeChars`。
+/// The `maxResultSizeChars` declared by most Claude Code tools.
 const COMMON_MAX_RESULT_SIZE_CHARS: usize = 100_000;
 const MAX_TOOL_USE_ID_LENGTH: usize = 200;
-/// 调用 id 不能直接作文件名或已被不同内容占用时，改用"清洗后的 id-内容哈希"命名。
+/// When a call id cannot be used directly as a file name or is already taken by different content,
+/// name the file "sanitized id-content hash" instead.
 const FALLBACK_STEM_LENGTH: usize = 64;
 const CONTENT_DIGEST_HEX_LENGTH: usize = 16;
 const FALLBACK_NAME_ATTEMPTS: usize = 8;
@@ -102,8 +110,10 @@ impl Agent {
         )
     }
 
-    /// 工具结果写入对话前按阈值外存；外存后结果内容换成替换文本，未自带输出引用的结果
-    /// 指向外存文件。A Chat without a Folder stores nothing, so the result is cut instead.
+    /// Externalizes tool results by threshold before they are written to the conversation;
+    /// afterwards the result content becomes the replacement text, and results without their own
+    /// output reference point at the externalized file. A Chat without a Folder stores nothing, so
+    /// the result is cut instead.
     pub(super) async fn persist_large_tool_result(
         &self,
         receipt: &Receipt,
@@ -164,8 +174,9 @@ pub(super) fn waited_call_result(
     result
 }
 
-/// 工具的外存阈值；`None` 表示从不外存（Claude Code 的 Read 声明为 Infinity：
-/// 把读文件的结果外存成文件再让模型读回是循环的）。
+/// The tool's externalization threshold; `None` means never externalize (Claude Code's Read
+/// declares Infinity: externalizing a file read result to a file for the model to read back would
+/// be circular).
 fn persistence_threshold(tool_name: &str) -> Option<usize> {
     let declared = match tool_name {
         READ_TOOL_NAME => return None,
@@ -249,8 +260,9 @@ pub(super) struct PersistedToolResult {
     pub replacement: String,
 }
 
-/// 照 Claude Code `maybePersistLargeToolResult`：超过阈值时外存并返回替换文本；
-/// 未超过阈值或写入失败时返回 `None`，调用方保留原内容。
+/// Following Claude Code's `maybePersistLargeToolResult`: externalizes and returns replacement text
+/// when over the threshold; returns `None` when under the threshold or the write fails, and the
+/// caller keeps the original content.
 pub(super) fn persist_large_tool_result(
     chat_directory: &PrivateDirectory,
     tool_name: &str,
@@ -264,9 +276,11 @@ pub(super) fn persist_large_tool_result(
     persist_tool_result(chat_directory, tool_use_id, content).ok()
 }
 
-/// 以不覆盖的方式写入。调用 id 可以直接作文件名时照 Claude Code 写 `<toolUseId>.txt`；
-/// 已有文件内容相同时沿用（Claude Code 把 `EEXIST` 一律视为已写入）。id 含非法字符或
-/// 文件已被不同内容占用时改写 `<清洗后的 id>-<内容哈希>.txt`，不放弃外存。
+/// Writes without overwriting. When the call id can be used directly as a file name, writes
+/// `<toolUseId>.txt` following Claude Code; reuses an existing file with identical content (Claude
+/// Code treats any `EEXIST` as already written). When the id contains illegal characters or the
+/// file is taken by different content, writes `<sanitized id>-<content hash>.txt` instead of giving
+/// up on externalization.
 fn persist_tool_result(
     chat_directory: &PrivateDirectory,
     tool_use_id: &str,
@@ -351,7 +365,8 @@ fn is_safe_file_stem(tool_use_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// 替换文本是否由这份内容生成：跨 Run 重复或回退后重用的 id 不会套用别的结果的替换。
+/// Whether the replacement text was generated from this content: ids repeated across Runs or reused
+/// after a rollback do not pick up another result's replacement.
 fn is_replacement_for(replacement: &str, content: &str) -> bool {
     replacement
         .strip_prefix(PERSISTED_OUTPUT_TAG)
@@ -362,19 +377,21 @@ fn is_replacement_for(replacement: &str, content: &str) -> bool {
         })
 }
 
-/// Claude Code `ContentReplacementState`：只存在于运行期，恢复时由内容替换条目重建。
+/// Claude Code's `ContentReplacementState`: exists only at runtime and is rebuilt from content
+/// replacement entries on resume.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct ContentReplacementState {
-    /// 已经过预算检查的结果；之后永远不会再被新替换。
+    /// Results that have passed the budget check; they are never newly replaced afterwards.
     seen: HashSet<String>,
-    /// 已替换的结果及模型看到的原文。
+    /// Replaced results and the original text the model saw.
     replacements: HashMap<String, String>,
 }
 
 impl ContentReplacementState {
-    /// Claude Code `reconstructContentReplacementState`：对话中出现的候选结果都视为已见过；
-    /// 只采用对话中仍存在、且由该结果内容生成的替换记录。候选取自发给模型的投影对话，
-    /// 与请求时的键一致。
+    /// Claude Code's `reconstructContentReplacementState`: candidate results appearing in the
+    /// conversation are all treated as seen; only replacement records still present in the
+    /// conversation and generated from that result's content are adopted. Candidates come from the
+    /// projected conversation sent to the model, matching the keys used at request time.
     pub(super) fn reconstruct(
         snapshot: &ChatSnapshot,
         records: &[ContentReplacementRecord],
@@ -425,13 +442,15 @@ impl ContentReplacementState {
             .filter(|replacement| is_replacement_for(replacement, content))
     }
 
-    /// 仍适用于快照中模型可见对话（最后一个压缩边界之后）的替换决定。压缩写出边界时以此在
-    /// 边界之后重新记录：超过 5MB 的 Transcript 加载时跳过边界之前的记录。
+    /// Replacement decisions still applicable to the model-visible conversation in the snapshot
+    /// (after the last compaction boundary). Compaction uses this to re-record them after the
+    /// boundary it writes: loading a Transcript over 5MB skips records before the boundary.
     pub(super) fn records_for(&self, snapshot: &ChatSnapshot) -> Vec<ContentReplacementRecord> {
         Self::reconstruct(snapshot, &self.records()).records()
     }
 
-    /// 以记录形式导出替换决定，供 `--fork-session` 与 Branch 以新 chatId 重新记录。
+    /// Exports replacement decisions as records, for `--fork-session` and Branch to re-record under
+    /// a new chatId.
     pub(super) fn records(&self) -> Vec<ContentReplacementRecord> {
         let mut records = self
             .replacements
@@ -454,9 +473,10 @@ struct Candidate<'a> {
     size: usize,
 }
 
-/// Claude Code `collectCandidatesByMessage`：以 assistant 消息为界，把相邻 user 消息中的
-/// 工具结果归为一组（请求中它们合并成一条 user 消息）。已替换、为空或含图片的结果不是候选
-/// （Claude Code `hasImageBlock`：外存只保存文字，替换会丢掉图片）。
+/// Claude Code's `collectCandidatesByMessage`: groups the tool results of adjacent user messages,
+/// delimited by assistant messages (they are merged into one user message in the request). Results
+/// that are already replaced, empty, or contain images are not candidates (Claude Code's
+/// `hasImageBlock`: externalization stores only text, so replacement would drop the images).
 fn candidate_groups(messages: &[Message]) -> Vec<Vec<Candidate<'_>>> {
     let mut groups = Vec::new();
     let mut current = Vec::new();
@@ -499,8 +519,9 @@ fn candidate_groups(messages: &[Message]) -> Vec<Vec<Candidate<'_>>> {
     groups
 }
 
-/// Claude Code `enforceToolResultBudget`：就地替换请求消息中的工具结果，更新状态，
-/// 返回本次新做出的替换决定（重新套用的旧替换不返回）。
+/// Claude Code's `enforceToolResultBudget`: replaces tool results in the request messages in place,
+/// updates the state, and returns the replacement decisions newly made this time (reapplied old
+/// replacements are not returned).
 pub(super) fn enforce_tool_result_budget(
     messages: &mut [Message],
     state: &mut ContentReplacementState,
@@ -725,7 +746,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(tool_result_contents(&first)[0].starts_with(PERSISTED_OUTPUT_TAG));
 
-        // 回退后同一 id 被新结果重用：旧的替换不再套用，重建时也不采用。
+        // The same id was reused by a new result after a rollback: the old replacement no longer
+        // applies and is not adopted on rebuild either.
         let reused = "b".repeat(1000);
         let mut second = tool_round("reused", &reused).to_vec();
         assert!(enforce_tool_result_budget(&mut second, &mut state, &chat_directory).is_empty());

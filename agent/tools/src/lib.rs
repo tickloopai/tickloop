@@ -476,7 +476,8 @@ pub enum ToolError {
 pub struct ChatDirectory {
     /// File change reviews and stored tool results go here.
     pub chat: PrivateDirectory,
-    /// 后台任务输出目录，照 Claude Code 位于系统临时目录下的 `<chatId>/tasks`。
+    /// Background task output directory; following Claude Code, `<chatId>/tasks` under the system
+    /// temp directory.
     pub task_output: PrivateDirectory,
     /// Canonical private family temp space, shared by the family's root and its children.
     pub family_temp: PrivateDirectory,
@@ -498,7 +499,8 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// 独立使用时，附属文件与任务输出都放在 `output_dir` 下；没有运行命令的宿主，Shell 命令被拒绝。
+    /// When used standalone, attachments and task output both go under `output_dir`; with no host
+    /// to run commands, Shell commands are rejected.
     pub fn new(output_dir: PathBuf) -> Self {
         let output_dir = PrivateDirectory::trusted(output_dir);
         Self::with_commands(
@@ -1211,7 +1213,8 @@ fn prepare_with_readable_directories(
     })
 }
 
-/// 不跟随符号链接地打开已存在的路径；`directory` 时要求最后一段也是目录。
+/// Opens an existing path without following symlinks; with `directory`, the last component must
+/// also be a directory.
 pub(crate) fn open_existing(path: &Path, directory: bool) -> Result<File, ToolError> {
     let target = if directory {
         OpenTarget::Directory { create_mode: None }

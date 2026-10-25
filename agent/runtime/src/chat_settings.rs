@@ -34,8 +34,9 @@ pub(super) struct SelectedModel {
 }
 
 impl Agent {
-    /// 最近一次为该 Chat 读取用户设置（新建、恢复、Branch、切换工作目录）时发现的问题，
-    /// 例如设置文件不是合法 JSON 导致持久规则没有生效。
+    /// Problems found the last time user settings were read for this Chat (create, resume, Branch,
+    /// working directory change), such as persistent rules not taking effect because the settings
+    /// file is not valid JSON.
     pub fn user_settings_warnings(&self, chat_id: ChatId) -> Vec<String> {
         self.inner
             .settings_warnings
@@ -111,7 +112,8 @@ impl Agent {
         output_style
     }
 
-    /// 在阻塞线程中读取用户设置；不读写设置的 Agent 返回 `None`。
+    /// Reads user settings on a blocking thread; returns `None` for Agents that do not read or
+    /// write settings.
     pub(super) async fn load_user_settings(&self) -> Result<Option<LoadedSettings>, AgentError> {
         let Some(settings) = self.inner.settings.clone() else {
             return Ok(None);
@@ -122,7 +124,8 @@ impl Agent {
             .map_err(|error| AgentError::Storage(error.to_string()))
     }
 
-    /// 把 Chat 的持久规则换成设置中其工作目录分区的规则，会话规则不变，并记录读取警告。
+    /// Replaces the Chat's persistent rules with the rules of its working directory's partition in
+    /// settings, keeping session rules, and records read warnings.
     pub(super) fn replace_persistent_rules(
         &self,
         snapshot: &mut ChatSnapshot,
@@ -148,7 +151,7 @@ impl Agent {
             .insert(snapshot.id, saved.into_warnings());
     }
 
-    /// 之后新建或恢复的 Chat 使用这个模型。
+    /// Chats created or resumed afterwards use this model.
     pub(super) fn select_model(&self, config: ModelConfig, client: Arc<dyn ModelClient>) {
         *self
             .inner
@@ -301,7 +304,7 @@ impl Agent {
             .await
     }
 
-    /// 把持久规则的改动写入用户设置中各自的项目分区。
+    /// Writes persistent rule changes to their respective project partitions in user settings.
     pub(super) async fn save_persistent_rule_changes(
         &self,
         changes: &RuleChanges,
@@ -320,7 +323,7 @@ impl Agent {
         .await
     }
 
-    /// 设置写入包含 `sync_all`，在阻塞线程中进行。
+    /// Settings writes include `sync_all`, so they run on a blocking thread.
     pub(super) async fn write_user_settings(
         &self,
         write: impl FnOnce(&UserSettings) -> Result<(), SettingsError> + Send + 'static,
@@ -334,8 +337,10 @@ impl Agent {
             .map_err(|error| AgentError::Storage(error.to_string()))
     }
 
-    /// 已写入设置的持久规则改动同步到本进程已加载、工作目录属于该分区的其他 Chat（`skip` 除外）。
-    /// 不读写设置的 Agent 没有项目分区，持久规则只属于添加它的 Chat。
+    /// Syncs persistent rule changes already written to settings into other Chats loaded by this
+    /// process whose working directory belongs to that partition (except `skip`). Agents that do
+    /// not read or write settings have no project partitions, so a persistent rule belongs only to
+    /// the Chat that added it.
     pub(super) fn sync_persistent_rules(
         &self,
         chats: &mut HashMap<ChatId, Chat>,
@@ -426,8 +431,9 @@ impl Agent {
         Ok(())
     }
 
-    /// 照 Claude Code"不再询问"：为权限请求添加的持久规则写入用户设置中本项目的分区，
-    /// 并加入发起请求的 Chat 与本进程已加载的同项目 Chat。调用方持有 `settings_writes`。
+    /// Following Claude Code's "don't ask again": persistent rules added for a permission request
+    /// are written to this project's partition in user settings and added to the requesting Chat
+    /// and to same-project Chats loaded by this process. The caller holds `settings_writes`.
     pub(super) async fn add_persistent_rule_for_request(
         &self,
         chat_id: ChatId,
@@ -438,7 +444,8 @@ impl Agent {
         let (project, rule) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            // 先按回答时的条件校验，失效的请求不写入设置；回答阶段仍会再次校验。
+            // Validate against the answer-time conditions first, so stale requests are not written
+            // to settings; the answer phase validates again.
             let request = super::answerable_permission_request(chat, request_id, allow)?;
             if !self.inner.approvals.lock().await.contains_key(&request_id) {
                 return Err(AgentError::Invalid(
@@ -491,7 +498,8 @@ impl Agent {
             },
         )]);
         self.save_persistent_rule_changes(&changes).await?;
-        // 规则已在设置中：即使写入期间请求过期或被取消，已加载的 Chat 也与设置保持一致。
+        // The rule is already in settings: even if the request expired or was cancelled during the
+        // write, loaded Chats stay consistent with settings.
         let mut chats = self.inner.chats.lock().await;
         self.sync_persistent_rules(&mut chats, &changes, Some(chat_id));
         if let Some(chat) = chats.get_mut(&chat_id) {
@@ -501,8 +509,10 @@ impl Agent {
     }
 }
 
-/// Chat 规则集从当前变为 `rules` 时各项目分区的持久规则改动。规则按完整内容比较：内容变化
-/// 的规则（同 id）既删除旧的也添加新的。删除与修改写回规则记录的分区，新规则写入工作目录的分区。
+/// Persistent rule changes per project partition when the Chat's rule set changes from the current
+/// one to `rules`. Rules are compared by full content: a rule whose content changed (same id) is
+/// both deleted (old) and added (new). Deletions and modifications are written back to the
+/// partition recorded for the rule; new rules go to the working directory's partition.
 pub(super) fn persistent_rule_changes(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
@@ -565,7 +575,8 @@ pub(super) fn persistent_rule_changes(
     Ok(changes)
 }
 
-/// 调用方已把规则集整体替换后，更新持久规则所属分区的记录。
+/// After the caller has replaced the whole rule set, updates the record of which partition each
+/// persistent rule belongs to.
 pub(super) fn record_rule_projects(bookkeeping: &mut ChatBookkeeping, changes: &RuleChanges) {
     for (project, change) in changes {
         for id in &change.removed {
@@ -579,7 +590,8 @@ pub(super) fn record_rule_projects(bookkeeping: &mut ChatBookkeeping, changes: &
     }
 }
 
-/// 在 Chat 的规则集中应用一个分区的持久规则改动；有变化时递增规则版本。
+/// Applies one partition's persistent rule changes to the Chat's rule set; bumps the rule version
+/// when anything changed.
 fn apply_rule_changes(chat: &mut Chat, project: &Path, change: &ProjectRuleChanges) {
     let replaced = change
         .removed

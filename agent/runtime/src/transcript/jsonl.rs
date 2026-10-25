@@ -19,7 +19,8 @@ use super::store::{
     TranscriptError, TranscriptStore,
 };
 
-/// 照 Claude Code `SKIP_PRECOMPACT_THRESHOLD`：超过 5MB 的 Transcript 跳过压缩边界之前的内容。
+/// Following Claude Code's `SKIP_PRECOMPACT_THRESHOLD`: Transcripts over 5MB skip content before
+/// the compaction boundary.
 pub(crate) const SKIP_PRECOMPACT_THRESHOLD: u64 = 5 * 1024 * 1024;
 const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
@@ -50,10 +51,11 @@ struct ChatFiles {
 }
 
 struct ChatFile {
-    /// 创建或找到时固定；之后改变工作目录也不移动文件。
+    /// Fixed when created or found; later working directory changes do not move the file.
     path: PathBuf,
-    /// 文件已在磁盘上：本进程追加成功过，或加载时读到。之后的追加不再创建文件，文件不存在说明
-    /// 已被外部删除。
+    /// The file is already on disk: this process appended to it successfully, or it was read while
+    /// loading. Later appends no longer create the file, so a missing file means it was deleted
+    /// externally.
     exists_on_disk: bool,
     /// The file as an acknowledged append or a load last saw it. A shorter or different file
     /// has lost committed Lines.
@@ -472,7 +474,7 @@ fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
     Ok(())
 }
 
-/// 每一行的文件偏移与内容（不含换行符）。
+/// File offset and content (without the newline) of each line.
 fn split_lines(bytes: &[u8]) -> Vec<(u64, &[u8])> {
     let mut offset = 0u64;
     bytes
@@ -485,9 +487,12 @@ fn split_lines(bytes: &[u8]) -> Vec<(u64, &[u8])> {
         .collect()
 }
 
-/// 照 Claude Code `scanChunkLines`：最后一个不带保留区段的压缩边界所在行的偏移；带保留区段的
-/// 边界不截断（保留的消息在它之前）。被定向摘要重写到新边界之后的旧边界有父条目，不是对话链
-/// 的起点，同样不截断（Claude Code 写出的边界父指针总为空）。没有这样的边界时返回 0。
+/// Following Claude Code's `scanChunkLines`: offset of the line holding the last compaction
+/// boundary without a preserved segment; boundaries with a preserved segment do not truncate (the
+/// preserved messages come before them). Old boundaries rewritten after a new boundary by a
+/// directed summary have a parent entry and are not the start of the conversation chain, so they do
+/// not truncate either (boundaries written by Claude Code always have a null parent pointer).
+/// Returns 0 when there is no such boundary.
 fn last_unpreserved_boundary_offset(lines: &[(u64, &[u8])]) -> u64 {
     lines
         .iter()
@@ -515,8 +520,9 @@ fn append_line(buffer: &mut Vec<u8>, line: &Line) {
     }
 }
 
-/// 文件已在磁盘上时只追加、不创建：文件不存在说明已被外部删除，由调用方停止记录。
-/// 第一次写入时创建文件，必要时先创建目录。
+/// When the file is already on disk, only appends and never creates: a missing file means it was
+/// deleted externally, and the caller stops recording. The first write creates the file, creating
+/// the directory first if needed.
 fn append_to_transcript(
     path: &Path,
     bytes: &[u8],
@@ -536,7 +542,8 @@ fn append_to_transcript(
     }
 }
 
-/// 写入中途失败时把已写出的半截字节截回原长度，避免留下坏行，也避免重试时重复写入。
+/// On a mid-write failure, truncates the partially written bytes back to the original length,
+/// avoiding a broken line and duplicate writes on retry.
 /// Returns the file as it is after the write, including what other writers appended.
 fn append(path: &Path, bytes: &[u8], create: bool) -> io::Result<std::fs::Metadata> {
     let mut options = std::fs::OpenOptions::new();

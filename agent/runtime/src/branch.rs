@@ -192,7 +192,8 @@ impl Agent {
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         carry_loop(&mut snapshot, &source.snapshot);
         carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
-        // 照 Claude Code `copyPlanForFork`：Branch 使用新的 slug 并复制计划文件，之后双方各自修改。
+        // Following Claude Code's `copyPlanForFork`: the Branch uses a new slug and copies the plan
+        // file, after which each side edits its own.
         let plans_directory = self.plans_directory(&folder);
         super::plan::copy_plans_to_new_slug(
             &mut snapshot,
@@ -235,7 +236,8 @@ impl Agent {
         }
         let tools = self.create_chat_tools(&snapshot);
         let skills = self.discover_skills(Some(&folder));
-        // 照 Claude Code `/branch`：以子 Chat 的 id 重新记录来源中仍在复制对话里的替换决定。
+        // Following Claude Code's `/branch`: re-records, under the child Chat's id, the source's
+        // replacement decisions still in the copied conversation.
         let source_replacements = chats
             .get(&request.source_chat_id)
             .map(|source| source.content_replacements.records())
@@ -263,7 +265,8 @@ impl Agent {
                 bookkeeping,
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
-                // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
+                // Occupy the child Chat until the backups finish copying outside the lock; it
+                // cannot start a Run or rewind.
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
                 upgrade_wait: None,
@@ -300,8 +303,10 @@ impl Agent {
         drop(permission_context);
         drop(chats);
         drop(_settings_gate);
-        // 照 Claude Code `copyFileHistoryForResume` 把备份硬链接到子 Chat 的目录（失败时复制），
-        // 复制可能涉及大文件，放在锁外；备份全部复制成功的快照以子 Chat 的 id 写入 Transcript。
+        // Following Claude Code's `copyFileHistoryForResume`, hard-link the backups into the child
+        // Chat's directory (copying on failure); copying may involve large files, so it happens
+        // outside the lock. Snapshots whose backups were all copied are written to the Transcript
+        // under the child Chat's id.
         let copied_snapshots = tokio::task::spawn_blocking(move || {
             source_file_history.copy_backups_to(&child_file_history_directory)
         })
@@ -340,7 +345,7 @@ impl Agent {
 }
 
 impl Agent {
-    /// 源 Chat 所在项目中已保存的标题，供 Branch 标题查重。
+    /// Titles already saved in the source Chat's project, used to deduplicate the Branch title.
     async fn saved_titles_near(&self, source_chat_id: ChatId) -> Vec<String> {
         let Some(local) = self
             .inner
@@ -356,7 +361,8 @@ impl Agent {
     }
 }
 
-/// 源 Chat 发给模型的公开对话（去掉私有推理与空消息），以及每条消息投影自的源消息下标。
+/// The public conversation the source Chat sends to the model (without private reasoning and empty
+/// messages), plus the source message index each message is projected from.
 fn public_seed_with_sources(source: &Chat) -> Result<Vec<(Message, Option<usize>)>, AgentError> {
     let mut seed = projection::projected_messages_with_sources(
         &source.snapshot,
@@ -374,9 +380,11 @@ fn public_seed_with_sources(source: &Chat) -> Result<Vec<(Message, Option<usize>
     Ok(seed)
 }
 
-/// 照 Claude Code 复制对话时保留消息 uuid：来自源 Chat 用户提示的种子消息仍是 rewind 的
-/// 可选位置。这些消息换回源提示的原文与附带上下文，投影结果与复制的种子一致；文件回滚
-/// 快照按同一 uuid 关联，Branch 中 rewind 仍能恢复分出之前的文件状态。
+/// Message uuids are kept when copying the conversation, following Claude Code: seed messages from
+/// the source Chat's user prompts remain rewind targets. These messages are switched back to the
+/// source prompt's original text and attached context, so the projection matches the copied seeds;
+/// file rollback snapshots are associated by the same uuid, so rewind in the Branch can still
+/// restore file state from before the branch point.
 fn carry_rewind_points(
     child: &mut ChatSnapshot,
     source: &ChatSnapshot,
@@ -481,8 +489,9 @@ fn carry_citation_results(
     Ok(())
 }
 
-/// Branch 复制源 Chat 的 Loop，照历史装载的规则进入子 Chat：运行或等待中的转为已中断，接收暂停，
-/// Chat 继续时恢复。
+/// A Branch copies the source Chat's Loop into the child Chat under the rules of history loading:
+/// running or waiting work becomes interrupted and receiving is paused, resuming when the Chat
+/// continues.
 fn carry_loop(child: &mut ChatSnapshot, source: &ChatSnapshot) {
     child.chat_loop = source.chat_loop.clone();
     // The copy subscribes on its own: a subscription id names one Loop's subscription.
@@ -527,8 +536,10 @@ fn carry_plans_and_progress(
     child.progress = progress;
 }
 
-/// 复制对话中的压缩摘要仍标记为压缩摘要。Branch 按当前链复制边界之后的可见对话，边界本身不再
-/// 需要：子 Chat 的对话链从复制的第一条消息开始（Claude Code `/branch` 也把边界接成直线链）。
+/// Compaction summaries in the copied conversation stay marked as compaction summaries. A Branch
+/// copies the visible conversation after the boundary along the current chain, and the boundary
+/// itself is no longer needed: the child Chat's conversation chain starts at the first copied
+/// message (Claude Code's `/branch` also links the boundary into a straight chain).
 fn carry_compaction_summaries(
     child: &mut ChatSnapshot,
     source: &ChatSnapshot,
@@ -776,8 +787,10 @@ fn normalize_requested_name(name: Option<&str>) -> Result<Option<String>, AgentE
     Ok(Some(name.into()))
 }
 
-/// 照 Claude Code `getUniqueForkName`：标题基于指定名称或首条提示（压缩空白后取前 100 个字符），
-/// 总是追加 " (Branch)"；与已有标题（不区分大小写）重名时依次使用 " (Branch 2)"、" (Branch 3)"。
+/// Following Claude Code's `getUniqueForkName`: the title is based on the given name or the first
+/// prompt (whitespace collapsed, first 100 characters) and always gets " (Branch)" appended; when
+/// it collides with an existing title (case-insensitive), " (Branch 2)", " (Branch 3)" are used in
+/// turn.
 fn branch_title<'a>(
     requested_name: Option<&str>,
     public_seed: &[BranchPublicItem],

@@ -1,7 +1,9 @@
-//! 照 Claude Code，把 Esc 中断、`!` 命令和后台任务完成表示为普通的 user 消息。
+//! Following Claude Code, Esc interrupts, `!` commands and background task completions are
+//! represented as ordinary user messages.
 //!
-//! 这些消息直接进入对话，既发给模型，也随对话一起保存与恢复；终端通过
-//! [`LocalMessage::parse`] 识别它们，按 Claude Code 的样式呈现，而不显示原始标签。
+//! These messages go straight into the conversation: they are sent to the model and saved and
+//! restored with the conversation; the terminal recognizes them through [`LocalMessage::parse`] and
+//! renders them in Claude Code's style instead of showing the raw tags.
 
 use std::path::PathBuf;
 
@@ -65,7 +67,7 @@ impl TaskNotificationStatus {
     }
 }
 
-/// 后台 Shell 任务结束后写入所属 Chat 的任务通知。
+/// Task notification written to the owning Chat when a background Shell task ends.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskNotification {
     pub chat_id: ChatId,
@@ -122,7 +124,7 @@ impl TaskNotification {
     }
 }
 
-/// 终端识别出的本地消息；普通用户输入返回 `None`。
+/// A local message recognized by the terminal; ordinary user input returns `None`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalMessage {
     AgentCommunication {

@@ -1,6 +1,7 @@
-//! Chat 的 Loop 随对话链记录：rewind、Branch、压缩与重启后保持同一个 Loop、它的 Tick 订阅与接收开关。
-//! 同一测试进程中的多个 Agent 实例模拟多个进程；Trigger 租约、锁文件接管、接收状态与子进程持锁见
-//! `loop_trigger_safety.rs`。
+//! A Chat's Loop is recorded along the conversation chain: after rewind, Branch, compaction and
+//! restart it keeps the same Loop, its Tick Subscriptions and its receiving switch. Several Agent
+//! instances in the same test process simulate several processes; for the Trigger lease, lock file
+//! takeover, receiving state and a child process holding the lock, see `loop_trigger_safety.rs`.
 
 use std::{
     path::PathBuf,
@@ -22,7 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// 每个请求都回复一段文字；不带工具的摘要请求回复摘要。
+/// Replies to every request with some text; summary requests without tools get a summary reply.
 struct EchoModel {
     requests: Mutex<Vec<ModelRequest>>,
 }
@@ -34,7 +35,8 @@ impl EchoModel {
         })
     }
 
-    /// 最后一条消息包含 `needle` 的请求数，用于统计 Trigger 触发的运行。
+    /// Number of requests whose last message contains `needle`, used to count runs started by
+    /// Triggers.
     fn prompts_containing(&self, needle: &str) -> usize {
         self.requests
             .lock()
@@ -427,7 +429,8 @@ async fn subscriptions_survive_restart_after_compaction() {
         assert_eq!(restored.chat_loop.receiving, HISTORY_LOADED, "{label}");
 
         complete_turn(&restarted, chat, "resume watching").await;
-        // Loop 条目不进入发给模型的对话：重启后的请求只多出恢复哨兵与新的提示。
+        // Loop entries do not enter the conversation sent to the model: the request after restart
+        // adds only the resume sentinel and the new prompt.
         let sent = model
             .last_conversation_request()
             .messages

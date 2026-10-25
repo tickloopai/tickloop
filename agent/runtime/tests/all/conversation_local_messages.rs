@@ -342,7 +342,8 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
     let restored = Agent::open_embedded(archive, config(), model.clone()).unwrap();
     restored.install_own_tickhost();
     restored.resume_chat(chat).await.unwrap();
-    // 照 Claude Code：恢复时末尾是 user 消息，追加不请求回复的 assistant 哨兵。
+    // Following Claude Code: when the conversation ends with a user message on resume, append the
+    // no-response-requested assistant sentinel.
     let mut expected = expected;
     expected.push(assistant("No response requested."));
     assert_eq!(

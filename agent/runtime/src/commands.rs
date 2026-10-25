@@ -324,7 +324,8 @@ fn command_state_is_terminal(state: &CommandState) -> bool {
     )
 }
 
-/// 照 Claude Code 的后台任务状态：用户停止记为 killed，其余非正常结束记为 failed。
+/// Following Claude Code's background task states: a user stop is recorded as killed, other
+/// abnormal endings as failed.
 pub(super) fn notification_status(
     state: &CommandState,
     reason: Option<&str>,

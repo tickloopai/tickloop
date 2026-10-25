@@ -143,7 +143,7 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
         outcome.messages_summarized,
         raw_messages.len() - checkpoint.message_index
     );
-    // 照 Claude Code partial compact：边界、选点之前保留的消息、摘要。
+    // Following Claude Code's partial compact: boundary, messages kept before the pick, summary.
     assert_eq!(
         outcome.snapshot.messages.len(),
         checkpoint.message_index + 2
@@ -167,7 +167,8 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
         serde_json::to_value(&before.operations).unwrap()
     );
     assert_eq!(outcome.snapshot.user_shells, before.user_shells);
-    // 保留的提示在 Transcript 中重写为新条目，rewind 位置随之换用新 id。
+    // Kept prompts are rewritten as new entries in the Transcript, and rewind points switch to the
+    // new ids accordingly.
     let kept_points = outcome.snapshot.rewind_points();
     assert_eq!(
         kept_points
@@ -476,7 +477,8 @@ async fn repeated_summaries_follow_claude_code_partial_compaction_layouts() {
     run_prompt(&agent, &mut events, chat.uuid(), "prompt B").await;
     summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::FromHere).await;
 
-    // 向前保留时，之前的边界与摘要作为保留消息原样留在新边界之后。
+    // When keeping forward, the earlier boundary and summary stay unchanged after the new boundary
+    // as kept messages.
     run_prompt(&agent, &mut events, chat.uuid(), "prompt C").await;
     let summary_c = summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::FromHere).await;
     assert_eq!(
@@ -486,7 +488,8 @@ async fn repeated_summaries_follow_claude_code_partial_compaction_layouts() {
     assert!(summary_c.snapshot.is_compact_boundary(0));
     assert!(summary_c.snapshot.is_compact_boundary(1));
 
-    // 向后保留时，被摘要范围从最后一个边界开始，保留消息中不再有旧边界和旧摘要。
+    // When keeping backward, the summarized range starts at the last boundary, and the kept
+    // messages no longer contain the old boundary and summary.
     run_prompt(&agent, &mut events, chat.uuid(), "prompt D").await;
     let summary_d = summarize_last_prompt(&agent, chat.uuid(), SummaryDirection::UpToHere).await;
     assert_eq!(summary_texts(&summary_d.snapshot), ["summary through C"]);
@@ -1158,7 +1161,8 @@ async fn pending_adapter_applies_and_preserves_original_private_history() {
         false,
     )
     .await;
-    // 照 Claude Code，向前保留的消息原样保留，其中的私有推理仍在模型可见的对话中。
+    // Following Claude Code, messages kept forward stay unchanged, and their private reasoning
+    // remains in the model-visible conversation.
     assert_pending_model_after_summary(
         SummaryDirection::FromHere,
         private_answer("first public answer"),

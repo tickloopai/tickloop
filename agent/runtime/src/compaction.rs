@@ -1,9 +1,12 @@
-//! 压缩边界与压缩摘要，照 Claude Code `compact_boundary` 与 `isCompactSummary` 的表示。
+//! Compaction boundaries and compaction summaries, represented following Claude Code's
+//! `compact_boundary` and `isCompactSummary`.
 //!
-//! 全量压缩在对话末尾追加一个边界 system 消息和一条摘要 user 消息，边界之前的消息仍留在本进程
-//! 内存中，模型只看到最后一个边界之后的消息。定向摘要（partial compact）把对话替换为
-//! 边界、摘要与保留的消息；保留的消息换上新的消息 id，在 Transcript 中直线重写到新边界之后
-//! （偏离 Claude Code 的保留区段重接，见 `CompactionLayout::apply`）。
+//! Full compaction appends a boundary system message and a summary user message at the end of the
+//! conversation; messages before the boundary stay in this process's memory, and the model sees
+//! only messages after the last boundary. A directed summary (partial compact) replaces the
+//! conversation with the boundary, the summary and the kept messages; kept messages get new message
+//! ids and are rewritten linearly after the new boundary in the Transcript (diverging from Claude
+//! Code's preserved-segment relinking; see `CompactionLayout::apply`).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,7 +18,7 @@ use tickloop_agent_protocol::{
     SummarizeMetadata, Usage,
 };
 
-/// 压缩后对话中一条消息的来源。
+/// Source of one message in the conversation after compaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MessageSource {
     Existing(usize),
@@ -23,10 +26,11 @@ pub(super) enum MessageSource {
     Summary,
 }
 
-/// 压缩结果：新对话由已有消息、新的边界与摘要按顺序组成。
+/// Compaction result: the new conversation consists of existing messages, the new boundary and the
+/// summary, in order.
 pub(super) struct CompactionLayout {
     pub sources: Vec<MessageSource>,
-    /// 边界的逻辑父消息在压缩前对话中的下标。
+    /// Index of the boundary's logical parent message in the conversation before compaction.
     pub logical_parent: Option<usize>,
     pub boundary: CompactBoundary,
     pub summary: Message,
@@ -40,7 +44,8 @@ impl CompactionLayout {
             .position(|candidate| *candidate == source)
     }
 
-    /// 压缩前的全部消息原样留在开头（全量压缩）；否则是定向摘要，保留的消息要重写到新边界之后。
+    /// All messages before compaction stay at the start unchanged (full compaction); otherwise this
+    /// is a directed summary, and kept messages are rewritten after the new boundary.
     pub(super) fn keeps_existing_prefix(&self, message_count: usize) -> bool {
         let existing = self
             .sources
@@ -54,13 +59,17 @@ impl CompactionLayout {
                 .all(|(index, source)| *source == MessageSource::Existing(index))
     }
 
-    /// 按布局生成压缩后的快照：保留消息的附属记录随消息移动，边界与摘要获得新的消息 id。
+    /// Produces the post-compaction snapshot according to the layout: records attached to kept
+    /// messages move with them, and the boundary and summary get new message ids.
     ///
-    /// 定向摘要偏离 Claude Code：Claude Code 让保留的消息沿用原条目，加载时按边界上的保留区段
-    /// 重接，但定向摘要叠加、rewind 到区段的头之后继续对话时，重接会丢掉或复活消息。Tickloop
-    /// 把保留的消息作为新条目直线重写在新边界之后，因此它们换上新的消息 id（关联提示 id 的文件
-    /// 回滚快照由调用方按 [`Self::renamed_message_ids`] 重记）；其中 assistant 消息的用量照
-    /// Claude Code 重接时的做法清零，被带到新边界之后的旧边界标记为 `preserved_by_later_summary`。
+    /// Directed summaries diverge from Claude Code: Claude Code keeps the original entries for kept
+    /// messages and relinks them on load via the preserved segment on the boundary, but when
+    /// directed summaries stack, or the conversation continues after a rewind past the segment's
+    /// head, relinking drops or revives messages. Tickloop rewrites kept messages linearly as new
+    /// entries after the new boundary, so they get new message ids (file rollback snapshots tied to
+    /// prompt ids are re-recorded by the caller per [`Self::renamed_message_ids`]); usage of kept
+    /// assistant messages is zeroed as Claude Code does when relinking, and old boundaries carried
+    /// after the new boundary are marked `preserved_by_later_summary`.
     pub(super) fn apply(
         &self,
         snapshot: &ChatSnapshot,
@@ -257,7 +266,8 @@ impl CompactionLayout {
         (compacted, compacted_bookkeeping)
     }
 
-    /// `apply` 前后同一条保留消息的 id 变化（旧 id → 新 id）；全量压缩时为空。
+    /// Id changes of the same kept message before and after `apply` (old id → new id); empty for
+    /// full compaction.
     pub(super) fn renamed_message_ids(
         &self,
         before: &ChatSnapshot,

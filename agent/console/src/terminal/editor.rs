@@ -153,7 +153,8 @@ impl Editor {
         self.history_position.is_some()
     }
 
-    /// 用持久化历史替换上箭头列表，`history` 由旧到新排列；浏览中不替换。
+    /// Replaces the Up-arrow list with persisted history, `history` ordered oldest first; not
+    /// replaced while browsing.
     pub(super) fn replace_history(&mut self, history: Vec<String>) {
         if !self.is_browsing_history() {
             self.history = history;

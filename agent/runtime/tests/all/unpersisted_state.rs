@@ -37,8 +37,9 @@ async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) -> Receipt {
     receipt
 }
 
-/// 照 Claude Code，重启恢复只还原对话：权限模式回到默认，挂起的权限请求、提问、排队输入与命令、
-/// 会话级规则、附加目录、操作记录、用量账本和事件都不再出现。
+/// Following Claude Code, restart restores only the conversation: the permission mode returns to
+/// default, and pending permission requests, questions, queued input and commands, session-level
+/// rules, additional directories, operation records, the usage ledger and events no longer appear.
 #[tokio::test]
 async fn restart_keeps_the_conversation_but_forgets_session_only_state() {
     let directory = tempfile::tempdir().unwrap();
@@ -174,7 +175,8 @@ async fn restart_keeps_the_conversation_but_forgets_session_only_state() {
     first.shutdown().await;
 }
 
-/// 用量只统计本进程：恢复后的 Chat 从空账本开始，新一轮对话只记本进程的请求。
+/// Usage counts only this process: a resumed Chat starts with an empty ledger, and the new turn
+/// records only this process's requests.
 #[tokio::test]
 async fn usage_after_restart_counts_only_requests_made_by_this_process() {
     let directory = tempfile::tempdir().unwrap();

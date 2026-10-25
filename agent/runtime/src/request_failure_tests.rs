@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// 报告用量后永不完成的独立权限检查模型。
+/// Standalone permission-check model that never completes after reporting usage.
 struct Checker {
     calls: AtomicUsize,
     dropped: AtomicBool,

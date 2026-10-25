@@ -125,7 +125,8 @@ pub(super) fn finish_success(
     })
 }
 
-/// 失败、被拒绝或取消的摘要不改变对话，也没有写入 Transcript；按错误类型说明结果。
+/// A failed, rejected or cancelled summary does not change the conversation and is not written
+/// to the Transcript; the result is explained by error type.
 pub(super) fn finish_failure(
     console: &Console,
     error: &AccessError,

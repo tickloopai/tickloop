@@ -1,6 +1,7 @@
-//! 进程登记：照 Claude Code `utils/concurrentSessions.ts`，每个 Agent 进程在
-//! `<root>/sessions/<pid>.json` 记录自己和当前前台 Chat，退出时删除；统计活动进程时
-//! 清理已退出进程留下的文件。所有写入失败只影响登记本身，不影响运行。
+//! Process registry: following Claude Code's `utils/concurrentSessions.ts`, each Agent process
+//! records itself and its current foreground Chat in `<root>/sessions/<pid>.json` and deletes it on
+//! exit; counting active processes cleans up files left by exited processes. Any write failure
+//! affects only the registration, not the run.
 
 use std::{
     fs,
@@ -18,7 +19,7 @@ use tickloop_agent_base::private_fs::{
 
 const SESSIONS_DIRECTORY: &str = "sessions";
 const INTERACTIVE_KIND: &str = "interactive";
-/// 照 Claude Code `CLAUDE_CODE_ENTRYPOINT`：有终端时为 `cli`，否则为 `sdk-cli`。
+/// Following Claude Code's `CLAUDE_CODE_ENTRYPOINT`: `cli` with a terminal, otherwise `sdk-cli`.
 const TERMINAL_ENTRYPOINT: &str = "cli";
 const PIPED_ENTRYPOINT: &str = "sdk-cli";
 
@@ -33,14 +34,14 @@ struct Registration {
     entrypoint: &'static str,
 }
 
-/// 本进程的登记文件；析构时删除。
+/// This process's registry file; deleted on drop.
 pub(super) struct ProcessRegistration {
     path: PathBuf,
     record: Registration,
 }
 
 impl ProcessRegistration {
-    /// 写入登记文件。失败时返回 `None`，本次运行不登记。
+    /// Writes the registry file. Returns `None` on failure, and this run is not registered.
     pub(super) fn register(
         root: &Path,
         chat_id: Option<Uuid>,
@@ -77,7 +78,7 @@ impl ProcessRegistration {
         self.record.chat_id
     }
 
-    /// 前台 Chat 切换后改写登记文件。
+    /// Rewrites the registry file after the foreground Chat changes.
     pub(super) fn update_chat(&mut self, chat_id: Option<Uuid>) {
         if self.record.chat_id != chat_id {
             self.record.chat_id = chat_id;
@@ -106,8 +107,9 @@ impl Drop for ProcessRegistration {
     }
 }
 
-/// 照 Claude Code `countConcurrentSessions`：统计登记目录中仍在运行的进程（含本进程），
-/// 并删除已退出进程的文件。只处理严格形如 `<pid>.json` 的文件名。
+/// Following Claude Code's `countConcurrentSessions`: counts processes in the registry directory
+/// that are still running (including this one) and deletes files of exited processes. Only handles
+/// file names strictly of the form `<pid>.json`.
 pub(super) fn count_concurrent_processes(root: &Path) -> usize {
     let directory = root.join(SESSIONS_DIRECTORY);
     let Ok(entries) = fs::read_dir(&directory) else {
@@ -134,12 +136,13 @@ pub(super) fn count_concurrent_processes(root: &Path) -> usize {
     count
 }
 
-/// 照 Claude Code `isProcessRunning`：`kill(pid, 0)` 成功才算存活。
+/// Following Claude Code's `isProcessRunning`: alive only if `kill(pid, 0)` succeeds.
 fn is_process_running(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
-    // SAFETY: 信号 0 只做存在与权限检查，不向目标进程发送信号。
+    // SAFETY: signal 0 only checks existence and permissions and sends no signal to the target
+    // process.
     pid > 1 && unsafe { libc::kill(pid, 0) } == 0
 }
 

@@ -43,7 +43,7 @@ async fn require_workspace_write_approval(agent: &Agent, chat: Uuid) {
         .unwrap();
 }
 
-/// 按顺序回复的模型；`None` 表示这次请求一直等待，直到运行被取消。
+/// A model replying in order; `None` means this request waits until the run is cancelled.
 struct SequenceModel {
     requests: Mutex<Vec<ModelRequest>>,
     replies: Mutex<VecDeque<Option<Vec<Content>>>>,
@@ -399,7 +399,8 @@ async fn killed_process_resumes_from_its_flushed_transcript() {
 
 #[tokio::test]
 async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history() {
-    // 末尾是工具结果：先追加"从中断处继续"的 meta 消息，再追加哨兵。
+    // Ends with a tool result: first append the "continue from where it was interrupted" meta
+    // message, then the sentinel.
     {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
@@ -444,7 +445,8 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         );
         restored.shutdown().await;
     }
-    // 工具结果没有写入：所有 tool_use 都没有结果的 assistant 被过滤，提示后接哨兵。
+    // Tool results were not written: assistant messages whose tool_uses all lack results are
+    // filtered out, and the sentinel follows the prompt.
     {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
@@ -542,7 +544,7 @@ async fn a_restored_loop_is_interrupted_and_paused_until_a_new_input() {
     assert_eq!(live.chat_loop.state, LoopState::Running);
     original.flush_transcripts().await;
 
-    // 原进程仍在运行时，另一个实例恢复同一 Chat。
+    // While the original process is still running, another instance resumes the same Chat.
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("trigger resumed")]));
     let other = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
     let restored = other.resume_chat(chat).await.unwrap();
@@ -636,7 +638,7 @@ fn tool_results(request: &ModelRequest) -> Vec<(String, ToolResultContent)> {
         .collect()
 }
 
-/// 读出或改写 Transcript 中某个工具结果条目的 `content` 原始 JSON。
+/// Reads or rewrites the raw `content` JSON of a tool result entry in the Transcript.
 fn edit_stored_tool_result(path: &Path, call_id: &str, edit: impl Fn(&mut Value)) -> Value {
     let mut stored = None;
     let lines = std::fs::read_to_string(path)
@@ -663,7 +665,8 @@ fn edit_stored_tool_result(path: &Path, call_id: &str, edit: impl Fn(&mut Value)
     stored.unwrap_or_else(|| panic!("Transcript has no result for {call_id}"))
 }
 
-/// 从已加载的来源 Chat 分支，关闭后以 `model` 重新打开并恢复子 Chat，使其只能从 Transcript 读回。
+/// Branches from the loaded source Chat, closes, reopens with `model` and resumes the child Chat,
+/// so it can only be read back from the Transcript.
 async fn branch_and_reopen(
     agent: Agent,
     root: &Path,
@@ -953,7 +956,8 @@ async fn interruption_while_waiting_for_permission_leaves_no_pending_work_after_
     }
     original.flush_transcripts().await;
 
-    // 原进程停在等待权限处，另一个实例恢复同一 Chat，相当于进程在此退出后重启。
+    // The original process stopped while waiting for permission and another instance resumes the
+    // same Chat, equivalent to the process exiting here and restarting.
     let resumed =
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let restored = resumed.resume_chat(chat).await.unwrap();
@@ -1132,8 +1136,10 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     restored.shutdown().await;
 }
 
-/// 恢复的 Chat 不会立即写 Transcript；期间文件被外部删除后，继续对话既不重建只含后续
-/// 条目的断链文件，退出时也不写出元数据空壳，并通过写入错误提示后续内容不再保存。
+/// A resumed Chat does not write its Transcript immediately; if the file is deleted externally
+/// meanwhile, continuing the conversation neither recreates a broken-chain file containing only
+/// later entries nor writes an empty metadata shell on exit, and a write error signals that later
+/// content is no longer saved.
 #[tokio::test]
 async fn a_resumed_chat_whose_transcript_was_deleted_is_not_recreated() {
     let directory = tempfile::tempdir().unwrap();
@@ -1213,8 +1219,9 @@ async fn externally_removing_the_transcript_of_a_running_chat_stops_saving_it() 
     assert!(transcripts.is_empty(), "{transcripts:?}");
 }
 
-/// 照 Claude Code `shouldSkipPersistence`：`cleanupPeriodDays` 为 0 时对话不产生 Transcript，但照常读写
-/// 用户设置，也不删除已有的记录。
+/// Following Claude Code's `shouldSkipPersistence`: when `cleanupPeriodDays` is 0, conversations
+/// produce no Transcript, but user settings are still read and written and existing records are not
+/// deleted.
 #[tokio::test]
 async fn a_zero_cleanup_period_writes_no_transcript() {
     let directory = tempfile::tempdir().unwrap();
@@ -1289,7 +1296,7 @@ async fn the_working_directory_resumes_from_the_last_recorded_entry() {
     }
     complete_turn(&agent, chat, "prompt in the right directory").await;
     agent.flush_transcripts().await;
-    // 之后的切换没有写出任何新条目，不在 Transcript 中。
+    // Later switches wrote no new entries and are not in the Transcript.
     agent
         .set_directories(chat, directories[0].clone(), Vec::new())
         .await
@@ -1338,7 +1345,8 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     origin.shutdown().await;
     drop(origin);
 
-    // 照 Claude Code，恢复时只加载边界之后的链，并删除只含空白的回复。
+    // Following Claude Code, resume loads only the chain after the boundary and removes
+    // whitespace-only replies.
     let first_model = Arc::new(ScriptedModel::new(vec![text("fourth answer")]));
     let first_resume = Agent::open_embedded(root.clone(), config(), first_model.clone()).unwrap();
     let restored = first_resume.resume_chat(chat).await.unwrap();
@@ -1353,7 +1361,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     first_resume.shutdown().await;
     drop(first_resume);
 
-    // 被删除的消息仍在链上，再次恢复时同样被删除。
+    // Removed messages are still on the chain and are removed again on the next resume.
     let second_model = Arc::new(ScriptedModel::new(vec![text("fifth answer")]));
     let second_resume = Agent::open_embedded(root, config(), second_model.clone()).unwrap();
     let restored = second_resume.resume_chat(chat).await.unwrap();
@@ -1367,7 +1375,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
     second_resume.shutdown().await;
 }
 
-/// 规格"会话内容的表示"中列出的 Transcript 条目类型。
+/// Transcript entry types listed in the spec section "Representation of session content".
 const SPECIFIED_LINE_TYPES: [&str; 18] = [
     "user",
     "assistant",
@@ -1389,7 +1397,7 @@ const SPECIFIED_LINE_TYPES: [&str; 18] = [
     "retained-snapshot",
 ];
 
-/// Loop id、计划（版本与内容）与进度步骤。
+/// Loop id, plan (version and content) and progress steps.
 type LoopPlanState = (LoopId, Option<(u64, String)>, Option<String>);
 
 fn plan_and_progress(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> LoopPlanState {
@@ -1583,7 +1591,8 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
     assert_eq!(restored.folder, before.folder);
     assert_eq!(restored.folder, Some(other.canonicalize().unwrap()));
     assert_eq!(plan_and_progress(&restored), plan_and_progress(&before));
-    // 重启只加载最后一个压缩边界之后的链：进程内的位置减去边界下标后应一致。
+    // A restart loads only the chain after the last compaction boundary: in-process positions minus
+    // the boundary index should match.
     let chain_root = compaction_positions(&before)[0].0;
     assert_eq!(
         compaction_positions(&restored),

@@ -151,7 +151,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
         outcome.snapshot.public_conversation_items().unwrap(),
         source_before.public_conversation_items().unwrap()
     );
-    // 源 Chat 的 Loop 复制到子 Chat。
+    // The source Chat's Loop is copied to the child Chat.
     assert_eq!(outcome.snapshot.chat_loop.id, source_receipt.loop_id);
     assert!(outcome.snapshot.request_usage.entries().is_empty());
     assert_eq!(
@@ -261,7 +261,8 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
     agent.shutdown().await;
     drop(agent);
 
-    // 请求标识只在创建 Branch 的进程内有效；重启后 Branch 来源与名称由 Transcript 元数据恢复。
+    // Request identifiers are only valid within the process that created the Branch; after a
+    // restart the Branch origin and name are restored from Transcript metadata.
     let reopened = Agent::open_embedded(archive, config(), model).unwrap();
     reopened.resume_chat(source_chat_id).await.unwrap();
     let restored = reopened.resume_chat(outcome.child_chat_id).await.unwrap();
@@ -1078,14 +1079,16 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
     let reopened_source = reopened.resume_chat(source_chat_id).await.unwrap();
     assert!(has_task_notification(&reopened_source, shell.command_id));
     let reopened_child = reopened.resume_chat(outcome.child_chat_id).await.unwrap();
-    // 照 Claude Code：恢复时末尾是 user 消息，追加不请求回复的 assistant 哨兵。
+    // Following Claude Code: when the conversation ends with a user message on resume, append the
+    // no-response-requested assistant sentinel.
     let sentinel = Message {
         role: tickloop_agent_protocol::Role::Assistant,
         content: vec![Content::Text {
             text: "No response requested.".into(),
         }],
     };
-    // 复制种子的公开来源只在创建 Branch 的进程内有效；重启后公开对话按子 Chat 自身的消息投影。
+    // The public origin of copied seeds is only valid within the process that created the Branch;
+    // after a restart the public conversation is projected from the child Chat's own messages.
     let without_source = |items: &[BranchPublicItem]| {
         items
             .iter()

@@ -1,8 +1,10 @@
-//! 输入历史：照 Claude Code `history.ts`，保存在全局 `<root>/history.jsonl`。
+//! Input history: following Claude Code's `history.ts`, stored globally in `<root>/history.jsonl`.
 //!
-//! 条目先进入内存缓冲，由后台写入线程加锁追加到文件；读取时先看缓冲，
-//! 再倒序读文件并跳过坏行。已解析的文件内容按文件身份与长度缓存，文件变长时
-//! 只解析新增字节。大段粘贴按内容哈希写入 `<root>/paste-cache/`，只在填回草稿时读取。
+//! Entries go into an in-memory buffer first, and a background writer thread appends them to the
+//! file under a lock; reads check the buffer first, then read the file backwards and skip malformed
+//! lines. Parsed file content is cached by file identity and length, and when the file grows only
+//! the new bytes are parsed. Large pastes are written to `<root>/paste-cache/` by content hash and
+//! read only when filled back into the draft.
 
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -30,11 +32,12 @@ const MAX_SHELL_HISTORY_COMMANDS: usize = 50;
 const SHELL_PROMPT_PREFIX: char = '!';
 const MAX_INLINE_PASTED_CHARACTERS: usize = 1024;
 const PASTE_HASH_HEX_LENGTH: usize = 16;
-// proper-lockfile 语义：锁目录超过 10 秒视为过期；拿不到锁时再试 3 次，每次间隔 50ms。
+// proper-lockfile semantics: a lock directory older than 10 seconds is stale; when the lock is
+// unavailable, retry 3 more times, 50ms apart.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
 const LOCK_RETRIES: usize = 3;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-// 追加失败后每 500ms 重试，最多 5 次；之后暂停，直到下一条输入到来。
+// After an append fails, retry every 500ms, up to 5 times; then pause until the next input arrives.
 const MAX_FLUSH_RETRIES: usize = 5;
 const FLUSH_RETRY_DELAY: Duration = Duration::from_millis(500);
 const REVERSE_READ_CHUNK_BYTES: u64 = 64 * 1024;
@@ -66,15 +69,15 @@ impl HistoryScope {
     }
 }
 
-/// 草稿中一段折叠粘贴的位置，`range` 是原始草稿中的字节范围。
+/// Position of a collapsed paste in the draft; `range` is the byte range in the original draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PastedText {
     pub(super) id: u64,
     pub(super) range: Range<usize>,
 }
 
-/// 搜索候选只携带显示文本与已存储的粘贴引用；完整输入由
-/// [`InputHistory::resolve_match`] 在填回草稿时展开。
+/// Search candidates carry only the display text and stored paste references; the full input is
+/// expanded by [`InputHistory::resolve_match`] when filled back into the draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct HistoryMatch {
     project: String,
@@ -87,7 +90,7 @@ impl HistoryMatch {
         &self.project
     }
 
-    /// 带粘贴占位符的显示文本，用于列表展示与搜索匹配。
+    /// Display text with paste placeholders, used for list display and search matching.
     pub(super) fn display(&self) -> &str {
         &self.display
     }
@@ -222,7 +225,7 @@ impl InputHistory {
         }
     }
 
-    /// 不写盘的历史，只在本进程内可见。
+    /// History that is not written to disk, visible only within this process.
     pub(super) fn in_memory() -> Self {
         Self {
             paths: None,
@@ -281,9 +284,11 @@ impl InputHistory {
         Ok(true)
     }
 
-    /// 照 Claude Code `removeLastFromHistory`：提交后又被撤回、放回输入框的提示不再留在历史里，
-    /// 上箭头不会把它和输入框中的文字重复列出。只撤回最近一次记录且内容就是 `prompt` 的条目，
-    /// 最多一次；仍在缓冲中的直接移除，已写入文件的在本进程读取时跳过。
+    /// Following Claude Code's `removeLastFromHistory`: a prompt that was submitted and then
+    /// withdrawn back into the input box no longer stays in history, so the Up arrow does not list
+    /// it alongside the text in the input box. Withdraws only the most recently recorded entry, and
+    /// only if its content is exactly `prompt`, at most once; an entry still in the buffer is
+    /// removed directly, and one already written to the file is skipped when this process reads it.
     pub(super) fn withdraw_last(&mut self, prompt: &str) {
         let Some(entry) = self.last_added.take() else {
             return;
@@ -305,7 +310,8 @@ impl InputHistory {
         }
     }
 
-    /// 上箭头历史：只看当前项目，当前 Chat 的条目在前，各组内由新到旧。
+    /// Up-arrow history: current project only, current Chat's entries first, newest first within
+    /// each group.
     pub(super) fn recent_prompts(
         &self,
         chat_id: &str,
@@ -319,8 +325,9 @@ impl InputHistory {
             .collect())
     }
 
-    /// Shell 补全历史：照 Claude Code `getShellHistoryCommands`，在上箭头的同一窗口内
-    /// 取以 `!` 开头的显示文本，去掉前缀并修剪空白后去重，最多 50 条；不展开粘贴。
+    /// Shell completion history: following Claude Code's `getShellHistoryCommands`, takes display
+    /// texts starting with `!` within the same window as the Up arrow, strips the prefix, trims
+    /// whitespace and deduplicates, at most 50 entries; pastes are not expanded.
     pub(super) fn recent_shell_commands(
         &self,
         chat_id: &str,
@@ -339,12 +346,14 @@ impl InputHistory {
             .collect())
     }
 
-    /// 展开候选中的粘贴引用，得到填回草稿的完整输入；大段粘贴此时才读取 paste-cache。
+    /// Expands paste references in a candidate into the full input to fill back into the draft;
+    /// large pastes are read from paste-cache only at this point.
     pub(super) fn resolve_match(&self, candidate: &HistoryMatch) -> String {
         self.resolve_pasted_text(&candidate.display, &candidate.pasted_contents)
     }
 
-    /// 当前项目最近 100 条，当前 Chat 的条目排在前面，各组内由新到旧。
+    /// The latest 100 entries of the current project, current Chat's entries first, newest first
+    /// within each group.
     fn project_window(
         &self,
         chat_id: &str,
@@ -372,7 +381,8 @@ impl InputHistory {
         Ok(current_chat)
     }
 
-    /// 一次性搜索，供测试直接断言候选；界面通过 [`HistorySearch`] 使用同一候选集。
+    /// One-shot search so tests can assert candidates directly; the UI uses the same candidate set
+    /// through [`HistorySearch`].
     #[cfg(test)]
     pub(super) fn search(
         &self,
@@ -386,7 +396,8 @@ impl InputHistory {
         Ok(filter_matches(&candidates, query, limit))
     }
 
-    /// 停止后台写入线程并冲刷缓冲；退出时调用，重复调用无副作用。
+    /// Stops the background writer thread and flushes the buffer; called on exit, repeated calls
+    /// have no effect.
     pub(super) fn flush(&mut self) {
         let Some(writer) = self.writer.take() else {
             return;
@@ -396,7 +407,8 @@ impl InputHistory {
         let _ = writer.join();
     }
 
-    /// 搜索候选：按范围过滤、按显示文本去重，由新到旧最多 100 条。
+    /// Search candidates: filtered by scope, deduplicated by display text, newest first, at most
+    /// 100.
     fn search_candidates(
         &self,
         chat_id: &str,
@@ -437,7 +449,8 @@ impl InputHistory {
             .parsed_file
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // 持有缓冲锁完成快照并同步文件新增部分，避免与写入线程交错时重复或遗漏条目。
+        // Take the snapshot and sync the newly appended part of the file while holding the buffer
+        // lock, so interleaving with the writer thread neither duplicates nor misses entries.
         let pending = {
             let pending = self.shared.lock();
             if let Some(paths) = &self.paths {
@@ -491,7 +504,8 @@ impl InputHistory {
             return stored;
         }
         let hash = hash_pasted_text(content);
-        // 与 Claude Code 一致：写入失败不阻止条目记录，只是恢复时无法展开该粘贴。
+        // Consistent with Claude Code: a write failure does not block recording the entry; the
+        // paste just cannot be expanded on restore.
         let _ = write_private_file(&paths.paste_cache, &paths.paste_file(&hash), content);
         stored.content = None;
         stored.content_hash = Some(hash);
@@ -576,9 +590,11 @@ fn append_pending_entries(shared: &WriterShared, paths: &HistoryPaths) -> io::Re
     append_batch(&mut file, &mut pending.entries)
 }
 
-/// 照 Claude Code `immediateFlushHistory`：拿到锁后先取出整批并清空缓冲再追加，
-/// 追加失败则丢弃该批，不会在重试时重写已写入的部分。已写入的半截字节在仍持锁时
-/// 截回原长度，避免留下坏行并与下一批的首行粘连。
+/// Following Claude Code's `immediateFlushHistory`: after acquiring the lock, take the whole batch
+/// and clear the buffer before appending; if the append fails the batch is dropped, so retries
+/// never rewrite already-written parts. Partially written bytes are truncated back to the original
+/// length while the lock is still held, so no malformed line is left glued to the first line of the
+/// next batch.
 fn append_batch(
     file: &mut impl HistoryAppendTarget,
     entries: &mut Vec<StoredEntry>,
@@ -613,7 +629,8 @@ impl HistoryAppendTarget for File {
     }
 }
 
-/// proper-lockfile 风格的目录锁：`mkdir` 成功即持有，释放时删除目录。
+/// proper-lockfile style directory lock: held once `mkdir` succeeds, released by removing the
+/// directory.
 struct HistoryFileLock {
     directory: PathBuf,
 }
@@ -658,9 +675,11 @@ fn lock_is_stale(directory: &Path) -> bool {
         .is_some_and(|age| age > LOCK_STALE_AFTER)
 }
 
-/// 已解析的 `history.jsonl` 片段：缓存 `[oldest_line_start, newest_line_end)` 内的完整行，
-/// 条目由新到旧排列。按需向前倒序补读更早的块；文件变长时只解析新增的完整行，
-/// 末尾未写完的半行留到补全后再读。文件被替换、截短或同长度改写时整体重建。
+/// A parsed slice of `history.jsonl`: caches the complete lines within
+/// `[oldest_line_start, newest_line_end)`, with entries ordered newest first. Earlier chunks are
+/// read backwards on demand; when the file grows only the new complete lines are parsed, and an
+/// unfinished trailing half line is left until it is complete. The cache is rebuilt entirely when
+/// the file is replaced, truncated or rewritten at the same length.
 #[derive(Debug, Default)]
 struct ParsedHistoryFile {
     file: Option<File>,
@@ -724,7 +743,8 @@ impl ParsedHistoryFile {
         Ok(())
     }
 
-    /// 向前补读一块完整行；已读到文件开头时返回 `false`。
+    /// Reads one more chunk of complete lines backwards; returns `false` once the start of the file
+    /// has been read.
     fn load_older_lines(&mut self) -> io::Result<bool> {
         let Some(file) = &self.file else {
             return Ok(false);
@@ -737,7 +757,8 @@ impl ParsedHistoryFile {
         loop {
             let start = end.saturating_sub(chunk_bytes);
             let chunk = read_byte_range(file, start, end)?;
-            // `end` 前一个字节是换行；块首的残缺行不算，单行超过块大小时加倍重读。
+            // The byte before `end` is a newline; an incomplete line at the chunk start does not
+            // count, and a single line larger than the chunk size doubles the chunk and rereads.
             let first_line_offset = if start == 0 {
                 0
             } else {
@@ -796,7 +817,8 @@ fn parse_entry(line: &[u8]) -> Option<StoredEntry> {
     (!entry.display.is_empty() && !entry.project.is_empty()).then_some(entry)
 }
 
-/// 把草稿中的折叠粘贴换成 `[Pasted text #N +M lines]` 占位符，返回显示文本与粘贴内容。
+/// Replaces collapsed pastes in the draft with `[Pasted text #N +M lines]` placeholders, returning
+/// the display text and the paste contents.
 fn split_pasted_texts(prompt: &str, pasted_texts: &[PastedText]) -> (String, Vec<(u64, String)>) {
     let mut ordered = pasted_texts.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|pasted| pasted.range.start);
@@ -834,7 +856,7 @@ fn format_pasted_text_reference(id: u64, line_breaks: usize) -> String {
     }
 }
 
-/// 与 Claude Code 相同，按 `\r\n`、`\r`、`\n` 计数换行。
+/// Same as Claude Code, counts line breaks by `\r\n`, `\r` and `\n`.
 fn line_break_count(text: &str) -> usize {
     let mut characters = text.chars().peekable();
     let mut count = 0;
@@ -1789,7 +1811,8 @@ mod tests {
             ["older"]
         );
 
-        // 同长度改写已解析的行并还原修改时间：未重读文件，仍返回缓存中的条目。
+        // Rewrite already-parsed lines at the same length and restore the modification time: the
+        // file is not reread, so cached entries are still returned.
         let length = fs::metadata(&history_file).unwrap().len() as usize;
         let modified = fs::metadata(&history_file).unwrap().modified().unwrap();
         let mut unreadable = vec![b'x'; length - 1];

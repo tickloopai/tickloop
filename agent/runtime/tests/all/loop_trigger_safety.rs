@@ -1,7 +1,8 @@
-//! 同一 Chat 只送达一次、停止即停止：跨实例的 Trigger 租约（flock）与接收状态文件。
-//! 同一测试进程中的多个 Agent 实例模拟多个进程，每个实例在自己的内存 Tick 流上观察同一个 Shell
-//! Tick；需要真实进程退出时，以本测试可执行文件运行 `lease_holder_child_process` 作为子进程持有
-//! 租约。
+//! One delivery per Chat, and stop means stop: cross-instance Trigger lease (flock) and receiving
+//! state file. Several Agent instances in the same test process simulate several processes, each
+//! observing the same Shell Tick on its own in-memory Tick stream; when a real process exit is
+//! needed, this test executable runs `lease_holder_child_process` as a child process that holds the
+//! lease.
 
 use std::{
     path::{Path, PathBuf},
@@ -134,7 +135,7 @@ async fn wait_until(what: &str, timeout: Duration, condition: impl Fn() -> bool)
     }
 }
 
-/// Chat 目录：与 Transcript 同级的 `<projectDir>/<chatId>/`。
+/// Chat directory: `<projectDir>/<chatId>/`, alongside the Transcript.
 fn chat_directory(root: &Path, chat: ChatId) -> PathBuf {
     std::fs::read_dir(root.join("projects"))
         .unwrap()
@@ -155,7 +156,7 @@ fn lock_path(root: &Path, chat: ChatId) -> PathBuf {
         .join("lease.lock")
 }
 
-/// 已保存的 Chat，它的 Loop 订阅 `task` 的 Shell Tick。
+/// A saved Chat whose Loop subscribes to the Shell Tick of `task`.
 async fn saved_chat_with_shared_loop(root: &Path, workdir: &Path, task: Uuid) -> ChatId {
     let creator = Agent::open_embedded(root.into(), config(), EchoModel::new()).unwrap();
     let shell = ShellTick::new(task);
@@ -167,7 +168,8 @@ async fn saved_chat_with_shared_loop(root: &Path, workdir: &Path, task: Uuid) ->
     chat
 }
 
-/// 一个实例：恢复共享 Chat，以一条用户输入继续它，并在自己的流上观察那个 Shell Tick。
+/// One instance: resumes the shared Chat, continues it with one user input, and observes that Shell
+/// Tick on its own stream.
 struct Instance {
     agent: Agent,
     model: Arc<EchoModel>,
@@ -223,7 +225,8 @@ struct SharedInstances {
     other: Instance,
 }
 
-/// 两个实例恢复同一 Chat；先送达的实例持有租约，另一个实例的送达留在它的订阅里。
+/// Two instances resume the same Chat; the instance that delivers first holds the lease, and the
+/// other instance's delivery stays in its subscription.
 async fn two_receiving_instances() -> SharedInstances {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
@@ -268,7 +271,8 @@ async fn stopping_the_chat_in_the_lease_holder_keeps_the_other_instance_from_del
     } = two_receiving_instances().await;
     holder.agent.stop(chat).await.unwrap();
     other.shell.update(3, SHARED_NOTE);
-    // 接手租约的实例读到暂停：同步为暂停接收且不送达。
+    // The instance taking over the lease reads the pause: it syncs to paused receiving and does not
+    // deliver.
     wait_for_receiving(&other.agent, chat, STOPPED).await;
     tokio::time::sleep(SETTLE).await;
     assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0);
@@ -286,7 +290,8 @@ async fn stopping_the_chat_in_the_waiting_instance_pauses_the_lease_holder() {
         other,
     } = two_receiving_instances().await;
     other.agent.stop(chat).await.unwrap();
-    // 持有者下一次送达前读到接收状态：同步为暂停接收、归还租约且不送达。
+    // The holder reads the receiving state before its next delivery: it syncs to paused receiving,
+    // releases the lease and does not deliver.
     let delivered = holder.model.prompts_containing(SHARED_NOTE);
     holder.shell.update(3, SHARED_NOTE);
     wait_for_receiving(&holder.agent, chat, STOPPED).await;
@@ -339,7 +344,8 @@ async fn a_stopped_chat_stays_paused_after_a_restart_until_a_new_input() {
     let task = Uuid::new_v4();
     let chat = saved_chat_with_shared_loop(&root, directory.path(), task).await;
     let first = resumed_instance(&root, chat, task, "goal to stop").await;
-    // 先写出接收中的状态，暂停写成对话叶子之后的尾随 Loop 条目。
+    // Write the receiving state first, then the pause as a trailing Loop entry after the
+    // conversation leaf.
     first.agent.flush_transcripts().await;
     first.agent.stop(chat).await.unwrap();
     first.agent.shutdown().await;
@@ -383,8 +389,9 @@ struct LeaseHolderPlan {
     ready: PathBuf,
 }
 
-/// 子进程入口：未设置 `TICKLOOP_TEST_LEASE_HOLDER` 时什么也不做。设置时恢复并继续 Chat，送达
-/// 一次 Shell Tick 更新后写出就绪文件，之后一直持有租约直到被杀死。
+/// Child process entry: does nothing when `TICKLOOP_TEST_LEASE_HOLDER` is not set. When set,
+/// resumes and continues the Chat, delivers one Shell Tick update, writes the ready file, and then
+/// holds the lease until killed.
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_holder_child_process() {
     let Ok(plan) = std::env::var(LEASE_HOLDER_ENV) else {
@@ -448,7 +455,8 @@ async fn a_killed_holder_process_releases_its_lease_to_the_waiting_instance() {
     .await;
     assert_eq!(other.model.prompts_containing(SHARED_NOTE), 0);
 
-    // SIGKILL：子进程来不及归还租约，锁文件留在原处，由内核释放 flock；等待中的送达随后重试。
+    // SIGKILL: the child has no chance to release the lease, the lock file stays in place, and the
+    // kernel releases the flock; the waiting delivery then retries.
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(lock.exists());
@@ -467,8 +475,9 @@ enum HolderExit {
     Drop,
 }
 
-/// 在独立的 tokio 运行时中恢复并继续 Chat、送达一次更新，送达后通知 `ready`，收到 `release`
-/// 后按 `exit` 退出；`Drop` 时直接释放 Agent 与运行时，模拟实例退出而未调用 shutdown。
+/// In a separate tokio runtime, resumes and continues the Chat and delivers one update, notifies
+/// `ready` after delivering, and on `release` exits according to `exit`; on `Drop` it drops the
+/// Agent and runtime directly, simulating an instance exiting without calling shutdown.
 fn spawn_lease_holder(
     root: PathBuf,
     chat: ChatId,
@@ -576,7 +585,8 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
     let mut exited = std::process::Command::new("true").spawn().unwrap();
     let exited_pid = exited.id();
     exited.wait().unwrap();
-    // 仍在运行但与 Tickloop 无关的进程：模拟锁文件中的 PID 已被复用。
+    // A process that is still running but unrelated to Tickloop: simulates the PID in the lock file
+    // having been reused.
     let mut unrelated = std::process::Command::new("sleep")
         .arg("30")
         .spawn()

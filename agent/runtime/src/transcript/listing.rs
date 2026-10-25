@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use super::path::TRANSCRIPT_FILE_SUFFIX;
 
-/// 照 Claude Code `LITE_READ_BUF_SIZE`：列表只读每个文件的头尾各 64KB。
+/// Following Claude Code's `LITE_READ_BUF_SIZE`: listing reads only 64KB from the head and tail of
+/// each file.
 pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
 
@@ -24,7 +25,8 @@ pub struct TranscriptSummary {
     pub forked_from: Option<ForkedFrom>,
 }
 
-/// 列出项目目录中的 Transcript，按修改时间从新到旧排列；目录不存在时为空。
+/// Lists Transcripts in the project directory, newest modification time first; empty when the
+/// directory does not exist.
 pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<TranscriptSummary>> {
     let entries = match std::fs::read_dir(project_directory) {
         Ok(entries) => entries,
@@ -95,7 +97,7 @@ fn read_head_and_tail(path: &Path, length: u64) -> io::Result<(String, String)> 
     ))
 }
 
-/// 头部第一个完整的非 meta user 文本条目；只对候选行做完整解析。
+/// First complete non-meta user text entry in the head; only candidate lines are fully parsed.
 fn first_prompt(head: &str) -> Option<String> {
     let complete = head.rfind('\n').map_or("", |end| &head[..end]);
     complete
@@ -150,7 +152,8 @@ fn first_json_string_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
-/// 读取紧跟在开引号之后的 JSON 字符串值；遇到截断或非法转义时返回 `None`。
+/// Reads the JSON string value right after an opening quote; returns `None` on truncation or an
+/// invalid escape.
 fn json_string_at(text: &str) -> Option<String> {
     let mut escaped = false;
     for (index, character) in text.char_indices() {

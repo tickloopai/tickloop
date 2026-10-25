@@ -136,7 +136,8 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
         let mut chats = source.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).unwrap();
         loop_id = chat.snapshot.chat_loop.id;
-        // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
+        // The Transcript is created only when the first conversation message is written; a Chat
+        // with no messages is not saved.
         for (role, text) in [
             (tickloop_agent_protocol::Role::User, "watch for events"),
             (tickloop_agent_protocol::Role::Assistant, "watching"),

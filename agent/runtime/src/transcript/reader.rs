@@ -14,7 +14,7 @@ use super::retained::RetainedFold;
 use super::store::{StorePosition, StoredTranscript};
 
 pub(crate) struct LoadedTranscript {
-    /// 从根到叶子的当前对话链。
+    /// Current conversation chain from root to leaf.
     pub chain: Vec<ChainEntry>,
     pub metadata: CachedMetadata,
     /// The latest record of the Chat's goal, the state of a Trigger source, which is not cached
@@ -23,13 +23,16 @@ pub(crate) struct LoadedTranscript {
     /// The latest record of the scheduled tasks, a Trigger source's own state, which is not
     /// written again as metadata.
     pub scheduled_tasks: Option<ScheduledTasksEntry>,
-    /// 照 Claude Code：按条目 `messageId` 保存的文件回滚快照，同一键以最后一条为准。
+    /// Following Claude Code: file rollback snapshots keyed by entry `messageId`, the last entry
+    /// winning for the same key.
     pub file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
-    /// 文件顺序中全部内容替换条目；调用方按 chatId 取用（照 Claude Code 按 sessionId 取用）。
+    /// All content-replacement entries in file order; callers take them by chatId (Claude Code
+    /// takes them by sessionId).
     pub content_replacements: Vec<ContentReplacementEntry>,
-    /// 加载时解析到的全部链条目 uuid，用作写入去重的种子。
+    /// All chain entry uuids parsed during loading, used to seed write deduplication.
     pub uuids: HashSet<Uuid>,
-    /// 加载时需要让用户知道的问题，例如保留区段校验失败后加载了完整历史。
+    /// Problems found during loading that the user should know about, such as loading the full
+    /// history after the preserved segment failed validation.
     pub warnings: Vec<String>,
     /// The store position of the snapshot these Lines came from.
     pub position: StorePosition,
@@ -186,10 +189,13 @@ pub(crate) fn load_compaction_ancestors(
     Some(ancestors)
 }
 
-/// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 组装已读出的记录：重接部分
-/// 压缩的保留区段，从 `leaf`（缺省时取时间最新的叶子）沿父指针重建对话链。没有任何
-/// user／assistant 条目、或找不到 `leaf` 时返回 `None`。第二个返回值表示对话链沿父指针一直走到了
-/// 根，没有停在缺失的父条目上；记录只从最近的边界读起时，调用方据此改读完整历史。
+/// Assembles records already read, following Claude Code's `loadTranscriptFile` and
+/// `buildConversationChain`: relinks preserved segments of partial compaction and rebuilds the
+/// conversation chain along parent pointers from `leaf` (by default, the newest leaf). Returns
+/// `None` when there are no user/assistant entries or `leaf` is not found. The second return value
+/// says whether the chain reached the root along parent pointers instead of stopping at a missing
+/// parent entry; when records were read only from the latest boundary, the caller uses it to reread
+/// the full history.
 pub(crate) fn assemble(
     stored: &StoredTranscript,
     leaf: Option<Uuid>,
@@ -232,7 +238,8 @@ pub(crate) fn assemble(
         warnings.push(warning);
         None
     });
-    // 有后续对话条目的条目。Loop 条目不算后续：它们挂在消息之后，不改变哪条消息是叶子。
+    // Entries that have later conversation entries. Loop entries do not count as later: they hang
+    // after messages and do not change which message is the leaf.
     let mut parents = HashSet::new();
     for indexed in entries
         .values()
@@ -313,8 +320,9 @@ pub(crate) fn assemble(
     }
     chain.reverse();
     append_trailing_loop_records(&mut chain, &entries, &parents, &mut visited);
-    // 只有叶子的对话链经过最后一个边界时才删除它之前的内容；rewind 越过该边界后继续的分支
-    // 仍需要边界之前的祖先。
+    // Content before the last boundary is removed only when the leaf's conversation chain passes
+    // through that boundary; a branch continued after a rewind across the boundary still needs the
+    // ancestors before it.
     if let Some(prune) = prune
         && chain.iter().any(|entry| entry.uuid == prune.last_boundary)
     {
@@ -343,8 +351,9 @@ pub(crate) fn assemble(
     (Some(loaded), reaches_root)
 }
 
-/// 叶子之后写入的 Loop 条目（例如一轮回复结束后的状态变化）不在父指针链上，从叶子向下接回：
-/// 每一步取没有后续对话条目、时间最新的 Loop 子条目。
+/// Loop entries written after the leaf (for example, state changes after a reply ends) are not on
+/// the parent-pointer chain and are linked back downward from the leaf: each step takes the newest
+/// Loop child entry that has no later conversation entries.
 fn append_trailing_loop_records(
     chain: &mut Vec<ChainEntry>,
     entries: &HashMap<Uuid, IndexedEntry>,
@@ -378,18 +387,22 @@ fn append_trailing_loop_records(
     }
 }
 
-/// 带保留区段的文件在重接之后，按最后一个边界删除之前内容的依据。
+/// For a file with preserved segments, the basis for removing content before the last boundary
+/// after relinking.
 struct PrecompactPrune {
     last_boundary: Uuid,
     last_boundary_index: usize,
     preserved: HashSet<Uuid>,
 }
 
-/// 照 Claude Code `applyPreservedSegmentRelinks` 读取带保留区段的文件（Tickloop 自己不再写区段）：
-/// 只采用文件中最后一个带保留区段的边界。先从尾到头校验区段链，再把头接到锚点、把锚点的其他
-/// 子节点接到尾，清零保留 assistant 消息的用量。返回删除最后一个边界之前、不在保留区段中的
-/// 条目所需的信息，由调用方在选出叶子后决定是否删除。区段校验失败时不做任何修改，返回说明，
-/// 调用方加载完整历史。
+/// Reads a file with preserved segments following Claude Code's `applyPreservedSegmentRelinks`
+/// (Tickloop itself no longer writes segments): only the last boundary in the file with a preserved
+/// segment is used. The segment chain is first validated from tail to head, then the head is linked
+/// to the anchor, the anchor's other children are linked to the tail, and usage of preserved
+/// assistant messages is zeroed. Returns the information needed to remove entries before the last
+/// boundary that are not in the preserved segment, leaving the caller to decide on removal after
+/// choosing the leaf. When segment validation fails, nothing is modified and an explanation is
+/// returned, and the caller loads the full history.
 fn apply_preserved_segment_relinks(
     entries: &mut HashMap<Uuid, IndexedEntry>,
 ) -> Result<Option<PrecompactPrune>, String> {
@@ -420,7 +433,8 @@ fn apply_preserved_segment_relinks(
         .map(|(index, uuid, _)| (*index, *uuid))
         .max_by_key(|(index, _)| *index)
         .unwrap_or((segment_index, segment.head_uuid));
-    // 区段之后又有不带区段的边界时，区段已经过时：不重接，仍按最后一个边界删除之前的内容。
+    // When a boundary without a segment follows the segment, the segment is stale: do not relink,
+    // but still remove content before the last boundary.
     let segment_is_live = segment_index == last_boundary_index;
     let mut preserved = HashSet::new();
     if segment_is_live {
@@ -471,9 +485,10 @@ fn apply_preserved_segment_relinks(
     }))
 }
 
-/// 照 Claude Code `recoverOrphanedParallelToolResults`：并行工具结果若写成了兄弟分支，
-/// 沿父链重建时只会带上其中一支，这里把其余结果补回同一条结果消息。
-/// Tickloop 目前的写入拓扑是线性的，正常不会触发。
+/// Following Claude Code's `recoverOrphanedParallelToolResults`: if parallel tool results were
+/// written as sibling branches, rebuilding along the parent chain carries only one of them, so the
+/// remaining results are added back to the same result message. Tickloop's current write topology
+/// is linear, so this does not normally trigger.
 fn recover_orphaned_parallel_tool_results(
     chain: &mut Vec<ChainEntry>,
     entries: &HashMap<Uuid, IndexedEntry>,
@@ -849,7 +864,8 @@ mod tests {
         );
         assert!(loaded.warnings.is_empty());
 
-        // 区段的尾不在文件中：不重接、不删除，并给出可见的说明。
+        // The segment's tail is not in the file: no relinking, no removal, and a visible
+        // explanation is given.
         if let Line::System(entry) = &mut lines[4] {
             entry
                 .compact_metadata
@@ -912,7 +928,7 @@ mod tests {
                 false,
                 text(Role::User, "s"),
             )),
-            // rewind 越过边界后接在边界之前的消息上继续。
+            // After a rewind across the boundary, continue from a message before the boundary.
             Line::User(entry(
                 rewound,
                 Some(answer),

@@ -429,8 +429,9 @@ impl Agent {
         Ok(())
     }
 
-    /// 照 Claude Code：用户中断或停止时，已经流出的文字保留为一条 assistant 消息；
-    /// Loop 到期、宿主关闭等其他原因取消的请求不保留。
+    /// Following Claude Code: when the user interrupts or stops, text already streamed is kept as
+    /// an assistant message; requests cancelled for other reasons, such as the Loop expiring or the
+    /// host shutting down, are not kept.
     pub(super) async fn commit_interrupted_reply(
         &self,
         receipt: &Receipt,

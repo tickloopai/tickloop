@@ -35,7 +35,7 @@ pub const WRITE_TOOL_NAME: &str = "Write";
 pub const EDIT_TOOL_NAME: &str = "Edit";
 
 const MAX_WRITE_BYTES: usize = 8 * 1024 * 1024;
-/// 覆盖已有文件时沿用的权限位；新建文件使用私有文件权限。
+/// Permission bits kept when overwriting an existing file; new files get private file permissions.
 const PRESERVED_PERMISSION_BITS: u32 = 0o777;
 /// Parent directories created for a new file get the conventional mode, narrowed by the umask.
 const NEW_DIRECTORY_MODE: u32 = 0o777;
@@ -502,8 +502,9 @@ pub(super) fn take_review(operation: &mut PreparedWrite) -> Box<FileChangeReview
         .expect("bound write operation must contain a file change review")
 }
 
-/// 在目标目录中先写临时文件，再以原子方式发布：新建文件用硬链接，已存在的文件用重命名。
-/// 执行前后都核对文件身份，批准后文件被外部改动时以冲突失败。
+/// Writes a temporary file in the target directory first, then publishes it atomically: a hard link
+/// for a new file, a rename for an existing one. File identity is checked before and after; if the
+/// file was changed externally after approval, the write fails with a conflict.
 ///
 /// A new file also gets its missing parent directories. On success the written content is
 /// returned as a full read, so later changes need no new `Read`.
@@ -546,7 +547,8 @@ pub(super) fn execute(
         .map(|(_, metadata)| metadata.mode() & PRESERVED_PERMISSION_BITS)
         .unwrap_or(PRIVATE_FILE_MODE);
     let temporary = CString::new(format!(".tickloop-write-{operation_id}")).unwrap();
-    // SAFETY: 目录描述符有效，临时文件名以 NUL 结尾；O_CREAT 时按约定传入权限参数。
+    // SAFETY: The directory descriptor is valid and the temporary file name is NUL-terminated; with
+    // O_CREAT the mode argument is passed as required.
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -558,12 +560,13 @@ pub(super) fn execute(
     if descriptor < 0 {
         return Err(io_error(path, std::io::Error::last_os_error()));
     }
-    // SAFETY: openat 成功返回的描述符未被其他对象持有，所有权交给 `File`。
+    // SAFETY: The descriptor returned by a successful openat is not held by anything else;
+    // ownership passes to `File`.
     let mut file = unsafe { File::from_raw_fd(descriptor) };
     let result = (|| {
         file.write_all(content)
             .map_err(|error| io_error(path, error))?;
-        // SAFETY: 描述符在 `file` 存活期间有效。
+        // SAFETY: The descriptor is valid while `file` is alive.
         if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
             return Err(io_error(path, std::io::Error::last_os_error()));
         }
@@ -582,8 +585,10 @@ pub(super) fn execute(
         #[cfg(test)]
         fail_at(WriteFailurePoint::BeforePublish, path)?;
         let published = if operation.expected.is_none() {
-            // 新建目标时不能替换批准之后才出现的文件：硬链接在目标已存在时失败。
-            // SAFETY: 两个名称都以 NUL 结尾且位于同一个有效的目录描述符下；flags 为 0 时不跟随符号链接。
+            // A new target must not replace a file that appeared only after approval: the hard link
+            // fails when the target already exists.
+            // SAFETY: Both names are NUL-terminated and under the same valid directory descriptor;
+            // with flags 0 symlinks are not followed.
             unsafe {
                 libc::linkat(
                     directory.as_raw_fd(),
@@ -594,7 +599,7 @@ pub(super) fn execute(
                 )
             }
         } else {
-            // SAFETY: 两个名称都以 NUL 结尾且位于同一个有效的目录描述符下。
+            // SAFETY: Both names are NUL-terminated and under the same valid directory descriptor.
             unsafe {
                 libc::renameat(
                     directory.as_raw_fd(),
@@ -625,7 +630,8 @@ pub(super) fn execute(
             FileReadRecord::whole_file(text, modified),
         ))
     })();
-    // SAFETY: 目录描述符有效，临时文件名以 NUL 结尾；发布成功后删除的是多余的临时名称。
+    // SAFETY: The directory descriptor is valid and the temporary file name is NUL-terminated;
+    // after a successful publish, what is removed is the leftover temporary name.
     unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
     result
 }
@@ -704,7 +710,8 @@ fn read_current(
     name: &CString,
     path: &Path,
 ) -> Result<Option<(File, Metadata)>, ToolError> {
-    // SAFETY: 调用方保证目录描述符有效，名称以 NUL 结尾。
+    // SAFETY: The caller guarantees the directory descriptor is valid and the name is
+    // NUL-terminated.
     let descriptor = unsafe {
         libc::openat(
             directory,
@@ -719,7 +726,8 @@ fn read_current(
         }
         return Err(io_error(path, error));
     }
-    // SAFETY: openat 成功返回的描述符未被其他对象持有，所有权交给 `File`。
+    // SAFETY: The descriptor returned by a successful openat is not held by anything else;
+    // ownership passes to `File`.
     let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata().map_err(|error| io_error(path, error))?;
     if !metadata.is_file() {

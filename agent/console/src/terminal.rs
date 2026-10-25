@@ -1117,7 +1117,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .map_err(|error| format!("cannot resolve working directory: {error}"))?;
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let config_root = config_root_directory().map(normalize_state_root);
-    // 与 `Agent::open` 一样使用规范化的根目录，启动时与之后新建 Chat 时报告的设置警告一致。
+    // Use the canonicalized root like `Agent::open`, so settings warnings reported at startup match
+    // those reported later when new Chats are created.
     let user_settings = config_root
         .as_deref()
         .map(|root| UserSettings::in_root(&root.canonicalize().unwrap_or_else(|_| root.into())));
@@ -1400,7 +1401,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     result.and(console_cleanup).and(view_cleanup)
 }
 
-/// 启动时进入的 Chat：不带参数时新建；`-c`／`-r CHAT` 已在启动前恢复；`-r` 打开选择器。
+/// The Chat entered at startup: a new one without arguments; `-c`/`-r CHAT` were already resumed
+/// before startup; `-r` opens the picker.
 enum StartupChat {
     New,
     Resumed(Box<tickloop_agent_protocol::ChatSnapshot>, bool),
@@ -1447,7 +1449,7 @@ fn initialize_startup_console(
     console.set_prompt_enabled(true)
 }
 
-/// 按 `--fork-session` 恢复或复制已保存的 Chat，错误文案照 Claude Code。
+/// Resumes or copies a saved Chat per `--fork-session`, with error messages following Claude Code.
 async fn open_saved_chat(
     agent: &Agent,
     chat: ChatId,
@@ -5071,7 +5073,7 @@ async fn check_shell_prompt_watchdog(
     Ok(())
 }
 
-/// 照 Claude Code 的任务通知样式：状态色圆点加摘要。
+/// Following Claude Code's task notification style: a status-colored dot plus a summary.
 fn task_notification_line(
     notification: &TaskNotification,
     display: DisplayProfile,
@@ -5205,13 +5207,14 @@ async fn render_user_shell_update(
 #[derive(Debug, PartialEq, Eq)]
 struct UserShellObservation {
     render_in_chat: bool,
-    /// `Some` 表示该 Chat 的前台 Shell 状态需要改为此值。
+    /// `Some` means this Chat's foreground Shell state should change to this value.
     foreground: Option<bool>,
 }
 
-/// 按 `!` 命令的状态记录调整前台 Shell。用户状态事件可能晚于转入后台的处理才被读到，
-/// 已转入后台的命令记在 `backgrounded_shells` 中，旧的"运行中"记录不能把它放回前台；
-/// 转入后台的记录一律离开前台，结束后不再跟踪。
+/// Adjusts the foreground Shell from `!` command state records. A user state event may be read
+/// after the move-to-background handling, so commands already moved to the background are tracked
+/// in `backgrounded_shells` and a stale "running" record cannot bring them back to the foreground;
+/// backgrounded records always leave the foreground and are no longer tracked once finished.
 fn observe_user_shell_record(
     foreground_shells: &mut HashMap<uuid::Uuid, uuid::Uuid>,
     backgrounded_shells: &mut HashSet<uuid::Uuid>,
@@ -7059,7 +7062,8 @@ async fn stage_draft_directories(
     Ok((directory, additional))
 }
 
-/// 按请求 id 在本进程所有已加载 Chat 中定位所属 Chat；找不到时交给前台 Chat 报告。
+/// Finds the Chat owning a request id among all Chats loaded in this process; if none is found, the
+/// foreground Chat reports it.
 async fn answer_permission(
     agent: &Agent,
     selected_chat: Option<ChatId>,
@@ -7121,8 +7125,9 @@ async fn open_chat(
     Ok(snapshot)
 }
 
-/// 最近显示过的用户设置警告。启动和每次新建、恢复 Chat 都会读取设置，同一组警告只显示一次；
-/// 设置恢复有效后清空，之后再次失效时重新显示。
+/// User settings warnings shown most recently. Settings are read at startup and on every new or
+/// resumed Chat, and the same set of warnings is shown only once; cleared once settings become
+/// valid again, so a later failure shows them again.
 static SHOWN_SETTINGS_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn show_settings_warnings(console: &Console, warnings: Vec<String>) -> Result<(), String> {
@@ -7172,7 +7177,7 @@ fn write_warning(console: &Console, warning: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 把刚切到前台的 Chat 历史写入视图。
+/// Writes the history of the Chat just brought to the foreground into the view.
 fn show_opened_chat(
     console: &Console,
     agent: &Agent,
@@ -7227,7 +7232,8 @@ fn readable_background_label(agent: &Agent, console: &Console, chat: ChatId) -> 
 
 const REPLY_COMPLETED_NOTICE: &str = "reply completed";
 
-/// 后台 Chat 的运行结束时显示在状态栏的提示；不写入前台对话。
+/// Notice shown in the status bar when a background Chat's run ends; not written into the
+/// foreground conversation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BackgroundRunNotice {
     message: String,
@@ -7255,7 +7261,8 @@ fn background_run_notice(event: &tickloop_agent_protocol::Event) -> Option<Backg
     })
 }
 
-/// 后台 Chat 发出权限请求或提问时，管道模式输出的单行提示。
+/// Single-line notice printed in pipe mode when a background Chat raises a permission request or
+/// question.
 fn background_request_notice(
     event: &tickloop_agent_protocol::Event,
     label: &str,
@@ -7270,7 +7277,8 @@ fn background_request_notice(
     Some(format!("{label} · {request}"))
 }
 
-/// 管道模式输出后台 Chat 的提示，交互模式保留运行结束提示供状态栏显示；返回是否需要刷新状态栏。
+/// Pipe mode prints background Chat notices, while interactive mode keeps run-end notices for the
+/// status bar; returns whether the status bar needs a refresh.
 fn announce_background_event(
     console: &Console,
     event: &tickloop_agent_protocol::Event,
@@ -7294,8 +7302,9 @@ fn announce_background_event(
     Ok(true)
 }
 
-/// 维护所有 Chat 的待完成运行与待处理请求，不论事件是否来自前台 Chat。
-/// 等待权限或提问的运行一律视为待完成，与 `sync_snapshot` 从快照恢复的口径一致。
+/// Tracks pending runs and pending requests for all Chats, whether or not the event comes from the
+/// foreground Chat. Runs waiting on a permission or question always count as pending, matching how
+/// `sync_snapshot` restores them from a snapshot.
 fn track_run_requests(
     event: &tickloop_agent_protocol::Event,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
@@ -7346,7 +7355,8 @@ struct BackgroundWait {
     kind: BackgroundWaitKind,
 }
 
-/// 非前台 Chat 中等待用户处理的请求；权限请求优先于提问。
+/// Requests awaiting the user in a non-foreground Chat; permission requests take precedence over
+/// questions.
 fn background_wait(
     selected_chat: Option<ChatId>,
     permissions: &HashMap<uuid::Uuid, PermissionRequestOwner>,
@@ -7486,7 +7496,8 @@ struct BackgroundRecovery {
     failed: bool,
 }
 
-/// 事件流滞后后按快照校正一个后台 Chat 的待完成运行与请求，并补回丢失的结束与请求提示。
+/// After the event stream lags, corrects a background Chat's pending runs and requests from a
+/// snapshot, and restores lost run-end and request notices.
 fn recover_background_chat(
     status: &ChatStatus,
     label: &str,
@@ -9223,7 +9234,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(effect.selection, Some(Into::into(child_chat_id)));
-        // Branch 的创建请求与复制种子只在创建它的进程内有效，恢复时由元数据只还原来源与名称。
+        // A Branch's creation request and copy seed are valid only in the process that created it;
+        // on resume, metadata restores only its source and name.
         let mut restored_child = durable_child.clone();
         restored_child["branch_origin"]["creation"] = serde_json::Value::Null;
         assert_eq!(
@@ -9575,7 +9587,7 @@ mod tests {
         let label = readable_background_label(&agent, &console, background_chat.into());
         assert_eq!(label, "Agent Write in the background");
 
-        // 滞后丢失了权限请求事件：终端只知道提交回执。
+        // Lag dropped the permission request event: the terminal only knows the submission receipt.
         let mut pending = HashMap::from([(receipt.run_id.uuid(), receipt.clone())]);
         let mut permissions = HashMap::new();
         let mut questions = HashMap::new();
@@ -9637,7 +9649,8 @@ mod tests {
                 _ => {}
             }
         }
-        // 滞后又丢失了运行结束事件：残留的请求与待完成运行按快照清理并补回结束提示。
+        // Lag also dropped the run-end event: leftover requests and pending runs are cleared from
+        // the snapshot and the end notice is restored.
         let snapshot = agent.snapshot(background_chat).await.unwrap();
         let recovery = recover_background_chat(
             &tickloop_agent_protocol::ChatStatus::of(&snapshot),

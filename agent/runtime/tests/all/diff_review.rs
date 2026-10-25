@@ -327,7 +327,8 @@ async fn saved_reviews_report_missing_or_corrupt_sidecars_and_are_not_listed_aft
     );
     assert!(corrupt.to_string().contains("artifact is corrupt"));
 
-    // 照 Claude Code，操作记录只在本进程内存中：重启后 `/diff` 不再列出之前保存的 Agent 改动。
+    // Following Claude Code, operation records live only in this process's memory: after a restart,
+    // `/diff` no longer lists previously saved Agent changes.
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let restored = Agent::open_embedded(state, config(), model.clone()).unwrap();
     let snapshot = restored.resume_chat(chat).await.unwrap();

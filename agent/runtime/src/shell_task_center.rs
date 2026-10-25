@@ -97,7 +97,8 @@ impl ShellTaskCenter {
             task.description = generated.get(&task.id).cloned().flatten();
         }
         drop(generated);
-        // 各 Chat 内部顺序不变；活动任务整体排在已结束任务之前，同类中前台 Chat 优先。
+        // Order within each Chat is unchanged; active tasks as a whole come before finished ones,
+        // and within each group the foreground Chat comes first.
         tasks.sort_by_key(|task| (task.state.is_terminal(), task.chat_id != chat_id));
         let live_revision = match revisions.get_mut(&chat_id) {
             Some(state) if state.tasks == tasks => state.live_revision,

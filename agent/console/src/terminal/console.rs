@@ -284,7 +284,8 @@ const FOREGROUND_COMMAND_HINT: &str = "     (ctrl+b to run in background)";
 const SECRET_PASTE_ERROR: &str = "API key paste must contain one line of text";
 pub(super) const REFRESH_ACCOUNT_MODELS_LABEL: &str = "Refresh account models";
 const COMPACT_PICKER_COLUMNS: usize = 100;
-// 照 Claude Code `shellHistoryCompletion.ts`：输入期间历史不会变化，缓存 60 秒。
+// Following Claude Code's `shellHistoryCompletion.ts`: history does not change while typing, so
+// cache it for 60 seconds.
 const SHELL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
 const NO_CLIPBOARD_IMAGE: &str = "No image found in clipboard";
 const NO_CLIPBOARD_IMAGE_OVER_SSH: &str = "No image found in clipboard · over SSH this reads the remote host's clipboard; attach the image with @path instead";
@@ -824,7 +825,8 @@ pub(super) struct State {
     history_project: PathBuf,
     history_session: String,
     shell_history_cache: Option<ShellHistoryCache>,
-    /// 最近一次 Enter 提交的原文及其折叠粘贴，供记录输入历史时还原粘贴位置。
+    /// The raw text of the most recent Enter submission and its collapsed pastes, used to restore
+    /// paste positions when recording input history.
     submitted_pasted_texts: Option<(String, Vec<PastedText>)>,
     /// Editor state of the last sent prompt, put back if the Agent refuses it.
     submitted_prompt: Option<SubmittedPrompt>,
@@ -1120,7 +1122,8 @@ pub(super) struct ExecutionLossNotice {
     pub(super) technical: String,
 }
 
-/// Shell 补全用的历史命令，由新到旧；按键过滤只读这里，不读历史文件。
+/// History commands for Shell completion, newest first; keystroke filtering reads only this, never
+/// the history file.
 struct ShellHistoryCache {
     commands: Vec<String>,
     loaded_at: Instant,
@@ -2484,7 +2487,7 @@ impl Console {
         Ok(())
     }
 
-    /// `root` 为 `None` 时历史只保存在内存中。
+    /// When `root` is `None`, history is kept only in memory.
     pub fn configure_input_history(
         &self,
         root: Option<&Path>,
@@ -9912,8 +9915,9 @@ impl State {
         self.schedule_file_index();
     }
 
-    /// 进入 `!` 模式时载入，之后按 Claude Code 的 60 秒 TTL 复用；离开 `!` 模式（含提交）
-    /// 时丢弃，下次进入会带上刚提交的命令。读取失败与 Claude Code 一样缓存为空，过期后再试。
+    /// Loaded on entering `!` mode, then reused under Claude Code's 60-second TTL; dropped on
+    /// leaving `!` mode (including submission), so the next entry picks up the command just
+    /// submitted. Like Claude Code, a read failure is cached as empty and retried after expiry.
     fn refresh_shell_history_cache(&mut self) {
         if self
             .shell_history_cache
@@ -10171,7 +10175,8 @@ impl State {
         }
     }
 
-    /// 释放已完成的菜单与 Branch 提交对输入的占用，返回界面是否变化。
+    /// Releases the input held by finished menus and Branch submissions; returns whether the screen
+    /// changed.
     fn release_finished_submissions(&mut self) -> bool {
         let menu_changed = self.clear_finished_menu_submission();
         let branch_finished = self.clear_finished_branch_submission();
@@ -10923,7 +10928,8 @@ impl State {
         id
     }
 
-    /// 即将从草稿进入上箭头历史时，从持久化历史重新载入列表。
+    /// Reloads the list from persisted history just before moving from the draft into Up-arrow
+    /// history.
     fn load_up_arrow_history(&mut self, wrap_width: usize) {
         if self.editor.is_browsing_history() || !self.editor.is_on_first_visual_row(wrap_width) {
             return;
@@ -13337,8 +13343,9 @@ fn read_keys(
         let mut state = state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        // 提交期间已排队的按键仍被丢弃；输入排空后才到达的事件晚于期间完成的提交，
-        // 应作用于提交后可见的界面，否则菜单关闭后立即输入的按键会丢失。
+        // Keys already queued during submission are still dropped; events arriving after the input
+        // drains come later than the submission completed meanwhile and must apply to the screen
+        // visible after it, otherwise keys typed right after a menu closes would be lost.
         let submission_released = input_was_idle && state.release_finished_submissions();
         let mut output = io::stdout().lock();
         let mut redraw = true;
@@ -18320,7 +18327,8 @@ mod tests {
 
         state.key(key(KeyCode::Char('!')));
         assert_eq!(state.shell_input.kind(), InputKind::Shell);
-        // 进入 `!` 模式时已载入缓存；删除文件后连续按键仍能补全，说明按键过滤不再读文件。
+        // The cache was loaded on entering `!` mode; completion still works on consecutive keys
+        // after the file is deleted, showing that keystroke filtering no longer reads the file.
         std::fs::remove_file(&history_file).unwrap();
         for character in "cargo".chars() {
             state.key(key(KeyCode::Char(character)));

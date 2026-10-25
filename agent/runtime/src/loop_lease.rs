@@ -1,36 +1,52 @@
-//! Trigger 的跨进程租约与接收状态，锁文件参考 Claude Code `utils/cronTasksLock.ts`。
+//! Cross-process lease and receiving state for Triggers; the lock file follows Claude Code's
+//! `utils/cronTasksLock.ts`.
 //!
-//! 同一个 Chat 可以在多个进程中恢复，它的 Tick 订阅与 Artifact 反馈因此可能同时送到几个进程。
-//! "同一 Chat 同一时刻只由一个进程送达、`/stop` 暂停接收之后不再送达"是安全约束：唤醒底座的
-//! 唯一入口每次送达前取得租约，取得租约的进程才把输入交给 Loop。
+//! The same Chat can be resumed in several processes, so its Tick Subscriptions and Artifact
+//! feedback may reach several processes at once. "Within a Chat, only one process delivers at any
+//! moment, and nothing is delivered after `/stop` pauses receiving" is a safety constraint: the
+//! single entry point of the wake-up base acquires the lease before each delivery, and only the
+//! process holding the lease hands the input to the Loop.
 //!
-//! **租约**：送达前获取 `<Chat 目录>/trigger/lease.lock`。锁文件以独占创建（写临时文件后硬链接）
-//! 建立，内容 `{chatId, pid, nonce, startedAt, host}` 只用于诊断；持有权由对该文件的
-//! `flock(LOCK_EX | LOCK_NB)` 决定，[`ChatLease`] 在持有期间保持文件描述符打开。进程退出（包括
-//! 被 SIGKILL）时内核释放 flock，不判断 PID 是否存活，因此没有"确认持有者已退出再删除"的
-//! 检查与删除之间的窗口，也不受 PID 复用影响。flock 属于打开的文件描述：同一进程内两个 Agent
-//! 实例各自打开文件，同样互斥；Rust 打开的文件带 close-on-exec，工具启动的子进程不会继承锁。
+//! **Lease**: before delivery, acquire `<Chat directory>/trigger/lease.lock`. The lock file is
+//! created exclusively (write a temporary file, then hard-link it), and its content
+//! `{chatId, pid, nonce, startedAt, host}` is only for diagnostics; ownership is decided by
+//! `flock(LOCK_EX | LOCK_NB)` on the file, and [`ChatLease`] keeps the file descriptor open while
+//! held. When the process exits (including by SIGKILL) the kernel releases the flock, and PID
+//! liveness is never checked, so there is no window between "confirm the holder exited" and
+//! deletion, and PID reuse has no effect. The flock belongs to the open file description: two Agent
+//! instances in the same process each open the file and exclude each other just the same; files
+//! opened by Rust are close-on-exec, so child processes started by tools do not inherit the lock.
 //!
-//! 归还时先在仍持有 flock 的情况下删除锁文件，再关闭描述符。获取者拿到 flock 后确认锁路径仍指向
-//! 自己打开的文件（设备号与 inode 相同）：若它打开的是随后被持有者删除的旧文件，路径已不存在或
-//! 换成新文件，放弃这个描述符重新打开。只有持有 flock 的一方删除，所以不会删掉别人持有的锁。
-//! 锁内容记录的主机与本机不同时拒绝接管并报告：锁目录可能位于多台机器共享的文件系统上，flock
-//! 不一定跨主机生效。
+//! On release, the lock file is deleted while the flock is still held, then the descriptor is
+//! closed. After obtaining the flock, an acquirer confirms that the lock path still points to the
+//! file it opened (same device and inode): if it opened an old file that the holder then deleted,
+//! the path is gone or now names a new file, and it drops this descriptor and reopens. Only the
+//! side holding the flock deletes, so it never deletes a lock held by someone else. When the host
+//! recorded in the lock differs from this machine, takeover is refused and reported: the lock
+//! directory may be on a file system shared by several machines, where flock is not guaranteed to
+//! work across hosts.
 //!
-//! **接收状态**：`trigger/receiving.state` 记录 `{generation, receiving, updatedAt, pid}`，以临时
-//! 文件加 rename 原子替换，读改写在 `trigger/.receiving.lock` 的 flock 内完成。暂停与恢复接收都
-//! 递增 generation。持锁进程每次送达前读取：已暂停且 generation 新于本进程所知，就同步本地接收
-//! 开关（暂停接收、停止 Artifact 监听、归还租约）且不送达。仅删除锁文件的旧做法会让另一实例接手
-//! 后继续送达。
+//! **Receiving state**: `trigger/receiving.state` records
+//! `{generation, receiving, updatedAt, pid}`, replaced atomically via a temporary file plus rename,
+//! with read-modify-write done under the flock of `trigger/.receiving.lock`. Both pausing and
+//! resuming receiving increment the generation. The lock holder reads it before each delivery: if
+//! receiving is paused and the generation is newer than this process knows, it syncs the local
+//! receiving switch (pause receiving, stop Artifact listening, release the lease) and does not
+//! deliver. The old approach of only deleting the lock file would let another instance take over
+//! and keep delivering.
 //!
-//! **接手**：每次新取得租约都先从存储整份重建该 Chat 的 Trigger 状态（账本中的 Trigger 记录、
-//! 等待执行的 Trigger 输入、Tick 已送达的序号），完成之前同一 Chat 的所有送达与取用都在同一道
-//! 屏障上等待；重建失败时不送达，下一次送达重试。上一个持有者在租约期间送达、执行或结算的内容
-//! 因此和一次干净装载看到的一致。用户输入与 Agent 消息不需要租约，属于各自的进程，不随接手改变。
+//! **Takeover**: each time the lease is newly acquired, the Chat's Trigger state (Trigger records
+//! in the ledger, Trigger input awaiting execution, sequence numbers already delivered by Ticks) is
+//! first rebuilt entirely from storage, and until that finishes every delivery and take for the
+//! same Chat waits on the same barrier; if the rebuild fails nothing is delivered, and the next
+//! delivery retries. What the previous holder delivered, executed or settled during its lease thus
+//! matches what a clean load sees. User input and Agent messages need no lease; they belong to
+//! their own processes and do not change on takeover.
 //!
-//! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
-//! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
-//! 恢复，不使用租约与接收状态。
+//! Unlike Claude Code: on resume, Claude Code rewrites the owner to itself whenever the sessionId
+//! matches; two Tickloop processes can continue the same Chat at the same time, so the holder is
+//! decided by flock. Chats of non-persisting Agents are never resumed by other processes and use
+//! neither the lease nor the receiving state.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -57,7 +73,8 @@ const STATE_WRITE_LOCK_FILE: &str = ".receiving.lock";
 /// How long a write of the receiving switch waits for another process's write before it tries
 /// again.
 const RECEIVING_WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
-/// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
+/// Number of reopens when the opened lock file happens to have been deleted or replaced by the
+/// holder; beyond it, the lock is treated as held by another process.
 const LOCK_OPEN_ATTEMPTS: usize = 3;
 /// How long a source waits to enter the Chat's Trigger boundary before it hears the Chat is
 /// busy: a take holds the boundary while the record of its start is retried.
@@ -75,13 +92,15 @@ struct LeaseHolder {
     host: String,
 }
 
-/// 读取锁内容时只关心主机；旧格式或损坏的内容没有主机，视为本机。
+/// Only the host matters when reading the lock content; old-format or corrupt content has no host
+/// and is treated as this machine.
 #[derive(Deserialize)]
 struct RecordedHost {
     host: Option<String>,
 }
 
-/// 本进程持有的一份租约：持有期间保持锁文件的描述符与 flock。析构即归还。
+/// A lease held by this process: the lock file's descriptor and flock are kept while held. Released
+/// on drop.
 pub(super) struct ChatLease {
     path: PathBuf,
     file: File,
@@ -95,7 +114,8 @@ impl ChatLease {
 
 impl Drop for ChatLease {
     fn drop(&mut self) {
-        // 仍持有 flock 时删除；随后 `file` 关闭，内核释放 flock。
+        // Delete while still holding the flock; `file` is closed afterwards and the kernel releases
+        // the flock.
         if self.is_still_at_path() {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -123,7 +143,7 @@ enum LeaseAttempt {
     ForeignHost(String),
 }
 
-/// 持有租约后读取接收状态得到的结论。
+/// Conclusion from reading the receiving state after holding the lease.
 enum LeaseCheck {
     /// Held as the holding `epoch`; until `synced`, this process has not taken over what another
     /// process delivered to the Chat while it held the lease.
@@ -143,18 +163,20 @@ enum LeaseCheck {
     Closing,
 }
 
-/// 一次送达前的判断结果。
+/// Decision before one delivery.
 pub(super) enum TriggerPermit {
     /// Deliver under `holding`, which the acceptance or the start checks again under the Chats
     /// lock: a lease released meanwhile no longer stands behind it.
     Fire(LeaseHolding),
-    /// 暂不能送达（被其他进程持有、锁来自另一台主机、Loop 未在接收），稍后重试。`recoverable`
-    /// while the Loop receives and only the lease keeps it out, so waiting input is retried.
+    /// Cannot deliver for now (held by another process, lock from another host, Loop not
+    /// receiving); retry later. `recoverable` while the Loop receives and only the lease keeps it
+    /// out, so waiting input is retried.
     Wait {
         reason: String,
         recoverable: bool,
     },
-    /// 接收状态显示已在其他进程暂停，本地已同步。
+    /// The receiving state shows receiving was paused in another process; the local state has been
+    /// synced.
     Withdrawn,
     Failed(String),
 }
@@ -219,7 +241,8 @@ struct HeldLease {
     synced: bool,
 }
 
-/// 本进程持有的全部租约、已知的接收状态 generation 与待显示的提示，都按 Chat。
+/// All leases held by this process, the known receiving-state generations and pending notices, all
+/// per Chat.
 #[derive(Default)]
 pub(super) struct ChatLeases {
     held: Mutex<HashMap<ChatId, HeldLease>>,
@@ -238,8 +261,9 @@ pub(super) struct ChatLeases {
 }
 
 impl ChatLeases {
-    /// 确保持有租约并读取接收状态。持有同一把 `held` 锁完成获取，本进程内的并发送达不会
-    /// 因为自己的 flock 而误判为被其他进程持有。
+    /// Ensures the lease is held and reads the receiving state. Acquisition completes while holding
+    /// the same `held` lock, so concurrent deliveries within this process are not misjudged as held
+    /// by another process because of our own flock.
     fn check(&self, directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseCheck> {
         let key = chat_id;
         // The holding is taken out of `held` while its files are looked at, so no file work is
@@ -253,7 +277,8 @@ impl ChatLeases {
             }
             held.remove(&key)
         };
-        // 锁文件被外部删除或替换时，别的进程可能已在新文件上持有：放弃旧描述符重新获取。
+        // When the lock file was deleted or replaced externally, another process may already hold
+        // the new file: drop the old descriptor and acquire again.
         let holding = match taken.filter(|holding| holding.lease.is_still_at_path()) {
             Some(holding) => holding,
             None => match try_acquire(directory, chat_id)? {
@@ -481,7 +506,8 @@ impl Drop for BoundaryWaiter {
     }
 }
 
-/// 尝试获取租约：打开锁文件（不存在时独占创建）并尝试 flock。
+/// Tries to acquire the lease: opens the lock file (creating it exclusively when absent) and tries
+/// flock.
 fn try_acquire(directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<LeaseAttempt> {
     directory.create()?;
     let path = directory.path().join(LEASE_FILE);
@@ -531,7 +557,8 @@ fn try_acquire(directory: &PrivateDirectory, chat_id: ChatId) -> io::Result<Leas
     Ok(LeaseAttempt::HeldElsewhere)
 }
 
-/// 写临时文件再硬链接到锁路径：锁文件出现时诊断内容已经完整。路径已存在时由调用方打开它。
+/// Writes a temporary file and then hard-links it to the lock path, so the diagnostic content is
+/// complete when the lock file appears. When the path already exists, the caller opens it.
 fn create_exclusive(directory: &PrivateDirectory, path: &Path, content: &[u8]) -> io::Result<()> {
     let temporary = unique_temporary_path(directory);
     let mut file = OpenOptions::new()
@@ -568,7 +595,7 @@ fn refers_to_same_file(file: &File, path: &Path) -> io::Result<bool> {
 
 fn local_host_name() -> String {
     let mut buffer = [0u8; 256];
-    // SAFETY: 缓冲区长度与传入的长度一致；gethostname 最多写入该长度。
+    // SAFETY: The buffer length matches the length passed; gethostname writes at most that length.
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
     if result != 0 {
         return String::new();
@@ -598,7 +625,8 @@ fn read_receiving(directory: &PrivateDirectory) -> io::Result<Option<ReceivingRe
     }
 }
 
-/// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态。
+/// Reads, increments and atomically replaces the receiving state under the state write lock,
+/// returning the state in the file after writing.
 fn open_receiving_write_lock(directory: &PrivateDirectory) -> io::Result<File> {
     directory.create()?;
     OpenOptions::new()
@@ -611,8 +639,9 @@ fn open_receiving_write_lock(directory: &PrivateDirectory) -> io::Result<File> {
         .open(directory.path().join(STATE_WRITE_LOCK_FILE))
 }
 
-/// 在状态写锁内读取、递增并原子替换接收状态，返回写入后文件中的状态；写锁正被别的进程持有时返回
-/// `None`，由调用方稍后再试。
+/// Reads, increments and atomically replaces the receiving state under the state write lock,
+/// returning the state in the file after writing; returns `None` when another process holds the
+/// write lock, and the caller retries later.
 fn write_receiving(
     directory: &PrivateDirectory,
     change: ReceivingChange,
@@ -796,8 +825,10 @@ impl Agent {
         })
     }
 
-    /// 每次送达前调用，在 Chat 的 Trigger 边界内：持有该 Chat 的租约、读取接收状态，并确认 Loop
-    /// 仍在接收。接收状态显示已在其他进程暂停时同步本地接收开关并返回 `Withdrawn`。
+    /// Called before each delivery, within the Chat's Trigger boundary: holds the Chat's lease,
+    /// reads the receiving state, and confirms the Loop is still receiving. When the receiving
+    /// state shows receiving was paused in another process, syncs the local receiving switch and
+    /// returns `Withdrawn`.
     pub(super) async fn acquire_trigger_permit(
         &self,
         chat_id: ChatId,
@@ -905,9 +936,11 @@ impl Agent {
         })
     }
 
-    /// 记录接收开关的变化，让其他进程在下一次送达前看到。暂停应在归还租约之前写入，避免接手的
-    /// 进程在写入前读到旧状态。失败时在归还租约后显示提示，不影响本地操作。Within the Chat's
-    /// Trigger boundary, as the end of the operation that turned the switch here.
+    /// Records a change of the receiving switch so other processes see it before their next
+    /// delivery. A pause should be written before releasing the lease, so the process taking over
+    /// does not read the old state before the write. On failure, a notice is shown after the lease
+    /// is released, without affecting the local operation. Within the Chat's Trigger boundary, as
+    /// the end of the operation that turned the switch here.
     pub(super) async fn record_receiving(
         &self,
         chat_id: ChatId,
@@ -1004,7 +1037,7 @@ impl Agent {
         }
     }
 
-    /// 需要让用户看到的 Trigger 租约提示，按 Chat 排列。
+    /// Trigger lease notices to show the user, ordered by Chat.
     pub fn loop_trigger_notices(&self) -> Vec<LoopTriggerNotice> {
         let mut notices = self
             .inner
@@ -1084,7 +1117,8 @@ mod tests {
         let stale = File::open(&lease.path).unwrap();
         let path = lease.path.clone();
         drop(lease);
-        // 旧描述符上的 flock 可以拿到，但路径已不指向它；新获取者创建新文件。
+        // The flock on the old descriptor can be taken, but the path no longer points to it; the
+        // new acquirer creates a new file.
         stale.try_lock().unwrap();
         assert!(!refers_to_same_file(&stale, &path).unwrap());
         let current = acquired(try_acquire(&directory, chat_id.into()).unwrap());

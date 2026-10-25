@@ -6,10 +6,11 @@ use uuid::Uuid;
 
 use tickloop_agent_base::private_fs::{PrivateDirectory, current_uid};
 
-/// Transcript 的项目目录与文件名后缀；列表按同一布局查找。
+/// Transcript project directory and file name suffix; listing looks them up with the same layout.
 const PROJECTS_DIRECTORY: &str = "projects";
 pub(super) const TRANSCRIPT_FILE_SUFFIX: &str = ".jsonl";
-/// 多数文件系统单个路径段上限 255 字节；照 Claude Code 保留 200，给哈希后缀留出空间。
+/// Most file systems limit a single path segment to 255 bytes; following Claude Code, keep 200 to
+/// leave room for the hash suffix.
 const MAX_SANITIZED_LENGTH: usize = 200;
 const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
 const DEFAULT_TEMP_DIRECTORY: &str = "/tmp";
@@ -19,18 +20,20 @@ const PRIVATE_TICKHOST_PREFIX: &str = "tickhost-";
 /// Where in its directory an Agent's own Tickhost keeps its runtime files.
 pub(crate) const TICKHOST_RUNTIME_SUBDIRECTORY: &str = "host";
 
-/// `<root>/projects/<项目目录名>`。项目目录名照 Claude Code：canonical 路径做 NFC 规范化后
-/// 替换非字母数字字符；工作目录无法解析时按原路径计算。
+/// `<root>/projects/<project directory name>`. The project directory name follows Claude Code: the
+/// canonical path, NFC-normalized, with non-alphanumeric characters replaced; when the working
+/// directory cannot be resolved, the original path is used.
 pub(crate) fn project_directory(root: &Path, workdir: &Path) -> PathBuf {
     root.join(PROJECTS_DIRECTORY)
         .join(project_directory_name(workdir))
 }
 
-/// `<临时目录>/tickloop-private-<uid>/<项目目录名>`。
-/// 临时目录取 `TICKLOOP_TMPDIR`（对应 `CLAUDE_CODE_TMPDIR`），未设置时为 `/tmp`；
-/// 与 Claude Code `getClaudeTempDir` 相同，只对这个基础目录解析一次符号链接，其下各层是字面路径。
-/// A separate namespace leaves legacy shared roots untouched; every new layer still requires
-/// private ownership and permissions, with no fallback when the new root is unsafe.
+/// `<temp dir>/tickloop-private-<uid>/<project directory name>`. The temp dir is `TICKLOOP_TMPDIR`
+/// (corresponding to `CLAUDE_CODE_TMPDIR`), or `/tmp` when unset; as with Claude Code's
+/// `getClaudeTempDir`, symlinks are resolved only once for this base directory, and the levels
+/// below it are literal paths. A separate namespace leaves legacy shared roots untouched; every new
+/// layer still requires private ownership and permissions, with no fallback when the new root is
+/// unsafe.
 pub(crate) fn private_project_temp_directory(workdir: &Path) -> PrivateDirectory {
     private_temp_root().join(project_directory_name(workdir))
 }
@@ -41,9 +44,10 @@ pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirect
         .join(root_chat_id.to_string())
 }
 
-/// `<临时目录>/tickloop-private-<uid>/tickhost-<随机>`：没有 daemon、被装上自带 Tickhost 的 Agent
-/// （如测试）所用 Tickhost 的私有运行目录，每次装上一个。临时目录太长、放不下其中的 socket 时
-/// 改用默认的 `/tmp`。
+/// `<temp dir>/tickloop-private-<uid>/tickhost-<random>`: the private runtime directory of the
+/// Tickhost used by an Agent with no daemon that has its own Tickhost installed (such as in tests),
+/// one per installation. Falls back to the default `/tmp` when the temp dir is too long to fit the
+/// socket inside it.
 pub(crate) fn private_tickhost_directory() -> PrivateDirectory {
     const NAME_CHARACTERS: usize = 8;
     let name = format!(
@@ -91,7 +95,8 @@ pub(crate) fn transcript_path(project_directory: &Path, chat_id: Uuid) -> PathBu
     project_directory.join(format!("{chat_id}{TRANSCRIPT_FILE_SUFFIX}"))
 }
 
-/// 按 Chat id 在所有项目目录中查找 Transcript；恢复不要求原工作目录仍然存在。
+/// Finds a Transcript by Chat id across all project directories; resuming does not require the
+/// original working directory to still exist.
 pub(crate) fn locate(root: &Path, chat_id: Uuid) -> io::Result<Option<PathBuf>> {
     let projects = match std::fs::read_dir(root.join(PROJECTS_DIRECTORY)) {
         Ok(entries) => entries,
@@ -107,8 +112,9 @@ pub(crate) fn locate(root: &Path, chat_id: Uuid) -> io::Result<Option<PathBuf>> 
     Ok(None)
 }
 
-/// 照 Claude Code `sanitizePath`：按 UTF-16 码元把非 ASCII 字母数字替换为 `-`，
-/// 超长时截断并追加 djb2 哈希（Claude Code 在 Node 下的回退实现）。
+/// Following Claude Code's `sanitizePath`: replaces non-ASCII-alphanumeric characters with `-` per
+/// UTF-16 code unit, and when too long truncates and appends a djb2 hash (Claude Code's fallback
+/// implementation under Node).
 fn sanitize_path(name: &str) -> String {
     let sanitized = name
         .encode_utf16()
