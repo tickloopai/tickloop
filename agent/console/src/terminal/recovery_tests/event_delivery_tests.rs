@@ -1,9 +1,10 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tickloop_agent_protocol::{
-    Cursor, Event, HistoryAction, LiveChatSnapshot, ObservationUpdate, PersistenceState,
-    ReceiptState, ResetReason,
+use tickloop_agent_access::{
+    Cursor, HistoryAction, LiveChatSnapshot, ObservationUpdate, PersistenceState, ReceiptState,
+    ResetReason,
 };
+use tickloop_agent_protocol::Event;
 
 struct ControlledDelivery {
     daemon: EmbeddedAgentAccess,

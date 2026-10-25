@@ -3309,6 +3309,10 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
 async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
     use crate::monitor_rows::TickIntent;
     use crate::terminal::execution::ConsoleExecution;
+    use tickloop_agent_access::{
+        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
+        DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
+    };
     use tickloop_agent_daemon::EmbeddedAgentAccess;
     use tickloop_agent_protocol::*;
 

@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use super::frame::{read_frame, verify_peer, write_frame};
 use super::incoming::IncomingTransfer;
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess,
     CLIENT_HANDOFF_VERSION, ClientHandoffHello, ClientMessage, CommandEnvelope, CommandReceipt,
     Cursor, DisplayReceipt, DisplayUpdate, FEED_CAPACITY, HANDSHAKE_FRAME_BYTES, Observation,

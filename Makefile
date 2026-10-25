@@ -72,6 +72,8 @@ check: check-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check-workspace:
+	node --test scripts/check-agent-access.test.mjs
+	node scripts/check-agent-access.mjs
 	cargo fmt --all --check
 	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings

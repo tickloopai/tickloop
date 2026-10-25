@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 
-use tickloop_agent_protocol::{AccessErrorCode, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use tickloop_agent_access::{AccessErrorCode, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
 pub mod daemon_endpoint;
 pub mod daemon_management;

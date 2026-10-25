@@ -1,5 +1,7 @@
 use super::*;
-use tickloop_agent_protocol::{AgentAccess, ViewRef};
+
+use tickloop_agent_access::{AgentAccess, ViewRef};
+
 use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 /// The family panel's rows under its heading; a conversation's `› Message from` lines are not

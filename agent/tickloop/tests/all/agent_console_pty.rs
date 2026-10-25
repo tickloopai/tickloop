@@ -36,12 +36,14 @@ use portable_pty::{PtySize, native_pty_system};
 use serde_json::{Value, json};
 use tickloop_agent_client::LocalAgentClient;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter, AgentSummary, CommandEnvelope,
     CommandResult, ConfigurationChange, ExecutionRef, LaunchSpec, LiveChatSnapshot,
     ObservationRequest, ObservationValue, Page, PendingRequestKind, RequestRef, TaskOrigin,
-    TaskRef, UserInput, UserShellState,
+    TaskRef, UserInput,
 };
+use tickloop_agent_protocol::UserShellState;
+
 use tickloop_agent_test_support::screen;
 
 const STARTUP_BANNER_TITLE: &str = concat!("Tickloop v", env!("CARGO_PKG_VERSION"));
@@ -1256,7 +1258,7 @@ async fn run_sustained_daemon_loss(
     daemon_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Err(error) = shutdown {
         assert!(
-            error.code == tickloop_agent_protocol::AccessErrorCode::Unavailable
+            error.code == tickloop_agent_access::AccessErrorCode::Unavailable
                 && error.message == "daemon connection closed",
             "unexpected stop error after the owned processes exited: {error}"
         );

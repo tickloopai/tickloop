@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use tickloop_agent_protocol::ExecutionRef;
+use tickloop_agent_access::ExecutionRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum MentionKind {
@@ -1444,7 +1444,7 @@ mod tests {
         let index = FileMentionIndex::build(directory.path(), &[]).unwrap();
         let mut state = FileMentionState::with_index(index);
         let target = FamilyMentionTarget {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::new_v4(),
                 agent_id: uuid::Uuid::new_v4(),
                 generation: 1,
@@ -1479,7 +1479,7 @@ mod tests {
         let mut state =
             FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
         state.set_family_targets(vec![FamilyMentionTarget {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::new_v4(),
                 agent_id: uuid::Uuid::new_v4(),
                 generation: 1,
@@ -1511,7 +1511,7 @@ mod tests {
         let mut state =
             FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
         let target = FamilyMentionTarget {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::new_v4(),
                 agent_id: uuid::Uuid::new_v4(),
                 generation: 1,

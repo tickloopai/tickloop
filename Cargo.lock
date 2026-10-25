@@ -3938,6 +3938,7 @@ dependencies = [
  "shell-words",
  "tar",
  "tempfile",
+ "tickloop-agent-access",
  "tickloop-agent-artifacts",
  "tickloop-agent-client",
  "tickloop-agent-config",
@@ -3961,6 +3962,21 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+]
+
+[[package]]
+name = "tickloop-agent-access"
+version = "0.2.24"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tickloop-agent-protocol",
+ "tickloop-ids",
+ "tickloop-tick-protocol",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4016,6 +4032,7 @@ dependencies = [
  "sha2",
  "shell-words",
  "tempfile",
+ "tickloop-agent-access",
  "tickloop-agent-protocol",
  "tickloop-ids",
  "tickloop-tick-packages",
@@ -4067,6 +4084,7 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror 2.0.20",
+ "tickloop-agent-access",
  "tickloop-agent-artifacts",
  "tickloop-agent-base",
  "tickloop-agent-client",
@@ -4121,6 +4139,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tickloop-agent-access",
  "tickloop-agent-artifacts",
  "tickloop-agent-base",
  "tickloop-agent-client",
@@ -4200,13 +4219,11 @@ dependencies = [
 name = "tickloop-agent-protocol"
 version = "0.2.24"
 dependencies = [
- "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tickloop-ids",
  "tickloop-tick-protocol",
- "tokio",
  "unicode-width",
  "uuid",
 ]

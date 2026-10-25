@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, CommandEnvelope, CommandReceipt, CommandResult, ExecutionRef,
     PersistenceState, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS, ReceiptState,
 };

@@ -235,9 +235,10 @@ impl TerminalSurface {
 
 #[cfg(test)]
 use super::monitor::MonitorEntry;
+use tickloop_agent_access::ExecutionRef;
 use tickloop_agent_protocol::{
-    ExecutionRef, Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
-    TaskBoard, TickSubscriptionStatus,
+    Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind, TaskBoard,
+    TickSubscriptionStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17898,7 +17899,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("audit.txt"), "evidence").unwrap();
         let target = FamilyMentionTarget {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: Uuid::new_v4(),
                 agent_id: Uuid::new_v4(),
                 generation: 1,

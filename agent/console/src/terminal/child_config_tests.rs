@@ -14,10 +14,12 @@ use std::{
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use uuid::Uuid;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AgentAccess, CommandEnvelope, CommandReceipt, DisplayReceipt, DisplayUpdate,
-    ExecutionAvailability, LaunchSpec, LoopState, Observation, ObservationRequest, ViewRef,
+    ExecutionAvailability, LaunchSpec, Observation, ObservationRequest, ViewRef,
 };
+use tickloop_agent_protocol::LoopState;
+
 use tickloop_agent_test_support::{input_dialog, screen};
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_FIXTURE";

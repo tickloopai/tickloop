@@ -12,12 +12,13 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
-use tickloop_agent_protocol::{
-    AgentAccess, AgentCommand, AgentDetailQuery, CommandResult, EnvironmentValue, ExecutionMode,
-    ExecutionRef, LaunchSpec, LoopAction, ObservationRequest, ObservationValue, PendingInput,
-    PromptPolicy, Receipt, TriggerSource, UserInput,
+use tickloop_agent_access::{
+    AgentAccess, AgentCommand, AgentDetailQuery, CommandResult, EnvironmentValue, ExecutionRef,
+    LaunchSpec, LoopAction, ObservationRequest, ObservationValue, UserInput,
 };
+use tickloop_agent_client::{LocalAgentClient, connect_or_start_at};
+use tickloop_agent_protocol::{ExecutionMode, PendingInput, PromptPolicy, Receipt, TriggerSource};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},

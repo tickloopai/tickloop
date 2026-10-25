@@ -49,12 +49,12 @@ fn main() -> ExitCode {
     if arguments.first().and_then(|argument| argument.to_str()) == Some("--runtime-info") {
         println!(
             "{}",
-            serde_json::to_string(&tickloop_agent_protocol::RuntimeBinaryInfo {
+            serde_json::to_string(&tickloop_agent_access::RuntimeBinaryInfo {
                 product_version: env!("CARGO_PKG_VERSION").into(),
                 build_id: env!("TICKLOOP_BUILD_IDENTITY").into(),
-                protocol_major: tickloop_agent_protocol::PROTOCOL_MAJOR,
-                protocol_minor: tickloop_agent_protocol::PROTOCOL_MINOR,
-                handoff_version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+                protocol_major: tickloop_agent_access::PROTOCOL_MAJOR,
+                protocol_minor: tickloop_agent_access::PROTOCOL_MINOR,
+                handoff_version: tickloop_agent_access::RUNTIME_HANDOFF_VERSION,
             })
             .unwrap()
         );
@@ -166,11 +166,11 @@ async fn run_legacy_daemon(
     directory: &Path,
     fixture: &LegacyFixture,
 ) -> Result<(), String> {
-    use tickloop_agent_client::{daemon_management, frame};
-    use tickloop_agent_protocol::{
+    use tickloop_agent_access::{
         AccessLimits, PROTOCOL_MAJOR, ServerHello, ServerMessage,
         daemon_management::{CONTROL_MAJOR, Hello, Reply, Request},
     };
+    use tickloop_agent_client::{daemon_management, frame};
     use tokio::net::UnixListener;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;

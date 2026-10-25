@@ -124,7 +124,7 @@ impl AgentAccess for ActivityAccess {
         let interrupted = match &command.command {
             AgentCommand::ManageLoop {
                 execution,
-                action: tickloop_agent_protocol::LoopAction::Interrupt,
+                action: tickloop_agent_access::LoopAction::Interrupt,
             } => Some(*execution),
             _ => None,
         };
@@ -610,7 +610,7 @@ fn lose_completed_events(
                 )
                 .unwrap();
                 update.change = ObservationChange::Reset {
-                    reason: tickloop_agent_protocol::ResetReason::Lagged,
+                    reason: tickloop_agent_access::ResetReason::Lagged,
                     snapshot,
                 };
             }

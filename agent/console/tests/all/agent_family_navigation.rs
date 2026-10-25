@@ -5,10 +5,12 @@ use std::sync::{
 };
 use tickloop_agent_console::agent_console::{AgentConsole, Intent};
 use tickloop_agent_daemon::EmbeddedAgentAccess;
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessError, AgentAccess, AgentSummary, CommandEnvelope, CommandReceipt, DisplayReceipt,
     DisplayUpdate, ExecutionRef, Observation, ObservationRequest, ObservationValue,
 };
+
 use uuid::Uuid;
 
 struct Catalog {

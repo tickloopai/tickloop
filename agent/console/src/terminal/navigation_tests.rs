@@ -11,12 +11,13 @@ use std::{
     time::Duration,
 };
 use tickhost_connect::herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr};
-use tickloop_agent_daemon::EmbeddedAgentAccess;
-use tickloop_agent_protocol::{
-    AgentAccess, AgentCommand, CommandEnvelope, CommandResult, DisplayUpdate, EventKind,
-    ExecutionRef, HostLocation, HostWorkContext, LaunchSpec, UserInput, UserShellRecord,
-    UserShellState, ViewRef,
+use tickloop_agent_access::{
+    AgentAccess, AgentCommand, CommandEnvelope, CommandResult, DisplayUpdate, ExecutionRef,
+    HostLocation, HostWorkContext, LaunchSpec, UserInput, ViewRef,
 };
+use tickloop_agent_daemon::EmbeddedAgentAccess;
+use tickloop_agent_protocol::{EventKind, UserShellRecord, UserShellState};
+
 use tickloop_agent_runtime::Agent as RuntimeAgent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

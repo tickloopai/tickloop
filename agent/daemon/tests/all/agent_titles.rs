@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_runtime::Agent;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, LaunchSpec, ObservationRequest,
     ObservationValue, Page, UserInput,
 };

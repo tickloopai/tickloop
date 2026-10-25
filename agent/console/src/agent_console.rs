@@ -5,13 +5,14 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentFilter, AgentSummary,
     CommandEnvelope, CommandReceipt, CommandResult, DisplayedView, ExecutionAvailability,
-    ExecutionRef, HostLocation, InteractionSource, LaunchSpec, LoopState, MAX_PAGE_LIMIT,
-    ObservationRequest, ObservationValue, Page, ReceiptState, RunId, TranscriptRef, UserInput,
-    ViewRef,
+    ExecutionRef, HostLocation, InteractionSource, LaunchSpec, MAX_PAGE_LIMIT, ObservationRequest,
+    ObservationValue, Page, ReceiptState, TranscriptRef, UserInput, ViewRef,
 };
+use tickloop_agent_protocol::{LoopState, RunId};
+
 use uuid::Uuid;
 const FINISHED_CHILD_GRACE_MS: u64 = 30_000;
 

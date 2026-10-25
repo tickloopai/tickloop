@@ -1,9 +1,10 @@
 use std::{future::Future, time::Duration};
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentCommand, ExecutionRef, InteractionSource, PersistenceState, ReceiptState,
     ServerHandoffHello, UserInput, ViewRef,
 };
+
 use tokio::{net::UnixListener, task::JoinHandle};
 
 use super::*;

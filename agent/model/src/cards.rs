@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 use super::validate_model_config;
 use tickloop_agent_protocol::{
-    Adapter, LaunchSpec, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider,
-    Protocol, ProviderConnection, ProviderPatch, ReasoningEffort, ThinkingControl,
+    Adapter, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, Protocol,
+    ProviderConnection, ProviderPatch, ReasoningEffort, ThinkingControl,
 };
 
 /// Anthropic's minimum `budget_tokens`.
@@ -642,13 +642,11 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
     config
 }
 
-/// The model a worker for `launch` starts with: the launch's catalog model, or the bundled
+/// The catalog model a worker starts with for the requested model, or the bundled
 /// default when it names none or one the catalog no longer has.
-pub fn launch_model(launch: &LaunchSpec) -> ModelConfig {
+pub fn launch_model(model: Option<&ModelConfig>) -> ModelConfig {
     let catalog = ModelCatalog::defaults();
-    launch
-        .model
-        .as_ref()
+    model
         .and_then(|model| catalog.get(&model.provider_id, &model.model_id))
         .unwrap_or_else(|| {
             catalog

@@ -2,8 +2,8 @@
 
 use serde_json::json;
 use tickloop_agent_protocol::{
-    ChatSnapshot, ChatStatus, CommandSnapshot, CommandState, Event, EventKind, ExecutionRef,
-    LiveChatSnapshot, PermissionExecution, PermissionRequest, QuestionRequest, chat_preview,
+    ChatSnapshot, ChatStatus, CommandSnapshot, CommandState, Event, EventKind, PermissionExecution,
+    PermissionRequest, QuestionRequest, chat_preview,
 };
 use uuid::Uuid;
 
@@ -158,31 +158,6 @@ fn a_status_derives_the_facts_it_needs_from_the_history_it_leaves_out() {
         status_bytes * 10 < snapshot_bytes,
         "status {status_bytes} bytes against snapshot {snapshot_bytes} bytes"
     );
-}
-
-#[test]
-fn a_live_snapshot_answers_the_status_a_status_query_would() {
-    let execution = ExecutionRef {
-        daemon_epoch: id(0xe0),
-        agent_id: id(0xa1),
-        generation: 2,
-    };
-    let snapshot = busy_chat();
-    let live = LiveChatSnapshot::from_snapshot(execution, snapshot.clone(), vec!["slow".into()]);
-    let status = live.status();
-    assert_eq!(
-        serde_json::to_value(&status.chat).unwrap(),
-        serde_json::to_value(ChatStatus::of(&snapshot)).unwrap()
-    );
-    let decoded: LiveChatSnapshot =
-        serde_json::from_value(serde_json::to_value(&live).unwrap()).unwrap();
-    assert_eq!(
-        serde_json::to_value(decoded.status()).unwrap(),
-        serde_json::to_value(&status).unwrap(),
-        "a snapshot that crossed the wire answers the same status"
-    );
-    assert_eq!(status.request_refs, live.request_refs);
-    assert_eq!(status.warnings, ["slow"]);
 }
 
 #[test]

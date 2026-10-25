@@ -28,6 +28,7 @@ sha2 = "0.10"
 similar = { version = "2.7", features = ["inline"] }
 tempfile = "3"
 thiserror = "2"
+tickloop-agent-access = { path = "../access" }
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-client = { path = "../client" }
@@ -53,6 +54,7 @@ vt100 = "0.16.2"
 [dev-dependencies]
 jsonschema = { version = "0.56", default-features = false }
 portable-pty = "0.9"
+tickloop-agent-access = { path = "../access", features = ["test-support"] }
 tickloop-agent-daemon = { path = "../daemon" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }

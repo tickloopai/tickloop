@@ -249,8 +249,8 @@ fn incompatible_daemon_output(terminal: bool) -> String {
     assert!(output.contains(&format!("Executable: {resolved_executable}")));
     assert!(output.contains(&format!(
         "client {}.{}",
-        tickloop_agent_protocol::PROTOCOL_MAJOR,
-        tickloop_agent_protocol::PROTOCOL_MINOR
+        tickloop_agent_access::PROTOCOL_MAJOR,
+        tickloop_agent_access::PROTOCOL_MINOR
     )));
     assert!(output.contains("peer protocol 1.1"));
     let config_argument = format!(
@@ -272,8 +272,8 @@ fn incompatible_daemon_has_readable_plain_guidance_without_dispatching() {
     let output = incompatible_daemon_output(false);
     assert!(output.starts_with(&format!(
         "Error: Agent daemon version mismatch (client {}.{}).",
-        tickloop_agent_protocol::PROTOCOL_MAJOR,
-        tickloop_agent_protocol::PROTOCOL_MINOR
+        tickloop_agent_access::PROTOCOL_MAJOR,
+        tickloop_agent_access::PROTOCOL_MINOR
     )));
     assert!(!output.contains('\x1b'));
 }
@@ -324,9 +324,10 @@ fn write_json_frame(stream: &mut std::os::unix::net::UnixStream, value: &serde_j
 
 #[tokio::test]
 async fn a_compatible_daemon_build_is_reused_without_management_or_a_restart_prompt() {
-    use tickloop_agent_protocol::{
+    use tickloop_agent_access::{
         AgentAccess, AgentFilter, ObservationRequest, ObservationValue, Page,
     };
+
     let fixture = support::runtime_dir();
     let root = fixture.path().canonicalize().unwrap();
     let socket = root.join("daemon.sock");
@@ -337,14 +338,14 @@ async fn a_compatible_daemon_build_is_reused_without_management_or_a_restart_pro
     let daemon = thread::spawn(move || {
         let mut stream = accept_within(&listener, "the client never connected");
         assert!(read_json_frame(&mut stream).get("Hello").is_some());
-        let hello = tickloop_agent_protocol::ServerHello {
+        let hello = tickloop_agent_access::ServerHello {
             process_id: std::process::id(),
-            major: tickloop_agent_protocol::PROTOCOL_MAJOR,
-            minor: tickloop_agent_protocol::PROTOCOL_MINOR,
+            major: tickloop_agent_access::PROTOCOL_MAJOR,
+            minor: tickloop_agent_access::PROTOCOL_MINOR,
             daemon_epoch: epoch,
             session_id: uuid::Uuid::new_v4(),
             capabilities: Vec::new(),
-            limits: tickloop_agent_protocol::AccessLimits::DEFAULT.into(),
+            limits: tickloop_agent_access::AccessLimits::DEFAULT.into(),
             build: Some("0.0.0+another-build".into()),
             executable: None,
             upgrade_protocol: None,

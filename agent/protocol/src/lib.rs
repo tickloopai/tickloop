@@ -1,6 +1,5 @@
-//! Shared domain types and AgentAccess wire definitions that depend on no other Agent crate.
+//! Shared Harness domain types and wire definitions.
 
-mod access;
 mod approvals;
 mod artifact;
 mod auto_rules;
@@ -9,11 +8,9 @@ mod auto_setup;
 mod chat;
 mod chat_status;
 mod context_usage;
-pub mod daemon_management;
 mod denials;
 mod family;
 mod file_change;
-mod frame;
 mod goal;
 mod history;
 mod host;
@@ -22,7 +19,6 @@ mod ids;
 mod image;
 mod input;
 mod interaction;
-mod limits;
 pub mod local_messages;
 mod loops;
 mod model;
@@ -35,6 +31,7 @@ mod permissions_view;
 mod plan;
 pub mod projection;
 mod provider_connection;
+mod provider_credential_scope;
 mod provider_failure;
 mod scheduled_tasks;
 mod shell_tasks;
@@ -43,29 +40,8 @@ mod tick_subscriptions;
 mod tool;
 mod tools;
 mod trigger_display;
-mod upgrade;
 mod usage;
 
-pub use upgrade::{
-    RUNTIME_HANDOFF_VERSION, RuntimeBinaryInfo, RuntimeVersion, WorkerRuntimeVersion,
-};
-
-pub use access::{
-    AccessCapability, AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand,
-    AgentDetailQuery, AgentFilter, AgentSummary, CLIENT_HANDOFF_VERSION, ChunkedResponseKind,
-    ClientHandoffHello, ClientMessage, CommandEnvelope, CommandReceipt, CommandResult,
-    ConfigurationChange, Cursor, DEFAULT_PAGE_LIMIT, DisplayReceipt, DisplayUpdate, DisplayedView,
-    EnvironmentValue, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
-    HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
-    LoopRef, MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure,
-    ObservationRequest, ObservationUpdate, ObservationValue, OtherTickhost, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits,
-    ProviderCredentialScope, QueuedCommandFailure, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS,
-    REPLAY_CAPACITY, ReceiptState, RecordedMessage, RecordedTranscript, RequestRef, ResetReason,
-    ServerHandoffHello, ServerHello, ServerMessage, SessionResume, TaskAction, TaskOrigin, TaskRef,
-    TickhostOccupancy, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update,
-    build_identity, set_build_identity,
-};
 pub use approvals::{
     ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewer,
@@ -91,7 +67,7 @@ pub use chat::{
     ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
     chat_has_work, chat_preview, short_chat_title,
 };
-pub use chat_status::ChatStatus;
+pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_usage::{
     ContextMeasurement, ESTIMATED_CONTEXT_BYTES_PER_TOKEN, serialized_context_bytes,
 };
@@ -113,7 +89,6 @@ pub use file_change::{
     FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileIdentity, FileVersion,
     PreparedFileChange,
 };
-pub use frame::{check_frame_length, decode_frame, encode_frame};
 pub use goal::{
     GoalAction, GoalAuthor, GoalBlock, GoalCheck, GoalHistoryEntry, GoalNotice, GoalPause,
     GoalSnapshot, GoalStatus, GoalVerdict,
@@ -128,7 +103,7 @@ pub use history::{
 };
 pub use host::{
     HerdrInteraction, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority,
-    HostedResources,
+    HostedResources, OtherTickhost, TickhostOccupancy,
 };
 pub use hosted::{
     ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedMember, HostedMemberState, HostedProgramExit,
@@ -143,7 +118,6 @@ pub use ids::{
 pub use image::{Image, ImageMediaType};
 pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
-pub use limits::*;
 pub use local_messages::{
     FOLDED_TICK_REPLY_CHARACTERS, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE, LocalMessage,
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
@@ -172,6 +146,7 @@ pub use permissions_view::{
 pub use plan::{Plan, Progress, TodoItem, TodoStatus};
 pub use projection::{HistoryCall, InvalidConversation};
 pub use provider_connection::{ConnectionRegion, ModelDiscovery, ProductKind, ProviderConnection};
+pub use provider_credential_scope::ProviderCredentialScope;
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
 pub use scheduled_tasks::{
     MAX_SCHEDULED_TASK_TITLE_CHARS, MAX_SCHEDULED_TASKS_PER_CHAT, ScheduledTask,

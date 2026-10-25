@@ -143,7 +143,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         .unwrap();
         record_phase(&directory, "agent-opened");
         core.install_own_tickhost();
-        let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.clone());
+        let mut launch = tickloop_agent_access::LaunchSpec::embedded(directory.clone());
         launch.model = Some(model.clone());
         launch.config_root = Some(root);
         let agent = crate::terminal::execution::ConsoleExecution::from_embedded_launch(

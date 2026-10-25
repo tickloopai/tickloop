@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use tickloop_agent_protocol::AccessError;
+use tickloop_agent_access::AccessError;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]

@@ -12,6 +12,8 @@ mod agent_titles;
 mod builtin_catalog;
 #[path = "all/busy_inputs.rs"]
 mod busy_inputs;
+#[path = "all/live_context.rs"]
+mod live_context;
 #[path = "all/permission_claims.rs"]
 mod permission_claims;
 #[path = "all/streaming_snapshot.rs"]

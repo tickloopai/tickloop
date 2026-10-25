@@ -80,7 +80,7 @@ pub struct ChatStatus {
 
 /// The state of a Chat that lives only in the process running it, as a `ChatSnapshot` or a
 /// `LiveChatSnapshot` holds it.
-pub(crate) struct ProcessState<'a> {
+pub struct ChatStatusInput<'a> {
     pub model: &'a ModelConfig,
     pub pending_model: &'a Option<ModelConfig>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -103,7 +103,7 @@ impl ChatStatus {
     pub fn of(snapshot: &ChatSnapshot) -> Self {
         Self::assemble(
             snapshot,
-            ProcessState {
+            ChatStatusInput {
                 model: &snapshot.model,
                 pending_model: &snapshot.pending_model,
                 reasoning_effort: snapshot.reasoning_effort,
@@ -124,7 +124,7 @@ impl ChatStatus {
         )
     }
 
-    pub(crate) fn assemble(conversation: &ChatSnapshot, process: ProcessState<'_>) -> Self {
+    pub fn assemble(conversation: &ChatSnapshot, process: ChatStatusInput<'_>) -> Self {
         let pending = process
             .permissions
             .iter()

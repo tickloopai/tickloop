@@ -16,14 +16,15 @@ use super::{
     receipts::ReceiptStore,
     views::{ViewRegistry, command_origin, verify_host},
 };
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter,
     AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, Cursor, DisplayReceipt,
     DisplayUpdate, ExecutionAvailability, ExecutionRef, FEED_CAPACITY, LaunchSpec, MAX_PAGE_LIMIT,
-    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    OtherTickhost, Page, PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion,
-    TranscriptRef, chat_display_title, chat_has_work, chat_preview,
+    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
+    PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion, TranscriptRef,
 };
+use tickloop_agent_protocol::OtherTickhost;
+use tickloop_agent_protocol::{chat_display_title, chat_has_work, chat_preview};
 
 #[async_trait]
 pub trait WorkerFactory: Send + Sync {
@@ -39,7 +40,7 @@ pub trait WorkerFactory: Send + Sync {
     ) -> RuntimeVersion {
         RuntimeVersion {
             executable: std::env::current_exe().unwrap_or_default(),
-            build_id: tickloop_agent_protocol::build_identity()
+            build_id: tickloop_agent_access::build_identity()
                 .unwrap_or_default()
                 .into(),
             requested_executable: None,
@@ -915,14 +916,13 @@ impl AgentAccess for DaemonServer {
                         .await;
                 }
                 Ok(Observation::single(
-                    tickloop_agent_runtime::transcript::records::saved_records(root, folder, page)
-                        .await?,
+                    crate::records::saved_records(root, folder, page).await?,
                     self.cursor(),
                     None,
                 ))
             }
             ObservationRequest::Transcript { record, page } => Ok(Observation::single(
-                tickloop_agent_runtime::transcript::records::transcript(record, page).await?,
+                crate::records::transcript(record, page).await?,
                 self.cursor(),
                 None,
             )),

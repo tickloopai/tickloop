@@ -276,6 +276,10 @@ mod channel {
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use tickhost_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
+    use tickloop_agent_access::{
+        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EnvironmentValue,
+        HostWorkContext, LaunchSpec,
+    };
     use tickloop_agent_daemon::{
         DaemonServer, EmbeddedAgentAccess, WorkerFactory, build_runtime_with_models,
         worker_control::WorkerControl,
@@ -283,10 +287,9 @@ mod channel {
     use tickloop_agent_model::ModelClient;
     use tickloop_agent_protocol::ToolResult;
     use tickloop_agent_protocol::{
-        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EnvironmentValue,
-        EventKind, HostEndpointIdentity, HostToolAuthority, HostWorkContext, LaunchSpec,
-        TickLinkState, TickSubscriptionChange,
+        EventKind, HostEndpointIdentity, HostToolAuthority, TickLinkState, TickSubscriptionChange,
     };
+
     use tickloop_agent_runtime::{
         Agent, HarnessOptions, HarnessSeams,
         environment::LocalEnvironment,
@@ -429,7 +432,7 @@ mod channel {
         server: DaemonServer,
         epoch: Uuid,
         chats: Vec<Uuid>,
-        executions: Vec<tickloop_agent_protocol::ExecutionRef>,
+        executions: Vec<tickloop_agent_access::ExecutionRef>,
         grants: Vec<WorkerControlGrant>,
         runtimes: Vec<Agent>,
         controller: Arc<HostController>,
@@ -561,7 +564,7 @@ mod channel {
         async fn try_command(
             &self,
             command: AgentCommand,
-        ) -> Result<CommandResult, tickloop_agent_protocol::AccessError> {
+        ) -> Result<CommandResult, tickloop_agent_access::AccessError> {
             self.server
                 .execute(CommandEnvelope {
                     daemon_epoch: self.epoch,
@@ -2284,8 +2287,10 @@ for line in sys.stdin:
     /// a Herdr that refuses it leaves the Tick running without one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_herdr_worker_opens_hidden_by_default_and_streams_the_hosted_tick() {
+        use tickloop_agent_access::ConfigurationChange;
+        use tickloop_agent_protocol::EventKind;
         use tickloop_agent_protocol::ExecutionMode;
-        use tickloop_agent_protocol::{ConfigurationChange, EventKind};
+
         let directory = tempfile::Builder::new()
             .prefix("thh")
             .tempdir_in(tickloop_agent_test_support::SHORT_TEMP_ROOT)
@@ -2435,7 +2440,7 @@ for line in sys.stdin:
     /// a Herdr Workspace check.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delegated_child_cannot_open_or_use_its_parents_hosted_tick() {
-        use tickloop_agent_protocol::ConfigurationChange;
+        use tickloop_agent_access::ConfigurationChange;
         use tickloop_agent_protocol::ExecutionMode;
         let directory = tempfile::Builder::new()
             .prefix("thd")

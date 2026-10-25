@@ -11,7 +11,8 @@ use std::{
 
 use serde_json::{Value, json};
 use tickloop_agent_client::LocalAgentClient;
-use tickloop_agent_protocol::{AgentAccess, AgentCommand, RuntimeBinaryInfo};
+
+use tickloop_agent_access::{AgentAccess, AgentCommand, RuntimeBinaryInfo};
 
 use crate::graceful_upgrade::{PrivateRuntime, command, copy_bundle, version};
 

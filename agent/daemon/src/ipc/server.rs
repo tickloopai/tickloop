@@ -15,7 +15,8 @@ use crate::ingress::{DaemonIngress, SessionTicket};
 use crate::lifecycle::DaemonLifecycle;
 use crate::{chunked::EncodedResponse, views::command_origin};
 use tickloop_agent_client::frame::{read_frame_body, verify_peer, write_frame};
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess, ChunkedResponseKind,
     ClientMessage, DisplayUpdate, HANDSHAKE_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     ServerHello, ServerMessage, bounded_update, decode_frame,
@@ -230,7 +231,7 @@ pub(super) async fn serve_connection_mode(
             ..
         }) => (PROTOCOL_MINOR, handoff),
         Some(ClientMessage::Hello {
-            major: tickloop_agent_protocol::daemon_management::CONTROL_MAJOR,
+            major: tickloop_agent_access::daemon_management::CONTROL_MAJOR,
             minor: 0,
             ..
         }) if daemon_shutdown.is_some() => {
@@ -334,11 +335,11 @@ pub(super) async fn serve_connection_mode(
             session_id,
             capabilities,
             limits: limits.into(),
-            build: tickloop_agent_protocol::build_identity().map(str::to_owned),
+            build: tickloop_agent_access::build_identity().map(str::to_owned),
             executable: std::env::current_exe().ok(),
             upgrade_protocol: daemon_shutdown
                 .as_ref()
-                .map(|_| tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION),
+                .map(|_| tickloop_agent_access::RUNTIME_HANDOFF_VERSION),
             handoff: session.as_ref().and_then(|session| session.handoff.clone()),
         }),
         HANDSHAKE_FRAME_BYTES,

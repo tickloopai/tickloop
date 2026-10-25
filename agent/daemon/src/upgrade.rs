@@ -13,11 +13,13 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tickloop_agent_client::{LocalAgentClient, ReconnectFactory, RecoveringAgentClient};
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessError, AgentAccess, CommandEnvelope, CommandReceipt, DisplayReceipt, DisplayUpdate,
     LaunchSpec, Observation, ObservationRequest, RUNTIME_HANDOFF_VERSION, RuntimeBinaryInfo,
     RuntimeVersion,
 };
+
 use tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -233,7 +235,7 @@ impl ProcessWorkerFactory {
             .and_then(|path| path.canonicalize())
             .map_err(|error| AccessError::unavailable(error.to_string()))?;
         if executable == current {
-            return if Some(binary.build_id.as_str()) == tickloop_agent_protocol::build_identity() {
+            return if Some(binary.build_id.as_str()) == tickloop_agent_access::build_identity() {
                 Ok(())
             } else {
                 Err(AccessError::unavailable(
@@ -258,7 +260,7 @@ impl ProcessWorkerFactory {
 
     pub(crate) async fn version(
         &self,
-        routes: &[(tickloop_agent_protocol::ExecutionRef, Arc<dyn AgentAccess>)],
+        routes: &[(tickloop_agent_access::ExecutionRef, Arc<dyn AgentAccess>)],
     ) -> RuntimeVersion {
         let (requested_executable, upgrading, error) = {
             let state = self.upgrade.lock().await;
@@ -277,7 +279,7 @@ impl ProcessWorkerFactory {
             .lock()
             .await
             .iter()
-            .map(|worker| tickloop_agent_protocol::WorkerRuntimeVersion {
+            .map(|worker| tickloop_agent_access::WorkerRuntimeVersion {
                 process_id: worker.pid,
                 executable: worker.executable.clone(),
                 build_id: worker.build_id.clone(),
@@ -292,7 +294,7 @@ impl ProcessWorkerFactory {
             .collect();
         RuntimeVersion {
             executable,
-            build_id: tickloop_agent_protocol::build_identity()
+            build_id: tickloop_agent_access::build_identity()
                 .unwrap_or_default()
                 .into(),
             requested_executable,
@@ -439,7 +441,7 @@ async fn verify_successor(executable: &Path) -> Result<(PathBuf, RuntimeBinaryIn
         ));
     }
     if info.handoff_version != RUNTIME_HANDOFF_VERSION
-        || info.protocol_major != tickloop_agent_protocol::PROTOCOL_MAJOR
+        || info.protocol_major != tickloop_agent_access::PROTOCOL_MAJOR
     {
         return Err(AccessError::invalid(
             "upgrade executable uses an incompatible runtime protocol",
@@ -840,7 +842,9 @@ impl AgentAccess for ExitedWorker {
 mod tests {
     use super::*;
     use crate::{EmbeddedAgentAccess, WorkerFactory};
-    use tickloop_agent_protocol::{AccessErrorCode, AgentCommand, CommandResult, PersistenceState};
+
+    use tickloop_agent_access::{AccessErrorCode, AgentCommand, CommandResult, PersistenceState};
+
     use tickloop_agent_runtime::Agent;
 
     struct OneWorker(Arc<dyn AgentAccess>);

@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tickloop_agent_protocol::LoopAction;
+use tickloop_agent_access::LoopAction;
 
 const HIDDEN_FIXTURE_VARIABLE: &str = "TICKLOOP_HIDDEN_VIEW_RECOVERY_FIXTURE";
 const LAGGED_OVERVIEW_ROUTE: &str = "lagged-overview";
