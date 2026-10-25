@@ -1,0 +1,14 @@
+{
+  "release": "v0.2.24",
+  "commit": "8476e2ccf254687ac4d429f22db5b5e93a747951",
+  "generatorVersion": "0.52.0",
+  "toolchain": "nightly-2026-10-19",
+  "packages": [
+    "tickloop-ids",
+    "tickloop-tick-protocol",
+    "tickloop-tick-sdk",
+    "tickloop-tick-packages",
+    "tickloop-tick-oauth",
+    "tickloop-ui"
+  ]
+}
